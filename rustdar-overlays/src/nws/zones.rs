@@ -442,3 +442,358 @@ async fn read_cached_zone(_cache_dir: &Path, _url: &str) -> Option<Vec<GeoPolygo
 
 #[cfg(target_arch = "wasm32")]
 async fn write_cached_zone(_cache_dir: &Path, _url: &str, _polygons: &[GeoPolygon]) {}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+//
+// Native-only: the loopback stub is `std::net::TcpListener` and a real thread,
+// neither of which exists on wasm32. The code under test is not gated — this is
+// the same production body on both targets.
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::nws::alert::{AlertCategory, NwsAlert};
+
+    /// A canned GeoJSON zone Feature — the bare `Feature` the zones API really
+    /// returns, with `geometry` at the top level rather than a
+    /// `FeatureCollection`. Big enough that `simplify_ring` cannot reduce it
+    /// below three points.
+    fn zone_body(lat: f64) -> String {
+        format!(
+            r#"{{"type":"Feature","geometry":{{"type":"Polygon","coordinates":
+             [[[-97.0,{lat}],[-97.0,{}],[-96.0,{}],[-96.0,{lat}],[-97.0,{lat}]]]}}}}"#,
+            lat + 1.0,
+            lat + 1.0,
+        )
+    }
+
+    /// Serve canned responses by path from a loopback socket, forever.
+    ///
+    /// Routed rather than one-shot ([`archive`]'s `serve_once` is the
+    /// single-response shape): the whole point here is a round of many requests
+    /// where *some* succeed, which one response cannot express. An unrouted path
+    /// answers 500, so a test states only what it wants to succeed.
+    ///
+    /// [`archive`]: rustdar_radar::archive
+    fn serve(routes: HashMap<String, (u16, String)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut scratch = [0u8; 4096];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or("");
+                let (code, body) = routes
+                    .get(path)
+                    .cloned()
+                    .unwrap_or((500, "upstream is unwell".to_string()));
+                let response = format!(
+                    "HTTP/1.1 {code} .\r\nContent-Type: application/geo+json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// `tls::init()` is required even for a cleartext URL: with
+    /// `rustls-no-provider` and `aws-lc-rs` out of the graph, `build()` panics
+    /// without a provider whatever scheme is used.
+    fn loopback_client() -> reqwest::Client {
+        rustdar_radar::tls::init();
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client")
+    }
+
+    /// A zone-based alert exactly as the parser admits one: zone URLs, no
+    /// geometry of its own, no features.
+    fn zone_alert(id: &str, zones: Vec<String>) -> NwsAlert {
+        NwsAlert {
+            id: id.to_string(),
+            event: "Tornado Warning".to_string(),
+            category: AlertCategory::Warning,
+            severity: "Severe".parse().unwrap(),
+            urgency: "Immediate".parse().unwrap(),
+            certainty: "Observed".parse().unwrap(),
+            headline: None,
+            description: String::new(),
+            instruction: None,
+            area_desc: String::new(),
+            sender_name: String::new(),
+            effective: String::new(),
+            expires: String::new(),
+            onset: None,
+            ends: None,
+            affected_zones: zones,
+            features: Vec::new(),
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a tokio runtime")
+    }
+
+    /// Everything resolves: three counties, three outlines, nothing to report.
+    ///
+    /// The counterweight to the two below — without it, a resolver that failed
+    /// on everything would satisfy them both.
+    #[test]
+    fn a_round_that_resolves_every_zone_reports_nothing_missing() {
+        let routes: HashMap<String, (u16, String)> = (0..3)
+            .map(|i| {
+                (
+                    format!("/zones/county/OKC{i:03}"),
+                    (200, zone_body(35.0 + f64::from(i))),
+                )
+            })
+            .collect();
+        let base = serve(routes);
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("{base}/zones/county/OKC{i:03}"))
+            .collect();
+        let mut alerts = vec![zone_alert("a", urls)];
+
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+
+        assert_eq!(alerts[0].features.len(), 3, "all three counties must draw");
+        assert_eq!(
+            resolution,
+            ZoneResolution {
+                alerts_expected: 1,
+                alerts_complete: 1,
+                alerts_partial: 0,
+                alerts_missing: 0,
+                zones_requested: 3,
+                zones_resolved: 3,
+                failures: Vec::new(),
+            },
+        );
+        assert!(
+            resolution.completeness().is_complete(),
+            "a whole round must not mark the layer",
+        );
+    }
+
+    /// **The observed bug.** Every zone fails, so the alert draws nothing — and
+    /// the round still has to say so, because the alert fetch itself succeeded
+    /// and nothing else on screen will.
+    ///
+    /// The failure is counted by cause, not merely counted: 503 and a body that
+    /// is not JSON are different things to whoever is reading the panel.
+    #[test]
+    fn a_round_that_resolves_no_zone_says_the_alert_draws_nothing() {
+        let base = serve(HashMap::from([(
+            "/zones/county/OKC001".to_string(),
+            (200, "this is not JSON".to_string()),
+        )]));
+        let mut alerts = vec![zone_alert(
+            "a",
+            vec![
+                format!("{base}/zones/county/OKC000"),
+                format!("{base}/zones/county/OKC001"),
+            ],
+        )];
+
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+
+        assert!(
+            alerts[0].features.is_empty(),
+            "premise: nothing resolved, so nothing draws",
+        );
+        assert_eq!(
+            alerts.len(),
+            1,
+            "the alert must keep its place in the list - it is not dropped and \
+             nothing is invented for it",
+        );
+        assert_eq!(resolution.alerts_missing, 1);
+        assert_eq!(resolution.alerts_complete, 0);
+        assert_eq!(resolution.zones_resolved, 0);
+        assert_eq!(
+            resolution.failures,
+            vec![(ZoneFailure::Http(500), 1), (ZoneFailure::Unreadable, 1)],
+            "each cause is counted separately: a refusal and a body that would \
+             not parse are different faults",
+        );
+
+        let note = resolution
+            .completeness()
+            .status_note()
+            .expect("a round that placed nothing must say so");
+        assert!(
+            note.contains("missing 1 of 1 alerts") && note.contains("0 of 2 zone boundaries"),
+            "the note must be countable: {note}",
+        );
+        assert!(
+            note.contains("HTTP 500") && note.contains("unreadable"),
+            "the note must say why, not only how many: {note}",
+        );
+    }
+
+    /// **The worst case, and the one nothing could see.** Two of three counties
+    /// resolve, so the alert draws a real outline that is the *wrong* outline —
+    /// and unlike a missing alert, there is nothing about the picture that looks
+    /// wrong at all.
+    ///
+    /// Counted apart from `alerts_missing` for exactly that reason: "212 not on
+    /// the map" and "6 drawing two thirds of themselves" are different things to
+    /// tell someone standing under the third county.
+    #[test]
+    fn a_round_that_resolves_some_of_an_alerts_zones_reports_it_as_partial() {
+        let base = serve(HashMap::from([
+            ("/zones/county/OKC000".to_string(), (200, zone_body(35.0))),
+            ("/zones/county/OKC001".to_string(), (200, zone_body(36.0))),
+            // OKC002 is unrouted, so it answers 500.
+        ]));
+        let mut alerts = vec![zone_alert(
+            "a",
+            (0..3)
+                .map(|i| format!("{base}/zones/county/OKC{i:03}"))
+                .collect(),
+        )];
+
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+
+        assert_eq!(
+            alerts[0].features.len(),
+            2,
+            "the two that resolved must still draw - a partial answer is not \
+             thrown away",
+        );
+        assert_eq!(resolution.alerts_partial, 1);
+        assert_eq!(resolution.alerts_missing, 0);
+        assert_eq!(resolution.alerts_complete, 0);
+        assert_eq!(
+            (resolution.zones_resolved, resolution.zones_requested),
+            (2, 3)
+        );
+        assert_eq!(resolution.failures, vec![(ZoneFailure::Http(500), 1)]);
+
+        let note = resolution
+            .completeness()
+            .status_note()
+            .expect("a partly drawn alert must say so");
+        assert!(
+            note.contains("1 of 1 alerts drawing only part of their area"),
+            "a wrong shape must not be reported as a missing one: {note}",
+        );
+    }
+
+    /// An alert is whole when **its own** zones are all there, however badly the
+    /// rest of the round went. Two alerts, one county each, one of the two
+    /// counties dead: one complete and one missing, not two partials.
+    #[test]
+    fn each_alert_is_judged_against_its_own_zones_and_not_the_round() {
+        let base = serve(HashMap::from([(
+            "/zones/county/OKC000".to_string(),
+            (200, zone_body(35.0)),
+        )]));
+        let mut alerts = vec![
+            zone_alert("a", vec![format!("{base}/zones/county/OKC000")]),
+            zone_alert("b", vec![format!("{base}/zones/county/OKC001")]),
+        ];
+
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+
+        assert_eq!(resolution.alerts_complete, 1);
+        assert_eq!(resolution.alerts_missing, 1);
+        assert_eq!(resolution.alerts_partial, 0);
+        assert_eq!(alerts[0].features.len(), 1);
+        assert!(alerts[1].features.is_empty());
+    }
+
+    /// An alert that arrived with its own geometry is not this pass's business:
+    /// it is not counted, and its features are left exactly as they were. Without
+    /// this the many alerts that carry *both* a polygon and an `affectedZones`
+    /// list would read as 1-of-5 partial for ever.
+    #[test]
+    fn an_alert_that_brought_its_own_geometry_is_not_counted_as_a_zone_alert() {
+        let base = serve(HashMap::new());
+        let mut inline = zone_alert("a", vec![format!("{base}/zones/county/OKC000")]);
+        inline.features.push(OverlayFeature::new(
+            vec![vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]]],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            "Tornado Warning".to_string(),
+            String::new(),
+            HatchPattern::None,
+        ));
+        let mut alerts = vec![inline];
+
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+
+        assert_eq!(
+            resolution,
+            ZoneResolution::default(),
+            "an alert carrying its own polygon asks nothing of zone resolution",
+        );
+        assert_eq!(alerts[0].features.len(), 1, "its own geometry is untouched");
+    }
+
+    /// A body that parses but carries nothing drawable is its own cause, not a
+    /// transport failure — the panel line is what a user reads back, and
+    /// "unreachable" for a zone the origin served would send them to their
+    /// router.
+    #[test]
+    fn a_zone_with_no_drawable_boundary_is_reported_as_such() {
+        let base = serve(HashMap::from([(
+            "/zones/county/OKC000".to_string(),
+            (200, r#"{"type":"Feature","geometry":null}"#.to_string()),
+        )]));
+        let mut alerts = vec![zone_alert("a", vec![format!("{base}/zones/county/OKC000")])];
+
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+
+        assert_eq!(resolution.failures, vec![(ZoneFailure::NoBoundary, 1)]);
+        assert_eq!(resolution.alerts_missing, 1);
+    }
+
+    /// Nothing to do is not a fault: a round of alerts that all carry geometry
+    /// leaves the layer unmarked.
+    #[test]
+    fn a_round_with_no_zone_alerts_reports_nothing() {
+        let mut alerts: Vec<NwsAlert> = Vec::new();
+        let resolution = runtime().block_on(resolve_zone_geometries(
+            &loopback_client(),
+            &mut alerts,
+            None,
+        ));
+        assert_eq!(resolution, ZoneResolution::default());
+        assert_eq!(resolution.completeness().status_mark(), None);
+    }
+}

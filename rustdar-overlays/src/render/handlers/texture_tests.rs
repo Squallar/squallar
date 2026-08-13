@@ -220,9 +220,9 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     handler.set_enabled(true);
 
     let payload: FetchPayload = match handler.kind() {
-        OverlayKind::NwsAlerts => {
-            Box::new(super::alert::NwsAlertFetchResult(Ok(vec![alert_fixture()])))
-        }
+        OverlayKind::NwsAlerts => Box::new(super::alert::NwsAlertFetchResult(Ok(
+            crate::nws::fetch::ActiveAlerts::whole(vec![alert_fixture()]),
+        ))),
         OverlayKind::SpcDiscussions => {
             Box::new(super::discussion::SpcDiscussionFetchResult(Ok(vec![
                 discussion_fixture(),
@@ -244,6 +244,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             transport_failures: None,
             level_failures: Vec::new(),
             evaluated_levels: Vec::new(),
+            listing_failures: Vec::new(),
         }))),
         OverlayKind::ModelData => Box::new(HrrrFetchResult(Ok(cin_grid()))),
         OverlayKind::RadarSites | OverlayKind::Radar => return false,

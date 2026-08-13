@@ -935,6 +935,7 @@ fn outcome(
         transport_failures,
         level_failures: Vec::new(),
         evaluated_levels: Vec::new(),
+        listing_failures: Vec::new(),
     })))
 }
 
@@ -953,6 +954,7 @@ fn level_outcome(
         transport_failures: None,
         level_failures,
         evaluated_levels,
+        listing_failures: Vec::new(),
     })))
 }
 

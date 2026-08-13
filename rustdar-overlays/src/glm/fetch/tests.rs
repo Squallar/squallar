@@ -914,6 +914,7 @@ fn build_outcome_binds_each_bucket_to_its_own_field() {
         Vec::new(),
         Vec::new(),
         vec![GlmSatellite::GoesEast],
+        Vec::new(),
         &tally,
         acc,
     );
@@ -957,7 +958,7 @@ fn build_outcome_keeps_level_failures_out_of_the_file_counts() {
         level_failures: vec![level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group)],
         ..Default::default()
     };
-    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), Vec::new(), &tally, acc);
 
     assert!(outcome.parse_failures.is_none(), "no *file* failed");
     assert!(outcome.transport_failures.is_none());
@@ -973,7 +974,7 @@ fn build_outcome_leaves_an_empty_bucket_unreported() {
         parse_errors: vec!["a.nc: boom".into()],
         ..Default::default()
     };
-    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), Vec::new(), &tally, acc);
 
     assert_eq!(
         outcome.parse_failures.expect("parse failures").in_window,

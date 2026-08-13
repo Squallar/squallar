@@ -280,7 +280,7 @@ impl OverlayHandler for NwsAlertHandler {
     /// Folding only the id was wrong for a **zone-based** alert, and those are
     /// ordinary: [`crate::nws::alert`] admits an alert with `affectedZones` and
     /// no `geometry`, carrying **no features at all**, and
-    /// [`crate::nws::zones::resolve_zone_geometry`] fills them in per poll —
+    /// [`crate::nws::zones::resolve_zone_geometries`] fills them in per poll —
     /// silently dropping any zone whose fetch failed, with no retry. So the
     /// same id legitimately arrives drawing nothing on one poll and drawing its
     /// counties on the next. Same id, same drawn count, and before
@@ -588,6 +588,8 @@ impl OverlayHandler for NwsAlertHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nws::fetch::ActiveAlerts;
+    use crate::nws::zones::ZoneResolution;
     use crate::types::{HatchPattern, OverlayFeature};
 
     /// A minimal alert with geometry, identified by `id`.
@@ -622,9 +624,22 @@ mod tests {
         }
     }
 
+    /// One good round of alerts that asked nothing of zone resolution — every
+    /// alert carrying its own geometry.
+    fn whole(alerts: Vec<NwsAlert>) -> FetchPayload {
+        Box::new(NwsAlertFetchResult(Ok(ActiveAlerts::whole(alerts))))
+    }
+
+    /// A round whose zone resolution came up short, exactly as the fetch path
+    /// delivers one: the alerts that did resolve, beside the report of what did
+    /// not.
+    fn with_zones(alerts: Vec<NwsAlert>, zones: ZoneResolution) -> FetchPayload {
+        Box::new(NwsAlertFetchResult(Ok(ActiveAlerts { alerts, zones })))
+    }
+
     fn handler_with(alerts: Vec<NwsAlert>) -> NwsAlertHandler {
         let mut handler = NwsAlertHandler::new();
-        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(alerts))));
+        handler.apply_fetch_result(whole(alerts));
         handler
     }
 
@@ -662,7 +677,7 @@ mod tests {
     ///
     /// The id alone cannot see this and the drawn count cannot either.
     /// `nws::alert` admits a zone-based warning with no geometry and no
-    /// features; `nws::zones::resolve_zone_geometry` fills them per poll and
+    /// features; `nws::zones::resolve_zone_geometries` fills them per poll and
     /// silently drops a zone whose fetch failed, with no retry. So poll *N* is
     /// the same id drawing nothing and poll *N+1* is the same id drawing three
     /// counties — one alert either way, `is_drawn` true either way. A consumer
@@ -682,11 +697,7 @@ mod tests {
              count would move on its own and this proves nothing",
         );
 
-        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![zone_alert(
-            "a",
-            "Tornado Warning",
-            3,
-        )]))));
+        handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
         let resolved = handler.content_signature();
         assert_eq!(
             handler.drawn_count(),
@@ -700,11 +711,7 @@ mod tests {
         );
 
         // And the partial case: some zones resolved, then the rest.
-        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![zone_alert(
-            "a",
-            "Tornado Warning",
-            2,
-        )]))));
+        handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 2)]));
         assert_ne!(
             handler.content_signature(),
             resolved,
@@ -723,10 +730,7 @@ mod tests {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
         let first = handler.content_signature();
         let generation_before = handler.data_generation();
-        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![alert(
-            "a",
-            "Tornado Warning",
-        )]))));
+        handler.apply_fetch_result(whole(vec![alert("a", "Tornado Warning")]));
         assert_ne!(
             handler.data_generation(),
             generation_before,
@@ -747,18 +751,15 @@ mod tests {
         let one_warning = handler.content_signature();
 
         // A second warning issues mid-session.
-        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![
+        handler.apply_fetch_result(whole(vec![
             alert("a", "Tornado Warning"),
             alert("b", "Severe Thunderstorm Warning"),
-        ]))));
+        ]));
         let two_warnings = handler.content_signature();
         assert_ne!(two_warnings, one_warning, "a new warning must move it");
 
         // The first expires out of the feed.
-        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![alert(
-            "b",
-            "Severe Thunderstorm Warning",
-        )]))));
+        handler.apply_fetch_result(whole(vec![alert("b", "Severe Thunderstorm Warning")]));
         let b_only = handler.content_signature();
         assert_ne!(b_only, two_warnings, "an expiry must move it");
         assert_ne!(
