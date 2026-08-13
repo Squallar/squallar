@@ -557,9 +557,24 @@ pub fn derive(velocity: &Level3Message, sample: &StormMotionSample) -> Option<De
         _ => source.scale_factor,
     };
 
+    // `first_range_bin` is an index *denominated in gates*
+    // (`RadialPacket::gate_range_km`), so re-spacing the packet above changes
+    // what the very same number means: carried over unchanged across a
+    // 1 km -> 0.25 km rewrite it would pull the field's start four times
+    // closer to the radar. Re-index onto the new spacing so the first gate
+    // stays where the source put it. Every live product declares 0 here, so
+    // this is inert on the wire today and the test below is what holds it.
+    let old_gate_km = source.gate_interval_km();
+    let new_gate_km = pdb.range_gate_km().unwrap_or(old_gate_km);
+    let first_range_bin = if new_gate_km > 0.0 {
+        ((source.first_range_bin as f64 * old_gate_km) / new_gate_km).round() as i16
+    } else {
+        source.first_range_bin
+    };
+
     Some(DerivedSrm {
         packet: RadialPacket {
-            first_range_bin: source.first_range_bin,
+            first_range_bin,
             num_range_bins: source.num_range_bins,
             i_center: source.i_center,
             j_center: source.j_center,
