@@ -203,6 +203,21 @@ impl RangeBinning {
 pub struct MomentGrid {
     /// `[az_deg][range_km]`, `NaN` where no gate carried data.
     pub values: Vec<Vec<f32>>,
+    /// Why each cell of [`values`](Self::values) is `NaN`, at the same
+    /// `[az_deg][range_km]` indices — the three distinct facts the `NaN`
+    /// cannot hold apart. `Value` exactly where `values` is finite.
+    ///
+    /// A **parallel plane** rather than a sentinel value or a `NaN` payload,
+    /// and rather than replacing `values` with an enum grid. The reasoning is
+    /// written out once at [`crate::types::GateReport`]'s call site in
+    /// [`sweep_to_grid`]; the short of it is that this arm is additive — every
+    /// existing reader of `values` keeps its type, its arithmetic and its
+    /// results — while costing one byte per cell against four, and that it
+    /// cannot be silently dropped by a later reader the way a sentinel can.
+    ///
+    /// A cell aggregates several gates, so this is their [`Ord`]-max: see
+    /// [`crate::types::GateReport`] for why that ordering is the precedence.
+    pub status: Vec<Vec<crate::types::GateReport>>,
     /// Index into [`Scan::sweeps`] of the sweep this grid was computed from.
     pub sweep_index: usize,
     /// Whether this sweep displaced an earlier sweep at the same elevation — a
@@ -449,8 +464,11 @@ fn tilt_at(
                 .find(|(k, ..)| (k - key).abs() < 0.05)
                 .map(|&(_, si, displaced)| {
                     let radials = scan.sweeps()[si].radials();
+                    let (values, status) =
+                        sweep_to_grid(radials, moment, stat, binning.range_scale(radials));
                     MomentGrid {
-                        values: sweep_to_grid(radials, moment, stat, binning.range_scale(radials)),
+                        values,
+                        status,
                         sweep_index: si,
                         displaced_repeat: displaced,
                     }
@@ -588,13 +606,55 @@ impl LinearZMemo {
 /// range it was measured at, `cos e` to file it under the ground it sits over.
 /// A parameter rather than a re-derivation from `radials` because it is one
 /// number per sweep and this runs once per moment per tilt.
+///
+/// # The second return value, and why it is a second value
+///
+/// The `NaN` above is three different facts wearing one bit pattern — the
+/// radar looked and found nothing, the radar found signal it cannot place in
+/// range, and no gate was ever reported here — and
+/// [`crate::types::GateReport`] says why a consumer wants them apart. Four
+/// ways to keep them were weighed:
+///
+/// * **A parallel status plane** (this). Additive: `grid` keeps its type, its
+///   arithmetic and every value it ever produced, so no existing reader
+///   changes and no pinned digest moves. Costs one byte per cell against the
+///   value's four — 82.8 kB per tilt per moment, 25% on top of a `f32` grid.
+/// * **A sentinel in the value.** Free, and the cheapest to lose: nothing in
+///   the type says the number is not a number, so the first consumer to
+///   compare, average or rescale it silently launders the sentinel back into
+///   data. This crate has already had to write `z >= 999.0` guards for
+///   exactly that pattern arriving from a decoder.
+/// * **`NaN` payload bits.** Also free — an `f32` `NaN` has 22 spare — and
+///   there is precedent for it two crates over in the rasterizer's
+///   `RANGE_FOLDED_BITS`. Rejected here because payloads are preserved by
+///   convention rather than by the language: `f32 as f64`, `min`/`max` and
+///   any library call may or may not carry them, and this grid is summed,
+///   averaged and interpolated. The rasterizer's use survives because it
+///   *paints* the value immediately, and even there the render path
+///   deliberately canonicalises the payload away rather than let it reach JS.
+/// * **An enum grid** replacing `values` outright. The clearest statement and
+///   the most invasive: every consumer's element type changes, and the
+///   arithmetic ones would have to unwrap on every gate of every column.
+///
+/// The plane wins on the same argument twice: it is the only one of the four
+/// that adds the fact without moving any existing number, and the only one a
+/// later reader cannot drop by accident — reading `values` without `status`
+/// leaves you exactly where this crate already was, rather than somewhere
+/// subtly worse.
+///
+/// **It stays crate-internal.** Nothing here crosses the worker boundary, so
+/// the worker protocol stays at version 4; the products that do cross are
+/// rasterized downstream of this. That is a decision, not an oversight — see
+/// [`MomentGrid::status`].
 fn sweep_to_grid(
     radials: &[Radial],
     moment: RadarProduct,
     stat: CellStat,
     range_scale: f64,
-) -> Vec<Vec<f32>> {
+) -> (Vec<Vec<f32>>, Vec<Vec<crate::types::GateReport>>) {
+    use crate::types::GateReport;
     let mut grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
+    let mut status = vec![vec![GateReport::NotReported; RANGE_BINS]; 360];
     // nearest radial per whole-degree centre
     let mut nearest: Vec<Option<usize>> = vec![None; 360];
     for (ri, radial) in radials.iter().enumerate() {
@@ -631,12 +691,25 @@ fn sweep_to_grid(
         // collects into would be eight bytes per gate allocated and dropped
         // for every azimuth cell of every sweep of the volume.
         for (j, v) in md.iter().enumerate() {
-            let MomentValue::Value(z) = v else { continue };
-            if z >= 999.0 || z.is_nan() {
-                continue;
-            }
+            // The bin is the gate's, whatever the gate said: a below-threshold
+            // or range-folded gate is still a gate *here*, and filing it is
+            // the whole point of the status plane.
             let r = ((fg + j as f64 * gi) * range_scale) as usize;
             if r >= RANGE_BINS {
+                continue;
+            }
+            let MomentValue::Value(z) = v else {
+                // `max`, so the cell keeps the strongest claim any of its
+                // gates made — see `GateReport`'s ordering note.
+                status[cell][r] = status[cell][r].max(GateReport::of(&v));
+                continue;
+            };
+            if z >= 999.0 || z.is_nan() {
+                // The decoder's own out-of-range sentinels. A gate was
+                // reported, but it carries neither a number nor either of the
+                // two meanings the other arms have, so it raises nothing: the
+                // cell keeps whatever its other gates said, and stays
+                // `NotReported` if they said nothing.
                 continue;
             }
             match stat {
@@ -659,10 +732,15 @@ fn sweep_to_grid(
                     CellStat::Mean => (sum / n as f64) as f32,
                     CellStat::Max => sum as f32,
                 };
+                // Written from the same `n > 0` the value is, in the same
+                // pass, so the plane and the grid cannot disagree about which
+                // cells are defined. `xsect.rs` keeps its own status plane
+                // honest the same way.
+                status[cell][r] = GateReport::Value;
             }
         }
     }
-    grid
+    (grid, status)
 }
 
 /// Echo tops: height (kft above radar) of the interpolated crossing of

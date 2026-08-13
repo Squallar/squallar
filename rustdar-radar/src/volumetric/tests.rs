@@ -1101,3 +1101,148 @@ fn the_tilts_the_pool_builds_are_the_tilts_a_serial_walk_builds() {
         }
     }
 }
+
+/// A cell's status names which of the decoder's three answers its gates gave,
+/// and a cell no gate reached says so.
+///
+/// Validated against **the decoder's own raw-code convention**, not against
+/// any table of ours: `nexrad_model`'s `MomentData::from_fixed_point` maps raw
+/// 0 to `BelowThreshold` and raw 1 to `RangeFolded`, so the bytes written here
+/// are the input side and `GateReport` is the output side. Nothing in this
+/// test consults the value grid to decide what the status ought to be.
+///
+/// The four 1-km cells are built from 0.25 km gates, four to a cell, so the
+/// aggregation rule is exercised rather than assumed:
+///
+/// * cell 0 — all four below threshold. The radar looked and saw nothing.
+/// * cell 1 — three below threshold and one range folded. Signal beats no
+///   signal, so the cell is folded, not empty.
+/// * cell 2 — one real value among a fold and two blanks. A number beats
+///   everything.
+/// * cell 3 — all four range folded.
+///
+/// Everything past the moment's last gate is `NotReported`, which is the arm
+/// a bare `NaN` could never distinguish from the two above it.
+#[test]
+fn a_cells_status_names_which_of_the_decoders_answers_its_gates_gave() {
+    use crate::types::GateReport;
+
+    // Raw codes, four 0.25 km gates per 1-km cell. 0 and 1 are the decoder's;
+    // anything >= 2 decodes to a number through SCALE/OFFSET.
+    let bytes: Vec<u8> = vec![
+        0, 0, 0, 0, // cell 0: below threshold throughout
+        0, 0, 1, 0, // cell 1: one fold among blanks
+        0, 1, 200, 0, // cell 2: a real value, a fold, two blanks
+        1, 1, 1, 1, // cell 3: folded throughout
+    ];
+    let radial = Radial::new(
+        0,
+        0,
+        0.5,
+        1.0,
+        RadialStatus::IntermediateRadialData,
+        1,
+        0.5,
+        Some(MomentData::from_fixed_point(
+            bytes.len() as u16,
+            0,
+            GATE_INTERVAL_M,
+            8,
+            SCALE,
+            OFFSET,
+            bytes,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let (values, status) = sweep_to_grid(
+        &radials_vec(radial),
+        RadarProduct::Reflectivity,
+        CellStat::Max,
+        1.0,
+    );
+
+    assert_eq!(status[0][0], GateReport::BelowThreshold, "cell 0");
+    assert_eq!(status[0][1], GateReport::RangeFolded, "cell 1: fold wins");
+    assert_eq!(status[0][2], GateReport::Value, "cell 2: a number wins");
+    assert_eq!(status[0][3], GateReport::RangeFolded, "cell 3");
+    assert_eq!(
+        status[0][4],
+        GateReport::NotReported,
+        "past the last gate is an absence, not a measurement",
+    );
+    // The azimuths no radial served are absences too.
+    assert_eq!(status[10][0], GateReport::NotReported, "unserved azimuth");
+
+    // The invariant `xsect.rs` holds its own status plane to: the plane says
+    // `Value` exactly where the grid has a number, on every cell of the grid.
+    for (az, (vrow, srow)) in values.iter().zip(status.iter()).enumerate() {
+        for (r, (v, s)) in vrow.iter().zip(srow.iter()).enumerate() {
+            assert_eq!(
+                v.is_finite(),
+                *s == GateReport::Value,
+                "az {az} bin {r}: value {v} against status {s:?}",
+            );
+        }
+    }
+}
+
+/// The status plane keeps that invariant over a whole built cube, not only
+/// over one hand-made radial — every moment, every tilt.
+///
+/// It also pins what this fixture *is*, which is why a synthetic scan cannot
+/// stand in for a measurement of the populations: `refl_sweep` writes a raw
+/// code for every gate of every radial out to 250 km, past the 230 km domain,
+/// so every blank in it is a below-threshold **measurement** and the cube it
+/// builds holds no `NotReported` cell at all. Real volumes are not like that.
+/// [`crate::velocity::VelocityGrid`]'s census records the same limitation of
+/// the synthetic corpus — its patcher repaints every gate, so it reads zero
+/// folded everywhere. The absence arm is pinned on the hand-made radial
+/// above, where the gate range can actually stop short.
+#[test]
+fn the_cubes_status_plane_says_value_exactly_where_its_grid_has_a_number() {
+    use crate::types::GateReport;
+
+    let scan = golden_scan();
+    let cube = VolumeCube::build(
+        &scan,
+        &[RadarProduct::Reflectivity],
+        DedupPolicy::NewestWins,
+        RangeBinning::Slant,
+    );
+    let mut seen_value = 0u64;
+    let mut seen_below = 0u64;
+    let mut seen_absent = 0u64;
+    for ti in 0..cube.tilts.len() {
+        let Some(grid) = cube.grid(ti, RadarProduct::Reflectivity) else {
+            continue;
+        };
+        assert_eq!(grid.status.len(), grid.values.len(), "row counts agree");
+        for (vrow, srow) in grid.values.iter().zip(grid.status.iter()) {
+            assert_eq!(vrow.len(), srow.len(), "column counts agree");
+            for (v, s) in vrow.iter().zip(srow.iter()) {
+                assert_eq!(v.is_finite(), *s == GateReport::Value);
+                match s {
+                    GateReport::Value => seen_value += 1,
+                    GateReport::BelowThreshold => seen_below += 1,
+                    GateReport::NotReported => seen_absent += 1,
+                    GateReport::RangeFolded => {}
+                }
+            }
+        }
+    }
+    // A vacuous pass would satisfy the assertions above; both populations have
+    // to be non-empty for the invariant to have been tested at all.
+    assert!(seen_value > 0, "the fixture must define some cells");
+    assert!(seen_below > 0, "and leave some measured-empty");
+    assert_eq!(
+        seen_absent, 0,
+        "this fixture reports every gate of the domain: its blanks are all \
+         measurements, which is exactly why the populations are measured on \
+         real volumes and not here",
+    );
+}

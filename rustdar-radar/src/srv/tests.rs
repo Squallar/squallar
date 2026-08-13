@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::GateReport;
 use nexrad_model::data::{MomentData, Radial, RadialStatus};
 
 /// Levels at the profile's 0.3 km layer centres, `count` of them, so
@@ -79,6 +80,7 @@ fn bunkers_falls_back_to_the_mean_wind_without_shear_direction() {
 fn the_storm_motion_term_is_added_along_the_radial() {
     let mut grid = VelocityGrid {
         values: vec![vec![10.0; 4]; 4],
+        status: vec![vec![GateReport::Value; 4]; 4],
         azimuths_deg: vec![90.0, 180.0, 270.0, 0.0],
         gate_count: 4,
         first_gate_range_km: 2.125,
@@ -105,6 +107,14 @@ fn the_storm_motion_term_is_added_along_the_radial() {
 fn a_zero_vector_is_identity_and_no_data_stays_empty() {
     let mut grid = VelocityGrid {
         values: vec![vec![-12.5, f64::NAN, 33.0]],
+        // The empty gate here is a gate the fixture never reported, which is
+        // the arm that has always been meant by a bare `NaN` in a hand-built
+        // grid — not a below-threshold measurement.
+        status: vec![vec![
+            GateReport::Value,
+            GateReport::NotReported,
+            GateReport::Value,
+        ]],
         azimuths_deg: vec![137.0],
         gate_count: 3,
         first_gate_range_km: 2.125,
@@ -284,6 +294,24 @@ fn grid_from_packet(
                         } else {
                             (g as f64 - offset) / scale
                         }
+                    })
+                    .collect()
+            })
+            .collect(),
+        // Levels 0 and 1 are below-threshold and range-folded across the whole
+        // Level III family — the same convention `twin::compare::ValueCodec`
+        // decodes by — so this side of the comparison can say which of the two
+        // each empty gate is rather than flattening both to `NaN`.
+        status: packet
+            .radials
+            .iter()
+            .map(|run| {
+                run.gate_values
+                    .iter()
+                    .map(|&g| match g {
+                        0 => GateReport::BelowThreshold,
+                        1 => GateReport::RangeFolded,
+                        _ => GateReport::Value,
                     })
                     .collect()
             })
