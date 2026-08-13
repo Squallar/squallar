@@ -178,17 +178,73 @@ struct Record {
 
 // ── Fetch ─────────────────────────────────────────────────────────────────
 
+/// What one round of the viewport's state networks delivered.
+///
+/// A skipped network used to be invisible. Refusing the round only when **every**
+/// network failed is right — one state's ASOS feed being down still leaves
+/// observations to draw across the rest of the viewport — but the survivors then
+/// went through `set_data`, which declares an answer whole. Measured over a
+/// socket with a viewport spanning eight plains networks and Oklahoma's refused
+/// 503: health `Ok`, `is_incomplete()` false, no mark, a fresh clock, and every
+/// Oklahoma station absent from a map centred on Oklahoma.
+///
+/// Nothing about that is *stale*, so no rung of the health ladder could express
+/// it. This is the coverage half.
+#[derive(Debug)]
+pub struct MetarRound {
+    pub observations: Vec<MetarOb>,
+    /// The state networks that did not answer, and why. Empty on a whole round.
+    pub failed_networks: Vec<(String, FetchError)>,
+    /// How many networks the viewport asked for at all — the denominator the
+    /// failures are measured against, and not a number the survivors can reveal.
+    pub networks_asked: usize,
+}
+
+impl MetarRound {
+    /// The layer-agnostic report the UI renders.
+    ///
+    /// A network is the unit: each covers a state and a missing one takes every
+    /// station in that state off the map, whole. There is no part-drawn case —
+    /// `currents.json` either parsed or it did not — so no second denominator.
+    ///
+    /// Stations that were present and unparseable are **not** counted here.
+    /// They are a schema or unit change upstream rather than a round that
+    /// half-arrived, they are already warned about by count, and folding them in
+    /// would put a per-station number under a per-network noun.
+    pub fn completeness(&self) -> crate::fetch_policy::DataCompleteness {
+        crate::fetch_policy::DataCompleteness {
+            expected: self.networks_asked,
+            partial: 0,
+            missing: self.failed_networks.len(),
+            parts_requested: 0,
+            parts_resolved: 0,
+            unit: "state networks",
+            part_unit: "requests",
+            reasons: self
+                .failed_networks
+                .iter()
+                .map(|(state, e)| (format!("{state}: {}", e.message), 1))
+                .collect(),
+        }
+    }
+}
+
 /// One request per state network the viewport overlaps, concurrently. A failed
-/// network is skipped, not fatal, unless every one fails.
+/// network is skipped, not fatal, unless every one fails — and a skipped one is
+/// reported, see [`MetarRound`].
 pub async fn fetch_current_metars(
     client: &reqwest::Client,
     sources: &rustdar_radar::sources::DataSources,
     viewport: &GeoBounds,
-) -> Result<Vec<MetarOb>, FetchError> {
+) -> Result<MetarRound, FetchError> {
     let states = networks::networks_for_viewport(viewport);
     if states.is_empty() {
         log::info!("METAR: viewport overlaps no ASOS network");
-        return Ok(Vec::new());
+        return Ok(MetarRound {
+            observations: Vec::new(),
+            failed_networks: Vec::new(),
+            networks_asked: 0,
+        });
     }
     log::info!(
         "Fetching METARs for {} network(s): {states:?}",
@@ -220,8 +276,8 @@ pub async fn fetch_current_metars(
 
     let mut all = Vec::new();
     let mut rejected_total = 0u32;
-    let mut verdicts = Vec::new();
-    for result in results {
+    let mut failed_networks: Vec<(String, FetchError)> = Vec::new();
+    for (state, result) in states.iter().zip(results) {
         match result {
             Ok((obs, rejected)) => {
                 all.extend(obs);
@@ -229,7 +285,7 @@ pub async fn fetch_current_metars(
             }
             Err(e) => {
                 log::warn!("METAR network fetch failed: {e}");
-                verdicts.push(e);
+                failed_networks.push((state.to_string(), e));
             }
         }
     }
@@ -238,13 +294,30 @@ pub async fn fetch_current_metars(
     // still leaves observations to draw. When every one of them failed, the
     // round's verdict is the merge of theirs — refused only if every part was,
     // so a single dead network cannot take METAR off the poll nationwide.
-    if verdicts.len() == states.len() {
+    if failed_networks.len() == states.len() {
+        let verdicts: Vec<FetchError> = failed_networks.into_iter().map(|(_, e)| e).collect();
         return Err(FetchError::of_round(
             &verdicts,
             format!("all {} METAR network fetches failed", verdicts.len()),
         ));
     }
 
+    if !failed_networks.is_empty() {
+        // WARN, not INFO: the layer is about to draw a map with whole states
+        // blank on it, on a fresh clock. The per-request line above says
+        // nothing about what the round as a whole ended up holding.
+        log::warn!(
+            "METAR incomplete: {} of {} state networks did not answer ({}), so no \
+             station in those states is on the map",
+            failed_networks.len(),
+            states.len(),
+            failed_networks
+                .iter()
+                .map(|(state, _)| state.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     if rejected_total > 0 {
         log::warn!(
             "METAR: {rejected_total} present-but-unparseable cell(s) - a schema \
@@ -252,7 +325,11 @@ pub async fn fetch_current_metars(
         );
     }
     log::info!("Parsed {} METAR observations", all.len());
-    Ok(all)
+    Ok(MetarRound {
+        observations: all,
+        failed_networks,
+        networks_asked: states.len(),
+    })
 }
 
 /// Returns observations plus the count of present-but-unusable cells. The

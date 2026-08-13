@@ -374,7 +374,8 @@ async fn live_metar_fetch_carries_every_mapped_field() {
 
     let obs = fetch_current_metars(&client, &sources, &view)
         .await
-        .expect("METAR fetch must succeed");
+        .expect("METAR fetch must succeed")
+        .observations;
     println!("fetched {} observations", obs.len());
     assert!(obs.len() > 20, "expected a state's worth of ASOS sites");
 
