@@ -288,12 +288,82 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// It is the *side* that stops moving, not the picture — the extent is the
 /// data's either way, so what that caller receives is the section above's
 /// coarser frame over the same ground, not a different frame.
-pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize) -> usize {
+pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize, sample_km: f64) -> usize {
     if extent_km > BASE_EXTENT_KM {
-        side_ceiling_px
+        side_ceiling_px.min(data_limited_side_px(extent_km, sample_km))
     } else {
         IMAGE_SIZE.min(side_ceiling_px)
     }
+}
+
+/// Texels per sample the raster is allowed to spend, at most.
+///
+/// Two, which is Nyquist: below it adjacent gates share a texel and detail the
+/// radar measured is lost, above it the picture is sampling its own
+/// interpolation rather than any new measurement. It is a statement about
+/// sampling and not a tuning knob, which is why it is spelt here once and
+/// derived from nowhere.
+pub const TEXELS_PER_SAMPLE: f64 = 2.0;
+
+/// The largest side worth painting `extent_km` of a field sampled every
+/// `sample_km` onto — the point past which more texels buy nothing.
+///
+/// # The two terms, and why neither alone is the answer
+///
+/// **The data's own term** is `TEXELS_PER_SAMPLE` per sample across the
+/// diameter: `2 · extent_km / sample_km · TEXELS_PER_SAMPLE`. On a WSR-88D
+/// surveillance cut — 1832 gates of 0.25 km, ±460.11 km on the ground — that
+/// is 7362 px, and at 4096 the same cut gets **1.11** texels per gate, so the
+/// display has been discarding half of what the radar measured out there for
+/// as long as it has drawn past the base extent. Measured on this crate over
+/// seven sites (KDMX, KCRP, KFTG, KATX, KPDT, KTLX, TORD).
+///
+/// **The display's own term** is the scale the base texture is calibrated at,
+/// `IMAGE_SIZE / (2 · BASE_EXTENT_KM)` = 4.4522 px/km, applied to whatever
+/// ground this raster covers. It is here because a radial Nyquist figure alone
+/// would *lower* the side for a coarsely sampled field: a 1 km × 1° echo-tops
+/// grid reaching 460 km asks for only 1840 px radially, and a raster that
+/// narrow loses azimuthal detail inside about 50 km, where a 1° cell is far
+/// finer than a range bin. Azimuthal cells shrink to nothing at the origin, so
+/// no azimuthal Nyquist figure exists to bound them with; the display's
+/// calibrated scale is the floor that stands in for it.
+///
+/// So the answer is the larger of the two, and the effect is exactly one
+/// direction: **a raster is never coarser than the scale this display has
+/// always drawn at, and rises above it only as far as the samples justify.**
+///
+/// # What each real sweep asks for, measured
+///
+/// | sweep | extent | sample | asks for | gets today |
+/// |---|---:|---:|---:|---:|
+/// | WSR-88D surveillance, 1832 gates | ±460.11 km | 0.25 km | 7362 | 4096 |
+/// | WSR-88D Doppler, 1192 gates      | ±300.11 km | 0.25 km | 4802 | 4096 |
+/// | TDWR long-range reflectivity     | ±417.00 km | 0.30 km | 5560 | 4096 |
+/// | TDWR Doppler, 592 gates          | ±88.80 km  | 0.15 km | 2368 | 2048 |
+/// | echo tops / VIL density / hail   | ±460 km    | 1.00 km | 4096 | 4096 |
+///
+/// The last two rows are why the floor is there and why the base branch of
+/// [`raster_side_px`] is untouched: a TDWR Doppler disc is already inside
+/// [`BASE_EXTENT_KM`], so it takes the base texture whatever this answers, and
+/// the 1 km volume grids come out at the calibrated scale rather than under it.
+///
+/// A non-positive or non-finite `sample_km` says nothing about sampling, so it
+/// answers the display's term alone rather than dividing by it.
+pub fn data_limited_side_px(extent_km: f64, sample_km: f64) -> usize {
+    let reference_scale_px_per_km = IMAGE_SIZE as f64 / (2.0 * BASE_EXTENT_KM);
+    let diameter_km = 2.0 * extent_km.max(0.0);
+    let at_reference = diameter_km * reference_scale_px_per_km;
+    // `is_finite` before the comparison, not folded into it: every ordering
+    // against a `NaN` is false, so `> 0.0` alone would admit one and the
+    // division would carry it into the side.
+    let at_nyquist = if sample_km.is_finite() && sample_km > 0.0 {
+        diameter_km / sample_km * TEXELS_PER_SAMPLE
+    } else {
+        0.0
+    };
+    // `ceil` and not `round`: a side one texel short of the data's own limit is
+    // still short of it.
+    (at_reference.max(at_nyquist).ceil() as usize).max(1)
 }
 
 /// Mean radius of Earth in kilometers — the IUGG mean radius, and the one

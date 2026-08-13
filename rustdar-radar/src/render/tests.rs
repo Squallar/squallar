@@ -2594,7 +2594,10 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
             "a WSR-88D surveillance cut, 2.125 + 1832 × 0.25 km",
         ),
     ] {
-        let side = types::raster_side_px(extent_km, LONG_RANGE_SIDE);
+        // The super-res gate every row here is flown at: 0.25 km asks for more
+        // pixels than `LONG_RANGE_SIDE` offers at all three extents, so the
+        // ceiling is what binds and this is the same assertion it always was.
+        let side = types::raster_side_px(extent_km, LONG_RANGE_SIDE, 0.25);
         let px_per_km = side as f64 / (2.0 * extent_km);
         assert!(
             px_per_km >= floor * (1.0 - TOLERANCE),
@@ -2633,7 +2636,7 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
 
     // The cap: the extent where the long-range raster is furthest under the
     // floor, by the 2.1% the table names and no more.
-    let at_cap = types::raster_side_px(types::MAX_EXTENT_KM, LONG_RANGE_SIDE) as f64
+    let at_cap = types::raster_side_px(types::MAX_EXTENT_KM, LONG_RANGE_SIDE, 0.25) as f64
         / (2.0 * types::MAX_EXTENT_KM);
     assert!(
         (at_cap / floor - 0.9787).abs() < 1e-3,
@@ -2845,7 +2848,7 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
         (460.125, 2.2255, "a WSR-88D surveillance cut"),
         (types::MAX_EXTENT_KM, 2.1787, "the arithmetic cap"),
     ] {
-        let side = types::raster_side_px(extent, types::IMAGE_SIZE);
+        let side = types::raster_side_px(extent, types::IMAGE_SIZE, 0.25);
         let scale = side as f64 / (2.0 * extent);
         assert!(
             (scale - expected).abs() < 1e-3,

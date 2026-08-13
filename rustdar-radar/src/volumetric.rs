@@ -51,6 +51,15 @@ const ET_THRESHOLD_DBZ: f32 = 18.3;
 /// total — the domain the RPG specifies its derived products over.
 pub const RANGE_BINS: usize = 230;
 
+/// How wide one of those cells is, km.
+///
+/// The `1` in [`RangeBinning`]'s `[r, r+1)`, given a name because the raster
+/// that draws these grids has to be told how far apart their samples are:
+/// [`crate::types::data_limited_side_px`] will not paint more texels across a
+/// field than its samples can fill, and a grid whose spacing it could not read
+/// would be sized as though it had said nothing about its own sampling.
+pub const RANGE_BIN_KM: f64 = 1.0;
+
 /// Polar grid of a volume-derived product: 360 azimuth degrees × 1-km range
 /// bins, value `NaN` where undefined.
 pub struct VolumetricGrid {

@@ -471,6 +471,23 @@ struct RenderBuffers {
 /// were already holding those six buffers live at once.
 static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex::new(None);
 
+/// How much larger than the render asking for it a carried cell buffer may be
+/// before [`RenderBuffers::checkout`] drops it instead of shrinking it.
+///
+/// Four, which is one doubling of the side. `Vec::resize_with` never returns
+/// capacity, so without a bound the one slot holds the largest raster this
+/// process ever drew for as long as it runs. That was a 4x spread and an
+/// affordable one while both ends were constants — 32 MiB of base-size cells
+/// against 128 MiB of long-range. It is not any more: a surveillance cut on a
+/// device that reports 32768 is 7362 px and 414 MiB of cells, and a base-size
+/// render behind it would otherwise keep every one of those pages.
+///
+/// One doubling and not an exact fit because the point is to stop the *spread*
+/// from becoming residency, not to refuse reuse: the renders that actually
+/// alternate are a pane and its loop, one side apart at most, and those still
+/// hit the slot.
+const CELL_POOL_REUSE_FACTOR: usize = 4;
+
 /// The one RGBA texture this process keeps between plan-view renders, and the
 /// one value grid, in two slots that fill and empty independently.
 ///
@@ -894,11 +911,23 @@ impl RenderBuffers {
         // only thing keeping the lock off the allocation.
         let pooled = Self::pool().take();
         match pooled {
-            Some(mut cells) => {
+            // Carried buffers are kept only while they are near the size being
+            // asked for. `resize_with` never returns capacity, so a slot that
+            // once held the largest raster this device allows would hold that
+            // allocation for the life of the process — and the spread between
+            // the smallest and largest side is no longer the 4x it was when
+            // both ends were constants. A surveillance cut on a device that
+            // reports 32768 is 7362 px, whose cells are 414 MiB, against 32 MiB
+            // for a base-size raster: carrying the big one under a small render
+            // would pin thirteen times the memory that render needs. Past the
+            // threshold the buffer is dropped and a right-sized one allocated,
+            // which is what the pool does on its first render anyway.
+            Some(cells) if cells.len() <= n.saturating_mul(CELL_POOL_REUSE_FACTOR) => {
+                let mut cells = cells;
                 cells.resize_with(n, || AtomicU64::new(Self::EMPTY));
                 cells
             }
-            None => (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
+            _ => (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
         }
     }
 
@@ -1485,6 +1514,33 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
     reach
 }
 
+/// How far apart this sweep's gates are along a radial, km — the **finest**
+/// spacing any radial carrying the product declares.
+///
+/// The finest and not the first radial's, for the reason [`compute_max_range`]
+/// takes the longest reach: a sweep whose radials disagree is rendered to
+/// whichever of them asks the most of the raster, so no radial's gates are
+/// under-sampled by a side chosen from another radial's geometry. A split cut's
+/// two halves have genuinely different spacings, and the sweeps this walks are
+/// one half each.
+///
+/// Zero when no radial carries the product, which is the same answer
+/// [`compute_max_range`] gives for that sweep and which
+/// [`types::data_limited_side_px`] reads as "this says nothing about sampling".
+fn compute_gate_interval_km(radials: &[Radial], product: types::RadarProduct) -> f64 {
+    let mut finest = f64::INFINITY;
+    for radial in radials {
+        let Some(moment) = product.get_moment(radial) else {
+            continue;
+        };
+        let km = moment.gate_interval_km();
+        if km > 0.0 {
+            finest = finest.min(km);
+        }
+    }
+    if finest.is_finite() { finest } else { 0.0 }
+}
+
 /// The factor between the slant range a sweep's gates are measured at and the
 /// ground range they sit over: `cos e` of the sweep's **median** elevation.
 ///
@@ -1534,21 +1590,30 @@ fn sweep_ground_factor(radials: &[Radial]) -> f64 {
 /// gates were shortened but whose extent was not would draw a 60° TDWR tilt
 /// at half radius on a frame twice as wide as it needed.
 ///
-/// `side_ceiling_px` is the largest side the caller will accept; the extent and
-/// that ceiling together give the raster's own side through
+/// `side_ceiling_px` is the largest side the caller will accept; the extent,
+/// that ceiling and `sample_km` together give the raster's own side through
 /// [`types::raster_side_px`], which is the second half of the geometry and the
 /// only half this crate cannot decide alone.
+///
+/// `sample_km` is how far apart this field's samples are along a radial, in the
+/// same ground coordinate `reach_km` is in — so the four per-tilt paths fold
+/// [`sweep_ground_factor`] into it exactly as they fold it into the reach. It
+/// is what stops the raster being asked for more texels than the data can fill:
+/// [`types::data_limited_side_px`] is where that is argued and measured. A path
+/// whose samples are not evenly spaced along a radial passes a non-positive
+/// figure, which asks for the display's calibrated scale and nothing more.
 fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
     reach_km: f64,
+    sample_km: f64,
     product: types::RadarProduct,
     side_ceiling_px: usize,
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
 ) -> SweepRender {
     let extent_km = types::plan_view_extent_km(reach_km);
-    let side_px = types::raster_side_px(extent_km, side_ceiling_px);
+    let side_px = types::raster_side_px(extent_km, side_ceiling_px, sample_km);
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
     let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km, side_px);
     let bufs = RenderBuffers::new(product, side_px);
@@ -1793,11 +1858,13 @@ pub fn render_radar_to_image_full_sized(
     // are where the one becomes the other.
     let cos_e = sweep_ground_factor(radials);
     let ground_reach_km = compute_max_range(radials, product) * cos_e;
+    let ground_sample_km = compute_gate_interval_km(radials, product) * cos_e;
 
     let output = render_with_projection(
         radar_lat,
         radar_lon,
         ground_reach_km,
+        ground_sample_km,
         product,
         side_ceiling_px,
         "Radar",
@@ -1936,6 +2003,7 @@ fn render_nrot_to_image(
         radar_lat,
         radar_lon,
         ground_reach_km,
+        vg.gate_interval_km * cos_e,
         types::RadarProduct::NormalizedRotation,
         side_ceiling_px,
         "NROT",
@@ -2037,6 +2105,7 @@ fn render_srv_to_image(
         radar_lat,
         radar_lon,
         ground_reach_km,
+        grid.gate_interval_km * cos_e,
         types::RadarProduct::StormRelativeVelocity,
         side_ceiling_px,
         "SRV",
@@ -2084,6 +2153,7 @@ pub fn render_echo_tops_interp_to_image(
         radar_lat,
         radar_lon,
         max_range,
+        crate::volumetric::RANGE_BIN_KM,
         types::RadarProduct::EchoTopsInterpolated,
         side_ceiling_px,
         "Radar",
@@ -2155,6 +2225,7 @@ pub fn render_derived_vild_to_image_sized(
         radar_lat,
         radar_lon,
         max_range,
+        crate::volumetric::RANGE_BIN_KM,
         types::RadarProduct::VilDensity,
         side_ceiling_px,
         "Radar",
@@ -2253,6 +2324,7 @@ pub fn render_hail_to_image(
         radar_lat,
         radar_lon,
         max_range,
+        crate::volumetric::RANGE_BIN_KM,
         product,
         side_ceiling_px,
         "Radar",
@@ -2398,6 +2470,7 @@ pub fn render_hhc_to_image(
         radar_lat,
         radar_lon,
         max_range,
+        grid.gate_interval_km,
         types::RadarProduct::HydrometeorClassification,
         side_ceiling_px,
         "Radar",
@@ -2463,6 +2536,7 @@ pub fn render_derived_kdp_to_image(
         radar_lat,
         radar_lon,
         ground_reach_km,
+        derived.gate_interval_km * cos_e,
         types::RadarProduct::SpecificDifferentialPhase,
         side_ceiling_px,
         "KDP",
@@ -2581,6 +2655,7 @@ fn render_level3_radial_with_gate_km(
         radar_lat,
         radar_lon,
         actual_max_range,
+        gate_interval,
         product,
         side_ceiling_px,
         "Level III",
