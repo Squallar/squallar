@@ -1200,6 +1200,25 @@ pub(crate) fn find_sweep(
 /// have" is a claim about data, and `Sweep::new` takes the number separately,
 /// so reading the radial's would be a second source of truth for the one field
 /// the ladder cannot get wrong. This returns the first.
+///
+/// # Which radials the moment questions are asked of
+///
+/// **Every radial, not the first one.** Whether a sweep carries a product, and
+/// whether it is a split cut's Doppler half, are properties of the *sweep*, and
+/// asking them of `radials.first()` let one radial answer for all 720 of them:
+/// a leading radial whose moment was missing — a truncated record, a mis-framed
+/// message, an antenna still settling — hid the entire sweep from this search,
+/// and the pane then rendered a different cut or nothing at all. On the extent
+/// path that is not a cosmetic failure, because the chosen sweep's reach is
+/// what [`types::plan_view_extent_km`] frames the raster and the range ring at:
+/// a hidden 88.8 km Doppler cut is answered by a 417 km surveillance one, and
+/// the ring moves 328 km.
+///
+/// It is the same first-radial assumption the wind-profile fits carried, and it
+/// costs nothing to drop: `any` short-circuits on the first radial that does
+/// carry the moment, which on every well-formed sweep is the first radial.
+/// `a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_own_reach`
+/// is the guard.
 pub(crate) fn find_sweep_owner(
     scan: &Scan,
     product: types::RadarProduct,
@@ -1208,13 +1227,12 @@ pub(crate) fn find_sweep_owner(
     let newest = |surveillance_only: bool| {
         scan.sweeps().iter().rev().find(|sweep| {
             let radials = sweep.radials();
-            radials
-                .first()
-                .zip(crate::volumetric::sweep_elevation_deg(radials))
-                .map(|(r, elevation)| {
+            crate::volumetric::sweep_elevation_deg(radials)
+                .map(|elevation| {
                     (elevation - f64::from(elevation_angle)).abs() < ELEVATION_WINDOW
-                        && product.get_moment(r).is_some()
-                        && !(surveillance_only && r.velocity().is_some())
+                        && radials.iter().any(|r| product.get_moment(r).is_some())
+                        && !(surveillance_only
+                            && radials.iter().any(|r| r.velocity().is_some()))
                 })
                 .unwrap_or(false)
         })

@@ -62,7 +62,7 @@ fn main() {
 
             let mut best_ms = f64::INFINITY;
             let mut out = None;
-            for _ in 0..3 {
+            for _ in 0..7 {
                 let t = std::time::Instant::now();
                 let r = rustdar_radar::render::render_radar_to_image(&scan, elev, product, lat, lon);
                 let ms = t.elapsed().as_secs_f64() * 1000.0;

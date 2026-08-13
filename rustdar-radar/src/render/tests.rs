@@ -80,10 +80,13 @@ fn digest(image: &[u8], values: &[f32]) -> u64 {
 fn fixture_covers_a_realistic_share_of_the_image() {
     let (image, values) = render(&packet(None));
     let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
-    // 600 gates of 0.25 km reach 150 km, inside the floor, so this fixture is
-    // drawn on the 230 km frame every short product gets.
-    let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
-    let disc = std::f64::consts::PI * (N_BINS as f64 * 0.25 * px_per_km).powi(2);
+    // 600 bins of 0.25 km reach 150 km, and the frame is now 150 km too, so
+    // the disc fills it corner to corner: pi/4 of the raster, against the
+    // 21% of it the same packet covered while every short product was
+    // drawn on a 230 km frame.
+    let reach_km = N_BINS as f64 * 0.25;
+    let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * reach_km);
+    let disc = std::f64::consts::PI * (reach_km * px_per_km).powi(2);
     assert!(
         (painted as f64) > disc * 0.9 && (painted as f64) < disc * 1.1,
         "painted {painted}, expected about {disc:.0} for a {N_BINS}-gate disc"
@@ -279,8 +282,15 @@ fn l2_sweep(gates: &[u8], azimuths: &[f32], declared_spacing: f32, velocity: boo
         .zip(azimuths)
         .enumerate()
         .map(|(i, (&byte, &azimuth))| {
-            let moment =
-                MomentData::from_fixed_point(600, 0, 250, 8, SCALE, OFFSET, vec![byte; 600]);
+            let moment = MomentData::from_fixed_point(
+                L2_GATES as u16,
+                0,
+                (L2_GATE_KM * 1000.0) as u16,
+                8,
+                SCALE,
+                OFFSET,
+                vec![byte; L2_GATES],
+            );
             let (refl, vel) = if velocity {
                 (None, Some(moment))
             } else {
@@ -368,10 +378,24 @@ fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize
     py * side_px + px
 }
 
-/// [`probe_at`] on the floor, which is where every fixture in this file that
-/// does not say otherwise is drawn — their moments reach 150 km.
-fn probe(az_deg: f64, range_km: f64) -> usize {
-    probe_at(types::BASE_EXTENT_KM, types::IMAGE_SIZE, az_deg, range_km)
+/// Gates in [`l2_sweep`]'s moments, and the gate they are — the shape of a
+/// WSR-88D cut, and the geometry every probe in this file that does not say
+/// otherwise is answered against.
+const L2_GATES: usize = 600;
+/// See [`L2_GATES`]. 600 of these reach 150 km of beam.
+const L2_GATE_KM: f64 = 0.25;
+
+/// The ground [`l2_sweep`] covers, km, and so the extent every render of it is
+/// projected at.
+///
+/// Derived from the fixture's own gates rather than written down, because that
+/// is the property under test everywhere it is used: these renders are framed
+/// by what their data reaches, so a probe that assumed any other number would
+/// be asking about a different picture. It used to be `types::BASE_EXTENT_KM` —
+/// a 150 km fixture really was drawn on a 230 km frame — and that is exactly
+/// the substitution this file now has none of.
+fn l2_ground_reach_km() -> f64 {
+    L2_GATES as f64 * L2_GATE_KM * f64::from(L2_ELEVATION).to_radians().cos()
 }
 
 /// The raw gate codes Level II reserves below the data range. Every other
@@ -386,10 +410,16 @@ fn pixel_at(image: &[u8], idx: usize) -> (u8, u8, u8, u8) {
     (px[0], px[1], px[2], px[3])
 }
 
-/// Assert what the sweep painted at a list of `(azimuth, range)` probes.
+/// Assert what the sweep painted at a list of `(azimuth, range)` probes, on
+/// the frame [`l2_sweep`]'s own reach gives it.
 fn assert_probes(values: &[f32], painted: bool, probes: &[(f64, f64)], why: &str) {
     for &(az, range) in probes {
-        let v = values[probe(az, range)];
+        let v = values[probe_at(
+            l2_ground_reach_km(),
+            types::IMAGE_SIZE,
+            az,
+            range,
+        )];
         assert_eq!(
             !v.is_nan(),
             painted,
@@ -948,6 +978,236 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     );
 }
 
+/// Gates in a TDWR's Doppler moments, and the gate they are.
+///
+/// Measured, not chosen: 592 gates of 150 m from the antenna, reaching
+/// 88.800 km of beam, decoded from the lowest cut of the 2026-08-11 00Z volume
+/// at **TOKC, TDAL, TPIT and TATL** — four TDWR sites across four regions,
+/// identical on every one of them to the last bit. Beside them on the same
+/// volume sits [`TDWR_GATES`]' 1390-gate reflectivity reaching 417 km, which is
+/// 4.7 times as far.
+const TDWR_DOPPLER_GATES: usize = 592;
+/// See [`TDWR_DOPPLER_GATES`]. 592 of these reach 88.8 km of beam.
+const TDWR_DOPPLER_GATE_KM: f64 = 0.15;
+
+/// A TDWR volume as the four sites above actually fly it: one cut carrying a
+/// 1390-gate reflectivity **and** a 592-gate velocity, so the two moments of
+/// one sweep reach 417 km and 88.8 km respectively.
+///
+/// Both moments are filled rather than beaconed, because what these tests read
+/// off the picture is where each product's data *stops*.
+fn tdwr_doppler_volume() -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+
+    let radials = (0..360)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                L2_ELEVATION,
+                Some(MomentData::from_fixed_point(
+                    TDWR_GATES as u16,
+                    0,
+                    (TDWR_GATE_KM * 1000.0) as u16,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    vec![200; TDWR_GATES],
+                )),
+                Some(MomentData::from_fixed_point(
+                    TDWR_DOPPLER_GATES as u16,
+                    0,
+                    (TDWR_DOPPLER_GATE_KM * 1000.0) as u16,
+                    8,
+                    2.0,
+                    129.0,
+                    vec![200; TDWR_DOPPLER_GATES],
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            80,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// **The reported defect.** A TDWR velocity pane is framed at the 88.8 km its
+/// Doppler moment reaches, not at 230 km, and the reflectivity beside it on the
+/// same volume is framed at its own 417 km.
+///
+/// A pane's range ring is drawn at the render's `max_range_km`
+/// (`rustdar_egui::ui_map_pane`'s `render_radar_range_ring`), so this number
+/// *is* the ring. Drawn at 230 km around 88.8 km of data it claimed 6.7 times
+/// the coverage the radar had, and on a velocity pane — where the ring is read
+/// as the edge of the Doppler coverage — that is the reading it destroys.
+///
+/// The two products are asserted against each other and not only against their
+/// own numbers, because a per-product reach is exactly what a single volume-wide
+/// extent cannot express: one volume, one sweep, two moments, two frames.
+///
+/// Run at all four sites' real coordinates rather than one. The extent in
+/// kilometres is a property of the moment and must not move between them; where
+/// the site *is* changes the bounds those kilometres become, and asserting both
+/// halves at four latitudes from 26 °N to 40 °N is what separates
+/// "the extent is the data's" from "the extent happens to be right at one site".
+#[test]
+fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
+    let cos_e = f64::from(L2_ELEVATION).to_radians().cos();
+    let doppler_ground_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
+
+    // The four measured sites, with the coordinates the site table holds.
+    for (name, lat, lon) in [
+        ("TOKC", 35.2764, -97.5100),
+        ("TDAL", 32.9264, -96.9683),
+        ("TPIT", 40.5011, -80.4867),
+        ("TATL", 33.6467, -84.2622),
+    ] {
+        let scan = tdwr_doppler_volume();
+
+        let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, lat, lon)
+            .expect("the Doppler moment is on the sweep");
+        let refl = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, lat, lon)
+            .expect("the reflectivity moment is on the same sweep");
+
+        // The defect, stated as the assertion that would have failed.
+        assert_ne!(
+            vel.max_range_km, types::BASE_EXTENT_KM,
+            "{name}: a velocity pane is still framed at 230 km",
+        );
+        assert!(
+            (vel.max_range_km - doppler_ground_km).abs() < 1e-9,
+            "{name}: 592 gates of 0.15 km cover {doppler_ground_km:.5} km of \
+             ground; the render declares {}",
+            vel.max_range_km,
+        );
+
+        // Per-product reach on one volume: the same sweep, two frames.
+        assert!(
+            (refl.max_range_km - tdwr_ground_reach_km()).abs() < 1e-9,
+            "{name}: the reflectivity beside it declares {}",
+            refl.max_range_km,
+        );
+        assert!(
+            refl.max_range_km > vel.max_range_km * 4.6,
+            "{name}: reflectivity reaches {:.2} km and velocity {:.2} km; a \
+             volume-wide extent cannot express both",
+            refl.max_range_km,
+            vel.max_range_km,
+        );
+
+        // What the ring the user sees is drawn at, at this site's latitude:
+        // the bounds the frontend hands back to `ImageBounds::from_radar_site`.
+        let bounds = types::ImageBounds::from_radar_site(lat, lon, vel.max_range_km);
+        let ring_km = (bounds.max_lat - lat) * types::KM_PER_DEGREE_LAT;
+        assert!(
+            (ring_km - doppler_ground_km).abs() < 1e-6,
+            "{name}: the ring stands {ring_km:.4} km out around \
+             {doppler_ground_km:.4} km of data",
+        );
+
+        // And the echo fills that frame, so the ring bounds the picture rather
+        // than floating outside it. Due east the projection's cos correction
+        // is exactly 1.
+        let side = types::IMAGE_SIZE;
+        let east = (0..side)
+            .rev()
+            .find(|&col| (0..side).any(|row| !vel.values[row * side + col].is_nan()))
+            .expect("the Doppler disc painted something");
+        assert!(
+            east >= side - 2,
+            "{name}: the velocity echo stops at column {east} of {side}",
+        );
+    }
+}
+
+/// A sweep whose leading radial carries no moment is still found, and is still
+/// framed by its own reach.
+///
+/// `find_sweep_owner` asked `radials.first()` whether the sweep carried the
+/// product, so one blank radial spoke for all 360: the Doppler cut vanished
+/// from the search and a velocity request fell through to whatever else
+/// matched. On this volume that is the reflectivity half of the same cut, so
+/// the pane came back framed at 417 km — the range ring 328 km out around
+/// 88.8 km of velocity, which is the reported defect reappearing through a
+/// different door.
+///
+/// It is the same first-radial assumption the wind-profile fits carried, found
+/// on the extent path while tracing where the frame's reach comes from.
+#[test]
+fn a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_own_reach() {
+    use nexrad_model::data::Sweep;
+
+    let full = tdwr_doppler_volume();
+    let sweep = &full.sweeps()[0];
+
+    // The same volume with the first radial's velocity stripped and every
+    // other radial untouched.
+    let radials: Vec<Radial> = sweep
+        .radials()
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            Radial::new(
+                r.collection_timestamp(),
+                r.azimuth_number(),
+                r.azimuth_angle_degrees(),
+                r.azimuth_spacing_degrees(),
+                r.radial_status(),
+                r.elevation_number(),
+                r.elevation_angle_degrees(),
+                r.reflectivity().cloned(),
+                if i == 0 { None } else { r.velocity().cloned() },
+                r.spectrum_width().cloned(),
+                r.differential_reflectivity().cloned(),
+                r.differential_phase().cloned(),
+                r.correlation_coefficient().cloned(),
+                r.clutter_filter_power().cloned(),
+            )
+        })
+        .collect();
+    assert!(radials[0].velocity().is_none(), "the fixture must be blank");
+    assert!(radials[1].velocity().is_some(), "and only in front");
+
+    let scan = Scan::new(full.coverage_pattern().clone(), vec![Sweep::new(1, radials)]);
+
+    let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
+        .expect("359 radials carry the moment and the sweep must still be found");
+
+    let cos_e = f64::from(L2_ELEVATION).to_radians().cos();
+    let doppler_ground_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
+    assert!(
+        (vel.max_range_km - doppler_ground_km).abs() < 1e-9,
+        "one blank leading radial reframed the pane at {} km instead of \
+         {doppler_ground_km:.5} km",
+        vel.max_range_km,
+    );
+}
+
 // ── Where a tilt's gates are drawn ───────────────────────────────────────
 //
 // A gate is measured out along the beam and belongs on the ground under it,
@@ -1259,18 +1519,19 @@ fn a_low_tilt_beacon_moves_less_than_a_pixel() {
     );
 }
 
-/// A sweep whose data stops inside the floor is drawn on the floor's frame,
-/// at the scale it has always been drawn at.
+/// A sweep whose data stops short is drawn at the range it reaches, and its
+/// echo fills the frame rather than sitting in the middle of one.
 ///
-/// This is the guarantee the floor exists for. `l2_sweep`'s moments are 600
-/// gates of 250 m — 150 km, the shape of a WSR-88D Doppler cut — so the
-/// picture must come out 230 km wide with the echo filling 150 km of it, and
-/// the radius is recovered from the pixels rather than assumed: the painted
-/// disc's outermost column is measured and converted back at
-/// `IMAGE_SIZE / 460`, the km-per-pixel this display had before there was an
-/// extent at all.
+/// The reported defect at fixture scale. `l2_sweep`'s moments are 600 gates
+/// of 250 m — 150 km — and the picture used to come out 230 km wide with
+/// the echo filling 150 km of it and the outer 80 km permanently blank. The
+/// range ring was drawn around the 230, which is the lie: it claimed 53%
+/// more coverage than the sweep had. The radius is recovered from the pixels
+/// rather than assumed — the painted disc's outermost column is measured and
+/// converted back at the render's own px/km — so this fails if the frame and
+/// the picture inside it ever stop agreeing.
 #[test]
-fn a_sweep_inside_the_floor_is_drawn_at_the_floor() {
+fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
     let scan = l2_sweep(&[200; 360], &azimuths, 1.0, false);
     let SweepRender {
@@ -1279,10 +1540,16 @@ fn a_sweep_inside_the_floor_is_drawn_at_the_floor() {
         ..
     } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
-    assert_eq!(
+    assert!(
+        (extent_km - l2_ground_reach_km()).abs() < 1e-9,
+        "600 gates of 0.25 km cover {:.5} km of ground; the render declares \
+         {extent_km}",
+        l2_ground_reach_km(),
+    );
+    assert_ne!(
         extent_km,
         types::BASE_EXTENT_KM,
-        "a 150 km sweep must be drawn on the 230 km frame it always was",
+        "a 150 km sweep must not be raised to a 230 km frame",
     );
 
     // Due east and due west of the site the projection's `cos φ₀ / cos φ`
@@ -1295,12 +1562,22 @@ fn a_sweep_inside_the_floor_is_drawn_at_the_floor() {
     let east = (0..side).rev().find(|&c| painted(c)).expect("echo east");
     let west = (0..side).find(|&c| painted(c)).expect("echo west");
 
-    let px_per_km = side as f64 / (2.0 * types::BASE_EXTENT_KM);
+    let px_per_km = side as f64 / (2.0 * extent_km);
     let radius_km = (east - west) as f64 / 2.0 / px_per_km;
     assert!(
         (radius_km - 150.0).abs() < 1.0,
         "600 gates of 0.25 km must fill 150 km of the frame; the disc measures \
          {radius_km:.2} km across columns {west}..{east} at {px_per_km:.4} px/km",
+    );
+
+    // And it fills the frame: the disc's extreme columns are the raster's
+    // own, give or take the half-pixel the edge column is quantized to. On
+    // the old frame the echo stopped at column 1381 of 2048 and the 667
+    // columns past it were unpaintable.
+    assert!(
+        west <= 1 && east >= side - 2,
+        "the echo runs columns {west}..{east} of {side}; a sweep drawn at its \
+         own reach must reach its own edge",
     );
 }
 
@@ -1313,8 +1590,54 @@ fn a_sweep_inside_the_floor_is_drawn_at_the_floor() {
 /// builds, and a hover divides a pointer position by them to pick a pixel
 /// back out — so a gate painted past the extent would be a return the display
 /// draws in one place and reads from another, with nothing anywhere to notice.
+///
+/// # Why the bound is not one pixel
+///
+/// It was, and the assertion was **vacuous at both fixtures**: the frame used
+/// to be 230 km around 150 km of echo and 417 km around a beacon at 400.2, so
+/// 80 km and 17 km of empty margin absorbed anything this could have caught.
+/// Now that a raster is projected at its sweep's own reach the echo runs to the
+/// frame's edge, the margin is gone, and the test measures something for the
+/// first time. What it measured immediately is a **pre-existing disagreement
+/// between two models of the ground**, not a gate drawn out of bounds:
+///
+/// * `render_gate` places a gate by an equirectangular construction — `dy` km
+///   north as a latitude offset, `dx` km east as a longitude offset taken at
+///   the destination's own latitude.
+/// * [`painted_ranges_km`] reads a pixel back with
+///   [`crate::beam::site_bearing_range_km`], a great-circle distance.
+///
+/// Those agree on the cardinals and diverge on the diagonals, always outward.
+/// Measured on filled discs at five latitudes, worst bearing near 305° every
+/// time:
+///
+/// | extent | 26 °N | 35.3 °N | 47 °N |
+/// |-------:|------:|--------:|------:|
+/// |  88.8 km (TDWR Doppler) | 0.06 km | 0.12 km | 0.20 km |
+/// | 150.0 km (this fixture) | 0.24 km | 0.40 km | 0.64 km |
+/// | 230.0 km               | 0.75 km | 1.11 km | 1.71 km |
+/// | 417.0 km (TDWR long range) | 2.71 km | 3.92 km | 6.01 km |
+///
+/// It grows with range and with latitude and reaches 1.44% of the extent at
+/// 47 °N over 417 km. **None of this is new** — the 230 km row is what every
+/// render on the old fixed frame already did, and the 417 km row is what the
+/// long-range path has done since it landed. The extent following the data
+/// only removed the margin that was hiding it.
+///
+/// So the bound here is the extent plus that measured disagreement, and the
+/// test still catches what it was written for: a gate loop running one gate
+/// long is 0.25 km at 150 km, well inside a bound that starts at 0.4 km, and
+/// anything structurally wrong is a multiple of the extent rather than a
+/// percent of it. The disagreement itself wants fixing in `render_gate`'s
+/// placement, which is a change to where every pixel of every render lands and
+/// belongs in its own campaign, not here.
 #[test]
 fn nothing_is_painted_outside_the_extent_a_render_declares() {
+    // 1.5% clears the worst row of the table above (1.44%, at a latitude no
+    // site in the continental fleet reaches over a 417 km cut) and is far
+    // under the smallest structural failure: half a frame is 50%.
+    const PROJECTION_DISAGREEMENT: f64 = 0.015;
+
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
     for (scan, why) in [
         (
@@ -1332,13 +1655,47 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
         assert!(!ranges.is_empty(), "{why} painted nothing");
 
         let furthest = ranges.iter().copied().fold(0.0f64, f64::max);
-        // One pixel of slop: a pixel's *centre* is what is measured and a gate
-        // reaching exactly the extent claims the pixel it starts in.
+        // One pixel of slop on top: a pixel's *centre* is what is measured and
+        // a gate reaching exactly the extent claims the pixel it starts in.
         let slop = 1.0 / (types::IMAGE_SIZE as f64 / (2.0 * extent_km));
+        let bound = extent_km * (1.0 + PROJECTION_DISAGREEMENT) + slop;
         assert!(
-            furthest <= extent_km + slop,
+            furthest <= bound,
             "{why}: a pixel {furthest:.2} km out on a raster declaring \
-             {extent_km:.2} km",
+             {extent_km:.2} km, past the {bound:.2} km bound",
+        );
+    }
+
+    // And on the cardinals, where the two models of the ground agree, the
+    // one-pixel bound still holds exactly. This is the half of the property
+    // that is about the gate loop rather than about the projection, and it is
+    // asserted at full strength.
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(
+        &l2_sweep(&[200; 360], &azimuths, 1.0, false),
+        L2_ELEVATION,
+        PRODUCT,
+        LAT,
+        LON,
+    )
+    .unwrap();
+    let side = types::IMAGE_SIZE;
+    let px_per_km = side as f64 / (2.0 * extent_km);
+    for (name, row, col) in [
+        ("east", side / 2, (0..side).rev().find(|&c| !values[side / 2 * side + c].is_nan()).unwrap()),
+        ("west", side / 2, (0..side).find(|&c| !values[side / 2 * side + c].is_nan()).unwrap()),
+        ("north", (0..side).find(|&r| !values[r * side + side / 2].is_nan()).unwrap(), side / 2),
+        ("south", (0..side).rev().find(|&r| !values[r * side + side / 2].is_nan()).unwrap(), side / 2),
+    ] {
+        let radius_px = ((row as f64 - side as f64 / 2.0).abs()).max((col as f64 - side as f64 / 2.0).abs());
+        let radius_km = radius_px / px_per_km;
+        assert!(
+            radius_km <= extent_km + 1.0 / px_per_km,
+            "the {name}most painted pixel stands {radius_km:.3} km out on a \
+             raster declaring {extent_km:.3} km",
         );
     }
 }
@@ -1352,7 +1709,11 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
 #[test]
 fn nrot_does_not_smear_past_its_sector() {
     let scan = nrot_sector(72, 0.5);
-    let SweepRender { values, .. } = render_radar_to_image(
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(
         &scan,
         L2_ELEVATION,
         types::RadarProduct::NormalizedRotation,
@@ -1364,13 +1725,18 @@ fn nrot_does_not_smear_past_its_sector() {
     let painted = values.iter().filter(|v| !v.is_nan()).count();
     assert!(painted > 1_000, "the NROT sector painted only {painted} px");
 
+    // On the grid's own frame. NROT is a derived product with its own reach,
+    // which is not `l2_sweep`'s, and a probe on the wrong frame would land in
+    // an arbitrary pixel and pass by being unpainted for the wrong reason.
     for range in [20.0, 30.0, 40.0, 50.0] {
-        assert_probes(
-            &values,
-            false,
-            &[(37.0, range), (-1.5, range)],
-            "the sector runs 0° to 35.5° and the display must end where it does",
-        );
+        for az in [37.0, -1.5] {
+            let v = values[probe_at(extent_km, types::IMAGE_SIZE, az, range)];
+            assert!(
+                v.is_nan(),
+                "({az}°, {range} km) is painted - the sector runs 0° to \
+                 35.5° and the display must end where it does",
+            );
+        }
     }
 }
 
@@ -2319,7 +2685,7 @@ fn wsr88d_doppler_sweep() -> Scan {
 ///
 /// **What keeps that affordable** is the last block: two pixels per kilometre
 /// is where a 250 m gate stops landing in a pixel at all
-/// (`a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_floor`), and the
+/// (`a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_base_extent`), and the
 /// base-size arm clears it at every extent this display can be handed — down to
 /// 2.1787 px/km at [`types::MAX_EXTENT_KM`], which is 8.9% of margin and the
 /// reason that cap cannot quietly rise.
@@ -2488,7 +2854,7 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
         render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
             .expect("the fixture renders");
 
-    let folded = probe(FOLDED_AZ as f64, 50.0);
+    let folded = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, FOLDED_AZ as f64, 50.0);
     assert_eq!(
         pixel_at(&image, folded),
         crate::palette::RANGE_FOLDED,
@@ -2505,7 +2871,7 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
         "and it is the canonical NaN, not the sentinel the cell held",
     );
 
-    let below = probe(BELOW_AZ as f64, 50.0);
+    let below = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, BELOW_AZ as f64, 50.0);
     assert_eq!(
         pixel_at(&image, below).3,
         0,
@@ -2515,7 +2881,7 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
 
     // The precondition: the rest of the sweep really did paint, or the two
     // assertions above are about a blank picture.
-    let neighbour = probe(80.0, 50.0);
+    let neighbour = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, 80.0, 50.0);
     assert!(
         !values[neighbour].is_nan() && pixel_at(&image, neighbour) != crate::palette::RANGE_FOLDED,
         "an ordinary radial paints its own colour",

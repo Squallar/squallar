@@ -106,17 +106,23 @@ fn each_cfg_arm_selects_the_image_size_named_for_it() {
     }
 }
 
-/// A 250 m gate has a pixel of its own at the floor, on both arms.
+/// A 250 m gate has a pixel of its own at [`BASE_EXTENT_KM`], on both arms.
 ///
 /// `MercatorProjection::px_per_km` is the whole rasterizer's scale factor, and
-/// it is now `IMAGE_SIZE / (2 · extent)` per render rather than a constant —
-/// so the property worth pinning is not the arithmetic (which the projection
-/// does in one line) but that the *coarser* arm still resolves a gate at the
-/// extent nearly every render uses. Below two pixels per kilometre a 250 m
-/// gate stops landing in a pixel of its own and the display starts dropping
-/// gates rather than drawing them small.
+/// it is `IMAGE_SIZE / (2 · extent)` per render rather than a constant — so the
+/// property worth pinning is not the arithmetic (which the projection does in
+/// one line) but that the *coarser* arm still resolves a gate at the extent the
+/// base texture is calibrated for. Below two pixels per kilometre a 250 m gate
+/// stops landing in a pixel of its own and the display starts dropping gates
+/// rather than drawing them small.
+///
+/// This is now a **worst case over every short render**, not one point on the
+/// curve. [`raster_side_px`] hands the base texture to every extent at or
+/// inside this one, so px/km rises as the extent falls: a TDWR Doppler sweep
+/// reaching 88.8 km gets 11.53 px/km out of the same 2048 pixels. The bound
+/// binds where it is loosest, which is exactly here.
 #[test]
-fn a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_floor() {
+fn a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_base_extent() {
     for size in [WASM_IMAGE_SIZE, NATIVE_IMAGE_SIZE] {
         let scale = size as f64 / (2.0 * BASE_EXTENT_KM);
         assert!(scale > 2.0, "{size} px gives {scale:.3} px/km");
@@ -126,33 +132,47 @@ fn a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_floor() {
 /// What each reach is drawn at, across the whole range of reaches this
 /// display can be handed.
 ///
-/// The floor's rows are the load-bearing ones, and what they hold is narrower
-/// than it looks: a derived 1° × 1 km grid and a fetched Level III product land
-/// inside 230 km, and so does every tilt from about 5° up, but a **Doppler cut
-/// does not** — 2.125 + 1192 × 0.25 is 300.125 km, measured identical on eight
-/// sites. The rows below carry the reaches a WSR-88D really produces rather
-/// than the round numbers they used to, because the floor's promise is only
-/// worth what its membership is.
+/// **Every row that states a reach is drawn at that reach.** The rows carry
+/// the reaches real radars really produce, decoded from real volumes rather
+/// than rounded, because the claim is about data and not about arithmetic: a
+/// WSR-88D's Doppler cut is 2.125 + 1192 × 0.25 and a TDWR's is 0 + 592 × 0.15,
+/// and the display has no business drawing either of them anywhere else.
+///
+/// The two rows that do *not* state a reach — 0.0 and a negative — are the
+/// fallback's whole membership. See
+/// `an_unstated_reach_is_the_only_way_to_reach_the_fallback_extent`.
 #[test]
-fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
+fn the_extent_is_the_reach_the_data_states_bounded_only_by_the_cap() {
     for (reach, extent, why) in [
-        (0.0, BASE_EXTENT_KM, "a product no radial carries"),
-        (10.0, BASE_EXTENT_KM, "a 40-gate Level III packet"),
-        (208.125, BASE_EXTENT_KM, "KCBW's 5.05° cut, 824 × 0.25 km"),
-        (229.9, BASE_EXTENT_KM, "just inside the floor"),
-        (230.0, BASE_EXTENT_KM, "exactly the floor"),
-        (230.1, 230.1, "just past it — the floor does not round up"),
+        (0.0, FALLBACK_EXTENT_KM, "a product no radial carries"),
+        (-1.0, FALLBACK_EXTENT_KM, "a negative reach"),
+        (10.0, 10.0, "a 40-gate Level III packet"),
         (
-            249.125,
-            249.125,
-            "KCBW's 3.96° cut, 988 × 0.25 km — the first tilt past the floor",
+            88.797,
+            88.797,
+            "every TDWR Doppler moment: 592 × 0.15 km, measured at TOKC, \
+             TDAL, TPIT and TATL",
         ),
+        (
+            208.125,
+            208.125,
+            "KCBW's 5.05° cut, 824 × 0.25 km — the first tilt that used to be \
+             raised to the floor",
+        ),
+        (229.9, 229.9, "just inside the old floor"),
+        (230.0, 230.0, "exactly where the old floor stood"),
+        (230.1, 230.1, "just past it"),
+        (249.125, 249.125, "KCBW's 3.96° cut, 988 × 0.25 km"),
         (
             300.125,
             300.125,
             "every WSR-88D Doppler cut: 2.125 + 1192 × 0.25 km",
         ),
-        (417.0, 417.0, "TDWR long-range reflectivity, 1390 × 0.3 km"),
+        (
+            416.985,
+            416.985,
+            "TDWR long-range reflectivity, 1390 × 0.3 km on a 0.48° cut",
+        ),
         (
             460.125,
             460.125,
@@ -161,7 +181,6 @@ fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
         (470.0, MAX_EXTENT_KM, "exactly the cap"),
         (12_000.0, MAX_EXTENT_KM, "a mis-framed gate count"),
         (f64::INFINITY, MAX_EXTENT_KM, "an infinite reach"),
-        (-1.0, BASE_EXTENT_KM, "a negative reach"),
     ] {
         assert_eq!(
             plan_view_extent_km(reach),
@@ -169,42 +188,85 @@ fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
             "{reach} km ({why}) must be drawn at {extent} km",
         );
     }
-    // A `NaN` reach is the one input `clamp` would pass straight through, and
+    // A `NaN` reach is the one input the bound would pass straight through, and
     // an unplaceable raster is a worse answer than a too-wide one.
-    assert_eq!(plan_view_extent_km(f64::NAN), BASE_EXTENT_KM);
+    assert_eq!(plan_view_extent_km(f64::NAN), FALLBACK_EXTENT_KM);
+}
+
+/// The fallback is unreachable from any sweep that says how far it reached.
+///
+/// [`FALLBACK_EXTENT_KM`] and [`BASE_EXTENT_KM`] hold the same number, so the
+/// table above cannot tell "the fallback fired" from "the data reached 230 km".
+/// This can: it sweeps the whole positive range finely and asserts the extent
+/// **is the reach itself** everywhere under the cap, which leaves no input
+/// except a `NaN` or a non-positive one that can produce the fallback at all.
+///
+/// The step is 0.05 km rather than something round so the walk cannot skip past
+/// [`BASE_EXTENT_KM`] and cannot land on it exactly, and both are checked
+/// separately underneath.
+#[test]
+fn an_unstated_reach_is_the_only_way_to_reach_the_fallback_extent() {
+    let mut reach = 0.05_f64;
+    while reach < MAX_EXTENT_KM {
+        assert_eq!(
+            plan_view_extent_km(reach),
+            reach,
+            "a sweep reaching {reach} km must be drawn at {reach} km",
+        );
+        reach += 0.05;
+    }
+
+    // The two values that used to be indistinguishable from a fallback.
+    assert_eq!(plan_view_extent_km(BASE_EXTENT_KM), BASE_EXTENT_KM);
+    assert_eq!(plan_view_extent_km(FALLBACK_EXTENT_KM), FALLBACK_EXTENT_KM);
+
+    // And the fallback's entire membership, stated as a closed set.
+    for unstated in [0.0, -0.0, -1.0, -MAX_EXTENT_KM, f64::NEG_INFINITY, f64::NAN] {
+        assert_eq!(
+            plan_view_extent_km(unstated),
+            FALLBACK_EXTENT_KM,
+            "{unstated} is not a reach and must answer the fallback",
+        );
+    }
 }
 
 /// How many pixels each extent gets, at each ceiling a caller in this
 /// workspace passes.
 ///
-/// The first block is the guarantee: at or under the floor the answer is
-/// [`IMAGE_SIZE`] whatever ceiling is offered, so a derived 1° × 1 km grid, a
-/// fetched Level III product and every tilt from about 5° up are drawn on
-/// exactly the raster they have always been drawn on. A Doppler cut is **not**
-/// in that block — it reaches 300.125 km — and its rows sit in the second and
-/// third instead, which is where the whole cost of this table lives. The last
-/// block is the mechanism the device gate and the loop policy both use: a
-/// ceiling is a ceiling, and one at or below the base size fixes the side
-/// rather than being ignored.
+/// The first block is the guarantee: at or under [`BASE_EXTENT_KM`] the answer
+/// is [`IMAGE_SIZE`] whatever ceiling is offered, so a derived 1° × 1 km grid,
+/// a fetched Level III product, a TDWR Doppler moment and every tilt from about
+/// 5° up are drawn on the base texture. What that texture now *buys* them has
+/// changed — the extent is their own reach rather than a 230 km frame, so the
+/// same pixels land on less ground and resolve it more finely — but the side
+/// itself has not moved, which is what keeps
+/// `rustdar_frontend::constants::raster_side_from_rgba_len`'s closed set of
+/// valid sides honest. A Doppler cut on a WSR-88D is **not** in that block —
+/// it reaches 300.125 km — and its rows sit in the second and third instead.
+/// The last block is the mechanism the device gate and the loop policy both
+/// use: a ceiling is a ceiling, and one at or below the base size fixes the
+/// side rather than being ignored.
 #[test]
 fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
     const LONG_RANGE: usize = 4096;
     for (extent, ceiling, side, why) in [
-        // At and below the floor: the base size, whatever is on offer.
+        // At and below the reference extent: the base size, whatever is on
+        // offer.
         (0.0, LONG_RANGE, IMAGE_SIZE, "a product no radial carries"),
+        (88.797, LONG_RANGE, IMAGE_SIZE, "a TDWR Doppler moment"),
         (208.125, LONG_RANGE, IMAGE_SIZE, "KCBW's 5.05° cut"),
         (
             BASE_EXTENT_KM,
             LONG_RANGE,
             IMAGE_SIZE,
-            "exactly the floor, with 4096 offered",
+            "exactly the reference extent, with 4096 offered",
         ),
         // Past it: the ceiling, because there is now ground to spend it on.
         (
             230.1,
             LONG_RANGE,
             LONG_RANGE,
-            "one tenth of a kilometre past the floor",
+            "one tenth of a kilometre past the reference extent",
         ),
         (300.125, LONG_RANGE, LONG_RANGE, "a WSR-88D Doppler cut"),
         (417.0, LONG_RANGE, LONG_RANGE, "a TDWR long-range cut"),
@@ -231,12 +293,12 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
             BASE_EXTENT_KM,
             IMAGE_SIZE,
             IMAGE_SIZE,
-            "the floor, ceiling == base",
+            "the reference extent, ceiling == base",
         ),
         // And a ceiling *below* it is honoured rather than clamped away —
         // the web's loop frames, which are deliberately leaner than its
         // static renders.
-        (BASE_EXTENT_KM, 1024, 1024, "a loop frame on the floor"),
+        (BASE_EXTENT_KM, 1024, 1024, "a loop frame at the reference extent"),
         (460.125, 1024, 1024, "a loop frame of a surveillance cut"),
     ] {
         assert_eq!(
@@ -245,6 +307,69 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
             "{extent} km under a {ceiling} px ceiling ({why})",
         );
     }
+}
+
+/// A sweep that stops short keeps the whole base texture and spends it on the
+/// ground it actually covers.
+///
+/// This is [`BASE_EXTENT_KM`]'s surviving role and the other half of the range
+/// ring fix. The extent following the data would be worth much less if the
+/// *side* followed it too — the picture would be the same coarse thing on a
+/// smaller canvas. It does not: [`raster_side_px`] hands [`IMAGE_SIZE`] to
+/// every extent at or inside the reference one, so the pixels a short sweep
+/// used to spend on empty corners are spent on the sweep instead.
+///
+/// The figures are the measured TDWR Doppler case. A 88.797 km reach inside a
+/// 230 km frame put `π · 88.797² / 460²` = 11.7% of the raster over data and
+/// left the other 88.3% permanently empty; at its own extent the disc is `π/4`
+/// of the raster. The ratio of those is the pixel budget the change recovers,
+/// and it is asserted rather than described.
+#[test]
+fn a_short_sweep_gets_the_base_texture_over_its_own_ground() {
+    const TDWR_DOPPLER_KM: f64 = 88.797;
+
+    let extent = plan_view_extent_km(TDWR_DOPPLER_KM);
+    assert_eq!(extent, TDWR_DOPPLER_KM);
+
+    // The side did not move, so the whole texture is still paid for.
+    let side = raster_side_px(extent, IMAGE_SIZE);
+    assert_eq!(side, IMAGE_SIZE);
+
+    // And the scale it buys, against what the same sweep used to get.
+    let now = side as f64 / (2.0 * extent);
+    let before = side as f64 / (2.0 * BASE_EXTENT_KM);
+    assert!(
+        (now / before - BASE_EXTENT_KM / TDWR_DOPPLER_KM).abs() < 1e-9,
+        "{now:.4} px/km against {before:.4}",
+    );
+    assert!(
+        now > 11.5 && now < 11.6,
+        "a TDWR Doppler sweep should resolve at ~11.53 px/km, got {now:.4}",
+    );
+
+    // A 0.15 km TDWR Doppler gate was sub-pixel at the old frame and is not
+    // now, which is the quality half of the same fact.
+    const TDWR_DOPPLER_GATE_KM: f64 = 0.15;
+    assert!(
+        TDWR_DOPPLER_GATE_KM * before < 1.0,
+        "the premise is that the gate used to be sub-pixel",
+    );
+    assert!(
+        TDWR_DOPPLER_GATE_KM * now > 1.5,
+        "the gate must now cover more than a pixel of its own",
+    );
+
+    // The share of the raster that can carry data, both ways round.
+    let covered = |ext: f64| std::f64::consts::PI * TDWR_DOPPLER_KM.powi(2) / (4.0 * ext * ext);
+    assert!(
+        covered(BASE_EXTENT_KM) < 0.12,
+        "under 12% of the old frame could ever be painted, not {:.3}",
+        covered(BASE_EXTENT_KM),
+    );
+    assert!(
+        (covered(extent) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+        "a disc at its own extent fills π/4 of its raster",
+    );
 }
 
 /// The bounds are the extent, in degrees, and nothing else — so a raster twice
@@ -286,9 +411,14 @@ fn bounds_scale_with_the_extent_and_reproduce_the_floor_exactly() {
     // own cosine.
     //
     // The divisor is the shared constant and not a literal, for two reasons
-    // that happen to agree. It is what the pre-extent code did — `230.0` was
-    // `MAX_RANGE_KM` and the degree was already `KM_PER_DEGREE_LAT`, so this
-    // is the arithmetic being reproduced rather than a re-derivation of it.
+    // that happen to agree. It is what the pre-extent code did — this constant
+    // was called `MAX_RANGE_KM` then, and the degree was already
+    // `KM_PER_DEGREE_LAT`, so this is the arithmetic being reproduced rather
+    // than a re-derivation of it. **`MAX_RANGE_KM` no longer exists under any
+    // name**: it became `BASE_EXTENT_KM` when the extent started following the
+    // sweep, and `BASE_EXTENT_KM` stopped being a floor under the extent when
+    // the range ring was found still drawing at 230 km around 88.8 km of TDWR
+    // Doppler data. Do not go looking for it.
     // And `rustdar-radar/tests/geodesy_one_definition.rs` scans every `.rs`
     // file in the workspace for a second spelling of the planet: a literal
     // `111.32` here would be exactly the fourth definition that guard exists
