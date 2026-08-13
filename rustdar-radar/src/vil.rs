@@ -352,25 +352,120 @@
 //!   depth, max dBZ, beam height or the share of VIL in the lowest tilt — and
 //!   the survey found it varying with none of them. A geometry or units error
 //!   would have bent against at least one.
-//! * **The per-site spread**, which was the one fact the constant theory could
-//!   not hold. The ratio ran 0.563 at KMLB to 1.012 at KMSX. A constant cannot
-//!   do that; a max-minus-mean gap must, and in exactly that order — deep
-//!   tropical convection has the sharpest sub-cell gradients and the widest
-//!   gap, a smooth mountain-west volume has almost none and needs almost no
-//!   correction.
+//! * ~~**The per-site spread.**~~ This bullet used to claim the mechanism
+//!   explained the 0.563–1.012 per-site range as well, deep convection worst.
+//!   **The re-measurement below refutes that**, and the claim is retracted
+//!   rather than edited: `Max` turns out to apply a near-uniform ×1.34 at
+//!   every site (1.19–1.42, CV 4.3%), so it moves the level without touching
+//!   the spread, which survives at the same relative width. The spread is a
+//!   second, still-unexplained defect.
 //! * **The A/B that kept favouring `Max`.** The bounded matrix split 15/21 for
 //!   `Max` with its only large wins at the two deepest-convection sites. That
 //!   was read as noise plus two outliers. It was the effect, concentrated
 //!   where the mechanism predicts it is largest.
 //!
-//! **What is still owed.** The nine-site band-by-band ratio table has **not**
-//! been re-measured with this fix. The live harness lives on branch
-//! `campaign-harness`, which has diverged substantially from main, and the
-//! original survey ran against live volumes on a sky that no longer exists, so
-//! the same 78,051 columns are not reproducible on demand. The figures above
-//! are the module's own prior measurements re-interpreted, not a fresh run.
-//! Re-running it is the next step, and until it has run this section states a
-//! mechanism with an arithmetic check behind it rather than a verified 1.00.
+//! # The re-measurement — 14 volumes, 2026-08-13
+//!
+//! The table above was owed a fresh run and has had one. **Fourteen volumes,
+//! fourteen sites, five VCPs, seven weather regimes, the original roster's two
+//! untouched holdouts plus four volumes that played no part in any tuning**
+//! (KAMA panhandle supercell, KHGX Gulf-coast convection, KLIX Hurricane Ida
+//! landfall, KMLB 2023). The oracle is the RPG's own product 134 decoded by
+//! **MetPy**, never by `nexrad-level3`, so no shared decode bug can cancel.
+//! Registration was established **values-blind** on the defined/undefined
+//! footprint — the metric that correctly refused the false +1 km offset a
+//! value-driven search sold on echo tops — and prefers `(0, 0)` at 13 of 14
+//! sites, KATX being indifferent by 0.03 points.
+//!
+//! Both arithmetic changes were measured **separately**, since FMH-11 licenses
+//! them independently: `Max`-with-cap and `LinearZMean`-uncapped were run as
+//! their own arms. The `Max`-uncapped arm was checked bit-for-bit against
+//! [`compute_vil`] at all fourteen sites.
+//!
+//! **The old measurement reproduces.** Pooling the original nine at their own
+//! mask (the RPG ≥ 0.3 kg/m²) gives **n = 78,647, median 0.750** against the
+//! recorded 78,051 and 0.751 — so the before arm is the code that was
+//! measured, and this scoring path is the one that measured it.
+//!
+//! ```text
+//!                       before    stat only   cap only   after        n
+//! pooled, original 9     0.750       0.981      0.752    0.987     78,647
+//! pooled, all 14         0.748       0.976      0.750    0.981    153,661
+//! RPG band  2-15         0.723       0.944      0.724    0.947     42,921
+//! RPG band 15-40         0.699       0.871      0.721    0.930      5,170
+//! RPG band   >40         0.627       0.719      0.748    0.955      1,155
+//! ```
+//!
+//! **The level is confirmed: 0.751 → 0.987, and it stays flat.** Median ratio
+//! after the fix, against every axis the deficit was flat in before (RPG ≥ 0.3,
+//! all 14 pooled):
+//!
+//! ```text
+//! range km        0-30  30-60  60-90 90-120 120-150 150-180 180-230
+//!                1.022  0.994  0.974  0.981   0.979   0.976   0.936
+//! column depth     0-2    2-4    4-6    6-8    8-12   12-16   16-24
+//!                1.137  1.032  0.926  0.952   0.996   0.975   0.953
+//! max dBZ        20-30  30-35  35-40  40-45   45-50   50-55   55-60
+//!                0.963  0.981  1.006  1.021   0.990   0.995   1.019
+//! VIL-wtd beam ht  0-1    1-2    2-3    3-4     4-5     5-7
+//!                1.115  1.014  0.993  0.994   0.964   0.950
+//! ```
+//!
+//! Max dBZ is the axis that matters most and it is the flattest: 0.963–1.021
+//! across four decades of Z, which is what a sub-cell texture correction
+//! should look like and what a mis-shaped `Z` mapping could not. Nothing
+//! overshoots: no axis bin and no band sits above 1.04.
+//!
+//! **The cap is not what moved it.** Alone it is worth **0.002** of pooled
+//! ratio (0.750 → 0.752) and nothing at all below 56 dBZ, exactly as predicted;
+//! its whole contribution is in the hail cores, where it carries the > 40
+//! kg/m² band from 0.627 to 0.748 on its own and 0.719 → 0.955 alongside `Max`.
+//! **The cell statistic is what moved it**, everywhere else. Two separable
+//! claims, both from FMH-11, and each is right about a different part of the
+//! field.
+//!
+//! **What the re-measurement refutes.** The per-site spread does **not**
+//! collapse, and the mechanism cannot make it:
+//!
+//! ```text
+//! site   KMLB  KMLB2  KABX  KDMX  KHGX  KAMA  KFTG  KLIX  KUDX  KATX  KOKX  KBUF  KMSX
+//! before 0.516 0.540 0.562 0.726 0.727 0.738 0.761 0.761 0.762 0.707 0.830 0.870 1.012
+//! after  0.707 0.765 0.790 0.972 0.933 0.944 0.997 1.008 0.995 0.973 0.991 1.175 1.365
+//! x      1.370 1.417 1.406 1.339 1.283 1.279 1.310 1.325 1.306 1.376 1.194 1.351 1.349
+//! ```
+//!
+//! The multiplier is **near-uniform — 1.194 to 1.417, median 1.339, CV 4.3%**,
+//! against the 1.310 the 2.05 dB gap predicted. That is a strong confirmation
+//! of the *magnitude* argument and a flat refutation of the *spread* argument:
+//! a uniform factor cannot close a spread, and it did not. Relative spread
+//! across sites goes 17.9% → 16.8%, i.e. unchanged; the correlation between a
+//! site's old deficit and its multiplier is only −0.48, far too weak to matter.
+//! KMLB needed ×1.94 and got ×1.37.
+//!
+//! So the field is no longer uniformly low — it is centred on 1.00 with the
+//! **same** per-site scatter, now visible on both sides: smooth regimes
+//! overshoot (KMSX 1.365, KBUF 1.175) and deep tropical convection still
+//! undershoots (KMLB 0.707, KMLB2 0.765, KABX 0.790). **A second defect,
+//! independent of the cell statistic, sets a per-volume scale.** It is the
+//! open question this module now carries, and it is not the one the fix
+//! closed. Note its sign is the *opposite* of the retracted bullet's story:
+//! the sites needing most help are the ones the mechanism helps least.
+//!
+//! **Presence is untouched, exactly.** Defined-bin disagreement is
+//! **bit-identical before and after at all fourteen sites** (Δ = 0.00; 2.4% at
+//! KFTG to 41.4% at the clear-air control). This is correct by construction and
+//! worth stating because it is easy to expect otherwise: the fix changed the
+//! cell statistic and the LWC cap, neither of which can define or undefine a
+//! bin. The participation gate was **already** `min_refl: None` before the fix
+//! — admitting sub-18 dBZ reflectivity was shipped earlier and is not part of
+//! this change. The DQA-editing presence gap is therefore exactly as it was.
+//!
+//! **One caveat at the very top.** Product 134 saturates at its 79.5 kg/m²
+//! encoding ceiling, so no ratio is meaningful there (203 bins over 14
+//! volumes). Uncapped Greene–Clark reads 81–97 kg/m² median in those columns
+//! and up to 171 at KFTG, on gates above 70 dBZ that are likely three-body
+//! scatter. Nothing in the comparison depends on them; flagged so the maxima
+//! in the table below are not read as a regression.
 //!
 //! # Why the source is unobtainable, stated once so nobody looks again
 //!
