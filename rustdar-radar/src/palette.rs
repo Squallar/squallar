@@ -246,12 +246,26 @@ static VELOCITY_INBOUND: ColorScale = &(
     true,
 );
 
-/// Spectrum width (m/s).
+/// Spectrum width (m/s) — the RPG's own `sw_8` table, transcribed.
+///
+/// ORPG Build 21.0r1.7 configures every spectrum-width product (2, 8, 9, 10,
+/// 185 in `src/code_util/tsk001/config/prod_config`) with
+/// `config/colors/sw_8.plt`, an eight-entry table. Level 0 is
+/// below-threshold black and level 7 is the fold, which this crate paints
+/// with [`RANGE_FOLDED`] instead; levels 1–6 are the six visible bands and
+/// are the six stops below. The thresholds are that product's exact 4-knot
+/// bins — 2.0578 m/s is 4.0000 kt — so each stop sits on its own band's
+/// lower edge.
+///
+/// `spectrum_width_is_the_rpgs_sw_8_table` pins all six against the file's
+/// own numbers. The 4.1156 m/s stop was `#00BBBB` until that test was
+/// written: a blue channel of `0xBB` where `sw_8` has `0x00`, which turned
+/// the source's green band cyan.
 static SPECTRUM_WIDTH: ColorScale = &(
     &[
         (0.0, (118, 118, 118)),
         (2.0578, (156, 156, 156)),
-        (4.1156, (0, 187, 187)),
+        (4.1156, (0, 187, 0)),
         (6.1733, (255, 0, 0)),
         (8.2311, (208, 112, 0)),
         (10.2889, (255, 255, 0)),
@@ -620,6 +634,83 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every visible spectrum-width band is the operational source's own.
+    ///
+    /// **Non-circular by construction:** the expected colours below are
+    /// decoded from the RPG's file, not read back out of [`SPECTRUM_WIDTH`].
+    /// ORPG Build 21.0r1.7,
+    /// `src/code_util/tsk001/config/colors/sw_8.plt`, is four lines — a count
+    /// `8`, then three planes of eight integers, all reds, then all greens,
+    /// then all blues:
+    ///
+    /// ```text
+    /// 8
+    /// 0 118 156 0 255 208 255 119     (line 2, red)
+    /// 0 118 156 187 0 112 255 0       (line 3, green)
+    /// 0 118 156 0 0 0 0 125           (line 4, blue)
+    /// ```
+    ///
+    /// so level *i* is `(red[i], green[i], blue[i])`. Every spectrum-width
+    /// row of `src/code_util/tsk001/config/prod_config` — products 2, 8, 9,
+    /// 10 and 185, unit `kt rms` — names that file. Level 0 is
+    /// below-threshold black and level 7 is the fold, which this crate paints
+    /// with [`RANGE_FOLDED`]; levels 1–6 are the six bands this palette
+    /// carries, at the product's 4-knot bin edges.
+    ///
+    /// This is the test the plan asked for: the 4.1156 m/s stop read
+    /// `(0, 187, 187)` against the source's `(0, 187, 0)` — a single stray
+    /// blue channel that turned the RPG's green band cyan, and the sort of
+    /// slip a test written against our own table cannot see.
+    #[test]
+    fn spectrum_width_is_the_rpgs_sw_8_table() {
+        const SW_8_RED: [u8; 8] = [0, 118, 156, 0, 255, 208, 255, 119];
+        const SW_8_GREEN: [u8; 8] = [0, 118, 156, 187, 0, 112, 255, 0];
+        const SW_8_BLUE: [u8; 8] = [0, 118, 156, 0, 0, 0, 0, 125];
+        /// 1 kt = 1852 m / 3600 s, exactly (BIPM).
+        const KT_TO_MS: f32 = 1852.0 / 3600.0;
+
+        let &(stops, _) = SPECTRUM_WIDTH;
+        assert_eq!(
+            stops.len(),
+            6,
+            "sw_8 has six visible levels (1..=6); level 0 is below threshold \
+             and level 7 is the fold",
+        );
+
+        for (i, &(threshold, colour)) in stops.iter().enumerate() {
+            let level = i + 1;
+            assert_eq!(
+                colour,
+                (SW_8_RED[level], SW_8_GREEN[level], SW_8_BLUE[level]),
+                "stop {i} is not sw_8.plt level {level}",
+            );
+
+            // The bins are the product's own 4 kt steps: level 1 opens at
+            // 0 kt, level 6 at 20 kt.
+            let expected = (level as f32 - 1.0) * 4.0 * KT_TO_MS;
+            assert!(
+                (threshold - expected).abs() < 1e-4,
+                "stop {i} sits at {threshold} m/s, not the {} kt bin edge \
+                 {expected} m/s",
+                (level - 1) * 4,
+            );
+
+            // And the wire from the public entry point, probed *inside* the
+            // band rather than on its edge so no float comparison decides it.
+            let probe = expected + 1.0;
+            assert_eq!(
+                get_color_for_value(RadarProduct::SpectrumWidth, probe),
+                (
+                    SW_8_RED[level],
+                    SW_8_GREEN[level],
+                    SW_8_BLUE[level],
+                    TRANSPARENCY
+                ),
+                "{probe} m/s does not paint sw_8.plt level {level}",
+            );
+        }
+    }
 
     /// ZDR's first stop is a NEG_INFINITY floor; interpolating from it would
     /// make `t = inf/inf = NaN` and every channel would cast to 0. Values
