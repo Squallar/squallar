@@ -304,8 +304,9 @@ pub struct RadarTextureMeta {
     /// Radar site longitude.
     pub lon: f64,
     /// The half-width this texture was projected at, km — the renderer's own
-    /// answer, which is the sweep's reach held between
-    /// [`rustdar_radar::types::BASE_EXTENT_KM`] and `MAX_EXTENT_KM`.
+    /// answer, which is the sweep's own reach, capped only by
+    /// [`rustdar_radar::types::MAX_EXTENT_KM`] and replaced by
+    /// `FALLBACK_EXTENT_KM` when the scan states no reach at all.
     ///
     /// It travels with the texture rather than beside it for the same reason
     /// `product` does: a pane-level copy could outlive the pixels it

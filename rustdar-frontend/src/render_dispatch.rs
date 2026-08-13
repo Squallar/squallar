@@ -467,7 +467,7 @@ pub struct RenderDispatcher {
     ///
     /// Bounded by `MAX_RENDER_CACHE_ENTRIES` on an LRU policy: it is a sharing
     /// cache for the panes on screen, not a history, and each entry costs
-    /// `side² × 8` bytes — 32 MiB at the 230 km floor and 128 MiB for a
+    /// `side² × 8` bytes — 32 MiB at the base side and 128 MiB for a
     /// long-range sweep on a device that can take one. See
     /// `constants::MAX_RENDER_CACHE_ENTRIES` for why the bound stays a count
     /// and what the resulting ceiling is.

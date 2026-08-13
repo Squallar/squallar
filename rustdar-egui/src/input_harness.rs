@@ -1551,8 +1551,12 @@ impl InputHarness {
         // The extent this fixture's image was "projected" at. One name for the
         // bounds and the metadata, because production derives both from the
         // render's single `max_range_km` and a fixture that let them drift
-        // would be modelling a state the host cannot reach. The floor is the
-        // right value: the products these tests place all stop inside it.
+        // would be modelling a state the host cannot reach.
+        //
+        // Any positive value would do — a real render's extent is its sweep's
+        // own reach, so there is no one number a fixture should prefer — and
+        // this stays `BASE_EXTENT_KM` because these tests' expected pixel
+        // positions were computed at it.
         let extent_km = BASE_EXTENT_KM;
 
         let (lat, lon) = {

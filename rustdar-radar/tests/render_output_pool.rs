@@ -78,19 +78,30 @@ const SCALE_FACTOR: f32 = 4.0;
 /// invented one.
 const SMALL_SIDE: usize = 1024;
 
-/// A full sweep of `bins` gates per radial.
+/// A full sweep of `bins` gates per radial, of which the first `painted_bins`
+/// carry a value and the rest are 0.
 ///
-/// `paint` false leaves every gate at 0, which the rasterizer skips (`<= 1`), so
-/// the packet is well-formed and renders successfully while claiming no pixel at
-/// all — the sharpest probe there is of what the texture arrived holding.
-fn packet(bins: usize, paint: bool) -> RadialPacket {
+/// **Every packet here declares the same `bins`, so every render is projected
+/// at the same extent onto the same raster.** `plan_view_extent_km` frames a
+/// raster at the range its data reaches, so packets declaring different bin
+/// counts come back on different frames with each echo filling its own, and a
+/// small render stops being a small *picture*. What has to differ is how much
+/// of the shared frame is claimed, which is `painted_bins`. See
+/// `rustdar-radar/tests/render_cell_pool.rs`, whose fixture this mirrors.
+///
+/// `painted_bins` of 0 leaves every gate at 0, which the rasterizer skips
+/// (`<= 1`), so the packet is well-formed and renders successfully while
+/// claiming no pixel at all — the sharpest probe there is of what the texture
+/// arrived holding.
+fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
+    assert!(painted_bins <= bins, "cannot paint more gates than there are");
     let radials = (0..RADIALS)
         .map(|i| RadialRun {
             start_angle: i as f32,
             angle_delta: 1.0,
             gate_values: (0..bins)
                 .map(|j| {
-                    if !paint {
+                    if j >= painted_bins {
                         return 0;
                     }
                     // A field that varies with both range and azimuth, so the
@@ -149,14 +160,22 @@ fn painted(values: &[u32]) -> usize {
 
 #[test]
 fn a_render_never_inherits_a_texel_from_the_one_before_it() {
-    // 120 bins is a 30 km disc; 920 is 230 km, which is the whole paintable
-    // image — the render maps that radius onto `IMAGE_SIZE / 2` pixels and no
-    // sweep can claim a pixel outside it. Reaching the edge is load-bearing
-    // rather than tidiness: a reset that covered only the middle of the buffer,
-    // or missed the last few rows, has to fail here.
-    let narrow = packet(120, true);
-    let wide = packet(920, true);
-    let blank = packet(920, false);
+    // Every packet declares 920 bins, so every render below is a 230 km frame
+    // on the same raster; what differs is how much of it is claimed. 120
+    // painted bins is a 30 km disc, and 920 is the whole paintable image — the
+    // render maps that radius onto `IMAGE_SIZE / 2` pixels and no sweep can
+    // claim a pixel outside it. Reaching the edge is load-bearing rather than
+    // tidiness: a reset that covered only the middle of the buffer, or missed
+    // the last few rows, has to fail here.
+    //
+    // The declared count is what holds the two on one frame. With 120 and 920
+    // *declared*, each render is framed at its own reach and fills 78.5% of its
+    // own raster — 3 236 167 against 3 293 133 pixels, 1.8% apart — and the
+    // annulus a leak has to show up in stops existing.
+    const BINS: usize = 920;
+    let narrow = packet(BINS, 120);
+    let wide = packet(BINS, BINS);
+    let blank = packet(BINS, 0);
 
     // The reference: the narrow render on buffers nothing has used, because this
     // is the process's first render and both slots are empty.

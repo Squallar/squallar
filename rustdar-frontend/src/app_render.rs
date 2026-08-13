@@ -629,8 +629,8 @@ impl super::App {
         // Store in overlay cache with radar metadata. The bounds come from the
         // render's own `max_range_km` — the half-width it projected at — so
         // the texture is placed on exactly the ground its gates were painted
-        // onto, whether that is the 230 km floor or a TDWR long-range cut's
-        // 417 km.
+        // onto, whether that is a TDWR Doppler cut's 88.8 km or the same
+        // radar's 417 km long-range reflectivity.
         let bounds = ImageBounds::from_radar_site(lat, lon, render.max_range_km);
         let geo_bounds = GeoBounds {
             min_lat: bounds.min_lat,

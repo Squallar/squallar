@@ -24,7 +24,7 @@ struct MercatorProjection {
     ///
     /// A field rather than a constant because both of the quantities behind it
     /// are per render now. Where the caller's ceiling is above the base size it
-    /// stays close to 4.45 px/km on purpose — 2048 over the 230 km floor, 4096
+    /// stays close to 4.45 px/km on purpose — 2048 over a 230 km sweep, 4096
     /// over a 460.11 km surveillance cut (4.45) or a TDWR's 417 km long-range
     /// reflectivity (4.91). Where the ceiling *is* the base size it is the
     /// extent alone that moves it, so the same sweeps read 2.23 and 2.46, and a

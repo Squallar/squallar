@@ -213,9 +213,12 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// — and a loop frame, which renders leaner on purpose, would crop the pane it
 /// is playing in rather than merely softening it.
 ///
-/// At the floor the answer is [`IMAGE_SIZE`], so a 230 km sweep is the same
-/// 4.4522 px/km it has always been. Past it, whether the extra ground is free
-/// depends entirely on the ceiling on offer.
+/// At [`BASE_EXTENT_KM`] the answer is [`IMAGE_SIZE`], so a 230 km sweep is the
+/// same 4.4522 px/km it has always been, and **inside** it the same texture is
+/// spent on less ground: a TDWR Doppler sweep reaching 88.8 km is 11.5319
+/// px/km, 2.59× finer than it was while every short sweep was drawn on a 230 km
+/// frame. Past it, whether the extra ground is free depends entirely on the
+/// ceiling on offer.
 ///
 /// # What each ceiling buys, measured
 ///
@@ -226,8 +229,8 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// | velocity, 1192 gates of 0.25 km| ±300.11 km|  6.8241 px/km|  3.4121 px/km|
 /// | reflectivity, 1832 gates       | ±460.11 km|  4.4512 px/km|  2.2256 px/km|
 ///
-/// Against the floor's 4.4522 px/km, a 4096 ceiling is where the second number
-/// pays for itself: the Doppler cut comes out **finer** than the floor and the
+/// Against [`BASE_EXTENT_KM`]'s 4.4522 px/km, a 4096 ceiling is where the second number
+/// pays for itself: the Doppler cut comes out **finer** than that and the
 /// surveillance cut lands 0.022% under it, which is the same picture over 1.7×
 /// and 4.0× the ground.
 ///
@@ -235,13 +238,13 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 ///
 /// A ceiling of [`IMAGE_SIZE`] cannot buy pixels, so the wider frame is paid
 /// for in scale: that Doppler cut is 3.4121 px/km, **23.4% coarser** than the
-/// floor, and a 0.25 km gate goes from 1.11 pixels of its own to 0.85 of one.
+/// reference, and a 0.25 km gate goes from 1.11 pixels of its own to 0.85 of one.
 /// Two callers are in that case — a browser, where 2048 is the largest texture
 /// WebGL2 guarantees, and a GLES 3.0 handheld reporting the spec floor.
 ///
 /// It is a real cost and it is taken deliberately, because the alternative is
-/// worse than it looks. Holding those devices at the floor's scale means
-/// holding them at the floor's *extent*, and that trades a picture that is
+/// worse than it looks. Holding those devices at the reference scale means
+/// holding them at the reference *extent*, and that trades a picture that is
 /// uniformly softer for one that is missing its outer third — on a Doppler cut,
 /// everything from 230 km to 300 km, which over 192 sweeps of the eight sites
 /// above is 448 690 gates carrying a velocity, 3.4% of all the velocity those
@@ -268,15 +271,15 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// decide this here. The caller passes what it can take, and gets back what it
 /// gets.
 ///
-/// # Why it bounds the floor too, and not only the long range
+/// # Why it bounds the short range too, and not only the long
 ///
 /// A ceiling *under* [`IMAGE_SIZE`] is a real request, not a mistake to clamp
 /// away: the browser renders its loop frames at 1024 on purpose — the eight it
 /// textures at once would be 128 MiB at 2048², against a 48 MiB per-pane loop
 /// budget — while its static renders take the full 2048. So `min` rather than
 /// "base unless the extent is long": a caller that says 1024 means 1024, and a
-/// caller that says 4096 gets the floor's own size until there is ground to
-/// spend it on.
+/// caller that says 4096 gets the base size until there is ground to spend the
+/// rest on.
 ///
 /// Passing exactly [`IMAGE_SIZE`] therefore fixes the raster's side for every
 /// extent, which is the device gate's whole mechanism: a machine that cannot
@@ -284,7 +287,7 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// picture rather than a texture creation that fails and leaves a blank pane.
 /// It is the *side* that stops moving, not the picture — the extent is the
 /// data's either way, so what that caller receives is the section above's
-/// coarser frame over the same ground, not the floor's frame.
+/// coarser frame over the same ground, not a different frame.
 pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize) -> usize {
     if extent_km > BASE_EXTENT_KM {
         side_ceiling_px

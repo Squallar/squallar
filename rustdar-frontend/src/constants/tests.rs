@@ -13,7 +13,7 @@ use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 struct Arm {
     name: &'static str,
     /// `rustdar_radar::types::IMAGE_SIZE` for this class — the side a static
-    /// plan-view render takes at the 230 km floor. It is a *two*-arm cascade —
+    /// plan-view render takes at the base side. It is a *two*-arm cascade —
     /// mobile is native — so this is where the two cascade shapes in this
     /// workspace are reconciled.
     image_size: usize,

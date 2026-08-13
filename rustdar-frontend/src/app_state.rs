@@ -122,7 +122,7 @@ pub struct AppState {
     pub volume_support: volume::VolumeSupport,
     /// Whether this device's 2D textures reach
     /// [`crate::constants::LONG_RANGE_IMAGE_SIZE`], and so whether a sweep
-    /// reaching past the 230 km floor may be rendered at the long-range raster
+    /// reaching past 230 km may be rendered at the long-range raster
     /// size.
     ///
     /// Read off the device once, here, rather than probed per render: it is a

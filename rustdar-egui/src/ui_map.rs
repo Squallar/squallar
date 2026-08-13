@@ -3582,7 +3582,7 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -
 ///
 /// The grid is square by construction — it is one `f32` per pixel of a square
 /// raster — but its side is no longer a constant: a sweep reaching past the
-/// 230 km floor is rendered wider, and this crate has no way to know which
+/// 230 km is rendered wider, and this crate has no way to know which
 /// ceiling the frontend passed for it. Reading the side back off the length is
 /// therefore the only honest answer, and an exact integer square root is what
 /// makes it safe: a length that is not a perfect square cannot produce an index

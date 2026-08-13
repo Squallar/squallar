@@ -93,8 +93,8 @@
 //! constant, and that changes nothing here: the disagreement was a *ratio* of
 //! two spheres, so closing it closes it at every extent a sweep can ask for.
 //! It would have been scale-free even unclosed — the raster's side follows its
-//! extent ([`crate::types::raster_side_px`]), so 4.4522 px/km at the 230 km
-//! floor against 4.4512 at a surveillance cut's ±460.11 km on 4096, and a fixed
+//! extent ([`crate::types::raster_side_px`]), so 4.4522 px/km on a 230 km
+//! sweep against 4.4512 at a surveillance cut's ±460.11 km on 4096, and a fixed
 //! fraction of a kilometre costs the same pixel on either frame: the seam was
 //! 1.15 px on both. (That reach is 2.125 + 1832 × 0.25 = 460.125 km of slant
 //! range; the 458 km this paragraph used to quote omitted the first gate and is
@@ -105,7 +105,9 @@
 //! A plan view's frame is now sized from its own sweep
 //! ([`crate::types::plan_view_extent_km`]), so it no longer throws returns
 //! away: a surveillance cut's 460 km and a TDWR's 417 km are drawn, where a
-//! fixed ±230 km frame had nowhere to put them.
+//! fixed ±230 km frame had nowhere to put them — and it no longer pads them
+//! either, so a TDWR's 88.8 km Doppler cut is a frame 88.8 km wide rather than
+//! a 230 km one with the outer 61% of its area permanently blank.
 //!
 //! A section has no such option, because its extent is not the data's — it is
 //! the line the user drew, and that line routinely outruns the volume. So this

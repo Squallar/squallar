@@ -15,6 +15,10 @@ pub const RENDER_HEIGHT: u32 = 1080;
 /// The side, in pixels, a **static** plan-view render is allowed to grow to
 /// when its sweep reaches past [`rustdar_radar::types::BASE_EXTENT_KM`].
 ///
+/// Only *past* it. A sweep reaching less than that keeps the base side and
+/// spends it on the ground the sweep actually covers, so a TDWR Doppler pane
+/// is 2048 pixels over 88.8 km rather than over 230.
+///
 /// # Why the size class lives here and not in the rasterizer
 ///
 /// `rustdar_radar` cannot pick it. The `mobile` cfg that names the device class
@@ -970,7 +974,7 @@ pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
 ///
 /// | render                        | side | entry   |
 /// |-------------------------------|-----:|--------:|
-/// | anything inside the 230 km floor | 2048 |  32 MiB |
+/// | anything at or inside 230 km     | 2048 |  32 MiB |
 /// | a long-range sweep, gate passed  | 4096 | 128 MiB |
 ///
 /// Until this bound existed the only thing that ever removed an entry was

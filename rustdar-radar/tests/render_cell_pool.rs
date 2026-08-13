@@ -12,8 +12,8 @@
 //! only that the output has the right size.
 //!
 //! The length half became a live question when a raster's side stopped being
-//! one constant: `raster_side_px` answers 2048 at the floor, a device's
-//! ceiling past it, and 1024 for a browser loop frame, so the buffer in the
+//! one constant: `raster_side_px` answers 2048 at and inside the base extent, a
+//! device's ceiling past it, and 1024 for a browser loop frame, so the buffer in the
 //! slot is routinely the wrong length for the render that takes it. `checkout`
 //! resizes it to fit, which makes both directions failable — a buffer
 //! truncated to a smaller raster, and one grown back for a larger one, where
@@ -63,20 +63,36 @@ const RADIALS: usize = 360;
 /// packet's radius in km is `bins / 4`.
 const SCALE_FACTOR: f32 = 4.0;
 
-/// A full sweep of `bins` gates per radial.
+/// A full sweep of `bins` gates per radial, of which the first `painted_bins`
+/// carry a value and the rest are 0.
 ///
-/// `paint` false leaves every gate at 0, which the rasterizer skips (`<= 1`),
-/// so the packet is well-formed and renders successfully while claiming no
-/// pixel at all — the sharpest probe there is of what the buffer arrived
-/// holding.
-fn packet(bins: usize, paint: bool) -> RadialPacket {
+/// The split is the whole fixture. **Every packet here declares the same
+/// `bins`, so every render is projected at the same extent onto the same
+/// raster** — `plan_view_extent_km` frames a raster at the range its data
+/// reaches, so packets declaring different bin counts would come back on
+/// different frames, each echo filling its own, and a small render would no
+/// longer be a small *picture*. What has to differ is how much of the shared
+/// frame is claimed, which is `painted_bins`.
+///
+/// It used to differ by `bins` and get the same effect from a 230 km floor
+/// under every extent: a 120-bin packet was a 30 km disc adrift on a 230 km
+/// frame. That is exactly the substitution the floor's removal was for, and
+/// this fixture now states the invariant it was relying on instead of
+/// inheriting it.
+///
+/// `painted_bins` of 0 leaves every gate at 0, which the rasterizer skips
+/// (`<= 1`), so the packet is well-formed and renders successfully while
+/// claiming no pixel at all — the sharpest probe there is of what the buffer
+/// arrived holding.
+fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
+    assert!(painted_bins <= bins, "cannot paint more gates than there are");
     let radials = (0..RADIALS)
         .map(|i| RadialRun {
             start_angle: i as f32,
             angle_delta: 1.0,
             gate_values: (0..bins)
                 .map(|j| {
-                    if !paint {
+                    if j >= painted_bins {
                         return 0;
                     }
                     // A field that varies with both range and azimuth, so the
@@ -135,19 +151,29 @@ fn painted(values: &[u32]) -> usize {
 
 #[test]
 fn a_render_never_inherits_a_pixel_from_the_one_before_it() {
-    // 120 bins is a 30 km disc; 920 is 230 km, which is `MAX_RANGE_KM` and so
-    // the **whole** paintable image — the render maps that radius onto
-    // `IMAGE_SIZE / 2` pixels, and no sweep can claim a pixel outside it.
+    // Every packet declares 920 bins, so every render below is a 230 km frame
+    // on the same raster; what differs is how much of it is claimed. 120
+    // painted bins is a 30 km disc, and 920 is the **whole** paintable image —
+    // the render maps that radius onto `IMAGE_SIZE / 2` pixels, and no sweep
+    // can claim a pixel outside it.
     //
-    // Reaching the edge is load-bearing, not tidiness. At 600 bins the wide
-    // render stopped at 150 km — 668 px of a 1024 px radius — and the 157 to
-    // 230 km annulus was never painted by anything here, so a reset that
-    // covered only the middle of the buffer, or that missed the last few rows,
-    // passed this test while leaking on any real full-range sweep. Both of
-    // those were live mutants until this number changed.
-    let narrow = packet(120, true);
-    let wide = packet(920, true);
-    let blank = packet(920, false);
+    // Reaching the edge is load-bearing, not tidiness. When the wide render
+    // stopped at 150 km, the 157 to 230 km annulus was never painted by
+    // anything here, so a reset that covered only the middle of the buffer, or
+    // that missed the last few rows, passed this test while leaking on any
+    // real full-range sweep. Both of those were live mutants until the wide
+    // packet reached the edge.
+    //
+    // The declared count is what holds the two on one frame, and it is not
+    // decoration: with 120 and 920 *declared*, the narrow packet is now framed
+    // at its own 30 km and fills 78.5% of its raster exactly as the wide one
+    // fills 78.5% of its own. The two renders came out 3 236 167 and 3 293 133
+    // pixels — 1.8% apart, on near-identical footprints — and the annulus a
+    // leak has to show up in stopped existing.
+    const BINS: usize = 920;
+    let narrow = packet(BINS, 120);
+    let wide = packet(BINS, BINS);
+    let blank = packet(BINS, 0);
 
     // The reference: the narrow render on a buffer nothing has used, because
     // this is the process's first render and the pool is empty.

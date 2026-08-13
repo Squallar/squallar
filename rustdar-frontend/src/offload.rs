@@ -466,7 +466,7 @@ impl JobRequest {
     /// Both answers are "render this at the base size", so they are one flag.
     /// That is not the same as "the picture the display always made": the
     /// extent is the sweep's either way, so a base-size ceiling over a sweep
-    /// reaching past the 230 km floor buys the ground and pays in scale —
+    /// reaching past 230 km buys the ground and pays in scale —
     /// `rustdar_radar::types::raster_side_px` costs that out. The gate is
     /// applied at the dispatch site rather than here because this type travels
     /// to a worker that has no device to ask.

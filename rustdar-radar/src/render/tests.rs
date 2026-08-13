@@ -362,7 +362,7 @@ fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) 
 ///
 /// The extent and the side are both arguments because both are now properties
 /// of the render being probed rather than of the display: a fixture reaching
-/// 150 km is drawn on the 230 km floor at [`types::IMAGE_SIZE`], a TDWR-shaped
+/// 150 km is drawn on a 150 km frame at [`types::IMAGE_SIZE`], a TDWR-shaped
 /// one on a 417 km frame, and the same TDWR through a `_sized` entry on a
 /// 4096-pixel one. A probe that assumed any of those would be asking about the
 /// wrong picture. Callers pass what the render they are probing handed back.
@@ -936,7 +936,7 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     );
 
     // The beacon, at four bearings, on the frame this render declared. Not on
-    // the floor's frame: a probe there would be asking about a picture 1.81×
+    // a 230 km frame: a probe there would be asking about a picture 1.81×
     // smaller, and 400 km east of the site is not on it at all.
     for az in [0.0, 90.0, 180.0, 270.0] {
         let at = probe_at(extent_km, types::IMAGE_SIZE, az, BEACON_KM);
@@ -1465,11 +1465,12 @@ fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
 /// The reach a render reports is a **ground** reach, so a frame is sized by
 /// the ground it covers rather than by the beam's length.
 ///
-/// TPIT's long-range surveillance cut is the one case where this is visible
-/// in the extent rather than absorbed by the 230 km floor: 1390 gates of
+/// TPIT's long-range surveillance cut is where this is largest: 1390 gates of
 /// 300 m reach 417 km, and at the 0.2637° that cut actually flies they cover
 /// 416.996 km of ground. Small on purpose — the point is that the number is
-/// the ground one, not that it is far off.
+/// the ground one, not that it is far off. It is visible at every extent now
+/// rather than only past 230 km, because no floor absorbs a short sweep's
+/// correction any more: the same cut's 88.8 km Doppler moment reports 88.797.
 #[test]
 fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
     const ELEV: f32 = 0.2637;
@@ -1494,8 +1495,8 @@ fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
 /// A 0.5° beacon at 200 km moves less than a pixel — the near-invariance
 /// that makes this landable on the WSR-88D fleet.
 ///
-/// `1 − cos 0.5°` is 3.8e-5, so 200 km of range moves 7.6 m. At the floor's
-/// 4.45 px/km that is 0.034 of a pixel: every low tilt, which is nearly every
+/// `1 − cos 0.5°` is 3.8e-5, so 200 km of range moves 7.6 m. At the 4.45 px/km
+/// a 230 km frame gives that is 0.034 of a pixel: every low tilt, which is nearly every
 /// tilt anyone looks at, is where it has always been. The shift only becomes
 /// visible where the geometry makes it real — 0.9 px at 2.4°, 18 px at 19.5°,
 /// and half the radius at a TDWR's 60°.
@@ -1920,15 +1921,14 @@ fn message_with_lying_scale_factor(product_code: i16, bins: usize) -> Level3Mess
 /// twin-comparison path does, or the on-screen KDP field draws 4× too
 /// far out. A product without an override keeps the packet's own value.
 ///
-/// Both arms are given enough gates to reach past
-/// [`types::BASE_EXTENT_KM`], because what a render reports is the extent it
-/// was projected at and below the floor that is 230 km whatever the spacing —
-/// which is exactly the observation this test would lose. 1200 gates at the
-/// ICD's 0.25 km is 300 km; believing the packet instead would ask for
-/// 1201 km and be held at the cap. 460 gates at the packet's own ~1.001 km is
-/// 460.5 km; a spurious override would collapse it to 115 km and be held at
-/// the floor. So each arm's wrong answer is a different number from its right
-/// one on both sides.
+/// What a render reports is the extent it was projected at, which is now the
+/// reach itself, so each arm's right and wrong answers are four distinct
+/// numbers. 1200 gates at the ICD's 0.25 km is 300 km; believing the packet
+/// instead would ask for 1201 km and be held at [`types::MAX_EXTENT_KM`]. 460
+/// gates at the packet's own ~1.001 km is 460.5 km; a spurious override would
+/// collapse it to 115 km. The arms used to need enough gates to clear a 230 km
+/// floor before any of that was visible; they no longer do, and the gate counts
+/// are kept as they are because they are the real products' own.
 #[test]
 fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
     const ICD_BINS: usize = 1200;
