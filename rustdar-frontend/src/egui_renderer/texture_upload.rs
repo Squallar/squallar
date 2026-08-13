@@ -71,24 +71,37 @@
 //! feature to avoid fixing the upload, and it does not even work — it is the
 //! fallback only if the two above had failed.
 //!
-//! # A band is visible before its successors land
+//! # A band is visible before its successors land, and who does something about it
 //!
-//! A raster appears top-down over the frames its bands take: 7 frames (117 ms)
-//! for 7362² on a ring device, 2 for 2048² without one. It is not held back
-//! until complete, and that is a decision rather than an oversight.
+//! A raster fills top-down over the frames its bands take: 7 frames (117 ms) for
+//! 7362² on a ring device, 2 for 2048² without one. **This module does not hold
+//! it back, and cannot.** egui mints a fresh `TextureId` per
+//! `Context::load_texture`, so "hold" at this layer means the id has no bind
+//! group yet, `egui_wgpu::Renderer::render` skips the mesh with a warning, and
+//! the pane draws no radar at all for the same 117 ms — strictly worse than the
+//! strips. Worse still, the id is opaque here: nothing at this layer knows which
+//! id is the *predecessor* of which, so it could not even choose what to hold
+//! instead.
 //!
-//! Holding is not free and it is not even better. egui mints a fresh
-//! `TextureId` per `Context::load_texture`, and the pane's handle is swapped the
-//! moment `apply_render_to_pane` runs — so "hold" at this layer means the id has
-//! no bind group yet, `egui_wgpu::Renderer::render` skips the mesh with a
-//! warning, and the pane draws **no radar at all** for the same 117 ms. A
-//! picture arriving in seven strips beats no picture for seven frames, and both
-//! beat the whole UI stopping for 59 ms, which is what shipped.
+//! The app knows both. A pane keeps the previous raster on screen — with the
+//! bounds and the metadata that describe it — and swaps the whole set when the
+//! next one is whole; see `rustdar_egui::overlay_cache::OverlayTextureCache`.
+//! What this module owes that is one honest answer to one question, which is
+//! [`TextureUploads::is_delivered`]: **has every texel egui handed over for this
+//! id reached the GPU?**
 //!
-//! Nothing samples a raster except the paint. Hover reads the value grid on the
-//! CPU, and the overlay compositor keys off `OverlayTextureData`'s own bounds —
-//! so a partially-filled texture is a partially-drawn picture and never a wrong
-//! answer.
+//! It is a query rather than an event, and level-triggered rather than
+//! edge-triggered, for the reason `OverlayTextureCache`'s own doc gives about
+//! staleness: a caller that misses one frame's notification is a caller wedged
+//! forever, where a caller that misses one frame's *question* asks it again on
+//! the next.
+//!
+//! Nothing samples a raster except the paint — verified against the hover path
+//! as of 73fa4619, which now reads the gate under the pointer out of the volume
+//! and never touches the texture or even the rect it was drawn into. So a
+//! partially-filled texture is a partially-drawn picture and never a wrong
+//! answer; what the app's hold buys is that a *whole* picture is never captioned
+//! with another picture's product, tilt, fold limit or ground.
 //!
 //! # The frame that finishes an upload has to be asked for
 //!
@@ -100,6 +113,7 @@
 //! may assume.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -185,6 +199,20 @@ pub struct TextureUploads {
     /// Bands still to move, oldest first, so a raster that arrived earlier
     /// completes before one that arrived later starts.
     pending: VecDeque<Band>,
+    /// Ids every texel of whose latest delta has reached the GPU. See
+    /// [`Self::is_delivered`].
+    ///
+    /// **Every** id this module is shown, not only the banded ones: a delta that
+    /// went straight to `Renderer::update_texture` is delivered by the time this
+    /// frame's queue is submitted, and an answer of "no, because I never banded
+    /// it" would be a hold that never ends. The set is what makes the query
+    /// total.
+    ///
+    /// It does not grow without bound. [`Self::free`] takes an id out as egui
+    /// retires it, and egui retires an id when the last `TextureHandle` for it
+    /// drops — so this holds one `u64`-sized key per *live* texture, which is
+    /// the font atlas, the map tiles' LRU and one raster per pane.
+    delivered: HashSet<egui::TextureId>,
 }
 
 /// What is left of one texture's upload.
@@ -227,6 +255,7 @@ impl TextureUploads {
             capable,
             owned: HashMap::new(),
             pending: VecDeque::new(),
+            delivered: HashSet::new(),
         }
     }
 
@@ -238,6 +267,7 @@ impl TextureUploads {
             capable: false,
             owned: HashMap::new(),
             pending: VecDeque::new(),
+            delivered: HashSet::new(),
         }
     }
 
@@ -297,6 +327,10 @@ impl TextureUploads {
         // is why nothing about glyph UVs or atlas growth changes.
         if !mine && image.as_raw().len() <= UPLOAD_BAND_BYTES {
             renderer.update_texture(device, queue, id, delta);
+            // Whole, on this frame's queue, before anything can draw it — so it
+            // is delivered by the same test the banded path is held to. See
+            // [`Self::delivered`] for why the cheap path has to answer at all.
+            self.delivered.insert(id);
             return;
         }
 
@@ -333,6 +367,13 @@ impl TextureUploads {
             };
             self.owned.insert(id, existing);
         }
+
+        // Filed as bands, so texels egui has handed over are not on the GPU yet.
+        // Withdrawn here rather than only on the whole-image arm above, because
+        // a *partial* into an adopted texture unfinishes it just as thoroughly:
+        // the id was delivered a moment ago and the rows this delta names are
+        // not there.
+        self.delivered.remove(&id);
 
         let origin = delta.pos.unwrap_or([0, 0]);
         self.pending.push_back(Band {
@@ -458,7 +499,14 @@ impl TextureUploads {
             let Some(plan) =
                 BandPlan::of(band.image.width(), band.image.height() as u32, band.done)
             else {
-                // A finished or degenerate band, dropped rather than requeued.
+                // A finished or degenerate band, dropped rather than requeued —
+                // and *delivered*, because there is nothing left to move. A
+                // zero-width image is not a size `plan_view_image` will make,
+                // but "no rows will ever land" answering "not yet" would be a
+                // pane holding its previous picture for the rest of the
+                // session, and liveness is not something to spend on a shape
+                // that cannot occur.
+                self.delivered.insert(band.id);
                 continue;
             };
 
@@ -476,7 +524,13 @@ impl TextureUploads {
                 band.done += plan.rows;
                 band.declined = 0;
                 let done = band.done >= plan.height;
-                if !done {
+                if done {
+                    // The last band of this delta. The copy is on the queue this
+                    // frame submits, and the frame that reads the answer is a
+                    // later one, so there is no window in which this says "whole"
+                    // while the picture is not.
+                    self.delivered.insert(band.id);
+                } else {
                     self.pending.push_front(band);
                 }
                 if allocated {
@@ -573,8 +627,29 @@ impl TextureUploads {
     pub fn free(&mut self, ids: &[egui::TextureId]) {
         for id in ids {
             self.owned.remove(id);
+            // What keeps [`Self::delivered`] the size of the live texture set
+            // rather than the size of the session.
+            self.delivered.remove(id);
         }
         self.pending.retain(|band| !ids.contains(&band.id));
+    }
+
+    /// Whether every texel egui has handed over for `id` has reached the GPU.
+    ///
+    /// The question a pane asks before it swaps the picture it is showing for
+    /// the one behind this id; see the module note. `false` for an id this
+    /// module has never been shown, which is the honest answer while a
+    /// `load_texture` from *this* frame is still sitting in `TextureManager`
+    /// waiting for `end_pass` to hand its delta over.
+    ///
+    /// **An id from a renderer that no longer exists answers `false` forever**,
+    /// because a rebuilt `EguiRenderer` starts with an empty set. That is the
+    /// right answer to the question asked — those texels are on no GPU — and it
+    /// is why `App::restore_cached_render` lets go of every held raster before
+    /// it re-uploads: a hold whose id died with its context is the one hold
+    /// nothing else would ever end.
+    pub fn is_delivered(&self, id: egui::TextureId) -> bool {
+        self.delivered.contains(&id)
     }
 
     /// Bands not yet moved, for a test that wants to say how far along an upload
@@ -582,6 +657,18 @@ impl TextureUploads {
     #[cfg(test)]
     pub fn pending_bands(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Put `id` in the delivered set without a device to deliver it with.
+    ///
+    /// Only [`Self::free`]'s side of the bookkeeping can be reached without a
+    /// GPU — filing and draining both take a `wgpu::Device` — and that side is
+    /// the one that keeps the set the size of the live texture list rather than
+    /// the size of the session. The delivering half is checked for real in
+    /// `tests/raster_upload_gpu.rs`.
+    #[cfg(test)]
+    pub fn mark_delivered_for_test(&mut self, id: egui::TextureId) {
+        self.delivered.insert(id);
     }
 
     /// The texture this module allocated for `id`, if it owns one.

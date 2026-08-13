@@ -228,3 +228,42 @@ fn the_widest_raster_takes_fourteen_frames_on_a_ring_and_twenty_six_without() {
         );
     }
 }
+
+/// An id this module has never been shown has not been delivered.
+///
+/// The default that two of the three ways a hold ends depend on. A pane stages
+/// its hold on the frame it calls `load_texture`, and egui does not hand the
+/// delta over until `end_pass` — so the very first question a hold asks is about
+/// an id nothing here has seen, and answering it optimistically would swap the
+/// pane onto a texture with no texels in it at all.
+///
+/// It is also the answer that ends a hold after a renderer rebuild: a resumed
+/// session has a fresh `TextureUploads` whose set is empty, so every id from the
+/// dead context answers `false` here — for ever, which is why
+/// `restore_cached_render` lets go of the holds rather than waiting on them.
+#[test]
+fn an_id_that_was_never_filed_has_not_been_delivered() {
+    let uploads = TextureUploads::without_device();
+    assert!(!uploads.is_delivered(egui::TextureId::Managed(0)));
+    assert!(!uploads.is_delivered(egui::TextureId::Managed(7)));
+    assert!(!uploads.is_delivered(egui::TextureId::User(3)));
+}
+
+/// A freed id stops being delivered, which is what bounds the set.
+///
+/// `delivered` is a `HashSet` that would otherwise hold one key per texture ever
+/// created — the map tiles alone churn a 256-entry LRU for the life of a
+/// session. `free` is called from `EguiRenderer::free_textures` with exactly the
+/// ids egui retired, so the set tracks the live textures and nothing else.
+#[test]
+fn freeing_an_id_takes_it_back_out_of_the_delivered_set() {
+    let mut uploads = TextureUploads::without_device();
+    let id = egui::TextureId::Managed(11);
+    uploads.mark_delivered_for_test(id);
+    assert!(uploads.is_delivered(id));
+    uploads.free(&[id]);
+    assert!(
+        !uploads.is_delivered(id),
+        "a retired id stayed in the set, so the set grows with the session",
+    );
+}

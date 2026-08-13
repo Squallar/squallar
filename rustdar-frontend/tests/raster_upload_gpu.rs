@@ -145,10 +145,22 @@ fn run_to_completion(
     queue: &wgpu::Queue,
     renderer: &mut egui_wgpu::Renderer,
     set: &[(egui::TextureId, egui::epaint::ImageDelta)],
+    watch: Option<egui::TextureId>,
 ) -> u32 {
     let mut frames = 0;
     let mut pending = uploads.apply(device, queue, renderer, set);
     while pending {
+        // The half of `is_delivered` a pane's hold depends on, and the half
+        // nothing else would notice going wrong: while a band is still to move,
+        // the answer has to be *no*. A version that said yes early would read
+        // green everywhere and swap a pane onto a half-filled picture.
+        if let Some(id) = watch {
+            assert!(
+                !uploads.is_delivered(id),
+                "the raster reported delivered after {frames} frames with bands \
+                 still pending, so a pane would swap onto a half-filled picture",
+            );
+        }
         frames += 1;
         assert!(
             frames < 1000,
@@ -203,7 +215,26 @@ fn every_texel_lands(with_ring: bool) {
 
     let mut uploads = TextureUploads::new(&device);
     assert_eq!(uploads.has_ring(), with_ring);
-    let frames = run_to_completion(&mut uploads, &device, &queue, &mut renderer, &delta.set);
+    // Before anything is filed the answer is no, which is what a pane asks on
+    // the frame it stages a hold — the delta is still in egui's
+    // `TextureManager` and `end_pass` has not handed it over yet.
+    assert!(
+        !uploads.is_delivered(handle.id()),
+        "an id this module has never been shown reported delivered",
+    );
+    let frames = run_to_completion(
+        &mut uploads,
+        &device,
+        &queue,
+        &mut renderer,
+        &delta.set,
+        Some(handle.id()),
+    );
+    assert!(
+        uploads.is_delivered(handle.id()),
+        "the last band landed and the raster still does not report delivered, so \
+         the pane holding it would hold forever",
+    );
 
     // More than one, or the band budget is not doing anything and this test is
     // checking a single `write_texture` under another name.
