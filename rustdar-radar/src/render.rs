@@ -1030,6 +1030,9 @@ impl RenderBuffers {
             values: value_data,
             // Set by the sweep paths that know one; see the field.
             nyquist_ms: None,
+            // Set by the classification path, which is the only one that has
+            // a melting layer to report; see the field.
+            melting_layer_source: None,
         }
     }
 }
@@ -1100,12 +1103,30 @@ pub struct SweepRender {
     /// every Message 1 volume and every payload that reached the renderer
     /// without a table.
     pub nyquist_ms: Option<f64>,
+    /// Which melting layer the hybrid hydrometeor classification was computed
+    /// against, or `None` for every other product — nothing else has one.
+    ///
+    /// Here for the same reason `nyquist_ms` is: it is a fact about *these*
+    /// pixels that a consumer cannot recover from them, and one that changes
+    /// what they mean. A classification on
+    /// [`MeltingLayerSource::FleetDefault`](crate::hca::MeltingLayerSource::FleetDefault)
+    /// is a plausible-looking picture that disagreed with the RPG four times
+    /// in five across the campaign's winter volumes; a viewer who cannot tell
+    /// it from the 95 % case has been handed a guess wearing a
+    /// classification's colours.
+    pub melting_layer_source: Option<crate::hca::MeltingLayerSource>,
 }
 
 impl SweepRender {
     /// Stamp the fold limit of the sweep this raster was drawn from.
     fn declaring(mut self, nyquist_ms: Option<f64>) -> Self {
         self.nyquist_ms = nyquist_ms;
+        self
+    }
+
+    /// Stamp which melting layer the classification stood on.
+    fn classified_against(mut self, source: crate::hca::MeltingLayerSource) -> Self {
+        self.melting_layer_source = Some(source);
         self
     }
 }
@@ -1519,6 +1540,10 @@ fn render_with_projection(
 /// its fold limit off the sweep and [`SweepRender::nyquist_ms`] is `None` — the
 /// answer for a caller holding only model types, which is every caller of this
 /// short form. [`render_radar_to_image_full`] takes the table.
+///
+/// It also passes no melting layer object, so a classification drawn through
+/// here runs on [`crate::hca::resolve_melting_layer`]'s lower rungs and says
+/// so in [`SweepRender::melting_layer_source`].
 pub fn render_radar_to_image(
     data: &Scan,
     elevation_angle: f32,
@@ -1532,6 +1557,7 @@ pub fn render_radar_to_image(
         product,
         radar_lat,
         radar_lon,
+        None,
         None,
         None,
         &crate::nyquist::DeclaredNyquist::empty(),
@@ -1574,6 +1600,7 @@ pub fn render_from_sized(
         input.radar_lon(),
         input.storm_motion_override(),
         input.env_heights_km_msl(),
+        input.melting_layer_product().map(|o| o.as_slice()),
         &input.declared_nyquist(),
         side_ceiling_px,
     )
@@ -1613,6 +1640,7 @@ pub fn render_radar_to_image_full(
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
+    melting_layer_product: Option<&[u8]>,
     declared_nyquist: &crate::nyquist::DeclaredNyquist,
 ) -> Option<SweepRender> {
     render_radar_to_image_full_sized(
@@ -1623,6 +1651,7 @@ pub fn render_radar_to_image_full(
         radar_lon,
         storm_motion_override,
         env_heights_km_msl,
+        melting_layer_product,
         declared_nyquist,
         types::IMAGE_SIZE,
     )
@@ -1639,6 +1668,7 @@ pub fn render_radar_to_image_full_sized(
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
+    melting_layer_product: Option<&[u8]>,
     declared_nyquist: &crate::nyquist::DeclaredNyquist,
     side_ceiling_px: usize,
 ) -> Option<SweepRender> {
@@ -1666,6 +1696,7 @@ pub fn render_radar_to_image_full_sized(
             radar_lat,
             radar_lon,
             env_heights_km_msl,
+            melting_layer_product,
             side_ceiling_px,
         );
     }
@@ -2204,9 +2235,29 @@ pub fn render_hail_to_image(
 /// grid of class codes painted with the HHC palette. Tilt-independent —
 /// every elevation request renders the same volume product.
 ///
-/// `env_heights_km_msl` is the sounding's (0 °C, −20 °C) pair; `None`
-/// falls back to the operational adaptation defaults, exactly as the RPG
-/// runs without environmental data. The radar height comes from the
+/// # Where the melting layer comes from, and what it costs when it is a guess
+///
+/// `melting_layer_product` is the RPG's own Melting Layer object (Level III
+/// 166, `N0M`) **for this volume**, and it is the answer whenever it is
+/// there. [`crate::hca::resolve_melting_layer`] owns the chain below it —
+/// this volume's own MLDA, then the sounding's freezing level flat, then the
+/// `hail.alg` adaptation default — and whichever rung answered comes back on
+/// [`SweepRender::melting_layer_source`] rather than being forgotten.
+///
+/// That last part is the point. Scored against the RPG's own `N0H` on ten
+/// volumes at ten sites, the *same classifier* reads **84.2–98.6 % exact on
+/// the RPG's layer and 16.0–19.8 % on the adaptation default** in winter and
+/// stratiform regimes, where that default sits 2.9–3.1 km from the real
+/// layer. Both draw a full, plausible picture in the same colours. See
+/// [`crate::hca`]'s "Melting layer and environmental data" for the per-site
+/// table.
+///
+/// `env_heights_km_msl` is the sounding's (0 °C, −20 °C) pair. It still
+/// places the HSDA's wet-bulb regimes, and its 0 °C height is the chain's
+/// third rung; `None` falls back to the operational adaptation defaults,
+/// exactly as the RPG runs without environmental data.
+///
+/// The radar height comes from the
 /// nearest-site table, as the EET render path's does; the radial-header
 /// parameters a decoded `Scan` cannot carry come from
 /// [`crate::kdp::KdpParams::render_fallback`] (fleet-typical `dbz0`/atmos —
@@ -2235,6 +2286,7 @@ pub fn render_hhc_to_image(
     radar_lat: f64,
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
+    melting_layer_product: Option<&[u8]>,
     side_ceiling_px: usize,
 ) -> Option<SweepRender> {
     let radar_km_msl = render_site_height_ft(radar_lat, radar_lon) * 0.0003048;
@@ -2242,17 +2294,23 @@ pub fn render_hhc_to_image(
         isdp_est_deg: crate::kdp::estimate_volume_isdp(scan),
         ..crate::kdp::KdpParams::render_fallback()
     };
-    let (h0c, hsda) = match env_heights_km_msl {
-        Some((h0c, hm20c)) => (
-            h0c,
-            crate::hca::HsdaHeights::from_env_heights(h0c, hm20c, radar_km_msl),
-        ),
-        None => (
-            crate::hca::DEFAULT_HEIGHT_0_KM_MSL,
-            crate::hca::HsdaHeights::operational_defaults(radar_km_msl),
-        ),
+    let hsda = match env_heights_km_msl {
+        Some((h0c, hm20c)) => crate::hca::HsdaHeights::from_env_heights(h0c, hm20c, radar_km_msl),
+        None => crate::hca::HsdaHeights::operational_defaults(radar_km_msl),
     };
-    let default_top_arl = (h0c - radar_km_msl).max(0.0);
+    // The object's own decoder, not a second description of the product. A
+    // decode failure is not fatal here: it drops this rung of
+    // `resolve_melting_layer`'s chain and the next one answers, which is
+    // exactly what a missing object does.
+    let rpg_layer = melting_layer_product.and_then(|bytes| {
+        match nexrad_level3::decode::decode_product(bytes) {
+            Ok(message) => Some(message),
+            Err(e) => {
+                log::warn!("Could not decode the melting layer product: {e}");
+                None
+            }
+        }
+    });
 
     let all: Vec<&[nexrad_model::data::Radial]> =
         scan.sweeps().iter().map(|s| s.radials()).collect();
@@ -2275,8 +2333,16 @@ pub fn render_hhc_to_image(
                 .unwrap_or(false)
         })
         .collect();
-    let ml =
-        crate::hca::detect_melting_layer(&ml_sweeps, &params, default_top_arl, &hsda, Some(&cappi));
+    let ml = crate::hca::resolve_melting_layer(
+        rpg_layer.as_ref(),
+        &ml_sweeps,
+        &params,
+        env_heights_km_msl.map(|(h0c, _)| h0c),
+        radar_km_msl,
+        &hsda,
+        Some(&cappi),
+    );
+    let melting_layer_source = ml.source;
     let tilts = crate::hhc::volume_tilts(&all);
     let grid = crate::hhc::compute_hhc(&tilts, &params, &ml, &hsda, Some(&cappi))?;
 
@@ -2306,7 +2372,7 @@ pub fn render_hhc_to_image(
             });
         },
     );
-    Some(output)
+    Some(output.classified_against(melting_layer_source))
 }
 
 /// Render the locally derived Specific Differential Phase

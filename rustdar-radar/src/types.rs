@@ -1485,12 +1485,19 @@ impl RadarProduct {
             // renders nothing rather than guessing.
             RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
             // The hybrid classification picks `HsdaHeights::from_env_heights`
-            // over `operational_defaults` and feeds both the melting-layer
-            // detection, so every class code downstream of the layer moves
-            // with the pair (`crate::render::render_hhc_to_image`). Absent a
-            // sounding it falls back to the adaptation defaults, exactly as
-            // the RPG runs without environmental data — which is why the
-            // stale case looked plausible instead of empty.
+            // over `operational_defaults`, and the pair's 0 °C height is the
+            // third rung of `crate::hca::resolve_melting_layer`, so every
+            // class code downstream of the layer moves with it
+            // (`crate::render::render_hhc_to_image`). Absent a sounding it
+            // falls back to the adaptation defaults, exactly as the RPG runs
+            // without environmental data — which is why the stale case looked
+            // plausible instead of empty, and why the picture now says which
+            // melting layer it stood on.
+            //
+            // The RPG's own melting layer object rides
+            // `RenderInput::with_melting_layer_product` rather than this
+            // predicate: it is per *volume*, not per site, so it cannot live
+            // in a site-keyed cache the way the sounding does.
             RadarProduct::HydrometeorClassification => true,
             // Every other product must never carry the pair, or the byte
             // identity of its payload would depend on an unrelated cache.

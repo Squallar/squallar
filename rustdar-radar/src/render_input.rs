@@ -81,6 +81,22 @@ pub struct RenderInput {
     /// adaptation defaults, exactly as the RPG does without environmental
     /// data.
     env_heights_km_msl: Option<(f64, f64)>,
+    /// The RPG's own **Melting Layer product** (Level III 166, `N0M`) for
+    /// this very volume, as the object's own bytes.
+    ///
+    /// Read by the hybrid hydrometeor classification alone, and it is the
+    /// difference between a classification and a guess: the twin campaign
+    /// scored the same classifier at 82.8–95.9 % exact against the RPG's
+    /// `N0H` with this layer and at 16.0–19.8 % without it in winter regimes.
+    /// See [`crate::hca::resolve_melting_layer`] for the chain that consumes
+    /// it and what stands in when it is absent.
+    ///
+    /// Bytes rather than a decoded layer for the reason
+    /// [`crate::level3::Level3Product::bytes`] gives: a `Level3Message` has no
+    /// wire form, and shipping the object lets the worker run the same
+    /// decoder the main thread would have. Six kilobytes against the
+    /// megabytes of moments beside it.
+    melting_layer_product: Option<std::sync::Arc<Vec<u8>>>,
     /// The volume coverage pattern number the scan was flown under.
     ///
     /// Nothing on a render path reads it. It travels because the *cut angles*
@@ -428,6 +444,7 @@ impl RenderInput {
                 .then_some(storm_motion_override)
                 .flatten(),
             env_heights_km_msl: None,
+            melting_layer_product: None,
             vcp: pattern.pattern_number().number(),
             declared_cut_angles_deg: pattern
                 .elevation_cuts()
@@ -513,6 +530,9 @@ impl RenderInput {
                 // unrelated cache.
                 None
             },
+            // Stamped afterwards by `with_melting_layer_product`, which is
+            // where the object's own arrival schedule is known.
+            melting_layer_product: None,
             vcp: scan.coverage_pattern().pattern_number().number(),
             declared_cut_angles_deg: scan
                 .coverage_pattern()
@@ -551,6 +571,33 @@ impl RenderInput {
     /// adaptation defaults.
     pub fn env_heights_km_msl(&self) -> Option<(f64, f64)> {
         self.env_heights_km_msl
+    }
+
+    /// Stamp the RPG's own melting layer object for this volume onto a
+    /// payload the extraction has already built.
+    ///
+    /// A second step and not an [`extract`](Self::extract) argument, for the
+    /// reason [`declaring_nyquist`](Self::declaring_nyquist) is one: the
+    /// object is fetched on its own schedule and pairs to the volume by its
+    /// PDB, so it arrives after the moments do — and a caller that has no
+    /// object simply does not call this, rather than threading a `None`
+    /// through every extraction site.
+    ///
+    /// Dropped for every product but the hybrid classification, on the same
+    /// rule `env_heights_km_msl` follows: a payload's bytes must not depend
+    /// on a cache its product never reads.
+    #[must_use]
+    pub fn with_melting_layer_product(mut self, object: Option<std::sync::Arc<Vec<u8>>>) -> Self {
+        self.melting_layer_product =
+            object.filter(|_| self.product == RadarProduct::HydrometeorClassification);
+        self
+    }
+
+    /// The RPG's own melting layer object for this volume, or `None` — the
+    /// classification then falls to [`crate::hca::resolve_melting_layer`]'s
+    /// next source.
+    pub fn melting_layer_product(&self) -> Option<&std::sync::Arc<Vec<u8>>> {
+        self.melting_layer_product.as_ref()
     }
 
     /// Stamp each carried sweep with the Nyquist velocity its cut declared,
@@ -1208,7 +1255,13 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// from a reconstructed scan — so the tilt ladder's per-rung ages, which a
 /// section pane now reports, were readable off a real volume and identically
 /// zero off a payload. See [`SweepData::collected_ms`].
-const FORMAT_VERSION: u16 = 9;
+/// Version 10 added the RPG's own **melting layer object** (Level III 166,
+/// `N0M`) as a length-prefixed blob, after the environmental heights. Without
+/// it the worker's hybrid classification could only ever reach
+/// `crate::hca::resolve_melting_layer`'s lower rungs, so a browser render and
+/// a desktop one would classify the same volume against melting layers up to
+/// three kilometres apart — with no error, and both drawing a full picture.
+const FORMAT_VERSION: u16 = 10;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -1237,6 +1290,14 @@ impl RenderInput {
                 out.push(1);
                 out.extend_from_slice(&h0c.to_le_bytes());
                 out.extend_from_slice(&hm20c.to_le_bytes());
+            }
+        }
+
+        match &self.melting_layer_product {
+            None => out.extend_from_slice(&0u32.to_le_bytes()),
+            Some(object) => {
+                out.extend_from_slice(&(object.len() as u32).to_le_bytes());
+                out.extend_from_slice(object);
             }
         }
 
@@ -1329,6 +1390,17 @@ impl RenderInput {
             _ => return None,
         };
 
+        // A zero length is the absent case; the object is never empty, so the
+        // two cannot be confused.
+        let melting_layer_len = r.u32()?;
+        let melting_layer_product = if melting_layer_len == 0 {
+            None
+        } else {
+            Some(std::sync::Arc::new(
+                r.take(melting_layer_len as usize)?.to_vec(),
+            ))
+        };
+
         let vcp = r.u16()?;
         // Eight bytes per angle, so the claimed count is measured against what
         // remains before it becomes a capacity.
@@ -1410,6 +1482,7 @@ impl RenderInput {
             radar_lon,
             storm_motion_override,
             env_heights_km_msl,
+            melting_layer_product,
             vcp,
             declared_cut_angles_deg,
             sweeps,
@@ -1428,6 +1501,7 @@ impl RenderInput {
         } else {
             0
         };
+        let melting_layer = 4 + self.melting_layer_product.as_ref().map_or(0, |o| o.len());
         let sweeps: usize = self
             .sweeps
             .iter()
@@ -1457,7 +1531,7 @@ impl RenderInput {
         // `+ 2` for the coverage pattern number, `+ 4` and its `f64`s for the
         // declared cut table, `+ 4` for the sweep count.
         let declared = 4 + self.declared_cut_angles_deg.len() * 8;
-        header + motion + env + 2 + declared + 4 + sweeps
+        header + motion + env + melting_layer + 2 + declared + 4 + sweeps
     }
 }
 

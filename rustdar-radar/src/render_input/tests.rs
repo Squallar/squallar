@@ -190,6 +190,7 @@ fn render_from_an_extracted_payload_matches_the_scan_path() {
             LON,
             over,
             env,
+            None,
             &crate::nyquist::DeclaredNyquist::empty(),
         )
         .unwrap();
@@ -266,6 +267,7 @@ fn a_sweep_that_opened_off_its_tilt_still_renders_after_the_port() {
         product,
         LAT,
         LON,
+        None,
         None,
         None,
         &crate::nyquist::DeclaredNyquist::empty(),
@@ -999,7 +1001,7 @@ fn the_sentinel_elevation_is_one_no_sweep_can_carry() {
 /// one. Mirrors `xsect`'s and `voxel`'s tests of the same name.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
-    assert_eq!(FORMAT_VERSION, 9);
+    assert_eq!(FORMAT_VERSION, 10);
     let bytes = RenderInput::extract(
         &volume(),
         0.5,
@@ -1014,7 +1016,7 @@ fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(&bytes[..4], b"RDRI", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
-        9,
+        10,
         "the version is not where a decoder from another build looks for it",
     );
 }
@@ -1172,6 +1174,7 @@ fn a_product_with_no_level_two_moment_extracts_nothing() {
             LON,
             None,
             None,
+            None,
             &crate::nyquist::DeclaredNyquist::empty()
         )
         .is_none(),
@@ -1203,6 +1206,7 @@ fn hail_without_an_environment_renders_nothing_on_both_paths() {
                 product,
                 LAT,
                 LON,
+                None,
                 None,
                 None,
                 &crate::nyquist::DeclaredNyquist::empty()
@@ -1493,4 +1497,75 @@ fn every_product_has_a_stable_distinct_wire_code() {
         None,
         "18 decodes, so the table above has stopped being the whole wire",
     );
+}
+
+/// The RPG's melting layer object rides the port intact, and only for the
+/// one product that reads it.
+///
+/// Byte identity is the reason for the second half: a payload's bytes must
+/// not depend on a cache its product never consults, or two panes showing
+/// the same reflectivity sweep would hash to different payloads because one
+/// of them happened to have a melting layer cached.
+#[test]
+fn the_melting_layer_object_round_trips_and_only_for_the_classification() {
+    let scan = volume();
+    let object = std::sync::Arc::new(vec![0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE]);
+
+    let carried = RenderInput::extract(
+        &scan,
+        0.5,
+        RadarProduct::HydrometeorClassification,
+        LAT,
+        LON,
+        None,
+        env_for(RadarProduct::HydrometeorClassification),
+    )
+    .expect("the fixture carries dual-pol")
+    .with_melting_layer_product(Some(object.clone()));
+    assert_eq!(
+        carried.melting_layer_product().map(|o| o.as_slice()),
+        Some(object.as_slice()),
+    );
+    let after = RenderInput::from_bytes(&carried.to_bytes()).expect("round trips");
+    assert_eq!(
+        after.melting_layer_product().map(|o| o.as_slice()),
+        Some(object.as_slice()),
+        "the object did not survive the port",
+    );
+    assert_eq!(after, carried);
+
+    // Absent is a distinct wire state, not an empty object.
+    let bare = RenderInput::extract(
+        &scan,
+        0.5,
+        RadarProduct::HydrometeorClassification,
+        LAT,
+        LON,
+        None,
+        env_for(RadarProduct::HydrometeorClassification),
+    )
+    .expect("the fixture carries dual-pol");
+    assert!(bare.melting_layer_product().is_none());
+    assert!(
+        RenderInput::from_bytes(&bare.to_bytes())
+            .expect("round trips")
+            .melting_layer_product()
+            .is_none(),
+    );
+
+    // Every other product drops it, so its payload cannot move with a cache
+    // it does not read.
+    for product in [
+        RadarProduct::Reflectivity,
+        RadarProduct::Velocity,
+        RadarProduct::MaxExpectedHailSize,
+    ] {
+        let other = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, env_for(product))
+            .expect("the fixture carries this moment")
+            .with_melting_layer_product(Some(object.clone()));
+        assert!(
+            other.melting_layer_product().is_none(),
+            "{product:?} must not carry a melting layer object",
+        );
+    }
 }

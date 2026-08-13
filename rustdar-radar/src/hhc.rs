@@ -88,7 +88,19 @@
 //!   anyway; terrain-blocked mountain sites are expected to diverge
 //!   exactly where product 165 already does.
 //! * The melting layer, environmental heights, CAPPI and met-signal state
-//!   carry [`crate::hca`]'s documented gaps into every tilt.
+//!   carry [`crate::hca`]'s documented gaps into every tilt — the melting
+//!   layer most of all, since the composite is built out of per-tilt
+//!   classifications that all stand on it. Measured against the RPG's own
+//!   `HHC` on the ten-volume twin roster, the same code reads **93.8–100 %
+//!   exact at the three winter and stratiform sites on the RPG's own melting
+//!   layer and 16.0–27.3 % on the fleet adaptation default**, which is what
+//!   [`crate::hca::resolve_melting_layer`] exists to stop.
+//!
+//!   The one place the RPG's layer does *not* help is KDMX, which reads
+//!   70.70 % on the default and 67.85 % on the RPG's — the only site of ten
+//!   where the better melting layer scores worse, and also the convective
+//!   site with the largest HHC presence disagreement (21.8 %). Unexplained,
+//!   recorded rather than smoothed over.
 //! * `mode_filter_length`, `pct_hybrate_filled` and `highest_elang` are
 //!   product-dependent parameters (halfwords 30–32), not gate data; the
 //!   mode filter itself is applied by display consumers, not by the

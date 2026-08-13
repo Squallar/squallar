@@ -139,6 +139,63 @@
 //!
 //! # Melting layer and environmental data
 //!
+//! **Where the melting layer comes from, in one place.**
+//! [`resolve_melting_layer`] is the chain and the only place it is written
+//! down; this is what each rung is worth, measured.
+//!
+//! 1. **The RPG's own melting layer for this volume** — its published
+//!    Melting Layer product (Level III 166, AWIPS `N0M`), inverted by
+//!    [`MeltingLayer::from_melting_layer_product`]. Per azimuth, paired to
+//!    the volume by its own PDB, and therefore right for a replay as well as
+//!    for a live scan.
+//! 2. **This volume's own MLDA** ([`detect_melting_layer`]) — per azimuth,
+//!    but from one volume where the RPG accumulates three, so in practice it
+//!    concludes almost never (0 of 18 measurements in the July survey below,
+//!    0 of 10 on the twin roster).
+//! 3. **A sounding's freezing level**, flat ([`crate::sounding`]).
+//! 4. **The `hail.alg` fleet adaptation default**, flat at 10.5 kft MSL.
+//!    A guess.
+//!
+//! ## What the guess costs — measured 2026-08-13, ten volumes, ten sites
+//!
+//! The same classifier, the same ten Level II volumes, the same ten RPG
+//! products, with only the melting layer different. Scored as exact class
+//! agreement against the RPG's own `N0H`, oracle decoded independently
+//! (MetPy), on four VCPs, six weather regimes and two holdouts:
+//!
+//! ```text
+//! site  regime                     compared   rung 4   rung 1   delta
+//! KFTG  deep convection               43190    80.55    96.78  +16.24
+//! KDMX  convective line               26937    91.61    95.65   +4.04
+//! KMSX  mountain convection           56573    82.33    95.30  +12.97
+//! KOKX  coastal winter storm          57075    19.80    98.59  +78.79
+//! KMLB  subtropical convection        17092    90.24    95.10   +4.87
+//! KATX  Pacific stratiform            24239    15.95    91.69  +75.74
+//! KBUF  lake-effect snow              24644    16.09    96.88  +80.80
+//! KARX  clear air (control)            5619    83.48    87.38   +3.90
+//! KUDX  HOLDOUT Black Hills           36063    87.61    93.16   +5.56
+//! KABX  HOLDOUT winter SW             12949    80.43    84.21   +3.78
+//! ```
+//!
+//! **On the fleet default the classification disagrees with the RPG four
+//! times in five in a winter or stratiform regime** — 16.0–19.8 % exact at
+//! the three sites where that default sits 2.9–3.1 km from the real layer —
+//! and it does so while drawing a full, plausible-looking picture. On the
+//! RPG's own layer the same code scores 84.2–98.6 %, eight of ten sites over
+//! 91 %, both holdouts included. The hybrid product ([`crate::hhc`]) tells
+//! the same story: 16.0–27.3 % against 93.8–100 % at those three sites.
+//!
+//! That is why [`MeltingLayer`] carries a [`MeltingLayerSource`] and why
+//! [`crate::render::SweepRender::melting_layer_source`] carries it out to
+//! the viewer: a 16 % answer and a 96 % answer are the same picture with the
+//! same colours, and nothing else distinguishes them.
+//!
+//! (The rung-4 column reproduces the twin campaign's own measurement of the
+//! shipped fallback to the second decimal at all ten sites, and the rung-1
+//! column reproduces its independently-derived Python inversion of the same
+//! ten product-166 objects — 82.77–95.85 % before the `weight_RHOhv`
+//! correction below, which is the state the campaign measured.)
+//!
 //! What the operational chain actually does with the model 0 °C height
 //! (`hca_buffer_control.c`, `melting_layer.c`):
 //!
@@ -166,11 +223,24 @@
 //!   fleet default `Melting_Layer_Source = Model_Enhanced` — merges in the
 //!   RUC/RAP **freezing-height grid**, per-azimuth, when fewer than 320
 //!   azimuths are radar-valid. Both are operational state a single archived
-//!   volume cannot reproduce (the model grid is not in the archive at all),
-//!   so this module's primary is the volume's own radar detection with the
-//!   sounding 0 °C fallback — the documented `Radar_Based` source, one
-//!   volume fresher than the operational value, with `RPG_0C_Hgt` as the
-//!   bounded A/B alternative.
+//!   volume cannot reproduce (the model grid is not in the archive at all) —
+//!   **but the RPG publishes its conclusion**, and product 166 is that
+//!   publication. Reading it back is why rung 1 above exists and why the
+//!   three-volume accumulation and the model merge are no longer a gap: they
+//!   are inside the number the RPG drew.
+//!
+//! ## Why the sounding cannot stand in for it on a replay
+//!
+//! [`crate::sounding`] fetches Open-Meteo's `/v1/forecast` for **now**, which
+//! is right for a live volume and wrong for an archived one — a January
+//! volume replayed in August is handed August's freezing level. The archive
+//! endpoint does not close the gap: `archive-api.open-meteo.com/v1/archive`
+//! answers `freezing_level_height` and every pressure-level temperature with
+//! `null` (ERA5 there carries surface fields only, checked 2026-08-13), and
+//! the forecast endpoint's `past_days` window reaches back about 92 days,
+//! which is not an archive. So for a replay the sounding is rung 3 in name
+//! only, and product 166 is the only source that is contemporaneous with the
+//! volume by construction.
 //!
 //! # Where the released source diverges from Park et al. (2009)
 //!
@@ -651,6 +721,7 @@ pub(crate) const MEM: [&MemTable; 10] = [
 /// `hca.alg`'s weight arrays, transposed to `[class − RA][input]`. The
 /// class columns of `weight_Z`…`weight_SDPHIdp` in order RA HR RH BD BI GC
 /// DS WS IC GR (U0/U1/UK/NE all carry 0 and never score).
+
 pub(crate) const WEIGHT: [[f64; NUM_FL_INPUTS]; 10] = [
     // SMZ  ZDR  LKDP RHO  SDZ  SDP
     [1.0, 0.8, 0.0, 0.6, 0.2, 0.2], // RA
@@ -801,24 +872,111 @@ const MAX_DIFF_PHIDP: f64 = 100.0;
 
 // ── Melting layer ────────────────────────────────────────────────────────────
 
+/// Where a [`MeltingLayer`] came from, and therefore how much a
+/// classification standing on it is worth.
+///
+/// This is not decoration. The campaign numbers in the module header are the
+/// **same classifier** scored against the same ten RPG products with only
+/// this value different: `Rpg` scores 82.8–95.9 % exact on `N0H` at ten
+/// sites, `FleetDefault` collapses to 16.0–19.8 % at the three sites where
+/// that default is 2.9–3.1 km wrong. A consumer that cannot tell the two
+/// apart cannot tell a classification from a guess, so every constructor
+/// records which it is and nothing constructs a layer without saying.
+///
+/// Ordered best-first; [`Ord`] is the fallback chain's own order, so
+/// `a < b` reads "a is the better source".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeltingLayerSource {
+    /// The RPG's own melting layer **for this volume**, inverted from its
+    /// published Melting Layer product (Level III 166, AWIPS `N0M`) by
+    /// [`MeltingLayer::from_melting_layer_product`]. Per-azimuth, and the
+    /// same number the RPG's own `N0H` was classified on.
+    Rpg,
+    /// This volume's own 4°–10° tilts through the MLDA
+    /// ([`detect_melting_layer`]). Per-azimuth, one volume of accumulation
+    /// where the RPG uses three.
+    RadarDetected,
+    /// Flat, at the environmental 0 °C height a sounding gave
+    /// ([`crate::sounding::EnvHeights`]). Right height, no azimuthal
+    /// structure — and only as contemporaneous as the sounding is.
+    Sounding,
+    /// Flat, at the `hail.alg` fleet adaptation default (10.5 kft MSL).
+    /// **A guess**, and the one measured to be up to 3.1 km wrong.
+    FleetDefault,
+}
+
+impl MeltingLayerSource {
+    /// Whether this layer was measured for this volume rather than assumed.
+    ///
+    /// The two `false` arms are not equally bad and the wording downstream
+    /// says so; what they share is that neither observed *this* volume's
+    /// melting layer, which is the distinction a viewer needs.
+    pub fn is_measured(self) -> bool {
+        matches!(self, Self::Rpg | Self::RadarDetected)
+    }
+
+    /// A short phrase naming the source, for a caption or a log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rpg => "RPG melting layer",
+            Self::RadarDetected => "radar-detected melting layer",
+            Self::Sounding => "sounding freezing level",
+            Self::FleetDefault => "assumed freezing level",
+        }
+    }
+
+    /// One sentence a viewer can act on: what the classification is standing
+    /// on, and what it costs when that is a guess.
+    ///
+    /// The costed arms quote the measured figures rather than hedging,
+    /// because "may be less accurate" is the kind of warning people learn to
+    /// skip and "four times in five" is not.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Self::Rpg => "melting layer from the RPG's own product for this volume",
+            Self::RadarDetected => "melting layer detected from this volume's own tilts",
+            Self::Sounding => "melting layer assumed flat at the sounding's freezing level",
+            Self::FleetDefault => {
+                "no melting layer available - assuming 10.5 kft, which in winter \
+                 has disagreed with the RPG four times in five"
+            }
+        }
+    }
+}
+
 /// Per-azimuth melting-layer top and bottom, km **above radar level** — the
-/// exact form `Hca_buffer_control` holds (`ML_top`/`ML_bottom`).
+/// exact form `Hca_buffer_control` holds (`ML_top`/`ML_bottom`) — with the
+/// provenance that says how much it is worth.
 #[derive(Debug, Clone)]
 pub struct MeltingLayer {
     pub top_km_arl: [f64; 360],
     pub bottom_km_arl: [f64; 360],
+    /// Where these heights came from. See [`MeltingLayerSource`] — it is the
+    /// difference between a 95 % classification and a 16 % one.
+    pub source: MeltingLayerSource,
 }
 
 impl MeltingLayer {
     /// A flat layer: top at `top_km_arl`, bottom 0.5 km below, both floored
     /// at ground — the source's default construction (`HALF_KM`).
-    pub fn flat(top_km_arl: f64) -> Self {
+    ///
+    /// `source` is a parameter and not a default because a flat layer is
+    /// built from three different things (the fleet constant, a sounding, and
+    /// the MLDA's own seed) and only the caller knows which.
+    pub fn flat_from(top_km_arl: f64, source: MeltingLayerSource) -> Self {
         let top = top_km_arl.max(0.0);
         let bottom = (top - ML_DEPTH_KM).max(0.0);
         Self {
             top_km_arl: [top; 360],
             bottom_km_arl: [bottom; 360],
+            source,
         }
+    }
+
+    /// [`flat_from`](Self::flat_from) at the fleet adaptation default's
+    /// provenance — the guess.
+    pub fn flat(top_km_arl: f64) -> Self {
+        Self::flat_from(top_km_arl, MeltingLayerSource::FleetDefault)
     }
 
     /// The operational default: the environmental 0 °C height (km MSL —
@@ -826,8 +984,241 @@ impl MeltingLayer {
     /// `height_0` adaptation value) converted to above-radar-level, bottom
     /// 0.5 km below.
     pub fn from_zero_c_height(h0c_km_msl: f64, radar_km_msl: f64) -> Self {
-        Self::flat(h0c_km_msl - radar_km_msl)
+        Self::flat_from(h0c_km_msl - radar_km_msl, MeltingLayerSource::Sounding)
     }
+
+    /// The RPG's own melting layer for one volume, recovered from its
+    /// published **Melting Layer product** (Level III 166, AWIPS `N0M`).
+    ///
+    /// # Why this is the primary source
+    ///
+    /// It is not a proxy for the RPG's melting layer; it *is* the RPG's
+    /// melting layer, published per volume — three-volume accumulation,
+    /// RUC/RAP model merge and all, none of which a single archived volume
+    /// can reconstruct (see this module's "Melting layer and environmental
+    /// data"). It is also correct for a replay: the object is paired to the
+    /// volume by [`crate::level3::fetch_product_for_volume`], so an archived
+    /// January volume gets January's layer and not today's.
+    ///
+    /// # How the inversion works
+    ///
+    /// The product is drawn, not tabulated: four linked contours at the
+    /// product's own elevation, marking where the beam's lower edge and then
+    /// its centre cross the layer **top**, and where the centre and then the
+    /// upper edge cross the layer **bottom**. Height rises with range at a
+    /// fixed elevation, and the top sits above the bottom, so ranking the
+    /// four rings by radius identifies them: widest is the top seen by the
+    /// lowest ray, narrowest is the bottom seen by the highest.
+    ///
+    /// Only the two **beam-centre** rings supply the answer, inverted through
+    /// `melting_layer.c`'s own `IR·RE` beam-height model
+    /// ([`ml_height_from_range`]). That is deliberate: a centre ring needs no
+    /// beamwidth, so the recovery does not inherit the 0.95°-vs-1.0°
+    /// ambiguity between the real half-power beamwidth and the 1° this
+    /// module's `hca_beamMLIntersection.c` transcription uses. The two edge
+    /// rings are spent on [`MeltingLayerRecovery::consistency_km`] instead,
+    /// which is a check the caller can read rather than an input it must
+    /// trust.
+    ///
+    /// A ring of zero radius is not a failure: it is the RPG saying the layer
+    /// does not intersect the beam at that azimuth because it is at or below
+    /// the radar. Those azimuths come back as 0 km ARL, which is what the
+    /// three winter sites in the campaign roster read.
+    ///
+    /// `None` when the product carries fewer than four contours, or when its
+    /// elevation is unusable — never a partial layer, because a layer that is
+    /// right on some azimuths and 3 km wrong on the rest is the exact failure
+    /// this whole path exists to remove.
+    pub fn from_melting_layer_product(
+        message: &nexrad_level3::model::Level3Message,
+    ) -> Option<MeltingLayerRecovery> {
+        use nexrad_level3::model::DataPacket;
+
+        let elev_deg = f64::from(message.pdb.elevation_angle());
+        if !elev_deg.is_finite() || elev_deg <= 0.0 || elev_deg >= 90.0 {
+            log::warn!("Melting layer product declares an unusable elevation {elev_deg}");
+            return None;
+        }
+
+        let rings: Vec<[f64; 360]> = message
+            .symbology
+            .iter()
+            .flat_map(|block| block.layers.iter())
+            .flat_map(|layer| layer.packets.iter())
+            .filter_map(|packet| match packet {
+                DataPacket::LinkedContour(contour) => Some(ring_radii_km(contour)),
+                _ => None,
+            })
+            .collect();
+        if rings.len() < 4 {
+            log::warn!(
+                "Melting layer product carries {} contours, not the four the layer needs",
+                rings.len()
+            );
+            return None;
+        }
+
+        // Widest first. `total_cmp` because a ring of all-zeros is ordinary
+        // here and a NaN would otherwise decide the order silently.
+        let mut ranked: Vec<(f64, usize)> = rings
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (median(r), i))
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let at = |slot: usize, ray_deg: f64| -> [f64; 360] {
+            let ring = &rings[ranked[slot].1];
+            std::array::from_fn(|az| {
+                if ring[az] > 0.0 {
+                    ml_height_from_range(ray_deg, ring[az])
+                } else {
+                    0.0
+                }
+            })
+        };
+        let half_bw = BEAM_WIDTH_DEG / 2.0;
+        let top_km_arl = at(1, elev_deg);
+        let bottom_km_arl = at(2, elev_deg);
+        let top_from_edge = at(0, elev_deg - half_bw);
+        let bottom_from_edge = at(3, elev_deg + half_bw);
+
+        let consistency_km = (0..360)
+            .map(|az| {
+                (top_km_arl[az] - top_from_edge[az])
+                    .abs()
+                    .max((bottom_km_arl[az] - bottom_from_edge[az]).abs())
+            })
+            .fold(0.0f64, f64::max);
+        let depth_km = mean(&top_km_arl) - mean(&bottom_km_arl);
+
+        Some(MeltingLayerRecovery {
+            layer: MeltingLayer {
+                top_km_arl,
+                bottom_km_arl,
+                source: MeltingLayerSource::Rpg,
+            },
+            depth_km,
+            consistency_km,
+        })
+    }
+}
+
+/// A melting layer recovered from product 166, with the two numbers that say
+/// whether the recovery worked.
+///
+/// Both are reported rather than asserted. The inversion has no oracle to
+/// check itself against, so the honest thing is to hand the caller the
+/// self-consistency evidence and let it decide — and to log it, which is what
+/// [`Self::looks_sound`] exists to phrase.
+#[derive(Debug, Clone)]
+pub struct MeltingLayerRecovery {
+    pub layer: MeltingLayer,
+    /// Mean top − mean bottom, km. The MLDA draws a 0.5 km layer
+    /// (`ML_DEPTH_KM`), so a recovery that comes out near 0.5 has inverted
+    /// the right rings through the right model.
+    pub depth_km: f64,
+    /// The largest disagreement, over all azimuths, between a height read off
+    /// the beam-centre ring and the same height read off the corresponding
+    /// beam-edge ring at `elev ∓ bw/2`. Two independent routes to one number;
+    /// this is how far apart they came out.
+    pub consistency_km: f64,
+}
+
+impl MeltingLayerRecovery {
+    /// Whether the two self-checks agree with what the algorithm draws.
+    ///
+    /// The depth band is generous (a quarter of the nominal 0.5 km either
+    /// way) because the rings are quantised to the product's 1/4 km screen
+    /// units, and the consistency bound is a beamwidth's worth of height at
+    /// the far edge of the domain. A recovery that fails either is not
+    /// silently corrected — it is refused, and the chain falls to the next
+    /// source.
+    ///
+    /// # The depth check does not apply to a layer sitting on the ground
+    ///
+    /// [`MeltingLayer::flat_from`] floors both surfaces at ground and so does
+    /// the RPG, so a layer whose **bottom** is underground comes back with
+    /// its bottom clamped to 0 and a depth that is the top's height rather
+    /// than the layer's thickness. That is not a failed recovery — it is the
+    /// winter answer, and the three volumes it applies to on the campaign
+    /// roster (KOKX 0.017 km, KATX 0.010 km, KBUF 0.000 km of apparent depth)
+    /// are exactly the ones where the fleet default was 2.9–3.1 km wrong and
+    /// where refusing the recovery would throw away the entire fix. So the
+    /// depth is only asked about when there is a layer above ground to have a
+    /// depth.
+    ///
+    /// The consistency check is not conditional: it compares two independent
+    /// routes to the same number and is meaningful whatever the layer's
+    /// height.
+    pub fn looks_sound(&self) -> bool {
+        // A layer whose bottom is above its top is not a layer at all —
+        // `Hca_beamMLintersection` would hand the classifier zone bounds in
+        // the wrong order and every gate would land in the wrong zone. Only
+        // reachable if two rings rank equal by median radius and sort the
+        // wrong way, which is why it is a check and not an assumption.
+        if (0..360).any(|az| self.layer.bottom_km_arl[az] > self.layer.top_km_arl[az]) {
+            return false;
+        }
+        if self.consistency_km > MAX_ML_INCONSISTENCY_KM {
+            return false;
+        }
+        let ground_truncated = self
+            .layer
+            .bottom_km_arl
+            .iter()
+            .filter(|&&b| b <= 0.0)
+            .count()
+            > 180;
+        ground_truncated || (0.25..=0.75).contains(&self.depth_km)
+    }
+}
+
+/// How far apart the beam-centre and beam-edge routes to one height may land
+/// before [`MeltingLayerRecovery::looks_sound`] gives up on the recovery.
+///
+/// Half a beamwidth of elevation moves the crossing range, and the crossing
+/// range moves the height; at the ~1.5–2.5 km layer heights this product
+/// draws at, that is a couple of hundred metres. Measured across the ten
+/// campaign volumes the worst azimuth came to 0.11 km, so this is not a
+/// tuned bound — it is a bound the real data sits an order of magnitude
+/// inside.
+const MAX_ML_INCONSISTENCY_KM: f64 = 0.5;
+
+/// Per whole degree of azimuth, the radius of one contour, km.
+///
+/// The contour is a chain of points, not a function of azimuth, so each
+/// degree takes the radius of the point nearest it in azimuth — the same
+/// nearest-neighbour read the RPG's own consumer makes of a drawn ring. A
+/// point at the origin carries no azimuth; those are dropped, and an azimuth
+/// with no point at all reads 0, which the caller renders as "layer at
+/// ground".
+fn ring_radii_km(contour: &nexrad_level3::model::LinkedContourPacket) -> [f64; 360] {
+    let mut best = [(f64::INFINITY, 0.0f64); 360];
+    for (east_km, north_km) in contour.points_km() {
+        let radius = east_km.hypot(north_km);
+        if radius <= 0.0 {
+            continue;
+        }
+        let az = east_km.atan2(north_km).to_degrees().rem_euclid(360.0);
+        for (i, slot) in best.iter_mut().enumerate() {
+            let separation = (az - (i as f64 + 0.5) + 180.0).rem_euclid(360.0) - 180.0;
+            if separation.abs() < slot.0 {
+                *slot = (separation.abs(), radius);
+            }
+        }
+    }
+    std::array::from_fn(|i| best[i].1)
+}
+
+fn mean(values: &[f64; 360]) -> f64 {
+    values.iter().sum::<f64>() / 360.0
+}
+
+fn median(values: &[f64; 360]) -> f64 {
+    let mut sorted = *values;
+    sorted.sort_by(f64::total_cmp);
+    (sorted[179] + sorted[180]) / 2.0
 }
 
 /// The four beam/melting-layer intersection ranges of one radial, as DP bin
@@ -2079,29 +2470,22 @@ fn ml_elev_weight(elev_deg: f64) -> f64 {
 pub fn detect_melting_layer(
     sweeps: &[&[Radial]],
     params: &KdpParams,
-    default_top_km_arl: f64,
+    default: &MeltingLayer,
     hsda: &HsdaHeights,
     cappi: Option<&ReflCappi>,
 ) -> MeltingLayer {
-    detect_melting_layer_impl(
-        sweeps,
-        params,
-        default_top_km_arl,
-        hsda,
-        cappi,
-        HcaOptions::primary(),
-    )
+    detect_melting_layer_impl(sweeps, params, default, hsda, cappi, HcaOptions::primary())
 }
 
 fn detect_melting_layer_impl(
     sweeps: &[&[Radial]],
     params: &KdpParams,
-    default_top_km_arl: f64,
+    default: &MeltingLayer,
     hsda: &HsdaHeights,
     cappi: Option<&ReflCappi>,
     opts: HcaOptions,
 ) -> MeltingLayer {
-    let default = MeltingLayer::flat(default_top_km_arl);
+    let default_top_km_arl = mean(&default.top_km_arl);
     let dbz0 = params.dbz0.map(f64::from);
     let atmos = params.atmos_db_per_km.map(f64::from);
 
@@ -2143,7 +2527,7 @@ fn detect_melting_layer_impl(
                     opts.metsignal,
                     cappi,
                 );
-                let classes = classify_radial(&f, &default, hsda.tw0_km_arl);
+                let classes = classify_radial(&f, default, hsda.tw0_km_arl);
                 let stop = (ml_range_from_height(c.elev, ML_MAX_TOP_KM) / f.dg + 0.5) as usize;
                 let az_index = (f.az.rem_euclid(360.0)) as usize % 360;
                 let mut heights = Vec::new();
@@ -2208,7 +2592,7 @@ fn detect_melting_layer_impl(
         }
     }
 
-    calculate_melting_layer(&weight, default_top_km_arl, &default)
+    calculate_melting_layer(&weight, default_top_km_arl, default)
 }
 
 /// `Calculate_melting_layer`'s radar-only path over one accumulation of
@@ -2292,7 +2676,89 @@ fn calculate_melting_layer(
     MeltingLayer {
         top_km_arl: out_top,
         bottom_km_arl: out_bottom,
+        source: MeltingLayerSource::RadarDetected,
     }
+}
+
+/// Resolve one volume's melting layer, best source first, and say which one
+/// answered.
+///
+/// # The chain, and why it is in this order
+///
+/// 1. **The RPG's own layer** for this volume (`rpg_melting_layer`, Level III
+///    166). Nothing else can be as right: it is the number the RPG's own
+///    `N0H` was classified on, per azimuth, with the three-volume
+///    accumulation and model merge a single archived volume cannot rebuild.
+///    Scored **82.8–95.9 % exact against `N0H` at ten sites**.
+/// 2. **This volume's own MLDA** ([`detect_melting_layer`]). Also per
+///    azimuth, also measured, but from one volume's worth of wet snow where
+///    the RPG accumulates three — so it concludes rarely, and when it does
+///    not it declines rather than inventing a layer.
+/// 3. **The sounding's freezing level**, flat. The right height with no
+///    azimuthal structure. Only reached when the two measured sources are
+///    unavailable, and only honest to the extent the sounding is
+///    contemporaneous with the volume — which for a live volume it is and for
+///    a replayed one it is not, since [`crate::sounding`] fetches a forecast
+///    for *now*. `sounding_h0c_km_msl` is therefore `None` on a replay, and
+///    the caller — not this function — is what knows which it is looking at.
+/// 4. **The fleet adaptation default**, flat at 10.5 kft MSL. A guess, and
+///    the measured cost of the guess is in [`MeltingLayerSource::caption`].
+///
+/// The MLDA is seeded with whichever of 3 or 4 is available, because its
+/// `Calculate_melting_layer` clips detections to ±2 layer depths of the
+/// previous top and a seed 3 km out would clip the right answer away.
+pub fn resolve_melting_layer(
+    rpg_melting_layer: Option<&nexrad_level3::model::Level3Message>,
+    ml_sweeps: &[&[Radial]],
+    params: &KdpParams,
+    sounding_h0c_km_msl: Option<f64>,
+    radar_km_msl: f64,
+    hsda: &HsdaHeights,
+    cappi: Option<&ReflCappi>,
+) -> MeltingLayer {
+    if let Some(message) = rpg_melting_layer {
+        match MeltingLayer::from_melting_layer_product(message) {
+            Some(recovery) if recovery.looks_sound() => {
+                log::info!(
+                    "Melting layer from the RPG's own product 166: mean top {:.3} km ARL, \
+                     depth {:.3} km (algorithm draws {ML_DEPTH_KM}), self-consistency {:.3} km",
+                    mean(&recovery.layer.top_km_arl),
+                    recovery.depth_km,
+                    recovery.consistency_km,
+                );
+                return recovery.layer;
+            }
+            Some(recovery) => log::warn!(
+                "Melting layer product 166 inverted to a {:.3} km layer with {:.3} km of \
+                 self-inconsistency; refusing it and falling back",
+                recovery.depth_km,
+                recovery.consistency_km,
+            ),
+            None => log::warn!("Melting layer product 166 carried no usable contours"),
+        }
+    }
+
+    let seed = match sounding_h0c_km_msl {
+        Some(h0c) => MeltingLayer::from_zero_c_height(h0c, radar_km_msl),
+        None => MeltingLayer::flat(DEFAULT_HEIGHT_0_KM_MSL - radar_km_msl),
+    };
+    let detected = detect_melting_layer(ml_sweeps, params, &seed, hsda, cappi);
+    if detected.source == MeltingLayerSource::RadarDetected {
+        log::info!(
+            "Melting layer detected from this volume's own 4-10 deg tilts: mean top {:.3} km ARL",
+            mean(&detected.top_km_arl),
+        );
+        return detected;
+    }
+    if seed.source == MeltingLayerSource::FleetDefault {
+        log::warn!(
+            "No melting layer for this volume from the RPG, the radar or a sounding: \
+             classifying on the {:.1} kft fleet adaptation default, which the twin campaign \
+             measured 2.9-3.1 km wrong in winter regimes (16-20% exact against N0H)",
+            DEFAULT_HEIGHT_0_KM_MSL / 0.3048,
+        );
+    }
+    seed
 }
 
 #[cfg(test)]

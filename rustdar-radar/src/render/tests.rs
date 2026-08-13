@@ -2375,10 +2375,11 @@ fn the_hybrid_classification_changes_with_the_environmental_heights() {
     // The fixture reaches 100 km, well inside the floor, so both renders take
     // the base raster and neither is asking anything of the size cascade.
     let scan = scan_of(vec![dual_pol_tilt(1, 0.5)]);
-    let defaults = super::render_hhc_to_image(&scan, LAT, LON, None, types::IMAGE_SIZE)
+    let defaults = super::render_hhc_to_image(&scan, LAT, LON, None, None, types::IMAGE_SIZE)
         .expect("the fixture classifies");
-    let sounding = super::render_hhc_to_image(&scan, LAT, LON, Some((0.8, 2.0)), types::IMAGE_SIZE)
-        .expect("the fixture classifies");
+    let sounding =
+        super::render_hhc_to_image(&scan, LAT, LON, Some((0.8, 2.0)), None, types::IMAGE_SIZE)
+            .expect("the fixture classifies");
 
     let painted = |grid: &[f32]| grid.iter().filter(|v| !v.is_nan()).count();
     let all_of = |grid: &[f32], class: f32| grid.iter().filter(|v| **v == class).count();
@@ -2445,6 +2446,7 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
         LON,
         None,
         None,
+        None,
         &crate::nyquist::DeclaredNyquist::empty(),
     )
     .expect("the fixture renders");
@@ -2454,6 +2456,7 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
         PRODUCT,
         LAT,
         LON,
+        None,
         None,
         None,
         &crate::nyquist::DeclaredNyquist::empty(),
@@ -2507,6 +2510,7 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
         PRODUCT,
         LAT,
         LON,
+        None,
         None,
         None,
         &crate::nyquist::DeclaredNyquist::empty(),
@@ -2771,6 +2775,7 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
             LON,
             None,
             None,
+            None,
             &crate::nyquist::DeclaredNyquist::empty(),
             ceiling,
         )
@@ -2875,6 +2880,7 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
         PRODUCT,
         LAT,
         LON,
+        None,
         None,
         None,
         &crate::nyquist::DeclaredNyquist::empty(),
@@ -3006,6 +3012,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         LON,
         None,
         None,
+        None,
         &declared,
     )
     .expect("the low tilt renders");
@@ -3017,6 +3024,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         types::RadarProduct::Velocity,
         LAT,
         LON,
+        None,
         None,
         None,
         &declared,
@@ -3036,6 +3044,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         LON,
         None,
         None,
+        None,
         &partial,
     )
     .expect("the low tilt renders");
@@ -3051,6 +3060,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         types::RadarProduct::EchoTopsInterpolated,
         LAT,
         LON,
+        None,
         None,
         None,
         &declared,
