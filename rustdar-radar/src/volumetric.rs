@@ -30,6 +30,10 @@
 //! The heights travel with the bins ([`BeamHeights::at_elevation`] takes the
 //! same parameter), because a cell filed under a ground range whose altitude
 //! came from a slant range describes two different points in the air.
+//!
+//! The seam has a second edge that is easy to miss: some volumes deliver
+//! content **coarser than the grid they declare**, and whether that costs
+//! anything depends on which side of the seam you are on. See [`GateFiling`].
 
 use crate::par::*;
 use crate::types::RadarProduct;
@@ -198,6 +202,223 @@ impl RangeBinning {
             Self::Ground => crate::beam::height_at_ground_km(range_km, elev_deg),
         }
     }
+
+    /// How this binning reads a sweep whose content may be coarser than the
+    /// grid it declares — see [`GateFiling`] for the property and
+    /// [`replicated_pairs`] for how it is recognised.
+    ///
+    /// **[`Slant`](Self::Slant) never decimates, and that is deliberate.**
+    /// Under slant binning the replication costs nothing: a 1 km bin holds the
+    /// declared gates `4r-8 ..= 4r-5`, the start index is always even, and two
+    /// whole replicated pairs land in every bin — so each 500 m sample is
+    /// weighted exactly once whichever way it is read. What decimating *would*
+    /// do there is reassociate the sums by which [`crate::eet`] and
+    /// [`crate::vil`] reproduce the RPG's own products bin for bin, moving a
+    /// twin comparison that exists to measure physics for no gain in the
+    /// physics. [`Ground`](Self::Ground) is where the alignment breaks, so
+    /// [`Ground`](Self::Ground) is where this looks.
+    fn gate_filing(self, radials: &[Radial], moment: RadarProduct) -> GateFiling {
+        match self {
+            Self::Slant => GateFiling::AsDeclared,
+            Self::Ground if replicated_pairs(radials, moment) => GateFiling::ReplicatedPairs,
+            Self::Ground => GateFiling::AsDeclared,
+        }
+    }
+}
+
+/// What one declared gate is, when a sweep's content is coarser than the grid
+/// it declares.
+///
+/// # The property
+///
+/// A **long-pulse** volume (`pulse_width = 4`; VCP 31 and VCP 34 here, 38 of
+/// the 158-volume corpus) declares 250 m reflectivity gates and delivers 500 m
+/// content, **replicated exactly twice**: declared gate `2k` and declared gate
+/// `2k+1` carry the same encoded value, always.
+///
+/// That is a property of the data and not of this decoder. MetPy, reading the
+/// raw 8-bit gate integers rather than anything decoded here, finds the even
+/// pairs identical over **134,570,160 gate pairs** across all 38 long-pulse
+/// volumes, 25 sites, both VCPs and the holdout, with **zero exceptions** —
+/// and the minimum over each of the 200,880 individual reflectivity radials is
+/// 1.0, not merely the mean. The replication is exactly 2×: `raw[4k]` against
+/// `raw[4k+2]` agrees 0.0794 of the time, which is the null rate, so there is
+/// no 4× structure underneath it. Sentinels replicate too — the 37.6 M
+/// below-threshold gates and the 336 range-folded ones pair up like the rest.
+///
+/// # Why it only matters under [`RangeBinning::Ground`]
+///
+/// Under [`RangeBinning::Slant`] a 1 km bin holds four declared gates starting
+/// at an even index, so it holds two whole pairs and each 500 m sample is
+/// weighted once. The `cos e` scaling of [`RangeBinning::Ground`] stretches
+/// that to **four or five** declared gates per bin, so a pair straddles a bin
+/// edge: one 500 m sample is counted twice in one bin and once in the next, and
+/// a cell's mean is a weighted average that nothing intended.
+///
+/// # The registration, which is the part easy to get wrong
+///
+/// Reading every other gate is only half the fix. The declared first gate is at
+/// **2125 m** — the ICD's range to the *centre* of gate 0, whose leading edge is
+/// therefore 2000 m — and the declared gate count is even, so the `N/2` 500 m
+/// samples tile `[2000 m, 2000 + 250·N)` exactly. The first sample spans
+/// `[2000, 2500)` and its centre is **2250 m**, half a declared gate beyond
+/// gate 0's own. Filing the pair at 2125 m instead — the first sub-gate's
+/// centre — puts every sample 125 m too near the radar, and under the `cos e`
+/// scaling that 125 m is most of the difference the whole change is about. It
+/// is the same half-gate class of error as an index read as a centre, and this
+/// crate has had one of those already.
+///
+/// So a pair's sample is filed at `first_gate + k·interval + interval/2`, which
+/// for even `k` is just the declared gate's own range plus half a gate.
+///
+/// The oracle confirms the inputs to that argument and not its conclusion, and
+/// the difference is worth keeping straight: MetPy reads `first_gate = 2125 m`
+/// and `gate_width = 250 m` off the wire, and the gate count is even on every
+/// long-pulse sweep (800…1832), but MetPy has no docstring, comment or
+/// attribute anywhere saying whether `first_gate` is a centre or a leading
+/// edge. **The centre reading is the ICD's, not MetPy's.** What the bits do
+/// settle is the tiling: the pairing starts at gate 0 — `raw[0] == raw[1]` on
+/// 32,400 of 32,400 radials checked, against a 0.079 null — so there is no
+/// unpaired leading gate and sample `j` is exactly declared gates `2j, 2j+1`.
+///
+/// # What this is worth, measured
+///
+/// Not much, and the honest number belongs next to the mechanism. Over the
+/// whole long-pulse corpus — 38 volumes, 25 sites, 3 in `holdout/` — filing
+/// pairs correctly moves **79 of 9353 defined cells (0.84 %)**, in **3 of 38
+/// volumes**, and only **11 cells in the entire corpus (0.12 %)** change the
+/// 1 kft bin the ICD quantises echo tops to. The pooled mean absolute change is
+/// **0.0014 kft**, about 0.4 m. **The holdout arm does not move a single
+/// cell.** The largest single-cell change is 3.06 kft, in the one volume
+/// (KGRB, 2024-12-16) that carries 68 of the 79.
+///
+/// The reason is structural rather than lucky, and it bounds the defect for
+/// good: **a long pulse is only ever used in a clear-air VCP**, and every
+/// long-pulse volume in the corpus — VCP 34 included — tops out between 4.44°
+/// and 4.53°. `cos 4.53°` is 0.99688, so a 1 km ground bin holds **4.0125**
+/// declared gates and a pair straddles a bin edge about once in every 80 bins.
+/// The steep cuts where ground binning bites hardest (19.5°, 4.24 gates to a
+/// bin) are short-pulse cuts, and short-pulse content is not replicated.
+/// Replication and steep elevation never co-occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateFiling {
+    /// Every declared gate is its own sample, filed at its declared range.
+    AsDeclared,
+    /// Declared gates come in replicated pairs. Each pair is one sample, read
+    /// from its even member and filed at the pair's centre — half a declared
+    /// gate beyond that member's own range.
+    ReplicatedPairs,
+}
+
+/// Radials the replication detector reads, spread at a fixed stride over the
+/// sweep.
+///
+/// Sixteen rather than one because a *single* radial proves nothing: on the
+/// short-pulse corpus individual radials reach 1.0000 even-parity agreement
+/// where their sweeps reach 0.25, so a per-radial test would false-positive on
+/// a data-starved cut. Sixteen rather than all of them because the detector
+/// then costs about 2 % of the grid build it guards, and because the property
+/// it looks for is not a tendency — it is exact, and a counterexample anywhere
+/// in the sample ends the question.
+const REPLICATION_SAMPLE_RADIALS: usize = 16;
+
+/// Gate pairs carrying **numbers** that the detector must clear before it will
+/// believe a sweep is replicated.
+///
+/// Measured, not guessed, over 158 archived volumes (120 short-pulse, 38
+/// long-pulse; 5 VCPs including two TDWR volumes whose 150 m gates are the
+/// finest — and so the smoothest-sampled — in the corpus):
+///
+/// | | short pulse (null) | long pulse (signal) |
+/// |---|---|---|
+/// | reflectivity sweeps | 1623 | 318 |
+/// | sweeps where **every** sampled pair matches | **0** | **318** |
+/// | most numeric pairs cleared before a mismatch | **3** | (no mismatch) |
+/// | numeric pairs available in the sample | — | **≥ 46**, median 829 |
+///
+/// The two arms do not overlap and do not come close to it. A genuinely smooth
+/// field agrees on adjacent gates about 7 % of the time — the short-pulse
+/// even-parity rate is 0.067 at the median and 0.25 at its worst sweep, and the
+/// long-pulse *odd*-parity control, which is the same null measured inside the
+/// signal arm, reads 0.076 at the median and 0.273 at its worst. Replication
+/// reads 1.0000, exactly, everywhere.
+///
+/// 32 sits an order of magnitude above the null's ceiling of 3 and 14 pairs
+/// below the signal's floor of 46, so it costs nothing on either arm: every one
+/// of the 318 long-pulse sweeps still detects, and none of the 1623 short-pulse
+/// sweeps comes within a factor of ten of qualifying. Under the worst null rate
+/// measured (0.25) clearing 32 pairs has probability 5 × 10⁻²⁰; even at a
+/// coin-flip 0.5 it is 2 × 10⁻¹⁰.
+///
+/// **A sweep that cannot clear it is simply filed as declared** — the defect
+/// this guards against is a mis-weighted mean, and declining to decimate leaves
+/// exactly the behaviour that shipped. False positives are the expensive
+/// direction: decimating a sweep that is *not* replicated would throw away half
+/// its gates.
+const REPLICATION_MIN_PAIRS: u32 = 32;
+
+/// Whether a sweep's `moment` is 500 m content replicated onto a declared 250 m
+/// grid — see [`GateFiling`] for the property and [`REPLICATION_MIN_PAIRS`] for
+/// the measurement behind the constants.
+///
+/// The predicate is **exactness over a sample**, not a ratio: every declared
+/// pair `(2k, 2k+1)` in [`REPLICATION_SAMPLE_RADIALS`] radials must be
+/// identical — sentinels included, which they are, so a `BelowThreshold` beside
+/// a number is itself a counterexample — and at least
+/// [`REPLICATION_MIN_PAIRS`] of them must carry numbers, so that an empty sweep
+/// whose every pair is two `BelowThreshold`s cannot qualify on vacuity.
+///
+/// Counting only numeric pairs toward the minimum is load-bearing and not
+/// fastidiousness: over **all** gates a short-pulse sweep's runs of
+/// below-threshold gates clear 2234 pairs before the first mismatch, against 3
+/// once the count is restricted to gates carrying numbers.
+///
+/// Cheap because it is exact. The first mismatch ends the walk, and on
+/// short-pulse data that arrives after one or two pairs — so the ~76 % of
+/// volumes this changes nothing for pay a handful of comparisons per sweep,
+/// not a scan. Measured end to end over the 120 short-pulse volumes,
+/// best-of-five user CPU: **29.63 s without this, 29.69 s with it**, which is
+/// 0.2 % and inside the run-to-run spread.
+///
+/// # Why a false positive cannot destroy data
+///
+/// Decimating a sweep that is not replicated would be the expensive mistake —
+/// an unconditional stride-2 walk drops 1.4–19.5 % of a short-pulse sweep's
+/// gates. This one cannot make it, because the gate it drops is one it has
+/// **checked is bit-identical** to the gate it keeps. A false positive is
+/// therefore not a loss of content; it is only a 125 m shift in where that
+/// content is filed. The check is over a sample rather than every radial, so
+/// that is an inference and not a proof — but it is an inference the oracle
+/// measured on all 200,880 radials of the long-pulse arm and found exact.
+///
+/// The limit worth naming: content that happens to be **constant over
+/// even-aligned pairs** is indistinguishable from replicated content, and no
+/// local test can separate them. Real fields are nowhere near it — 1623
+/// short-pulse sweeps clear at most 3 numeric pairs — and the failure would in
+/// any case be the benign one above.
+///
+/// A pure function of `(radials, moment)`, like everything else
+/// [`VolumeCube::build_with_stats`] runs under rayon, and deterministic: the
+/// stride is fixed, so the same sweep is read the same way on every thread and
+/// every run.
+fn replicated_pairs(radials: &[Radial], moment: RadarProduct) -> bool {
+    let stride = (radials.len() / REPLICATION_SAMPLE_RADIALS).max(1);
+    let mut numeric_pairs = 0u32;
+    for radial in radials.iter().step_by(stride) {
+        let Some(md) = moment.get_moment(radial) else {
+            continue;
+        };
+        let mut gates = md.iter();
+        while let (Some(a), Some(b)) = (gates.next(), gates.next()) {
+            if a != b {
+                return false;
+            }
+            if matches!(a, MomentValue::Value(_)) {
+                numeric_pairs += 1;
+            }
+        }
+    }
+    numeric_pairs >= REPLICATION_MIN_PAIRS
 }
 
 /// One moment's 360×230 grid on one tilt, with the sweep it came from.
@@ -465,8 +686,13 @@ fn tilt_at(
                 .find(|(k, ..)| (k - key).abs() < 0.05)
                 .map(|&(_, si, displaced)| {
                     let radials = scan.sweeps()[si].radials();
-                    let (values, status) =
-                        sweep_to_grid(radials, moment, stat, binning.range_scale(radials));
+                    let (values, status) = sweep_to_grid(
+                        radials,
+                        moment,
+                        stat,
+                        binning.range_scale(radials),
+                        binning.gate_filing(radials, moment),
+                    );
                     MomentGrid {
                         values,
                         status,
@@ -608,6 +834,12 @@ impl LinearZMemo {
 /// A parameter rather than a re-derivation from `radials` because it is one
 /// number per sweep and this runs once per moment per tilt.
 ///
+/// `filing` is [`RangeBinning::gate_filing`], a parameter for the same reason
+/// and answering a different question: whether a declared gate *is* a sample,
+/// or is one of a replicated pair that together make one. Over a pair this walk
+/// reads the even gate only and files it half a declared gate further out —
+/// which is where the pair's sample actually sits. See [`GateFiling`].
+///
 /// # The second return value, and why it is a second value
 ///
 /// The `NaN` above is three different facts wearing one bit pattern — the
@@ -652,6 +884,7 @@ fn sweep_to_grid(
     moment: RadarProduct,
     stat: CellStat,
     range_scale: f64,
+    filing: GateFiling,
 ) -> (Vec<Vec<f32>>, Vec<Vec<crate::types::GateReport>>) {
     use crate::types::GateReport;
     let mut grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
@@ -685,17 +918,25 @@ fn sweep_to_grid(
         };
         let fg = md.first_gate_range_km();
         let gi = md.gate_interval_km();
+        // How many declared gates one sample spans, and where its centre sits
+        // relative to the gate this walk reads it from. Both are 1 and 0 for
+        // ordinary content; see [`GateFiling`] for the pair case and for why
+        // the half-gate is not optional.
+        let (step, centre_shift) = match filing {
+            GateFiling::AsDeclared => (1, 0.0),
+            GateFiling::ReplicatedPairs => (2, gi / 2.0),
+        };
         // (accumulator, gate count) per cell; what the accumulator holds
         // depends on `stat`.
         let mut acc = vec![(0.0f64, 0u32); RANGE_BINS];
         // `iter`, not `values`: this walk is sequential, so the `Vec` `values`
         // collects into would be eight bytes per gate allocated and dropped
         // for every azimuth cell of every sweep of the volume.
-        for (j, v) in md.iter().enumerate() {
+        for (j, v) in md.iter().enumerate().step_by(step) {
             // The bin is the gate's, whatever the gate said: a below-threshold
             // or range-folded gate is still a gate *here*, and filing it is
             // the whole point of the status plane.
-            let r = ((fg + j as f64 * gi) * range_scale) as usize;
+            let r = ((fg + j as f64 * gi + centre_shift) * range_scale) as usize;
             if r >= RANGE_BINS {
                 continue;
             }
@@ -895,6 +1136,34 @@ fn sweep_to_grid(
 /// VCP's **target** elevation angle — bit-identical for both visits of a cut —
 /// would remove the failure mode outright. Not done here: it re-pins every
 /// cube consumer's fixtures at once and wants its own change.
+///
+/// Sized since, over the whole 158-volume corpus: **20 volumes split a physical
+/// cut across two tilt keys**, and the split is the *same number every time* —
+/// the two medians are **0.0439°** apart in 21 of 21 occurrences, which is the
+/// Message 5 elevation quantisation the geometry audit measured independently.
+/// It is a VCP-35-and-215 phenomenon (15 and 5 volumes) with one VCP 31 case,
+/// and it splits at the 0.4/0.5 and 1.3/1.4 key boundaries. That is an order of
+/// magnitude more common than the replication defect below and it moves cells
+/// by kilofeet rather than by metres, so of the two it is the one worth a
+/// change — but it is still a change to the tilt key that every cube consumer's
+/// fixtures are pinned against, and two of those consumers are scored against
+/// RPG twins.
+///
+/// # A second one: long-pulse volumes deliver 500 m content on a 250 m grid
+///
+/// [`GateFiling`] has the property, the mechanism and the registration; the
+/// part that belongs here is what it is worth to *this* product. Under
+/// [`RangeBinning::Ground`] a replicated pair can straddle a bin edge and be
+/// counted twice on one side and once on the other. Measured over the whole
+/// long-pulse corpus, correcting it moves **0.84 % of defined cells in 3 of 38
+/// volumes**, changes the ICD's own 1 kft bin for **11 cells in the corpus**,
+/// and moves **nothing at all in the holdout arm**. Its magnitude is capped by
+/// the fact that a long pulse only ever flies in a clear-air VCP, which never
+/// cuts above 4.53°.
+///
+/// [`crate::eet`] and [`crate::vil`] are untouched by it: they bin
+/// [`RangeBinning::Slant`], where a 1 km bin holds two whole pairs and the
+/// replication costs exactly nothing.
 ///
 /// # None of this is a licence to "fix" this to match `eet`
 ///
