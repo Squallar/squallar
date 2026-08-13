@@ -512,6 +512,11 @@ pub struct FetchConfig {
     pub viewport: Option<crate::types::GeoBounds>,
 }
 
+/// `Copy` so a rasterizer can be handed the whole thing rather than three loose
+/// scalars: `zoom`, `is_dark` and `device_scale` are read together by every
+/// symbol a texture overlay draws, and splitting them across an argument list
+/// is how one of them comes to be forgotten at a call site.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RasterizeContext {
     pub is_dark: bool,
     pub zoom: f64,
