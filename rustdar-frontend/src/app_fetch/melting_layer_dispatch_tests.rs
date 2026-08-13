@@ -1,17 +1,26 @@
-//! Which melting layer each dispatch path actually puts on the wire.
+//! Which **per-volume render input** each dispatch path actually puts on the
+//! wire: the RPG's melting layer for the hybrid classification, and the RPG's
+//! storm motion vector for storm-relative velocity.
+//!
+//! Two inputs, one file, because they are one mechanism. Both are objects the
+//! RPG published for exactly one volume, both are fetched on their own
+//! schedule and paired by PDB, both are cached one-per-site behind a
+//! volume-strict accessor, and both are *invisible in the output*: by the time
+//! a raster comes back there is nothing left in it to distinguish "classified
+//! against the RPG's own layer" from "classified against a fleet constant", or
+//! "shifted by the vector the reference product used" from "shifted by a
+//! right-mover prediction". That is the entire problem this workstream exists
+//! to solve, and a test that let the two inputs drift apart would be testing
+//! the mechanism once.
 //!
 //! Read back through `JobRequest::from_bytes`, the same decode a worker runs,
-//! for the reason `loop_raster_ceiling_tests` does it: the melting layer is a *render
-//! input*, and by the time a raster comes back there is nothing left in it to
-//! distinguish "classified against the RPG's own layer" from "classified
-//! against a fleet constant" — that is the entire problem this workstream
-//! exists to solve.
+//! for the reason `loop_raster_ceiling_tests` does it.
 //!
-//! Two paths dispatch a classification and they are written in two files.
+//! Two paths dispatch each product and they are written in two files.
 //! Asserting both from one app is what makes this a property of the dispatch
 //! rather than of whichever half was edited last: a loop frame and the still
-//! frame beside it must classify the same volume against the same layer, and
-//! *different* volumes against different ones.
+//! frame beside it must stand on the same volume's inputs, and *different*
+//! volumes on different ones.
 
 use super::*;
 use crate::offload::{JobRequest, JobSink};
@@ -316,4 +325,203 @@ fn a_product_that_classifies_nothing_carries_no_melting_layer() {
     );
 
     assert_eq!(dispatched_objects(&posted), vec![None]);
+}
+
+/// The RPG storm motion vector each posted job carries, in dispatch order.
+///
+/// [`dispatched_objects`]'s sibling, reading the other per-volume render input
+/// off the same decoded payload. A pair rather than a blob because that is what
+/// crosses: an `N0S` yields two scalars out of its PDB and the fetch decoded
+/// them there.
+fn dispatched_motions(posted: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<Option<(f32, f32)>> {
+    posted
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|bytes| {
+            let job = JobRequest::from_bytes(bytes).expect("a job this build posted decodes");
+            match job {
+                JobRequest::Radar { input, .. } => input.rpg_storm_motion(),
+                other => panic!("expected a Level II render job, got {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The vector the cache is primed with. Nothing round about it: a value that
+/// survived a dropped decimal or a knots/metres mix-up unnoticed would make
+/// this test agree with a broken path.
+const MOTION: (f32, f32) = (37.5, 218.5);
+
+/// **Both storm-relative dispatch paths carry the vector, and only for the
+/// volume it names.**
+///
+/// `both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other`
+/// for the other per-volume input, and the same two claims in two files: the
+/// still frame and the loop frame build their own `RenderInput`s, and the
+/// second is the one that decays quietly, because a loop frame with no RPG
+/// vector still draws a full, plausible storm-relative field.
+///
+/// The third dispatch is again the point of the design. A loop frame from a
+/// *different* volume gets `None` and falls to `srv::storm_motion`'s next rung,
+/// which says so on the pane. Handing it the cached vector would apply one
+/// volume's storm to another volume's field as a solid-body shift of every
+/// gate — `speed · cos(direction − azimuth)` everywhere — and the render would
+/// then report itself as `RpgScitAverage`, the RPG's own, while being neither.
+#[test]
+fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
+    let posted = Arc::new(Mutex::new(Vec::new()));
+    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+
+    let mut app = crate::app::tests::headless(TestBridge::desktop());
+    let site = rustdar_radar::sites::get_radar_site(SITE)
+        .expect("KTLX is a real radar")
+        .clone();
+    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.render.ensure_pane_count(1);
+    app.render.set_storm_motion(
+        SITE,
+        crate::render_dispatch::StormMotionObject {
+            volume_start: volume(0),
+            motion: MOTION,
+        },
+        &app.gui,
+    );
+
+    let params = || crate::render_dispatch::RenderParams {
+        product: RadarProduct::StormRelativeVelocity,
+        elevation: 0.5,
+        lat: site.lat,
+        lon: site.lon,
+    };
+    let target = || rustdar_egui::pane::RenderTarget {
+        site: SITE.to_string(),
+        product: RadarProduct::StormRelativeVelocity,
+        elevation: 0.5,
+    };
+
+    // 1. The still frame, on the volume the vector names.
+    let (sender, _rx) = std::sync::mpsc::channel();
+    app.render.spawn_level2_render(
+        0,
+        &params(),
+        SITE,
+        std::sync::Arc::new(dual_pol_scan()),
+        &rustdar_radar::nyquist::DeclaredNyquist::empty(),
+        volume(0),
+        sender,
+        None,
+    );
+
+    // 2. A loop frame of that same volume.
+    assert!(
+        app.spawn_loop_frame_render(
+            0,
+            volume(0),
+            crate::loop_downloads::LoopFrameData::Volume(
+                std::sync::Arc::new(dual_pol_scan()),
+                Default::default(),
+            ),
+            params(),
+            target(),
+        ),
+        "the fixture must actually reach the loop dispatch",
+    );
+
+    // 3. A loop frame of an *older* volume, which nothing fetched an `N0S`
+    //    for. This is the frame the still frame's vector must not reach.
+    assert!(
+        app.spawn_loop_frame_render(
+            0,
+            volume(6),
+            crate::loop_downloads::LoopFrameData::Volume(
+                std::sync::Arc::new(dual_pol_scan()),
+                Default::default(),
+            ),
+            params(),
+            target(),
+        ),
+        "the fixture must actually reach the loop dispatch",
+    );
+
+    let motions = dispatched_motions(&posted);
+    assert_eq!(motions.len(), 3, "one still frame and two loop frames");
+    assert_eq!(
+        motions[0],
+        Some(MOTION),
+        "the still frame shifted without the storm motion the app holds for \
+         its own volume",
+    );
+    assert_eq!(
+        motions[1],
+        Some(MOTION),
+        "a loop frame of the same volume shifted by a different vector than \
+         the still frame beside it",
+    );
+    assert_eq!(
+        motions[2], None,
+        "a loop frame took another volume's storm motion, which reports a \
+         prediction as the vector the RPG applied",
+    );
+}
+
+/// No other product carries the vector, however it is dispatched.
+///
+/// [`a_product_that_classifies_nothing_carries_no_melting_layer`]'s sibling,
+/// and refused in the same place and for the same reason: a storm motion
+/// vector is a render input to storm-relative velocity and to nothing else, so
+/// the accessor refuses it here rather than trusting the far end to — the far
+/// end refusing it is not something this side can see.
+#[test]
+fn a_product_that_applies_no_storm_motion_carries_none() {
+    let posted = Arc::new(Mutex::new(Vec::new()));
+    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+
+    let mut app = crate::app::tests::headless(TestBridge::desktop());
+    let site = rustdar_radar::sites::get_radar_site(SITE)
+        .expect("KTLX is a real radar")
+        .clone();
+    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.render.ensure_pane_count(1);
+    app.render.set_storm_motion(
+        SITE,
+        crate::render_dispatch::StormMotionObject {
+            volume_start: volume(0),
+            motion: MOTION,
+        },
+        &app.gui,
+    );
+
+    // Velocity is the sharp row: it is the moment SRV is *derived from*, so a
+    // gate written as "does this product read velocity" rather than "is this
+    // product storm-relative" would pass a plain velocity sweep the vector and
+    // paint a storm-relative field under the velocity legend.
+    for product in [
+        RadarProduct::Reflectivity,
+        RadarProduct::Velocity,
+        RadarProduct::HydrometeorClassification,
+    ] {
+        posted.lock().unwrap().clear();
+        let (sender, _rx) = std::sync::mpsc::channel();
+        app.render.spawn_level2_render(
+            0,
+            &crate::render_dispatch::RenderParams {
+                product,
+                elevation: 0.5,
+                lat: site.lat,
+                lon: site.lon,
+            },
+            SITE,
+            std::sync::Arc::new(dual_pol_scan()),
+            &rustdar_radar::nyquist::DeclaredNyquist::empty(),
+            volume(0),
+            sender,
+            None,
+        );
+        assert_eq!(
+            dispatched_motions(&posted),
+            vec![None],
+            "{product:?} was handed a storm motion vector it does not shift by",
+        );
+    }
 }

@@ -351,6 +351,7 @@ impl super::App {
                 elevation: rr.elevation,
                 nyquist_ms: rendered.nyquist_ms,
                 melting_layer_source: rendered.melting_layer_source,
+                storm_motion_source: rendered.storm_motion_source,
             };
 
             // Cache the render output for sharing with other panes on the same site
@@ -376,6 +377,7 @@ impl super::App {
                     hover: Arc::clone(&render_result.hover),
                     nyquist_ms: render_result.nyquist_ms,
                     melting_layer_source: render_result.melting_layer_source,
+                    storm_motion_source: render_result.storm_motion_source,
                 },
             );
 
@@ -625,6 +627,7 @@ impl super::App {
                 elevation: render.elevation,
                 nyquist_ms: render.nyquist_ms,
                 melting_layer_source: render.melting_layer_source,
+                storm_motion_source: render.storm_motion_source,
             });
         }
 
@@ -666,6 +669,11 @@ impl super::App {
                 // the object it came from belongs to a volume that will have
                 // rolled by the time anything could look it up again.
                 melting_layer_source: render.melting_layer_source,
+                // And where the shift behind them came from, on exactly the
+                // same terms: it describes *this* image, and the `N0S` it was
+                // read from belongs to a volume that will have rolled by the
+                // time anything could look it up again.
+                storm_motion_source: render.storm_motion_source,
                 // What these pixels are, travelling with them. Whichever
                 // datasource produced them: this is the one assignment behind
                 // `PaneState::stale_image_on_screen`, so a Level II and a
@@ -915,6 +923,47 @@ impl super::App {
                 log::info!(
                     "Melting layer moved for {}: dropped the classification renders",
                     ml.site
+                );
+            }
+        }
+        while let Ok(sm) = self.channels.storm_motion_receiver.try_recv() {
+            if self.render.is_fetch_stale(&sm.site, sm.generation) {
+                continue;
+            }
+            // A site that published no `N0S` for this volume, or one whose PDB
+            // carried no vector, caches nothing and is not retried — the same
+            // reading of "not found" the melting layer above takes. SRV falls
+            // to the next rung of `rustdar_radar::srv::storm_motion` and the
+            // pane says which one.
+            //
+            // **`Some((0.0, 0.0))` does not land here.** It is a vector the
+            // RPG applied — SCIT tracked no cells and the field went
+            // unshifted — so it passes this gate like any other reading and is
+            // cached. Only `None`, which is the absence of an object rather
+            // than a zero in one, stops.
+            let Some((speed_kt, direction_deg)) = sm.motion else {
+                continue;
+            };
+            log::info!(
+                "Storm motion cached for {} (volume {}): {speed_kt:.1} kt from {direction_deg:.1}°",
+                sm.site,
+                sm.volume_start,
+            );
+            // Through the setter, so an SRV pane already drawn against a
+            // Bunkers right-mover is redrawn against the RPG's own vector
+            // rather than waiting for the volume to roll — the same reason the
+            // two above go through theirs.
+            if self.render.set_storm_motion(
+                &sm.site,
+                crate::render_dispatch::StormMotionObject {
+                    volume_start: sm.volume_start,
+                    motion: (speed_kt, direction_deg),
+                },
+                &self.gui,
+            ) {
+                log::info!(
+                    "Storm motion moved for {}: dropped the storm-relative renders",
+                    sm.site
                 );
             }
         }
@@ -1207,6 +1256,7 @@ impl super::App {
                             elevation,
                             nyquist_ms: cached.nyquist_ms,
                             melting_layer_source: cached.melting_layer_source,
+                            storm_motion_source: cached.storm_motion_source,
                         };
                         log::info!(
                             "Reusing cached render for pane {}: {:?} at {:.1}°",
@@ -1788,6 +1838,7 @@ impl super::App {
             let elevation = cached.elevation;
             let nyquist_ms = cached.nyquist_ms;
             let melting_layer_source = cached.melting_layer_source;
+            let storm_motion_source = cached.storm_motion_source;
 
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 continue;
@@ -1856,6 +1907,11 @@ impl super::App {
                         // the picture this whole path exists to stop being
                         // indistinguishable from a measured one.
                         melting_layer_source,
+                        // And, for the storm motion, restoring a right-mover
+                        // prediction with nothing saying so — a field shifted
+                        // by a vector the RPG never applied, indistinguishable
+                        // from the reference product.
+                        storm_motion_source,
                         product,
                         elevation,
                     }),
@@ -3846,6 +3902,7 @@ fn rendered_image(
         max_range_km: rr.max_range_km,
         nyquist_ms: rr.nyquist_ms,
         melting_layer_source: rr.melting_layer_source,
+        storm_motion_source: rr.storm_motion_source,
         // **This is what makes a hover work under a loop.** The field carries
         // this frame's wedges and no numbers — `deliver` stripped them — and
         // `gates` is an `Arc` on the volume it was drawn from, which the loop's

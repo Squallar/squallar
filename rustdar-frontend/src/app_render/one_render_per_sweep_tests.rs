@@ -307,6 +307,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
                 hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
                 melting_layer_source: None,
+                storm_motion_source: None,
             }),
             product: RadarProduct::Reflectivity,
             elevation: TILT,

@@ -1526,7 +1526,7 @@ fn velocity_pane_on(screen: egui::Vec2, site: &str, nyquist_ms: Option<f64>) -> 
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::Velocity, 0.5);
     h.select_product(0, RadarProduct::Velocity);
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, nyquist_ms, None);
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, nyquist_ms, None, None);
     h
 }
 
@@ -1728,7 +1728,7 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
     };
     let undeclared = title_baseline(&h, "mph");
     h.select_product(0, RadarProduct::Reflectivity);
-    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None);
+    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
     assert_eq!(
         undeclared,
         title_baseline(&h, "dBZ"),
@@ -1822,6 +1822,7 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
         2.4,
         Some(DECLARED_NYQUIST_MS),
         None,
+        None,
     );
     assert_eq!(
         fold_line_painted(&h),
@@ -1833,6 +1834,7 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
         RadarProduct::Velocity,
         0.5,
         Some(DECLARED_NYQUIST_MS),
+        None,
         None,
     );
     assert!(
@@ -2125,7 +2127,7 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
 
     h.offer_product(0, RadarProduct::SpectrumWidth, 0.5);
     h.select_product(0, RadarProduct::SpectrumWidth);
-    h.place_radar_image(0, RadarProduct::SpectrumWidth, 0.5, None, None);
+    h.place_radar_image(0, RadarProduct::SpectrumWidth, 0.5, None, None, None);
     assert!(
         keyed(&h),
         "spectrum width carries range-folded gates too and has no key for \
@@ -2137,7 +2139,7 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     assert_eq!(fold_line_painted(&h), None);
 
     h.select_product(0, RadarProduct::Reflectivity);
-    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None);
+    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
     assert!(
         !keyed(&h),
         "the reflectivity bar keys a colour its surveillance cut does not \
@@ -2183,6 +2185,7 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
         RadarProduct::Velocity,
         0.5,
         Some(DECLARED_NYQUIST_MS),
+        None,
         None,
     );
     assert_eq!(
@@ -5007,6 +5010,7 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
         0.5,
         None,
         None,
+        None,
     );
     h.warm_up();
 
@@ -5751,7 +5755,7 @@ fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::EchoTops, 0.5);
     h.select_product(0, showing);
-    h.place_radar_image(0, showing, 0.5, None, None);
+    h.place_radar_image(0, showing, 0.5, None, None, None);
     h
 }
 
@@ -5826,7 +5830,7 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
     );
 
     // The render lands and the notice goes.
-    h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None, None);
+    h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None, None, None);
     assert!(
         !any_notice_painted(&h),
         "the notice outlived the render it was waiting for; painted: {:?}",
@@ -5849,7 +5853,7 @@ fn a_same_selection_re_render_draws_no_notice() {
     // Two more volumes' worth of the same selection re-rendered, as an
     // auto-poll or the chunk feed produces.
     for _ in 0..2 {
-        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None);
+        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
         assert!(
             !any_notice_painted(&h),
             "a routine re-render of the selected product drew a notice; \
@@ -5927,8 +5931,8 @@ fn the_pending_notice_is_identical_for_both_datasources() {
     );
 
     // And each one clears on its own render landing, the same way.
-    awaiting_l3.place_radar_image(0, l3, 0.5, None, None);
-    awaiting_l2.place_radar_image(0, l2, 0.5, None, None);
+    awaiting_l3.place_radar_image(0, l3, 0.5, None, None, None);
+    awaiting_l2.place_radar_image(0, l2, 0.5, None, None, None);
     assert!(!any_notice_painted(&awaiting_l3));
     assert!(!any_notice_painted(&awaiting_l2));
 }
@@ -15207,6 +15211,7 @@ fn classification_showing(source: Option<rustdar_radar::hca::MeltingLayerSource>
         0.5,
         None,
         source,
+        None,
     );
     h
 }
@@ -15305,23 +15310,41 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
     );
 }
 
-/// The two top-of-pane notices are never on screen together.
+/// **No two top-of-pane notices are ever on screen together — and there are
+/// three of them now.**
 ///
-/// They occupy the same spot by design (one plate, one voice), and the
-/// arrangement that keeps them apart is not draw-order arithmetic: it is
-/// `PaneState::displayed_melting_layer_source`'s `stale_image_on_screen` gate.
-/// While the pane is showing somebody else's product it says nothing about
-/// this one's melting layer, because it is not the melting layer of the
-/// picture on the glass.
+/// They occupy the same spot by design (one plate, one voice), and *two
+/// different arrangements* keep the three apart. Both are asserted here,
+/// because generalising the plate without generalising this test is how the
+/// third one comes to stack on the second.
+///
+/// 1. **Against the pending notice: the `stale_image_on_screen` gate.** Both
+///    `PaneState::displayed_melting_layer_source` and
+///    `PaneState::displayed_storm_motion_source` return `None` while the pane
+///    is showing somebody else's product, because the render input they
+///    describe is not the one behind the picture on the glass.
+/// 2. **Against each other: the product.** One is gated on
+///    `HydrometeorClassification` and the other on `StormRelativeVelocity`,
+///    and a pane has one selected product — so this is not draw-order
+///    arithmetic and not an ordering convention, it is arithmetic that cannot
+///    come out any other way.
 #[test]
-fn the_two_top_of_pane_notices_never_stack() {
+fn the_top_of_pane_notices_never_stack() {
     use rustdar_radar::hca::MeltingLayerSource;
+    use rustdar_radar::srv::StormMotionSource;
     use rustdar_radar::types::RadarProduct;
 
+    // 1. The melting-layer caveat against the pending notice.
     let mut h = classification_showing(Some(MeltingLayerSource::FleetDefault));
     assert!(
         melting_layer_notice_painted(&h).is_some() && !any_notice_painted(&h),
         "precondition: the melting-layer notice alone; painted: {:?}",
+        h.painted_text_strings(),
+    );
+    assert_eq!(
+        storm_motion_notice_painted(&h),
+        None,
+        "a classification pane drew a storm-motion notice; painted: {:?}",
         h.painted_text_strings(),
     );
 
@@ -15341,5 +15364,177 @@ fn the_two_top_of_pane_notices_never_stack() {
         None,
         "both notices were painted over one another; painted: {:?}",
         h.painted_text_strings(),
+    );
+
+    // 2. The storm-motion caveat against the pending notice, on exactly the
+    //    same terms — the third notice earns no exemption from the gate the
+    //    second one is held to.
+    let mut srv = storm_relative_showing(Some(StormMotionSource::BunkersRightMover));
+    assert!(
+        storm_motion_notice_painted(&srv).is_some() && !any_notice_painted(&srv),
+        "precondition: the storm-motion notice alone; painted: {:?}",
+        srv.painted_text_strings(),
+    );
+    assert_eq!(
+        melting_layer_notice_painted(&srv),
+        None,
+        "an SRV pane drew a melting-layer notice; painted: {:?}",
+        srv.painted_text_strings(),
+    );
+
+    srv.offer_product(0, RadarProduct::Reflectivity, 0.5);
+    srv.select_product(0, RadarProduct::Reflectivity);
+    assert!(
+        any_notice_painted(&srv),
+        "precondition: the pane is showing a storm-relative field labelled \
+             reflectivity; painted: {:?}",
+        srv.painted_text_strings(),
+    );
+    assert_eq!(
+        storm_motion_notice_painted(&srv),
+        None,
+        "the storm-motion notice was painted under the pending one; painted: {:?}",
+        srv.painted_text_strings(),
+    );
+}
+
+/// A harness with one pane on KTLX showing a finished storm-relative velocity
+/// image that was shifted by `source`.
+///
+/// [`classification_showing`]'s sibling, built the same way — through the real
+/// UI, with the image *placed* rather than the accessor stubbed — so what is
+/// asserted is what a viewer would be looking at.
+fn storm_relative_showing(source: Option<rustdar_radar::srv::StormMotionSource>) -> InputHarness {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.gui_mut()
+        .pane_mut(0)
+        .unwrap()
+        .set_overlay_enabled(OverlayKind::Radar, true);
+    h.offer_product(0, RadarProduct::StormRelativeVelocity, 0.5);
+    h.select_product(0, RadarProduct::StormRelativeVelocity);
+    h.place_radar_image(
+        0,
+        RadarProduct::StormRelativeVelocity,
+        0.5,
+        None,
+        None,
+        source,
+    );
+    h
+}
+
+/// The storm-motion notice a pane painted, if any.
+///
+/// Matched on the caption itself, as [`melting_layer_notice_painted`] is and
+/// for the same reason: the notice deliberately carries no leading icon, so
+/// the caption *is* the whole message.
+///
+/// The table is built from the rungs that *have* a caption rather than from a
+/// list written here — `caption` returns `None` for the two that earn no
+/// notice, and a probe that hard-coded four strings would not compile once one
+/// of them stopped existing.
+fn storm_motion_notice_painted(h: &InputHarness) -> Option<String> {
+    use rustdar_radar::srv::StormMotionSource as S;
+    let captions: Vec<&'static str> = [
+        S::UserOverride,
+        S::RpgScitAverage,
+        S::BunkersRightMover,
+        S::MeanWind,
+    ]
+    .into_iter()
+    .filter_map(S::caption)
+    .collect();
+    h.painted_text_strings()
+        .iter()
+        .find(|t| captions.contains(&t.as_str()))
+        .cloned()
+}
+
+/// **A viewer can tell the RPG's own storm motion from a prediction — and is
+/// not nagged about the ordinary case.**
+///
+/// The same two halves `a_classification_says_when_its_melting_layer_was_never_measured`
+/// balances, for the other per-picture render input, and the second half is
+/// again the harder one.
+///
+/// SRV shifted by a Bunkers right-mover is not a slightly worse SRV. The
+/// right-mover is a *prediction* of where a supercell would deviate from the
+/// mean wind; the RPG's vector is the average of the cells its SCIT algorithm
+/// actually tracked. The two differ by a signed rotation by construction, and
+/// the correction is `speed · cos(direction − azimuth)` at every gate — a
+/// solid-body shift of the whole field, not a local wobble. A pane that drew
+/// the two identically would be showing one quantity under the other's name.
+///
+/// But the RPG's own vector is the ordinary case, and a caveat on the ordinary
+/// case is worse than none — the section pane's module header records what that
+/// cost. So the rule about which rungs speak is not written at the draw site
+/// and not written here: it is `StormMotionSource::caption`, and this test
+/// reads that method rather than restating it.
+#[test]
+fn a_storm_relative_field_says_when_the_rpg_did_not_supply_its_vector() {
+    use rustdar_radar::srv::StormMotionSource;
+
+    // The two rungs that earn no notice, and they earn none for two different
+    // reasons: the RPG's own is the expected case, and an override is the
+    // user's own deliberate act with a widget already showing it.
+    for quiet in [
+        StormMotionSource::RpgScitAverage,
+        StormMotionSource::UserOverride,
+    ] {
+        let h = storm_relative_showing(Some(quiet));
+        assert_eq!(
+            quiet.caption(),
+            None,
+            "precondition: {quiet:?} earns no notice",
+        );
+        assert_eq!(
+            storm_motion_notice_painted(&h),
+            None,
+            "{quiet:?} drew a caveat on a case that earns none; painted: {:?}",
+            h.painted_text_strings(),
+        );
+    }
+
+    // The two fallback rungs say so, in the source's own words — which name the
+    // *direction* of the discrepancy ("clockwise of the RPG's cell average")
+    // rather than hedging, because a reader who knows which way it is wrong can
+    // correct for it.
+    for spoken in [
+        StormMotionSource::BunkersRightMover,
+        StormMotionSource::MeanWind,
+    ] {
+        let caption = spoken
+            .caption()
+            .unwrap_or_else(|| panic!("precondition: {spoken:?} earns a notice"));
+        let h = storm_relative_showing(Some(spoken));
+        let notice = storm_motion_notice_painted(&h).unwrap_or_else(|| {
+            panic!(
+                "{spoken:?} said nothing; painted: {:?}",
+                h.painted_text_strings()
+            )
+        });
+        assert!(
+            notice.contains(caption),
+            "the notice does not carry {spoken:?}'s own caption: {notice:?}",
+        );
+        // Over the pane it is about, not somewhere in the chrome: in a split
+        // layout each pane answers for its own image.
+        let pane_rect = h.pane_rects()[0];
+        assert!(
+            h.text_painted_in(pane_rect, caption),
+            "{spoken:?}'s notice was painted outside the pane it describes; \
+             painted: {:?}",
+            h.painted_text_strings(),
+        );
+    }
+
+    // And a render that states no vector at all — every product that shifts
+    // nothing — says nothing either.
+    assert_eq!(
+        storm_motion_notice_painted(&storm_relative_showing(None)),
+        None
     );
 }

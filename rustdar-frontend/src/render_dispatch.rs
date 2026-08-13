@@ -49,6 +49,13 @@ pub struct CachedPaneRender {
     /// time a suspended pane resumes, so a restore that re-derived this would
     /// caption an old classification with a new volume's provenance.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where the storm motion vector these cached pixels were shifted by came
+    /// from. Kept for exactly the reason the melting layer is: the `N0S`
+    /// behind it is per-volume and the cache holding it will have been
+    /// replaced by the time a suspended pane resumes, so a restore that
+    /// re-derived this would caption a right-mover prediction with the RPG's
+    /// name.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
 }
 
 /// Per-pane render tracking state.
@@ -222,6 +229,10 @@ pub struct CachedRenderOutput {
     /// the same argument as the two above: one buffer, one classification, one
     /// provenance, whichever pane is looking at it.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where the storm motion vector behind this shared raster came from —
+    /// shared for the same argument as the three above: one buffer, one
+    /// shift, one provenance, whichever pane is looking at it.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
 }
 
 /// `(site, product, view, elevation_tenths)` — see [`elevation_key`] and
@@ -544,6 +555,23 @@ pub struct RenderDispatcher {
     /// makes it correct. Keeping it is what lets a pane switched back to a
     /// volume still in hand classify without a second round-trip.
     melting_layer: HashMap<String, MeltingLayerObject>,
+    /// The RPG's own storm motion vector per site — the second rung of
+    /// `rustdar_radar::srv::storm_motion`, staged for the one product that
+    /// reads it and invalidated by
+    /// [`set_storm_motion`](Self::set_storm_motion).
+    ///
+    /// Carries a volume for exactly the reason `melting_layer` does, and the
+    /// lie it prevents is the same shape: the previous volume's SCIT average
+    /// is a real vector of a real storm, so nothing about the shifted field
+    /// looks wrong, and the render would report itself as
+    /// [`RpgScitAverage`](rustdar_radar::srv::StormMotionSource::RpgScitAverage)
+    /// — the RPG's own, for this volume — while being neither.
+    /// [`rpg_storm_motion_for`](Self::rpg_storm_motion_for) refuses every other
+    /// volume.
+    ///
+    /// Survives both reset paths on the same terms: a stale entry here cannot
+    /// be *applied*, so eviction is not what makes it correct.
+    storm_motion: HashMap<String, StormMotionObject>,
     /// Generation counter to discard stale render results after a **full** reset.
     ///
     /// Bumped by [`reset_panes`](Self::reset_panes) only. Per-site resets abandon
@@ -644,6 +672,40 @@ pub struct MeltingLayerObject {
     /// never a guess and never "close enough by listing time".
     pub volume_start: chrono::NaiveDateTime,
     pub bytes: Arc<Vec<u8>>,
+}
+
+/// One site's `N0S` storm motion vector **and the volume start it names**.
+///
+/// [`MeltingLayerObject`]'s sibling, and the pair is the type for the same
+/// reason: a bare `(f32, f32)` would be a vector with no statement of what
+/// storm it is the motion *of*, and every consumer would then have to remember
+/// to ask. Held together, the question cannot be skipped —
+/// [`RenderDispatcher::rpg_storm_motion_for`] is the only reader and it
+/// compares before it hands anything out.
+///
+/// # Decoded, where the melting layer is bytes
+///
+/// The one place this path deliberately diverges from `N0M`. That object ships
+/// as a blob because `rustdar_radar::render_input` carries it to the worker
+/// for a per-azimuth field to be decoded off-thread. An `N0S` yields two
+/// scalars out of its Product Description Block, and the pairing step
+/// (`rustdar_radar::level3::fetch_product_for_volume`) has already decoded that
+/// PDB to check which volume the object names — so carrying the bytes this far
+/// would mean decoding the same header a second time to recover numbers the
+/// fetch already held.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StormMotionObject {
+    /// The Level II volume start this object's PDB named, already validated by
+    /// `rustdar_radar::level3::fetch_product_for_volume` — so this field is
+    /// never a guess and never "close enough by listing time".
+    pub volume_start: chrono::NaiveDateTime,
+    /// `(speed_kt, direction_from_deg)`, exactly as the PDB stated them.
+    ///
+    /// **`(0.0, 0.0)` is a reading and is held as one.** SCIT tracked no cells
+    /// and the RPG painted an unshifted field; that is the vector the reference
+    /// product was built with, so treating it as absent would substitute a
+    /// derived rung for the RPG's own answer and still call it the RPG's.
+    pub motion: (f32, f32),
 }
 
 /// A whole-volume payload and the volume it came out of.
@@ -835,6 +897,7 @@ impl RenderDispatcher {
             level3_data: HashMap::new(),
             env_heights: HashMap::new(),
             melting_layer: HashMap::new(),
+            storm_motion: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
@@ -1010,6 +1073,53 @@ impl RenderDispatcher {
         }
         self.render_cache.retain(|(s, product, _view, _elev)| {
             s != site || *product != RadarProduct::HydrometeorClassification
+        });
+        true
+    }
+
+    /// Record a site's `N0S` storm motion vector for the volume it names and,
+    /// if that changes what the storm-relative field would be shifted by, drop
+    /// the site's SRV renders.
+    ///
+    /// [`set_melting_layer`](Self::set_melting_layer)'s sibling, on the same
+    /// narrow invalidation for the same narrow reason: exactly one product
+    /// applies a storm motion vector, so exactly one product's pictures can
+    /// change when one lands.
+    ///
+    /// The comparison is on the **volume**, not on the vector. Two objects for
+    /// one volume are the same answer however they were keyed, and an object
+    /// for a different volume is a different answer even if the numbers were
+    /// identical — which is the whole distinction this path is built on. It is
+    /// also what keeps a legitimate `(0.0, 0.0)` from reading as "nothing
+    /// landed": the identity that matters here is the volume's, never the
+    /// vector's.
+    ///
+    /// Returns whether anything was invalidated.
+    pub fn set_storm_motion(
+        &mut self,
+        site: &str,
+        object: StormMotionObject,
+        gui: &rustdar_egui::Gui,
+    ) -> bool {
+        let unchanged = self
+            .storm_motion
+            .get(site)
+            .is_some_and(|old| old.volume_start == object.volume_start);
+        self.storm_motion.insert(site.to_string(), object);
+        if unchanged {
+            return false;
+        }
+        for (idx, prs) in self.pane_render.iter_mut().enumerate() {
+            if gui.pane(idx).is_some_and(|p| p.site == site)
+                && prs
+                    .last_rendered
+                    .is_some_and(|(p, _)| p == RadarProduct::StormRelativeVelocity)
+            {
+                prs.last_rendered = None;
+            }
+        }
+        self.render_cache.retain(|(s, product, _view, _elev)| {
+            s != site || *product != RadarProduct::StormRelativeVelocity
         });
         true
     }
@@ -1434,6 +1544,57 @@ impl RenderDispatcher {
         self.melting_layer.get(site).map(|held| held.volume_start)
     }
 
+    /// The RPG's own storm motion vector for **this** volume of this site, or
+    /// `None`.
+    ///
+    /// [`melting_layer_product_for`](Self::melting_layer_product_for)'s
+    /// sibling, and it refuses identically: an object naming another volume is
+    /// withheld, and there is deliberately **no "latest vector" fallback**.
+    /// `fetch_product_for_volume` already refuses an object whose PDB does not
+    /// name the volume, so nothing unvalidated can reach the map; this is the
+    /// other half — a validated vector cannot outlive the volume it validated
+    /// against.
+    ///
+    /// The failure that buys is the same one the melting layer's docs record,
+    /// in SRV's terms. `srv::storm_motion`'s lower rungs know they are
+    /// predicting and the pane says so; the previous volume's SCIT average
+    /// would be reported as
+    /// [`RpgScitAverage`](rustdar_radar::srv::StormMotionSource::RpgScitAverage)
+    /// — the RPG's own, for this volume — while being neither, and a storm
+    /// motion error is a solid-body shift of every gate in the field.
+    ///
+    /// Gated on the product as its sibling is.
+    /// `RenderInput::with_rpg_storm_motion` drops the vector for every other
+    /// product anyway, so this gate buys no correctness — it buys not
+    /// describing a reflectivity render as storm-relative.
+    ///
+    /// **A `(0.0, 0.0)` reading is handed out like any other.** SCIT tracked no
+    /// cells and the RPG painted an unshifted field; that is the vector the
+    /// reference product was built with, and withholding it here would fall to
+    /// a Bunkers prediction of a storm the RPG did not think was moving.
+    pub(crate) fn rpg_storm_motion_for(
+        &self,
+        product: RadarProduct,
+        site: &str,
+        volume_start: chrono::NaiveDateTime,
+    ) -> Option<(f32, f32)> {
+        if product != RadarProduct::StormRelativeVelocity {
+            return None;
+        }
+        let cached = self.storm_motion.get(site)?;
+        (cached.volume_start == volume_start).then_some(cached.motion)
+    }
+
+    /// The volume the site's cached `N0S` vector names, if there is one.
+    ///
+    /// The fetch gate's read, exactly as
+    /// [`melting_layer_volume`](Self::melting_layer_volume) is: a poll that
+    /// would ask for a vector already in hand for this volume asks for
+    /// nothing instead.
+    pub(crate) fn storm_motion_volume(&self, site: &str) -> Option<chrono::NaiveDateTime> {
+        self.storm_motion.get(site).map(|held| held.volume_start)
+    }
+
     /// The object cached for one `(AWIPS code, site)`.
     ///
     /// The by-code counterpart of [`nearest_tilt`](Self::nearest_tilt), for a
@@ -1627,6 +1788,11 @@ impl RenderDispatcher {
         // is looked up in the map `set_melting_layer` invalidates on, and the
         // lookup refuses any volume but this one.
         let melting_layer = self.melting_layer_product_for(product, site, volume_start);
+        // And the RPG's own storm motion for **this** volume, for the one
+        // product that shifts by one. Read on exactly the terms above, from
+        // the map `set_storm_motion` invalidates on, and the lookup refuses
+        // any volume but this one.
+        let rpg_storm_motion = self.rpg_storm_motion_for(product, site, volume_start);
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
             pane_idx,
@@ -1665,10 +1831,14 @@ impl RenderDispatcher {
                     // and the melting layer is not in them. `None` here is
                     // not an error — it is `resolve_melting_layer` falling to
                     // its next rung, which the pane then says out loud.
+                    // Stamped on the same terms again, and `None` here is not
+                    // an error either — it is `srv::storm_motion` falling to
+                    // its next rung, which the pane then says out loud.
                     input: Box::new(
                         input
                             .with_declared_nyquist(declared)
-                            .with_melting_layer_product(melting_layer),
+                            .with_melting_layer_product(melting_layer)
+                            .with_rpg_storm_motion(rpg_storm_motion),
                     ),
                     // A static pane keeps the grid: it is what a hover reads.
                     values_wanted: true,
@@ -1983,6 +2153,7 @@ impl RenderDispatcher {
                             )),
                             nyquist_ms: frame.nyquist_ms,
                             melting_layer_source: frame.melting_layer_source,
+                            storm_motion_source: frame.storm_motion_source,
                         })
                     }),
                     product,

@@ -394,6 +394,16 @@ pub struct RadarTextureMeta {
     /// provenance — reporting a guess as measured, which is the failure this
     /// value exists to make visible.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where the storm motion vector these pixels were shifted by came from,
+    /// or `None` for a raster that shifted nothing.
+    ///
+    /// Travels with the texture for the reason the three above it do, and it
+    /// fails the same way a pane-level copy of the melting layer would: the
+    /// vector is per-volume, so a field on the pane would outlive its `N0S` by
+    /// exactly one volume and then describe a freshly-shifted field with the
+    /// previous volume's provenance — reporting a prediction as the RPG's own
+    /// applied vector, which is the failure this value exists to make visible.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
     /// The product these pixels depict.
     ///
     /// Not the pane's `selected_product`: that is what the user has *asked* for,

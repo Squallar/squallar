@@ -248,7 +248,7 @@ fn request(start: (f64, f64), end: (f64, f64), top_km_msl: Option<f64>) -> Secti
 fn a_cut_never_inherits_a_pixel_from_the_one_before_it() {
     let scan = scan();
     let render = |req: &SectionRequest| {
-        render_section(&scan, req, SITE.0, SITE.1, None).expect("the cut renders")
+        render_section(&scan, req, SITE.0, SITE.1, None, None).expect("the cut renders")
     };
 
     // Three deliberately unlike geometries. `blank` sits six degrees off the

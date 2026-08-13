@@ -373,6 +373,7 @@ fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
         elevation,
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
     }
 }
 
@@ -591,5 +592,6 @@ fn output() -> CachedRenderOutput {
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
     }
 }

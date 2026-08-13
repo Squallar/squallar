@@ -133,6 +133,7 @@ fn post_result(
     proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(0.0));
     proto::set_field(&message, proto::NYQUIST, &JsValue::NULL);
     proto::set_field(&message, proto::MELTING_LAYER, &JsValue::NULL);
+    proto::set_field(&message, proto::STORM_MOTION, &JsValue::NULL);
     proto::set_field(&message, proto::OUT, &JsValue::NULL);
     proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
 
@@ -144,6 +145,7 @@ fn post_result(
             polar,
             nyquist_ms,
             melting_layer_source,
+            storm_motion_source,
         })) => {
             let image = js_sys::Uint8Array::from(image.as_slice());
             let polar = js_sys::Uint8Array::from(polar.to_bytes().as_slice());
@@ -166,6 +168,16 @@ fn post_result(
                 proto::set_field(
                     &message,
                     proto::MELTING_LAYER,
+                    &JsValue::from_f64(f64::from(code)),
+                );
+            }
+            // And again: only storm-relative velocity applies a storm motion
+            // vector, so the null written above stands for every other product.
+            if let Some(source) = storm_motion_source {
+                let code = rustdar_frontend::offload::StormMotionWire(source).wire_code();
+                proto::set_field(
+                    &message,
+                    proto::STORM_MOTION,
                     &JsValue::from_f64(f64::from(code)),
                 );
             }

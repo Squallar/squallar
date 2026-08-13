@@ -2460,7 +2460,7 @@ pub fn build_voxels<'a>(
     lat: f64,
     lon: f64,
 ) -> Option<VoxelGrid> {
-    build_voxels_with_motion(volume, req, lat, lon, None)
+    build_voxels_with_motion(volume, req, lat, lon, None, None)
 }
 
 /// [`build_voxels`] with the user's storm motion override
@@ -2474,6 +2474,7 @@ pub fn build_voxels_with_motion<'a>(
     lat: f64,
     lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
 ) -> Option<VoxelGrid> {
     let volume = volume.into();
     let shape = req.shape;
@@ -2511,7 +2512,8 @@ pub fn build_voxels_with_motion<'a>(
     // here, before anything samples, so a raw volume can never be resampled
     // under a derived label.
     let slot = crate::derive::volume_slot(req.product)?;
-    let prepared = crate::derive::prepare(volume, req.product, storm_motion_override)?;
+    let prepared =
+        crate::derive::prepare(volume, req.product, storm_motion_override, rpg_storm_motion)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
     // scan's rungs are the same cuts flown at the same PRFs. `prepare` reads

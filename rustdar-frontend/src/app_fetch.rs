@@ -84,6 +84,34 @@ pub(super) fn site_offers_level3(site: &str) -> bool {
 /// minutes out of every five.
 const MELTING_LAYER_CODE: &str = "N0M";
 
+/// The AWIPS id of the RPG's Storm Relative Velocity product (Level III 56).
+///
+/// Out of [`RadarProduct::level3_codes_for`]'s walk for exactly the reason
+/// [`MELTING_LAYER_CODE`] is: nothing draws this object either. SRV is derived
+/// locally from the Level II velocity volume
+/// (`rustdar_radar::srv`) — what is wanted from `N0S` is the two scalars in its
+/// Product Description Block, the vector the RPG itself applied, and that is a
+/// *render input* paired to one volume. The by-code cache is keyed by code
+/// alone and takes the latest, which for this object is the wrong answer four
+/// minutes out of every five.
+const STORM_MOTION_CODE: &str = "N0S";
+
+/// What a loop frame's pixels stood on, carried out of `spawn_loop_frame_render`'s
+/// delivery closure as one value.
+///
+/// Both fields are the same kind of fact: a render input that changes what the
+/// picture *means* and that nothing downstream can recover from the pixels. A
+/// pair rather than two more slots in that closure's already-wide tuple, and
+/// the reason is not width — it is that the refused-image arm has to clear
+/// them **together**. A frame whose buffer the loop rejected depicts nothing,
+/// so it stood on nothing, and [`Default`] is the one spelling of that; two
+/// loose `None`s in a tuple are two chances to clear one and forget the other.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct FrameProvenance {
+    melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+}
+
 impl super::App {
     /// Spawn a detached future on whatever executor this target provides.
     ///
@@ -369,6 +397,94 @@ impl super::App {
                         site,
                         volume_start,
                         object: found.map(|p| p.bytes),
+                    }
+                });
+            }
+            // The RPG's own storm motion vector (Level III 56, AWIPS `N0S`)
+            // for the same volume — the second rung of
+            // `rustdar_radar::srv::storm_motion`, and the only rung that
+            // reproduces the reference product rather than predicting a storm
+            // it might have tracked.
+            //
+            // Everything about the schedule is the melting layer's above: same
+            // gate on the volume already in hand, same per-volume pairing,
+            // same side of the `site_offers_level3` return. An SPG makes no
+            // `N0S` either.
+            if self.render.storm_motion_volume(site) != Some(volume_start) {
+                let sender = self.channels.storm_motion_sender.clone();
+                let site = site.to_string();
+                self.spawn_async_task(sender, async move {
+                    let sources = rustdar_radar::sources::DataSources::production();
+                    // `VolumePick::NEAREST` for the reason `N0M` uses it: this
+                    // is a once-per-volume product, so the object nearest the
+                    // volume start that *names* the volume is the object. The
+                    // naming is checked inside — nothing here falls back to
+                    // the newest key.
+                    let found = rustdar_radar::level3::fetch_product_for_volume(
+                        &sources,
+                        &site,
+                        STORM_MOTION_CODE,
+                        volume_start,
+                        rustdar_radar::level3::VolumePick::NEAREST,
+                    )
+                    .await;
+                    // **Decoded here, and only the two scalars kept.** The one
+                    // place this path does not copy `N0M`: that object travels
+                    // as bytes so a worker can decode a per-azimuth field
+                    // off-thread, while an `N0S` yields a pair out of its PDB
+                    // and the pairing above has already decoded that PDB to
+                    // check the volume. Carrying the bytes onward would decode
+                    // the same header a second time, on the frame thread, for
+                    // numbers this future already has in hand.
+                    let motion = found.as_ref().and_then(|p| {
+                        match nexrad_level3::decode::decode_product(&p.bytes) {
+                            Ok(msg) => match msg.pdb.storm_motion() {
+                                // `storm_motion` is `Some` only for codes 55
+                                // and 56; on anything else halfword 51 is the
+                                // BZ2 compression flag and would read as a
+                                // plausible-looking lie. The gate lives in
+                                // `nexrad-level3`; this arm simply honours it.
+                                Some(m) => Some((m.speed_kt, m.direction_deg)),
+                                None => {
+                                    log::warn!(
+                                        "{site} {STORM_MOTION_CODE} for volume \
+                                         {volume_start} carries no storm motion \
+                                         vector; SRV falls back"
+                                    );
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                log::warn!(
+                                    "{site} {STORM_MOTION_CODE} for volume \
+                                     {volume_start} would not decode ({e}); SRV \
+                                     falls back"
+                                );
+                                None
+                            }
+                        }
+                    });
+                    match (&found, motion) {
+                        // Logged with the numbers because a zero vector is a
+                        // reading here and reads like a bug in a log that
+                        // omits it: SCIT tracked no cells and the RPG painted
+                        // an unshifted field.
+                        (Some(p), Some((speed, direction))) => log::info!(
+                            "{site} storm motion for volume {volume_start} is \
+                             {speed:.1} kt from {direction:.1}° ({})",
+                            p.stamp.key
+                        ),
+                        (Some(_), None) => {}
+                        (None, _) => log::info!(
+                            "{site} published no {STORM_MOTION_CODE} for volume \
+                             {volume_start}; SRV falls back"
+                        ),
+                    }
+                    crate::channels::StormMotionResponse {
+                        generation,
+                        site,
+                        volume_start,
+                        motion,
                     }
                 });
             }
@@ -1598,6 +1714,24 @@ impl super::App {
                 let melting_layer =
                     self.render
                         .melting_layer_product_for(product, &target.site, timestamp);
+                // The RPG's storm motion is asked per frame for exactly the
+                // reason the melting layer is, and the limitation is the same
+                // one, scoped the same way: only the volume the pane is on has
+                // an `N0S` fetched for it, so **every other frame of an SRV
+                // loop shifts on a derived rung**. Those frames are not wrong
+                // about themselves — they carry
+                // `StormMotionSource::BunkersRightMover` or `MeanWind` and the
+                // pane says so as they play — and closing it is the same
+                // per-frame pairing (`spawn_loop_l3_listing` +
+                // `spawn_loop_l3_pairing`) pointed at `N0S`.
+                //
+                // Handing every frame the still frame's vector would be worse
+                // than the fallback rather than better: a solid-body shift of
+                // one volume's storm applied to twenty other volumes' fields,
+                // all of them reporting themselves as the RPG's own.
+                let rpg_storm_motion =
+                    self.render
+                        .rpg_storm_motion_for(product, &target.site, timestamp);
                 match rustdar_radar::render_input::RenderInput::extract(
                     &scan_data,
                     snapped,
@@ -1618,7 +1752,8 @@ impl super::App {
                             input: Box::new(
                                 input
                                     .with_declared_nyquist(&declared)
-                                    .with_melting_layer_product(melting_layer),
+                                    .with_melting_layer_product(melting_layer)
+                                    .with_rpg_storm_motion(rpg_storm_motion),
                             ),
                             // Loop frames store an empty value grid, so asking
                             // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
@@ -1668,7 +1803,7 @@ impl super::App {
             // section's differently-shaped buffers. See `JobOutput::frame`.
             let frame = output.and_then(crate::offload::JobOutput::frame);
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let (image, max_range_km, nyquist_ms, melting_layer_source, polar) = match frame {
+            let (image, max_range_km, nyquist_ms, describes, polar) = match frame {
                 Some(mut frame) => {
                     // Converted here, in `deliver`, so `rgba` drops at the end
                     // of this scope and only one of the two buffers is ever in
@@ -1677,12 +1812,21 @@ impl super::App {
                     // render that lands on the main thread, and what it does
                     // there is copy 4 MiB — the premultiply behind it belongs
                     // to `offload::execute` and ran in the worker.
+                    //
+                    // The two provenances travel as one pair rather than as
+                    // two more tuple slots: they are the same kind of fact —
+                    // what this picture stood on, unrecoverable from its
+                    // pixels — and the failure arm has to clear them together
+                    // or not at all. See `FrameProvenance`.
                     let converted = match loop_frame_image(&frame.image) {
                         Some(image) => (
                             Some(image),
                             frame.max_range_km,
                             frame.nyquist_ms,
-                            frame.melting_layer_source,
+                            FrameProvenance {
+                                melting_layer_source: frame.melting_layer_source,
+                                storm_motion_source: frame.storm_motion_source,
+                            },
                         ),
                         None => {
                             log::error!(
@@ -1690,7 +1834,7 @@ impl super::App {
                                 frame.image.len(),
                                 LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4
                             );
-                            (None, 0.0, None, None)
+                            (None, 0.0, None, FrameProvenance::default())
                         }
                     };
                     // `rgba` drops at the end of this scope either way, as the
@@ -1716,16 +1860,16 @@ impl super::App {
                     // `rustdar_radar::hover::SweepGates`.
                     frame.polar.strip_values();
                     rustdar_radar::render::recycle_image(frame.image);
-                    let (image, max_range_km, nyquist_ms, melting_layer_source) = converted;
-                    (
-                        image,
-                        max_range_km,
-                        nyquist_ms,
-                        melting_layer_source,
-                        frame.polar,
-                    )
+                    let (image, max_range_km, nyquist_ms, describes) = converted;
+                    (image, max_range_km, nyquist_ms, describes, frame.polar)
                 }
-                None => (None, 0.0, None, None, Default::default()),
+                None => (
+                    None,
+                    0.0,
+                    None,
+                    FrameProvenance::default(),
+                    Default::default(),
+                ),
             };
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them. It describes the render that was dispatched — the sweep
@@ -1744,7 +1888,8 @@ impl super::App {
                 image,
                 max_range_km,
                 nyquist_ms,
-                melting_layer_source,
+                melting_layer_source: describes.melting_layer_source,
+                storm_motion_source: describes.storm_motion_source,
                 polar,
             });
             super::notify_redraw(&window);

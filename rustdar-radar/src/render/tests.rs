@@ -2447,6 +2447,7 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
         None,
         None,
         None,
+        None,
         &crate::nyquist::DeclaredNyquist::empty(),
     )
     .expect("the fixture renders");
@@ -2456,6 +2457,7 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
         PRODUCT,
         LAT,
         LON,
+        None,
         None,
         None,
         None,
@@ -2510,6 +2512,7 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
         PRODUCT,
         LAT,
         LON,
+        None,
         None,
         None,
         None,
@@ -2780,6 +2783,7 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
             None,
             None,
             None,
+            None,
             &crate::nyquist::DeclaredNyquist::empty(),
             ceiling,
         )
@@ -2884,6 +2888,7 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
         PRODUCT,
         LAT,
         LON,
+        None,
         None,
         None,
         None,
@@ -3017,6 +3022,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         None,
         None,
         None,
+        None,
         &declared,
     )
     .expect("the low tilt renders");
@@ -3028,6 +3034,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         types::RadarProduct::Velocity,
         LAT,
         LON,
+        None,
         None,
         None,
         None,
@@ -3049,6 +3056,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         None,
         None,
         None,
+        None,
         &partial,
     )
     .expect("the low tilt renders");
@@ -3064,6 +3072,7 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         types::RadarProduct::EchoTopsInterpolated,
         LAT,
         LON,
+        None,
         None,
         None,
         None,

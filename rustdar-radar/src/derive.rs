@@ -192,17 +192,24 @@ fn codec(product: RadarProduct) -> (f32, f32) {
 /// them.
 ///
 /// `storm_motion_override` is the user's `(speed_kt, direction_from_deg)`
-/// vector, read only by SRV — the same pair the plan-view SRV path carries.
+/// vector and `rpg_storm_motion` is the RPG's own for this volume, read only
+/// by SRV — the same pair the plan-view SRV path carries. Both are threaded
+/// through rather than resolved here so a section and the plan view of one
+/// volume shift by the *same* vector; resolving them separately is how the two
+/// panes come to disagree with no error and no visible difference.
 pub fn prepare<'s>(
     volume: crate::nyquist::Volume<'s>,
     product: RadarProduct,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
 ) -> Option<Prepared<'s>> {
     if crate::sampler::samplable(product).is_some() {
         return Some(Prepared::Native(volume.scan()));
     }
     let derived = match product {
-        RadarProduct::StormRelativeVelocity => derive_srv(volume, storm_motion_override)?,
+        RadarProduct::StormRelativeVelocity => {
+            derive_srv(volume, storm_motion_override, rpg_storm_motion)?
+        }
         RadarProduct::NormalizedRotation => derive_nrot(volume)?,
         RadarProduct::SpecificDifferentialPhase => derive_kdp(volume.scan())?,
         _ => return None,
@@ -237,6 +244,7 @@ fn velocity_tilts(
 fn derive_srv(
     volume: crate::nyquist::Volume<'_>,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
 ) -> Option<Scan> {
     let scan = volume.scan();
     let tilts = velocity_tilts(volume);
@@ -244,12 +252,16 @@ fn derive_srv(
     let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
         srv::SrvMotion::user_override(speed_kt, direction_deg)
     });
+    let rpg = rpg_storm_motion.and_then(|(speed_kt, direction_deg)| {
+        srv::SrvMotion::rpg_scit_average(speed_kt, direction_deg)
+    });
     // No vector, no SRV: base velocity under a storm-relative label is the
     // failure this refusal exists to prevent.
-    let Some(motion) = srv::storm_motion(profile.as_ref(), user) else {
+    let Some(motion) = srv::storm_motion(profile.as_ref(), user, rpg) else {
         log::warn!(
-            "SRV derivation refused: no storm motion vector — no user override \
-             and no Bunkers fit from the volume's own winds"
+            "SRV derivation refused: no storm motion vector — no user override, \
+             no RPG vector for this volume, and no Bunkers fit from the volume's \
+             own winds"
         );
         return None;
     };

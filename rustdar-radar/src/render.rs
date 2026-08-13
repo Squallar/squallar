@@ -1107,6 +1107,9 @@ impl RenderBuffers {
             // Set by the classification path, which is the only one that has
             // a melting layer to report; see the field.
             melting_layer_source: None,
+            // Set by the SRV path, which is the only one that applies a storm
+            // motion vector; see the field.
+            storm_motion_source: None,
         }
     }
 }
@@ -1213,6 +1216,19 @@ pub struct SweepRender {
     /// it from the 95 % case has been handed a guess wearing a
     /// classification's colours.
     pub melting_layer_source: Option<crate::hca::MeltingLayerSource>,
+    /// Which storm motion vector the storm-relative velocity was computed
+    /// against, or `None` for every other product — nothing else applies one.
+    ///
+    /// Here for exactly the reason `melting_layer_source` is: it is a fact
+    /// about *these* pixels that no consumer can recover from them, and one
+    /// that changes what they mean. SRV on a
+    /// [`StormMotionSource::BunkersRightMover`](crate::srv::StormMotionSource::BunkersRightMover)
+    /// is not a degraded rendering of SRV on the RPG's vector, it is a
+    /// different quantity — a supercell right-mover prediction rather than the
+    /// average of the cells actually tracked — and the two differ by a signed
+    /// rotation large enough to move gates several display levels. A viewer
+    /// who cannot tell them apart has been handed one under the other's name.
+    pub storm_motion_source: Option<crate::srv::StormMotionSource>,
 }
 
 impl SweepRender {
@@ -1225,6 +1241,12 @@ impl SweepRender {
     /// Stamp which melting layer the classification stood on.
     fn classified_against(mut self, source: crate::hca::MeltingLayerSource) -> Self {
         self.melting_layer_source = Some(source);
+        self
+    }
+
+    /// Stamp which storm motion vector the storm-relative field was shifted by.
+    fn moved_by(mut self, source: crate::srv::StormMotionSource) -> Self {
+        self.storm_motion_source = Some(source);
         self
     }
 }
@@ -1874,7 +1896,10 @@ fn render_with_projection(
 ///
 /// It also passes no melting layer object, so a classification drawn through
 /// here runs on [`crate::hca::resolve_melting_layer`]'s lower rungs and says
-/// so in [`SweepRender::melting_layer_source`].
+/// so in [`SweepRender::melting_layer_source`]. Likewise no RPG storm motion
+/// vector, so an SRV drawn through here runs on
+/// [`crate::srv::storm_motion`]'s lower rungs and says so in
+/// [`SweepRender::storm_motion_source`].
 pub fn render_radar_to_image(
     data: &Scan,
     elevation_angle: f32,
@@ -1888,6 +1913,7 @@ pub fn render_radar_to_image(
         product,
         radar_lat,
         radar_lon,
+        None,
         None,
         None,
         None,
@@ -1930,6 +1956,7 @@ pub fn render_from_sized(
         input.radar_lat(),
         input.radar_lon(),
         input.storm_motion_override(),
+        input.rpg_storm_motion(),
         input.env_heights_km_msl(),
         input.melting_layer_product().map(|o| o.as_slice()),
         &input.declared_nyquist(),
@@ -1970,6 +1997,7 @@ pub fn render_radar_to_image_full(
     radar_lat: f64,
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
     melting_layer_product: Option<&[u8]>,
     declared_nyquist: &crate::nyquist::DeclaredNyquist,
@@ -1981,6 +2009,7 @@ pub fn render_radar_to_image_full(
         radar_lat,
         radar_lon,
         storm_motion_override,
+        rpg_storm_motion,
         env_heights_km_msl,
         melting_layer_product,
         declared_nyquist,
@@ -1998,6 +2027,7 @@ pub fn render_radar_to_image_full_sized(
     radar_lat: f64,
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
     melting_layer_product: Option<&[u8]>,
     declared_nyquist: &crate::nyquist::DeclaredNyquist,
@@ -2060,6 +2090,7 @@ pub fn render_radar_to_image_full_sized(
             radar_lat,
             radar_lon,
             storm_motion_override,
+            rpg_storm_motion,
             nyquist_ms,
             side_ceiling_px,
         );
@@ -2278,12 +2309,14 @@ fn render_nrot_to_image(
 /// hollow for even the mean-wind fallback — because painting base velocity
 /// under a storm-relative label is the failure the old Level III path
 /// refused too (it waited for an `N0S`).
+#[allow(clippy::too_many_arguments)]
 fn render_srv_to_image(
     scan: &Scan,
     radials: &[Radial],
     radar_lat: f64,
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
     declared_nyquist_ms: Option<f64>,
     side_ceiling_px: usize,
 ) -> Option<SweepRender> {
@@ -2298,7 +2331,14 @@ fn render_srv_to_image(
     let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
         crate::srv::SrvMotion::user_override(speed_kt, direction_deg)
     });
-    let motion = crate::srv::storm_motion(profile.as_ref(), user)?;
+    // Already paired to this volume by the caller — see
+    // `render_dispatch::rpg_storm_motion_for`, which refuses any volume but the
+    // one the render names, exactly as the melting layer's accessor does. A
+    // vector from a neighbouring volume is a measurable error, not a nuance.
+    let rpg = rpg_storm_motion.and_then(|(speed_kt, direction_deg)| {
+        crate::srv::SrvMotion::rpg_scit_average(speed_kt, direction_deg)
+    });
+    let motion = crate::srv::storm_motion(profile.as_ref(), user, rpg)?;
     log::info!(
         "SRV {elevation_deg:.1}°: {:.1} kt from {:.1}° ({:?})",
         motion.speed_kt,
@@ -2359,7 +2399,11 @@ fn render_srv_to_image(
             });
         },
     );
-    Some(output.declaring(declared_nyquist_ms))
+    Some(
+        output
+            .declaring(declared_nyquist_ms)
+            .moved_by(motion.source),
+    )
 }
 
 /// Render interpolated echo tops: the whole reflectivity volume reduced to a

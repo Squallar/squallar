@@ -94,6 +94,15 @@ pub struct RenderedImage {
     /// from may already have been replaced by the next volume's — and the
     /// difference between the two answers is a classification against a guess.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where the storm motion vector these pixels were shifted by came from,
+    /// or `None` for a raster that shifted nothing.
+    ///
+    /// Metadata that travels with the picture for the reason above, and for
+    /// the same sharpened version of it: the `N0S` a render stood on is
+    /// per-volume and the cache holding it may already have rolled, so the
+    /// difference between the two answers is the RPG's own applied vector
+    /// against a right-mover prediction rotated clockwise of it.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
 }
 
 /// Result from a background radar render thread.
@@ -395,6 +404,16 @@ pub struct LoopRenderResponse {
     /// fleet constant. One number for the whole loop would caption most of its
     /// frames with another frame's provenance.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where this frame's storm motion vector came from, or `None` for a frame
+    /// that shifted nothing.
+    ///
+    /// Per frame, and emphatically so, for the reason the melting layer is: a
+    /// loop pairs one `N0S` per volume, so the newest frame can be shifted by
+    /// the RPG's own applied vector while an older frame — whose object was
+    /// never fetched — falls back to a Bunkers right-mover. One number for the
+    /// whole loop would caption most of its frames with another frame's
+    /// provenance.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
     /// Where this frame's gates are, with **no numbers behind them**.
     ///
     /// The half of [`rustdar_radar::render::polar::PolarField`] a loop frame
@@ -536,6 +555,42 @@ pub struct MeltingLayerResponse {
     pub object: Option<Arc<Vec<u8>>>,
 }
 
+/// One site's RPG storm motion vector for one volume, already decoded.
+///
+/// [`MeltingLayerResponse`]'s sibling, on the same schedule and with the same
+/// volume discipline: the vector is a fact about **one volume**, so the volume
+/// it names travels with it and the accessor that hands it to a render refuses
+/// to apply it to any other.
+///
+/// # Why this one carries no bytes
+///
+/// The one place this path deliberately differs from `N0M`. That object ships
+/// as a blob because the worker decodes a per-azimuth field off-thread; an
+/// `N0S` yields two scalars out of its Product Description Block, and the
+/// pairing step in `rustdar_radar::level3::fetch_product_for_volume` has
+/// already decoded that PDB to check which volume the object names. Shipping
+/// the bytes onward would decode the same header a second time, on the frame
+/// thread, to recover numbers the fetch already held.
+pub struct StormMotionResponse {
+    pub generation: u64,
+    pub site: String,
+    /// The Level II volume start the object was paired against, and the only
+    /// volume this vector may be applied to. Echoed from the request rather
+    /// than read back off the pane, on the discipline
+    /// [`MeltingLayerResponse::volume_start`] keeps.
+    pub volume_start: NaiveDateTime,
+    /// `(speed_kt, direction_from_deg)` as the PDB stated them, or `None` when
+    /// the site generated no `N0S` for that volume or its PDB carried no
+    /// vector. An ordinary gap, not a failure: SRV falls to the next rung of
+    /// `rustdar_radar::srv::storm_motion` and says so on screen.
+    ///
+    /// **`Some((0.0, 0.0))` is a reading, not a gap.** SCIT tracked no cells
+    /// and the RPG painted an unshifted field; that is the vector the reference
+    /// product was built with, and dropping it would replace the RPG's own
+    /// answer with a derived one under the RPG's name.
+    pub motion: Option<(f32, f32)>,
+}
+
 /// The network site catalogue, once the launch's one refresh has landed.
 ///
 /// It exists to be **written to the cache**, not applied: the table was
@@ -588,6 +643,8 @@ pub struct ChannelHub {
     pub sounding_receiver: Receiver<SoundingResponse>,
     pub melting_layer_sender: Sender<MeltingLayerResponse>,
     pub melting_layer_receiver: Receiver<MeltingLayerResponse>,
+    pub storm_motion_sender: Sender<StormMotionResponse>,
+    pub storm_motion_receiver: Receiver<StormMotionResponse>,
     pub site_catalogue_sender: Sender<SiteCatalogueResponse>,
     pub site_catalogue_receiver: Receiver<SiteCatalogueResponse>,
 }
@@ -615,6 +672,7 @@ impl ChannelHub {
         let (loop_section_sender, loop_section_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
         let (melting_layer_sender, melting_layer_receiver) = std::sync::mpsc::channel();
+        let (storm_motion_sender, storm_motion_receiver) = std::sync::mpsc::channel();
         let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
         let (site_catalogue_sender, site_catalogue_receiver) = std::sync::mpsc::channel();
 
@@ -651,6 +709,8 @@ impl ChannelHub {
             sounding_receiver,
             melting_layer_sender,
             melting_layer_receiver,
+            storm_motion_sender,
+            storm_motion_receiver,
             site_catalogue_sender,
             site_catalogue_receiver,
         }

@@ -141,6 +141,15 @@ fn deliver(data: &JsValue) {
                 .and_then(|v| v.as_f64())
                 .and_then(|v| offload::MeltingLayerWire::from_wire_code(v as u8))
                 .map(|wire| wire.0),
+            // The same filter for the same reason — see `proto::STORM_MOTION`.
+            // A raster that applied no vector and a byte this build cannot read
+            // both land on `None`, and the page then draws no qualification;
+            // the protocol token is what keeps a worker old enough to mean the
+            // second by the first from ever being attached.
+            storm_motion_source: proto::field(data, proto::STORM_MOTION)
+                .and_then(|v| v.as_f64())
+                .and_then(|v| offload::StormMotionWire::from_wire_code(v as u8))
+                .map(|wire| wire.0),
         })
     });
 

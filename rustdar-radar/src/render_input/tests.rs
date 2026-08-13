@@ -189,6 +189,7 @@ fn render_from_an_extracted_payload_matches_the_scan_path() {
             LAT,
             LON,
             over,
+            None,
             env,
             None,
             &crate::nyquist::DeclaredNyquist::empty(),
@@ -267,6 +268,7 @@ fn a_sweep_that_opened_off_its_tilt_still_renders_after_the_port() {
         product,
         LAT,
         LON,
+        None,
         None,
         None,
         None,
@@ -1001,7 +1003,7 @@ fn the_sentinel_elevation_is_one_no_sweep_can_carry() {
 /// one. Mirrors `xsect`'s and `voxel`'s tests of the same name.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
-    assert_eq!(FORMAT_VERSION, 10);
+    assert_eq!(FORMAT_VERSION, 11);
     let bytes = RenderInput::extract(
         &volume(),
         0.5,
@@ -1016,7 +1018,7 @@ fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(&bytes[..4], b"RDRI", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
-        10,
+        11,
         "the version is not where a decoder from another build looks for it",
     );
 }
@@ -1175,6 +1177,7 @@ fn a_product_with_no_level_two_moment_extracts_nothing() {
             None,
             None,
             None,
+            None,
             &crate::nyquist::DeclaredNyquist::empty()
         )
         .is_none(),
@@ -1206,6 +1209,7 @@ fn hail_without_an_environment_renders_nothing_on_both_paths() {
                 product,
                 LAT,
                 LON,
+                None,
                 None,
                 None,
                 None,

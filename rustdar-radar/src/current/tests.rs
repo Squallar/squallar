@@ -623,7 +623,7 @@ async fn live_substrate_costs_are_measured() {
         product: RadarProduct::Reflectivity,
     };
     let t = Instant::now();
-    let section = crate::xsect::render_section(&scan, &request, radar.lat, radar.lon, None);
+    let section = crate::xsect::render_section(&scan, &request, radar.lat, radar.lon, None, None);
     println!(
         "render_section: {:?} (cut: {})",
         t.elapsed(),

@@ -79,6 +79,9 @@ fn the_gate_skips_the_objects_and_leaves_the_sounding_alone() {
     let melting_layer = body
         .find("self.channels.melting_layer_sender")
         .expect("the melting-layer spawn left the function");
+    let storm_motion = body
+        .find("self.channels.storm_motion_sender")
+        .expect("the storm-motion spawn left the function");
 
     assert!(
         sounding < gate,
@@ -98,5 +101,16 @@ fn the_gate_skips_the_objects_and_leaves_the_sounding_alone() {
         gate < melting_layer,
         "the melting-layer fetch runs before the RPG gate, so a TDWR asks S3 \
              for an N0M its SPG never generates",
+    );
+    // The storm motion vector is the melting layer's twin in every respect
+    // that matters here: a Level III object, published by an RPG, fetched once
+    // per volume. `N0S` is a *storm-relative velocity* product, and an SPG
+    // generates no storm-relative products at all — SCIT does not run there —
+    // so outside the gate it would be a sixth doomed request per scan load and
+    // per poll at every TDWR.
+    assert!(
+        gate < storm_motion,
+        "the storm-motion fetch runs before the RPG gate, so a TDWR asks S3 \
+             for an N0S its SPG never generates",
     );
 }
