@@ -883,13 +883,22 @@ fn sane_device_scale(device_scale: f32) -> f32 {
 
 /// Interior rings below this projected area (square pixels) are dropped.
 ///
-/// They are not rare and they are not hypothetical: RDP simplification
-/// (`SIMPLIFY_EPSILON`) collapses a small closed ring to a retracing
-/// out-and-back, and 2,515 of the 4,579 interior rings in a full 7,015-zone
-/// cache have exactly zero area — every one of them a three-point ring whose
-/// shoelace terms cancel pairwise. Such a ring encloses nothing, so even-odd
-/// already ignores it for the fill — but it is still a subpath, and the stroke
-/// would draw every one of them as a hairline scratch across the zone.
+/// They are not rare and they are not hypothetical. When this was written, RDP
+/// simplification collapsed a small closed ring to a retracing out-and-back,
+/// and 2,515 of the 4,579 interior rings in a full 7,015-zone cache had exactly
+/// zero area — every one of them a three-point ring whose shoelace terms cancel
+/// pairwise. Such a ring encloses nothing, so even-odd already ignores it for
+/// the fill — but it is still a subpath, and the stroke would draw every one of
+/// them as a hairline scratch across the zone.
+///
+/// [`simplify_ring`](crate::render::geo::simplify_ring) no longer produces
+/// them: it tightens its own tolerance rather than flatten a ring, so what used
+/// to arrive here as a zero-area sliver now arrives as the small real hole it
+/// always was. That does not retire this floor — it is what the floor was
+/// always for. A hole a third of a pixel across is still nothing anyone can
+/// see, and deciding *that* needs the projection, which is why the decision is
+/// here and not upstream. What changed is that it now judges honest geometry
+/// instead of covering for a simplifier that had already destroyed it.
 const MIN_HOLE_AREA_PX: f32 = 0.25;
 
 /// Interior rings thinner than this *on average* — twice the area over the
