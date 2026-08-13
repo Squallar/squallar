@@ -809,6 +809,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
             polar: Default::default(),
             nyquist_ms: None,
             melting_layer_source: None,
+            storm_motion_source: None,
         })),
     );
 
@@ -968,4 +969,64 @@ fn a_decoded_volume_comes_back_under_its_own_out_kind() {
             "kind {kind} accepted"
         );
     }
+}
+
+/// **Every storm motion rung has a stable, distinct byte, and it survives the
+/// round trip.**
+///
+/// The only boundary a [`rustdar_radar::srv::StormMotionSource`] crosses as a
+/// number is the browser's page↔worker port, and what is on the far side of
+/// that number is which vector an SRV field was shifted by. A renumbering that
+/// went one way and not the other would not blank the notice — it would move
+/// it, and the page would caption a Bunkers right-mover as the RPG's own
+/// applied vector, or the reverse. That is not a degraded picture; the two are
+/// different quantities and the whole path exists to keep them apart.
+///
+/// So this asserts three things at once: the codes are the ones the wire is
+/// documented to carry, no two rungs share one, and `from_wire_code` is the
+/// genuine inverse rather than a second table that agrees today. The exhaustive
+/// walk over `ALL` is what makes it a property of the enum: a fifth rung added
+/// upstream fails the match arms in `StormMotionWire` first, and this row-count
+/// assertion second.
+#[test]
+fn every_storm_motion_rung_has_a_stable_distinct_wire_code() {
+    use rustdar_radar::srv::StormMotionSource as S;
+
+    // Declaration order, which is fallback order, which is the numbering.
+    const ALL: [(S, u8); 4] = [
+        (S::UserOverride, 0),
+        (S::RpgScitAverage, 1),
+        (S::BunkersRightMover, 2),
+        (S::MeanWind, 3),
+    ];
+
+    let mut seen = std::collections::HashSet::new();
+    for (source, expected) in ALL {
+        let code = StormMotionWire(source).wire_code();
+        assert_eq!(
+            code, expected,
+            "{source:?} moved on the wire: a page and a worker built either \
+             side of that change caption one rung with another's words",
+        );
+        assert!(
+            seen.insert(code),
+            "{source:?} shares byte {code} with another rung",
+        );
+        assert_eq!(
+            StormMotionWire::from_wire_code(code),
+            Some(StormMotionWire(source)),
+            "byte {code} did not decode back to {source:?}",
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        4,
+        "a rung was added or removed without this table moving",
+    );
+
+    // A byte this build does not have reads as "no source stated" — a page and
+    // a worker on opposite sides of a deploy, which the protocol token already
+    // refuses — rather than as some rung picked by arithmetic.
+    assert_eq!(StormMotionWire::from_wire_code(4), None);
+    assert_eq!(StormMotionWire::from_wire_code(u8::MAX), None);
 }

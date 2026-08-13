@@ -792,9 +792,10 @@ pub fn assembly_span_secs(tilt_collected_ms: &[i64]) -> Option<i64> {
 ///   thread's with no error anywhere.
 ///
 /// `storm_motion_override` is the user's `(speed_kt, direction_from_deg)`
-/// vector, read only when `req.product` is storm-relative velocity — the
-/// same pair the plan-view SRV render receives, threaded from the
-/// `RenderInput` by the worker's job handler.
+/// vector and `rpg_storm_motion` is the RPG's own for this volume, read only
+/// when `req.product` is storm-relative velocity — the same pair the plan-view
+/// SRV render receives, threaded from the `RenderInput` by the worker's job
+/// handler so that a section and the plan view shift by the same vector.
 ///
 /// Every refusal is logged, so a `None` swallowed by a `?` still leaves its
 /// reason somewhere.
@@ -804,13 +805,15 @@ pub fn render_section<'a>(
     lat: f64,
     lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    rpg_storm_motion: Option<(f32, f32)>,
 ) -> Option<CrossSection> {
     let volume = volume.into();
     // The derivation seam: native moments pass through as a borrow; derived
     // products are computed here, per sweep, before anything samples — so a
     // raw volume can never be sampled under a derived label (the sampler's
     // own gate still refuses that combination).
-    let prepared = crate::derive::prepare(volume, req.product, storm_motion_override)?;
+    let prepared =
+        crate::derive::prepare(volume, req.product, storm_motion_override, rpg_storm_motion)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
     // scan's rungs are the same cuts flown at the same PRFs. `prepare` reads

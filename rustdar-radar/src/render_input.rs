@@ -109,6 +109,22 @@ pub struct RenderInput {
     /// decoder the main thread would have. Six kilobytes against the
     /// megabytes of moments beside it.
     melting_layer_product: Option<std::sync::Arc<Vec<u8>>>,
+    /// The RPG's own applied **storm motion vector** for this very volume,
+    /// knots and degrees-from, read out of an `N0S` Product Description Block.
+    ///
+    /// Read by storm-relative velocity alone, and it is the difference between
+    /// this pane's quantity and the reference's: SCIT averages the cells it
+    /// tracked, the local fallback predicts a supercell right-mover, and the
+    /// two differ by a signed rotation. See [`crate::srv::storm_motion`] for
+    /// the chain that consumes it and what stands in when it is absent.
+    ///
+    /// The decoded pair rather than the object's bytes — the opposite of
+    /// `melting_layer_product` above, and deliberately. `N0M` carries a
+    /// per-azimuth field worth decoding on the worker; an `N0S` carries two
+    /// scalars in its PDB, and the *pairing* step has already decoded that PDB
+    /// to check the volume it names ([`crate::level3::names_volume`]). Shipping
+    /// bytes would decode the same block twice to recover eight bytes.
+    rpg_storm_motion: Option<(f32, f32)>,
     /// The volume coverage pattern number the scan was flown under.
     ///
     /// Nothing on a render path reads it. It travels because the *cut angles*
@@ -457,6 +473,9 @@ impl RenderInput {
                 .flatten(),
             env_heights_km_msl: None,
             melting_layer_product: None,
+            // Stamped afterwards by `with_rpg_storm_motion`, for the same
+            // byte-identity reason the override above is gated on the product.
+            rpg_storm_motion: None,
             vcp: pattern.pattern_number().number(),
             declared_cut_angles_deg: pattern
                 .elevation_cuts()
@@ -545,6 +564,9 @@ impl RenderInput {
             // Stamped afterwards by `with_melting_layer_product`, which is
             // where the object's own arrival schedule is known.
             melting_layer_product: None,
+            // Likewise `with_rpg_storm_motion`: the `N0S` it comes from is
+            // fetched on the same schedule and pairs the same way.
+            rpg_storm_motion: None,
             vcp: scan.coverage_pattern().pattern_number().number(),
             declared_cut_angles_deg: scan
                 .coverage_pattern()
@@ -610,6 +632,30 @@ impl RenderInput {
     /// next source.
     pub fn melting_layer_product(&self) -> Option<&std::sync::Arc<Vec<u8>>> {
         self.melting_layer_product.as_ref()
+    }
+
+    /// Stamp the RPG's own storm motion vector for this volume onto a payload
+    /// the extraction has already built.
+    ///
+    /// A second step for the same reason
+    /// [`with_melting_layer_product`](Self::with_melting_layer_product) is one:
+    /// the `N0S` it was read from is fetched on its own schedule and pairs to
+    /// the volume by its PDB, so it arrives after the moments do.
+    ///
+    /// Dropped for every product but storm-relative velocity, on the same rule
+    /// `env_heights_km_msl` follows: a payload's bytes must not depend on a
+    /// cache its product never reads.
+    #[must_use]
+    pub fn with_rpg_storm_motion(mut self, motion: Option<(f32, f32)>) -> Self {
+        self.rpg_storm_motion =
+            motion.filter(|_| self.product == RadarProduct::StormRelativeVelocity);
+        self
+    }
+
+    /// The RPG's own storm motion vector for this volume, or `None` — SRV then
+    /// falls to [`crate::srv::storm_motion`]'s next rung.
+    pub fn rpg_storm_motion(&self) -> Option<(f32, f32)> {
+        self.rpg_storm_motion
     }
 
     /// Stamp each carried sweep with the Nyquist velocity its cut declared,
@@ -1320,7 +1366,13 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// `crate::hca::resolve_melting_layer`'s lower rungs, so a browser render and
 /// a desktop one would classify the same volume against melting layers up to
 /// three kilometres apart — with no error, and both drawing a full picture.
-const FORMAT_VERSION: u16 = 10;
+/// Version 11 added the RPG's own **storm motion vector** (`N0S` halfwords 51
+/// and 52) as an optional knots/degrees-from pair, after the melting layer
+/// blob. Without it a worker's storm-relative velocity could only ever reach
+/// `crate::srv::storm_motion`'s lower rungs, so a browser render and a desktop
+/// one would shift the same volume by vectors tens of degrees apart — with no
+/// error, and both drawing a full picture under the same label.
+const FORMAT_VERSION: u16 = 11;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -1357,6 +1409,15 @@ impl RenderInput {
             Some(object) => {
                 out.extend_from_slice(&(object.len() as u32).to_le_bytes());
                 out.extend_from_slice(object);
+            }
+        }
+
+        match self.rpg_storm_motion {
+            None => out.push(0),
+            Some((speed_kt, direction_deg)) => {
+                out.push(1);
+                out.extend_from_slice(&speed_kt.to_le_bytes());
+                out.extend_from_slice(&direction_deg.to_le_bytes());
             }
         }
 
@@ -1460,6 +1521,12 @@ impl RenderInput {
             ))
         };
 
+        let rpg_storm_motion = match r.u8()? {
+            0 => None,
+            1 => Some((r.f32()?, r.f32()?)),
+            _ => return None,
+        };
+
         let vcp = r.u16()?;
         // Eight bytes per angle, so the claimed count is measured against what
         // remains before it becomes a capacity.
@@ -1542,6 +1609,7 @@ impl RenderInput {
             storm_motion_override,
             env_heights_km_msl,
             melting_layer_product,
+            rpg_storm_motion,
             vcp,
             declared_cut_angles_deg,
             sweeps,
@@ -1561,6 +1629,11 @@ impl RenderInput {
             0
         };
         let melting_layer = 4 + self.melting_layer_product.as_ref().map_or(0, |o| o.len());
+        let rpg_motion = 1 + if self.rpg_storm_motion.is_some() {
+            8
+        } else {
+            0
+        };
         let sweeps: usize = self
             .sweeps
             .iter()
@@ -1590,7 +1663,7 @@ impl RenderInput {
         // `+ 2` for the coverage pattern number, `+ 4` and its `f64`s for the
         // declared cut table, `+ 4` for the sweep count.
         let declared = 4 + self.declared_cut_angles_deg.len() * 8;
-        header + motion + env + melting_layer + 2 + declared + 4 + sweeps
+        header + motion + env + melting_layer + rpg_motion + 2 + declared + 4 + sweeps
     }
 }
 

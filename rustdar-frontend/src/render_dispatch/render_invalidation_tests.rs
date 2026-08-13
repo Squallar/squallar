@@ -25,6 +25,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
                     polar: Default::default(),
                     nyquist_ms: None,
                     melting_layer_source: None,
+                    storm_motion_source: None,
                 },
             ))
         })),
@@ -473,6 +474,7 @@ fn cached(range: f64) -> CachedRenderOutput {
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
     }
 }
 
@@ -908,5 +910,186 @@ fn a_landed_melting_layer_drops_the_classification_renders_that_missed_it() {
         d.melting_layer_product_for(RadarProduct::HydrometeorClassification, "KTLX", volume(0))
             .is_none(),
         "the previous volume's object survived the replacement",
+    );
+}
+
+/// **A storm motion vector is never applied to a volume it does not name.**
+///
+/// [`a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names`]'s
+/// sibling, and the defect it closes has the same shape with a sharper edge. A
+/// storm motion error is not a local one: the correction is
+/// `speed · cos(direction − azimuth)` at every gate, so the previous volume's
+/// vector is a solid-body shift of the entire field. The RPG re-fits the SCIT
+/// average every volume and adjacent volumes differed by up to 4.7 kt in the
+/// sample the derivation was validated against — which is several display
+/// levels across a couplet.
+///
+/// And, exactly as with the melting layer, the neighbouring volume's vector is
+/// the *worst* of the three states rather than a middling one: it is a real
+/// average of real tracked cells, so nothing about the shifted field looks
+/// wrong, and the render reports itself as `RpgScitAverage` — the RPG's own,
+/// for this volume — while being neither. So the cache holds the volume start
+/// beside the pair and the accessor compares before it hands anything out.
+/// "The latest vector" is not a fallback here and must never become one.
+#[test]
+fn a_storm_motion_vector_is_only_ever_applied_to_the_volume_it_names() {
+    let volume = |minute: u32| {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, minute, 0)
+            .unwrap()
+    };
+    let object = |start: chrono::NaiveDateTime| StormMotionObject {
+        volume_start: start,
+        motion: (34.0, 225.0),
+    };
+    let srv = RadarProduct::StormRelativeVelocity;
+
+    let mut d = RenderDispatcher::new();
+    let gui = gui_showing("KTLX");
+    d.ensure_pane_count(1);
+
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KTLX", volume(0)),
+        None,
+        "with nothing cached SRV must fall back, not invent",
+    );
+
+    assert!(
+        d.set_storm_motion("KTLX", object(volume(0)), &gui),
+        "the first vector for a site is a change from nothing",
+    );
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KTLX", volume(0)),
+        Some((34.0, 225.0)),
+        "the vector for this very volume must reach the render",
+    );
+
+    // The volume rolls. The cached vector is still perfectly good data — it is
+    // simply not this picture's — so it is withheld, and withheld for every
+    // neighbouring volume rather than only for distant ones.
+    for other in [volume(6), volume(12), volume(1)] {
+        assert_eq!(
+            d.rpg_storm_motion_for(srv, "KTLX", other),
+            None,
+            "a vector naming {} was handed to a render of {other}",
+            volume(0),
+        );
+    }
+
+    // Per site, on the same terms: KOUN's volume happens to start at the same
+    // instant and still gets nothing, because it has no vector of its own.
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KOUN", volume(0)),
+        None,
+        "one site's storm motion was applied to another site's volume",
+    );
+
+    // And no other product applies one, whatever is cached.
+    for product in [
+        RadarProduct::Reflectivity,
+        RadarProduct::Velocity,
+        RadarProduct::CorrelationCoefficient,
+    ] {
+        assert_eq!(
+            d.rpg_storm_motion_for(product, "KTLX", volume(0)),
+            None,
+            "{product:?} was handed a storm motion vector it does not shift by",
+        );
+    }
+
+    // The replacement discipline, as the melting layer's: the same volume is
+    // not a change, the next one is, and the previous vector does not survive.
+    assert!(
+        !d.set_storm_motion("KTLX", object(volume(0)), &gui),
+        "a vector for the volume already in hand is not a change",
+    );
+    assert!(d.set_storm_motion("KTLX", object(volume(6)), &gui));
+    assert_eq!(d.storm_motion_volume("KTLX"), Some(volume(6)));
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KTLX", volume(0)),
+        None,
+        "the previous volume's vector survived the replacement",
+    );
+}
+
+/// **A zero vector is carried, not dropped.**
+///
+/// This one has no melting-layer analogue, and it is the trap this path is
+/// most likely to fall into: `0.0 kt from 0.0°` looks exactly like an
+/// uninitialised pair, and every instinct in a codebase full of
+/// `Option`-shaped absences says to treat it as one.
+///
+/// It is a **reading**. The RPG's SCIT algorithm tracked no cells this volume
+/// — no storm met the cell-identification thresholds, which is the ordinary
+/// state of a quiet or purely stratiform scan — and the RPG then painted an
+/// unshifted storm-relative field. That is the vector the reference product
+/// was built with, so a path that dropped it would not "fall back safely": it
+/// would substitute a *derived* rung, shift every gate by a Bunkers prediction
+/// of a storm the RPG did not think was moving, and the pane would go on
+/// captioning the result as a prediction while the reference beside it is
+/// unshifted — a disagreement with the RPG manufactured out of a zero.
+///
+/// So `(0.0, 0.0)` travels the whole path: cached, volume-checked, handed to
+/// the render, and still refused for the volume it does not name. The identity
+/// this cache turns on is the *volume's*, never the vector's.
+#[test]
+fn a_zero_storm_motion_vector_is_a_reading_and_is_carried_like_any_other() {
+    let volume = |minute: u32| {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, minute, 0)
+            .unwrap()
+    };
+    let srv = RadarProduct::StormRelativeVelocity;
+
+    let mut d = RenderDispatcher::new();
+    let gui = gui_showing("KTLX");
+    d.ensure_pane_count(1);
+
+    let zero = StormMotionObject {
+        volume_start: volume(0),
+        motion: (0.0, 0.0),
+    };
+    assert!(
+        d.set_storm_motion("KTLX", zero, &gui),
+        "a zero vector landing is a change from nothing, exactly as any other \
+         reading is — a `set` that treated it as no news would leave the pane \
+         on whatever rung it had already drawn",
+    );
+    assert_eq!(
+        d.storm_motion_volume("KTLX"),
+        Some(volume(0)),
+        "a zero vector was not recorded as an object of this volume, so the \
+         fetch gate would re-download it on every poll",
+    );
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KTLX", volume(0)),
+        Some((0.0, 0.0)),
+        "a zero vector was withheld from the render, which then shifts the \
+         field by a derived rung the RPG never applied",
+    );
+
+    // And the volume gate still holds over it. A zero is a reading *of one
+    // volume*: the next volume's storm may well be moving.
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KTLX", volume(6)),
+        None,
+        "an unshifted volume's zero was handed to a volume that never claimed it",
+    );
+
+    // Replacing a zero with a real vector is a change; the comparison is on
+    // the volume, so this cannot be reached by comparing the pairs.
+    assert!(d.set_storm_motion(
+        "KTLX",
+        StormMotionObject {
+            volume_start: volume(6),
+            motion: (41.0, 190.0),
+        },
+        &gui,
+    ));
+    assert_eq!(
+        d.rpg_storm_motion_for(srv, "KTLX", volume(6)),
+        Some((41.0, 190.0)),
     );
 }

@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 5;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 5. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 6;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 6. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -572,8 +572,13 @@ fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
          output a worker could answer with. A version 4 worker has no encoder \
          for that and a version 4 page no decoder, and either mismatch is a \
          decode that silently produces nothing — the browser's whole radar \
-         picture missing, with no error. Changing the message shapes without \
-         changing this number is the whole failure it prevents.",
+         picture missing, with no error. Version 6 added `smv`, where a \
+         storm-relative reply began reporting which storm motion vector it was \
+         shifted by: the RPG's own, or one of the local stand-ins that disagree \
+         with it on 83 % of gates and on more than half of them by two display \
+         levels or more. A reply that omits it is one whose storm-relative \
+         field cannot say which quantity it is showing. Changing the message \
+         shapes without changing this number is the whole failure it prevents.",
     );
 }
 
@@ -605,6 +610,13 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         "proto::POLAR,",
         "proto::MAX_RANGE,",
         "proto::NYQUIST,",
+        // The two provenance fields were missing from this list, which is the
+        // one thing it exists to enumerate: both are written before the match
+        // exactly as the others are, and neither was pinned. A default deleted
+        // from either would have left every non-SRV, non-classification reply
+        // carrying a stale provenance from whatever the worker answered last.
+        "proto::MELTING_LAYER,",
+        "proto::STORM_MOTION,",
         "proto::OUT,",
         "proto::OUT_KIND,",
     ] {

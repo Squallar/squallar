@@ -117,6 +117,7 @@ fn a_real_section_cut_lands_on_the_same_picture() {
         input.radar_lat(),
         input.radar_lon(),
         input.storm_motion_override(),
+        input.rpg_storm_motion(),
     )
     .expect("the fixture volume cuts")
     .image()
@@ -154,6 +155,7 @@ fn a_voxel_grid_passes_through_the_output_stage_untouched() {
         input.radar_lat(),
         input.radar_lon(),
         input.storm_motion_override(),
+        input.rpg_storm_motion(),
     )
     .expect("the fixture volume builds a grid");
 

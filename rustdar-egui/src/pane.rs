@@ -68,6 +68,15 @@ pub struct RadarImageData {
     /// default. The frame on the glass is the only thing that can say which
     /// this one is.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where the storm motion vector this frame was shifted by came from, or
+    /// `None` for a frame that shifted nothing.
+    ///
+    /// Per frame for the melting layer's reason exactly: the `N0S` is paired
+    /// to one volume, so a loop routinely animates one frame shifted by the
+    /// RPG's own applied vector beside twenty shifted by a right-mover
+    /// prediction. The frame on the glass is the only thing that can say which
+    /// this one is.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
 }
 
 /// Holds a rendered cross-section raster and the little that has to travel with
@@ -2055,6 +2064,50 @@ impl PaneState {
             .radar_meta
             .as_ref()?
             .melting_layer_source
+    }
+
+    /// Where the storm motion vector behind the storm-relative field **on
+    /// screen** came from, or `None` when the picture is not storm-relative.
+    ///
+    /// [`displayed_melting_layer_source`](Self::displayed_melting_layer_source)'s
+    /// sibling, sharing every one of its gates and for the same reasons:
+    ///
+    /// * **One product.** A storm motion vector is a render input to
+    ///   storm-relative velocity and to nothing else, so every other product
+    ///   answers `None` rather than reporting whatever the last SRV render
+    ///   shifted by.
+    /// * **The playing frame wins over the texture.** A loop's frames are
+    ///   separate volumes with separately-paired vectors, so the texture's
+    ///   metadata describes the static render the animation replaced.
+    /// * **Only what the pixels are.** Gated through
+    ///   [`stale_image_on_screen`](Self::stale_image_on_screen), so a pane
+    ///   still showing the previous product says nothing about a shift it is
+    ///   not displaying. That gate is also what keeps this from ever sharing
+    ///   the plate with the pending-render notice.
+    ///
+    /// It cannot collide with the melting-layer notice either, and by a
+    /// stronger argument than ordering: the two are gated on *different*
+    /// products, so at most one of them is ever `Some`.
+    ///
+    /// Map panes only, as its sibling is.
+    pub fn displayed_storm_motion_source(&self) -> Option<rustdar_radar::srv::StormMotionSource> {
+        if self.selected_product != RadarProduct::StormRelativeVelocity || !self.is_map() {
+            return None;
+        }
+        if self.loop_state.is_active() {
+            return self
+                .active_image()
+                .and_then(|frame| frame.storm_motion_source);
+        }
+        if self.stale_image_on_screen().is_some() {
+            return None;
+        }
+        self.overlay_cache(OverlayKind::Radar)?
+            .current
+            .as_ref()?
+            .radar_meta
+            .as_ref()?
+            .storm_motion_source
     }
 
     /// Whether this overlay is enabled for this pane.

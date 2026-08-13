@@ -15,6 +15,7 @@ use crate::tile_source::HttpsTiles;
 use rustdar_radar::hca::MeltingLayerSource;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
+use rustdar_radar::srv::StormMotionSource;
 use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
@@ -248,6 +249,7 @@ pub(super) fn render_pane_map_content(
         // the pane's list is egui's hash-order safety net (see `paint_order`).
         let mut pending_notice: Option<(RadarProduct, f32)> = None;
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
+        let mut storm_motion_caveat: Option<StormMotionSource> = None;
 
         let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
         for &kind in &draw_order {
@@ -354,6 +356,24 @@ pub(super) fn render_pane_map_content(
                         .pane
                         .displayed_melting_layer_source()
                         .filter(|source| !source.is_measured());
+                    // And the third sentence about the same pixels, for the
+                    // other product with an unrecoverable render input: what
+                    // the storm-relative field was shifted by, when it was not
+                    // the RPG's own vector.
+                    //
+                    // Filtered on `caption().is_some()` rather than on a rung
+                    // test written here. That method already encodes which
+                    // rungs earn a notice — the RPG's own because it is the
+                    // expected case, an override because the user set it and
+                    // the widget already shows it — and re-deriving the rule at
+                    // the draw site is how the two come to disagree.
+                    //
+                    // Mutually exclusive with the caveat above by product, not
+                    // by ordering: HHC and SRV cannot both be selected.
+                    storm_motion_caveat = ctx
+                        .pane
+                        .displayed_storm_motion_source()
+                        .filter(|source| source.caption().is_some());
                 }
                 // City label tiles — the same projector-driven tile pass the
                 // basemap goes through, at the same bias, so the names sit on
@@ -480,6 +500,22 @@ pub(super) fn render_pane_map_content(
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
             draw_melting_layer_notice(
+                &notice_painter,
+                ctx.pane_rect,
+                crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
+                source,
+            );
+        }
+
+        // The third occupant of that one plate, on the same terms — see the
+        // Radar arm. Glass, and exclusive with both of the above: with the
+        // pending notice by `stale_image_on_screen`, and with the melting-layer
+        // caveat by product, since one is gated on HHC and this on SRV.
+        if let Some(source) = storm_motion_caveat
+            && ctx.surfaces.paints(PaneSurface::Glass)
+        {
+            let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
+            draw_storm_motion_notice(
                 &notice_painter,
                 ctx.pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
@@ -1649,9 +1685,51 @@ pub(super) fn draw_melting_layer_notice(
     draw_top_notice(painter, pane_rect, top_margin, melting_layer_notice(source));
 }
 
-/// The rounded plate both top-of-pane notices are drawn on.
+/// Draw the storm-motion qualification across the top of the pane.
 ///
-/// One spelling, so a second notice cannot acquire a different size, colour or
+/// # Only the rungs that earn it
+///
+/// The caller filters on [`StormMotionSource::caption`] being `Some`, and that
+/// method — not this one, and not the call site — is where the rule lives. Two
+/// rungs earn no notice: the RPG's own vector, because it is the expected case
+/// and a notice on every SRV pane is a notice nobody reads, and a user
+/// override, because the user set it deliberately and the override widget
+/// already shows it. This function takes a source rather than a caption so the
+/// signature matches [`draw_melting_layer_notice`]'s, and it is a `let else`
+/// rather than an `expect` because a notice that cannot be worded is a notice
+/// that must not be drawn.
+///
+/// # Only ever one plate
+///
+/// Third occupant of the position the pending notice and the melting-layer
+/// caveat share, and it cannot collide with either. With the pending notice
+/// for [`draw_melting_layer_notice`]'s reason:
+/// [`PaneState::displayed_storm_motion_source`] is gated through
+/// `stale_image_on_screen`. With the melting-layer caveat by something
+/// stronger than ordering — that one is gated on
+/// `HydrometeorClassification` and this on `StormRelativeVelocity`, and a pane
+/// has one selected product.
+///
+/// Same plate, same quiet white, no icon, for every reason
+/// [`melting_layer_notice`] records. A field shifted by a Bunkers right-mover
+/// is a qualified answer, not a failed one — but it is a *different quantity*
+/// from the RPG's cell average, not a degraded version of it, so the pane says
+/// which one it is showing.
+pub(super) fn draw_storm_motion_notice(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    top_margin: f32,
+    source: StormMotionSource,
+) {
+    let Some(caption) = source.caption() else {
+        return;
+    };
+    draw_top_notice(painter, pane_rect, top_margin, caption.to_owned());
+}
+
+/// The rounded plate every top-of-pane notice is drawn on.
+///
+/// One spelling, so a further notice cannot acquire a different size, colour or
 /// urgency by being written separately — which is how a plain qualification
 /// ends up looking like a fault.
 ///

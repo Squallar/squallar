@@ -23,6 +23,7 @@ fn output(range: f64) -> CachedRenderOutput {
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
         ))),
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
     }
 }
 

@@ -364,6 +364,16 @@ pub struct RenderedFrame {
     /// between a classification measured for this volume and one standing on a
     /// fleet constant that has been measured 3 km wrong.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where the storm motion vector this raster was shifted by came from, or
+    /// `None` for every raster that shifted nothing — which is every product
+    /// but storm-relative velocity.
+    ///
+    /// See [`rustdar_radar::srv::StormMotionSource`]. It rides beside
+    /// `melting_layer_source` and for the same reason: it is a fact about
+    /// *this* picture that the far end cannot recompute, and here it is the
+    /// difference between the vector the reference product was built with and
+    /// a right-mover prediction that runs clockwise of it.
+    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
 }
 
 /// A [`MeltingLayerSource`](rustdar_radar::hca::MeltingLayerSource) as a
@@ -410,6 +420,53 @@ impl MeltingLayerWire {
     }
 }
 
+/// A [`StormMotionSource`](rustdar_radar::srv::StormMotionSource) as a number,
+/// for the same boundary [`MeltingLayerWire`] crosses.
+///
+/// Written here for the reason that one is: the enum lives in `rustdar-radar`,
+/// which crosses no message port and needs no wire form; the browser's
+/// page↔worker port does, and it carries JS values.
+///
+/// A newtype rather than two free functions so the pair cannot drift apart:
+/// [`from_wire_code`](Self::from_wire_code) is exhaustive over the same match
+/// arms [`wire_code`](Self::wire_code) writes, so adding a rung upstream fails
+/// this build rather than silently encoding as "unknown" — which for this
+/// value would mean an SRV pane reporting a Bunkers prediction as the RPG's own
+/// cell average, the one confusion the whole path exists to prevent.
+///
+/// The numbering **is** the declaration order, which is the fallback order, so
+/// a code reads as a rung of the chain. `None` from `from_wire_code` is a byte
+/// this build does not have — a page and a worker on opposite sides of a
+/// deploy, which the protocol token already refuses — and reads as "no source
+/// stated", the same as an absent field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StormMotionWire(pub rustdar_radar::srv::StormMotionSource);
+
+impl StormMotionWire {
+    pub fn wire_code(self) -> u8 {
+        use rustdar_radar::srv::StormMotionSource as S;
+        match self.0 {
+            S::UserOverride => 0,
+            S::RpgScitAverage => 1,
+            S::BunkersRightMover => 2,
+            S::MeanWind => 3,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    pub fn from_wire_code(code: u8) -> Option<Self> {
+        use rustdar_radar::srv::StormMotionSource as S;
+        let source = match code {
+            0 => S::UserOverride,
+            1 => S::RpgScitAverage,
+            2 => S::BunkersRightMover,
+            3 => S::MeanWind,
+            _ => return None,
+        };
+        Some(Self(source))
+    }
+}
+
 /// `None` where the renderer found nothing to draw — a scan with no matching
 /// sweep. Callers treat it as the failure the renderer already meant by it.
 pub type JobResult = Option<JobOutput>;
@@ -437,6 +494,7 @@ impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
             polar: render.polar,
             nyquist_ms: render.nyquist_ms,
             melting_layer_source: render.melting_layer_source,
+            storm_motion_source: render.storm_motion_source,
         }
     }
 }
@@ -1071,7 +1129,12 @@ pub fn execute(request: &JobRequest) -> JobResult {
         // come to disagree with the main thread's.
         // The storm motion override rides the `RenderInput` — the lane the
         // plan-view SRV render already uses — and is threaded here into the
-        // derivation seam both vertical renderers share.
+        // derivation seam both vertical renderers share. The RPG's own vector
+        // rides the same payload, one field over, and is threaded through
+        // beside it: the two are rungs of one chain and the derivation is what
+        // arbitrates between them, so a caller that passed only the override
+        // would silently demote every vertical SRV cut to a derived rung while
+        // the map beside it used the RPG's.
         //
         // So does the declared Nyquist table, and it has to be lifted back out
         // separately: `to_scan` rebuilds model types, and the model type is
@@ -1086,6 +1149,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 input.radar_lat(),
                 input.radar_lon(),
                 input.storm_motion_override(),
+                input.rpg_storm_motion(),
             )
             .map(|section| JobOutput::Section(Box::new(section)))
         }
@@ -1116,6 +1180,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 input.radar_lat(),
                 input.radar_lon(),
                 input.storm_motion_override(),
+                input.rpg_storm_motion(),
             )
             .map(|grid| JobOutput::Voxels(Box::new(grid)))
         }

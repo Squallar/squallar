@@ -57,6 +57,20 @@ pub const NYQUIST: &str = "nyq";
 /// does, and the page reads both back through the same `as_f64` filter.
 pub const MELTING_LAYER: &str = "mls";
 
+/// Worker → page: which storm motion vector a storm-relative velocity raster
+/// was shifted by, as [`rustdar_frontend::offload::StormMotionWire`]'s byte, or
+/// null for a raster that applied none — which is every product but
+/// storm-relative velocity.
+///
+/// A number and not a string for the reason [`MELTING_LAYER`] is one, and it
+/// carries the same weight: the two rungs on either side of this byte are not
+/// a better and a worse rendering of one field, they are different fields. A
+/// page that read a Bunkers right-mover as the RPG's own applied vector would
+/// caption a picture that disagrees with the reference on 83 % of its gates as
+/// the one that matches it. Null encodes `None`, and a byte this build does
+/// not have resolves to "no source stated" rather than to a plausible label.
+pub const STORM_MOTION: &str = "smv";
+
 /// Worker → page: an output that is not a plan-view frame — a cross-section
 /// raster or a voxel grid — as **one** transferred `Uint8Array` in the payload
 /// type's own wire form.
@@ -113,7 +127,15 @@ pub const OUT_KIND: &str = "outkind";
 /// decoder, and either mismatch would be a decode that silently produced
 /// nothing — the browser's whole radar picture, missing, with no error. The
 /// token is what turns that into a clean termination.
-const PROTOCOL_VERSION: u32 = 5;
+/// Version 6 added [`STORM_MOTION`], for the reason version 4 added the melting
+/// layer and not the reason version 3 added the Nyquist. A page reading `None`
+/// from an older worker would draw *no* qualification over a storm-relative
+/// field built on the Bunkers right-mover — a field that agrees with the RPG's
+/// own answer on 17 % of its gates, and on fewer than half of them to within
+/// one display level. Left unqualified it is indistinguishable from the one
+/// that sits at the achievable ceiling, which is exactly the silence the token
+/// exists to convert into a clean termination.
+const PROTOCOL_VERSION: u32 = 6;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

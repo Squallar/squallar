@@ -743,6 +743,7 @@ fn image() -> rustdar_egui::pane::RadarImageData {
         max_range_km: 100.0,
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
     }
 }

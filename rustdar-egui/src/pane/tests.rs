@@ -210,6 +210,7 @@ fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
         max_range_km: 100.0,
         nyquist_ms: None,
         melting_layer_source: None,
+        storm_motion_source: None,
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
     }
 }
@@ -1098,7 +1099,7 @@ fn frames_outside_the_render_set_do_not_block_readiness() {
 /// `stale_image_on_screen` falls back to the product alone and a pane showing
 /// velocity while velocity is selected is showing what it claims to.
 fn velocity_pane(ctx: &egui::Context, nyquist_ms: Option<f64>) -> PaneState {
-    pane_showing_render(ctx, RadarProduct::Velocity, nyquist_ms, None)
+    pane_showing_render(ctx, RadarProduct::Velocity, nyquist_ms, None, None)
 }
 
 /// A pane showing a finished classification render that stood on `source`.
@@ -1110,16 +1111,36 @@ fn classification_pane(
     ctx: &egui::Context,
     source: Option<rustdar_radar::hca::MeltingLayerSource>,
 ) -> PaneState {
-    pane_showing_render(ctx, RadarProduct::HydrometeorClassification, None, source)
+    pane_showing_render(
+        ctx,
+        RadarProduct::HydrometeorClassification,
+        None,
+        source,
+        None,
+    )
 }
 
-/// A pane showing a finished render of `product`, described by the two facts a
+/// A pane showing a finished storm-relative render shifted by `source`.
+///
+/// The third sibling on the one fixture, for the third per-picture fact. It
+/// states no melting layer and `classification_pane` states no storm motion,
+/// which is not tidiness: the two inputs belong to different products and a
+/// fixture carrying both would model a render the host cannot produce.
+fn storm_relative_pane(
+    ctx: &egui::Context,
+    source: Option<rustdar_radar::srv::StormMotionSource>,
+) -> PaneState {
+    pane_showing_render(ctx, RadarProduct::StormRelativeVelocity, None, None, source)
+}
+
+/// A pane showing a finished render of `product`, described by the facts a
 /// render carries about itself that nothing else can recompute.
 fn pane_showing_render(
     ctx: &egui::Context,
     product: RadarProduct,
     nyquist_ms: Option<f64>,
     melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
 ) -> PaneState {
     use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
 
@@ -1145,6 +1166,7 @@ fn pane_showing_render(
             max_range_km: 100.0,
             nyquist_ms,
             melting_layer_source,
+            storm_motion_source,
             product,
             elevation: 0.5,
         }),
@@ -1325,4 +1347,118 @@ fn a_looping_classification_pane_reports_the_playing_frames_layer() {
     // must not fall back to the texture underneath it.
     pane.loop_state.current_frame = 2;
     assert_eq!(pane.displayed_melting_layer_source(), None);
+}
+
+/// An SRV pane reports the vector **its own pixels** were shifted by.
+///
+/// [`a_classification_pane_reports_the_layer_its_pixels_stood_on`]'s sibling,
+/// and the whole point of carrying the source this far. SRV on the RPG's own
+/// SCIT average and SRV on a Bunkers right-mover are not a good and a slightly
+/// worse rendering of one field: the right-mover is a *prediction* of where a
+/// supercell would deviate, the SCIT average is the mean of the cells actually
+/// tracked, and the two differ by a signed rotation. Every gate is shifted by
+/// `speed · cos(direction − azimuth)`, so a pane that could not tell them apart
+/// would show one quantity under the other's name.
+#[test]
+fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
+    use rustdar_radar::srv::StormMotionSource;
+
+    let ctx = egui::Context::default();
+
+    let rpg = storm_relative_pane(&ctx, Some(StormMotionSource::RpgScitAverage));
+    assert_eq!(
+        rpg.displayed_storm_motion_source(),
+        Some(StormMotionSource::RpgScitAverage),
+    );
+
+    // The rungs are reported whether or not they earn a notice. This accessor
+    // answers "what were these pixels shifted by"; `caption` is what decides
+    // whether that answer is worth a plate, and keeping the two apart is what
+    // lets the hover name a rung the notice stays quiet about.
+    for derived in [
+        StormMotionSource::UserOverride,
+        StormMotionSource::BunkersRightMover,
+        StormMotionSource::MeanWind,
+    ] {
+        let pane = storm_relative_pane(&ctx, Some(derived));
+        assert_eq!(
+            pane.displayed_storm_motion_source(),
+            Some(derived),
+            "{derived:?} was not reported by the pane it shifted",
+        );
+    }
+
+    // Every other product shifted nothing, so there is nothing to report — and
+    // emphatically not the last SRV render's vector. Velocity is the row that
+    // matters: it is the moment SRV is derived from and sits next to it in
+    // every picker.
+    let mut other = storm_relative_pane(&ctx, Some(StormMotionSource::BunkersRightMover));
+    for product in [
+        RadarProduct::Reflectivity,
+        RadarProduct::Velocity,
+        RadarProduct::HydrometeorClassification,
+    ] {
+        other.selected_product = product;
+        assert_eq!(
+            other.displayed_storm_motion_source(),
+            None,
+            "{product:?} was described as having been shifted by a storm motion",
+        );
+    }
+
+    // A section and a 3D volume assemble a whole ladder; neither is the one
+    // plan-view field this describes.
+    let mut ladder = storm_relative_pane(&ctx, Some(StormMotionSource::BunkersRightMover));
+    ladder.set_map_render(MapRender::Volume);
+    assert_eq!(ladder.displayed_storm_motion_source(), None);
+    ladder.set_map_render(MapRender::Plan);
+    ladder.set_kind(PaneKind::CrossSection);
+    assert_eq!(ladder.displayed_storm_motion_source(), None);
+
+    // And a classification pane reports no vector while an SRV pane reports no
+    // layer: the two per-picture inputs are gated on different products, which
+    // is what makes their two notices mutually exclusive by construction
+    // rather than by draw order.
+    assert_eq!(
+        storm_relative_pane(&ctx, Some(StormMotionSource::MeanWind))
+            .displayed_melting_layer_source(),
+        None,
+    );
+    assert_eq!(
+        classification_pane(
+            &ctx,
+            Some(rustdar_radar::hca::MeltingLayerSource::FleetDefault)
+        )
+        .displayed_storm_motion_source(),
+        None,
+    );
+}
+
+/// While a loop runs, the vector is the *playing frame's*.
+///
+/// A loop pairs one `N0S` per volume and the app has only ever fetched one —
+/// the still frame's — so a loop routinely animates a field shifted by the
+/// RPG's own vector beside twenty shifted by a right-mover prediction. Reading
+/// the static texture's metadata would report the whole animation as the RPG's.
+#[test]
+fn a_looping_storm_relative_pane_reports_the_playing_frames_vector() {
+    use rustdar_radar::srv::StormMotionSource;
+
+    let ctx = egui::Context::default();
+    let mut pane = storm_relative_pane(&ctx, Some(StormMotionSource::RpgScitAverage));
+    pane.loop_state = loop_with_frames(3, 1);
+    pane.loop_state.frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
+        storm_motion_source: Some(StormMotionSource::BunkersRightMover),
+        ..dummy_plan_view(&ctx)
+    }));
+    assert_eq!(
+        pane.displayed_storm_motion_source(),
+        Some(StormMotionSource::BunkersRightMover),
+        "the loop reported the static render's vector, not the frame on the glass",
+    );
+
+    // A playhead on a frame with no picture yet has nothing to describe, and
+    // must not fall back to the texture underneath it.
+    pane.loop_state.current_frame = 2;
+    assert_eq!(pane.displayed_storm_motion_source(), None);
 }

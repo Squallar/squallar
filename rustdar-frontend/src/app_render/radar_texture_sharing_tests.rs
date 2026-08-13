@@ -135,6 +135,7 @@ fn post(
                 hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
                 melting_layer_source: None,
+                storm_motion_source: None,
             }),
             product,
             elevation,

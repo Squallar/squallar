@@ -181,7 +181,10 @@ fn render_a_real_volume_mask() {
         values_wanted: false,
     };
     let motion = motion_from_env(product);
-    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion)
+    // No RPG vector: this harness renders from a Level II file alone and
+    // fetches no `N0S`, so the derivation resolves the rung it would have
+    // resolved on any volume the app has no object for.
+    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion, None)
         .unwrap_or_else(|| {
             panic!(
                 "build_voxels refused: product {} at {:?}, base {} km, top {} km, \
@@ -584,7 +587,10 @@ fn measure_boundary_honesty_and_smoothness() {
         values_wanted: false,
     };
     let motion = motion_from_env(product);
-    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion)
+    // No RPG vector: this harness renders from a Level II file alone and
+    // fetches no `N0S`, so the derivation resolves the rung it would have
+    // resolved on any volume the app has no object for.
+    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion, None)
         .unwrap_or_else(|| panic!("build_voxels refused {}", product.code()));
 
     let size = size_from_env();

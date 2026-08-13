@@ -281,7 +281,7 @@ fn request(start: (f64, f64), end: (f64, f64)) -> SectionRequest {
 /// `column_distance_km(c)` exactly.
 fn radial_section(scan: &Scan, bearing_deg: f64, length_km: f64) -> CrossSection {
     let req = request(SITE, point_at(bearing_deg, length_km));
-    render_section(scan, &req, SITE.0, SITE.1, None).expect("a radial section renders")
+    render_section(scan, &req, SITE.0, SITE.1, None, None).expect("a radial section renders")
 }
 
 fn status_at(section: &CrossSection, col: usize, row: usize) -> SampleStatus {
@@ -607,7 +607,7 @@ fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
     // radial, so the azimuth changes down the raster and a track measured
     // as a straight lat/lon lerp would drift off it.
     let req = request(point_at(310.0, 40.0), point_at(65.0, 190.0));
-    let section = render_section(&scan, &req, SITE.0, SITE.1, None).unwrap();
+    let section = render_section(&scan, &req, SITE.0, SITE.1, None, None).unwrap();
     let axes = *section.axes();
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
 
@@ -1234,6 +1234,7 @@ fn the_cone_of_silence_is_reported_as_the_extent_of_the_empty_columns() {
         SITE.0,
         SITE.1,
         None,
+        None,
     )
     .unwrap();
     assert_eq!(far.axes().cone_of_silence_km, 0.0);
@@ -1245,7 +1246,7 @@ fn the_cone_of_silence_is_reported_as_the_extent_of_the_empty_columns() {
 fn the_cone_extent_follows_the_axis_the_caller_asked_for() {
     let scan = scan_with(&|_az, _slant| Gate::Dbz(35.0));
     let end = point_at(5.0, 120.0);
-    let tall = render_section(&scan, &request(SITE, end), SITE.0, SITE.1, None).unwrap();
+    let tall = render_section(&scan, &request(SITE, end), SITE.0, SITE.1, None, None).unwrap();
 
     let low = render_section(
         &scan,
@@ -1255,6 +1256,7 @@ fn the_cone_extent_follows_the_axis_the_caller_asked_for() {
         },
         SITE.0,
         SITE.1,
+        None,
         None,
     )
     .unwrap();
@@ -1283,7 +1285,7 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
     let scan = scan_with(&|az, slant| Gate::Dbz(20.0 + az / 36.0 + slant / 50.0));
     // Straight through the site: 100 km out on 20°, 100 km out on 200°.
     let req = request(point_at(200.0, 100.0), point_at(20.0, 100.0));
-    let section = render_section(&scan, &req, SITE.0, SITE.1, None).unwrap();
+    let section = render_section(&scan, &req, SITE.0, SITE.1, None, None).unwrap();
     let axes = *section.axes();
 
     // Ground ranges along the line, recomputed the way the renderer does.
@@ -1397,7 +1399,7 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
 fn the_blind_guard_holds_where_the_first_gate_starts_at_the_antenna() {
     let scan = scan_with_first_gate(&|az, _slant| Gate::Dbz(20.0 + az / 12.0), 0);
     let req = request(point_at(200.0, 40.0), point_at(20.0, 40.0));
-    let section = render_section(&scan, &req, SITE.0, SITE.1, None).unwrap();
+    let section = render_section(&scan, &req, SITE.0, SITE.1, None, None).unwrap();
     let axes = *section.axes();
 
     let col = (0..SECTION_WIDTH)
@@ -1841,7 +1843,7 @@ fn a_request_that_names_no_section_is_refused() {
     let end = point_at(45.0, 100.0);
 
     assert!(
-        render_section(&scan, &request(SITE, SITE), SITE.0, SITE.1, None).is_none(),
+        render_section(&scan, &request(SITE, SITE), SITE.0, SITE.1, None, None).is_none(),
         "a zero-length line rendered",
     );
     assert!(
@@ -1850,13 +1852,22 @@ fn a_request_that_names_no_section_is_refused() {
             &request((f64::NAN, -97.0), end),
             SITE.0,
             SITE.1,
+            None,
             None
         )
         .is_none(),
         "a non-finite endpoint rendered",
     );
     assert!(
-        render_section(&scan, &request(SITE, end), f64::INFINITY, SITE.1, None).is_none(),
+        render_section(
+            &scan,
+            &request(SITE, end),
+            f64::INFINITY,
+            SITE.1,
+            None,
+            None
+        )
+        .is_none(),
         "a non-finite site rendered",
     );
     for top in [
@@ -1874,6 +1885,7 @@ fn a_request_that_names_no_section_is_refused() {
                 },
                 SITE.0,
                 SITE.1,
+                None,
                 None
             )
             .is_none(),
@@ -1891,6 +1903,7 @@ fn a_request_that_names_no_section_is_refused() {
             },
             SITE.0,
             SITE.1,
+            None,
             None
         )
         .is_some(),
@@ -1908,6 +1921,7 @@ fn a_request_that_names_no_section_is_refused() {
             },
             SITE.0,
             SITE.1,
+            None,
             None
         )
         .is_none(),
@@ -1915,7 +1929,15 @@ fn a_request_that_names_no_section_is_refused() {
     );
     let placeholder = Scan::new(vcp(&[]), scan.sweeps().to_vec());
     assert!(
-        render_section(&placeholder, &request(SITE, end), SITE.0, SITE.1, None).is_none(),
+        render_section(
+            &placeholder,
+            &request(SITE, end),
+            SITE.0,
+            SITE.1,
+            None,
+            None
+        )
+        .is_none(),
         "a scan with an empty cut table rendered, so a worker would build \
              a different ladder than the main thread with no error",
     );
@@ -1934,7 +1956,8 @@ fn every_axis_number_of_a_rendered_section_is_finite() {
         (point_at(90.0, 400.0), point_at(270.0, 400.0)),
         (point_at(10.0, 0.2), point_at(190.0, 0.2)),
     ] {
-        let section = render_section(&scan, &request(start, end), SITE.0, SITE.1, None).unwrap();
+        let section =
+            render_section(&scan, &request(start, end), SITE.0, SITE.1, None, None).unwrap();
         let a = section.axes();
         for (name, v) in [
             ("length_km", a.length_km),
@@ -2063,6 +2086,7 @@ fn a_section_with_no_values_still_equals_itself() {
         &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
         SITE.0,
         SITE.1,
+        None,
         None,
     )
     .unwrap();
@@ -2756,6 +2780,7 @@ fn a_section_round_trips_through_its_wire_form() {
         SITE.0,
         SITE.1,
         None,
+        None,
     )
     .expect("a section well outside the volume still renders");
     let shallow = render_section(
@@ -2766,6 +2791,7 @@ fn a_section_round_trips_through_its_wire_form() {
         },
         SITE.0,
         SITE.1,
+        None,
         None,
     )
     .expect("a low axis renders");
@@ -2830,6 +2856,7 @@ fn the_encoded_length_of_a_section_is_exact() {
         &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
         SITE.0,
         SITE.1,
+        None,
         None,
     )
     .unwrap();

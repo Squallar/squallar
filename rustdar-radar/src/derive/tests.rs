@@ -243,6 +243,7 @@ fn srv_subtracts_the_override_motion_radial_by_radial() {
         (&scan).into(),
         RadarProduct::StormRelativeVelocity,
         Some((speed_kt, direction)),
+        None,
     )
     .expect("a velocity volume with an override derives");
     let Prepared::Derived(derived) = prepared else {
@@ -431,7 +432,15 @@ fn nrot_decodes_onto_the_reference_lattice() {
 fn srv_with_no_motion_vector_refuses() {
     // No velocity anywhere: no wind fit, and (no override) no vector.
     let scan = scan_with(&|_, _| (Some(40.0), None, None, Some(0.99)));
-    assert!(prepare((&scan).into(), RadarProduct::StormRelativeVelocity, None).is_none());
+    assert!(
+        prepare(
+            (&scan).into(),
+            RadarProduct::StormRelativeVelocity,
+            None,
+            None
+        )
+        .is_none()
+    );
 }
 
 /// NROT is the rotation pipeline's output, not relabelled velocity: on a
@@ -440,7 +449,7 @@ fn srv_with_no_motion_vector_refuses() {
 #[test]
 fn nrot_is_rotation_not_relabelled_velocity() {
     let scan = scan_with(&|_, _| (Some(40.0), Some(15.0), None, Some(0.99)));
-    let prepared = prepare((&scan).into(), RadarProduct::NormalizedRotation, None)
+    let prepared = prepare((&scan).into(), RadarProduct::NormalizedRotation, None, None)
         .expect("a velocity volume derives");
     let Prepared::Derived(derived) = prepared else {
         panic!("NROT must be derived, never served from the raw scan");
@@ -483,15 +492,22 @@ fn a_derived_section_slices_the_derived_field() {
         top_km_msl: None,
         product,
     };
-    let bv =
-        crate::xsect::render_section(&scan, &req(RadarProduct::Velocity), site.0, site.1, None)
-            .expect("the velocity section renders");
+    let bv = crate::xsect::render_section(
+        &scan,
+        &req(RadarProduct::Velocity),
+        site.0,
+        site.1,
+        None,
+        None,
+    )
+    .expect("the velocity section renders");
     let srv = crate::xsect::render_section(
         &scan,
         &req(RadarProduct::StormRelativeVelocity),
         site.0,
         site.1,
         Some((20.0, 240.0)),
+        None,
     )
     .expect("the SRV section renders");
 
@@ -531,14 +547,22 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
         },
         values_wanted: true,
     };
-    let bv = build_voxels_with_motion(&scan, &req(RadarProduct::Velocity), site.0, site.1, None)
-        .expect("the velocity grid builds");
+    let bv = build_voxels_with_motion(
+        &scan,
+        &req(RadarProduct::Velocity),
+        site.0,
+        site.1,
+        None,
+        None,
+    )
+    .expect("the velocity grid builds");
     let srv = build_voxels_with_motion(
         &scan,
         &req(RadarProduct::StormRelativeVelocity),
         site.0,
         site.1,
         Some((20.0, 240.0)),
+        None,
     )
     .expect("the SRV grid builds");
 
@@ -568,6 +592,7 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
         &req(RadarProduct::NormalizedRotation),
         site.0,
         site.1,
+        None,
         None,
     )
     .expect("the NROT grid builds");
@@ -599,6 +624,7 @@ fn kdp_is_the_phase_derivative_not_relabelled_phase() {
     let prepared = prepare(
         (&scan).into(),
         RadarProduct::SpecificDifferentialPhase,
+        None,
         None,
     )
     .expect("a ΦDP volume derives");
@@ -683,7 +709,7 @@ fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
         // no Nyquist limit, so the dealias each derivation runs estimates one
         // — which is what this fixture had before the declaration crossed the
         // boundary, and the clocks it checks do not depend on it.
-        let prepared = prepare((&scan).into(), product, Some((30.0, 240.0)))
+        let prepared = prepare((&scan).into(), product, Some((30.0, 240.0)), None)
             .unwrap_or_else(|| panic!("{product:?} derives from this fixture"));
         let derived = match &prepared {
             Prepared::Derived(scan) => scan,
@@ -751,7 +777,7 @@ fn arc_sweep(n: usize, step_deg: f32) -> Sweep {
 fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
     for (n, step, expected) in [(360usize, 1.0f32, 1.0f32), (72, 0.5, 0.5)] {
         let scan = Scan::new(vcp(&[0.5]), vec![arc_sweep(n, step)]);
-        let prepared = prepare((&scan).into(), RadarProduct::NormalizedRotation, None)
+        let prepared = prepare((&scan).into(), RadarProduct::NormalizedRotation, None, None)
             .expect("a velocity volume derives NROT");
         let Prepared::Derived(derived) = prepared else {
             panic!("NROT must be derived, never served from the raw scan");
@@ -818,6 +844,7 @@ fn a_tilt_whose_leading_radial_lost_its_phase_is_still_derived() {
     let prepared = prepare(
         (&maimed).into(),
         RadarProduct::SpecificDifferentialPhase,
+        None,
         None,
     )
     .expect("a \u{3a6}DP volume derives");
