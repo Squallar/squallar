@@ -10,6 +10,8 @@ use nexrad_model::data::{DataMoment, Radial, Scan};
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod polar;
+
 // ── Shared rendering infrastructure ──────────────────────────────────────────
 
 /// Pre-computed Web Mercator projection constants, derived from
@@ -126,6 +128,14 @@ impl MercatorProjection {
         value: f32,
         from: GateId,
     ) {
+        // The one place a `(radial, gate)`, the sky it stands for and the
+        // number painted from it all exist together, so it is where they are
+        // recorded. Every rasterization path gets its polar field from this
+        // line rather than assembling one beside its own fill loop; see
+        // [`polar::PolarBuffers`] for what that buys.
+        bufs.polar
+            .paint(from, ctx.azimuth_deg, ctx.az_half_spacing, value);
+
         let range_start = range_km - gate_interval / 2.0;
         let range_end = range_km + gate_interval / 2.0;
 
@@ -177,6 +187,16 @@ struct RadialContext {
     sin_az_delta: f64,
     cos_az_delta: f64,
     az_half_spacing: f64,
+    /// The radial's own azimuth, degrees, kept unencoded beside the sines and
+    /// cosines the paint loop reads.
+    ///
+    /// It is not recoverable from them to the precision a readout needs — the
+    /// pair either end of the wedge are the *edges*, and `atan2` back to the
+    /// middle of a wedge a few hundredths of a degree wide costs more than
+    /// carrying the number that was already in hand. `render_gate` records it
+    /// with every gate it paints, which is what lets
+    /// [`polar::PolarGeometry::pick`] ask the wedge question backwards.
+    azimuth_deg: f64,
 }
 
 impl RadialContext {
@@ -208,6 +228,7 @@ impl RadialContext {
             sin_az_delta: sin_az_end - sin_az_start,
             cos_az_delta: cos_az_end - cos_az_start,
             az_half_spacing: az_half_spacing_deg,
+            azimuth_deg,
         }
     }
 }
@@ -336,6 +357,15 @@ struct RenderBuffers {
     /// it: [`Self::checkout`] resizes a carried buffer to that length on the way
     /// in and nothing resizes it again.
     cells: Vec<AtomicU64>,
+    /// The gates themselves, at the resolution the radar measured them,
+    /// recorded as [`MercatorProjection::render_gate`] paints them.
+    ///
+    /// Beside the cells rather than derived from them afterwards, because the
+    /// cells cannot answer for it: a cell holds the *winning* claim on a pixel,
+    /// so every gate a later radial outranked is already gone from the raster,
+    /// and a gate finer than a texel never had a pixel of its own to be found
+    /// in. See [`polar::PolarBuffers`].
+    polar: polar::PolarBuffers,
     /// Only `into_output` needs it, but it has to be the product the gates were
     /// coloured against, so it is captured at construction rather than passed
     /// back in.
@@ -855,9 +885,15 @@ impl RenderBuffers {
     /// [`RenderBuffers::into_output`] reads the lengths back off `cells` rather
     /// than being told them again — so nothing downstream can be handed a
     /// picture whose dimensions disagree with its bytes.
-    fn new(product: types::RadarProduct, side_px: usize) -> Self {
+    fn new(
+        product: types::RadarProduct,
+        side_px: usize,
+        shape: polar::PolarShape,
+        gate_interval_km: f64,
+    ) -> Self {
         Self {
             cells: Self::checkout(side_px * side_px),
+            polar: polar::PolarBuffers::new(shape, gate_interval_km),
             product,
         }
     }
@@ -1024,7 +1060,11 @@ impl RenderBuffers {
     /// runs and taking `self` by value proves it, so the drain is a plain load
     /// and store per cell rather than 4 M locked read-modify-writes.
     fn into_output(self, extent_km: f64) -> SweepRender {
-        let Self { mut cells, product } = self;
+        let Self {
+            mut cells,
+            polar,
+            product,
+        } = self;
         let mut value_data = checkout_values();
         value_data.extend(cells.iter_mut().map(|a| {
             match std::mem::replace(a.get_mut(), Self::EMPTY) {
@@ -1057,6 +1097,7 @@ impl RenderBuffers {
             image,
             max_range_km: extent_km,
             values: value_data,
+            polar: polar.into_field(),
             // Set by the sweep paths that know one; see the field.
             nyquist_ms: None,
             // Set by the classification path, which is the only one that has
@@ -1121,7 +1162,31 @@ pub struct SweepRender {
     pub max_range_km: f64,
     /// Per-pixel values, `f32::NAN` where nothing was painted **and** where a
     /// range-folded gate was (see [`RANGE_FOLDED_BITS`]).
+    ///
+    /// # This is the rasterizer's own instrument, not a readout's copy
+    ///
+    /// It used to be both, and being both is what made it 206.75 MiB of
+    /// resident memory per pane: `7362² × 4` for a surveillance cut, carried out
+    /// of this crate, `Arc`-ed into the pane, the render cache and the suspend
+    /// copy, and read one `f32` at a time by a hover. Nothing outside this
+    /// crate holds it now — [`Self::polar`] answers that question at the
+    /// resolution the radar measured at, about a fortieth of the size — and the
+    /// frontend hands this buffer straight back through [`recycle_values`] the
+    /// moment the texture has been built from it.
+    ///
+    /// What it is still for is the thing only a raster can say: *where the
+    /// pixels went*. This module's own tests measure painted ranges, ring
+    /// bounds and the pairing between a texel and the number behind it off this
+    /// buffer, and none of those questions has a polar answer.
     pub values: Vec<f32>,
+    /// The gates behind those pixels, at the resolution the radar measured
+    /// them, and the geometry to find one under a point.
+    ///
+    /// This is what a hover reads. See [`polar`] for why the answer is derived
+    /// from the measurements rather than resampled from them, and for the one
+    /// rule — `render_gate`'s, inverted — that keeps the number under the
+    /// cursor and the colour under the cursor describing the same gate.
+    pub polar: polar::PolarField,
     /// Where the rendered sweep's cut declared its velocity folds, m/s.
     ///
     /// A property of the **sweep**, not of the product drawn from it, so every
@@ -1541,6 +1606,57 @@ fn compute_gate_interval_km(radials: &[Radial], product: types::RadarProduct) ->
     if finest.is_finite() { finest } else { 0.0 }
 }
 
+/// Where a sweep's gates start and how many of them there are, for the product
+/// being drawn — the two halves of [`polar::PolarShape`] that
+/// [`compute_max_range`] and [`compute_gate_interval_km`] do not already answer.
+///
+/// Both taken the way those two take theirs: the **nearest** first gate and the
+/// **most** gates any radial carrying the product declares, so the polar field
+/// is at least as large as every radial the fill will walk. A shape smaller
+/// than the walk loses the tail of a radial's readout, which `PolarBuffers::
+/// paint` will `debug_assert` on but cannot recover from.
+///
+/// In practice there is nothing to choose between the radials. Within one cut
+/// the RDA declares one gate count and one first-gate range per moment, and
+/// real volumes hold to it exactly — the same 102 sweeps over six sites that
+/// [`GATE_REACH_SPREAD_WARN_KM`] was calibrated on agreed on their reach to the
+/// last bit. This takes the widest anyway, because the cost of doing so is a
+/// few unpainted `NaN`s at the end of a row and the cost of not doing so is a
+/// readout that goes quiet over part of the picture.
+///
+/// Zeroes where no radial carries the product, which is the same answer its two
+/// neighbours give for that sweep.
+fn compute_gate_span(radials: &[Radial], product: types::RadarProduct) -> (f64, usize) {
+    let mut first_km = f64::INFINITY;
+    let mut gates = 0usize;
+    for radial in radials {
+        let Some(moment) = product.get_moment(radial) else {
+            continue;
+        };
+        first_km = first_km.min(moment.first_gate_range_km());
+        gates = gates.max(moment.gate_count() as usize);
+    }
+    (if first_km.is_finite() { first_km } else { 0.0 }, gates)
+}
+
+/// The polar shape of a 1° × 1 km volume grid — the layout
+/// [`crate::volumetric`] computes echo tops, VIL density and the hail pair
+/// onto, and the one three of the paths below share.
+///
+/// Gate 0's centre sits half a bin out because that is where those fills paint
+/// it: each calls `render_gate` at `r + 0.5` for row index `r`, so the first
+/// bin spans `[0, 1)` km and is centred at 0.5. Spelt once rather than three
+/// times for the reason [`FieldRadial`] is one argument: a shape that disagreed
+/// with the fill about where bin zero starts would offset every range in the
+/// readout by half a bin, in a picture where half a bin is invisible.
+fn volume_grid_shape(rows: usize, range_bins: usize) -> polar::PolarShape {
+    polar::PolarShape {
+        radials: rows,
+        gates: range_bins,
+        first_gate_km: crate::volumetric::RANGE_BIN_KM / 2.0,
+    }
+}
+
 /// The factor between the slant range a sweep's gates are measured at and the
 /// ground range they sit over: `cos e` of the sweep's **median** elevation.
 ///
@@ -1586,6 +1702,20 @@ struct FieldRadial {
     /// [`types::data_limited_side_px`] answers it with the display's calibrated
     /// scale rather than dividing by it.
     sample_km: f64,
+    /// The polar layout the fill will walk — how many radials, how many gates
+    /// each, and where gate 0 sits.
+    ///
+    /// Here rather than passed alongside for the reason the two above are here:
+    /// it has to agree with them about its coordinate. `first_gate_km` is the
+    /// ground range `sample_km` steps out from, and a shape declared in slant
+    /// kilometres beside a spacing in ground ones would put every gate of the
+    /// readout at a range the picture does not draw it at.
+    ///
+    /// It cannot be recovered from the raster afterwards, which is why the fill
+    /// has to say it: the cells hold only winning claims, so a gate a later
+    /// radial outranked leaves no trace, and a gate finer than a texel never
+    /// had a pixel of its own.
+    shape: polar::PolarShape,
 }
 
 /// Project a field onto the image, at the extent its own data asks for.
@@ -1636,12 +1766,17 @@ fn render_with_projection(
     let FieldRadial {
         reach_km,
         sample_km,
+        shape,
     } = field;
     let extent_km = types::plan_view_extent_km(reach_km);
     let side_px = types::raster_side_px(extent_km, side_ceiling_px, sample_km);
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
     let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km, side_px);
-    let bufs = RenderBuffers::new(product, side_px);
+    // The gate depth the field records is `sample_km` and not a fourth number
+    // the fill states separately: it is the same spacing the raster was sized
+    // from, so a readout cannot come to disagree with the picture about how
+    // deep a gate is.
+    let bufs = RenderBuffers::new(product, side_px, shape, sample_km);
 
     fill(&proj, &bufs);
 
@@ -1884,6 +2019,7 @@ pub fn render_radar_to_image_full_sized(
     let cos_e = sweep_ground_factor(radials);
     let ground_reach_km = compute_max_range(radials, product) * cos_e;
     let ground_sample_km = compute_gate_interval_km(radials, product) * cos_e;
+    let (first_gate_slant_km, gate_count) = compute_gate_span(radials, product);
 
     let output = render_with_projection(
         radar_lat,
@@ -1891,6 +2027,11 @@ pub fn render_radar_to_image_full_sized(
         FieldRadial {
             reach_km: ground_reach_km,
             sample_km: ground_sample_km,
+            shape: polar::PolarShape {
+                radials: radials.len(),
+                gates: gate_count,
+                first_gate_km: first_gate_slant_km * cos_e,
+            },
         },
         product,
         side_ceiling_px,
@@ -2032,6 +2173,11 @@ fn render_nrot_to_image(
         FieldRadial {
             reach_km: ground_reach_km,
             sample_km: vg.gate_interval_km * cos_e,
+            shape: polar::PolarShape {
+                radials: nrot_grid.len(),
+                gates: nrot_grid.iter().map(Vec::len).max().unwrap_or(0),
+                first_gate_km: vg.first_gate_range_km * cos_e,
+            },
         },
         types::RadarProduct::NormalizedRotation,
         side_ceiling_px,
@@ -2136,6 +2282,11 @@ fn render_srv_to_image(
         FieldRadial {
             reach_km: ground_reach_km,
             sample_km: grid.gate_interval_km * cos_e,
+            shape: polar::PolarShape {
+                radials: grid.values.len(),
+                gates: grid.values.iter().map(Vec::len).max().unwrap_or(0),
+                first_gate_km: grid.first_gate_range_km * cos_e,
+            },
         },
         types::RadarProduct::StormRelativeVelocity,
         side_ceiling_px,
@@ -2186,6 +2337,7 @@ pub fn render_echo_tops_interp_to_image(
         FieldRadial {
             reach_km: max_range,
             sample_km: crate::volumetric::RANGE_BIN_KM,
+            shape: volume_grid_shape(grid.values.len(), grid.range_bins),
         },
         types::RadarProduct::EchoTopsInterpolated,
         side_ceiling_px,
@@ -2260,6 +2412,7 @@ pub fn render_derived_vild_to_image_sized(
         FieldRadial {
             reach_km: max_range,
             sample_km: crate::volumetric::RANGE_BIN_KM,
+            shape: volume_grid_shape(grid.values.len(), grid.range_bins),
         },
         types::RadarProduct::VilDensity,
         side_ceiling_px,
@@ -2361,6 +2514,7 @@ pub fn render_hail_to_image(
         FieldRadial {
             reach_km: max_range,
             sample_km: crate::volumetric::RANGE_BIN_KM,
+            shape: volume_grid_shape(grid.values.len(), grid.range_bins),
         },
         product,
         side_ceiling_px,
@@ -2509,6 +2663,11 @@ pub fn render_hhc_to_image(
         FieldRadial {
             reach_km: max_range,
             sample_km: grid.gate_interval_km,
+            shape: polar::PolarShape {
+                radials: grid.values.len(),
+                gates: max_gates,
+                first_gate_km: grid.first_gate_km,
+            },
         },
         types::RadarProduct::HydrometeorClassification,
         side_ceiling_px,
@@ -2577,6 +2736,11 @@ pub fn render_derived_kdp_to_image(
         FieldRadial {
             reach_km: ground_reach_km,
             sample_km: derived.gate_interval_km * cos_e,
+            shape: polar::PolarShape {
+                radials: n_radials,
+                gates: max_gates,
+                first_gate_km: derived.first_gate_km * cos_e,
+            },
         },
         types::RadarProduct::SpecificDifferentialPhase,
         side_ceiling_px,
@@ -2698,6 +2862,11 @@ fn render_level3_radial_with_gate_km(
         FieldRadial {
             reach_km: actual_max_range,
             sample_km: gate_interval,
+            shape: polar::PolarShape {
+                radials: radials.len(),
+                gates: num_bins,
+                first_gate_km: first_gate_range,
+            },
         },
         product,
         side_ceiling_px,
