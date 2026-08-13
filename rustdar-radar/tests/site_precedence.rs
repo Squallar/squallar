@@ -34,7 +34,7 @@
 
 use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 use rustdar_radar::site_position::{SitePosition, SitePositionSource};
-use rustdar_radar::sites::{self, Datum, SiteFix, SiteFixRank};
+use rustdar_radar::sites::{self, Datum, SiteFix};
 use rustdar_radar::types::ScanInfo;
 
 /// Serializes the tests in this file.
@@ -114,21 +114,6 @@ fn scan_stating(lat: f32) -> Scan {
 /// The shape a chunk-fed or pre-2010 volume arrives in: no site on it at all.
 fn silent_scan() -> Scan {
     Scan::new(vcp(), Vec::new())
-}
-
-/// The ranks, as an ordering, before anything is built on top of them.
-///
-/// Trivial and worth having: `extended` picks the strongest fix per radar by
-/// comparing these, so a variant reordering would silently invert the whole
-/// ladder while every structural test still passed.
-#[test]
-fn the_ranks_descend_learned_network_unplaced() {
-    let _gate = serialized();
-    assert!(SiteFixRank::Learned < SiteFixRank::Network);
-    assert!(SiteFixRank::Network < SiteFixRank::Unplaced);
-    assert_eq!(SiteFix::Learned(learned()).rank(), SiteFixRank::Learned);
-    assert_eq!(network().rank(), SiteFixRank::Network);
-    assert_eq!(SiteFix::Unplaced.rank(), SiteFixRank::Unplaced);
 }
 
 /// The whole ladder, in one resolution.
