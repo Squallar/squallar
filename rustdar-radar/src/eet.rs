@@ -70,17 +70,81 @@
 //!   cell above clamps the top to the crossing tilt's own altitude,
 //!   non-topped. Topped-flag agreement is printed by the harness so the gap
 //!   stays measured.
+//!
+//!   **This clamp is the dominant term in the depth-dependent low bias
+//!   below, and it is a bigger error than the cell statistic.** A column that
+//!   clamps forfeits the whole interpolation up into the gap above it, and
+//!   the gap grows with height because the upper cuts are further apart. Its
+//!   share of non-topped columns rises monotonically with the RPG's own
+//!   height — 2.0% below 15 kft, 9.0%, 10.4%, 16.9%, and **52.7% above
+//!   45 kft** — and it is the worse path exactly where it is commonest:
+//!   above 45 kft a clamped column sits −3.04 kft against the RPG with 16.8%
+//!   within a level, over a mean tilt gap of 10.55 kft, while a column that
+//!   found data above sits −1.59 kft with 51.5%. The two together are the
+//!   +0.05 → −2.38 kft grade.
+//!
+//!   The mechanism is the input, not the rule: above a storm top the RPG's
+//!   DQA buffer carries a valid *below-threshold* reflectivity where raw
+//!   Level II carries nothing at all, so HREET interpolates across that gap
+//!   where this clamps under it. That the RPG is not instead flagging those
+//!   columns topped is measured, not assumed — topped shares track ours
+//!   closely at every height (2.5% against 2.9% above 45 kft), so the RPG is
+//!   reading real data there rather than bad data. Closing this needs a
+//!   defensible value for "what is above the echo", which no public document
+//!   supplies and which must not be fitted to the twin.
 //! * **SAILS/MRLE revisits**: HREET consumes each elevation's DQA buffer once
 //!   as the volume completes, so the cube is deduplicated
 //!   [`DedupPolicy::FirstOfVolume`] — the coherent first pass the RPG's
 //!   volume products are computed from, not the freshest look. (Measured:
 //!   newest-wins is indistinguishable, so the choice is by the doc,
 //!   uncontradicted.)
-//! * **Cell statistic** — twin-arbitrated, not documented: each 1° × 1 km
-//!   cell takes the **maximum** dBZ of its sub-gates ([`CellStat::Max`]).
-//!   The documented recombination average (linear-Z mean) measured lower
-//!   against a live EET twin and left bins undefined that the twin defines:
-//!   the RPG keeps peaks. Measured provenance: branch `campaign-harness`.
+//! * **Cell statistic** — twin-arbitrated, and arbitrated *against* the
+//!   operational source: each 1° × 1 km cell takes the **maximum** dBZ of its
+//!   sub-gates ([`CellStat::Max`]).
+//!
+//!   The source says otherwise, and was tried. The ORPG's
+//!   `combine_radials.c` recombines super-resolution reflectivity by
+//!   linear-Z mean on both axes — `Combine_range` takes ΣZ/4, `Combine_azi`
+//!   takes (Z₁+Z₂)/2 — and `product_attr_table` puts that recombination on
+//!   DQA's input, which is what feeds HREET. `vil.rs` sits on the RPG's side
+//!   of exactly that rule. This module does not, and the reason is measured:
+//!   against the RPG's own product 135 on seven volumes at seven sites
+//!   (KFTG, KDMX, KMSX, KAMA, KHGX, KLIX, and KMLB as a holdout),
+//!   186,102 compared bins,
+//!
+//!   | recombination | within 1 kft | mean residual |
+//!   |---|---|---|
+//!   | `Max`, as shipped | **70.6%** | −0.34 kft |
+//!   | linear-Z mean, range axis | 59.3% | −1.80 kft |
+//!   | linear-Z mean, both axes | 60.0% | −1.79 kft |
+//!
+//!   `Max` wins at **all seven sites**, by 4.5 to 20.6 points over whichever
+//!   mean arm did better at each. The azimuth axis
+//!   is worth 0.7 points and is not the question: this crate's cube *selects*
+//!   the radial nearest each whole-degree centre rather than averaging the
+//!   pair, and closing that to the RPG's `Combine_azi` moves nothing.
+//!
+//!   Nor is the loss merely the depth defect above masking a correct
+//!   statistic. On the sub-population where that defect is nearly absent —
+//!   below 15 kft, neither side topped, the tilt above carrying data, where
+//!   only 2.0% of columns clamp — `Max` is unbiased at +0.09 kft (81.1%
+//!   within a level) while the linear-Z mean is biased low at −0.97 kft
+//!   (78.8%). A values-blind footprint test says the same and says it louder:
+//!   under the mean the RPG defines 5,309 bins at KFTG that this does not,
+//!   against 68 the other way, where `Max` is near-balanced at 2,203 against
+//!   1,631. The RPG has echo where a 1 km × 1° linear-Z mean has none, so
+//!   that mean is not what HREET is reading.
+//!
+//!   What it *is* reading is not settled here. `hireseet(4)` calls the output
+//!   a "flat polar" 360 × 345 projection and `product_attr_table` gives 135 —
+//!   alone among the products checked — an internal `x_azi_res 3600` /
+//!   `y_ran_res 460`, both finer than the 1° × 1 km it emits; thresholding a
+//!   column at that resolution and reducing afterwards would behave far more
+//!   like a peak than like a mean. `cpc014/tsk012` is in no public CODE
+//!   distribution, so this stays a measured choice with a plausible
+//!   mechanism, not a documented one. **Do not re-derive it from `vil.rs`:
+//!   the two products take their input from the same buffer and still
+//!   measure differently, which is the finding.**
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
@@ -93,14 +157,32 @@
 //! convective volumes: clear-air/weak sites pass, sites with real storms
 //! fall well short with a storm-depth-dependent low bias, and the twin
 //! defines bins no per-column recomputation of the same Level II data can
-//! (its field is also visibly smoother than a raw column scan). Every
-//! reproducible candidate for the residual was measured and ruled out,
-//! each change isolated — the A/B record lives on the branch. The
-//! remaining candidate is HREET's own pre/post-processing (its input is
-//! the DQA buffer and its source, `cpc014/tsk012`, is not in any public
-//! CODE distribution), so the residual is recorded here rather than
-//! papered over: do not lower the bar, and do not calibrate further
-//! heuristics against a single twin volume.
+//! (its field is also visibly smoother than a raw column scan). Pooled over
+//! seven convective volumes at seven sites it is 70.6% within one level
+//! against a 99% bar, and the shortfall is overwhelmingly deep: 82.6% below
+//! 15 kft against 32.4% above 45 kft.
+//!
+//! **The residual is depth-dependent, and it is not the cell statistic.**
+//! Those are two questions, and the measurement separates them. The low bias
+//! grades monotonically with the RPG's own height — +0.05, −0.38, −0.25,
+//! −0.91, **−2.38 kft** across the `<15 / 15–25 / 25–35 / 35–45 / ≥45` kft
+//! bands — while moving the cell statistic to the RPG's documented linear-Z
+//! mean shifts the *whole* curve down by about 1.5 kft without flattening
+//! it, and loses at every site. The grade tracks the **tilt gap**, not the
+//! elevation angle: at a fixed height the residual *improves* toward the
+//! upper cuts, which is the opposite of what a slant-versus-ground
+//! projection error would do and rules that candidate out. What it tracks
+//! instead is the "bad data above" clamp among the gaps above, whose share
+//! of columns rises from 2.0% to 52.7% across those same bands.
+//!
+//! So the next hand on this should go to the clamp, and to how a top is
+//! placed inside the ~10 kft gap between the highest cuts — not to the
+//! recombination, which has now been measured three ways and lost. HREET's
+//! own pre/post-processing remains the backstop candidate (its input is the
+//! DQA buffer and its source, `cpc014/tsk012`, is in no public CODE
+//! distribution), so the residual is recorded here rather than papered
+//! over: do not lower the bar, and do not calibrate further heuristics
+//! against a single twin volume.
 
 use crate::sites::Datum;
 use crate::types::RadarProduct;
