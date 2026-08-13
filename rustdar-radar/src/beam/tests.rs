@@ -818,3 +818,54 @@ fn the_degeneracy_guard_is_a_derived_threshold() {
         hav_230 / MIN_CONDITIONING,
     );
 }
+
+/// [`great_circle_destination`] is the inverse of [`site_bearing_range_km`],
+/// not merely its neighbour: walk out on a bearing and a range, ask where you
+/// are, and get the bearing and the range back.
+///
+/// The pair have to compose to the identity because the display uses them in
+/// both directions over the same picture — `render_gate` places a gate with the
+/// forward one and the hover readout, the cross-section and the render tests'
+/// `painted_ranges_km_at` read it back with the inverse. A forward that merely
+/// *approximated* the inverse is exactly what the equirectangular placement
+/// was, and it cost up to 18.6 km at KATX's 460 km reach.
+///
+/// Four real sites spanning the fleet's latitudes — KCRP 27.78 °N, KTLX
+/// 35.33 °N, KMSX 47.04 °N, KATX 48.19 °N — over every tenth of a degree of
+/// bearing and six ranges out to a surveillance cut's full 460 km.
+#[test]
+fn a_bearing_and_range_round_trip_through_the_destination() {
+    let mut worst_range = 0.0f64;
+    let mut worst_bearing = 0.0f64;
+    for (site_lat, site_lon) in [
+        (27.784, -97.511),
+        (35.3333, -97.2778),
+        (47.0411, -113.986),
+        (48.1946, -122.4958),
+    ] {
+        for i in 0..3600 {
+            let bearing = f64::from(i) / 10.0;
+            for range in [1.0, 88.8, 150.0, 230.0, 417.0, 460.11] {
+                let (lat, lon) = great_circle_destination(site_lat, site_lon, bearing, range);
+                let (back_bearing, back_range) =
+                    site_bearing_range_km(site_lat, site_lon, lat, lon);
+                worst_range = worst_range.max((back_range - range).abs());
+                // Wrapped, because 359.9999° and 0.0001° are a ten-thousandth
+                // of a degree apart and not 360.
+                let d = (back_bearing - bearing).abs();
+                worst_bearing = worst_bearing.max(d.min(360.0 - d));
+            }
+        }
+    }
+    // Documented on `great_circle_destination` as 3.9e-10 km — 0.39 µm, which
+    // is `EARTH_RADIUS_KM`'s own last few bits over an `atan2`/`asin` pair and
+    // not a model difference. A model difference starts at metres.
+    assert!(
+        worst_range < 1e-9,
+        "the range round trip is off by {worst_range:.3e} km",
+    );
+    assert!(
+        worst_bearing < 1e-9,
+        "the bearing round trip is off by {worst_bearing:.3e}\u{b0}",
+    );
+}

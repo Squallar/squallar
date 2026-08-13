@@ -90,14 +90,23 @@
 //! rather than trusting "always under one gate", which stops being true the
 //! moment a caller wants heights the troposphere does not have.
 //!
-//! # Horizontal geometry: 6371, tangent plane
+//! # Horizontal geometry: 6371, spherical
 //!
-//! [`site_bearing_range_km`] and [`great_circle_point`] measure on a sphere of
+//! [`site_bearing_range_km`], [`great_circle_destination`] and
+//! [`great_circle_point`] measure on a sphere of
 //! [`crate::types::EARTH_RADIUS_KM`] (6371 km) — deliberately the same
 //! constant [`crate::render`]'s `render_gate` projects gates with, so a line
 //! drawn on a plan view lands on the ground the plan view put under the
 //! cursor. The map's hover readout reads [`site_bearing_range_km`] for exactly
 //! that reason.
+//!
+//! The first two of those are a matched pair, inverse and direct, and the plan
+//! view goes through the direct one: `render_gate` asks
+//! [`great_circle_destination`] where a gate is and turns the answer into a
+//! pixel. It used to walk `r·cos az` north and `r·sin az` east instead and read
+//! those off as degrees — an equirectangular approximation of the same
+//! question, worth 11.8 km at KTLX's 460 km reach and 17.9 km at KMSX's. The
+//! table is at [`great_circle_destination`].
 //!
 //! [`crate::types::ImageBounds`] used to disagree, working in `1.0 / 111.32`
 //! degrees per km — a 6378 km sphere, 0.11 % off this one, which put the
@@ -110,12 +119,14 @@
 //! including keeping [`RE_EFF_KM`] below out of its reach, since that is
 //! refraction and not geodesy.
 //!
-//! [`ground_range_km`] is the tangent-plane projection `r·cos e`, matching
-//! `render_gate`'s own `r·sin az` / `r·cos az`, and not the spherical arc
-//! `Rₑ·asin(r·cos e/(Rₑ + h))` that `polar_to_geo` returns. Those differ by
-//! ~110 m at 230 km / 0.5° and ~182 m at 70 km / 19.5° — the same order as the
-//! beam-height residual, and in the same direction for every consumer, which
-//! is what makes it a consistency choice rather than an accuracy claim.
+//! [`ground_range_km`] is the tangent-plane projection `r·cos e`, and not the
+//! spherical arc `Rₑ·asin(r·cos e/(Rₑ + h))` that `polar_to_geo` returns. Those
+//! differ by ~110 m at 230 km / 0.5° and ~182 m at 70 km / 19.5° — the same
+//! order as the beam-height residual, and in the same direction for every
+//! consumer, which is what makes it a consistency choice rather than an
+//! accuracy claim. It is *not* the same order as the equirectangular placement
+//! that used to sit downstream of it, which was a hundred times larger; that
+//! one is gone and this one is deliberate.
 //!
 //! Every drawn product in this crate now shares that choice. The plan view's
 //! four per-tilt rasterizers hoist `cos e` of their sweep's median elevation
@@ -300,6 +311,62 @@ pub fn site_bearing_range_km(site_lat: f64, site_lon: f64, lat: f64, lon: f64) -
     let bearing_deg = (y.atan2(x).to_degrees() + 360.0) % 360.0;
 
     (bearing_deg, range_km)
+}
+
+/// Where a point `ground_range_km` from the site along initial bearing
+/// `bearing_deg` actually is, as `(lat, lon)` in degrees — the exact inverse of
+/// [`site_bearing_range_km`].
+///
+/// The direct problem on the same [`EARTH_RADIUS_KM`] sphere the inverse one is
+/// solved on, so `site_bearing_range_km` composed with this is the identity to
+/// rounding (`a_bearing_and_range_round_trip_through_the_destination`, 3.9e-10 km
+/// over a 4-site × 3600-azimuth × 6-range sweep).
+///
+/// # This is what a gate's position *is*
+///
+/// A radar measures a bearing and a distance and nothing else, so a gate's
+/// geography is this function of them — there is no other definition available.
+/// The plan view used to place gates by walking `r·cos az` north and
+/// `r·sin az` east of the site and reading those off as degrees, which is an
+/// equirectangular approximation: it is the first-order expansion of the
+/// formula below and it drops the whole second-order term. Two things go wrong
+/// with it, both outward on the diagonals and both growing with the square of
+/// the range:
+///
+/// | site | range | worst displacement | worst range overrun |
+/// |---|---|---:|---:|
+/// | KTLX, 35.33°N |  88.8 km |  0.44 km | 0.17 km |
+/// | KTLX, 35.33°N | 460.0 km | 11.79 km | 4.81 km |
+/// | KMSX, 47.04°N | 460.0 km | 17.87 km | 7.27 km |
+///
+/// The overrun column is the one that had a consumer: a gate at the raster's
+/// declared extent came out *past* it, so the number a render reports did not
+/// bound the picture it hands over. The displacement column is the one a viewer
+/// sees — an echo drawn 12 km from the ground it fell on.
+///
+/// Distance is a **ground** range, matching [`site_bearing_range_km`]'s output
+/// and [`ground_range_km`]'s; a caller holding a slant range applies
+/// [`ground_range_km`] first, as every rasterizer in [`crate::render`] does.
+///
+/// A range past half the circumference wraps over the pole and keeps going,
+/// which is what the spherical formula means and not something to guard: no
+/// radar reaches 20 015 km. `NaN` in either coordinate propagates.
+pub fn great_circle_destination(
+    site_lat: f64,
+    site_lon: f64,
+    bearing_deg: f64,
+    ground_range_km: f64,
+) -> (f64, f64) {
+    let (sin_lat1, cos_lat1) = site_lat.to_radians().sin_cos();
+    let (sin_az, cos_az) = bearing_deg.to_radians().sin_cos();
+    let (sin_d, cos_d) = (ground_range_km / EARTH_RADIUS_KM).sin_cos();
+
+    // Clamped for the same reason the haversine is: the sum can round a hair
+    // past ±1 for a range landing on a pole, and `asin` of that is `NaN`.
+    let sin_lat2 = (sin_lat1 * cos_d + cos_lat1 * sin_d * cos_az).clamp(-1.0, 1.0);
+    let dlon = (sin_az * sin_d * cos_lat1).atan2(cos_d - sin_lat1 * sin_lat2);
+
+    (sin_lat2.asin().to_degrees(), site_lon + dlon.to_degrees())
 }
 
 /// The point a fraction `t` of the way from `a` to `b` along their great

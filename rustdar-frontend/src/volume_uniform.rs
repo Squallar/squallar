@@ -360,19 +360,37 @@ pub struct VolumeUniform {
     /// down, from Mercator's own curvature against a floor whose rows are
     /// linear in latitude.
     ///
-    /// So the march reprojects per pixel instead, through the same three
-    /// lines the CPU compositor used to evaluate per texel:
+    /// So the march reprojects per pixel instead, and it does so by the
+    /// **direct spherical problem from the site**, because that is what the
+    /// box's kilometres mean: `build_voxels` reads `(x, y)` as
+    /// `range = hypot(x, y)`, `azimuth = atan2(x, y)` and nothing else.
     ///
     /// ```text
-    /// φ = φ₀ + y_km / KM_PER_DEGREE_LAT
-    /// λ = λ₀ + x_km / (KM_PER_DEGREE_LAT · cos φ)
+    /// δ      = hypot(x_km, y_km) / EARTH_RADIUS_KM
+    /// sin φ  = sin φ₀·cos δ + cos φ₀·sin δ·cos az
+    /// λ − λ₀ = atan2(sin az·sin δ·cos φ₀,  cos δ − sin φ₀·sin φ)
     /// (u, v) = (u₀ + (λ − λ₀)·u_per_deg,  v₀ + (mercᵧ(φ) − mercᵧ(φ₀))·v_per_merc)
     /// ```
     ///
-    /// `KM_PER_DEGREE_LAT` is [`rustdar_radar::types::KM_PER_DEGREE_LAT`] —
-    /// the sphere `render_gate` placed the echoes in the mirror on, which is
-    /// the whole reason this reprojection lands on them. The shader holds the
-    /// only hand-written copy of the figure and
+    /// That is [`rustdar_radar::beam::great_circle_destination`], which is also
+    /// what `render_gate` places the echoes in the mirror with — the whole
+    /// reason this reprojection lands on them.
+    ///
+    /// # It was equirectangular, and so was the raster
+    ///
+    /// The first two lines used to read `φ = φ₀ + y_km / KM_PER_DEGREE_LAT`,
+    /// `λ = λ₀ + x_km / (KM_PER_DEGREE_LAT · cos φ)`. That is a first-order
+    /// approximation of the pair above, and it registered against the mirror
+    /// only because `render_gate` carried the identical approximation — two
+    /// wrong answers agreeing. On the default box at 41.7 °N the two mappings
+    /// stand ~15 km apart at the corners, twice the trapezoid error this
+    /// reprojection exists to remove and in the same direction as it.
+    ///
+    /// `KM_PER_DEGREE_LAT` is [`rustdar_radar::types::KM_PER_DEGREE_LAT`], and
+    /// survives as how the shader reaches `EARTH_RADIUS_KM` without writing it
+    /// down a second time: kilometres over kilometres-per-degree is degrees of
+    /// arc, whatever the sphere. The shader holds the only hand-written copy of
+    /// the figure and
     /// `tests::the_shaders_km_per_degree_is_the_radar_crates_own` pins it.
     ///
     /// Anchoring both axes at the **site** rather than at the mirror's corner

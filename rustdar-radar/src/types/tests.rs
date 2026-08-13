@@ -1184,3 +1184,45 @@ fn a_corrected_position_reaches_every_consumer_of_it() {
         "a metre the volume cannot contradict must not move the row's feet",
     );
 }
+
+/// [`super::mercator_y_from_sin_lat`] is [`super::lat_rad_to_mercator_y`],
+/// reached from the sine — one projection with two spellings, not two
+/// conventions.
+///
+/// `ln(tan(π/4 + φ/2)) ≡ artanh(sin φ)` is an identity, so this is a
+/// floating-point measurement of an exact equality rather than a tolerance on
+/// an approximation. It matters because the two spellings are used on opposite
+/// sides of one comparison: `ImageBounds` builds a raster's top and bottom
+/// edges with the angle form, and `render::MercatorProjection::pixel_at` places
+/// every gate between them with the sine form. A gap between them is a gap
+/// between where the frame says the ground is and where the gates are drawn.
+#[test]
+fn the_mercator_y_from_a_sine_is_the_one_from_an_angle() {
+    let mut worst = 0.0f64;
+    let mut worst_lat = 0.0f64;
+    // Every hundredth of a degree over the whole span a Web Mercator picture
+    // is defined on, well past the ±85° the projection is usually cut at.
+    for i in -8_900..=8_900 {
+        let lat_deg = f64::from(i) / 100.0;
+        let lat_rad = lat_deg.to_radians();
+        let from_angle = super::lat_rad_to_mercator_y(lat_rad);
+        let from_sine = super::mercator_y_from_sin_lat(lat_rad.sin());
+        let gap = (from_angle - from_sine).abs();
+        if gap > worst {
+            worst = gap;
+            worst_lat = lat_deg;
+        }
+    }
+    // Mercator y runs to ±5.0 at 89°, so 1e-12 is under a part in 1e12 of the
+    // axis — and a raster is at most 4096 pixels tall.
+    assert!(
+        worst < 1e-12,
+        "the two spellings of Mercator y differ by {worst:.3e} at {worst_lat}\u{b0}",
+    );
+
+    // A pole is where the projection is genuinely infinite, and both spellings
+    // have to say so rather than one of them returning a finite number a row
+    // could be computed from.
+    assert!(super::mercator_y_from_sin_lat(1.0).is_infinite());
+    assert!(super::mercator_y_from_sin_lat(-1.0).is_infinite());
+}

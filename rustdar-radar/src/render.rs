@@ -15,11 +15,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Pre-computed Web Mercator projection constants, derived from
 /// [`types::ImageBounds`] so the pixel grid aligns with the bounds the UI gets.
 struct MercatorProjection {
-    radar_lat_rad: f64,
+    sin_radar_lat: f64,
     cos_radar_lat: f64,
     center_px: f64,
     merc_y_top: f64,
     merc_y_scale: f64,
+    /// Pixels per radian of longitude east of the site.
+    ///
+    /// `EARTH_RADIUS_KM · cos φ₀ · px_per_km`, which is exactly what
+    /// [`types::ImageBounds`] makes a column worth: the bounds span
+    /// `±extent_km / (KM_PER_DEGREE_LAT · cos φ₀)` degrees of longitude over
+    /// `side_px` columns, and `KM_PER_DEGREE_LAT` is `EARTH_RADIUS_KM · π/180`.
+    /// So a column is longitude and only longitude — which is the one thing a
+    /// gate's placement has to agree with the frontend about, because the
+    /// frontend pins the texture to those bounds' corners and reads a hover
+    /// back out of them.
+    lon_rad_to_px: f64,
     /// The image's scale, pixels per kilometre east-west at the site.
     ///
     /// A field rather than a constant because both of the quantities behind it
@@ -56,17 +67,54 @@ impl MercatorProjection {
         extent_km: f64,
         side_px: usize,
     ) -> Self {
-        let radar_lat_rad = radar_lat.to_radians();
+        let (sin_radar_lat, cos_radar_lat) = radar_lat.to_radians().sin_cos();
+        let px_per_km = side_px as f64 / (2.0 * extent_km);
         Self {
-            radar_lat_rad,
-            cos_radar_lat: radar_lat_rad.cos(),
+            sin_radar_lat,
+            cos_radar_lat,
             center_px: side_px as f64 / 2.0,
             merc_y_top: bounds.mercator_y_max,
             merc_y_scale: side_px as f64 / (bounds.mercator_y_max - bounds.mercator_y_min),
-            px_per_km: side_px as f64 / (2.0 * extent_km),
+            lon_rad_to_px: types::EARTH_RADIUS_KM * cos_radar_lat * px_per_km,
+            px_per_km,
             extent_km,
             side_px,
         }
+    }
+
+    /// The pixel a point `ground_range_km` out at bearing `(sin_az, cos_az)`
+    /// lands in, as fractional column and row.
+    ///
+    /// **The one statement of where a gate goes.** `render_gate` calls this per
+    /// sample and `render::tests::probe_at` calls it to ask the same question
+    /// backwards; there is no third spelling, because a rasterizer that painted
+    /// through one and clipped through another would be off by exactly the
+    /// difference and nothing would say so.
+    ///
+    /// The sine and cosine of the bearing come in already taken because the
+    /// caller lerps them across a radial's wedge — a wedge is a few hundredths
+    /// of a degree wide and the chord through it is the sample grid, not an
+    /// approximation of one.
+    ///
+    /// `sin_d` / `cos_d` come in for the same reason one level up: they are the
+    /// range's, so every azimuth sample at one range step shares them.
+    #[inline]
+    fn pixel_at(&self, sin_az: f64, cos_az: f64, sin_d: f64, cos_d: f64) -> (f64, f64) {
+        // `beam::great_circle_destination`'s two lines, with the site's sine and
+        // cosine hoisted onto the projection and the destination's latitude left
+        // as a sine — see `types::mercator_y_from_sin_lat` for why it never
+        // becomes an angle. `great_circle_destination` itself is what
+        // `the_rasterizer_places_a_gate_where_the_beam_module_says_it_is` holds
+        // this against.
+        let sin_lat =
+            (self.sin_radar_lat * cos_d + self.cos_radar_lat * sin_d * cos_az).clamp(-1.0, 1.0);
+        let dlon =
+            (sin_az * sin_d * self.cos_radar_lat).atan2(cos_d - self.sin_radar_lat * sin_lat);
+        let merc_y = types::mercator_y_from_sin_lat(sin_lat);
+        (
+            self.center_px + dlon * self.lon_rad_to_px,
+            (self.merc_y_top - merc_y) * self.merc_y_scale,
+        )
     }
 
     fn render_gate(
@@ -92,21 +140,22 @@ impl MercatorProjection {
 
         for r_step in 0..num_range_samples {
             let r = range_start + (range_end - range_start) * (r_step as f64 * inv_num_range);
-            let dy_center = r * ctx.cos_az_center;
-            let dest_lat_rad = self.radar_lat_rad + dy_center / types::EARTH_RADIUS_KM;
-            let cos_correction = self.cos_radar_lat / dest_lat_rad.cos();
+            // The angle this range subtends at the earth's centre, hoisted:
+            // every azimuth sample below is the same distance from the site, so
+            // the whole `sin δ` / `cos δ` pair is a property of the range step
+            // and the loop body is left with one `atan2` and one `ln`. That is
+            // the same two transcendentals the equirectangular spelling paid
+            // (`tan` and `ln`); the accuracy is not bought with frame time.
+            let (sin_d, cos_d) = (r / types::EARTH_RADIUS_KM).sin_cos();
 
             for az_step in 0..num_az_samples {
                 let t = az_step as f64 * inv_num_az;
                 let sin_az = ctx.sin_az_start + ctx.sin_az_delta * t;
                 let cos_az = ctx.cos_az_start + ctx.cos_az_delta * t;
 
-                let dx_km = r * sin_az;
-                let dy_km = r * cos_az;
-                let px_i = (self.center_px + dx_km * cos_correction * self.px_per_km) as i32;
-                let dest_lat_rad = self.radar_lat_rad + dy_km / types::EARTH_RADIUS_KM;
-                let dest_merc_y = types::lat_rad_to_mercator_y(dest_lat_rad);
-                let py_i = ((self.merc_y_top - dest_merc_y) * self.merc_y_scale) as i32;
+                let (px, py) = self.pixel_at(sin_az, cos_az, sin_d, cos_d);
+                let px_i = px as i32;
+                let py_i = py as i32;
 
                 if px_i >= 0
                     && px_i < self.side_px as i32
@@ -123,7 +172,6 @@ impl MercatorProjection {
 
 /// Pre-computed azimuth sin/cos values for a single radial strip.
 struct RadialContext {
-    cos_az_center: f64,
     sin_az_start: f64,
     cos_az_start: f64,
     sin_az_delta: f64,
@@ -152,11 +200,9 @@ impl RadialContext {
         let az_half_spacing_deg = az_half_spacing_deg.max(0.0);
         let az_start_rad = (azimuth_deg - az_half_spacing_deg) * PI / 180.0;
         let az_end_rad = (azimuth_deg + az_half_spacing_deg) * PI / 180.0;
-        let cos_az_center = (azimuth_deg * PI / 180.0).cos();
         let (sin_az_start, cos_az_start) = az_start_rad.sin_cos();
         let (sin_az_end, cos_az_end) = az_end_rad.sin_cos();
         Self {
-            cos_az_center,
             sin_az_start,
             cos_az_start,
             sin_az_delta: sin_az_end - sin_az_start,

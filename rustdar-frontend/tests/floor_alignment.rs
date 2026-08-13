@@ -55,9 +55,8 @@
 //!
 //!   * **columns are linear in longitude**, `min_lon` at column 0 and
 //!     `max_lon` at the right edge — `render_gate` writes
-//!     `centre + dx_km · (cos φ₀ / cos φ) · px_per_km`, and that
-//!     `cos φ₀ / cos φ` factor is exactly what turns kilometres east into
-//!     degrees of longitude and back;
+//!     `centre + Δλ · EARTH_RADIUS_KM · cos φ₀ · px_per_km`, which is a column
+//!     per radian of longitude and nothing else;
 //!   * **rows are linear in Web Mercator y**, not in latitude —
 //!     `py = (mercator_y_max − mercator_y(φ)) · IMAGE_SIZE / (mercator_y_max −
 //!     mercator_y_min)`, row 0 at `max_lat`.
@@ -488,13 +487,14 @@ enum Mapping {
     /// east-west by `1 / cos φ` about the site's meridian — nothing at
     /// `x = 0`, tens of kilometres at the box's east and west edges.
     NoCosLat,
-    /// Take `cos φ` at the **site** instead of at the pixel. This is the
-    /// trapezoid error: the box's footprint really is wider along its north
-    /// edge than its south, and a site-latitude cosine collapses it to a
-    /// rectangle. Exactly zero on the site's own parallel and at `x = 0`,
-    /// a few kilometres at the box's far corners — the error a centred score
-    /// cannot see.
-    CosAtSite,
+    /// The **equirectangular** mapping this reprojection used to run:
+    /// `φ = φ₀ + y/K`, `Δλ = x/(K·cos φ)`. Not an invented mistake — it is
+    /// what shipped, and it registered only because `render_gate` placed the
+    /// raster's gates by the same approximation. Zero on the cardinals through
+    /// the site and outward on the diagonals, growing with range and with
+    /// latitude: ~15 km at the default box's corners at 41.7 °N, which is twice
+    /// the trapezoid error this reprojection was introduced to remove.
+    Equirectangular,
     /// Run v linear in latitude instead of in Mercator y, at the slope that
     /// makes the two agree at the site. Zero at the site, growing as the
     /// square of the distance north or south.
@@ -506,7 +506,7 @@ impl Mapping {
     const ALL: [Mapping; 4] = [
         Mapping::Honest,
         Mapping::NoCosLat,
-        Mapping::CosAtSite,
+        Mapping::Equirectangular,
         Mapping::LinearLatitudeV,
     ];
 
@@ -514,7 +514,7 @@ impl Mapping {
         match self {
             Mapping::Honest => "honest (the shader)",
             Mapping::NoCosLat => "no cos(lat)",
-            Mapping::CosAtSite => "cos at site (trapezoid)",
+            Mapping::Equirectangular => "equirectangular (the deleted mapping)",
             Mapping::LinearLatitudeV => "v linear in latitude",
         }
     }
@@ -523,16 +523,21 @@ impl Mapping {
 /// `volume.wgsl`'s `floor_colour`, in Rust, up to the texture fetch.
 ///
 /// ```text
-/// x_km = floor_geo.y + hit.x · box_size_km.x
-/// y_km = floor_geo.z + hit.y · box_size_km.y
-/// φ    = φ₀ + y_km / KM_PER_DEGREE_LAT
-/// Δλ   = x_km / (KM_PER_DEGREE_LAT · cos φ)   ← cos at THIS point's latitude
-/// u    = floor_uv.x + Δλ · floor_uv.z
-/// v    = floor_uv.y + (mercᵧ(φ) − mercᵧ(φ₀)) · floor_uv.w
+/// x_km  = floor_geo.y + hit.x · box_size_km.x
+/// y_km  = floor_geo.z + hit.y · box_size_km.y
+/// δ     = hypot(x_km, y_km) / EARTH_RADIUS_KM      ← the box is polar…
+/// sin φ = sin φ₀·cos δ + cos φ₀·sin δ·cos az       ← …so this is spherical
+/// Δλ    = atan2(sin az·sin δ·cos φ₀, cos δ − sin φ₀·sin φ)
+/// u     = floor_uv.x + Δλ° · floor_uv.z
+/// v     = floor_uv.y + (mercᵧ(φ) − mercᵧ(φ₀)) · floor_uv.w
 /// ```
 ///
-/// `None` where the shader returns transparent: off the mirror, and at a
-/// latitude whose cosine has collapsed.
+/// `(sin az, cos az)` is `(x_km, y_km)/range`, which is what makes the box's
+/// own coordinates the bearing and the range with no trigonometry in between —
+/// see `rustdar_radar::voxel`'s "Geometry" section.
+///
+/// `None` where the shader returns transparent: off the mirror, and within a
+/// millionth of a pole.
 fn mirror_uv(
     mirror: &Mirror,
     geo: &BoxGeo,
@@ -543,18 +548,38 @@ fn mirror_uv(
     let y_km = geo.south_km + hit.1 * geo.size_y_km;
 
     let site_lat_rad = mirror.site_lat_deg.to_radians();
-    let lat_deg = mirror.site_lat_deg + y_km / KM_PER_DEGREE_LAT;
-    let lat_rad = lat_deg.to_radians();
 
-    let cos_lat = match mapping {
-        Mapping::NoCosLat => 1.0,
-        Mapping::CosAtSite => site_lat_rad.cos(),
-        _ => lat_rad.cos(),
+    let (lat_deg, d_lon_deg) = match mapping {
+        // The two equirectangular variants keep their own latitude, because
+        // the latitude *is* part of what they get wrong.
+        Mapping::NoCosLat | Mapping::Equirectangular => {
+            let lat_deg = mirror.site_lat_deg + y_km / KM_PER_DEGREE_LAT;
+            let cos_lat = match mapping {
+                Mapping::NoCosLat => 1.0,
+                _ => lat_deg.to_radians().cos(),
+            };
+            if cos_lat.abs() < 1e-6 {
+                return None;
+            }
+            (lat_deg, x_km / (KM_PER_DEGREE_LAT * cos_lat))
+        }
+        _ => {
+            // `beam::great_circle_destination` about the site, which is what
+            // the box's kilometres mean. Called rather than restated: the
+            // point of this instrument is to score the *shader's* arithmetic,
+            // and the placement it has to agree with is the radar crate's.
+            let range_km = x_km.hypot(y_km);
+            let bearing_deg = x_km.atan2(y_km).to_degrees();
+            let (lat, lon) = rustdar_radar::beam::great_circle_destination(
+                mirror.site_lat_deg,
+                0.0,
+                bearing_deg,
+                range_km,
+            );
+            (lat, lon)
+        }
     };
-    if cos_lat.abs() < 1e-6 {
-        return None;
-    }
-    let d_lon_deg = x_km / (KM_PER_DEGREE_LAT * cos_lat);
+    let lat_rad = lat_deg.to_radians();
     let u = mirror.u_at_site + d_lon_deg * mirror.u_per_degree_east;
 
     let v = match mapping {
@@ -1538,8 +1563,9 @@ fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
 ///
 /// The budget is deliberately *not* tightened to the smaller residual: it is a
 /// ceiling separating an honest mapping from the broken ones at `MUST_MISS_KM`,
-/// and those still miss by more than twice it for reasons — `cos φ` taken at
-/// the site, a latitude-linear v axis — that no unification touches.
+/// and those still miss by more than twice it for reasons — an
+/// equirectangular reprojection, a latitude-linear v axis — that no
+/// unification touches.
 #[test]
 fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
     const HONEST_BUDGET_KM: f64 = 0.9;
@@ -1906,12 +1932,13 @@ fn block_is_lit(ix: i64, iy: i64) -> bool {
 ///     It is fatal everywhere, corner included, and needs no corner to catch.
 ///     It also *saturates* — IoU has a floor — so its corner and centre falls
 ///     are of similar size and this test does not ask them to be ordered.
-///   * [`Mapping::CosAtSite`] (the trapezoid) and [`Mapping::LinearLatitudeV`]
-///     are **second order**: both are exactly right at the site and grow with
-///     the square of the distance from its parallel. These are the errors the
-///     warning is about. Measured on this fixture they cost 0.007 and 0.005 of
-///     IoU at the centre — noise — and 0.24 and 0.16 in the corner. A
-///     centred-only instrument would have called both of them clean.
+///   * [`Mapping::Equirectangular`] (the mapping this reprojection used to run)
+///     and [`Mapping::LinearLatitudeV`] are **second order**: both are exactly
+///     right at the site and grow with the square of the distance from it.
+///     These are the errors the warning is about, and the first of them is not
+///     hypothetical — it is what shipped, invisible because the raster it was
+///     scored against carried the same approximation. A centred-only
+///     instrument would have called both of them clean.
 ///
 /// The site is **KMPX**, at 44.8°N, and not the KTLX the other fixtures fly:
 /// both second-order errors scale with `tan φ₀`, so a northern site is where
@@ -2046,7 +2073,7 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
     // instrument demonstrably blind.
     for (mapping, fall) in falls
         .iter()
-        .filter(|(m, _)| matches!(m, Mapping::CosAtSite | Mapping::LinearLatitudeV))
+        .filter(|(m, _)| matches!(m, Mapping::Equirectangular | Mapping::LinearLatitudeV))
     {
         assert!(
             fall[1] < 0.05,

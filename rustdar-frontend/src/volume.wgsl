@@ -823,6 +823,14 @@ fn mercator_y(lat_rad: f32) -> f32 {
     return log(tan(0.78539816 + lat_rad * 0.5));
 }
 
+// The same y from `sin phi`, by the identity `ln(tan(pi/4 + phi/2)) == atanh(sin phi)`.
+// `rustdar_radar::types::mercator_y_from_sin_lat`, and here for the same reason:
+// the reprojection below produces this pixel's latitude as a sine, and going
+// through the angle would mean an `asin` undone by a `tan`.
+fn mercator_y_from_sin(sin_lat: f32) -> f32 {
+    return 0.5 * log((1.0 + sin_lat) / (1.0 - sin_lat));
+}
+
 // The floor's colour where the ray lands, linear and straight.
 //
 // # Why this reprojects instead of indexing the mirror directly
@@ -835,9 +843,22 @@ fn mercator_y(lat_rad: f32) -> f32 {
 // latitude. See `VolumeUniform::floor_uv` for the arithmetic.
 //
 // So the box position is carried out to geography and back into the mirror,
-// per pixel, through the same three lines the CPU compositor evaluated per
-// texel. `cos` is taken at **this pixel's** latitude, not the site's: taking
-// it at the site is precisely what collapses the trapezoid into a rectangle.
+// per pixel, through the same conversion the raster's own gates were placed by.
+//
+// # The box is polar, so the conversion is spherical
+//
+// `build_voxels` makes the box a **site-centred azimuthal-equidistant tangent
+// plane**: `(x, y)` is `range = hypot(x, y)`, `azimuth = atan2(x, y)` from the
+// radar and nothing else. So "where on the ground is this box point" is the
+// direct spherical problem from the site — `rustdar_radar::beam::
+// great_circle_destination` — and that is what the raster's gates are painted
+// at too, which is the whole reason this reprojection lands on them.
+//
+// It used to be `phi = phi0 + y/K`, `d_lon = x/(K cos phi)`: an
+// equirectangular approximation, the same one `render_gate` used, and the two
+// agreed only because they were wrong together. On the default box at 41.7 N
+// the two mappings differ by ~15 km at the corners — twice the trapezoid error
+// this reprojection was introduced to remove.
 //
 // Returns straight (un-premultiplied) linear RGB with the mirror's own alpha,
 // which is what the two composite arms below expect — they multiply by a
@@ -850,14 +871,31 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;
 
     let site_lat_deg = volume.floor_geo.x;
-    let lat_deg = site_lat_deg + y_km / KM_PER_DEGREE_LAT;
-    let lat_rad = radians(lat_deg);
-    let cos_lat = cos(lat_rad);
-    if abs(cos_lat) < 1e-6 {
+    let site_lat_rad = radians(site_lat_deg);
+    let sin_phi0 = sin(site_lat_rad);
+    let cos_phi0 = cos(site_lat_rad);
+
+    // The angle this box point subtends at the earth's centre. Taken as
+    // `radians(km / KM_PER_DEGREE_LAT)` so the earth's radius never has to be
+    // written down a second time: kilometres over kilometres-per-degree is
+    // degrees of arc, whatever the sphere.
+    let range_km = length(vec2<f32>(x_km, y_km));
+    let delta = radians(range_km / KM_PER_DEGREE_LAT);
+    let sd = sin(delta);
+    let cd = cos(delta);
+    // The bearing's sine and cosine without a trig call: `(x, y)/range` is
+    // already `(sin az, cos az)`. Zero at the site itself, where `sd` is zero
+    // too and both terms below vanish — the site maps to the site.
+    let inv = select(0.0, 1.0 / range_km, range_km > 0.0);
+    let sin_az = x_km * inv;
+    let cos_az = y_km * inv;
+
+    let sin_lat = clamp(sin_phi0 * cd + cos_phi0 * sd * cos_az, -1.0, 1.0);
+    if abs(sin_lat) > 0.999999 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    let d_lon_deg = x_km / (KM_PER_DEGREE_LAT * cos_lat);
-    let d_merc = mercator_y(lat_rad) - mercator_y(radians(site_lat_deg));
+    let d_lon_deg = degrees(atan2(sin_az * sd * cos_phi0, cd - sin_phi0 * sin_lat));
+    let d_merc = mercator_y_from_sin(sin_lat) - mercator_y(site_lat_rad);
 
     let uv = vec2<f32>(
         volume.floor_uv.x + d_lon_deg * volume.floor_uv.z,

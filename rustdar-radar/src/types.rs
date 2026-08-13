@@ -361,6 +361,36 @@ pub(crate) fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
     (PI / 4.0 + lat_rad / 2.0).tan().ln()
 }
 
+/// The same Web Mercator y, reached from `sin φ` instead of from `φ`.
+///
+/// `ln(tan(π/4 + φ/2)) ≡ artanh(sin φ)`, a standard identity of the
+/// projection and not an approximation of it, so this is
+/// [`lat_rad_to_mercator_y`] and not a second convention;
+/// `crate::types::tests::the_mercator_y_from_a_sine_is_the_one_from_an_angle`
+/// measures the two against each other over every tenth of a degree either
+/// side of the equator.
+///
+/// It exists because [`crate::render`]'s gate loop now gets `sin φ` for free.
+/// A gate's latitude comes out of `beam::great_circle_destination`'s arithmetic
+/// as a sine, and the only thing the rasterizer does with a latitude is turn it
+/// into a row — so going through the angle would mean an `asin` to recover it
+/// and a `tan` to undo the `asin`, two transcendentals per sample to arrive
+/// where one `ln` already is. That loop runs ~28 M times per frame and the
+/// module doc for `render::RenderBuffers` measures the Mercator conversion as
+/// most of it.
+///
+/// `sin φ` of exactly ±1 is a pole, where the projection is genuinely
+/// infinite; this returns ±∞ there, as the angle form does. Outside ±1 —
+/// which no sine is — it returns `NaN`.
+#[inline]
+pub(crate) fn mercator_y_from_sin_lat(sin_lat: f64) -> f64 {
+    // `0.5 · ln((1 + s)/(1 − s))` rather than `s.atanh()`: identical in exact
+    // arithmetic and within an ulp in floating point, and this spelling is the
+    // one that survives `s == 1.0` as `+∞` rather than depending on a libm's
+    // choice there.
+    0.5 * ((1.0 + sin_lat) / (1.0 - sin_lat)).ln()
+}
+
 /// Geographic bounds of the rendered radar image. Pixels are linearly spaced
 /// in Web Mercator Y and longitude, matching slippy-map tile providers.
 #[derive(Debug, Clone, Copy)]

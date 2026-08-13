@@ -353,12 +353,19 @@ fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) 
 /// raster projected at `extent_km`, through the same [`MercatorProjection`]
 /// the renderer paints with.
 ///
-/// A duplicate of the arithmetic in `render_gate` rather than a call into it,
-/// because `render_gate` writes and this asks. Both walk azimuth → offset →
-/// Mercator → truncated pixel, and the truncation is why a probe has to go
-/// through the projection at all: a hand-computed pixel would be off by one
-/// somewhere and the difference between "unpainted" and "off by one" is the
+/// Through `MercatorProjection::pixel_at`, the placement itself, rather than
+/// through a restatement of it: `render_gate` writes and this asks, but both
+/// have to be asking about the same pixel. The truncation is why a probe goes
+/// through the projection at all — a hand-computed pixel would be off by one
+/// somewhere, and the difference between "unpainted" and "off by one" is the
 /// whole point of these tests.
+///
+/// This *was* a duplicate, and the duplication is what let the placement stay
+/// wrong: it walked the same equirectangular offsets `render_gate` walked, so
+/// every probe in this file agreed with the renderer about a position neither
+/// of them shared with [`crate::beam::site_bearing_range_km`] — which is the
+/// function the hover readout, the cross-section and [`painted_ranges_km`] all
+/// ask the same question backwards with.
 ///
 /// The extent and the side are both arguments because both are now properties
 /// of the render being probed rather than of the display: a fixture reaching
@@ -370,12 +377,9 @@ fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize
     let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
     let proj = MercatorProjection::from_bounds(LAT, &bounds, extent_km, side_px);
     let (sin_az, cos_az) = az_deg.to_radians().sin_cos();
-    let dest_lat_rad = proj.radar_lat_rad + (range_km * cos_az) / types::EARTH_RADIUS_KM;
-    let cos_correction = proj.cos_radar_lat / dest_lat_rad.cos();
-    let px = (proj.center_px + range_km * sin_az * cos_correction * proj.px_per_km) as usize;
-    let py = ((proj.merc_y_top - types::lat_rad_to_mercator_y(dest_lat_rad)) * proj.merc_y_scale)
-        as usize;
-    py * side_px + px
+    let (sin_d, cos_d) = (range_km / types::EARTH_RADIUS_KM).sin_cos();
+    let (px, py) = proj.pixel_at(sin_az, cos_az, sin_d, cos_d);
+    py as usize * side_px + px as usize
 }
 
 /// Gates in [`l2_sweep`]'s moments, and the gate they are — the shape of a
@@ -822,18 +826,38 @@ const TDWR_BEACON_GATES: usize = 2;
 /// would put its outermost pixels at the reach whatever happened in between,
 /// and the point here is *where* a single far return lands.
 fn tdwr_long_range_sweep(beacon_km: f64) -> Scan {
+    let beacon_gate = (beacon_km / TDWR_GATE_KM).round() as usize;
+    tdwr_sweep_from_gates(
+        (0..TDWR_GATES)
+            .map(|g| {
+                if g.abs_diff(beacon_gate) <= TDWR_BEACON_GATES {
+                    200
+                } else {
+                    0
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The same cut with **every** gate above threshold, so the painted disc runs
+/// out to the frame's own edge at every bearing.
+///
+/// The band fixture above cannot ask where the edge is — it paints a ring at
+/// 400.2 km inside a 417 km frame, so 15.88 km of margin absorbs anything an
+/// edge test could catch, which is the same vacuity the 230 km floor used to
+/// give every fixture in this file. A disc is what
+/// `nothing_is_painted_outside_the_extent_a_render_declares` needs and the
+/// only thing it is used for.
+fn tdwr_filled_long_range_sweep() -> Scan {
+    tdwr_sweep_from_gates(vec![200; TDWR_GATES])
+}
+
+/// The 360 radials both TDWR fixtures are made of, over whatever gates they
+/// hand in: 1390 gates of 300 m from the antenna at the 1.0° a TDWR declares.
+fn tdwr_sweep_from_gates(gates: Vec<u8>) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
 
-    let beacon_gate = (beacon_km / TDWR_GATE_KM).round() as usize;
-    let gates: Vec<u8> = (0..TDWR_GATES)
-        .map(|g| {
-            if g.abs_diff(beacon_gate) <= TDWR_BEACON_GATES {
-                200
-            } else {
-                0
-            }
-        })
-        .collect();
     let radials = (0..360)
         .map(|i| {
             Radial::new(
@@ -886,8 +910,15 @@ fn tdwr_long_range_sweep(beacon_km: f64) -> Scan {
 /// Every painted pixel's ground range from the site, km, read back out of the
 /// bounds the render declares — the inverse of the trip `render_gate` makes,
 /// so it answers in the same kilometres the gates were indexed by.
-fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
-    let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
+///
+/// `site_lat` because the trip is not latitude-independent and the caller that
+/// matters renders the same sweep at several: it is
+/// [`crate::beam::site_bearing_range_km`] on the way back and
+/// [`crate::beam::great_circle_destination`] on the way out, and reading a
+/// render taken at one latitude through bounds built at another measures the
+/// mismatch instead of the render.
+fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f64> {
+    let bounds = types::ImageBounds::from_radar_site(site_lat, LON, extent_km);
     // Off the grid's own length, so this reads a 4096-pixel render as readily
     // as a base one and cannot be pointed at the wrong picture.
     let side = values.len().isqrt();
@@ -901,9 +932,15 @@ fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
                 + (col as f64 + 0.5) / side as f64 * (bounds.max_lon - bounds.min_lon);
             let merc_y = bounds.mercator_y_max - (row as f64 + 0.5) / side as f64 * merc_span;
             let lat = (2.0 * merc_y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
-            crate::beam::site_bearing_range_km(LAT, LON, lat, lon).1
+            crate::beam::site_bearing_range_km(site_lat, LON, lat, lon).1
         })
         .collect()
+}
+
+/// [`painted_ranges_km_at`] at [`LAT`], the site every fixture here is flown by
+/// unless it says otherwise.
+fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
+    painted_ranges_km_at(values, extent_km, LAT)
 }
 
 /// A TDWR's long-range reflectivity is drawn to the 417 km it reaches, and a
@@ -1583,8 +1620,8 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
 }
 
 /// The number a render reports bounds the picture it hands over: nothing is
-/// painted further from the site than the extent, on a frame that is full and
-/// on a frame that is not.
+/// painted further from the site than the extent, at any bearing, on two frame
+/// sizes and at three latitudes.
 ///
 /// The property every consumer of `max_range_km` depends on and none of them
 /// can check. The frontend places the texture between the bounds this extent
@@ -1592,85 +1629,91 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
 /// back out — so a gate painted past the extent would be a return the display
 /// draws in one place and reads from another, with nothing anywhere to notice.
 ///
-/// # Why the bound is not one pixel
+/// # The bound is one pixel, and it took two changes to get there
 ///
-/// It was, and the assertion was **vacuous at both fixtures**: the frame used
-/// to be 230 km around 150 km of echo and 417 km around a beacon at 400.2, so
-/// 80 km and 17 km of empty margin absorbed anything this could have caught.
-/// Now that a raster is projected at its sweep's own reach the echo runs to the
-/// frame's edge, the margin is gone, and the test measures something for the
-/// first time. What it measured immediately is a **pre-existing disagreement
-/// between two models of the ground**, not a gate drawn out of bounds:
+/// It was one pixel before either of them and it was **vacuous at both
+/// fixtures**: the frame used to be 230 km around 150 km of echo and 417 km
+/// around a beacon at 400.2, so 80 km and 17 km of empty margin absorbed
+/// anything this could have caught.
 ///
-/// * `render_gate` places a gate by an equirectangular construction — `dy` km
-///   north as a latitude offset, `dx` km east as a longitude offset taken at
-///   the destination's own latitude.
-/// * [`painted_ranges_km`] reads a pixel back with
-///   [`crate::beam::site_bearing_range_km`], a great-circle distance.
+/// Projecting a raster at its sweep's own reach removed the margin, and what
+/// the assertion then measured was a disagreement between two models of the
+/// ground — `render_gate` placing a gate equirectangularly, `dy` km north read
+/// off as a latitude offset and `dx` km east as a longitude one, against
+/// [`painted_ranges_km_at`] reading the pixel back with
+/// [`crate::beam::site_bearing_range_km`], a great-circle distance. Those agree
+/// on the cardinals and diverge on the diagonals, always outward, growing with
+/// range and with latitude to 1.44 % of the extent at 47 °N over 417 km. The
+/// bound here was widened to that measured disagreement and said so.
 ///
-/// Those agree on the cardinals and diverge on the diagonals, always outward.
-/// Measured on filled discs at five latitudes, worst bearing near 305° every
-/// time:
+/// It is not widened now. `render_gate` asks
+/// [`crate::beam::great_circle_destination`] where a gate is — the exact
+/// inverse of the function reading it back — so the two models are one model
+/// and the residual is the pixel grid alone. What is left over is a *negative*
+/// excess at every fixture and latitude below, i.e. the outermost painted pixel
+/// centre sits inside the extent, which is what a truncating cast onto a pixel
+/// grid does.
 ///
-/// | extent | 26 °N | 35.3 °N | 47 °N |
-/// |-------:|------:|--------:|------:|
-/// |  88.8 km (TDWR Doppler) | 0.06 km | 0.12 km | 0.20 km |
-/// | 150.0 km (this fixture) | 0.24 km | 0.40 km | 0.64 km |
-/// | 230.0 km               | 0.75 km | 1.11 km | 1.71 km |
-/// | 417.0 km (TDWR long range) | 2.71 km | 3.92 km | 6.01 km |
+/// # Why three latitudes and why a filled disc
 ///
-/// It grows with range and with latitude and reaches 1.44% of the extent at
-/// 47 °N over 417 km. **None of this is new** — the 230 km row is what every
-/// render on the old fixed frame already did, and the 417 km row is what the
-/// long-range path has done since it landed. The extent following the data
-/// only removed the margin that was hiding it.
+/// The error this replaced was **latitude-dependent** — 2.71 km at 26 °N
+/// against 6.01 km at 47 °N over the same 417 km — so a test at one site would
+/// have watched it shrink rather than go. The three below are the fixture's own
+/// site and the two highest latitudes the WSR-88D fleet reaches, KMSX (47.04 °N)
+/// and KATX (48.19 °N); a latitude-shaped regression cannot hide from the pair
+/// at the top.
 ///
-/// So the bound here is the extent plus that measured disagreement, and the
-/// test still catches what it was written for: a gate loop running one gate
-/// long is 0.25 km at 150 km, well inside a bound that starts at 0.4 km, and
-/// anything structurally wrong is a multiple of the extent rather than a
-/// percent of it. The disagreement itself wants fixing in `render_gate`'s
-/// placement, which is a change to where every pixel of every render lands and
-/// belongs in its own campaign, not here.
+/// Both fixtures are **filled discs**, because a disc's outermost painted
+/// pixels are at the reach whatever happened inside it. That is exactly the
+/// property [`tdwr_long_range_sweep`]'s band is built *not* to have, which is
+/// why the band is not used here and [`tdwr_filled_long_range_sweep`] exists.
 #[test]
 fn nothing_is_painted_outside_the_extent_a_render_declares() {
-    // 1.5% clears the worst row of the table above (1.44%, at a latitude no
-    // site in the continental fleet reaches over a 417 km cut) and is far
-    // under the smallest structural failure: half a frame is 50%.
-    const PROJECTION_DISAGREEMENT: f64 = 0.015;
-
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
     for (scan, why) in [
         (
             l2_sweep(&[200; 360], &azimuths, 1.0, false),
             "150 km of echo",
         ),
-        (tdwr_long_range_sweep(400.2), "a 417 km TDWR cut"),
+        (tdwr_filled_long_range_sweep(), "a filled 417 km TDWR cut"),
     ] {
-        let SweepRender {
-            max_range_km: extent_km,
-            values,
-            ..
-        } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
-        let ranges = painted_ranges_km(&values, extent_km);
-        assert!(!ranges.is_empty(), "{why} painted nothing");
+        for site_lat in [LAT, 47.0411, 48.1946] {
+            let SweepRender {
+                max_range_km: extent_km,
+                values,
+                ..
+            } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, site_lat, LON).unwrap();
+            let ranges = painted_ranges_km_at(&values, extent_km, site_lat);
+            assert!(
+                !ranges.is_empty(),
+                "{why} at {site_lat}\u{b0}N painted nothing"
+            );
 
-        let furthest = ranges.iter().copied().fold(0.0f64, f64::max);
-        // One pixel of slop on top: a pixel's *centre* is what is measured and
-        // a gate reaching exactly the extent claims the pixel it starts in.
-        let slop = 1.0 / (types::IMAGE_SIZE as f64 / (2.0 * extent_km));
-        let bound = extent_km * (1.0 + PROJECTION_DISAGREEMENT) + slop;
-        assert!(
-            furthest <= bound,
-            "{why}: a pixel {furthest:.2} km out on a raster declaring \
-             {extent_km:.2} km, past the {bound:.2} km bound",
-        );
+            let furthest = ranges.iter().copied().fold(0.0f64, f64::max);
+            // One pixel: a pixel's *centre* is what is measured and a gate
+            // reaching exactly the extent claims the pixel it starts in.
+            let slop = 1.0 / (types::IMAGE_SIZE as f64 / (2.0 * extent_km));
+            assert!(
+                furthest <= extent_km + slop,
+                "{why} at {site_lat}\u{b0}N: a pixel {furthest:.3} km out on a \
+                 raster declaring {extent_km:.3} km, past the one-pixel \
+                 ({slop:.3} km) bound by {:.3} km",
+                furthest - extent_km - slop,
+            );
+            // And the disc really does reach the edge, so the line above is
+            // measuring the frame and not an empty margin.
+            assert!(
+                furthest > extent_km - 2.0 * slop,
+                "{why} at {site_lat}\u{b0}N stops {:.3} km short of its own \
+                 {extent_km:.3} km frame, so the bound above is vacuous",
+                extent_km - furthest,
+            );
+        }
     }
 
-    // And on the cardinals, where the two models of the ground agree, the
-    // one-pixel bound still holds exactly. This is the half of the property
-    // that is about the gate loop rather than about the projection, and it is
-    // asserted at full strength.
+    // And on the cardinals, measured as pixel radii rather than through the
+    // bounds, so the row and column arithmetic is checked without the
+    // geography's help.
     let SweepRender {
         max_range_km: extent_km,
         values,
@@ -3173,3 +3216,63 @@ fn a_checked_out_value_grid_is_empty_at_every_length() {
 // assert only what a checkout must satisfy *whatever* the slot held, so no
 // interleaving can make them fail. See that file for how a separate process
 // gets the exact-contents claim back without the race.
+
+/// The rasterizer's own placement is [`crate::beam::great_circle_destination`]
+/// carried into pixels — the same point, arrived at by two routes.
+///
+/// `MercatorProjection::pixel_at` does not *call* `great_circle_destination`:
+/// it inlines the arithmetic with the site's sine and cosine hoisted onto the
+/// projection and the destination's latitude left as a sine, because it runs
+/// tens of millions of times a frame and an `asin` there would be undone by a
+/// `tan` immediately afterwards. That is a performance spelling of a shared
+/// model, and this is what keeps it one: the gate's geography goes through
+/// `beam`, then through [`types::ImageBounds`] the way the frontend places the
+/// texture and the way `painted_ranges_km_at` reads a pixel back, and lands on
+/// the column and row the rasterizer computed.
+///
+/// Sub-thousandth-of-a-pixel, not sub-pixel: the point is that the two are the
+/// same arithmetic in a different order, so anything a rounding difference
+/// cannot explain is a second model.
+#[test]
+fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
+    let mut worst_px = 0.0f64;
+    let mut worst_at = (0.0, 0.0, 0.0);
+    for site_lat in [27.784, LAT, 47.0411, 48.1946] {
+        for extent_km in [88.8, 150.0, 230.0, 416.98, 460.11] {
+            let bounds = types::ImageBounds::from_radar_site(site_lat, LON, extent_km);
+            let side = types::IMAGE_SIZE;
+            let proj = MercatorProjection::from_bounds(site_lat, &bounds, extent_km, side);
+            let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
+            for i in 0..720 {
+                let az = f64::from(i) / 2.0;
+                for frac in [0.01, 0.25, 0.5, 0.75, 1.0] {
+                    let range_km = extent_km * frac;
+
+                    let (sin_az, cos_az) = az.to_radians().sin_cos();
+                    let (sin_d, cos_d) = (range_km / types::EARTH_RADIUS_KM).sin_cos();
+                    let (px, py) = proj.pixel_at(sin_az, cos_az, sin_d, cos_d);
+
+                    // The same gate, placed by `beam` and framed by the bounds.
+                    let (lat, lon) =
+                        crate::beam::great_circle_destination(site_lat, LON, az, range_km);
+                    let want_px =
+                        (lon - bounds.min_lon) / (bounds.max_lon - bounds.min_lon) * side as f64;
+                    let merc_y = types::lat_rad_to_mercator_y(lat.to_radians());
+                    let want_py = (bounds.mercator_y_max - merc_y) / merc_span * side as f64;
+
+                    let off = (px - want_px).abs().max((py - want_py).abs());
+                    if off > worst_px {
+                        worst_px = off;
+                        worst_at = (site_lat, az, range_km);
+                    }
+                }
+            }
+        }
+    }
+    let (lat, az, range) = worst_at;
+    assert!(
+        worst_px < 1e-3,
+        "the rasterizer and `beam` disagree by {worst_px:.3e} px, worst at \
+         {lat}\u{b0}N / {az}\u{b0} / {range:.1} km",
+    );
+}
