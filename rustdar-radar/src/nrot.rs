@@ -2766,11 +2766,12 @@ fn half_turn_rows(rows: crate::azimuth::Rows) -> i32 {
 /// again. A caller that only wants the grid drops it — [`crate::srv`] does,
 /// and under [`DealiasProfile::Coverage`] there is nothing to drop.
 ///
-/// **What this hands back does not say which gates it examined**, and the
+/// **The grid this hands back does not say which gates it examined**, and the
 /// obvious way to recover that is measured to be useless. A pass either places
 /// a gate on a fold branch, refuses it under
 /// [`DealiasKnobs::refuse_incoherent`], or never reaches it — three different
-/// facts, and the grid that comes out carries none of them.
+/// facts. The mask names the middle one wherever a mask exists at all; the grid
+/// that comes out carries none of them.
 ///
 /// The cheap recovery is to call a gate resolved when its value moved. Counted
 /// on real volumes, 2026-08-12, lowest Doppler cut, against the passes' own
@@ -2792,8 +2793,11 @@ fn half_turn_rows(rows: crate::azimuth::Rows) -> i32 {
 ///
 /// That is exactly the distinction worth having — "a pass examined this and
 /// confirmed it" against "nothing ever looked here" — and it is most of the
-/// population. Nothing consumes it yet, so nothing is plumbed; recorded so the
-/// next reader reaches for the measurement instead of the comparison.
+/// population. It is also the whole of what is still unnamed: the refusal is
+/// reported, so what no return value here separates is the gate a pass reached
+/// and left alone from the gate no pass reached. Nothing consumes that yet, so
+/// nothing is plumbed; recorded so the next reader reaches for the measurement
+/// instead of the comparison.
 pub(crate) fn dealias(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,

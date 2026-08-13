@@ -198,7 +198,10 @@ pub fn dealias_grid(
         gate_interval_km: grid.gate_interval_km,
         declared_nyquist_ms,
     };
-    crate::nrot::dealias(
+    // The mask is dropped rather than ignored: this profile sets
+    // `refuse_incoherent` off, so the value is `None` and there is nothing here
+    // to drop. A profile that refused would have to answer for it.
+    let _ = crate::nrot::dealias(
         &mut grid.values,
         &sweep_view,
         elevation_deg,
