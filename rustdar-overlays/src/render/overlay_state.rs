@@ -127,6 +127,64 @@ impl<T> OverlayState<T, Assembled> {
     /// A recovered round passes [`DataCompleteness::default`] through here and
     /// the mark clears, so an assembled layer that is whole again does not have
     /// to remember to say so either.
+    ///
+    /// # The METAR defect, and why it no longer compiles
+    ///
+    /// One state network refuses, that state blanks, and the round is still
+    /// `Ok` because the rest of the country's observations are real. Written
+    /// the way it was written the first time — take the observations, hand them
+    /// to `set_data`, say nothing about the network that refused:
+    ///
+    /// ```compile_fail,E0599
+    /// use rustdar_overlays::fetch_policy::Assembled;
+    /// use rustdar_overlays::render::overlay_state::OverlayState;
+    ///
+    /// struct MetarRound {
+    ///     observations: Vec<u8>,
+    ///     failed_networks: Vec<&'static str>,
+    /// }
+    ///
+    /// let mut state: OverlayState<Vec<u8>, Assembled> = OverlayState::new();
+    /// let round = MetarRound {
+    ///     observations: vec![1, 2, 3],
+    ///     failed_networks: vec!["KS"],
+    /// };
+    /// state.set_data(round.observations);
+    /// ```
+    ///
+    /// The same round, the same state, the same data, the same clock — the only
+    /// difference being that the report of what is not on the map comes with
+    /// it:
+    ///
+    /// ```
+    /// use rustdar_overlays::fetch_policy::{Assembled, DataCompleteness};
+    /// use rustdar_overlays::render::overlay_state::OverlayState;
+    ///
+    /// struct MetarRound {
+    ///     observations: Vec<u8>,
+    ///     failed_networks: Vec<&'static str>,
+    /// }
+    ///
+    /// let mut state: OverlayState<Vec<u8>, Assembled> = OverlayState::new();
+    /// let round = MetarRound {
+    ///     observations: vec![1, 2, 3],
+    ///     failed_networks: vec!["KS"],
+    /// };
+    /// let coverage = DataCompleteness {
+    ///     expected: 6,
+    ///     missing: round.failed_networks.len(),
+    ///     unit: "state networks",
+    ///     ..DataCompleteness::default()
+    /// };
+    /// state.set_data_with_coverage(round.observations, coverage);
+    ///
+    /// // A good answer: fresh clock, clear ladder — and marked for the state
+    /// // that is not drawn, which is the half no check in this crate could
+    /// // express before `DataCompleteness` and no type could require before
+    /// // this method was the only one here.
+    /// assert!(!state.retry.is_unhealthy());
+    /// assert!(state.retry.is_incomplete());
+    /// ```
     pub fn set_data_with_coverage(&mut self, data: T, coverage: DataCompleteness) {
         self.install(data, coverage);
     }
@@ -163,6 +221,37 @@ impl<T, S: RoundShape> OverlayState<T, S> {
     ///
     /// `None` is "this payload is not mine", which every caller logs and
     /// returns on, exactly as it did when it wrote the downcast itself.
+    ///
+    /// # The storm-reports defect, at the earlier of its two seams
+    ///
+    /// Three CSVs, one per report kind, refused as a round only when all three
+    /// fail — so a 503 on the tornado CSV arrives here as `Ok` with every
+    /// tornado report in the country missing from it. A handler that files that
+    /// round into a `Whole` state does not get as far as `set_data`:
+    ///
+    /// ```compile_fail,E0271
+    /// use rustdar_overlays::fetch_policy::{Assembled, FetchRound, Whole};
+    /// use rustdar_overlays::render::overlay_state::{FetchPayload, OverlayState};
+    ///
+    /// struct StormReportsFetchResult {
+    ///     reports: Vec<u8>,
+    ///     failed_kinds: Vec<&'static str>,
+    /// }
+    /// impl FetchRound for StormReportsFetchResult {
+    ///     type Shape = Assembled;
+    /// }
+    ///
+    /// let state: OverlayState<Vec<u8>, Whole> = OverlayState::new();
+    /// let payload: FetchPayload = Box::new(StormReportsFetchResult {
+    ///     reports: vec![1, 2, 3],
+    ///     failed_kinds: vec!["tornado"],
+    /// });
+    /// let _round = state.downcast_round::<StormReportsFetchResult>(payload);
+    /// ```
+    ///
+    /// Declaring the same round [`Whole`] is the one step left that a person
+    /// can still take alone, and it is a step taken beside `failed_kinds` with
+    /// nothing else in the file to blame it on.
     pub fn downcast_round<R>(&self, payload: FetchPayload) -> Option<R>
     where
         R: FetchRound<Shape = S>,
