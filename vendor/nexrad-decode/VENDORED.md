@@ -121,6 +121,7 @@ weight.
 | `LICENSE` | See above — the tarball ships none. |
 | `VENDORED.md` | This file. |
 | `src/messages/framing_tests.rs` | The framing fix's own tests, and the multi-segment payload fix's, described in full under *Changed — source* below. An in-source module rather than a `tests/` target so it travels with the fix in any delta re-applied onto a later upstream release — which does mean it is a new file, shows up in `diff -rq`, and so belongs in this table and not only in that prose. |
+| `src/messages/digital_radar_data/position_tests.rs` | The position scale fix's tests, under *Changed — source* below. Same arrangement and the same reason. Ships no fixture: the three Volume Data Blocks it reads are quoted as byte arrays in the file, each naming the archive object it was lifted from, so `tests/data/` is untouched. |
 
 ### Changed — `Cargo.toml`
 
@@ -152,8 +153,9 @@ Verified against a real case: `manual_div_ceil` in
 
 ### Changed — source
 
-The framing fix this directory exists for, the multi-segment payload fix that
-came out of it, one lint scoping that changes no behaviour, and four findings
+The framing fix this directory exists for, the position scale fix that came out
+of reading a framed TDWR volume, the multi-segment payload fix, one lint
+scoping that changes no behaviour, and four findings
 from an audit of the vendored copy — one allocation removed from the per-radial
 path, one silent truncation fixed, and two hygiene changes. Every one of the
 four is either a shrink of the delta or a pin on something the delta depends
@@ -316,6 +318,74 @@ the RDA frames one and fails against the unfixed decoder with `[360, 356]`;
 bypass map framed the way the fixture generator frames one and fails against
 the fix with the clamp removed. Neither is phrased in terms of the constants it
 pins.
+
+#### The position is read at the scale it was written — `src/messages/digital_radar_data/volume_data_block.rs`
+
+`latitude_raw()` and `longitude_raw()` handed back the `Real*4` in the block
+unexamined. The field is **degrees** — ICD 2620002AA Table XVII-B, *Data Block
+#1 (Volume Data)*, `Lat` at bytes 8-11 and `Long` at bytes 12-15, both "deg",
+`0.0 to 90.0` and `-180.0 to +180.0`. No revision of that table states another
+scale and every WSR-88D volume writes degrees.
+
+TDWR Level II volumes written **before 2021-09-15** do not. They carry the
+Level III radar position in those fields instead — ICD 2620001AD's Product
+Description Block halfwords 11-12 and 13-14, an `INT*4` count of thousandths of
+a degree — widened into the `Real*4` without being divided. `TORD` states
+`41797.0, -87858.0` and means 41.797 °N, 87.858 °W. Read as declared it is not
+a place on Earth, so a caller that range-checks refuses it and no TDWR volume
+older than that date places its radar at all.
+
+Measured, not inferred from one file. Seven TDWR sites on 2020-08-10 — `TORD`,
+`TOKC`, `TDAL`, `TPIT`, `TMIA`, `TSJU`, `TPHX` — all thousandths; `KTLX` and
+`KAMX` on the same day, degrees. The producer was corrected between
+`TORD20210914_000151_V08` and `TORD20210915_000148_V08`, bisected over 21 TORD
+volumes from 2020-08 to 2026-08. Every affected volume is still in
+`s3://unidata-nexrad-level2`, so this is not history.
+
+Checked against a source that is not another Level II volume: the same nine
+radars' Level III `NCR` products of 2026-08-12, whose Product Description Block
+carries the position in the documented thousandths field. Decoded through the
+thousandths reading, every site lands within **0.3 m** of its Level III
+position except `TSJU` (106 m) and `TPHX` (111 m), each of which is one
+thousandth of a degree — the finest their field can express, and a
+disagreement between producers rather than a decode error.
+
+The reading is a property of the **pair**, in `states_thousandths`: the pair is
+not already a position, both coordinates are exact integers, and a thousandth
+of the pair is a position. Each condition earns its place. The first is what
+makes every conforming volume bit-identical — a value inside the ICD's range is
+never touched, and every WSR-88D value is inside it. The second is what
+separates the encoding from corruption: an `INT*4` widened into an `f32` is an
+exact integer, every count of thousandths a coordinate can produce is under
+180,000 and so exactly representable, and a non-integer out of range is not
+this encoding. The third is what makes the result checkable rather than
+assumed. And deciding for the pair rather than per coordinate matters at the
+equator: a radar within 0.09° of it states a thousandths latitude that is also
+a legal degrees latitude, and two independent decisions could land it in a place
+neither reading names.
+
+Neither height field is affected — `TORD` states `site_height` 226 and
+`tower_height` 226 either side of the change — and nothing else in the block is
+touched.
+
+**No snapshot moves.** The 16 `.snap` files record the `Debug` of the *raw*
+zerocopy structs, not these accessors: `digital_radar_data`'s snapshot holds
+`latitude: 41.7312` straight off `raw::VolumeDataBlock`, and that field is
+still exactly the bytes. Verified by running the suite.
+
+Nine tests in the new `src/messages/digital_radar_data/position_tests.rs`;
+three fail against the unfixed accessors. They read three real Volume Data
+Blocks quoted as byte arrays — `TORD20200810_203830_V08`,
+`TORD20260812_000527_V08` and `KTLX20260811_000049_V06` — and pin, among the
+rest, that both hemispheres divide alike (no US radar is south or east, so a
+sign error would hide behind the archive), that the pair decides together, and
+that a position no scale rescues is left out of range for the caller to refuse.
+
+**One API consequence**, stated because it is a real loss: `raw` is
+`pub(crate)`, so these two accessors were the only public route to these two
+fields, and a caller can no longer see the number the block literally holds. No
+new accessor was added for it — nothing in this workspace wants one, and the
+smaller delta is worth more than a method with no caller.
 
 #### The pointer table is walked, not collected — `src/messages/digital_radar_data/message.rs`
 

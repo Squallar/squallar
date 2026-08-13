@@ -69,4 +69,7 @@ pub use message::Message;
 pub(crate) mod raw;
 
 #[cfg(test)]
+mod position_tests;
+
+#[cfg(test)]
 mod snapshot_test;

@@ -5,6 +5,44 @@ use std::borrow::Cow;
 #[cfg(feature = "uom")]
 use uom::si::f64::{Angle, Information, Length, Power};
 
+/// Thousandths of a degree in one degree.
+///
+/// **Not** the unit this block is written in. See
+/// [`VolumeDataBlock::latitude_raw`] for the volumes that write it anyway.
+const THOUSANDTHS_PER_DEGREE: f32 = 1000.0;
+
+/// Whether `lat`/`lon` name a point on Earth, in degrees.
+///
+/// The ICD's own ranges for the two fields, except that latitude is taken
+/// symmetric: 2620002AA Table XVII-B states `0.0 to 90.0`, which is the
+/// hemisphere the WSR-88D network happens to occupy and not a property of the
+/// encoding.
+fn is_on_earth(lat: f32, lon: f32) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+}
+
+/// Whether the pair is a Level III radar position rather than the degrees the
+/// block declares — see [`VolumeDataBlock::latitude_raw`].
+///
+/// Three conditions, and all three are needed:
+///
+/// * the pair is **not already a position**, which is what keeps every
+///   conforming volume bit-identical: a value inside the ICD's range is
+///   returned untouched, and every WSR-88D value is inside it;
+/// * both are **exact integers**, because the encoding this recognises is an
+///   `INT*4` widened into the `Real*4`, and every count of thousandths a
+///   coordinate can produce (at most 180,000) is exactly representable in an
+///   `f32`. A non-integer out-of-range float is not this encoding, it is
+///   corruption, and corruption is for the caller to refuse;
+/// * a thousandth of the pair **is** a position, so the reading is one the
+///   result can be checked against rather than an assumption about the source.
+fn states_thousandths(lat: f32, lon: f32) -> bool {
+    !is_on_earth(lat, lon)
+        && lat.fract() == 0.0
+        && lon.fract() == 0.0
+        && is_on_earth(lat / THOUSANDTHS_PER_DEGREE, lon / THOUSANDTHS_PER_DEGREE)
+}
+
 /// Internal representation of the volume data block, supporting both legacy and modern formats.
 ///
 /// The format expanded at Build 20.0 (ICD 2620002U, July 2021).
@@ -86,18 +124,66 @@ impl<'a> VolumeDataBlock<'a> {
     }
 
     /// Latitude of radar in degrees (raw value).
+    ///
+    /// # One producer writes thousandths of a degree here
+    ///
+    /// The field is `Real*4` **degrees** — ICD 2620002AA (Build 24.0)
+    /// Table XVII-B, *Data Block #1 (Volume Data)*, `Lat` at bytes 8-11 and
+    /// `Long` at bytes 12-15, both "deg". No revision of that table states any
+    /// other scale, and every WSR-88D volume writes degrees.
+    ///
+    /// TDWR Level II volumes written before 2021-09-15 do not. They carry the
+    /// **Level III** radar position instead: ICD 2620001AD's Product
+    /// Description Block halfwords 11-12 and 13-14, an `INT*4` count of
+    /// thousandths of a degree, widened into the `Real*4` without being
+    /// divided. `TORD` reads `41797.0, -87858.0` where it means
+    /// 41.797 °N, 87.858 °W, and the same holds at `TOKC`, `TDAL`, `TPIT`,
+    /// `TMIA`, `TSJU` and `TPHX` on the same day. The producer was corrected
+    /// between `TORD20210914_000151_V08` and `TORD20210915_000148_V08`;
+    /// everything filed before that date is still in the archive and still
+    /// reads that way. Neither height field is affected — `TORD` states 226 m
+    /// on both sides of the change.
+    ///
+    /// So this returns degrees for both, converting only a pair that
+    /// [`states_thousandths`] recognises. That predicate cannot fire on a value
+    /// the ICD's own range admits, which is what makes every conforming volume
+    /// byte-for-byte what it was; and it does not rescue a pair that is merely
+    /// wrong, which stays out of range for the caller to refuse.
     pub fn latitude_raw(&self) -> f32 {
-        match &self.inner {
-            VolumeDataBlockInner::Legacy(inner) => inner.latitude.get(),
-            VolumeDataBlockInner::Modern(inner) => inner.latitude.get(),
-        }
+        self.position_degrees().0
     }
 
     /// Longitude of radar in degrees (raw value).
+    ///
+    /// See [`latitude_raw`](Self::latitude_raw) for the one producer that
+    /// writes thousandths of a degree in these two fields, and for what is done
+    /// about it.
     pub fn longitude_raw(&self) -> f32 {
+        self.position_degrees().1
+    }
+
+    /// The pair exactly as the block states it, before any scale is read into
+    /// it.
+    fn stated_position(&self) -> (f32, f32) {
         match &self.inner {
-            VolumeDataBlockInner::Legacy(inner) => inner.longitude.get(),
-            VolumeDataBlockInner::Modern(inner) => inner.longitude.get(),
+            VolumeDataBlockInner::Legacy(inner) => (inner.latitude.get(), inner.longitude.get()),
+            VolumeDataBlockInner::Modern(inner) => (inner.latitude.get(), inner.longitude.get()),
+        }
+    }
+
+    /// The stated pair in degrees, whichever of the two scales it is in.
+    ///
+    /// One function for both coordinates because the scale is a property of the
+    /// pair: a latitude alone cannot always be told apart — a radar within
+    /// 0.09° of the equator states a thousandths latitude that is itself a
+    /// legal degrees latitude — and a decision taken twice could disagree with
+    /// itself and land the radar in a place neither reading names.
+    fn position_degrees(&self) -> (f32, f32) {
+        let (lat, lon) = self.stated_position();
+        if states_thousandths(lat, lon) {
+            (lat / THOUSANDTHS_PER_DEGREE, lon / THOUSANDTHS_PER_DEGREE)
+        } else {
+            (lat, lon)
         }
     }
 
