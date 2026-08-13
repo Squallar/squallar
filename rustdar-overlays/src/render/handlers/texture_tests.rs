@@ -43,6 +43,7 @@ const BOUNDS: GeoBounds = GeoBounds {
 /// conventions to disagree about it.
 fn rctx() -> RasterizeContext {
     RasterizeContext {
+        device_scale: 1.0,
         is_dark: false,
         zoom: 7.0,
     }
@@ -354,7 +355,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     // `RasterizeOutput` rather than a bare buffer.
     assert_alpha_matches_bytes(
         "rasterize_radar_sites",
-        &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H, 7.0, false),
+        &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H, 7.0, false, 1.0),
     );
 }
 
@@ -369,6 +370,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
 fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     let now = chrono::Utc::now().naive_utc();
     let glm_params = rasterize::GlmRenderParams {
+        device_scale: 1.0,
         zoom: 7.0,
         is_dark: false,
         time_window_secs: 600.0,
@@ -376,11 +378,11 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     };
 
     assert_eq!(
-        rasterize_radar_sites(&site_fixtures(), &BOUNDS, 0, 0, 7.0, false).alpha,
+        rasterize_radar_sites(&site_fixtures(), &BOUNDS, 0, 0, 7.0, false, 1.0).alpha,
         AlphaMode::Premultiplied,
     );
     assert_eq!(
-        rasterize_storm_reports(&[report_fixture()], &[], &BOUNDS, 0, 0, 7.0, false).alpha,
+        rasterize_storm_reports(&[report_fixture()], &[], &BOUNDS, 0, 0, 7.0, false, 1.0).alpha,
         AlphaMode::Premultiplied,
     );
     assert_eq!(

@@ -95,6 +95,7 @@ fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
         &BOUNDS,
         W,
         H,
+        1.0,
     );
 
     let pixels = drawn(&rgba);

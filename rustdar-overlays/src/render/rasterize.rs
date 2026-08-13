@@ -184,7 +184,9 @@ pub fn rasterize_spc_outlooks(
     width: u32,
     height: u32,
     hatch_color: [u8; 4],
+    device_scale: f32,
 ) -> Vec<u8> {
+    let scale = sane_device_scale(device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_spc_outlooks ({}×{})",
@@ -200,7 +202,7 @@ pub fn rasterize_spc_outlooks(
     // Two passes: hatching must go over every fill, including fills drawn by
     // features later in the list.
     for feature in features {
-        draw_feature(&mut pixmap, feature, &mb, w, h);
+        draw_feature(&mut pixmap, feature, &mb, w, h, scale);
     }
     crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, hatch_color);
 
@@ -213,7 +215,9 @@ pub fn rasterize_spc_discussions(
     bounds: &GeoBounds,
     width: u32,
     height: u32,
+    device_scale: f32,
 ) -> Vec<u8> {
+    let scale = sane_device_scale(device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_spc_discussions ({}×{})",
@@ -242,7 +246,7 @@ pub fn rasterize_spc_discussions(
                 // Every ring of an MD is drawn as its own filled polygon, so
                 // there are no holes to honour here.
                 fill_path(&mut pixmap, &path, fill_rgba, FillRule::Winding);
-                let sw = scaled_stroke_width(&path, 2.0);
+                let sw = scaled_stroke_width(&path, 2.0, scale);
                 stroke_path(&mut pixmap, &path, stroke_rgba, sw);
             }
         }
@@ -261,7 +265,9 @@ pub fn rasterize_nws_alerts(
     bounds: &GeoBounds,
     width: u32,
     height: u32,
+    device_scale: f32,
 ) -> Vec<u8> {
+    let scale = sane_device_scale(device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_nws_alerts ({}×{})",
@@ -279,7 +285,7 @@ pub fn rasterize_nws_alerts(
             continue;
         }
         for feature in &alert.features {
-            draw_feature(&mut pixmap, feature, &mb, w, h);
+            draw_feature(&mut pixmap, feature, &mb, w, h, scale);
         }
     }
 
@@ -308,7 +314,9 @@ pub fn rasterize_radar_sites(
     height: u32,
     zoom: f64,
     is_dark: bool,
+    device_scale: f32,
 ) -> RasterizeOutput {
+    let scale = sane_device_scale(device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_radar_sites ({}×{})",
@@ -326,8 +334,11 @@ pub fn rasterize_radar_sites(
     let h = height as f32;
 
     let zoom_f32 = zoom as f32;
-    let radius = ((5.0 + zoom_f32).clamp(4.0, 12.0)).max(1.0);
-    let stroke_w = (radius * 0.3).clamp(0.5, 2.0);
+    // Chosen in points and converted to texels, rather than chosen in texels:
+    // the clamps are what a dot should look like on a screen, not how many
+    // samples of one it takes.
+    let radius = ((5.0 + zoom_f32).clamp(4.0, 12.0)).max(1.0) * scale;
+    let stroke_w = (radius * 0.3).clamp(0.5 * scale, 2.0 * scale);
 
     let text_bg = if is_dark {
         Color::from_rgba8(0, 0, 0, 140)
@@ -337,8 +348,11 @@ pub fn rasterize_radar_sites(
 
     for site in sites {
         let (px, py) = mb.project(site.lat, site.lon, w, h);
-        // 50 px of slack so a site just off-texture still contributes its label.
-        if px < -50.0 || px > w + 50.0 || py < -50.0 || py > h + 50.0 {
+        // 50 points of slack so a site just off-texture still contributes its
+        // label. In texels here, so the ground it stands for does not shrink
+        // with density.
+        let slack = 50.0 * scale;
+        if px < -slack || px > w + slack || py < -slack || py > h + slack {
             continue;
         }
 
@@ -375,10 +389,13 @@ pub fn rasterize_radar_sites(
         // tiny-skia cannot render text: only the background pill is baked in,
         // and egui draws the label over it per frame.
         if zoom >= 5.0 {
-            let label_w = site.name.len() as f32 * 5.5 + 4.0;
-            let label_h = 10.0;
+            // egui draws the glyphs over this pill at a fixed *point* size, so
+            // the pill has to be that many points wide in texels or the text
+            // overflows the background it is drawn on.
+            let label_w = (site.name.len() as f32 * 5.5 + 4.0) * scale;
+            let label_h = 10.0 * scale;
             let lx = px - label_w / 2.0;
-            let ly = py + radius + 2.0;
+            let ly = py + radius + 2.0 * scale;
             let mut pb = PathBuilder::new();
             if let Some(rect) = tiny_skia::Rect::from_xywh(lx, ly, label_w, label_h) {
                 pb.push_rect(rect);
@@ -510,7 +527,9 @@ pub fn rasterize_storm_reports(
     height: u32,
     zoom: f64,
     is_dark: bool,
+    device_scale: f32,
 ) -> RasterizeOutput {
+    let scale = sane_device_scale(device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_storm_reports ({}×{})",
@@ -528,8 +547,8 @@ pub fn rasterize_storm_reports(
     let h = height as f32;
 
     let zoom_f32 = zoom as f32;
-    let radius = (3.0 + zoom_f32 * 0.5).clamp(3.0, 10.0);
-    let stroke_w = (radius * 0.3).clamp(0.5, 2.0);
+    let radius = (3.0 + zoom_f32 * 0.5).clamp(3.0, 10.0) * scale;
+    let stroke_w = (radius * 0.3).clamp(0.5 * scale, 2.0 * scale);
     // Includes the stroke, so the outline itself is clickable.
     let hit_radius = radius + stroke_w;
 
@@ -543,7 +562,8 @@ pub fn rasterize_storm_reports(
 
     for (idx, report) in reports.iter().enumerate() {
         let (px, py) = mb.project(report.lat, report.lon, w, h);
-        if px < -20.0 || px > w + 20.0 || py < -20.0 || py > h + 20.0 {
+        let slack = 20.0 * scale;
+        if px < -slack || px > w + slack || py < -slack || py > h + slack {
             continue;
         }
 
@@ -698,6 +718,9 @@ pub struct GlmRenderParams {
     pub is_dark: bool,
     pub time_window_secs: f64,
     pub now: chrono::NaiveDateTime,
+    /// Texels per logical point — see
+    /// `crate::render::overlay_state::RasterizeContext::device_scale`.
+    pub device_scale: f32,
 }
 
 pub fn rasterize_glm_strikes(
@@ -725,9 +748,9 @@ pub fn rasterize_glm_strikes(
     let h = height as f32;
     let mut hit_map = HitMap::new(width, height);
 
-    // ~12 px at zoom 6, clamped to 6-20 px.
+    // ~12 points at zoom 6, clamped to 6-20 points, then taken into texels.
     let zoom_f32 = params.zoom as f32;
-    let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0);
+    let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(params.device_scale);
 
     for (i, flash) in flashes.iter().enumerate() {
         if flash.lat < bounds.min_lat
@@ -791,6 +814,7 @@ fn draw_feature(
     mb: &MercatorBounds,
     w: f32,
     h: f32,
+    scale: f32,
 ) {
     // Geo-AABB cull before any projection work.
     if let Some(ref fb) = feature.geo_bounds {
@@ -816,7 +840,7 @@ fn draw_feature(
                 // The path carries the holes as subpaths, so this outlines
                 // them too: a hole's edge is as much a boundary of the feature
                 // as the exterior is.
-                let sw = scaled_stroke_width(&path, 1.5);
+                let sw = scaled_stroke_width(&path, 1.5, scale);
                 stroke_path(pixmap, &path, feature.stroke_rgba, sw);
             }
         }
@@ -825,12 +849,37 @@ fn draw_feature(
 
 // ── Path building helpers ────────────────────────────────────────────────
 
-/// Thins the stroke below 40 px minimum dimension, so a small polygon is not
-/// swallowed by its own outline. `base` is the width at close zoom.
-fn scaled_stroke_width(path: &tiny_skia::Path, base: f32) -> f32 {
+/// Thins the stroke below a 40-point minimum dimension, so a small polygon is
+/// not swallowed by its own outline. `base` is the width at close zoom, in
+/// points; `scale` is texels per point.
+///
+/// Both the threshold and the clamps are in points and converted here, and the
+/// middle term needs no conversion at all: `min_dim` grows with density and the
+/// threshold grows with it, so the ratio is already right and only the bounds
+/// it is held between have to move. Left unscaled, a polygon large enough to
+/// take the full `base` would be outlined at `base` texels — half a point's
+/// width on a 2x display — which is the case this whole parameter exists for,
+/// since most polygons on screen are the large ones.
+fn scaled_stroke_width(path: &tiny_skia::Path, base: f32, scale: f32) -> f32 {
     let b = path.bounds();
     let min_dim = b.width().min(b.height());
-    (min_dim / 40.0 * base).clamp(0.5, base)
+    (min_dim / 40.0 * base).clamp(0.5 * scale, base * scale)
+}
+
+/// A device scale that can be multiplied by, from one that may not be.
+///
+/// The value crosses a public API and reaches a marker radius and a
+/// `tiny_skia::Rect`, where a zero draws nothing at all and a `NaN` makes
+/// `Rect::from_xywh` return `None` — both of which are an overlay that silently
+/// stops painting rather than an error anyone can read. Below one texel per
+/// point there is nothing to gain and a sub-point marker to lose, so that is
+/// the floor.
+fn sane_device_scale(device_scale: f32) -> f32 {
+    if device_scale.is_finite() {
+        device_scale.max(1.0)
+    } else {
+        1.0
+    }
 }
 
 /// Interior rings below this projected area (square pixels) are dropped.
@@ -1357,3 +1406,6 @@ mod model_nan_tests;
 
 #[cfg(test)]
 mod projection_window_tests;
+
+#[cfg(test)]
+mod device_scale_tests;

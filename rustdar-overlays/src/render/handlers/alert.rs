@@ -411,7 +411,8 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
-    fn prepare_rasterize(&self, _ctx: &RasterizeContext) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
+        let device_scale = ctx.device_scale;
         if self.state.data.is_empty() {
             return None;
         }
@@ -427,6 +428,7 @@ impl OverlayHandler for NwsAlertHandler {
                 bounds,
                 width,
                 height,
+                device_scale,
             );
             RasterizeOutput {
                 rgba,

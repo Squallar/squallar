@@ -438,6 +438,7 @@ mod tests {
             512,
             512,
             hatch_color,
+            1.0,
         );
         let hatch_pixels = rgba
             .chunks_exact(4)

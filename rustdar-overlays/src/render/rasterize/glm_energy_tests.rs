@@ -72,6 +72,7 @@ fn render_one(energy: Option<f32>) -> usize {
         128,
         128,
         &GlmRenderParams {
+            device_scale: 1.0,
             zoom: 8.0,
             is_dark: true,
             time_window_secs: 300.0,

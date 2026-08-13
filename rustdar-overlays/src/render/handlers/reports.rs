@@ -285,9 +285,17 @@ impl OverlayHandler for StormReportsHandler {
             .collect();
         let zoom = ctx.zoom;
         let is_dark = ctx.is_dark;
+        let device_scale = ctx.device_scale;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             rasterize::rasterize_storm_reports(
-                &reports, &items, bounds, width, height, zoom, is_dark,
+                &reports,
+                &items,
+                bounds,
+                width,
+                height,
+                zoom,
+                is_dark,
+                device_scale,
             )
         }))
     }

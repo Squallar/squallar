@@ -104,7 +104,7 @@ impl Rendered {
         };
         let mb = MercatorBounds::from_geo(&bounds);
         let mut pixmap = Pixmap::new(W, H).expect("pixmap");
-        draw_feature(&mut pixmap, feature, &mb, W as f32, H as f32);
+        draw_feature(&mut pixmap, feature, &mb, W as f32, H as f32, 1.0);
         Self { pixmap, mb }
     }
 
