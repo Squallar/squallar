@@ -638,14 +638,37 @@ impl super::App {
                                 xsect.unavailable =
                                     Some(rustdar_egui::pane::SectionUnavailable::AwaitingVolume);
                             }
+                            // The loop is the same judgement as the scan above
+                            // and belongs behind the same guard. Its frames are
+                            // one radar's files, listed for one radar's window
+                            // and rendered at one radar's coordinates, so a real
+                            // switch has to throw it away — but a pane re-picking
+                            // the site it is already on is showing a loop that is
+                            // correct in every one of those respects, and tearing
+                            // it down costs the whole listing, every download and
+                            // every render again. Nothing rebuilds it either: the
+                            // rebuild paths are `handle_enable_loop` and
+                            // `reinit_active_loops`, and a re-pick raises neither,
+                            // so the pane drops out of loop mode to its static
+                            // image with the transport still reading "loop on".
+                            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                         }
                         pane.loading_site = Some(site.clone());
                         pane.site = site.clone();
                         pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
-                        pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                     }
                 }
-                self.loop_mgr.clear_all();
+                // Gated for the same reason, and it is the other half of the same
+                // fix: `clear_all` empties the shared scan cache, every pane's
+                // download queue and every frame plan. Running it while the loops
+                // above survive leaves them holding frames whose scans have been
+                // dropped and whose plans are gone — a loop that plays blank and
+                // has nothing left to re-request, which is worse than the teardown
+                // it replaced. It runs when a pane really left a radar and not
+                // otherwise.
+                if !left_a_radar.is_empty() {
+                    self.loop_mgr.clear_all();
+                }
 
                 // The third way a 3D pane stops needing its volume, beside the
                 // kind change (`GuiAction::ReleaseVolume`) and the pane-count
