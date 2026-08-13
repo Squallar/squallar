@@ -204,9 +204,24 @@ impl ProductDescriptionBlock {
     /// `RPGC_digital_radial_data_hdr` call in the CODE B21 source), so its
     /// 920 × 0.25 km packet also decodes to ~1.0 km per gate; confirmed on
     /// live `HHC` objects by the HHC twin harness.
+    ///
+    /// Products 159 (Digital Differential Reflectivity) and 161 (Digital
+    /// Correlation Coefficient) join their `dualpol8bit.c` siblings on the
+    /// same evidence, gathered the same way: 102 live packets across **47
+    /// sites** — CONUS, Alaska (APD), Hawaii (HMO) and Puerto Rico (JUA),
+    /// VCPs 35, 212 and 215, two dates — every one of them reporting the
+    /// identical `(scale_factor 999, 1200 bins)`, i.e. 1201 km of range for
+    /// a 300 km product, with no site-to-site variation at all. The negative
+    /// control is what makes that conclusive rather than merely uniform:
+    /// product 32 (`DHR`), a genuinely 1 km × 230 km digital radial, writes
+    /// `scale_factor` 1000 and decodes to exactly 1.000 km — so the halfword
+    /// does carry a true spacing when the generator writes one, and 999 on
+    /// the 0.25 km family is an actively wrong value rather than an unused
+    /// field. Neither code is consumed anywhere in this workspace yet; they
+    /// are tabled so that the first consumer does not have to rediscover it.
     pub fn range_gate_km(&self) -> Option<f64> {
         match self.product_code {
-            99 | 154 | 163 | 165 | 177 => Some(0.25),
+            99 | 154 | 159 | 161 | 163 | 165 | 177 => Some(0.25),
             _ => None,
         }
     }
@@ -501,10 +516,16 @@ mod tests {
                 Some(0.25)
             );
         }
-        assert_eq!(pdb(163, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
-        assert_eq!(pdb(165, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
-        assert_eq!(pdb(177, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
-        for code in [56, 94, 134, 135, 176] {
+        for code in [159, 161, 163, 165, 177] {
+            assert_eq!(
+                pdb(code, [0; 16], [0; 7]).range_gate_km(),
+                Some(0.25),
+                "product {code} is a 0.25 km product whose halfword says 999",
+            );
+        }
+        // Product 32 (`DHR`) is the control: a genuine 1 km digital radial
+        // whose halfword reads a truthful 1000, so it must NOT be overridden.
+        for code in [32, 56, 94, 134, 135, 176] {
             assert_eq!(
                 pdb(code, [0; 16], [0; 7]).range_gate_km(),
                 None,
