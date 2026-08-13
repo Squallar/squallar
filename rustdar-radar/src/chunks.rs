@@ -855,7 +855,8 @@ pub struct VolumeProgress {
 /// The scheme is safe because elevation numbers are sequential and unique within
 /// a volume, SAILS and MRLE inserts included — each repeat of a low tilt takes
 /// its own number. `archive::tests::live_volume_elevation_numbers_are_contiguous_and_terminated`
-/// pins that against a real VCP-212 volume.
+/// pins that against a real VCP-212 volume — `#[ignore]`d, since it fetches
+/// one, so the default test row does not check it.
 pub struct VolumeAssembler {
     site: String,
     volume: VolumeIndex,

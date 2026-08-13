@@ -670,7 +670,8 @@ fn measure_boundary_honesty_and_smoothness() {
     let data_px = painted(&run_lut(band_top + 1, 255), &uniform);
 
     // The smoothness render: the production transfer function and the grid's
-    // own palette, exactly as `render_a_real_volume_mask` sets it.
+    // own palette, exactly as `render_a_real_volume_mask` sets it — that one
+    // is `#[ignore]`d, wanting an adapter and a `VOL` on disk.
     let largest_cell_km = (0..3)
         .map(|axis| box_size_km[axis] / grid_dims[axis] as f32)
         .fold(0.0f32, f32::max);

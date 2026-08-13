@@ -176,7 +176,8 @@ pub struct VolumeUniform {
     /// is a drawing convention and must never reach a measurement, which is
     /// the same line `OrbitCamera::vertical_exaggeration` draws and the
     /// `optical_depth_is_measured_against_the_unexaggerated_box` GPU test
-    /// pins. At 1.0 (the default) displayed and true geometry coincide.
+    /// pins — `#[ignore]`d behind a real adapter, so it is not part of a
+    /// default run. At 1.0 (the default) displayed and true geometry coincide.
     ///
     /// Never zero: the shader divides a cell extent by nothing else, and a
     /// zero here would make every vertical difference infinite and every

@@ -298,7 +298,8 @@ fn translucent_lut(alpha: u8) -> Vec<u8> {
 /// `1 − exp(−1 · 1000 · s)` is 1.0 in eight bits for any segment longer than
 /// about six metres, and the shortest segment any camera here produces is
 /// hundreds of metres. Verified by
-/// `a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down`.
+/// `a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down`,
+/// which is `#[ignore]`d behind a real adapter.
 const SATURATING_EXTINCTION: f32 = 1000.0;
 
 /// Fill a grid with index 255 wherever a cell's **centre** is inside the shape.
@@ -366,7 +367,8 @@ fn unproject(m: [[f32; 4]; 4], ndc: [f32; 2], depth: f32) -> [f32; 3] {
 /// Row 0 is the **top** of the render target, so screen `y` runs down while NDC
 /// `y` runs up. That sign is the one assumption in this file that cannot be
 /// derived from the public API, and it is checked empirically by
-/// `a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down`.
+/// `a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down` —
+/// `#[ignore]`d, so the check happens only under `-- --ignored`.
 fn ndc_for_pixel(px: u32, py: u32, size: [u32; 2]) -> [f32; 2] {
     [
         (px as f32 + 0.5) / size[0] as f32 * 2.0 - 1.0,

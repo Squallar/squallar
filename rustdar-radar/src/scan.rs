@@ -62,7 +62,9 @@ pub struct DecodedScan {
 /// records. Nothing about the result changes: the radials, their order, the
 /// site and the coverage pattern are `scan()`'s, and the Nyquist table is
 /// `from_archive`'s, both pinned against those two functions by
-/// [`tests::live_one_pass_decode_matches_the_two_pass_decode`].
+/// [`tests::live_one_pass_decode_matches_the_two_pass_decode`] — which is
+/// `#[ignore]`d, wanting a real volume, so the equivalence is checked only
+/// under `-- --ignored`.
 ///
 /// # Why the body restates `scan()` rather than calling it
 ///
@@ -120,7 +122,8 @@ pub struct DecodedScan {
 /// [`tests::the_map_collects_in_input_order_however_the_workers_finish`] holds
 /// that down rather than assuming it — `fold_contributions` is where every
 /// "first wins" in the walk is decided and the fixtures below pin it, and
-/// [`tests::live_one_pass_decode_matches_the_two_pass_decode`] still holds the
+/// [`tests::live_one_pass_decode_matches_the_two_pass_decode`] — `#[ignore]`d,
+/// so not part of a default run — still holds the
 /// whole thing against `File::scan()` and against
 /// [`crate::nyquist::DeclaredNyquist::from_archive`]'s own serial walk on a
 /// real volume.

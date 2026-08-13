@@ -1222,7 +1222,8 @@ fn the_floor_is_transparent_from_below() {
 /// egui's. Restated rather than approximated with a 2.2 power, because the
 /// expected values in [`the_floor_decodes_the_mirror_only_when_the_flag_says_to`]
 /// are the exact composition of the two and an approximation there would
-/// measure the approximation.
+/// measure the approximation. (That test, like everything in this file, is
+/// `#[ignore]`d behind a real adapter.)
 fn linear_from_gamma(gamma: f64) -> f64 {
     if gamma < 0.04045 {
         gamma / 12.92
@@ -1727,7 +1728,8 @@ fn a_translucent_mirror_composites_at_its_own_alpha() {
         // fixture *lies* about the mirror's encoding in one arm, planting the
         // bytes the other entry point would have written into the one texture
         // format a test can make. That is the same device
-        // `the_floor_decodes_the_mirror_only_when_the_flag_says_to` uses.
+        // `the_floor_decodes_the_mirror_only_when_the_flag_says_to` uses —
+        // both are `#[ignore]`d, so neither runs without `-- --ignored`.
         floor_geo[3] = if gamma_encoded { 1.0 } else { 0.0 };
         uniform.floor_geo = floor_geo;
 

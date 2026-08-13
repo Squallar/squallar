@@ -808,7 +808,9 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
     // 13/13 volume_gpu, 10/10 silhouette and 151/151 lib while deleting a
     // lone measured voxel from the 3D surface outright at the shipped region
     // rung. The measurement lives in
-    // `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`.
+    // `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`,
+    // which is `#[ignore]`d behind a real adapter — so this host-side check is
+    // the only one of the pair CI runs.
     let isosurface_arm = body
         .split_once("VolumeViewMode::Isosurface")
         .map(|(_, rest)| rest)

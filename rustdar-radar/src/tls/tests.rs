@@ -440,7 +440,8 @@ fn probe_list_files_installs_ring() {
 }
 
 /// The probe that pins `crate::archive` to [`super::client`].
-/// `probe_list_files_installs_ring` goes through `scan::list_files`, which
+/// `probe_list_files_installs_ring` — `#[ignore]`d, it needs the network —
+/// goes through `scan::list_files`, which
 /// calls `init()` itself, so it would still pass with `archive` on a bare
 /// `reqwest::Client::builder()` — which panics "No provider set" for anyone
 /// reaching `archive` directly. Fails if `archive::shared_client` stops

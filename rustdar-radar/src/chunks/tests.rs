@@ -388,8 +388,9 @@ fn renumber(r: &Radial, elevation: u8) -> Radial {
 /// actually publishes.
 ///
 /// 120 radials per chunk is the real size — confirmed against the live
-/// bucket by `live_a_start_chunk_decodes_and_carries_the_coverage_pattern`,
-/// which decodes an intermediate chunk to exactly 120 — so a super-resolution
+/// bucket by `live_a_start_chunk_decodes_and_carries_the_coverage_pattern`
+/// — `#[ignore]`d, since it reaches the live bucket — which decodes an
+/// intermediate chunk to exactly 120, so a super-resolution
 /// cut is 6 chunks and a standard one 3. The slicing is the bucket's, not an
 /// arbitrary split.
 ///
@@ -1767,7 +1768,8 @@ fn widening_the_selection_makes_the_skipped_chunks_wanted_again() {
 //   cargo test -p rustdar-radar --lib -- --ignored --nocapture chunks::tests::live_
 
 /// The claim this whole module rests on, mirroring
-/// `archive::tests::live_listing_needs_no_credentials`. If the chunk bucket
+/// `archive::tests::live_listing_needs_no_credentials` — which is `#[ignore]`d
+/// too, so neither side of the mirror runs by default. If the chunk bucket
 /// ever required signing, every other live test here would fail with a
 /// confusing decode error while this one names the cause.
 #[ignore = "hits the live unidata-nexrad-level2-chunks S3 bucket"]

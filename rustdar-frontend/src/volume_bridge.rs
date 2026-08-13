@@ -1336,7 +1336,9 @@ impl VolumePainter for BridgeVolumePainter {
         // tent, so a lone measured voxel reconstructs to coverage 0.125 and a
         // one-cell sheet to 0.502, and a `>= 0.5` cut deletes them. Measured
         // by `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`
-        // — sequential isosurface at threshold 100/255, 128 x 128 px, one
+        // — `#[ignore]`d, it needs a real adapter, so run it with
+        // `cargo test -p rustdar-frontend --test volume_gpu -- --ignored`.
+        // Sequential isosurface at threshold 100/255, 128 x 128 px, one
         // camera, same fixtures at both levels:
         //
         //   lone voxel:    level 0    74 px    level 1      0 px

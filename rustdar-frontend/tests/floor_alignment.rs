@@ -1325,7 +1325,8 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
 /// module inside the one it is testing.
 ///
 /// **Not what places the site for
-/// [`measure_floor_against_grid_on_a_real_volume`].** That one holds a volume,
+/// [`measure_floor_against_grid_on_a_real_volume`]** — which is `#[ignore]`d,
+/// since it wants both an adapter and a volume on disk. That one holds a volume,
 /// and a volume says where its own radar is — so it learns `VOL`'s site rather
 /// than looking it up here, and works on any radar's volume instead of on the
 /// two written down below. See `live_volume::site_of`. A fixture test has no

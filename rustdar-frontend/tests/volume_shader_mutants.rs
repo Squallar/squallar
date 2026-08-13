@@ -301,7 +301,8 @@ const CUBE_KM: [f32; 3] = [10.0, 10.0, 10.0];
 /// at alpha 1 the premultiply is the identity and every un-premultiply /
 /// re-premultiply rule agrees, so a saturated fixture cannot see that half of
 /// the colour pipeline at all. (That is exactly why the shipped
-/// `a_uniform_grid_paints_its_palette_colour`, which saturates, does not.)
+/// `a_uniform_grid_paints_its_palette_colour`, which saturates, does not — and
+/// it is `#[ignore]`d behind an adapter, as is everything here.)
 fn probe_translucent_volume(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -363,7 +364,8 @@ fn probe_opacity_ramp(
 /// * A *uniform* grid has no gradient at all, so `shading` takes its 1.0 early
 ///   exit and every lighting mutation is invisible — which is exactly what the
 ///   `gradient_shading = true` arm of the shipped
-///   `a_uniform_grid_paints_its_palette_colour` measures. So the index ramps.
+///   `a_uniform_grid_paints_its_palette_colour` measures (`#[ignore]`d, like
+///   every adapter-bound test named in this file). So the index ramps.
 /// * It ramps along **x and z together**, over a 240 x 240 x 20 km box. A
 ///   gradient with one non-zero component, or an isotropic cell, cannot see the
 ///   displayed-kilometre metric at all: `normal = -gradient / |gradient|`
@@ -607,6 +609,7 @@ fn probe_floor_registration(
 /// The repository is not entirely square, and the exception is worth naming
 /// because it is what these two floor rows are measured against:
 /// `volume_gpu`'s `the_floor_takes_cos_at_the_pixels_latitude_not_the_sites`
+/// — `#[ignore]`d, so this only holds for someone running `-- --ignored` —
 /// stands on a 100 × 400 km box, and it catches both of them when they are
 /// patched into `volume.wgsl` on disk. So they are rows that prove *that* test
 /// can fail, not holes it leaves. The shading row below is the hole.

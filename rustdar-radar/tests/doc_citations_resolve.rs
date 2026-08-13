@@ -20,14 +20,26 @@
 //!
 //! # What it checks, and what it cannot
 //!
-//! Only that a cited name **resolves** to a `fn` or `mod` that exists. That is
-//! a weak property and it is worth being blunt about the gap: two of the four
+//! Two things, and neither is that the sentence is true.
+//!
+//! **One**: a cited name **resolves** to a `fn` or `mod` that exists. That is a
+//! weak property and it is worth being blunt about the gap: two of the four
 //! findings above had a *resolvable* predecessor that asserted the opposite of
 //! what the prose claimed, and a scan of this shape would have passed both
 //! right up until the rename. What it catches is renames and deletions — the
 //! two ways a true citation rots without anyone touching the prose. It does not
 //! and cannot check that the test asserts what the sentence says it asserts.
 //! Do not read a green run here as "the docs are true".
+//!
+//! **Two**: a citation to an `#[ignore]`d test **says that it is ignored** —
+//! see [`a_citation_to_an_ignored_test_says_that_it_is_ignored`]. Resolution
+//! alone leaves one door open, and it is the same door: "this is pinned by
+//! `foo`" passes in full while `foo` never runs in the default `cargo test`
+//! row, so the prose promises a guard the build does not provide. 79 tests here
+//! carry the attribute and nearly all of them earn it — a real adapter, the
+//! network, an archived volume — so the defect is never the `#[ignore]`, only
+//! the sentence that reads as though CI were watching. 23 citations pointed at
+//! one when this was written and 18 of them said nothing about it.
 //!
 //! # What counts as a citation
 //!
@@ -435,6 +447,85 @@ fn definitions(files: &[PathBuf]) -> BTreeSet<String> {
     names
 }
 
+/// The name declared by a `fn` on this line, if there is one.
+///
+/// [`definitions`]' boundary rule, over a single line: `fn` has to be a whole
+/// token, so `transfn` and `fnord` are not declarations. Split out because
+/// [`ignored_tests`] needs the same judgement one line at a time, walking
+/// forward through an attribute run rather than over a whole file.
+fn declared_fn(line: &str) -> Option<String> {
+    let mut rest = line;
+    while let Some(at) = rest.find("fn") {
+        let (before, after) = rest.split_at(at);
+        let after = &after["fn".len()..];
+        let boundary_before = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if boundary_before && after.starts_with(char::is_whitespace) {
+            let name: String = after
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+        rest = &rest[at + "fn".len()..];
+    }
+    None
+}
+
+/// How far past an `#[ignore]` this will look for the function it decorates.
+///
+/// The attribute run between the two is a handful of lines at most — a
+/// `#[test]`, a `#[cfg]`, an `#[allow]`. The bound is what stops a stray
+/// `#[ignore` at the end of a file from claiming an unrelated function far
+/// below it, which would silently widen the gate onto a test that is not
+/// ignored at all.
+const ATTRIBUTE_RUN_LINES: usize = 12;
+
+/// Every test the workspace declares `#[ignore]`d.
+///
+/// # Why the attribute has to start its line
+///
+/// Matching `#[ignore` anywhere in the source instead over-reports badly, and
+/// it does it silently: prose that *mentions* `#[ignore]` is followed by
+/// whatever function comes next, and that function gets indexed as ignored. On
+/// this tree that is the difference between 79 real entries and 96, and the 17
+/// extras are names like `mercator_y`, `union`, `positions` and `gpu_lock` —
+/// none of them tests, all of them the first `fn` under a comment discussing
+/// the attribute. Requiring the attribute to open its own line is what
+/// separates a declaration from a sentence about one.
+///
+/// Like [`definitions`] this is a text match and not a parse, and for the same
+/// reason: a test ignored behind a `cfg` that never builds on this host is
+/// still an ignored test.
+fn ignored_tests(files: &[PathBuf]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for path in files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = src.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("#[ignore") {
+                continue;
+            }
+            // From the attribute's own line, so `#[ignore] fn f()` is caught
+            // alongside the usual attribute run below it.
+            for candidate in lines.iter().skip(index).take(ATTRIBUTE_RUN_LINES) {
+                if let Some(name) = declared_fn(candidate) {
+                    names.insert(name);
+                    break;
+                }
+            }
+        }
+    }
+    names
+}
+
 /// Consecutive comment lines, joined into blocks, with the line each block
 /// starts on.
 ///
@@ -728,6 +819,198 @@ fn every_test_a_comment_names_is_a_test_that_exists() {
         broken.len(),
         broken.join("\n"),
         file!(),
+    );
+}
+
+/// The token a comment block has to contain for a citation to an `#[ignore]`d
+/// test to count as disclosed.
+///
+/// One word, matched case-insensitively, so `#[ignore]`, "ignored" and
+/// `-- --ignored` all satisfy it. Deliberately not a list that also accepts
+/// "needs a real adapter" or "on a real device": those say *why* a test is
+/// gated, which a careful reader can already infer, and leave the fact that
+/// matters — **the default `cargo test` row does not run it** — as an
+/// inference. The convention this tree already states for live harnesses is
+/// that the invocation goes in the doc comment, and that convention writes
+/// this word for free.
+const DISCLOSURE: &str = "ignore";
+
+/// One citation to a test that does not run by default, in prose that does not
+/// say so.
+struct Undisclosed {
+    path: String,
+    line_no: usize,
+    name: String,
+}
+
+/// Every citation to an `#[ignore]`d test whose comment block never discloses
+/// the gating.
+///
+/// Disclosure is judged per **block**, not per line: a citation two sentences
+/// under "run with `-- --ignored`" is disclosed, and splitting the rule finer
+/// would force the word into the middle of every sentence that names a test.
+///
+/// The two halves read different text on purpose. Citations come out of
+/// [`blank_fenced`], so a name inside a fenced example cannot invent one;
+/// disclosure is read off the **raw** block, because the invocation a doc
+/// comment is supposed to carry is usually *inside* a fence, and blanking it
+/// would hide the very sentence this asks for.
+fn undisclosed_ignored_citations() -> Vec<Undisclosed> {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    files.sort();
+    let ignored = ignored_tests(&files);
+
+    let mut found = Vec::new();
+    for path in scanned(&root, &files) {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (start, text) in comment_blocks(&src) {
+            if text.to_ascii_lowercase().contains(DISCLOSURE) {
+                continue;
+            }
+            for (offset, span) in backticked(&blank_fenced(&text)) {
+                let Some(name) = cited_name(&span) else {
+                    continue;
+                };
+                if ignored.contains(&name) {
+                    found.push(Undisclosed {
+                        path: relative.clone(),
+                        line_no: start + offset,
+                        name,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A comment that cites an `#[ignore]`d test says that it is ignored.
+///
+/// # The gap this closes
+///
+/// [`every_test_a_comment_names_is_a_test_that_exists`] checks that a cited
+/// name resolves. Resolution is all it checks — so "this is pinned by `foo`"
+/// passes in full while `foo` carries an `#[ignore]` and the default
+/// `cargo test` row never runs it. The prose promises a guard; the build
+/// provides none; nothing anywhere notices. That is the same conversion of a
+/// guarantee into a claim this file was written to stop, arriving through the
+/// one door the resolution check leaves open.
+///
+/// **This is not a claim that those tests are wrong to be ignored.** 79 tests
+/// in this tree carry the attribute and nearly all of them earn it: they need a
+/// real adapter, or the network, or an archived volume on disk. The defect is
+/// never the `#[ignore]` — it is a sentence that reads as though CI is watching
+/// when it is not. So the fix is one honest clause, not an un-ignored test, and
+/// there is no allowance list here for the same reason: every site can satisfy
+/// this by saying what is true.
+#[test]
+fn a_citation_to_an_ignored_test_says_that_it_is_ignored() {
+    let undisclosed = undisclosed_ignored_citations();
+    let report: Vec<String> = undisclosed
+        .iter()
+        .map(|u| format!("  {}:{}  `{}`", u.path, u.line_no, u.name))
+        .collect();
+
+    assert!(
+        report.is_empty(),
+        "{} comment(s) cite a test that does not run by default, without saying so:\n\n{}\n\n\
+         Each of those names carries an `#[ignore]`, so the default `cargo test` row skips \
+         it and the sentence beside it promises a guard the build does not provide. Say so \
+         in the same comment block — the word `{}` anywhere in the block satisfies this, and \
+         the useful form is the invocation, e.g. \"`#[ignore]`d; run with \
+         `cargo test -p rustdar-frontend --test volume_gpu -- --ignored`\". Do **not** \
+         un-ignore the test to silence this: a test that needs a real adapter is right to be \
+         ignored, and the thing being fixed is the prose. There is no allowance list, \
+         because every site can satisfy this by writing what is true.",
+        report.len(),
+        report.join("\n"),
+        DISCLOSURE,
+    );
+}
+
+/// The ignored index finds a test behind its attribute run, and does not invent
+/// one out of prose that merely mentions the attribute.
+///
+/// Both halves matter. An index that found nothing would make
+/// [`a_citation_to_an_ignored_test_says_that_it_is_ignored`] pass over the
+/// whole workspace while checking nothing — the same silent-green failure
+/// [`the_index_finds_functions_and_modules`] exists to catch. An index that
+/// found too much would flag citations to tests that run perfectly well, and
+/// the fix a reader would reach for is to write a false sentence.
+#[test]
+fn the_ignored_index_finds_tests_and_not_sentences_about_them() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    let ignored = ignored_tests(&files);
+
+    assert!(
+        ignored.len() > 40,
+        "this tree carries far more than 40 `#[ignore]`d tests; found {} — the \
+         index is broken and the gate would pass without checking anything",
+        ignored.len(),
+    );
+    for name in [
+        // A GPU test: `#[ignore]` above `#[test]`, then the `fn`.
+        "the_pipelines_build_on_a_real_device",
+        // A live-network probe in a `#[cfg(test)]` module.
+        "probe_list_files_installs_ring",
+    ] {
+        assert!(
+            ignored.contains(name),
+            "`{name}` is `#[ignore]`d and the index missed it",
+        );
+    }
+    for name in [
+        // The first `fn` under a comment that discusses `#[ignore]`. Indexing
+        // these is what matching the attribute mid-line would have done.
+        "mercator_y",
+        "gpu_lock",
+        "union",
+    ] {
+        assert!(
+            !ignored.contains(name),
+            "`{name}` is not an ignored test — the index is reading prose about \
+             the attribute as a declaration of it",
+        );
+    }
+}
+
+/// A disclosure inside a fenced block still counts, because that is where an
+/// invocation is usually written.
+///
+/// [`blank_fenced`] runs over the citation half of
+/// [`undisclosed_ignored_citations`] and not over the disclosure half. Without
+/// that asymmetry the recommended fix — putting the `-- --ignored` command line
+/// in a fence — would leave the gate failing, and the only way to satisfy it
+/// would be to repeat the word outside the fence.
+#[test]
+fn a_fenced_invocation_discloses() {
+    let fenced = "/// Pinned by `a_name_with_five_or_more_segments`.\n\
+                  ///\n\
+                  /// ```text\n\
+                  /// cargo test -- --ignored\n\
+                  /// ```\n";
+    let blocks = comment_blocks(fenced);
+    assert_eq!(blocks.len(), 1, "the fixture is one comment block");
+    let (_, text) = &blocks[0];
+    assert!(
+        text.to_ascii_lowercase().contains(DISCLOSURE),
+        "the raw block carries the invocation and so discloses",
+    );
+    assert!(
+        !blank_fenced(text).to_ascii_lowercase().contains(DISCLOSURE),
+        "and the blanked block does not — which is exactly why disclosure is \
+         read off the raw text, and why this test exists to pin the asymmetry",
     );
 }
 

@@ -257,7 +257,9 @@ fn the_offscreen_format_is_not_srgb() {
 /// export the value, so the only thing that can be pinned locally is the
 /// literal. The measurement that actually proves the match is
 /// `the_blit_matches_egui_exactly_on_both_surface_formats`, which needs a
-/// GPU. The alpha component is the half worth staring at — `OneMinusDstAlpha`
+/// GPU and is `#[ignore]`d for it — so on a default `cargo test` run this
+/// literal is pinned and the match it stands for is not.
+/// The alpha component is the half worth staring at — `OneMinusDstAlpha`
 /// and `One`, not the `OneMinusSrcAlpha` symmetry invites.
 #[test]
 fn the_blend_state_is_the_one_egui_uses() {
@@ -1160,7 +1162,8 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
 /// `create_texture`, so a descriptor that had stopped reading this function
 /// would pass here. `an_omitted_coarse_level_marches_the_raw_field_at_the_
 /// cloud_rung` in `tests/volume_gpu.rs` is where the descriptor is on the
-/// hook, against a device, and it is the only thing standing under that half.
+/// hook, against a device, and it is the only thing standing under that half —
+/// and being `#[ignore]`d, it stands there only under `-- --ignored`.
 ///
 /// The budget arithmetic deliberately does *not* follow: `grid_bytes_with_mips`
 /// is a ceiling and an eviction figure, and both want the level that may be

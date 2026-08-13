@@ -176,7 +176,8 @@ pub const STAGING_RING_DEPTH: usize = 2;
 /// takes one frame on which every slot was still feeding a copy — a frame the
 /// GPU was behind on, which is exactly the frame the fallback exists for — and
 /// it is permanent once reached. `the_worst_case_residency_is_the_ring_and_the_
-/// widening_together` pins both figures.
+/// widening_together` pins both figures — `#[ignore]`d, so a default run does
+/// not check them.
 ///
 /// It is host memory either way, so it is outside the GPU budget
 /// `crate::constants::APP_TEXTURE_BUDGET_BYTES` states, exactly as the widening
@@ -523,7 +524,8 @@ impl PlaneLayout {
 /// all**, where the `write_texture` path has two (host buffer, then wgpu's own
 /// staging). Same table, same 256 four-byte answers, so the bytes are the same
 /// bytes; `the_two_routes_write_the_same_plane` is what says
-/// so against a real readback.
+/// so against a real readback. It is `#[ignore]`d for that reason — the claim
+/// is only checked when someone runs the suite with `-- --ignored`.
 ///
 /// `WriteOnly` rather than a `&mut [u8]` because that is all wgpu 29 will hand
 /// out for a mapped buffer: mapped memory may be write-combining, where a read
@@ -699,7 +701,8 @@ mod tests {
     /// The fallback's own precondition: a `VolumeStaging` built without a device
     /// must report no ring, so an upload through it takes the `write_texture`
     /// path. `the_two_routes_write_the_same_plane` on a real device is the
-    /// other half.
+    /// other half — and that half is `#[ignore]`d, so this is the one of the
+    /// two that runs by default.
     #[test]
     fn staging_with_no_device_has_no_ring_and_holds_nothing() {
         let staging = VolumeStaging::default();

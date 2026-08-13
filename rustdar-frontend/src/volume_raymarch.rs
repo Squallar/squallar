@@ -847,7 +847,8 @@ impl VolumePipelines {
     /// copy — and the `write_texture` below is what runs instead. **Both write
     /// the same bytes**, from the same table, and
     /// `the_two_routes_write_the_same_plane` reads them back
-    /// off a real device to say so.
+    /// off a real device to say so — which is why it is `#[ignore]`d, and why
+    /// no default `cargo test` run checks this.
     ///
     /// The ring submits its copy before returning, so this function's contract
     /// is unchanged: a grid it returns `Some` for is complete as far as anything
