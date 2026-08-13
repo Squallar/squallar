@@ -1476,8 +1476,8 @@ fn the_store_eviction_actually_bounds() {
 /// holder's other grids.
 ///
 /// Both of them, because they are different code paths and either alone would
-/// let a 3D loop lose thirteen of its fourteen frames the moment the
-/// fourteenth landed:
+/// let a 3D loop lose fourteen of its fifteen frames the moment the
+/// fifteenth landed:
 ///
 ///  * `share`, which sheds when a pane attaches to a new target;
 ///  * `complete`, whose "the grid that landed supersedes the one you were
@@ -1684,7 +1684,7 @@ fn hidden_holders_names_the_panes_the_layout_dropped_and_their_bytes_go() {
     assert!(
         store.holds_set(0),
         "the visible loop stopped being a set holder, so the next build to land \
-         will shed the twelve frames it is animating",
+         will shed the frames it is animating",
     );
     assert!(
         !store.holds_set(2),

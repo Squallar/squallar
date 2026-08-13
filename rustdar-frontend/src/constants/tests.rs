@@ -297,7 +297,7 @@ fn the_3d_loop_holds_exactly_what_it_marches() {
         // treadmill this loop kind cannot afford.
         //
         //  * what the byte budget admits **beside one live grid**, which binds
-        //    desktop (12 of the 30 frames a plan-view loop textures). The
+        //    desktop (14 of the 36 frames a plan-view loop may texture). The
         //    subtracted grid is not padding: see
         //    `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` for the
         //    layout it is there for and what happens without it.

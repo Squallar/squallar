@@ -187,7 +187,7 @@ fn hiding_a_3d_pane_gives_its_grid_back_and_leaves_the_visible_one_alone() {
 ///
 ///  * a hidden set holder is the one holder nothing else bounds —
 ///    `dispatch_loop_renders` walks only the visible panes, so its `retain_set`
-///    is never restated and its whole set (thirteen grids, 468 MiB on desktop)
+///    is never restated and its whole set (fourteen grids, 512 MiB on desktop)
 ///    outlives the layout;
 ///  * and the release must detach *that* pane rather than drop the entries, or
 ///    the visible loop beside it loses the frames it is animating.

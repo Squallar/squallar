@@ -16,7 +16,7 @@
 //!    holder is exempt from every shed there is;
 //!  * a change of key **releases before it builds**, because the seamless-swap
 //!    rule that keeps the old grid through a rebuild is a peak of two full sets
-//!    — 936 MiB against a 512 MiB budget on desktop.
+//!    — 1025 MiB against a 576 MiB budget on desktop.
 //!
 //! The pane-level identity rules live in `rustdar_egui::pane`; the store's own
 //! rules live in `volume::bridge::tests`. These are the dispatcher's.
@@ -195,8 +195,8 @@ fn the_resident_set_is_the_whole_frame_list() {
 /// ones were built.
 ///
 /// That rule is right for one grid — it is what stops a live 3D pane flashing
-/// "Building…" every sealed sweep — and wrong for thirteen: 13 × 36.001 MiB
-/// twice over is 936 MiB against a 512 MiB budget. So a set holder releases
+/// "Building…" every sealed sweep — and wrong for fourteen: 14 × 36.598 MiB
+/// twice over is 1025 MiB against a 576 MiB budget. So a set holder releases
 /// first and accepts the first-build message for the fraction of a second that
 /// costs.
 ///
@@ -274,8 +274,8 @@ fn a_region_change_releases_the_old_set_before_building_the_new_one() {
 /// `extract_volume_parts` runs on the frame thread — the job wire carries a
 /// `RenderInput`, not a `Scan` — so at most `MAX_LOOP_VOLUME_BUILDS_PER_FRAME`
 /// of them may be paid per pass. But a pass over a settled loop must be free to
-/// name every frame it finds already resident, or a thirteen-frame loop would
-/// take thirteen frames to notice grids it already had, every time the playhead
+/// name every frame it finds already resident, or a fourteen-frame loop would
+/// take fourteen frames to notice grids it already had, every time the playhead
 /// moved.
 ///
 /// `App::volume_extractions` counts the walks, and it is a `#[cfg(test)]`
@@ -313,7 +313,7 @@ fn the_pacing_caps_the_extraction_and_not_the_naming() {
 ///
 /// The teardown `PaneState::set_kind` starts is pane-local; the store is keyed
 /// by pane index and a `PaneState` cannot reach it. Without the host-side half,
-/// 468 MiB stays allocated for a pane that has gone back to showing one live
+/// 512 MiB stays allocated for a pane that has gone back to showing one live
 /// volume — the 3D counterpart of the download queue that outlived its loop.
 #[test]
 fn switching_the_loop_off_gives_the_resident_set_back() {
@@ -440,9 +440,9 @@ fn a_volume_with_nothing_to_resample_retires_its_frame() {
 /// A 3D loop is capped at its **resident** frame count when the scan listing
 /// lands, not at `MAX_LOOP_FRAMES`.
 ///
-/// Sixty frames sampled down to thirteen is what makes the frame list and the
+/// Sixty frames sampled down to fourteen is what makes the frame list and the
 /// resident set the same thing on desktop. Without this the list would be sixty
-/// long, the render set a thirteen-wide window inside it, and the loop would be
+/// long, the render set a fourteen-wide window inside it, and the loop would be
 /// back on the treadmill it cannot afford — 89 ms of resample per playback
 /// step, at a 200 ms interval.
 #[test]

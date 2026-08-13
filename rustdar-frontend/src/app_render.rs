@@ -1107,7 +1107,7 @@ impl super::App {
         // the invalidation below is not cheap: it evicts every storm-relative
         // grid and section. Applied per drag frame that is ~210 ms of re-cut
         // for a cross-section and, for a 3D loop, the whole resident set —
-        // thirteen grids and ~1.8 s of resample, thrown away and restarted on
+        // fourteen grids and ~1.9 s of resample, thrown away and restarted on
         // the next frame, so a loop would never finish building while a finger
         // was on the widget. Holding the commit makes the cost proportional to
         // the edit rather than to how long it took. See
@@ -2744,7 +2744,7 @@ impl super::App {
         // Panes whose 3D loop must let go of every grid it holds **before**
         // anything is built for the new key. See `VolumeStore::retain_set`:
         // the seamless-swap rule that keeps the old grid through a rebuild is
-        // right for one grid and is a peak of two full sets for thirteen.
+        // right for one grid and is a peak of two full sets for fourteen.
         // Collected rather than acted on inline, because the store is borrowed
         // from `self` while the pane is.
         let mut release_volume_sets: Vec<usize> = Vec::new();
@@ -2793,7 +2793,7 @@ impl super::App {
                     // over the same ground the live pane is showing, and reading
                     // the *stored* field rather than a per-frame measurement is
                     // what stops a gesture rekeying the loop: a zoom now moves
-                    // the eye, so thirteen grids are no longer thrown away for
+                    // the eye, so fourteen grids are no longer thrown away for
                     // one scroll.
                     v.region,
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
@@ -2872,7 +2872,7 @@ impl super::App {
         for pane_idx in retire_queues {
             self.loop_mgr.remove_pending(pane_idx);
             // A torn-down 3D loop's grids go with its queue. Without this the
-            // resident set outlives the loop that asked for it, and 468 MiB
+            // resident set outlives the loop that asked for it, and 512 MiB
             // stays allocated for a pane that is showing a live volume.
             //
             // Asked before it is done, because the answer is also what says
@@ -3366,8 +3366,8 @@ impl super::App {
     /// because this is the half with the two rules worth reading together:
     ///
     /// * **The pacing counts dispatches, not frames.** A pass over a settled
-    ///   thirteen-frame loop finds every grid already in the store and spends
-    ///   thirteen hash-free linear lookups; only a *miss* costs the
+    ///   fourteen-frame loop finds every grid already in the store and spends
+    ///   fourteen hash-free linear lookups; only a *miss* costs the
     ///   `extract_volume_parts` walk on the frame thread, and at most
     ///   [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] of those are paid per frame. The
     ///   cheap `share_held` probe ahead of the budget check is what separates

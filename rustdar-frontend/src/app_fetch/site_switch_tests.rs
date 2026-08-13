@@ -711,7 +711,7 @@ fn a_resample_dispatched_for_the_radar_being_left_lands_on_a_store_that_dropped_
 /// `dispatch_loop_renders` does reclaim a torn-down loop's set — the switch
 /// resets `loop_state`, and the next frame's `retire_queues` pass calls
 /// `release_set`. That left the set resident for the frame in between, which
-/// on the desktop shape is thirteen grids. The release is now edge-triggered on
+/// on the desktop shape is fourteen grids. The release is now edge-triggered on
 /// the switch, so no frame is drawn with it still held, and the set holder is
 /// unmarked with it.
 #[test]

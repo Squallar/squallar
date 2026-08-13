@@ -635,7 +635,7 @@ impl VolumeStore {
             // A set holder is exempt, and this is the line that makes a 3D
             // loop possible at all: the seamless swap's rule is "the grid that
             // just landed supersedes the one this pane was painting through the
-            // wait", which is right for one grid and destroys thirteen. What
+            // wait", which is right for one grid and destroys fourteen. What
             // bounds a set holder instead is `retain_set` and `enforce_budget`.
             if inner.set_holders.contains(&pane) {
                 continue;
@@ -657,7 +657,7 @@ impl VolumeStore {
     /// Calling it with an empty `keep` is the release-before-build rule a
     /// region, product or vector change needs. `share`'s `keep_old` deliberately
     /// holds the old grid through a rebuild so the swap is seamless — right for
-    /// one grid, and for thirteen it is a peak of two full sets at once (936
+    /// one grid, and for fourteen it is a peak of two full sets at once (1025
     /// MiB against a 512 MiB budget on desktop). A set holder therefore
     /// releases *first* and rebuilds after, and accepts the first-build message
     /// for the fraction of a second that costs.
@@ -713,7 +713,7 @@ impl VolumeStore {
     /// the ones with nothing else to bound them: a hidden pane is one
     /// `dispatch_loop_renders` never walks, so its
     /// [`Self::retain_set`] is never restated and its whole resident set —
-    /// thirteen grids, 468 MiB on desktop — outlives the layout that asked for
+    /// fourteen grids, 512 MiB on desktop — outlives the layout that asked for
     /// it. A holder marked as a set holder but holding no entry is named as
     /// well, so that [`Self::release`] can un-mark it: coming back as a
     /// *single* holder while still on that list would exempt it from every
@@ -1069,7 +1069,7 @@ impl StoreInner {
 /// A stored region cannot do that any more: a gesture does not write it, so a
 /// scroll names one target from beginning to end. What is left for this to
 /// license is the case it was always really about — the **stamp** advancing on
-/// every sealed sweep, thirteen times a volume, over a region that has not
+/// every sealed sweep, fourteen times a volume, over a region that has not
 /// moved. Excluding the region is still right for that, and it is now right for
 /// a reason that does not depend on a gesture: two targets differing only in
 /// their region differ by a *crop*, and a crop is an affine on a grid rather
@@ -1675,7 +1675,7 @@ fn floor_lanes(
 /// mobile and 4.58 MiB on wasm. At `MAX_PANES_DESKTOP` = 6 that is 219 MiB of
 /// backdrop — 43% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
 /// (512 MiB desktop), which is also `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, so it
-/// comes straight out of what a 3D loop may hold: six of the thirteen grids
+/// comes straight out of what a 3D loop may hold: six of the fourteen grids
 /// that floor buys, gone. On wasm the floor is 48 MiB and four panes of
 /// backdrop are 18 MiB of it, 37.5%. Against
 /// [`crate::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 256

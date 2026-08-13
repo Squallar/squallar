@@ -70,7 +70,7 @@ pub struct RadarImageData {
 /// The `CrossSection` behind the raster is ~18 MB natively — an RGBA plane, an
 /// `f32` value plane and a status plane — and only the value and status planes
 /// serve the hover readout. Retaining them per frame would cost
-/// `MAX_LOOP_RENDER_BUDGET` × 18 MB (540 MB on desktop) to answer a question
+/// `MAX_LOOP_RENDER_BUDGET` × 18 MB (648 MB on desktop) to answer a question
 /// nobody can ask of a moving picture. So a section loop frame drops them, and
 /// the pane's hover readout goes quiet while a loop runs — exactly as a plan-view
 /// loop frame's does, which carries an empty `value_data` for the same reason
@@ -412,7 +412,7 @@ impl SectionLoopKey {
 /// * **The storm motion vector.** A storm-relative grid is derived on the way
 ///   out of the volume, so the grid *is* a function of the vector, and the
 ///   vector is not in the target that keys it. Without it here, an override
-///   edit would leave thirteen grids painting the previous vector's field with
+///   edit would leave fourteen grids painting the previous vector's field with
 ///   nothing saying so — the same defect `SectionLoopKey::storm_motion` and
 ///   `render_dispatch::SectionInputKey::storm_motion` exist for.
 ///
