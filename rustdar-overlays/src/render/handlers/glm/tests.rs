@@ -1046,3 +1046,125 @@ fn apply_fetch_result_forwards_queried_set_and_failures() {
         "a queried satellite that stops being dead must clear through the seam"
     );
 }
+
+// ── The half-delivered round ──────────────────────────────────────────
+//
+// GLM's round is one S3 listing per selected satellite, and a dead one does
+// not fail the round: the survivor's flashes are real and cover most of
+// CONUS. That is the right call and it was silent. The round returned Ok,
+// `set_data` stamped a fresh clock and cleared the ladder, and GOES-East's
+// contribution drained out of the cache window over the next half hour with
+// nothing anywhere saying so.
+
+/// A round where one satellite's listing never answered — the shape
+/// `outcome` cannot express, since it hardcodes `listing_failures` empty.
+fn half_listed_round() -> FetchPayload {
+    Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+        flashes: vec![crate::glm::GlmFlash {
+            lat: 35.0,
+            lon: -97.0,
+            energy: None,
+            area: None,
+            time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+            satellite: GlmSatellite::GoesWest,
+            level: GlmDataLevel::Flash,
+        }],
+        dead_feeds: Vec::new(),
+        queried: vec![GlmSatellite::GoesWest],
+        parse_failures: None,
+        transport_failures: None,
+        level_failures: Vec::new(),
+        evaluated_levels: Vec::new(),
+        listing_failures: vec![(
+            GlmSatellite::GoesEast,
+            crate::fetch_policy::FetchError::transient("GLM listing HTTP 503"),
+        )],
+    })))
+}
+
+/// **A dead satellite reaches the row and the options, through the real
+/// ingest path.**
+///
+/// This is what `listing_failures` is carried for: without the verdict
+/// reaching the UI, the field is bookkeeping nobody reads. Driven through
+/// `OverlayRegistry::apply_fetch_result` rather than the handler alone,
+/// because the rendering is the registry's and a handler-level assertion
+/// would pass with the mark never drawn.
+#[test]
+fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
+    use crate::render::controls::PaneControlContext;
+    use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+
+    let ctx = PaneControlContext {
+        pane_idx: 0,
+        pane_state: None,
+    };
+    let kind = OverlayKind::Lightning;
+    let mut registry = OverlayRegistry::default();
+    registry.set_enabled(kind, true);
+
+    registry.apply_fetch_result(OverlayFetchResult {
+        kind,
+        data: half_listed_round(),
+    });
+
+    let line = registry
+        .status_line(kind)
+        .expect("an enabled lightning layer states its own line");
+    assert!(
+        line.starts_with("! incomplete"),
+        "half the sky stopped arriving and the row says nothing: {line}",
+    );
+    assert!(
+        line.contains("1 flashes"),
+        "the layer's own line must survive the mark: {line}",
+    );
+
+    let note = registry
+        .controls(kind, &ctx)
+        .into_iter()
+        .find_map(|item| match item {
+            ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
+            _ => None,
+        })
+        .expect("the options must say what the row is marking");
+    assert!(
+        note.contains("missing 1 of 2 satellite feeds"),
+        "the note must count the feeds, not the flashes: {note}",
+    );
+    assert!(
+        note.contains(GlmSatellite::GoesEast.display_name()) && note.contains("HTTP 503"),
+        "the note must name which satellite and why: {note}",
+    );
+
+    // The survivor's flashes are real data on a fresh clock. A half round is
+    // not a failed one and must not be filed as one.
+    assert_eq!(
+        registry.fetch_health(kind),
+        Some(&crate::fetch_policy::FetchHealth::Ok),
+    );
+    assert!(
+        !line.contains("not updating"),
+        "a half round is not stale: {line}"
+    );
+
+    // Both listings answer next poll: the mark clears itself.
+    registry.apply_fetch_result(OverlayFetchResult {
+        kind,
+        data: outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            Vec::new(),
+            None,
+            None,
+        ),
+    });
+    assert!(
+        !registry
+            .status_line(kind)
+            .is_some_and(|l| l.contains("incomplete")),
+        "the mark outlived the round it was about",
+    );
+}

@@ -646,6 +646,28 @@ impl OverlayRegistry {
         )))
     }
 
+    /// The NWS alert payload for a round whose **zone resolution came up
+    /// short** — the alerts that did resolve, beside the report of what did
+    /// not, exactly as `nws::fetch` delivers one.
+    ///
+    /// The counterpart to [`nws_alerts_payload`], for the same reason
+    /// [`spc_discussions_failure_payload`] is the counterpart to its own: the
+    /// half-delivered round is a production state, and a test that cannot build
+    /// one has to reach past the ingest path and poke the ledger, which is
+    /// exactly how a verdict stops reaching the UI without anything going red.
+    ///
+    /// [`nws_alerts_payload`]: OverlayRegistry::nws_alerts_payload
+    /// [`spc_discussions_failure_payload`]: OverlayRegistry::spc_discussions_failure_payload
+    #[doc(hidden)]
+    pub fn nws_alerts_partial_payload(
+        alerts: Vec<crate::nws::alert::NwsAlert>,
+        zones: crate::nws::zones::ZoneResolution,
+    ) -> FetchPayload {
+        Box::new(super::handlers::alert::NwsAlertFetchResult(Ok(
+            crate::nws::fetch::ActiveAlerts { alerts, zones },
+        )))
+    }
+
     /// The SPC Mesoscale Discussion fetch payload for a known MD list — the
     /// same seam as [`nws_alerts_payload`], for the same reason.
     ///
@@ -1624,6 +1646,279 @@ mod retry_ledger_tests {
                 "{kind:?} kept the mark after recovering",
             );
         }
+    }
+
+    /// The alerts of one poll: `placed` of them carrying the outlines a
+    /// zone-based alert only has once `resolve_zone_geometries` has fetched
+    /// them, the rest carrying none — which is exactly what the handler is
+    /// handed when zone boundaries fail.
+    fn alerts_where_only_some_resolved(
+        total: usize,
+        placed: usize,
+    ) -> Vec<crate::nws::alert::NwsAlert> {
+        use crate::nws::alert::{AlertCategory, NwsAlert};
+        use crate::types::{HatchPattern, OverlayFeature};
+        (0..total)
+            .map(|i| NwsAlert {
+                id: format!("urn:oid:2.49.0.1.840.0.{i}"),
+                event: "Tornado Warning".to_string(),
+                category: AlertCategory::Warning,
+                severity: "Severe".parse().unwrap(),
+                urgency: "Immediate".parse().unwrap(),
+                certainty: "Observed".parse().unwrap(),
+                headline: None,
+                description: String::new(),
+                instruction: None,
+                area_desc: String::new(),
+                sender_name: String::new(),
+                effective: String::new(),
+                expires: String::new(),
+                onset: None,
+                ends: None,
+                affected_zones: vec!["https://api.weather.gov/zones/county/OKC001".to_string()],
+                features: if i < placed {
+                    vec![OverlayFeature::new(
+                        vec![vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]]],
+                        [0, 0, 0, 0],
+                        [0, 0, 0, 0],
+                        "Tornado Warning".to_string(),
+                        String::new(),
+                        HatchPattern::None,
+                    )]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect()
+    }
+
+    /// **The bug, end to end, in the numbers it was observed in.**
+    ///
+    /// 297 warnings arrive, 212 of them referencing zone boundaries that would
+    /// not resolve, so 85 are on the map. Every check in this crate passed: the
+    /// alert fetch genuinely succeeded, so the ladder is clear, the clock is
+    /// fresh and the health is `Ok`. The row said `297 shown - W/Wa/Adv` and the
+    /// options said `Updated 0s ago`, and both were *true statements* about the
+    /// fetch and lies about the map.
+    ///
+    /// Driven through [`OverlayRegistry::apply_fetch_result`] — the one path
+    /// production takes — rather than by writing to the ledger, because every
+    /// link is load-bearing and any of them going quiet reproduces the bug:
+    /// the resolver counting, the fetch carrying, the handler filing through
+    /// `set_data_with_coverage`, and the registry rendering. Delete any one and
+    /// this fails.
+    #[test]
+    fn a_layer_that_under_drew_says_so_on_its_row_and_in_its_options() {
+        use crate::nws::zones::{ZoneFailure, ZoneResolution};
+
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        };
+        let kind = OverlayKind::NwsAlerts;
+        let mut registry = OverlayRegistry::default();
+
+        // Healthy first, so the difference below is this poll's and not the
+        // fixture's.
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind,
+            data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
+        });
+        assert_eq!(
+            registry.status_line(kind).as_deref(),
+            Some("297 shown - W/Wa/Adv"),
+            "a whole round must read as a plain count",
+        );
+        let quiet = registry.controls(kind, &ctx).len();
+
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind,
+            data: OverlayRegistry::nws_alerts_partial_payload(
+                alerts_where_only_some_resolved(297, 85),
+                ZoneResolution {
+                    alerts_expected: 297,
+                    alerts_complete: 85,
+                    alerts_partial: 0,
+                    alerts_missing: 212,
+                    zones_requested: 1200,
+                    zones_resolved: 995,
+                    failures: vec![(ZoneFailure::Http(503), 198), (ZoneFailure::NoBoundary, 7)],
+                },
+            ),
+        });
+
+        // The always-visible half. Both halves of it: the mark, and a count
+        // that no longer claims 297 warnings are on a map holding 85.
+        assert_eq!(
+            registry.status_line(kind).as_deref(),
+            Some("! incomplete - 85 of 297 shown - W/Wa/Adv"),
+            "a layer drawing 85 of 297 warnings must not read as healthy",
+        );
+
+        // The one-click half: what is missing, why, and that it is not the
+        // other fault.
+        let note = registry
+            .controls(kind, &ctx)
+            .into_iter()
+            .find_map(|item| match item {
+                ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
+                _ => None,
+            })
+            .expect("the options must say what the row is marking");
+        for expected in [
+            "missing 212 of 297 alerts",
+            "995 of 1200 zone boundaries resolved",
+            "198 HTTP 503",
+            "7 no usable boundary",
+            "Not the same as stale data",
+        ] {
+            assert!(
+                note.contains(expected),
+                "the note must be countable and say why - missing {expected:?}: {note}",
+            );
+        }
+        assert_eq!(
+            registry.controls(kind, &ctx).len(),
+            quiet + 1,
+            "exactly one line was added, and the layer's own options are intact",
+        );
+        assert!(
+            matches!(
+                registry.controls(kind, &ctx).first(),
+                Some(ControlItem::InfoText { text }) if text.starts_with("Incomplete"),
+            ),
+            "the note must lead the options it changes the meaning of",
+        );
+
+        // Incomplete is **not** stale, and the ledger must not have confused
+        // them: this round succeeded, so the clock is fresh and the ladder clear.
+        assert_eq!(
+            registry.fetch_health(kind),
+            Some(&FetchHealth::Ok),
+            "a round that delivered 85 real warnings is a good answer, and \
+             filing it as a failure would back the layer off from the retry \
+             that could complete it",
+        );
+        let since = registry
+            .fetch_time(kind)
+            .expect("a round that delivered data stamps the clock")
+            .elapsed();
+        assert!(
+            since < std::time::Duration::from_secs(1),
+            "the partial round must stamp its own clock: {since:?}",
+        );
+
+        // A recovered poll clears the mark without the handler saying so.
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind,
+            data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
+        });
+        assert_eq!(
+            registry.status_line(kind).as_deref(),
+            Some("297 shown - W/Wa/Adv"),
+            "the mark outlived the round it was about",
+        );
+    }
+
+    /// The two faults are independent, and a layer with both says both.
+    ///
+    /// `! incomplete` and `! not updating` answer different questions — what is
+    /// missing from the map, and whether what is on it is current — and a user
+    /// looking at a warning layer needs to know which one they have. Collapsing
+    /// them into one word would make the mark unactionable, and picking one
+    /// would hide the other exactly when both are true: a layer that under-drew
+    /// and has since stopped fetching is the worst state there is.
+    #[test]
+    fn a_layer_that_is_both_stale_and_incomplete_says_both() {
+        use crate::nws::zones::{ZoneFailure, ZoneResolution};
+
+        let kind = OverlayKind::NwsAlerts;
+        let mut registry = OverlayRegistry::default();
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind,
+            data: OverlayRegistry::nws_alerts_partial_payload(
+                alerts_where_only_some_resolved(297, 85),
+                ZoneResolution {
+                    alerts_expected: 297,
+                    alerts_complete: 85,
+                    alerts_missing: 212,
+                    zones_requested: 1200,
+                    zones_resolved: 995,
+                    failures: vec![(ZoneFailure::Http(503), 205)],
+                    ..ZoneResolution::default()
+                },
+            ),
+        });
+        assert_eq!(
+            registry.status_line(kind).as_deref(),
+            Some("! incomplete - 85 of 297 shown - W/Wa/Adv"),
+        );
+
+        // The origin then goes away entirely. What is drawn is now both a
+        // subset and out of date.
+        registry.record_fetch_failure(kind, &FetchError::transient("connection refused"));
+        assert_eq!(
+            registry.status_line(kind).as_deref(),
+            Some("! not updating, incomplete - 85 of 297 shown - W/Wa/Adv"),
+            "a failure must not overwrite the coverage verdict, or the reverse",
+        );
+
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        };
+        let notes: Vec<String> = registry
+            .controls(kind, &ctx)
+            .into_iter()
+            .filter_map(|item| match item {
+                ControlItem::InfoText { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes.iter().any(|n| n.contains("may be stale"))
+                && notes.iter().any(|n| n.starts_with("Incomplete")),
+            "both faults must be spelled out, not merged into one: {notes:?}",
+        );
+
+        // A user pressing Refresh has not yet been given the 212 zones that
+        // failed. Clearing the ladder must not claim they arrived.
+        registry.clear_retry(kind);
+        assert_eq!(
+            registry.status_line(kind).as_deref(),
+            Some("! incomplete - 85 of 297 shown - W/Wa/Adv"),
+            "clearing the retry ladder marked the layer whole before the answer \
+             that would make it whole had landed",
+        );
+    }
+
+    /// Switching a layer on when it is drawing 85 of 297 warnings must re-ask.
+    ///
+    /// The same argument as the staleness clause one axis over, and the same
+    /// user: someone who can see the layer is wrong and toggles it, which is the
+    /// first thing anyone tries. The zones that failed are not cached, so a
+    /// re-ask retries precisely them.
+    #[test]
+    fn switching_on_a_layer_that_under_drew_re_asks() {
+        use crate::fetch_policy::DataCompleteness;
+
+        let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+        state.set_data_with_coverage(
+            vec![1],
+            DataCompleteness {
+                expected: 297,
+                missing: 212,
+                ..DataCompleteness::default()
+            },
+        );
+        assert!(!state.retry.is_unhealthy(), "premise: the round succeeded");
+        assert!(state.enable_should_refetch(true));
+
+        state.set_data(vec![1]);
+        assert!(
+            !state.enable_should_refetch(true),
+            "a whole round must not spend a request on being switched on",
+        );
     }
 
     /// A hidden layer draws nothing, so nothing it holds can be misread, and

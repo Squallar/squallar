@@ -1200,6 +1200,150 @@ mod tests {
         }
     }
 
+    // ── Coverage: the other axis ──────────────────────────────────────
+
+    /// The three shapes of incomplete read as three different sentences.
+    ///
+    /// "Missing" and "drawing part of itself" are not the same news: one is an
+    /// absence someone can look for, the other is a shape on the map that is
+    /// wrong in a way nothing about it shows. A note that said "incomplete" and
+    /// stopped would leave a user unable to tell which they had.
+    #[test]
+    fn the_completeness_note_tells_the_three_shapes_of_incomplete_apart() {
+        let base = DataCompleteness {
+            expected: 297,
+            parts_requested: 1200,
+            parts_resolved: 995,
+            unit: "alerts",
+            part_unit: "zone boundaries",
+            reasons: vec![
+                ("HTTP 503".to_string(), 198),
+                ("no usable boundary".to_string(), 7),
+            ],
+            ..DataCompleteness::default()
+        };
+
+        let missing_only = DataCompleteness {
+            missing: 212,
+            ..base.clone()
+        }
+        .status_note()
+        .expect("212 alerts with no shape is not a complete answer");
+        assert_eq!(
+            missing_only,
+            "Incomplete - missing 212 of 297 alerts. 995 of 1200 zone boundaries \
+             resolved: 198 HTTP 503, 7 no usable boundary. Not the same as stale \
+             data: a refresh retries what is missing.",
+        );
+
+        let partial_only = DataCompleteness {
+            partial: 6,
+            ..base.clone()
+        }
+        .status_note()
+        .expect("6 alerts drawing part of themselves is not a complete answer");
+        assert!(
+            partial_only.contains("6 of 297 alerts drawing only part of their area"),
+            "a wrong shape must not be reported as a missing one: {partial_only}",
+        );
+
+        let both = DataCompleteness {
+            missing: 212,
+            partial: 6,
+            ..base.clone()
+        }
+        .status_note()
+        .expect("both at once is still not complete");
+        assert!(
+            both.contains("missing 212 of 297 alerts, with 6 more drawing only part"),
+            "both counts must survive: {both}",
+        );
+
+        assert_eq!(
+            DataCompleteness::default().status_note(),
+            None,
+            "a layer that assembles nothing must not carry a note",
+        );
+        assert_eq!(
+            base.status_note(),
+            None,
+            "nothing missing and nothing partial is a whole answer, whatever \
+             else the fields say",
+        );
+    }
+
+    /// A round with no second denominator says so by omission rather than by
+    /// printing `0 of 0` — GLM's unit *is* the satellite, so a parts sentence
+    /// would be the same two numbers twice.
+    #[test]
+    fn a_layer_whose_unit_has_no_parts_omits_the_parts_sentence() {
+        let note = DataCompleteness {
+            expected: 2,
+            missing: 1,
+            unit: "satellite feeds",
+            reasons: vec![("GOES-19 (East): HTTP 503".to_string(), 1)],
+            ..DataCompleteness::default()
+        }
+        .status_note()
+        .expect("a dead satellite is not a complete answer");
+        assert_eq!(
+            note,
+            "Incomplete - missing 1 of 2 satellite feeds: GOES-19 (East): HTTP 503. \
+             Not the same as stale data: a refresh retries what is missing.",
+        );
+        assert!(
+            !note.contains(" of 0 "),
+            "an absent denominator must not be printed: {note}",
+        );
+    }
+
+    /// **Coverage and health are separate axes, and nothing on the ladder may
+    /// move coverage.**
+    ///
+    /// The two ways this could quietly break are opposite: a failure that
+    /// cleared the coverage report would un-mark a layer for getting *worse*,
+    /// and a `clear()` that cleared it would mark the layer whole the moment a
+    /// user pressed Refresh — before the answer that would make it whole had
+    /// landed. Only a new answer moves it.
+    #[test]
+    fn only_a_new_answer_moves_what_the_layer_is_missing() {
+        let under_drew = DataCompleteness {
+            expected: 297,
+            missing: 212,
+            unit: "alerts",
+            ..DataCompleteness::default()
+        };
+        let mut retry = FetchRetry::new();
+        retry.record_coverage(under_drew.clone());
+        assert!(retry.is_incomplete());
+        assert!(!retry.is_unhealthy(), "a half round is not a stale one");
+
+        retry.record_failure(&transient());
+        assert!(
+            retry.is_incomplete(),
+            "a failure changed nothing about what is drawn, so it must not \
+             change what is reported missing from it",
+        );
+        assert!(retry.is_unhealthy(), "and the layer is now stale as well");
+
+        retry.record_success();
+        assert!(
+            retry.is_incomplete(),
+            "`record_success` replaced no data - the outlook handler's route - \
+             so it cannot claim the missing pieces arrived",
+        );
+        retry.clear();
+        assert!(
+            retry.is_incomplete(),
+            "a user pressing Refresh has not yet been given the 212 zones that \
+             failed",
+        );
+        assert!(!retry.is_unhealthy(), "but the ladder is theirs to clear");
+
+        retry.record_coverage(DataCompleteness::default());
+        assert!(!retry.is_incomplete(), "a whole answer clears it");
+    }
+
     /// The message survives classification, so the log line a user reports is
     /// still the origin's own words.
     #[test]

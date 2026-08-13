@@ -785,6 +785,60 @@ mod tests {
         );
     }
 
+    /// **`shown` means on the map, not past the filters.**
+    ///
+    /// The two used to be the same number and they are not: an alert whose zone
+    /// boundaries did not resolve is let through by every filter and paints
+    /// nothing. Counting it as shown is what let this row read `297 shown` over
+    /// a map with 85 warnings on it — a lie assembled entirely out of true
+    /// statements about the feed.
+    ///
+    /// The split spelling appears only when the two disagree, so a healthy layer
+    /// still reads `2 shown` rather than the arithmetic `2 of 2`.
+    #[test]
+    fn the_status_line_splits_what_is_on_the_map_from_what_passed_the_filters() {
+        let mut handler = NwsAlertHandler::new();
+        handler.apply_fetch_result(with_zones(
+            vec![
+                zone_alert("a", "Tornado Warning", 3),
+                zone_alert("b", "Tornado Warning", 0),
+                zone_alert("c", "Tornado Warning", 0),
+            ],
+            ZoneResolution {
+                alerts_expected: 3,
+                alerts_complete: 1,
+                alerts_missing: 2,
+                zones_requested: 9,
+                zones_resolved: 3,
+                ..ZoneResolution::default()
+            },
+        ));
+        assert_eq!(
+            handler.drawn_count(),
+            3,
+            "premise: every filter lets all three through",
+        );
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("1 of 3 shown - W/Wa/Adv"),
+            "two alerts with no shape must not be counted as shown",
+        );
+
+        // The user hides the one alert that *is* drawn: now nothing is on the
+        // map and only two alerts are even eligible.
+        handler.hidden_alerts.insert("a".to_string());
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("0 of 2 shown - W/Wa/Adv"),
+            "both numbers must move with the filters, not just the denominator",
+        );
+
+        // And once the boundaries arrive, the split spelling goes away.
+        handler.hidden_alerts.clear();
+        handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
+        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Wa/Adv"));
+    }
+
     /// The status line counts what would *draw* — category-filtered and
     /// hide-filtered — and names the categories letting it, so the row under
     /// "NWS Alerts" reads as the map's own state rather than the feed's.
