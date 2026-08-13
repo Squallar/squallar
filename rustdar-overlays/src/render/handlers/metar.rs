@@ -15,7 +15,9 @@ use crate::render::overlay_state::{
 };
 use crate::render::station_model;
 
-pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, crate::fetch_policy::FetchError>);
+pub(crate) struct MetarFetchResult(
+    pub Result<crate::metar::fetch::MetarRound, crate::fetch_policy::FetchError>,
+);
 
 const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -281,13 +283,21 @@ impl OverlayHandler for MetarHandler {
             return;
         };
         match fetch.0 {
-            Ok(observations) => {
-                log::info!("Received {} METAR observations", observations.len());
-                let items = observations
+            Ok(round) => {
+                log::info!("Received {} METAR observations", round.observations.len());
+                // A state network that did not answer takes every station in
+                // that state off the map, whole, and the round still returns
+                // `Ok` because the rest are real. That is the coverage axis,
+                // not the health one — it used to go through `set_data`, which
+                // declares an answer whole, and a viewport centred on the one
+                // dead state drew nothing under a green `Updated 0s ago`.
+                let coverage = round.completeness();
+                let items = round
+                    .observations
                     .into_iter()
                     .map(|ob| Arc::new(MetarItem { ob }))
                     .collect();
-                self.state.set_data(items);
+                self.state.set_data_with_coverage(items, coverage);
             }
             Err(e) => {
                 log::error!("METAR fetch failed: {e}");
@@ -569,5 +579,141 @@ mod tests {
     fn the_popup_keeps_a_real_bearing() {
         let wind = field(wind_ob(Some(WindDir::Degrees(360)), Some(3), None), "Wind").unwrap();
         assert_eq!(wind, "360° at 3 kt");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod round_tests {
+    use super::*;
+    use crate::render::controls::PaneControlContext;
+    use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+
+    /// A viewport spanning several plains ASOS networks, so a round really is
+    /// several requests and one of them can be refused on its own.
+    fn plains() -> crate::types::GeoBounds {
+        crate::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 40.0,
+            min_lon: -103.0,
+            max_lon: -94.0,
+        }
+    }
+
+    /// Serve `currents.json` from loopback, refusing exactly one state network.
+    fn iem_refusing(dead: Option<&'static str>) -> rustdar_radar::sources::DataSources {
+        use std::io::{Read, Write};
+        fn http(status_line: &str, body: &str) -> String {
+            format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut scratch = [0u8; 8192];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+                let refused = dead.is_some_and(|d| request.contains(&format!("network={d}_ASOS")));
+                let out = if refused {
+                    http("503 Service Unavailable", "down")
+                } else {
+                    http("200 OK", "{\"data\":[]}")
+                };
+                let _ = stream.write_all(out.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        rustdar_radar::sources::DataSources {
+            iem_base: format!("http://127.0.0.1:{port}").into(),
+            ..rustdar_radar::sources::DataSources::production()
+        }
+    }
+
+    /// Fetch over the socket and push the result through the production ingest
+    /// path, returning the row and the options note a user would see.
+    fn round(dead: Option<&'static str>) -> (Option<String>, Option<String>) {
+        rustdar_radar::tls::init();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let sources = iem_refusing(dead);
+        let result = runtime.block_on(crate::metar::fetch::fetch_current_metars(
+            &client,
+            &sources,
+            &plains(),
+        ));
+
+        let kind = OverlayKind::Metar;
+        let mut registry = OverlayRegistry::default();
+        registry.set_enabled(kind, true);
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind,
+            data: Box::new(MetarFetchResult(result)) as FetchPayload,
+        });
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        };
+        let note = registry
+            .controls(kind, &ctx)
+            .into_iter()
+            .find_map(|item| match item {
+                ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
+                _ => None,
+            });
+        (registry.status_line(kind), note)
+    }
+
+    /// **A state network that did not answer blanks that state.**
+    ///
+    /// The round returns `Ok` because the other seven networks are real, which
+    /// is right. What was wrong is that it then said nothing: measured over
+    /// this socket against the shipped code, eight networks asked, Oklahoma's
+    /// refused 503, health `Ok`, `is_incomplete()` false, no mark — and every
+    /// Oklahoma station absent from a map most likely centred on Oklahoma.
+    #[test]
+    fn a_state_network_that_did_not_answer_marks_the_layer_and_names_it() {
+        assert!(
+            crate::metar::networks::networks_for_viewport(&plains()).contains(&"OK"),
+            "premise: the viewport asks Oklahoma's network",
+        );
+        let (line, note) = round(Some("OK"));
+        let line = line.expect("an enabled METAR layer states its own line");
+        assert!(
+            line.starts_with("! incomplete"),
+            "a whole state is blank and the row says nothing: {line}",
+        );
+        let note = note.expect("the options must say what the row is marking");
+        assert!(
+            note.contains("missing 1 of 8 state networks"),
+            "the note must count the networks, not the stations: {note}",
+        );
+        assert!(
+            note.contains("OK") && note.contains("503"),
+            "the note must name which state and why: {note}",
+        );
+        assert!(
+            !line.contains("not updating"),
+            "seven networks answered on a fresh clock — not stale: {line}",
+        );
+    }
+
+    /// The control: every network answering carries no mark. Without it the
+    /// assertion above would pass on a report that always claimed incomplete.
+    #[test]
+    fn a_whole_round_carries_no_mark() {
+        let (line, note) = round(None);
+        let line = line.expect("line");
+        assert!(!line.starts_with("!"), "nothing failed: {line}");
+        assert_eq!(note, None);
     }
 }
