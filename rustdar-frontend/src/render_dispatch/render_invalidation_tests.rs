@@ -24,6 +24,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
                     max_range_km: 230.0,
                     values: Vec::new(),
                     nyquist_ms: None,
+                    melting_layer_source: None,
                 },
             ))
         })),
@@ -471,6 +472,7 @@ fn cached(range: f64) -> CachedRenderOutput {
         max_range_km: range,
         value_data: Arc::new(Vec::new()),
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }
 
@@ -737,5 +739,174 @@ fn finished_renders_stop_being_tracked() {
         d.pane_render[0].results_wanted.len(),
         1,
         "flags accumulated for renders that had already answered",
+    );
+}
+
+/// **A melting-layer object is never applied to a volume it does not name.**
+///
+/// The defect this closes is not "the classification is slightly off". The
+/// same classifier scored against ten RPG `N0H` products gets 82.8–95.9 %
+/// exact on the RPG's own melting layer and 16.0–19.8 % on the fleet default
+/// at the three sites where that default is ~3 km wrong. An object from the
+/// *previous* volume is a third state, and it is the worst of the three: the
+/// layer it places is a real measurement of a real atmosphere, so nothing
+/// about the picture looks wrong, and the render would report itself as
+/// `Rpg` — measured, for this volume — while being neither.
+///
+/// So the cache holds the volume start beside the bytes and the accessor
+/// compares before it hands anything out. "The latest object" is not a
+/// fallback here and must never become one.
+#[test]
+fn a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names() {
+    let volume = |minute: u32| {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, minute, 0)
+            .unwrap()
+    };
+    let object = |start: chrono::NaiveDateTime| MeltingLayerObject {
+        volume_start: start,
+        bytes: Arc::new(vec![0xAB; 8]),
+    };
+    let hca = RadarProduct::HydrometeorClassification;
+
+    let mut d = RenderDispatcher::new();
+    let gui = gui_showing("KTLX");
+    d.ensure_pane_count(1);
+
+    assert!(
+        d.melting_layer_product_for(hca, "KTLX", volume(0))
+            .is_none(),
+        "with nothing cached the classification must fall back, not invent",
+    );
+
+    assert!(
+        d.set_melting_layer("KTLX", object(volume(0)), &gui),
+        "the first object for a site is a change from nothing",
+    );
+    assert!(
+        d.melting_layer_product_for(hca, "KTLX", volume(0))
+            .is_some(),
+        "the object for this very volume must reach the render",
+    );
+
+    // The volume rolls. The cached object is still perfectly good data — it is
+    // simply not this picture's — so it is withheld, and withheld for every
+    // neighbouring volume rather than only for distant ones.
+    for other in [volume(6), volume(12), volume(1)] {
+        assert!(
+            d.melting_layer_product_for(hca, "KTLX", other).is_none(),
+            "an object naming {} was handed to a render of {other}",
+            volume(0),
+        );
+    }
+
+    // Per site, on the same terms: KOUN's volume happens to start at the same
+    // instant and still gets nothing, because it has no object of its own.
+    assert!(
+        d.melting_layer_product_for(hca, "KOUN", volume(0))
+            .is_none(),
+        "one site's melting layer was applied to another site's volume",
+    );
+
+    // And no other product reads one, whatever is cached.
+    for product in [
+        RadarProduct::Reflectivity,
+        RadarProduct::CorrelationCoefficient,
+        RadarProduct::ProbabilityOfSevereHail,
+    ] {
+        assert!(
+            d.melting_layer_product_for(product, "KTLX", volume(0))
+                .is_none(),
+            "{product:?} was handed a melting layer it does not classify with",
+        );
+    }
+}
+
+/// A landed object drops exactly the classification renders that were drawn
+/// without it — the per-volume sibling of the sounding invalidation above.
+///
+/// Without this, a pane that rendered on the fleet default a second before the
+/// object landed would keep that picture, uncorrected and captioned as a guess,
+/// until the volume rolled — which is four to six minutes of showing the wrong
+/// answer while the right one sits in the cache.
+#[test]
+fn a_landed_melting_layer_drops_the_classification_renders_that_missed_it() {
+    let volume = |minute: u32| {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, minute, 0)
+            .unwrap()
+    };
+    let object = |start: chrono::NaiveDateTime| MeltingLayerObject {
+        volume_start: start,
+        bytes: Arc::new(vec![0xAB; 8]),
+    };
+
+    let mut d = RenderDispatcher::new();
+    let gui = gui_showing("KTLX");
+    d.ensure_pane_count(1);
+
+    d.pane_render[0].last_rendered = Some((RadarProduct::HydrometeorClassification, 0.5));
+    d.cache_render(
+        "KTLX",
+        RadarProduct::HydrometeorClassification,
+        rustdar_radar::types::RenderView::PlanView,
+        0.5,
+        cached(1.0),
+    );
+    d.cache_render(
+        "KTLX",
+        RadarProduct::Reflectivity,
+        rustdar_radar::types::RenderView::PlanView,
+        0.5,
+        cached(2.0),
+    );
+
+    assert!(d.set_melting_layer("KTLX", object(volume(0)), &gui));
+    assert_eq!(
+        d.pane_render[0].last_rendered, None,
+        "the classification pane kept a picture drawn without the object",
+    );
+    assert!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::HydrometeorClassification,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+        )
+        .is_none(),
+        "the shared cache would hand the pre-object raster straight back",
+    );
+    assert!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+        )
+        .is_some(),
+        "reflectivity classifies nothing and must not be redrawn",
+    );
+
+    // A refetch of the same volume's object changes nothing and drops nothing:
+    // the answer for that volume is already on screen.
+    d.pane_render[0].last_rendered = Some((RadarProduct::HydrometeorClassification, 0.5));
+    assert!(
+        !d.set_melting_layer("KTLX", object(volume(0)), &gui),
+        "an object for the volume already in hand is not a change",
+    );
+    assert_eq!(
+        d.pane_render[0].last_rendered,
+        Some((RadarProduct::HydrometeorClassification, 0.5)),
+    );
+
+    // The next volume's object is, and the cache moves with it.
+    assert!(d.set_melting_layer("KTLX", object(volume(6)), &gui));
+    assert_eq!(d.melting_layer_volume("KTLX"), Some(volume(6)));
+    assert!(
+        d.melting_layer_product_for(RadarProduct::HydrometeorClassification, "KTLX", volume(0))
+            .is_none(),
+        "the previous volume's object survived the replacement",
     );
 }

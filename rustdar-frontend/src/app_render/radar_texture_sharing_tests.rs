@@ -134,6 +134,7 @@ fn post(
                 max_range_km: 230.0,
                 value_data: Arc::new(Vec::new()),
                 nyquist_ms: None,
+                melting_layer_source: None,
             }),
             product,
             elevation,

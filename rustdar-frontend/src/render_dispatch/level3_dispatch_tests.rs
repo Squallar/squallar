@@ -372,6 +372,7 @@ fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
         product,
         elevation,
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }
 
@@ -589,5 +590,6 @@ fn output() -> CachedRenderOutput {
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }

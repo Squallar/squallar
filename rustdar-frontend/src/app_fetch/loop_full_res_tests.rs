@@ -172,6 +172,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         SITE,
         std::sync::Arc::new(sample_scan()),
         &rustdar_radar::nyquist::DeclaredNyquist::empty(),
+        chrono::NaiveDateTime::default(),
         sender,
         None,
     );

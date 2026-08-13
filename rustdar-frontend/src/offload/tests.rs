@@ -792,6 +792,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
             max_range_km: 230.0,
             values: vec![f32::NAN],
             nyquist_ms: None,
+            melting_layer_source: None,
         })),
     );
 

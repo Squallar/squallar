@@ -12,6 +12,7 @@ use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
+use rustdar_radar::hca::MeltingLayerSource;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
@@ -245,6 +246,7 @@ pub(super) fn render_pane_map_content(
         // after the loop" — not a sub-layer, whose compositing order against
         // the pane's list is egui's hash-order safety net (see `paint_order`).
         let mut pending_notice: Option<(RadarProduct, f32)> = None;
+        let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
 
         let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
         for &kind in &draw_order {
@@ -342,6 +344,16 @@ pub(super) fn render_pane_map_content(
                     // and `PaneState::stale_image_on_screen` answers from the
                     // same texture metadata either way.
                     pending_notice = ctx.pane.stale_image_on_screen();
+                    // And, when the pixels *are* the selection, what the
+                    // classification behind them is standing on — but only
+                    // when nobody measured it. Decided in the same arm and
+                    // deferred the same way, because it is a sentence about
+                    // the same pixels. The two can never both be `Some`: see
+                    // `draw_melting_layer_notice`.
+                    melting_layer_caveat = ctx
+                        .pane
+                        .displayed_melting_layer_source()
+                        .filter(|source| !source.is_measured());
                 }
                 // City label tiles — the same projector-driven tile pass the
                 // basemap goes through, at the same bias, so the names sit on
@@ -457,6 +469,21 @@ pub(super) fn render_pane_map_content(
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
                 on_screen,
                 elevation,
+            );
+        }
+
+        // The other half of the same plate, on the same terms — see the Radar
+        // arm. Glass, and mutually exclusive with the notice above, so this is
+        // the one place either sentence is drawn and they cannot stack.
+        if let Some(source) = melting_layer_caveat
+            && ctx.surfaces.paints(PaneSurface::Glass)
+        {
+            let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
+            draw_melting_layer_notice(
+                &notice_painter,
+                ctx.pane_rect,
+                crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
+                source,
             );
         }
 
@@ -1562,14 +1589,90 @@ pub(super) fn draw_pending_render_notice(
     product: RadarProduct,
     elevation: f32,
 ) {
+    draw_top_notice(
+        painter,
+        pane_rect,
+        top_margin,
+        pending_render_notice(product, elevation),
+    );
+}
+
+/// What a pane says when the classification on screen is standing on a melting
+/// layer nobody measured for the volume it is drawn from.
+///
+/// # It fires on the exception, never on the ordinary case
+///
+/// Only for the two unmeasured sources — see
+/// [`MeltingLayerSource::is_measured`]. When the RPG published its own layer
+/// for this volume, or this volume's own tilts detected one, the pane says
+/// **nothing**. That is the rule the section pane's module header records the
+/// cost of learning: a caveat shown on the ordinary case is not honesty, it is
+/// an alarm people learn to skip, and it takes the exceptional case down with
+/// it.
+///
+/// # And it is not styled as a break
+///
+/// Same plate, same size, same quiet white as the pending-render notice — no
+/// red, no alert glyph. A classification on a sounding's freezing level is a
+/// qualified answer, not a failed one; the thing that is broken here would be a
+/// classification that did not say. The wording is
+/// [`MeltingLayerSource::caption`]'s, which states the measured cost for the
+/// fleet-default case rather than hedging, because "may be less accurate" is
+/// the kind of sentence that gets skipped and "four times in five" is not.
+///
+/// # And it carries no icon
+///
+/// The pending notice leads with `⟳` because it is about a *transient* state —
+/// something is on its way. This one is not: it is a standing property of the
+/// picture, and every icon calm enough to say so (`ⓘ`, `ℹ`) is either absent
+/// from egui's proportional family or carried only by the monospace one, so
+/// the alternatives are a tofu box, a second font at the draw site, or a
+/// warning triangle. A warning triangle is the thing this notice must not be.
+/// **The missing icon is the decision, not an omission** — `ⓘ` was tried
+/// first and dropped for this reason, so adding one back means loading a font
+/// that has it, not picking a glyph that renders.
+/// The plate is the marker; the sentence is the message.
+fn melting_layer_notice(source: MeltingLayerSource) -> String {
+    source.caption().to_owned()
+}
+
+/// Draw the melting-layer qualification across the top of the pane.
+///
+/// # Only ever one plate
+///
+/// This shares the pending notice's position, and the two cannot collide:
+/// [`PaneState::displayed_melting_layer_source`] is gated through
+/// `stale_image_on_screen`, so while there is a pending notice to draw this
+/// answers `None`. That is the arrangement chosen over stacking or offsetting —
+/// the two sentences are about the same pixels and the pending one is the more
+/// urgent ("these are not the pixels you asked for" precedes "and here is what
+/// they were classified against"). Once the render lands, the pending notice
+/// goes and this one takes the same spot, so nothing moves under the reader.
+pub(super) fn draw_melting_layer_notice(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    top_margin: f32,
+    source: MeltingLayerSource,
+) {
+    draw_top_notice(painter, pane_rect, top_margin, melting_layer_notice(source));
+}
+
+/// The rounded plate both top-of-pane notices are drawn on.
+///
+/// One spelling, so a second notice cannot acquire a different size, colour or
+/// urgency by being written separately — which is how a plain qualification
+/// ends up looking like a fault.
+///
+/// Deliberately non-blocking: the imagery stays fully visible and undimmed.
+/// Somebody watching weather must never lose the picture to a caption.
+///
+/// Wrapped rather than clipped, because the longest of these sentences is wider
+/// than a pane in a six-way split and a truncated notice about a misleading
+/// image would be its own small lie.
+fn draw_top_notice(painter: &egui::Painter, pane_rect: egui::Rect, top_margin: f32, text: String) {
     let font = egui::FontId::proportional(PENDING_FONT_SIZE);
     let wrap_width = (pane_rect.width() - SCALE_MARGIN * 2.0 - PENDING_PADDING.x * 2.0).max(1.0);
-    let galley = painter.layout(
-        pending_render_notice(product, elevation),
-        font,
-        egui::Color32::WHITE,
-        wrap_width,
-    );
+    let galley = painter.layout(text, font, egui::Color32::WHITE, wrap_width);
     let plate = egui::Rect::from_center_size(
         egui::pos2(
             pane_rect.center().x,

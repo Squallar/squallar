@@ -1538,12 +1538,17 @@ impl InputHarness {
     /// for — every Level III product, every volume product, and any Level II
     /// cut whose volume declared nothing — so a test that does not care states
     /// `None` and gets a pane with nothing to annotate.
+    ///
+    /// `melting_layer_source` is the same shape for the other unmeasurable:
+    /// `None` for every product but the hybrid classification, which is what a
+    /// test that is not about the melting layer states.
     pub(crate) fn place_radar_image(
         &mut self,
         idx: usize,
         product: rustdar_radar::types::RadarProduct,
         elevation: f32,
         nyquist_ms: Option<f64>,
+        melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
     ) {
         use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_radar::types::{BASE_EXTENT_KM, ImageBounds};
@@ -1598,6 +1603,7 @@ impl InputHarness {
                 lon,
                 max_range_km: extent_km,
                 nyquist_ms,
+                melting_layer_source,
                 product,
                 elevation,
             }),

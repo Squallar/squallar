@@ -132,6 +132,7 @@ fn post_result(
     proto::set_field(&message, proto::VALUES, &JsValue::NULL);
     proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(0.0));
     proto::set_field(&message, proto::NYQUIST, &JsValue::NULL);
+    proto::set_field(&message, proto::MELTING_LAYER, &JsValue::NULL);
     proto::set_field(&message, proto::OUT, &JsValue::NULL);
     proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
 
@@ -142,6 +143,7 @@ fn post_result(
             max_range_km,
             values,
             nyquist_ms,
+            melting_layer_source,
         })) => {
             let image = js_sys::Uint8Array::from(image.as_slice());
             let values = js_sys::Float32Array::from(values.as_slice());
@@ -155,6 +157,17 @@ fn post_result(
             // default above already wrote.
             if let Some(nyquist_ms) = nyquist_ms {
                 proto::set_field(&message, proto::NYQUIST, &JsValue::from_f64(nyquist_ms));
+            }
+            // The same shape, for the same reason: only the hybrid
+            // classification has a melting layer to name, so the null written
+            // above stands for every other product.
+            if let Some(source) = melting_layer_source {
+                let code = rustdar_frontend::offload::MeltingLayerWire(source).wire_code();
+                proto::set_field(
+                    &message,
+                    proto::MELTING_LAYER,
+                    &JsValue::from_f64(f64::from(code)),
+                );
             }
         }
         Some(output) => {

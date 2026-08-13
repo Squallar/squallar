@@ -35,6 +35,18 @@ pub const MAX_RANGE: &str = "range";
 /// absent field and a null one resolve alike — which is what makes writing it
 /// unconditionally in every arm of `post_result` the whole of the contract.
 pub const NYQUIST: &str = "nyq";
+/// Worker → page: where the melting layer the rendered raster was classified
+/// against came from, as
+/// [`rustdar_frontend::offload::MeltingLayerWire::wire_code`], or **null** for
+/// a raster that classified nothing — which is every product but the hybrid
+/// classification.
+///
+/// A number and not a string for the reason [`OUT_KIND`] is one: the page turns
+/// it back into the enum through the same exhaustive pair that wrote it, so a
+/// byte this build does not have resolves to "no source stated" rather than to
+/// a plausible-looking label. Null encodes `None`, exactly as [`NYQUIST`]'s
+/// does, and the page reads both back through the same `as_f64` filter.
+pub const MELTING_LAYER: &str = "mls";
 
 /// Worker → page: an output that is not a plan-view frame — a cross-section
 /// raster or a voxel grid — as **one** transferred `Uint8Array` in the payload
@@ -80,7 +92,13 @@ pub const OUT_KIND: &str = "outkind";
 /// the class of mismatch a version number exists to convert into a clean
 /// termination, and a page silently unable to name a fold limit is the same
 /// silence this workstream is closing everywhere else.
-const PROTOCOL_VERSION: u32 = 3;
+///
+/// Version 4 added [`MELTING_LAYER`], and that one is not merely a caption: a
+/// page reading `None` from an older worker would draw *no* qualification over
+/// a classification standing on the fleet default, which is the picture that
+/// scores 16 % against the RPG's own answer. Silently indistinguishable from
+/// the 95 % one is precisely what the version number is here to prevent.
+const PROTOCOL_VERSION: u32 = 4;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

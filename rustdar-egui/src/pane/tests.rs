@@ -209,6 +209,7 @@ fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
         lon: 0.0,
         max_range_km: 100.0,
         nyquist_ms: None,
+        melting_layer_source: None,
         value_data: Arc::new(Vec::new()),
     }
 }
@@ -1097,11 +1098,34 @@ fn frames_outside_the_render_set_do_not_block_readiness() {
 /// `stale_image_on_screen` falls back to the product alone and a pane showing
 /// velocity while velocity is selected is showing what it claims to.
 fn velocity_pane(ctx: &egui::Context, nyquist_ms: Option<f64>) -> PaneState {
+    pane_showing_render(ctx, RadarProduct::Velocity, nyquist_ms, None)
+}
+
+/// A pane showing a finished classification render that stood on `source`.
+///
+/// [`velocity_pane`]'s sibling for the other per-picture fact, built on the
+/// same fixture so the two accessors are exercised against one shape of pane
+/// rather than two that could drift.
+fn classification_pane(
+    ctx: &egui::Context,
+    source: Option<rustdar_radar::hca::MeltingLayerSource>,
+) -> PaneState {
+    pane_showing_render(ctx, RadarProduct::HydrometeorClassification, None, source)
+}
+
+/// A pane showing a finished render of `product`, described by the two facts a
+/// render carries about itself that nothing else can recompute.
+fn pane_showing_render(
+    ctx: &egui::Context,
+    product: RadarProduct,
+    nyquist_ms: Option<f64>,
+    melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+) -> PaneState {
     use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
 
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     let mut pane = PaneState::new();
-    pane.selected_product = RadarProduct::Velocity;
+    pane.selected_product = product;
     pane.overlay_cache_mut(OverlayKind::Radar).current = Some(OverlayTextureData {
         texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
         geo_bounds: rustdar_overlays::types::GeoBounds {
@@ -1120,7 +1144,8 @@ fn velocity_pane(ctx: &egui::Context, nyquist_ms: Option<f64>) -> PaneState {
             lon: -97.0,
             max_range_km: 100.0,
             nyquist_ms,
-            product: RadarProduct::Velocity,
+            melting_layer_source,
+            product,
             elevation: 0.5,
         }),
         hit_map: None,
@@ -1221,4 +1246,83 @@ fn only_a_plan_view_of_base_velocity_carries_a_fold_limit() {
         None,
         "a section cuts through every rung of the ladder at once",
     );
+}
+
+/// A classification pane reports the melting layer **its own pixels** stood on.
+///
+/// The whole point of carrying the source this far. The same classifier scored
+/// against the RPG's own `N0H` gets 82.8–95.9 % exact on the RPG's melting
+/// layer and 16.0–19.8 % on the fleet default; a pane that could not tell the
+/// two apart could not tell a classification from a guess.
+#[test]
+fn a_classification_pane_reports_the_layer_its_pixels_stood_on() {
+    use rustdar_radar::hca::MeltingLayerSource;
+
+    let ctx = egui::Context::default();
+
+    let measured = classification_pane(&ctx, Some(MeltingLayerSource::Rpg));
+    assert_eq!(
+        measured.displayed_melting_layer_source(),
+        Some(MeltingLayerSource::Rpg),
+    );
+
+    let guessed = classification_pane(&ctx, Some(MeltingLayerSource::FleetDefault));
+    assert_eq!(
+        guessed.displayed_melting_layer_source(),
+        Some(MeltingLayerSource::FleetDefault),
+    );
+
+    // Every other product classified nothing, so there is nothing to report —
+    // and emphatically not the last classification's layer.
+    let mut other = classification_pane(&ctx, Some(MeltingLayerSource::FleetDefault));
+    for product in [
+        RadarProduct::Reflectivity,
+        RadarProduct::Velocity,
+        RadarProduct::CorrelationCoefficient,
+    ] {
+        other.selected_product = product;
+        assert_eq!(
+            other.displayed_melting_layer_source(),
+            None,
+            "{product:?} was described as standing on a melting layer",
+        );
+    }
+
+    // A section and a 3D volume assemble a whole ladder; neither is the one
+    // plan-view classification this describes.
+    let mut ladder = classification_pane(&ctx, Some(MeltingLayerSource::FleetDefault));
+    ladder.set_map_render(MapRender::Volume);
+    assert_eq!(ladder.displayed_melting_layer_source(), None);
+    ladder.set_map_render(MapRender::Plan);
+    ladder.set_kind(PaneKind::CrossSection);
+    assert_eq!(ladder.displayed_melting_layer_source(), None);
+}
+
+/// While a loop runs, the provenance is the *playing frame's*.
+///
+/// A loop pairs one `N0M` object per volume and the app has only ever fetched
+/// one — the still frame's — so a loop routinely animates a measured
+/// classification beside twenty guessed ones. Reading the static texture's
+/// metadata would report the whole animation as measured.
+#[test]
+fn a_looping_classification_pane_reports_the_playing_frames_layer() {
+    use rustdar_radar::hca::MeltingLayerSource;
+
+    let ctx = egui::Context::default();
+    let mut pane = classification_pane(&ctx, Some(MeltingLayerSource::Rpg));
+    pane.loop_state = loop_with_frames(3, 1);
+    pane.loop_state.frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
+        melting_layer_source: Some(MeltingLayerSource::FleetDefault),
+        ..dummy_plan_view(&ctx)
+    }));
+    assert_eq!(
+        pane.displayed_melting_layer_source(),
+        Some(MeltingLayerSource::FleetDefault),
+        "the loop reported the static render's layer, not the frame on the glass",
+    );
+
+    // A playhead on a frame with no picture yet has nothing to describe, and
+    // must not fall back to the texture underneath it.
+    pane.loop_state.current_frame = 2;
+    assert_eq!(pane.displayed_melting_layer_source(), None);
 }

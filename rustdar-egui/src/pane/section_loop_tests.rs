@@ -107,6 +107,7 @@ fn plan_view_picture(ctx: &egui::Context) -> LoopFrameImage {
         lon: -97.28,
         max_range_km: 230.0,
         nyquist_ms: None,
+        melting_layer_source: None,
         value_data: Arc::new(Vec::new()),
     })
 }

@@ -126,6 +126,15 @@ fn deliver(data: &JsValue) {
             // rendered raster had no one cut behind it, so the absence needs no
             // separate test — see `proto::NYQUIST`.
             nyquist_ms: proto::field(data, proto::NYQUIST).and_then(|v| v.as_f64()),
+            // Null (a raster that classified nothing) and a byte this build
+            // does not have both land on `None` — see `proto::MELTING_LAYER`.
+            // The page then draws no qualification, which is the same thing it
+            // draws for a measured layer; the protocol token is what keeps a
+            // worker old enough to produce that from ever being attached.
+            melting_layer_source: proto::field(data, proto::MELTING_LAYER)
+                .and_then(|v| v.as_f64())
+                .and_then(|v| offload::MeltingLayerWire::from_wire_code(v as u8))
+                .map(|wire| wire.0),
         })
     });
 

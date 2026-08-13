@@ -262,6 +262,60 @@ pub struct RenderedFrame {
     /// See [`rustdar_radar::render::SweepRender::nyquist_ms`], which is where
     /// it comes from and which explains what it is a property of.
     pub nyquist_ms: Option<f64>,
+    /// Where the melting layer this raster was classified against came from,
+    /// or `None` for every raster that classified nothing — which is every
+    /// product but the hybrid classification.
+    ///
+    /// See [`rustdar_radar::hca::MeltingLayerSource`]. It rides beside
+    /// `nyquist_ms` and for the same reason: it is a fact about *this* picture
+    /// that the far end cannot recompute, and here it is the difference
+    /// between a classification measured for this volume and one standing on a
+    /// fleet constant that has been measured 3 km wrong.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+}
+
+/// A [`MeltingLayerSource`](rustdar_radar::hca::MeltingLayerSource) as a
+/// number, for the one boundary that can only carry numbers.
+///
+/// The enum lives in `rustdar-radar`, which has no wire form for it and needs
+/// none: nothing in that crate crosses a message port. The browser's
+/// page↔worker port does, and it carries JS values — so the mapping is written
+/// here, beside [`RenderedFrame`], which is the type that actually crosses.
+///
+/// A newtype rather than two free functions so the pair cannot drift apart:
+/// [`from_wire_code`](Self::from_wire_code) is exhaustive over the same match
+/// arms [`wire_code`](Self::wire_code) writes, so adding a variant upstream
+/// fails this build rather than silently encoding as "unknown".
+///
+/// `None` from `from_wire_code` is a byte this build does not have — a page and
+/// a worker on opposite sides of a deploy, which the protocol token already
+/// refuses — and reads as "no source stated", the same as an absent field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeltingLayerWire(pub rustdar_radar::hca::MeltingLayerSource);
+
+impl MeltingLayerWire {
+    pub fn wire_code(self) -> u8 {
+        use rustdar_radar::hca::MeltingLayerSource as S;
+        match self.0 {
+            S::Rpg => 0,
+            S::RadarDetected => 1,
+            S::Sounding => 2,
+            S::FleetDefault => 3,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    pub fn from_wire_code(code: u8) -> Option<Self> {
+        use rustdar_radar::hca::MeltingLayerSource as S;
+        let source = match code {
+            0 => S::Rpg,
+            1 => S::RadarDetected,
+            2 => S::Sounding,
+            3 => S::FleetDefault,
+            _ => return None,
+        };
+        Some(Self(source))
+    }
 }
 
 /// `None` where the renderer found nothing to draw — a scan with no matching
@@ -278,6 +332,7 @@ impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
             max_range_km: render.max_range_km,
             values: render.values,
             nyquist_ms: render.nyquist_ms,
+            melting_layer_source: render.melting_layer_source,
         }
     }
 }

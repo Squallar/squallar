@@ -74,6 +74,15 @@ pub struct RenderedImage {
     /// site but not the sweep, so a number about the sweep either travels with
     /// the pixels or is unavailable where they are drawn.
     pub nyquist_ms: Option<f64>,
+    /// Where the melting layer these pixels were classified against came from,
+    /// or `None` for a raster that classified nothing.
+    ///
+    /// Metadata that travels with the picture for the reason above, and the
+    /// one where travelling matters most: the melting layer a render stood on
+    /// is not recoverable from anything the far end holds — the cache it came
+    /// from may already have been replaced by the next volume's — and the
+    /// difference between the two answers is a classification against a guess.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
 }
 
 /// Result from a background radar render thread.
@@ -364,6 +373,15 @@ pub struct LoopRenderResponse {
     /// RDA reselects PRFs between them, so the limit the newest frame folded
     /// at is not necessarily the limit the oldest did.
     pub nyquist_ms: Option<f64>,
+    /// Where this frame's melting layer came from, or `None` for a frame that
+    /// classified nothing.
+    ///
+    /// Per frame, and emphatically so: a loop pairs one N0M object per volume,
+    /// so the newest frame can be classified against the RPG's own layer while
+    /// an older frame — whose object was never fetched — falls back to the
+    /// fleet constant. One number for the whole loop would caption most of its
+    /// frames with another frame's provenance.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
 }
 
 /// Result from cutting a single cross-section loop frame.
@@ -461,6 +479,37 @@ pub struct SoundingResponse {
     pub heights: Option<rustdar_radar::sounding::EnvHeights>,
 }
 
+/// The RPG's own Melting Layer object (Level III 166, AWIPS `N0M`) for one
+/// site's currently-loaded volume.
+///
+/// The counterpart of [`SoundingResponse`] for the other half of the hybrid
+/// classification's environment, and it differs from that one in the way that
+/// matters: a sounding is a fact about a place and an hour, so a stale one is
+/// merely old, while a melting-layer object is a fact about **one volume**.
+/// Applied to a different volume it would place the layer confidently in the
+/// wrong place — which is the defect this whole path exists to fix — so the
+/// volume it names travels with it and the accessor that hands it to a render
+/// refuses to apply it to any other.
+///
+/// Deliberately not folded into [`Level3Response`]. That one is keyed by AWIPS
+/// code alone and is fetched "latest": it feeds products that *draw* an object,
+/// where the newest is the right answer. This object is never drawn and the
+/// newest is emphatically not the right answer.
+pub struct MeltingLayerResponse {
+    pub generation: u64,
+    pub site: String,
+    /// The Level II volume start the object was paired against, and the only
+    /// volume it may be applied to. Echoed from the request rather than read
+    /// back off the pane, which may have moved on while the fetch was in the
+    /// air — the same discipline [`LoopL3FetchResponse::timestamp`] keeps.
+    pub volume_start: NaiveDateTime,
+    /// The object's bytes, or `None` when the site generated no `N0M` for that
+    /// volume. An ordinary gap, not a failure: the classification falls to the
+    /// next rung of `rustdar_radar::hca::resolve_melting_layer` and says so on
+    /// screen.
+    pub object: Option<Arc<Vec<u8>>>,
+}
+
 /// The network site catalogue, once the launch's one refresh has landed.
 ///
 /// It exists to be **written to the cache**, not applied: the table was
@@ -511,6 +560,8 @@ pub struct ChannelHub {
     pub chunk_receiver: Receiver<ChunkResponse>,
     pub sounding_sender: Sender<SoundingResponse>,
     pub sounding_receiver: Receiver<SoundingResponse>,
+    pub melting_layer_sender: Sender<MeltingLayerResponse>,
+    pub melting_layer_receiver: Receiver<MeltingLayerResponse>,
     pub site_catalogue_sender: Sender<SiteCatalogueResponse>,
     pub site_catalogue_receiver: Receiver<SiteCatalogueResponse>,
 }
@@ -537,6 +588,7 @@ impl ChannelHub {
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
         let (loop_section_sender, loop_section_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
+        let (melting_layer_sender, melting_layer_receiver) = std::sync::mpsc::channel();
         let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
         let (site_catalogue_sender, site_catalogue_receiver) = std::sync::mpsc::channel();
 
@@ -571,6 +623,8 @@ impl ChannelHub {
             chunk_receiver,
             sounding_sender,
             sounding_receiver,
+            melting_layer_sender,
+            melting_layer_receiver,
             site_catalogue_sender,
             site_catalogue_receiver,
         }

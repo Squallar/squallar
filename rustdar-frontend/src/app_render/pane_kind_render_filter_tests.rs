@@ -94,6 +94,7 @@ fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }
 
@@ -128,6 +129,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
                 max_range_km: 230.0,
                 value_data: Arc::new(Vec::new()),
                 nyquist_ms: None,
+                melting_layer_source: None,
             }),
             product: PRODUCT,
             elevation: TILT,
@@ -628,6 +630,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
                 image: Some(loop_frame_pixels()),
                 max_range_km: 230.0,
                 nyquist_ms: None,
+                melting_layer_source: None,
             })
             .expect("the receiver lives on the App");
         app.poll_loop_render_results(&egui::Context::default());
