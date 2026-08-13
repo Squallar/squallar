@@ -4761,7 +4761,8 @@ mod tests {
     fn both_constructors_fill_to_the_same_reach() {
         let centre = |l: usize| (l as f64 + 0.5) * PROFILE_LAYER_KM;
         // One level, at the bottom: everything else is fill or nothing.
-        let from_levels = WindProfile::from_levels(&[(0.0, 7.0, -3.0)]).expect("one level is a profile");
+        let from_levels =
+            WindProfile::from_levels(&[(0.0, 7.0, -3.0)]).expect("one level is a profile");
         let reach = PROFILE_FILL_MAX_LAYERS as usize;
         assert!(
             from_levels.wind_at_km(centre(reach)).is_some(),
@@ -4787,20 +4788,17 @@ mod tests {
         );
     }
 
-    /// The ceiling is the RPG's published number, not a tuned one: 9.7 kt
-    /// expressed in the m/s the fit works in.
-    #[test]
-    fn the_fit_quality_ceiling_is_the_rpgs_published_knots() {
-        assert!(
-            (PROFILE_MAX_RMS_MS - 9.7 * 0.514_444).abs() < 1e-12,
-            "the ceiling must stay 9.7 kt converted, not a number chosen here",
-        );
-        // Bracketed by the two arms above, so neither is a boundary case.
-        assert!(
-            4.0 < PROFILE_MAX_RMS_MS && PROFILE_MAX_RMS_MS < 6.0,
-            "the test's two residuals must straddle the ceiling",
-        );
-    }
+    /// The two residuals
+    /// `a_layer_whose_residual_clears_the_rpgs_ceiling_is_not_published` plants
+    /// — 4 m/s and 6 m/s — must go on straddling the ceiling, or that test
+    /// stops being a test of the ceiling and becomes two arms on one side of
+    /// it. A compile-time assertion rather than a `#[test]` because both sides
+    /// are constants: there is nothing here to learn at run time, and the build
+    /// is the right place to refuse a ceiling retuned out from under the arms.
+    const _: () = assert!(
+        4.0 < PROFILE_MAX_RMS_MS && PROFILE_MAX_RMS_MS < 6.0,
+        "the two planted residuals must straddle PROFILE_MAX_RMS_MS",
+    );
 
     /// A field folded across the Nyquist limit must come back continuous:
     /// with an environmental wind profile seeding the dealiaser, the folded

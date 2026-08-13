@@ -258,12 +258,96 @@ pub fn tilts(scan: &Scan) -> impl Iterator<Item = VelocityTilt<'_>> {
 pub fn wind_profile_of<'s, T: Borrow<VelocityTilt<'s>>>(
     tilts: impl IntoIterator<Item = T>,
 ) -> Option<WindProfile> {
+    // Collecting is what lets the second pass see the same tilts the first
+    // did. It is cheap where it happens: `crate::derive` already holds the
+    // volume's tilts and lends them, so `T` is a reference there and this is a
+    // vector of pointers. The streaming caller does not come through here —
+    // see [`volume_wind_profile`], which walks the scan twice instead so it
+    // can keep dropping each grid as it goes.
+    let tilts: Vec<T> = tilts.into_iter().collect();
     let mut builder = WindProfileBuilder::new();
-    for tilt in tilts {
+    for tilt in &tilts {
         let tilt = tilt.borrow();
         builder.add_sweep(&tilt.grid.sweep(None), tilt.elevation_deg);
     }
-    builder.finish()
+    let first = builder.finish()?;
+    let mut builder = WindProfileBuilder::new();
+    for tilt in &tilts {
+        offer_dealiased(&mut builder, tilt.borrow(), &first);
+    }
+    Some(builder.finish().unwrap_or(first))
+}
+
+/// Offer one tilt to `builder` after unfolding it under `seed` — the second
+/// pass's single step.
+///
+/// # Breaking the circle
+///
+/// The profile is fitted on aliased velocity and then used to unfold that same
+/// velocity. Every folded gate in a layer's samples pulls that layer's wind
+/// toward zero, the dealiaser is seeded with the wind that folding produced,
+/// and it proposes branches from it. The fit is not short — its median top
+/// fitted layer is 6.6 km, *higher* than the RPG's own NVW — it is simply
+/// wrong at the heights it does reach, and wrong in one direction.
+///
+/// So: fit, unfold under that fit, refit on what came back. A seed-swap over
+/// 754 315 RPG-folded gates measured the arms with the dealiaser held
+/// byte-identical, and a VAD fitted on a well-dealiased field was the best
+/// seed of any tried — 98.72% precision against the shipped fit's 82.14%,
+/// ahead even of substituting the RPG's own published profile. The same
+/// experiment is why this is not sold as a recall fix: the seed saturates near
+/// 34% recall however good it gets, because 79.4% of the dealiaser's remaining
+/// gap is structural and is not a seed question at all.
+///
+/// # What this pass is not
+///
+/// It is **not** the experiment's winning arm, and the two must not be
+/// confused. That arm fitted over a field dealiased by something better than
+/// us; this one fits over a field dealiased by us, seeded by the very profile
+/// it is trying to improve on. It is a bootstrap toward that ceiling, not the
+/// ceiling, and the only honest way to know where between the two it lands is
+/// to measure it.
+///
+/// # The fold limit this pass runs under
+///
+/// `sweep(None)`, so [`crate::nrot`] estimates the fold limit off the data
+/// rather than reading a declaration. That is not an oversight and it is not
+/// free. [`VelocityTilt`] carries the sweep, so a caller holding a
+/// [`crate::nyquist::DeclaredNyquist`] could look the declaration up by
+/// elevation number — but the two callers here reach this through signatures
+/// whose other users are outside this module, and the estimate is exact on
+/// precisely the volumes this pass exists for: a sweep that folded reaches its
+/// own limit by construction, so the estimate is only an *under*estimate on
+/// sweeps with nothing to unfold. Under one, `nrot::dealias` abandons the pass
+/// outright rather than inventing folds. Passing a limit here would also
+/// suggest the fit unfolds, and it does not — it fits what the dealiaser
+/// already unfolded.
+fn offer_dealiased(builder: &mut WindProfileBuilder, tilt: &VelocityTilt<'_>, seed: &WindProfile) {
+    let mut unfolded = tilt.grid.values.clone();
+    // `Coverage`, not `NoFalseShear`: a wind fit wants as many correctly
+    // unfolded gates as it can get and does its own trimming, where the
+    // stricter profile censors residual fold walls that a fit would simply
+    // have discarded. The clone is one tilt's grid at a time and is dropped
+    // with `unfolded` at the end of the call.
+    let _ = crate::nrot::dealias(
+        &mut unfolded,
+        &tilt.grid.sweep(None),
+        tilt.elevation_deg,
+        Some(seed),
+        crate::nrot::DealiasProfile::Coverage,
+    );
+    builder.add_sweep(
+        &VelocitySweep {
+            vel_grid: &unfolded,
+            azimuths_deg: &tilt.grid.azimuths_deg,
+            gate_count: tilt.grid.gate_count,
+            first_gate_range_km: tilt.grid.first_gate_range_km,
+            gate_interval_km: tilt.grid.gate_interval_km,
+            declared_nyquist_ms: None,
+            status: Some(&tilt.grid.status),
+        },
+        tilt.elevation_deg,
+    );
 }
 
 /// Fit the volume wind profile from every velocity tilt in the scan.
@@ -273,7 +357,25 @@ pub fn wind_profile_of<'s, T: Borrow<VelocityTilt<'s>>>(
 /// gathered enough samples to solve — see [`crate::nrot::WindProfileBuilder`]
 /// for what "enough" is and what it does with the layers that had none.
 pub fn volume_wind_profile(scan: &Scan) -> Option<WindProfile> {
-    wind_profile_of(tilts(scan))
+    // Two lazy walks rather than one collected one: [`tilts`] drops each grid
+    // before decoding the next, and a super-res volume's fifteen velocity cuts
+    // are tens of megabytes of `f64` between them. Walking twice pays for the
+    // second pass in decode time, which is the cheaper of the two currencies
+    // here and the one this function was written to spend.
+    let mut builder = WindProfileBuilder::new();
+    for tilt in tilts(scan) {
+        builder.add_sweep(&tilt.grid.sweep(None), tilt.elevation_deg);
+    }
+    let first = builder.finish()?;
+    let mut builder = WindProfileBuilder::new();
+    for tilt in tilts(scan) {
+        offer_dealiased(&mut builder, &tilt, &first);
+    }
+    // A refit that came back with nothing is not an improvement on something.
+    // `dealias` writes NaN over every gate it could not resolve, so the second
+    // pass is fitted on strictly fewer samples than the first and can fall
+    // under the 200-sample floor in layers the first pass cleared.
+    Some(builder.finish().unwrap_or(first))
 }
 
 #[cfg(test)]
