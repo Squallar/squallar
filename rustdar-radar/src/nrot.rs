@@ -358,6 +358,23 @@ pub struct VelocitySweep<'a> {
     /// disagree about where a sweep folds disagree about which of its gates are
     /// one datum.
     pub declared_nyquist_ms: Option<f64>,
+    /// Why each cell of [`vel_grid`](Self::vel_grid) is `NaN`, at the same
+    /// `(radial, gate)` indices — [`crate::velocity::VelocityGrid::status`],
+    /// borrowed.
+    ///
+    /// `None` is not "unknown". It says **this sweep has no report plane**,
+    /// which is true of exactly one kind of sweep: a grid built in a test or a
+    /// probe out of numbers rather than decoded out of a volume. Such a grid
+    /// has no below-threshold gates and no range-folded ones to have flattened,
+    /// so the finiteness of a cell *is* the whole of what it reports, and the
+    /// one reader below falls back to finiteness. Every decoded path carries
+    /// `Some`; `velocity_grid_sweeps_carry_the_report_plane` pins that.
+    ///
+    /// Read by [`median_filter`]'s raw-occupancy cliff and by nothing else yet.
+    /// The other candidates [`crate::velocity::VelocityGrid::status`] names —
+    /// the dealiaser's coverage rules, `tap_stencil`'s intact-tap demand — each
+    /// move painted pixels and want their own measurement.
+    pub status: Option<&'a [Vec<crate::types::GateReport>]>,
 }
 
 /// How this sweep's rows sit in azimuth: the step every stencil's
@@ -502,6 +519,7 @@ fn preprocess_velocity_with(
     let med = median_filter(
         &vel,
         sweep.vel_grid,
+        sweep.status,
         sweep.gate_count,
         sweep.first_gate_range_km,
         sweep.gate_interval_km,
@@ -932,12 +950,77 @@ const MEDIAN_AZ_HALF_MAX: i32 = 2;
 /// campaign's harness and not the hovering it did.
 const MEDIAN_RNG_HALF: i32 = 2;
 
-/// Minimum RAW-data fraction of the median window for a valid centre to
-/// survive: the reference NDs under-populated windows, cleaning sparse fold
-/// soup the raw-default dealias rule re-admits. The fraction is empirical,
-/// and like the rest of the median geometry it was fitted against readings
-/// the campaign scratchpad did not outlive: branch `campaign-harness` says
-/// how this was measured, never what came back.
+/// Minimum fraction of the median window that must carry **echo** — a gate the
+/// radar returned a number for — for a valid centre to survive: the reference
+/// NDs under-populated windows, cleaning sparse fold soup the raw-default
+/// dealias rule re-admits. The fraction is empirical, and like the rest of the
+/// median geometry it was fitted against readings the campaign scratchpad did
+/// not outlive: branch `campaign-harness` says how this was measured, never
+/// what came back.
+///
+/// # It is not a coverage rule, and the census is why
+///
+/// This constant used to be documented as asking whether the radar *sampled*
+/// that sky — "censored fold walls carry raw data and must not deplete the
+/// window, only genuinely missing samples do". It never asked that. Its key
+/// was the finiteness of a raw cell, and until [`crate::types::GateReport`]
+/// existed a `NaN` there meant three different things, so a below-threshold
+/// gate — the radar looking at that sky and finding no scatterers — counted as
+/// *not sampled*, which is the opposite of what the sentence claims.
+///
+/// The sentence is not merely wrong, it is **unachievable**. Over the
+/// 7.05–20 nm annulus the reference comparison scores, on the lowest Doppler
+/// cut of all nine of that comparison's volumes,
+/// [`GateReport::NotReported`](crate::types::GateReport::NotReported) is
+/// **0.0000%** of the annulus — every cell, at every site, was sampled — while
+/// [`BelowThreshold`](crate::types::GateReport::BelowThreshold) runs 0.57%
+/// (KCRP) to 85.72% (KLOT). So a rule keyed on "did the radar look" is keyed
+/// on a constant: re-keyed on
+/// [`is_measured`](crate::types::GateReport::is_measured), the window's
+/// occupancy is `slots`/`slots` at every centre of every one of those nine
+/// volumes, and the cliff is not a cliff but a deletion. That was measured, not
+/// argued: NROT grids taken with the re-keyed fraction at 0.0, at 0.6 and at
+/// 1.00 are byte-identical to each other at all nine sites, and differ from
+/// this tree at seven of them.
+///
+/// What the deletion costs is why the key stayed on echo, and the number that
+/// decides it is the **marginal** precision — of the bins an arm *adds*, how
+/// many the reference also paints. Overall precision can rise on a change whose
+/// every new bin is wrong, so the aggregate is not the test. Against the
+/// decoded reference, over the eight deciding sites, the re-key adds 70 bins
+/// and loses none, and 19 of the 70 agree: **0.271**, against the **0.726** the
+/// field already stands at. Per site it is 0.125 at KTLX, 0.152 at KDMX, 0.684
+/// at KFTG and **0.000** at KATX, where all ten added bins are ones the
+/// reference reads ND at. The holdout says the same and is the only site that
+/// also loses a bin: 109 added, 1 lost, marginal 0.303. So overall precision
+/// falls everywhere anything moves — KTLX 0.4451→0.4436, KDMX 0.7619→0.7483,
+/// KFTG 0.8394→0.8362, KATX 0.9211→0.9019, KDDC 0.7913→0.7728 — and mean |Δ|
+/// on agreeing bins improves nowhere. The one middle key that is neither
+/// vacuous nor the shipped one — counting
+/// [`RangeFolded`](crate::types::GateReport::RangeFolded) as echo, on the
+/// argument that ambiguous range is still signal — is the same trade smaller
+/// and no better shaped: +24 bins, marginal 0.500, still 0.000 at KATX, and
+/// KFTG's mean |Δ| rises 0.058→0.060.
+///
+/// # KHNX is not a control for this rule
+///
+/// The reference's KHNX paint is adjudicated spurious and this module's zero
+/// there is correct, which makes "does an arm start painting at KHNX" a
+/// tempting red flag to watch. It cannot fire here. The cliff *is* live at
+/// KHNX — it refuses 1098 of that cut's 62 272 dealiased annulus cells, and
+/// re-keying releases 973 of them — but **100% of KHNX's median cells lie on
+/// ground [`incoherent_velocity`] has already set aside**, at both keyings, so
+/// [`llsd_nrot`] carries 0 cells there whatever this gate decides. Its zero is
+/// held by the incoherence mask, upstream of anything this constant can move. A
+/// control that cannot fail is not a control; the holdout and the per-site
+/// marginal precisions above are what decided this.
+///
+/// So the rule is an **echo-coverage** rule and always was: a window three
+/// fifths empty sky is a filament of weather, and a median along a filament is
+/// a median of whatever the filament threads between. The key now says so, on
+/// the plane, by naming [`Value`](crate::types::GateReport::Value) — which is
+/// the arm the finiteness test always selected, so this is the same number at
+/// the same operating point, and the grids above pin that at all nine sites.
 const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 
 /// Minimum fraction of the median window that must still **carry a dealiased
@@ -1031,6 +1114,49 @@ const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 /// and anchor there, so the ramp the operator reads gets steeper, not flatter.
 /// The branch is a property of the neighbourhood and a per-bin estimator cannot
 /// choose it. Refusing the window is what is left.
+///
+/// # Its key is loose, and the loose part is not a missing channel
+///
+/// [`MEDIAN_MIN_RAW_OCC`] records a rule whose key did not match its sentence.
+/// This one has the same shape of gap and a different cause, so it is worth
+/// stating exactly. The sentence above is about the **censor**: what is left
+/// when the censor has taken most of the window is the censor's leftovers. The
+/// key is `window.len()` — cells carrying a dealiased value — and that counts
+/// two removals as one. A cell can be absent from the dealiased field because
+/// the censor cut it, or because the radar found no echo there and it was never
+/// in the raw sweep either.
+///
+/// Over the same annulus and the same nine cuts, of the window cells this rule
+/// does not count, the fraction that never carried echo — nothing to do with
+/// the censor — is 45.7% at KCRP, 75.2% at KTLX, 76.6% at KDMX, 85.0% at KDDC,
+/// 89.7% at KLOT, 90.8% at KATX, 94.1% at KFTG, 98.2% at KMSX and **100%** at
+/// KHNX, where the censor removes nothing at all. Keyed on the censor alone —
+/// refuse where the censor has taken more than 1 − 0.37 of the window — the
+/// rule would fire on **none** of the centres it currently fires on at seven of
+/// the nine sites, on 2 of 107 at KDMX and 2 of 10 at KATX, and on 71 of 76 at
+/// KCRP. Which is to say: it does the work its sentence describes at the one
+/// site the sentence was written from, and everywhere else it is a second, much
+/// stricter echo-coverage rule standing behind [`MEDIAN_MIN_RAW_OCC`].
+///
+/// **It is not a claim rule.** It does not mean "a pass placed this gate on a
+/// branch", and it must not be re-keyed to mean that: `dealias` never writes a
+/// value into a gate the raw sweep left empty — 0 such cells in the annulus at
+/// all nine sites — so the cells it counts are exactly the raw cells the censor
+/// spared, and placement is a different fact about them. A key on placement
+/// would be vacuous where it matters most: over that annulus the dealiaser
+/// moves 0 gates at KHNX and 0 at KMSX, 7 at KDDC, 8 at KLOT, 41 at KATX and
+/// 57 at KDMX, against 18 559 at KCRP — the same kind of near-constant
+/// statistic that made re-keying [`MEDIAN_MIN_RAW_OCC`] a deletion. (And a
+/// *moved value* is itself only a proxy for a placement: a pass that puts a
+/// gate on branch 0 leaves the number where it found it.)
+///
+/// So a `DealiasClaims` channel is **not** justified by this rule, and the
+/// separation the rule actually wants needs no channel at all: a cell the
+/// censor took is a cell whose raw value is finite and whose dealiased value is
+/// not, which both grids in [`median_filter`]'s hand already say. Splitting the
+/// key that way moves painted pixels — it would stop the rule firing on 284 of
+/// the 359 centres it fires on across the nine cuts — so it is a measurement of
+/// its own and not a comment change.
 const MEDIAN_MIN_DEALIASED_OCC: f64 = 0.37;
 
 /// The coverage rule this filter is often blamed for costs nothing where it is
@@ -1102,6 +1228,7 @@ const MEDIAN_MIN_DEALIASED_OCC: f64 = 0.37;
 fn median_filter(
     vel_grid: &[Vec<f64>],
     raw_grid: &[Vec<f64>],
+    raw_status: Option<&[Vec<crate::types::GateReport>]>,
     gate_count: usize,
     first_gate_range_km: f64,
     gate_interval_km: f64,
@@ -1143,7 +1270,18 @@ fn median_filter(
                                 continue;
                             }
                             slots += 1;
-                            if !raw_grid[ai][rj as usize].is_nan() {
+                            // **Echo**, asked of the report plane by name.
+                            // `GateReport::Value` — not `is_measured()`, which
+                            // is the same question the comment below used to
+                            // claim to ask and which [`MEDIAN_MIN_RAW_OCC`]
+                            // records as measurably vacuous here. The `None`
+                            // arm is a sweep with no plane, where finiteness is
+                            // the same predicate rather than a weaker one.
+                            let carries_echo = match raw_status {
+                                Some(st) => st[ai][rj as usize] == crate::types::GateReport::Value,
+                                None => !raw_grid[ai][rj as usize].is_nan(),
+                            };
+                            if carries_echo {
                                 raw_occ += 1;
                             }
                             let v = vel_grid[ai][rj as usize];
@@ -1152,9 +1290,12 @@ fn median_filter(
                             }
                         }
                     }
-                    // The sparsity cliff tests RAW data occupancy: censored
-                    // fold walls carry raw data and must not deplete the
-                    // window, only genuinely missing samples do.
+                    // The sparsity cliff tests how much of the window carries
+                    // echo: a censored fold wall still returned a number and
+                    // must not deplete a window the weather filled. It does
+                    // *not* test whether the radar sampled here — nothing in
+                    // this annulus goes unsampled, and [`MEDIAN_MIN_RAW_OCC`]
+                    // carries the census and what asking that instead costs.
                     if (raw_occ as f64) < MEDIAN_MIN_RAW_OCC * slots as f64 {
                         return f64::NAN;
                     }
@@ -4128,6 +4269,7 @@ mod tests {
             first_gate_range_km: 2.125,
             gate_interval_km: 0.25,
             declared_nyquist_ms: None,
+            status: None,
         }
     }
 
@@ -4143,6 +4285,7 @@ mod tests {
             first_gate_range_km: 0.25,
             gate_interval_km: 0.25,
             declared_nyquist_ms: None,
+            status: None,
         }
     }
 
@@ -4170,6 +4313,7 @@ mod tests {
             first_gate_range_km: 1.0,
             gate_interval_km: 1.0,
             declared_nyquist_ms: None,
+            status: None,
         }
     }
 
@@ -4311,6 +4455,7 @@ mod tests {
                     first_gate_range_km: 0.05,
                     gate_interval_km: 0.05,
                     declared_nyquist_ms: None,
+                    status: None,
                 },
                 0.5,
             );
@@ -4459,6 +4604,7 @@ mod tests {
             // No declaration: this fixture's expectations were measured against
             // the estimator, which is what an undeclared sweep still reaches.
             declared_nyquist_ms: None,
+            status: None,
         };
         dealias(&mut grid, &sw, 0.5, Some(&wp), DealiasProfile::NoFalseShear);
 
@@ -4891,6 +5037,7 @@ mod tests {
             first_gate_range_km: 2.125,
             gate_interval_km: 0.5,
             declared_nyquist_ms: Some(STRADDLE_VNY),
+            status: None,
         };
         let rows = sweep_rows(&coarse_sweep, n);
         let refused = |grid: &[Vec<f64>], gc: usize, gi: f64| {
@@ -5042,6 +5189,7 @@ mod tests {
             first_gate_range_km: 2.125,
             gate_interval_km: 0.25,
             declared_nyquist_ms: Some(STRADDLE_VNY),
+            status: None,
         }
     }
 
@@ -5607,7 +5755,7 @@ mod tests {
         let mut grid: Vec<Vec<f64>> = vec![vec![10.0; gates]; n];
         grid[20][20] = 90.0;
         let azs = ring_azimuths(n);
-        let filtered = median_filter(&grid, &grid, gates, 0.25, 0.25, rows_for(&azs, n));
+        let filtered = median_filter(&grid, &grid, None, gates, 0.25, 0.25, rows_for(&azs, n));
         assert_eq!(filtered[20][20], 10.0);
         assert_eq!(filtered[10][10], 10.0);
     }
@@ -5647,7 +5795,7 @@ mod tests {
         // 0.5 km first gate and 0.5 km gates put az_half at its cap of 2, so
         // the window is the 5 × 5 the reading above was taken over.
         let rows = rows_for(&azs, n);
-        let filtered = median_filter(&deal, &raw, gates, 0.5, 0.5, rows);
+        let filtered = median_filter(&deal, &raw, None, gates, 0.5, 0.5, rows);
         assert_eq!(deal[20][20], 30.0, "the centre carries a dealiased value");
         assert!(
             filtered[20][20].is_nan(),
@@ -5659,8 +5807,138 @@ mod tests {
         // floor the raw cliff has always allowed.
         let full: Vec<Vec<f64>> = vec![vec![30.0; gates]; n];
         assert_eq!(
-            median_filter(&full, &raw, gates, 0.5, 0.5, rows)[20][20],
+            median_filter(&full, &raw, None, gates, 0.5, 0.5, rows)[20][20],
             30.0
+        );
+    }
+
+    /// [`MEDIAN_MIN_RAW_OCC`] counts **echo**, and a below-threshold gate is
+    /// not echo however plainly the radar looked at it.
+    ///
+    /// Non-circular by construction: nothing here states what the window's
+    /// occupancy is. The bytes are the input, `nexrad_model`'s decoder is what
+    /// turns raw 0 into [`GateReport::BelowThreshold`], and the test asserts
+    /// only (a) that every cell of the window is one the radar *measured* —
+    /// so a rule keyed on [`GateReport::is_measured`] would pass all fifteen
+    /// and refuse nothing — and (b) that the filter refuses anyway. That pair
+    /// is the whole content of the constant's census, in miniature, and it is
+    /// what fails if the key is ever moved back onto illumination.
+    #[test]
+    fn the_raw_occupancy_cliff_counts_echo_and_not_illumination() {
+        use crate::types::GateReport;
+        use nexrad_model::data::{MomentData, Radial, RadialStatus};
+
+        // Velocity's own codec: raw 0 is below threshold, 1 is range folded,
+        // and 2 upward is a number.
+        const SCALE: f32 = 2.0;
+        const OFFSET: f32 = 129.0;
+        // 50 km out, 250 m gates and half a degree of spacing put az_half at
+        // its floor of 1, so the centre's window is 3 rows × 5 gates = 15.
+        const FIRST_GATE_M: u16 = 50_000;
+        const GATE_M: u16 = 250;
+        // Eight of those fifteen carry echo, seven are below threshold: 8/15 is
+        // 0.533, under MEDIAN_MIN_RAW_OCC and over MEDIAN_MIN_DEALIASED_OCC, so
+        // the raw cliff is the rule under test and the dealiased one is not.
+        let rows_bytes: [[u8; 5]; 3] = [
+            [200, 200, 200, 0, 0],
+            [200, 200, 200, 0, 0],
+            [200, 200, 0, 0, 0],
+        ];
+        let radials: Vec<Radial> = rows_bytes
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * 0.5,
+                    0.5,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    0.5,
+                    None,
+                    Some(MomentData::from_fixed_point(
+                        bytes.len() as u16,
+                        FIRST_GATE_M,
+                        GATE_M,
+                        8,
+                        SCALE,
+                        OFFSET,
+                        bytes.to_vec(),
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let grid = crate::velocity::grid(&radials).expect("the radials carry velocity");
+        let sweep = grid.sweep(None);
+        assert!(
+            sweep.status.is_some(),
+            "a decoded sweep's view carries the report plane",
+        );
+
+        // (a) Every cell the window reaches was measured — nothing here is
+        //     unsampled sky, which is the census's finding on all nine of the
+        //     reference volumes and the reason the intent-reading is vacuous.
+        for row in &grid.status {
+            for report in row {
+                assert_ne!(
+                    *report,
+                    GateReport::NotReported,
+                    "the radar reported every gate of this window",
+                );
+                assert!(report.is_measured());
+            }
+        }
+        assert!(
+            grid.status[0].contains(&GateReport::BelowThreshold),
+            "and seven of them are the decoder's measurement of emptiness",
+        );
+
+        // (b) The filter refuses the centre anyway, because five sevenths of
+        //     the window is empty sky and a median along the filament that is
+        //     left is a median of whatever the filament threads between.
+        let rows = sweep_rows(&sweep, radials.len());
+        let filtered = median_filter(
+            &grid.values,
+            &grid.values,
+            sweep.status,
+            grid.gate_count,
+            grid.first_gate_range_km,
+            grid.gate_interval_km,
+            rows,
+        );
+        assert!(
+            grid.values[1][2].is_finite(),
+            "precondition: the centre itself carries echo",
+        );
+        assert!(
+            filtered[1][2].is_nan(),
+            "8 of 15 cells carry echo, under MEDIAN_MIN_RAW_OCC; got {}",
+            filtered[1][2]
+        );
+        // And the `None` arm is the same predicate, not a weaker one: a sweep
+        // with no plane reads identically cell for cell.
+        let planeless = median_filter(
+            &grid.values,
+            &grid.values,
+            None,
+            grid.gate_count,
+            grid.first_gate_range_km,
+            grid.gate_interval_km,
+            rows,
+        );
+        assert!(
+            planeless
+                .iter()
+                .flatten()
+                .zip(filtered.iter().flatten())
+                .all(|(a, b)| (a.is_nan() && b.is_nan()) || a == b),
+            "finiteness selects the same cells GateReport::Value does",
         );
     }
 

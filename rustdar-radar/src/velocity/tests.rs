@@ -324,3 +324,52 @@ fn a_gates_status_is_the_decoders_answer_and_a_dry_radial_is_absent() {
         }
     }
 }
+
+/// The borrowed view carries the plane, so a consumer in `nrot` never has to
+/// re-derive from `values` the distinction `values` cannot hold.
+///
+/// Built from the same decoded bytes as the test above, for the same reason:
+/// what makes this worth pinning is that the sweep's plane says
+/// `BelowThreshold` at cells whose value is `NaN`, which no reader of `values`
+/// alone can recover.
+#[test]
+fn velocity_grid_sweeps_carry_the_report_plane() {
+    use crate::types::GateReport;
+
+    let bytes: Vec<u8> = vec![0, 1, 200, 2, 0];
+    let radial = Radial::new(
+        0,
+        0,
+        10.0,
+        1.0,
+        RadialStatus::IntermediateRadialData,
+        1,
+        0.5,
+        None,
+        Some(MomentData::from_fixed_point(
+            bytes.len() as u16,
+            0,
+            250,
+            8,
+            2.0,
+            129.0,
+            bytes,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let g = grid(&[radial]).expect("the radial carries velocity");
+    let view = g.sweep(None);
+    let plane = view
+        .status
+        .expect("a decoded sweep's view carries the plane");
+    assert_eq!(plane, g.status.as_slice(), "and it is the grid's own");
+    assert_eq!(plane[0][0], GateReport::BelowThreshold);
+    assert!(
+        view.vel_grid[0][0].is_nan(),
+        "which the values it sits beside cannot say",
+    );
+}

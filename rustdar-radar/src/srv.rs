@@ -197,6 +197,9 @@ pub fn dealias_grid(
         first_gate_range_km: grid.first_gate_range_km,
         gate_interval_km: grid.gate_interval_km,
         declared_nyquist_ms,
+        // The plane is the decoder's and the dealiaser does not write it, so
+        // it needs no copy: it still describes `reported` cell for cell.
+        status: Some(&grid.status),
     };
     // The mask is dropped rather than ignored: this profile sets
     // `refuse_incoherent` off, so the value is `None` and there is nothing here
