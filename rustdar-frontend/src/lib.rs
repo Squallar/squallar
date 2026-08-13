@@ -48,6 +48,7 @@ pub(crate) mod platform_double;
 pub mod render_dispatch;
 pub mod site_catalogue;
 pub mod site_positions;
+pub mod staging_ring;
 /// The radars this crate's tests run against. See the module note for why
 /// there is exactly one such list.
 #[cfg(test)]
