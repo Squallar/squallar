@@ -754,3 +754,77 @@ fn the_resident_set_survives_its_own_frames_landing() {
         "the store is not holding one grid per loop frame",
     );
 }
+
+/// **A slow radar shortens a 3D loop's frame list and leaves its span alone.**
+///
+/// The 3D loop is the one kind whose frame list *is* its resident set, so the
+/// span budget reaches its list rather than only its render set. What it must
+/// not reach is the *span*: `accept_scan_listing` samples a listing that
+/// overruns the cap instead of truncating it, so the loop still covers the
+/// whole lookback the user asked for and what a lower count costs is temporal
+/// resolution. That is exactly what the timeline caption reports — "spans 9h
+/// 45m over 9 frames, sampled from ~15 min scans" — so the oldest and the
+/// newest scan surviving is what keeps that sentence true.
+///
+/// A fifteen-minute cadence rather than a real one: the measured radars are
+/// 259 s, 360 s and 517 s, and on this build's arm none of them is slow enough
+/// to bind before the pool's own share of grids does. The property is about the
+/// ordering of the two bounds, not about any one site.
+#[test]
+fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
+    let budgets = test_budgets();
+    let step_mins = 15i64;
+    let mut ls = LoopPlaybackState::new_for_loop(10 * 3600, &site(), RenderView::Volume);
+    ls.phase = LoopPhase::Rendering;
+    let listing: Vec<_> = (0..40)
+        .map(|i| {
+            (
+                ts(0) + chrono::Duration::minutes(i * step_mins),
+                rustdar_radar::archive::Identifier::new(format!("v{i}")),
+            )
+        })
+        .collect();
+    let oldest = listing.first().expect("a listing").0;
+    let newest = listing.last().expect("a listing").0;
+
+    let wanted = budgets.frames_for_span(Some((step_mins * 60) as u32));
+    assert!(
+        wanted < test_loop_allocation().volume_frames,
+        "precondition: a {step_mins} min cadence must bind before the pool's \
+         share of {} grids, or this proves nothing",
+        test_loop_allocation().volume_frames,
+    );
+
+    accept_scan_listing(
+        test_loop_allocation(),
+        &budgets,
+        &mut ls,
+        SITE,
+        listing.clone(),
+    );
+
+    assert_eq!(
+        ls.frames.len(),
+        wanted,
+        "the span budget did not reach the 3D loop's frame list, which is the \
+         one list that is also a resident set",
+    );
+    assert_eq!(
+        ls.frames.first().map(|f| f.timestamp),
+        Some(oldest),
+        "the oldest scan went, so the caption's span is short of the lookback",
+    );
+    assert_eq!(
+        ls.frames.last().map(|f| f.timestamp),
+        Some(newest),
+        "the newest scan went, so the loop stops short of what the pane shows",
+    );
+
+    // And the plan-view loop beside it is untouched: a raster frame's history
+    // costs no texture until it is in the render set, so holding fewer would
+    // throw away resolution the span budget never paid for.
+    let mut plan = LoopPlaybackState::new_for_loop(10 * 3600, &site(), RenderView::PlanView);
+    plan.phase = LoopPhase::Rendering;
+    accept_scan_listing(test_loop_allocation(), &budgets, &mut plan, SITE, listing);
+    assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES.min(40));
+}
