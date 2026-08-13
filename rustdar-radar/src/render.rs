@@ -1252,6 +1252,62 @@ fn write_key(from: GateId) -> u32 {
 
 // ── Sweep / azimuth helpers ──────────────────────────────────────────────────
 
+/// What the plan-view render paints for one decoded gate, or `None` where it
+/// paints nothing at all.
+///
+/// **The one reading of a `MomentValue` this display makes.** The Level II fill
+/// calls it per gate, and [`crate::hover::SweepGates`] calls it again when a
+/// loop frame reads a number back out of the volume it was drawn from. Those
+/// two have to agree exactly or the readout under a looping pane prints a
+/// different number from the one the same pane printed while it was still, and
+/// nothing between them would say so.
+///
+/// The three outcomes, and why each is what it is:
+///
+///   * A value in scale is the number. `v < 999.0` is false for a NaN too, so
+///     the one test drops both the out-of-scale codes and anything that decoded
+///     to nothing.
+///   * A **range-folded** gate is a *reading*, not an absence, so it claims its
+///     pixel like any other and is coloured at output time — but it has no
+///     number, and [`RenderBuffers::into_output`] erases the sentinel from the
+///     values in the same pass that paints the colour. Callers wanting a number
+///     drop it on [`RANGE_FOLDED_BITS`] being a NaN.
+///   * **Below threshold** stays transparent: there the radar looked and found
+///     nothing above the noise, which is what an unpainted pixel already says.
+///     Painting the two alike would lay the folded-gate colour over most of a
+///     clear-air sweep.
+pub fn painted_moment_value(value: nexrad_model::data::MomentValue) -> Option<f32> {
+    use nexrad_model::data::MomentValue;
+    match value {
+        MomentValue::Value(v) if v < 999.0 => Some(v),
+        MomentValue::Value(_) => None,
+        MomentValue::RangeFolded => Some(RANGE_FOLDED_SENTINEL),
+        MomentValue::BelowThreshold => None,
+    }
+}
+
+/// Which of `scan`'s sweeps a plan-view render of `product` at
+/// `elevation_angle` would draw, by index.
+///
+/// [`find_sweep_owner`]'s answer, turned into something that can be stored: a
+/// loop frame keeps this index beside an `Arc` on the volume, and reads its
+/// readout's numbers out of that sweep for as long as the frame is on the
+/// glass. Derived from the selection rather than restating it, so a frame
+/// cannot come to read a different cut from the one it is showing.
+///
+/// By identity and not by re-running the search, which is what makes "the same
+/// sweep" a fact rather than a hope: `find_sweep_owner` prefers the newest
+/// matching cut, and two cuts of one volume can sit inside
+/// [`ELEVATION_WINDOW`] of each other on a split VCP.
+pub fn sweep_index_for(
+    scan: &Scan,
+    product: types::RadarProduct,
+    elevation_angle: f32,
+) -> Option<usize> {
+    let owner = find_sweep_owner(scan, product, elevation_angle)?;
+    scan.sweeps().iter().position(|s| std::ptr::eq(s, owner))
+}
+
 /// How near a sweep's elevation has to sit to a requested one to count as it.
 ///
 /// Read by [`find_sweep`], which explains why it is this narrow and why it can
@@ -2078,25 +2134,8 @@ pub fn render_radar_to_image_full_sized(
                                 break;
                             }
 
-                            use nexrad_model::data::MomentValue;
-                            let scaled_value = match moment_value {
-                                // `v < 999.0` is false for a NaN too, so the
-                                // one test drops both the out-of-scale codes
-                                // and anything that decoded to nothing.
-                                MomentValue::Value(v) if v < 999.0 => v,
-                                MomentValue::Value(_) => continue,
-                                // A range-folded gate is a *reading*, not an
-                                // absence, so it claims its pixel like any
-                                // other and is coloured at output time. See
-                                // [`RANGE_FOLDED_BITS`].
-                                MomentValue::RangeFolded => RANGE_FOLDED_SENTINEL,
-                                // Below threshold stays transparent: there the
-                                // radar looked and found nothing above the
-                                // noise, which is what an unpainted pixel
-                                // already says. Painting the two alike would
-                                // lay the folded-gate colour over most of a
-                                // clear-air sweep.
-                                MomentValue::BelowThreshold => continue,
+                            let Some(scaled_value) = painted_moment_value(moment_value) else {
+                                continue;
                             };
 
                             let from = GateId {

@@ -10,6 +10,7 @@ pub mod eet;
 pub mod hail;
 pub mod hca;
 pub mod hhc;
+pub mod hover;
 pub mod kdp;
 pub(crate) mod l3_values;
 pub mod level3;
