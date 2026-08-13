@@ -120,29 +120,28 @@ pub struct AppState {
     /// surface — outrank it, and they deliberately live outside this struct
     /// because a lost surface destroys this struct. See `volume::degrade`.
     pub volume_support: volume::VolumeSupport,
-    /// Whether this device's 2D textures reach
-    /// [`crate::constants::LONG_RANGE_IMAGE_SIZE`], and so whether a sweep
-    /// reaching past 230 km may be rendered at the long-range raster
-    /// size.
+    /// The largest side a static plan-view raster may have on this device.
+    ///
+    /// **A size and not a flag.** It used to be a `bool` —
+    /// `max_texture_dimension_2d >= 4096` — which is the only question the
+    /// whole raster path ever asked the device, and it threw the answer away:
+    /// whether the adapter said 4096 or 32768, the raster was 4096. This box
+    /// says 32768. [`crate::budget::Budgets::raster_side_for_adapter`] is what turns
+    /// the reading into a side, and why it does not simply believe it.
     ///
     /// Read off the device once, here, rather than probed per render: it is a
-    /// static property of the adapter and the render that would learn it the
-    /// hard way learns it by failing to create a texture, which leaves a blank
-    /// pane behind an error the latch swallows. Vulkan guarantees 4096 and iOS
-    /// Metal offers 8192, so this is `true` on every desktop and every iPhone;
-    /// the case it exists for is an Android GLES device reporting the spec
-    /// floor of 2048, where the answer is a correct picture instead of nothing.
+    /// static property of the adapter, and a render that learned it the hard
+    /// way would learn it by failing to create a texture, which leaves a blank
+    /// pane behind an error the latch swallows.
     ///
-    /// Correct, and coarser than the floor rather than equal to it: the extent
-    /// is the data's on either answer, so such a device draws a Doppler cut's
-    /// ±300.11 km at 3.4121 px/km and a surveillance cut's ±460.11 at 2.2256,
-    /// against the floor's 4.4522. `rustdar_radar::types::raster_side_px` is
-    /// where that trade is argued and measured.
-    ///
-    /// A `bool` and not the size itself, because the size belongs to the
-    /// constants and this is the one bit the *device* has to say. The dispatch
-    /// sites turn it into `JobRequest`'s `full_res`.
-    pub long_range_raster_ok: bool,
+    /// A device that reports the GLES floor of 2048 still gets a correct
+    /// picture rather than nothing, and a coarser one rather than a narrower
+    /// one: the extent is the data's whatever the ceiling, so such a device
+    /// draws a Doppler cut's ±300.11 km at 3.4121 px/km against the calibrated
+    /// 4.4522. `rustdar_radar::types::raster_side_px` is where that trade is
+    /// argued and measured. The dispatch sites carry this number into
+    /// `JobRequest`'s `side_ceiling_px`.
+    pub raster_side_ceiling_px: usize,
     max_surface_dimension: u32,
 }
 
@@ -228,18 +227,19 @@ impl AppState {
 
         // Get the maximum texture dimension - wgpu requires surface dimensions to respect this
         let max_surface_dimension = device.limits().max_texture_dimension_2d;
-        // The same figure, asked a different question: can a plan view of a
-        // long-reaching sweep become a texture on this machine at all?
-        let long_range_raster_ok =
-            max_surface_dimension as usize >= budgets.long_range_image_side_px;
-        if !long_range_raster_ok {
-            log::info!(
-                "long-range plan views degrade to {} px: this device's 2D textures stop at \
-                 {max_surface_dimension} px, under the {} px a long-range raster needs",
-                budgets.image_side_px,
-                budgets.long_range_image_side_px,
-            );
-        }
+        // The same figure, asked the question worth asking: how large a plan
+        // view may this machine hold? Not "is 4096 allowed" — that reading is
+        // what let a device offering 32768 draw the same 4096 as one offering
+        // exactly 4096. `raster_side_for_adapter` is where the halving and the
+        // no-regression floor are argued.
+        let raster_side_ceiling_px = budgets.raster_side_for_adapter(max_surface_dimension);
+        log::info!(
+            "plan views may reach {raster_side_ceiling_px} px: this device reports \
+             {max_surface_dimension} px 2D textures, and a raster is bounded by the \
+             smaller of half that, the {} px ceiling this build was measured to, and \
+             what the sweep's own gates carry",
+            budgets.raster_side_ceiling_px,
+        );
 
         // Clamp surface dimensions to the device's texture dimension limit
         let width = width.clamp(MIN_SIZE, max_surface_dimension);
@@ -269,7 +269,7 @@ impl AppState {
             egui_renderer,
             adapter,
             volume_support,
-            long_range_raster_ok,
+            raster_side_ceiling_px,
             max_surface_dimension,
         }
     }

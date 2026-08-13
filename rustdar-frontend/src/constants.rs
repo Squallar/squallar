@@ -57,31 +57,50 @@ pub const RENDER_HEIGHT: u32 = 1080;
 /// deliberate and `raster_side_px`'s doc is where it is argued and measured;
 /// what matters here is that the web class is the one that always pays it.
 ///
-/// Native's ceiling is checked against the device rather than assumed: see
-/// `AppState::long_range_raster_ok`. Vulkan guarantees 4096 and iOS Metal 8192,
-/// but the GLES 3.0 floor is 2048, so an Android handheld is the one class where
-/// the gate can fail — and it degrades to the base size, joining the browser in
-/// that same trade, which is a correct picture rather than a failed texture.
+/// # It is a floor now, not the ceiling
+///
+/// This used to *be* the answer for a device that could hold it, and it was a
+/// literal — 4096 while the box it was written on reported 32768, eight times
+/// it per axis. `budget::Budgets::raster_side_for_adapter` reads the device
+/// instead, and what
+/// this constant does there is guarantee that reading can only ever add: a
+/// device that reports at least this much still gets at least this much, so no
+/// machine that draws a 4096 raster today draws a smaller one after.
 ///
 /// # What it costs, measured
 ///
-/// A 7950X (32 threads), release, medians of 11 rasterizations of a real KDMX
-/// 0.5° cut on the existing render pool — nothing here is on the frame thread:
+/// Release, medians of 7 rasterizations of a real KDMX 0.53° cut (2022-03-05
+/// 23:23) through `rustdar_radar::render`, on an AMD Ryzen 9 7950X (32
+/// threads) — nothing here is on the frame thread:
 ///
-/// | sweep                     | side | render  | RGBA   |
-/// |---------------------------|-----:|--------:|-------:|
-/// | reflectivity, 460 km      | 2048 | 27.7 ms | 16 MiB |
-/// | reflectivity, 460 km      | 4096 | 82.4 ms | 64 MiB |
-/// | velocity, 300 km          | 2048 | 26.6 ms | 16 MiB |
-/// | velocity, 300 km          | 4096 | 81.9 ms | 64 MiB |
+/// | sweep                | side | render   | RGBA + grid |
+/// |----------------------|-----:|---------:|------------:|
+/// | reflectivity, 460 km | 2048 |   8.8 ms |      32 MiB |
+/// | reflectivity, 460 km | 4096 |  20.3 ms |     128 MiB |
+/// | reflectivity, 460 km | 8192 | 118.1 ms |     512 MiB |
+/// | velocity, 300 km     | 2048 |   9.8 ms |      32 MiB |
+/// | velocity, 300 km     | 4096 |  36.5 ms |     128 MiB |
+/// | velocity, 300 km     | 8192 | 120.7 ms |     512 MiB |
 ///
-/// Three times the wall clock for four times the pixels — the gate loop's
-/// per-sample Mercator is the cost and it parallelises, so the fourth quarter
-/// comes nearly free. Mobile has three render slots against desktop's six and
-/// no comparable pool, and is **not measured here**: no handheld was available,
-/// and a figure scaled off this machine would be a guess wearing a number.
-/// The frame thread is untouched either way; the conversion that used to land
-/// on it moved with this change (`channels::RenderedImage::image`).
+/// **These replace a table that was roughly three times higher** — 27.7 ms and
+/// 82.4 ms for the first two rows — taken on the same processor and the volume
+/// this one names. Re-measured cold, one render per process, the same two rows
+/// are 10.8 ms and 27.5 ms, so the gap is not a warm pool: the figures had gone
+/// stale. Six further sites agree with the new ones (KCRP, KFTG, KATX, KPDT,
+/// KTLX, TORD); the spread across them is 6.4–13.2 ms at 2048 and 14.6–45.0 ms
+/// at 4096.
+///
+/// The step from 4096 to 8192 is the one that is **not** linear in pixels: four
+/// times the texels for five to six times the wall clock, and the 512 MiB is
+/// host bytes on top of the same again in rasterization cells. That is what
+/// [`DESKTOP_RASTER_SIDE_CEILING`] is argued against, and why the ceiling is a
+/// figure someone measured rather than whatever the adapter reports.
+///
+/// Mobile has three render slots against desktop's six and no comparable pool,
+/// and is **not measured here**: no handheld was available, and a figure scaled
+/// off this machine would be a guess wearing a number. The frame thread is
+/// untouched either way; the conversion that used to land on it moved with an
+/// earlier change (`channels::RenderedImage::image`).
 ///
 /// The three arms are named outside the cascade for the reason
 /// [`WASM_VOLUME_GRID_CELLS`] gives.
@@ -100,6 +119,76 @@ pub const LONG_RANGE_IMAGE_SIZE: usize = MOBILE_LONG_RANGE_IMAGE_SIZE;
 /// See [`WASM_LONG_RANGE_IMAGE_SIZE`].
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const LONG_RANGE_IMAGE_SIZE: usize = DESKTOP_LONG_RANGE_IMAGE_SIZE;
+
+/// The largest side a static plan-view raster may reach on the desktop class,
+/// whatever the adapter reports.
+///
+/// **A side and not a byte budget, because the bracket it populates is a side**
+/// — `budget::BudgetLimits::raster_side_ceiling_px`, whose floor is
+/// [`DESKTOP_LONG_RANGE_IMAGE_SIZE`]. Bytes are still where it is *argued*, and
+/// [`raster_bytes`] is what states them: 8192 is 512 MiB of RGBA and value grid
+/// together, against 128 MiB at the 4096 this class ships today.
+///
+/// # Why it stops here
+///
+/// Two independent reasons that agree, which is what makes it a ceiling rather
+/// than a preference.
+///
+/// **The data stops first.** A 1832-gate surveillance cut over ±460.11 km is
+/// 2.23 texels per 0.25 km gate at 8192, and
+/// `rustdar_radar::types::data_limited_side_px` will not ask for more than the
+/// 7362 px two-texels-per-gate actually needs. So on the widest sweep a
+/// WSR-88D flies this ceiling is never reached — the data binds a doubling
+/// below it, and anything above 8192 would be sampling its own interpolation.
+///
+/// **The cost stops with it.** Measured on an AMD Ryzen 9 7950X (32 threads),
+/// release, medians of 7 rasterizations of a real KDMX 0.53° cut: the step from
+/// 4096 to 8192 is 20.3 ms to 118.1 ms — five to six times the wall clock for
+/// four times the texels, the one step in the ladder that is not linear in
+/// pixels — and takes process residency from 464 MiB to 1070 MiB, because the
+/// rasterization cells are `side² × 8` again on top of the raster itself.
+/// Doubling once more is 443 ms and 2 GiB for texels no gate can fill.
+///
+/// See [`LONG_RANGE_IMAGE_SIZE`] for the full ladder and the six further sites
+/// it was taken over.
+pub const DESKTOP_RASTER_SIDE_CEILING: usize = 8192;
+
+/// The mobile arm, pinned to what that class already renders.
+///
+/// Not a claim that a handheld cannot hold more — a modern one reports 8192 or
+/// 16384 and very likely can. It is a refusal to raise a ceiling on an
+/// unmeasured device: mobile has three render slots against desktop's six and
+/// no comparable render pool, no handheld was available, and the step this
+/// ceiling would authorise is the expensive one. `constants`' own rule is that
+/// a figure scaled off a desktop is a guess wearing a number.
+pub const MOBILE_RASTER_SIDE_CEILING: usize = MOBILE_LONG_RANGE_IMAGE_SIZE;
+
+/// The web arm, pinned to what the browser already renders.
+///
+/// The premise this used to rest on is **gone**: 2048 is what WebGL2
+/// *guarantees*, not what a browser reports, and Firefox on this project's own
+/// machine reports 32768. `budget::Budgets::raster_side_for_adapter` runs
+/// identically here and would spend a real reading if this ceiling let it.
+///
+/// What holds it is the other half of the argument, which the runtime reading
+/// does not touch. [`APP_TEXTURE_BUDGET_BYTES`] is 288 MiB for the whole
+/// application on this class, and one 4096 raster's GPU texture alone is 64 MiB
+/// of it — a fifth of the budget for one pane of one view. wasm32 is also
+/// single-threaded, so the rasterization does not fan out the way every figure
+/// on [`LONG_RANGE_IMAGE_SIZE`] was measured with, and **no browser render was
+/// measured at any side**. Raising this needs a browser on a stopwatch, not an
+/// inference from a 32-thread desktop.
+pub const WASM_RASTER_SIDE_CEILING: usize = WASM_LONG_RANGE_IMAGE_SIZE;
+
+/// Bytes one raster of `side` costs on the host: its RGBA and its `f32` value
+/// grid, four bytes each per pixel.
+///
+/// The GPU texture beside them is the RGBA half again, and the rasterization
+/// cells are another `side² × 8` while the render runs — so this is the
+/// *durable* half of a raster's cost, which is the half a budget can bound.
+pub const fn raster_bytes(side: usize) -> usize {
+    side * side * 8
+}
 
 /// The side a **loop frame** is rendered at — the whole side, not a ceiling on
 /// a long-range one: a loop of a 458 km surveillance cut draws every frame at
@@ -146,22 +235,46 @@ pub const LOOP_IMAGE_SIZE: usize = DESKTOP_LOOP_IMAGE_SIZE;
 /// if no render this build can produce has that length.
 ///
 /// Every consumer of a finished raster derives the side this way rather than
-/// naming a constant, because the side is no longer one number: a static render
-/// is [`rustdar_radar::types::IMAGE_SIZE`] or [`LONG_RANGE_IMAGE_SIZE`]
-/// depending on the sweep, and a loop frame is [`LOOP_IMAGE_SIZE`]. Deriving it
-/// keeps `offload`'s rule that a job's output carries no dimensions — the bytes
-/// are the statement — while the closed set is what keeps that from becoming
-/// "believe whatever arrived": a buffer of any other length is refused, and a
-/// refusal is a logged blank pane rather than the `ColorImage`
-/// assertion that would abort a browser tab.
+/// naming a constant, because the side is not one number: a loop frame is
+/// [`LOOP_IMAGE_SIZE`] and a static render is anywhere from
+/// [`rustdar_radar::types::IMAGE_SIZE`] up to whatever
+/// `budget::Budgets::raster_side_for_adapter` found this device good for, spent
+/// as far as the sweep's own gates justify. Deriving it keeps `offload`'s rule that a job's
+/// output carries no dimensions — the bytes are the statement.
+///
+/// # Why this is no longer a closed set
+///
+/// It used to be three constants, tried in turn. That was exactly as strong as
+/// the guard needs to be while the three were the only sides that existed, and
+/// it stopped being true the moment a side could be 7362 — a real surveillance
+/// cut on a device that reports 32768. Left as it was, every such render would
+/// have come back unrecognised and every such pane would have gone blank.
+///
+/// What replaces it keeps the property that mattered, which was never
+/// "membership of a list" but **"a length this build could plausibly have
+/// produced, checked rather than believed"**: the length must be a whole number
+/// of pixels, a perfect square, and a side between the smallest frame this
+/// build renders and the largest this build's own bracket allows. A buffer
+/// failing any of those is refused, and a refusal is a logged blank pane rather
+/// than the `ColorImage` assertion that would abort a browser tab.
+///
+/// The bound is the *bracket's* ceiling and not the resolved one, deliberately:
+/// this is a guard on bytes that arrived over a port, and it has to answer the
+/// same way whichever adapter this process happens to have met. A guard that
+/// tightened with the device would refuse a cached raster from a session on a
+/// larger one.
+///
+/// The refusals the closed set gave are all still refusals — a cross-section's
+/// `2048 × 1024` is not square, a truncated raster is not a perfect square, and
+/// a 512 px buffer is under the floor.
 pub fn raster_side_from_rgba_len(rgba_len: usize) -> Option<usize> {
-    [
-        LOOP_IMAGE_SIZE,
-        rustdar_radar::types::IMAGE_SIZE,
-        LONG_RANGE_IMAGE_SIZE,
-    ]
-    .into_iter()
-    .find(|side| side * side * 4 == rgba_len)
+    if !rgba_len.is_multiple_of(4) {
+        return None;
+    }
+    let pixels = rgba_len / 4;
+    let side = pixels.isqrt();
+    let ceiling = crate::budget::BudgetLimits::for_target().raster_side_ceiling_px;
+    (side * side == pixels && side >= LOOP_IMAGE_SIZE && side <= ceiling).then_some(side)
 }
 
 /// Maximum number of concurrent background radar renders (loop + static).
@@ -1583,16 +1696,30 @@ const _: () = const {
     assert!(DEFAULT_LOOP_SPEED_FPS <= MAX_LOOP_SPEED_FPS);
     // Eviction is what bounds the textured-frame count, so it must bind first.
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
-    // Not every render path is square any more — `xsect`'s section raster is
-    // `SECTION_WIDTH` × half of it. What every path does share is the side
-    // itself: the plan-view projection assumes it is a power of two, and that is
-    // also what makes the section's halved height exact and a power of two in
-    // its own right rather than a truncating divide. All three plan-view sides
-    // are checked, because `raster_side_from_rgba_len` will hand any of them to
-    // the same projection arithmetic.
-    assert!(rustdar_radar::types::IMAGE_SIZE.is_power_of_two());
-    assert!(LONG_RANGE_IMAGE_SIZE.is_power_of_two());
-    assert!(LOOP_IMAGE_SIZE.is_power_of_two());
+    // The plan-view side is **not** required to be a power of two, and the
+    // three sizes here being powers of two is a fact about them rather than a
+    // rule they obey. It was claimed to be a rule, twice — here and in
+    // `rustdar_radar::types::tests` — and the claim was checked and is false:
+    // `MercatorProjection` derives every field by `side_px as f64` division,
+    // the gate loop indexes `py * side_px + px`, and `queue.write_texture`
+    // repacks rows itself, so `COPY_BYTES_PER_ROW_ALIGNMENT` never applies. A
+    // 7362 px raster — a real surveillance cut on a device that reports 32768 —
+    // goes through all of it unchanged, and 7362 is not even a multiple of four.
+    // The section's halved height was the other half of the claim, and it does
+    // not depend on this at all: `SECTION_HEIGHT` comes from `SECTION_WIDTH`,
+    // its own constant, which no plan-view side reaches.
+    //
+    // What every path does still share is a floor and a ceiling, which is what
+    // `raster_side_from_rgba_len` checks a finished buffer against.
+    assert!(rustdar_radar::types::IMAGE_SIZE > 0);
+    assert!(LONG_RANGE_IMAGE_SIZE > 0);
+    assert!(LOOP_IMAGE_SIZE > 0);
+    // The ceiling has to be at least what this build already renders, or
+    // `Budgets::raster_side_for_adapter`'s bracket would be inverted — and
+    // `raster_side_from_rgba_len` would refuse the rasters this class produces.
+    assert!(WASM_RASTER_SIDE_CEILING >= WASM_LONG_RANGE_IMAGE_SIZE);
+    assert!(MOBILE_RASTER_SIDE_CEILING >= MOBILE_LONG_RANGE_IMAGE_SIZE);
+    assert!(DESKTOP_RASTER_SIDE_CEILING >= DESKTOP_LONG_RANGE_IMAGE_SIZE);
     // A ceiling under the base size is a deliberate choice (the web's loop
     // frames); one *over* the largest texture the class can hold is not a
     // choice at all, and on the web it would be every render failing to

@@ -3,12 +3,14 @@
 
 use super::*;
 
-/// The three sizes a render can come back at all convert, and each one is read
-/// at its own side rather than at a constant.
+/// Every side a render can come back at converts, and each is read at its own
+/// side rather than at a constant.
 ///
-/// The middle row is the one that used to be the only row. The others are the
-/// two ends the size cascade added: a browser's loop frame below the base size
-/// and a long-range static render above it.
+/// The third row is the one that used to be the only row. The others are the
+/// ends the size cascade added — a browser's loop frame below the base size, a
+/// long-range static render above it — and the last two are what a
+/// device-derived ceiling adds: a side that is in no constant anywhere, and is
+/// not a power of two, because a real surveillance cut asks for 7362 px.
 #[test]
 fn every_raster_size_this_build_renders_converts_at_its_own_side() {
     for (side, what) in [
@@ -17,6 +19,14 @@ fn every_raster_size_this_build_renders_converts_at_its_own_side() {
         (
             crate::constants::LONG_RANGE_IMAGE_SIZE,
             "a long-range render",
+        ),
+        (
+            crate::budget::BudgetLimits::for_target().raster_side_ceiling_px,
+            "a render at the largest side this build's bracket allows",
+        ),
+        (
+            (crate::budget::BudgetLimits::for_target().raster_side_ceiling_px * 9 / 10) | 1,
+            "an odd side no constant names",
         ),
     ] {
         let image = plan_view_image(&vec![0u8; side * side * 4])
@@ -63,26 +73,47 @@ fn a_length_no_render_produces_is_refused_rather_than_asserted_on() {
     }
 }
 
-/// The device gate decides `full_res`, and it starts closed.
+/// The device decides the ceiling, and before there is a device the answer is
+/// the size every device holds.
 ///
 /// A dispatcher exists before a device does — the frame loop returns before
 /// `dispatch_pane_renders` while `AppState` is `None`, so nothing in the
 /// shipped app dispatches through the default — and the direction the default
-/// falls in is the whole point: base size is a correct picture on any device,
-/// where a size the GPU refuses is a blank pane behind a swallowed error.
+/// falls in is the whole point: the base size is a correct picture on any
+/// device, where a size the GPU refuses is a blank pane behind a swallowed
+/// error.
+///
+/// The middle assertion is the one that used to be impossible. The ceiling was
+/// a `bool` turned back into `LONG_RANGE_IMAGE_SIZE`, so a device offering
+/// 8192 and a device offering exactly 4096 were dispatched identically; here
+/// the number the device gave is the number that comes back out.
 #[test]
-fn a_static_render_takes_the_long_range_raster_only_once_the_device_has_said_so() {
+fn a_static_render_takes_the_ceiling_the_device_reported_and_no_other() {
     let mut dispatcher = RenderDispatcher::new();
-    assert!(
-        !dispatcher.static_full_res(),
+    assert_eq!(
+        dispatcher.static_side_ceiling_px(),
+        rustdar_radar::types::IMAGE_SIZE,
         "before a device exists the answer must be the size every device holds",
     );
 
-    dispatcher.set_long_range_raster_ok(true);
-    assert!(dispatcher.static_full_res());
+    for side in [
+        rustdar_radar::types::IMAGE_SIZE,
+        crate::constants::LONG_RANGE_IMAGE_SIZE,
+        8192,
+    ] {
+        dispatcher.set_raster_side_ceiling_px(side);
+        assert_eq!(
+            dispatcher.static_side_ceiling_px(),
+            side,
+            "the dispatcher must offer what the device said, not a constant",
+        );
+    }
 
-    // And a device that reports less than the long-range side closes it again
-    // — a lost surface rebuilds `AppState`, so this is not a one-way latch.
-    dispatcher.set_long_range_raster_ok(false);
-    assert!(!dispatcher.static_full_res());
+    // And a device that reports less closes it again — a lost surface rebuilds
+    // `AppState`, so this is not a one-way latch.
+    dispatcher.set_raster_side_ceiling_px(rustdar_radar::types::IMAGE_SIZE);
+    assert_eq!(
+        dispatcher.static_side_ceiling_px(),
+        rustdar_radar::types::IMAGE_SIZE,
+    );
 }

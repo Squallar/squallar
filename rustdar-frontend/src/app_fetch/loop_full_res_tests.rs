@@ -108,13 +108,14 @@ fn sample_scan() -> nexrad_model::data::Scan {
     )
 }
 
-/// A loop frame is dispatched with `full_res` clear, and a still frame on the
-/// same app with it set.
+/// A loop frame is dispatched at the loop ceiling, and a still frame on the
+/// same app at the one the device reported.
 ///
-/// The pairing is the test. `full_res: false` alone would pass against a
-/// dispatcher that never sets it at all, which is a display that quietly lost
-/// the long-range raster; asserting both from one app says the flag is a
-/// decision the two paths make differently rather than a constant.
+/// The pairing is the test. Asserting the loop's ceiling alone would pass
+/// against a dispatcher that never reads the device at all, which is a display
+/// that quietly lost the long-range raster; asserting both from one app says
+/// the ceiling is a decision the two paths make differently rather than a
+/// constant.
 #[test]
 fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     let posted = Arc::new(Mutex::new(Vec::new()));
@@ -131,9 +132,12 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         .clone();
     app.gui.pane_mut(0).unwrap().site = SITE.to_string();
     app.render.ensure_pane_count(1);
-    // The device said yes, which is what makes the still frame's `true`
-    // meaningful — see `RenderDispatcher::set_long_range_raster_ok`.
-    app.render.set_long_range_raster_ok(true);
+    // What the device said it can hold, which is what makes the still frame's
+    // ceiling meaningful — see `RenderDispatcher::set_raster_side_ceiling_px`.
+    // Deliberately not the long-range constant: a still frame that came back at
+    // 4096 here would be reading a literal rather than this number.
+    const DEVICE_CEILING: usize = 8192;
+    app.render.set_raster_side_ceiling_px(DEVICE_CEILING);
 
     let params = || crate::render_dispatch::RenderParams {
         product: RadarProduct::Reflectivity,
@@ -185,18 +189,22 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         .collect();
 
     assert_eq!(jobs.len(), 2, "one loop frame and one still frame");
-    let full_res = |job: &JobRequest| match job {
-        JobRequest::Radar { full_res, .. } => *full_res,
+    let ceiling = |job: &JobRequest| match job {
+        JobRequest::Radar {
+            side_ceiling_px, ..
+        } => *side_ceiling_px as usize,
         other => panic!("expected a Level II render job, got {other:?}"),
     };
-    assert!(
-        !full_res(&jobs[0]),
-        "a loop frame took the long-range raster: thirty textured 4096 frames \
-         is 1.9 GiB a pane against a 512 MiB loop budget",
+    assert_eq!(
+        ceiling(&jobs[0]),
+        crate::constants::LOOP_IMAGE_SIZE,
+        "a loop frame took more than the loop ceiling: thirty textured 4096 \
+         frames is 1.9 GiB a pane against a 512 MiB loop budget",
     );
-    assert!(
-        full_res(&jobs[1]),
-        "a still frame declined the long-range raster on a device that can \
-         hold one",
+    assert_eq!(
+        ceiling(&jobs[1]),
+        DEVICE_CEILING,
+        "a still frame was dispatched at something other than what the device \
+         said it can hold",
     );
 }

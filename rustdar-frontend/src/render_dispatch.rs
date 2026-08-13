@@ -497,29 +497,30 @@ pub struct RenderDispatcher {
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
     /// across panes that display the same product at the same elevation on the same site.
     ///
-    /// Bounded by `MAX_RENDER_CACHE_ENTRIES` on an LRU policy: it is a sharing
+    /// Bounded on an LRU policy by a count **and** by bytes: it is a sharing
     /// cache for the panes on screen, not a history, and each entry costs
-    /// `side² × 8` bytes — 32 MiB at the base side and 128 MiB for a
-    /// long-range sweep on a device that can take one. See
-    /// `constants::MAX_RENDER_CACHE_ENTRIES` for why the bound stays a count
-    /// and what the resulting ceiling is.
+    /// `side² × 8` bytes — 32 MiB at the base side, 128 MiB at the long-range
+    /// one, and 414 MiB for a 7362 px surveillance cut on a device that reports
+    /// 32768. The count alone was a fair statement about memory while the side
+    /// was one of three; it is not one now, and `RenderCache::new` is where
+    /// both bounds and the byte figure they come from are argued.
     pub render_cache: RenderCache,
-    /// Whether the device this process is drawing on can hold a long-range
-    /// raster — `AppState::long_range_raster_ok`, copied here because the
-    /// dispatch sites are where it turns into a job.
-    ///
-    /// `false` until a device exists, which is the safe direction: a static
-    /// render dispatched before `ensure_rendering_state` has installed one
-    /// would be dispatched at the base size, not at a size nothing can upload.
-    /// Nothing dispatches that early in the shipped app — the frame loop
-    /// returns before `dispatch_pane_renders` while `state` is `None` — so
-    /// what actually observes the default is this crate's tests, and the base
-    /// size is what they were written against.
     /// Background radar renders that may be in flight at once — this build's
     /// `Budgets::concurrent_renders`, held rather than read from a `cfg`
     /// constant. See [`RenderDispatcher::with_budgets`].
     concurrent_renders: usize,
-    long_range_raster_ok: bool,
+    /// The largest plan-view raster the device this process is drawing on can
+    /// hold — `AppState::raster_side_ceiling_px`, copied here because the
+    /// dispatch sites are where it turns into a job.
+    ///
+    /// The **base** size until a device exists, which is the safe direction: a
+    /// static render dispatched before `ensure_rendering_state` has installed
+    /// one goes out at a size every device can upload rather than at one
+    /// nothing can. Nothing dispatches that early in the shipped app — the
+    /// frame loop returns before `dispatch_pane_renders` while `state` is
+    /// `None` — so what actually observes the default is this crate's tests,
+    /// and the base size is what they were written against.
+    raster_side_ceiling_px: usize,
     /// The storm motion override the storm-relative renders on screen were
     /// built with. Nothing else about a pane changes when the user edits the
     /// vector, so without this the field would keep the old motion until the
@@ -757,7 +758,7 @@ impl RenderDispatcher {
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             render_cache: RenderCache::new(budgets.render_cache_entries),
             concurrent_renders: budgets.concurrent_renders,
-            long_range_raster_ok: false,
+            raster_side_ceiling_px: budgets.image_side_px,
             last_storm_motion_override: None,
             section_input: None,
         }
@@ -773,23 +774,23 @@ impl RenderDispatcher {
     }
 
     /// Record what the device that has just been created can hold. See
-    /// [`long_range_raster_ok`](Self::long_range_raster_ok).
+    /// [`raster_side_ceiling_px`](Self::raster_side_ceiling_px).
     ///
     /// Called where the device is installed rather than read from there per
     /// dispatch, because the dispatcher outlives the device: a lost surface
     /// drops `AppState` and a new one is built, and a dispatcher that reached
     /// for a device would have to answer the question with no device in hand.
-    pub fn set_long_range_raster_ok(&mut self, ok: bool) {
-        self.long_range_raster_ok = ok;
+    pub fn set_raster_side_ceiling_px(&mut self, side: usize) {
+        self.raster_side_ceiling_px = side;
     }
 
-    /// Whether a **static** render dispatched now may take the long-range
-    /// raster size — the value that becomes `JobRequest`'s `full_res`.
+    /// The ceiling a **static** render dispatched now may take — the number
+    /// that becomes `JobRequest`'s `side_ceiling_px`.
     ///
-    /// Static, because a loop frame's answer is always `false` by policy; see
-    /// `offload::JobRequest::side_ceiling_px` for both halves of that byte.
-    fn static_full_res(&self) -> bool {
-        self.long_range_raster_ok
+    /// Static, because a loop frame's ceiling is `LOOP_IMAGE_SIZE` by policy;
+    /// see `offload::JobRequest::side_ceiling_px` for both callers.
+    fn static_side_ceiling_px(&self) -> usize {
+        self.raster_side_ceiling_px
     }
 
     /// Cache a fetched Level III object under the `(AWIPS code, site)` it is.
@@ -1416,7 +1417,7 @@ impl RenderDispatcher {
                     eet: std::sync::Arc::clone(&eet.bytes),
                     radar_lat: params.lat,
                     radar_lon: params.lon,
-                    full_res: self.static_full_res(),
+                    side_ceiling_px: self.static_side_ceiling_px() as u32,
                 }),
             );
             return true;
@@ -1430,7 +1431,7 @@ impl RenderDispatcher {
         let lon = params.lon;
         let product = params.product;
         // Read before `spawn_render` borrows `self` mutably.
-        let full_res_for_this_render = self.static_full_res();
+        let ceiling_for_this_render = self.static_side_ceiling_px() as u32;
 
         log::info!(
             "Spawning Level III render for pane {}: {:?}",
@@ -1453,7 +1454,7 @@ impl RenderDispatcher {
                 product,
                 radar_lat: lat,
                 radar_lon: lon,
-                full_res: full_res_for_this_render,
+                side_ceiling_px: ceiling_for_this_render,
             }),
         );
         true
@@ -1587,7 +1588,7 @@ impl RenderDispatcher {
                     values_wanted: true,
                     // And it is the one render kind that may take the
                     // long-range raster, if this device can hold one.
-                    full_res: self.static_full_res(),
+                    side_ceiling_px: self.static_side_ceiling_px() as u32,
                 })
             }
             None => crate::offload::Job::renders_nothing(),
