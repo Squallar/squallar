@@ -346,7 +346,7 @@ impl super::App {
             let render_result = crate::render_dispatch::CachedPaneRender {
                 image: rendered.image,
                 max_range_km: rendered.max_range_km,
-                value_data: rendered.value_data,
+                hover: rendered.hover,
                 product: rr.product,
                 elevation: rr.elevation,
                 nyquist_ms: rendered.nyquist_ms,
@@ -373,7 +373,7 @@ impl super::App {
                 crate::render_dispatch::CachedRenderOutput {
                     image: Arc::clone(&render_result.image),
                     max_range_km: render_result.max_range_km,
-                    value_data: Arc::clone(&render_result.value_data),
+                    hover: Arc::clone(&render_result.hover),
                     nyquist_ms: render_result.nyquist_ms,
                     melting_layer_source: render_result.melting_layer_source,
                 },
@@ -620,7 +620,7 @@ impl super::App {
             self.render.pane_render[pane_idx].cached_render = Some(CachedPaneRender {
                 image: Arc::clone(&render.image),
                 max_range_km: render.max_range_km,
-                value_data: Arc::clone(&render.value_data),
+                hover: Arc::clone(&render.hover),
                 product: render.product,
                 elevation: render.elevation,
                 nyquist_ms: render.nyquist_ms,
@@ -656,7 +656,7 @@ impl super::App {
             width: side as u32,
             height: side as u32,
             radar_meta: Some(RadarTextureMeta {
-                value_data: Arc::clone(&render.value_data),
+                hover: Arc::clone(&render.hover),
                 lat,
                 lon,
                 max_range_km: render.max_range_km,
@@ -1202,7 +1202,7 @@ impl super::App {
                         let render_result = crate::render_dispatch::CachedPaneRender {
                             image: Arc::clone(&cached.image),
                             max_range_km: cached.max_range_km,
-                            value_data: Arc::clone(&cached.value_data),
+                            hover: Arc::clone(&cached.hover),
                             product,
                             elevation,
                             nyquist_ms: cached.nyquist_ms,
@@ -1828,7 +1828,7 @@ impl super::App {
                     width: side as u32,
                     height: side as u32,
                     radar_meta: Some(RadarTextureMeta {
-                        value_data: Arc::clone(&cached.value_data),
+                        hover: Arc::clone(&cached.hover),
                         lat,
                         lon,
                         max_range_km,
@@ -2357,6 +2357,9 @@ impl super::App {
     fn poll_loop_render_results(&mut self, ctx: &egui::Context) {
         while let Ok(mut rr) = self.channels.loop_render_receiver.try_recv() {
             let origin_pane = rr.pane_idx;
+            // Resolved before the pane is borrowed, and off the *response*
+            // rather than off the pane — see `frame_gates`.
+            let gates = frame_gates(&self.loop_mgr, &rr);
 
             let Some(pane) = self.gui.pane_mut(origin_pane) else {
                 continue;
@@ -2368,7 +2371,7 @@ impl super::App {
             // retargeted away from costs no GPU memory.
             let counter = &mut self.texture_counter;
             let Some(texture) =
-                accept_render_result(&mut pane.loop_state, &mut rr, |color_image| {
+                accept_render_result(&mut pane.loop_state, &mut rr, gates, |color_image| {
                     *counter += 1;
                     // `color_image` is the only copy of this frame's pixels on this
                     // thread — the renderer's RGBA buffer was dropped on the worker —
@@ -2445,7 +2448,7 @@ impl super::App {
                     // where it sits. The receiver's own `site_lat`/`site_lon` are
                     // never consulted here — see `LoopRenderResponse::site_lat`.
                     sframe.image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(
-                        rendered_image(&rr, &texture),
+                        rendered_image(&rr, &texture, frame_gates(&self.loop_mgr, &rr)),
                     ));
                 }
             }
@@ -3822,6 +3825,7 @@ fn settle_loop_phase(
 fn rendered_image(
     rr: &crate::channels::LoopRenderResponse,
     texture: &egui::TextureHandle,
+    gates: Option<rustdar_radar::hover::SweepGates>,
 ) -> rustdar_egui::pane::RadarImageData {
     rustdar_egui::pane::RadarImageData {
         texture: texture.clone(),
@@ -3830,8 +3834,42 @@ fn rendered_image(
         max_range_km: rr.max_range_km,
         nyquist_ms: rr.nyquist_ms,
         melting_layer_source: rr.melting_layer_source,
-        value_data: Arc::new(Vec::new()),
+        // **This is what makes a hover work under a loop.** The field carries
+        // this frame's wedges and no numbers — `deliver` stripped them — and
+        // `gates` is an `Arc` on the volume it was drawn from, which the loop's
+        // download cache is holding anyway. The clone is 5.8 KiB of geometry
+        // per receiving pane, not 5.03 MiB of values.
+        //
+        // A `None` here is a frame whose volume has gone or whose product is
+        // computed rather than measured, and the readout says so rather than
+        // going blank — see `rustdar_radar::hover::Reading::NotResident`.
+        hover: Arc::new(rustdar_radar::hover::HoverSource::from_volume(
+            rr.polar.clone(),
+            gates,
+        )),
     }
+}
+
+/// The sweep a finished loop render was drawn from, for reading its numbers
+/// back out.
+///
+/// Keyed on the *render's* site and timestamp rather than on any pane's, for
+/// the reason [`crate::channels::LoopRenderResponse::site_lat`] gives: a
+/// sibling pane takes this image through the broadcast, and a receiver that
+/// looked the volume up under its own loop's site would be answering for a
+/// picture it did not draw.
+///
+/// The elevation is `snapped` and not `target.elevation` — the angle the image
+/// actually depicts, which is what the renderer resolved a sweep at. A frame
+/// read at the *selected* angle would be reading a different cut from the one
+/// on the glass wherever a scan's tilts do not line up with the selection, and
+/// a loop steps through scans that do not agree about that.
+fn frame_gates(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    rr: &crate::channels::LoopRenderResponse,
+) -> Option<rustdar_radar::hover::SweepGates> {
+    let (scan, _) = loop_mgr.get_cached(&rr.target.site, &rr.timestamp)?;
+    rustdar_radar::hover::SweepGates::new(Arc::clone(scan), rr.target.product, rr.snapped)
 }
 
 /// Place a finished loop render on the frame of `ls` that asked for it, returning
@@ -3860,6 +3898,7 @@ fn rendered_image(
 fn accept_render_result(
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     rr: &mut crate::channels::LoopRenderResponse,
+    gates: Option<rustdar_radar::hover::SweepGates>,
     upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
 ) -> Option<egui::TextureHandle> {
     let frame = ls.frame_awaiting_render_result_mut(rr.timestamp, &rr.target)?;
@@ -3872,7 +3911,7 @@ fn accept_render_result(
 
     let texture = upload(color_image);
     frame.image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(
-        rendered_image(rr, &texture),
+        rendered_image(rr, &texture, gates),
     ));
     Some(texture)
 }

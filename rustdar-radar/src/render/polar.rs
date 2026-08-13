@@ -137,7 +137,7 @@ pub struct GateAt {
 /// for a full ring — and it is the half a loop frame keeps, because a loop
 /// frame's numbers are already resident in the volume it was rendered from and
 /// copying them per frame would cost 14 × 5.03 MiB on a browser's loop.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolarGeometry {
     wedges: Vec<Wedge>,
     first_gate_km: f64,
@@ -265,7 +265,7 @@ impl PolarGeometry {
 /// [`super::RANGE_FOLDED_BITS`] where it painted a range-folded gate — the same
 /// two states the raster value grid carried, kept so that a readout derived
 /// from this prints exactly what one derived from that printed.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolarField {
     geometry: PolarGeometry,
     values: Vec<f32>,
@@ -323,6 +323,114 @@ impl PolarField {
             "a polar field is exactly radials × gates, or nothing"
         );
         Self { geometry, values }
+    }
+}
+
+impl PolarField {
+    /// The header this field's byte form opens with: three counts and two
+    /// ranges.
+    const HEADER: usize = 4 * 4 + 8 * 2;
+
+    /// This field as bytes, little-endian, for the one boundary that can only
+    /// carry buffers.
+    ///
+    /// The browser's page↔worker port is that boundary, and it is exactly the
+    /// reason this exists rather than a `serde` derive: the wire is
+    /// `postMessage`, the buffer is *transferred* rather than copied, and what
+    /// it costs is one pass to build and one to read. A full ring of a
+    /// surveillance cut is 5.03 MiB through it, where the raster grid it
+    /// replaced was 16 MiB on that target and 206.75 MiB on desktop.
+    ///
+    /// Not a general-purpose format and not versioned: the only thing that
+    /// writes it and the only thing that reads it ship in the same binary, and
+    /// `rustdar_web`'s protocol token already refuses a worker built from
+    /// different source.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let g = &self.geometry;
+        let mut out = Vec::with_capacity(Self::HEADER + g.wedges.len() * 8 + self.values.len() * 4);
+        out.extend_from_slice(&(g.wedges.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(g.gates as u32).to_le_bytes());
+        out.extend_from_slice(&(g.reach_gates as u32).to_le_bytes());
+        out.extend_from_slice(&(self.values.len() as u32).to_le_bytes());
+        out.extend_from_slice(&g.first_gate_km.to_le_bytes());
+        out.extend_from_slice(&g.gate_interval_km.to_le_bytes());
+        for w in &g.wedges {
+            out.extend_from_slice(&w.azimuth_deg.to_le_bytes());
+            out.extend_from_slice(&w.half_width_deg.to_le_bytes());
+        }
+        for v in &self.values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// The inverse of [`Self::to_bytes`], or `None` for anything this build did
+    /// not write.
+    ///
+    /// Every length is checked against the buffer rather than trusted, so a
+    /// truncated or foreign message answers `None` and the readout goes quiet,
+    /// which is what a message from a worker this page cannot understand should
+    /// do. The alternative is a panic on a slice index, in a browser, on a
+    /// message a user cannot see.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::HEADER {
+            return None;
+        }
+        let u32_at = |i: usize| -> usize {
+            u32::from_le_bytes(bytes[i..i + 4].try_into().expect("bounds checked")) as usize
+        };
+        let f64_at = |i: usize| -> f64 {
+            f64::from_le_bytes(bytes[i..i + 8].try_into().expect("bounds checked"))
+        };
+        let radials = u32_at(0);
+        let gates = u32_at(4);
+        let reach_gates = u32_at(8);
+        let n_values = u32_at(12);
+        let first_gate_km = f64_at(16);
+        let gate_interval_km = f64_at(24);
+
+        let wedge_bytes = radials.checked_mul(8)?;
+        let value_bytes = n_values.checked_mul(4)?;
+        if bytes.len()
+            != Self::HEADER
+                .checked_add(wedge_bytes)?
+                .checked_add(value_bytes)?
+        {
+            return None;
+        }
+        // A values buffer that is neither empty nor exactly the shape says the
+        // two halves disagree about the picture, which no reader can repair.
+        if n_values != 0 && n_values != radials.checked_mul(gates)? {
+            return None;
+        }
+
+        let mut at = Self::HEADER;
+        let mut wedges = Vec::with_capacity(radials);
+        for _ in 0..radials {
+            let f = |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().expect("checked"));
+            wedges.push(Wedge {
+                azimuth_deg: f(at),
+                half_width_deg: f(at + 4),
+            });
+            at += 8;
+        }
+        let mut values = Vec::with_capacity(n_values);
+        for _ in 0..n_values {
+            values.push(f32::from_le_bytes(
+                bytes[at..at + 4].try_into().expect("checked"),
+            ));
+            at += 4;
+        }
+        Some(Self {
+            geometry: PolarGeometry {
+                wedges,
+                first_gate_km,
+                gate_interval_km,
+                gates,
+                reach_gates,
+            },
+            values,
+        })
     }
 }
 

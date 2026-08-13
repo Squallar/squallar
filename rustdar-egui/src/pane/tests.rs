@@ -210,7 +210,7 @@ fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
         max_range_km: 100.0,
         nyquist_ms: None,
         melting_layer_source: None,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
     }
 }
 
@@ -1139,7 +1139,7 @@ fn pane_showing_render(
         width: 1,
         height: 1,
         radar_meta: Some(RadarTextureMeta {
-            value_data: Arc::new(Vec::new()),
+            hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
             lat: 35.0,
             lon: -97.0,
             max_range_km: 100.0,

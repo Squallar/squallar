@@ -346,12 +346,14 @@ pub fn plan_overlay_texture(
 
 /// Radar-specific metadata stored alongside the overlay texture.
 ///
-/// Non-radar overlays set `radar_meta: None`. Radar overlays carry hover
-/// value data, site coordinates, and the extent they were projected at, which
-/// the per-frame range ring and tooltip both place themselves from.
+/// Non-radar overlays set `radar_meta: None`. Radar overlays carry the gates
+/// a hover reads, site coordinates, and the extent they were projected at,
+/// which the per-frame range ring places itself from.
 pub struct RadarTextureMeta {
-    /// Per-pixel values for hover tooltip lookup.
-    pub value_data: Arc<Vec<f32>>,
+    /// The gates behind these pixels, for the hover readout — see
+    /// [`rustdar_radar::hover::HoverSource`]. It replaced a `side²` `f32` grid
+    /// of the same numbers resampled up to the raster's resolution.
+    pub hover: Arc<rustdar_radar::hover::HoverSource>,
     /// Radar site latitude.
     pub lat: f64,
     /// Radar site longitude.

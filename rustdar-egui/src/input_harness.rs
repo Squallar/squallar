@@ -1598,7 +1598,7 @@ impl InputHarness {
             width: 1,
             height: 1,
             radar_meta: Some(RadarTextureMeta {
-                value_data: std::sync::Arc::new(Vec::new()),
+                hover: std::sync::Arc::new(rustdar_radar::hover::HoverSource::empty()),
                 lat,
                 lon,
                 max_range_km: extent_km,

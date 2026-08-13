@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
 use rustdar_radar::hca::MeltingLayerSource;
+use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
@@ -298,7 +299,7 @@ pub(super) fn render_pane_map_content(
                                     m.lat,
                                     m.lon,
                                     m.max_range_km,
-                                    std::sync::Arc::clone(&m.value_data),
+                                    std::sync::Arc::clone(&m.hover),
                                 )
                             });
 
@@ -312,16 +313,15 @@ pub(super) fn render_pane_map_content(
                         }
 
                         // Per-frame: range ring + hover value from radar metadata
-                        if let Some((lat, lon, extent_km, value_data)) = meta_snapshot {
+                        if let Some((lat, lon, extent_km, hover)) = meta_snapshot {
                             render_radar_range_ring(ui, projector, lat, lon, extent_km);
                             update_pane_hover_value_from_meta(
                                 ui,
                                 projector,
                                 &RadarHoverData {
-                                    value_data: &value_data,
+                                    hover: &hover,
                                     lat,
                                     lon,
-                                    extent_km,
                                 },
                                 ctx.pane,
                                 ctx.pane_rect,
@@ -635,22 +635,14 @@ pub(super) fn render_pane_map_content(
             .overlay_cache(OverlayKind::Radar)
             .and_then(|c| c.current.as_ref())
             .and_then(|tex| tex.radar_meta.as_ref())
-            .map(|m| {
-                (
-                    m.lat,
-                    m.lon,
-                    m.max_range_km,
-                    std::sync::Arc::clone(&m.value_data),
-                )
-            });
-        if let Some((lat, lon, extent_km, value_data)) = raw_meta {
+            .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.hover)));
+        if let Some((lat, lon, hover)) = raw_meta {
             draw_long_press_tooltip(
                 ui,
                 projector,
-                &value_data,
+                &hover,
                 lat,
                 lon,
-                extent_km,
                 touch_pos,
                 ctx.pane,
                 ctx.preferences,
@@ -659,10 +651,9 @@ pub(super) fn render_pane_map_content(
             draw_long_press_tooltip(
                 ui,
                 projector,
-                &img.value_data,
+                &img.hover,
                 img.lat,
                 img.lon,
-                img.max_range_km,
                 touch_pos,
                 ctx.pane,
                 ctx.preferences,
@@ -734,10 +725,9 @@ fn render_radar_overlay(
         ui,
         projector,
         &RadarHoverData {
-            value_data: &img.value_data,
+            hover: &img.hover,
             lat: img.lat,
             lon: img.lon,
-            extent_km: img.max_range_km,
         },
         pane,
         pane_rect,
@@ -781,15 +771,17 @@ fn render_radar_range_ring(
     );
 }
 
-/// Radar value data, site location and frame extent for hover queries.
+/// The picture's gates and the site they were measured from — what a hover
+/// query needs.
+///
+/// The extent went with the value grid. A readout used to divide the pointer's
+/// position by the rectangle the raster was drawn into, so it had to be told
+/// which frame that was; it asks the gates where a *point* is now, and a gate
+/// knows its own range.
 struct RadarHoverData<'a> {
-    value_data: &'a [f32],
+    hover: &'a HoverSource,
     lat: f64,
     lon: f64,
-    /// The half-width the value grid was projected at, km — the render's own
-    /// `max_range_km`. A hover divides the pointer's position by the frame to
-    /// pick a pixel, so it has to divide by the frame that was drawn.
-    extent_km: f64,
 }
 
 /// Update hover value using radar metadata from the overlay cache.
@@ -801,15 +793,6 @@ fn update_pane_hover_value_from_meta(
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
 ) {
-    let bounds = ImageBounds::from_radar_site(radar.lat, radar.lon, radar.extent_km);
-    let nw = projector
-        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
-        .to_pos2();
-    let se = projector
-        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
-        .to_pos2();
-    let image_rect = egui::Rect::from_two_pos(nw, se);
-
     let Some(hover_pos) = ui.ctx().pointer_hover_pos() else {
         pane.last_hover_pos = None;
         pane.hover_value = None;
@@ -843,14 +826,12 @@ fn update_pane_hover_value_from_meta(
     let map_pos = projector.unproject(screen_vec);
 
     pane.hover_value = Some(super::compute_hover_info_raw(
-        radar.value_data,
+        radar.hover,
         &super::HoverInput {
             site_lat: radar.lat,
             site_lon: radar.lon,
             hover_lat: map_pos.y(),
             hover_lon: map_pos.x(),
-            hover_pos,
-            rect: image_rect,
         },
         pane.selected_product,
         prefs,
@@ -2581,49 +2562,27 @@ const TOOLTIP_OFFSET_Y: f32 = 60.0;
 fn draw_long_press_tooltip(
     ui: &egui::Ui,
     projector: &walkers::Projector,
-    value_data: &[f32],
+    hover: &HoverSource,
     lat: f64,
     lon: f64,
-    extent_km: f64,
     touch_pos: egui::Pos2,
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
-    use rustdar_radar::types::ImageBounds;
+    // The same question the pointer readout asks, through the same two
+    // functions: where is this point from the radar, and what did the render
+    // paint there. It used to be a second copy of the pixel arithmetic, against
+    // a rectangle rebuilt here from the extent — so a finger and a mouse over
+    // one spot could disagree, and only one of them was ever looked at.
+    let map_pos = projector.unproject(egui::vec2(touch_pos.x, touch_pos.y));
+    let (azimuth, ground_km) =
+        rustdar_radar::beam::site_bearing_range_km(lat, lon, map_pos.y(), map_pos.x());
 
-    let bounds = ImageBounds::from_radar_site(lat, lon, extent_km);
-
-    let nw = projector
-        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
-        .to_pos2();
-    let se = projector
-        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
-        .to_pos2();
-    let image_rect = egui::Rect::from_two_pos(nw, se);
-
-    // Compute pixel coordinates inside the radar image, on the grid's own
-    // side — see `ui_map::value_grid_side` for why it is read off the length.
-    let mut text = String::new();
-    if let Some(side) = super::value_grid_side(value_data.len()) {
-        let frac_x = (touch_pos.x - image_rect.left()) / image_rect.width();
-        let frac_y = (touch_pos.y - image_rect.top()) / image_rect.height();
-        let px = (frac_x * side as f32) as i32;
-        let py = (frac_y * side as f32) as i32;
-
-        if px >= 0 && px < side as i32 && py >= 0 && py < side as i32 {
-            let pixel_idx = py as usize * side + px as usize;
-            if pixel_idx < value_data.len() {
-                let value = value_data[pixel_idx];
-                if !value.is_nan() {
-                    text = pane.selected_product.format_value(value, prefs);
-                }
-            }
-        }
-    }
-
-    if text.is_empty() {
-        text = "No data".into();
-    }
+    let text = match hover.read(azimuth, ground_km) {
+        Reading::Value(value) => pane.selected_product.format_value(value, prefs),
+        Reading::Unpainted => "No data".to_string(),
+        Reading::NotResident => "No value held for this frame".to_string(),
+    };
 
     // Position tooltip above the finger
     let tooltip_pos = egui::pos2(touch_pos.x, touch_pos.y - TOOLTIP_OFFSET_Y);

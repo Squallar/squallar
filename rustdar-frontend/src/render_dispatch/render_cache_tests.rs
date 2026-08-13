@@ -20,14 +20,43 @@ fn output(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
         max_range_km: range,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
     }
 }
 
-/// An entry that costs what a real raster of `side` costs: the texture and the
-/// value grid beside it, `side² × 4` each.
+/// The gates behind a raster of `side` — a full ring of 720 radials at the gate
+/// count that side implies.
+///
+/// `side` is `2 · extent / sample · TEXELS_PER_SAMPLE` across the *diameter*
+/// (see `rustdar_radar::types::data_limited_side_px`), so a radius holds
+/// `side / 4` gates: 1840 at the 7362 px a surveillance cut asks for, against
+/// the 1832 such a cut really carries.
+fn hover_field(side: usize) -> rustdar_radar::render::polar::PolarField {
+    use rustdar_radar::render::polar::{PolarField, PolarGeometry, Wedge};
+    const RADIALS: usize = 720;
+    let gates = side / 4;
+    let wedges = (0..RADIALS)
+        .map(|i| Wedge {
+            azimuth_deg: i as f32 * 0.5,
+            half_width_deg: 0.25,
+        })
+        .collect();
+    PolarField::from_parts(
+        PolarGeometry::from_parts(wedges, 0.125, 0.25, gates),
+        vec![0.0; RADIALS * gates],
+    )
+}
+
+/// An entry that costs what a real raster of `side` costs: the texture,
+/// `side² × 4`, and the gates behind it.
+///
+/// Those two used to be the same size, because the second was a `side²` `f32`
+/// grid of the first's values resampled up. It is the measurements now, so a
+/// long-range entry costs a little over half what it did and the same budget
+/// buys nearly twice as many of them — see
+/// [`a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries`].
 fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::new(
@@ -35,7 +64,9 @@ fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
             vec![egui::Color32::BLACK; side * side],
         )),
         max_range_km: range,
-        value_data: Arc::new(vec![0.0; side * side]),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::resident(hover_field(
+            side,
+        ))),
         nyquist_ms: None,
         melting_layer_source: None,
     }
@@ -519,10 +550,22 @@ fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
             held >= 1,
             "{why}: the cache evicted everything, so nothing is ever shared",
         );
+        // An entry is the texture plus the gates, and the gates are the
+        // measurements rather than a resampling of them — so the arithmetic is
+        // read off the same two buffers the cache charges for rather than
+        // written down as `side² × 8`, which is what it was when the second
+        // buffer was a second raster.
+        let entry = side * side * 4 + hover_field(side).resident_bytes();
         assert_eq!(
             held,
-            (BUDGET / (side * side * 8)).clamp(1, 12),
+            (BUDGET / entry).clamp(1, 12),
             "{why}: {held} entries of {side} px is not what the budget pays for",
+        );
+        assert!(
+            entry * 3 < side * side * 8 * 2,
+            "{why}: an entry is {entry} B against the {} B two rasters cost, \
+             which is not the saving this change was for",
+            side * side * 8,
         );
     }
 }
@@ -557,7 +600,12 @@ fn a_single_raster_over_the_whole_budget_is_still_cached() {
 #[test]
 fn the_resident_total_survives_replacement_retention_and_clearing() {
     let mut cache = RenderCache::new(usize::MAX, usize::MAX);
-    let one = 512 * 512 * 8;
+    // What one entry costs, off the same two buffers the cache charges for
+    // rather than written down. It was `512² × 8` while the second buffer was a
+    // second raster of the same side; the gates behind a raster are not that
+    // shape and never were, so a literal here would be pinning arithmetic the
+    // cache stopped doing.
+    let one = 512 * 512 * 4 + hover_field(512).resident_bytes();
 
     cache.insert(key("KTLX", 5), output_of_side(1.0, 512));
     cache.insert(key("KOUN", 5), output_of_side(2.0, 512));

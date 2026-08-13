@@ -108,7 +108,7 @@ fn plan_view_picture(ctx: &egui::Context) -> LoopFrameImage {
         max_range_km: 230.0,
         nyquist_ms: None,
         melting_layer_source: None,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
     })
 }
 

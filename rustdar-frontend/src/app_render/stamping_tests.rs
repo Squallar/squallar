@@ -69,7 +69,7 @@ fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
             &vec![0u8; side * side * 4],
         )),
         max_range_km: 230.0,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         product,
         elevation,
         nyquist_ms: None,
@@ -303,7 +303,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         )),
         // The extent that put it there: a 417 km TDWR long-range cut.
         max_range_km: 417.0,
-        value_data: std::sync::Arc::new(vec![f32::NAN; side * side]),
+        hover: std::sync::Arc::new(rustdar_radar::hover::HoverSource::empty()),
         product: PRODUCT,
         elevation: 0.5,
         // KTLX's 0.5° Doppler cut's own declaration, so the assertion below

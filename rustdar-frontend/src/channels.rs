@@ -65,7 +65,15 @@ pub struct RenderedImage {
     /// Carried this far rather than recomputed at the far end because a
     /// placement site has the site's coordinates but not the sweep.
     pub max_range_km: f64,
-    pub value_data: Arc<Vec<f32>>,
+    /// The gates behind these pixels, for the readout under the pointer — see
+    /// [`rustdar_radar::hover::HoverSource`].
+    ///
+    /// This is the field that was a `side²` `f32` raster grid: 206.75 MiB for a
+    /// surveillance cut at the ceiling this display now reaches, carried out of
+    /// the renderer so that a hover could read one number out of it. It is the
+    /// same numbers at the resolution the radar took them, about a fortieth of
+    /// the size, and the raster grid no longer leaves `rustdar-radar` at all.
+    pub hover: Arc<rustdar_radar::hover::HoverSource>,
     /// Where the drawn sweep's cut declared its velocity folds, m/s, or `None`
     /// for a raster no single cut is behind.
     ///
@@ -382,6 +390,19 @@ pub struct LoopRenderResponse {
     /// fleet constant. One number for the whole loop would caption most of its
     /// frames with another frame's provenance.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    /// Where this frame's gates are, with **no numbers behind them**.
+    ///
+    /// The half of [`rustdar_radar::render::polar::PolarField`] a loop frame
+    /// can afford: 5.8 KiB of wedges and a gate spacing, against 5.03 MiB of
+    /// values that would be 70 MiB across a browser's loop. It is what turns
+    /// the point under the pointer back into a `(radial, gate)` of the volume
+    /// this frame was rendered from, which is resident anyway for as long as
+    /// the loop lives — see [`rustdar_radar::hover::SweepGates`].
+    ///
+    /// Set on the failure path too, as an empty field, for the reason `snapped`
+    /// is set there: there is one send site, and a response with no image has
+    /// no gates either.
+    pub polar: rustdar_radar::render::polar::PolarField,
 }
 
 /// Result from cutting a single cross-section loop frame.

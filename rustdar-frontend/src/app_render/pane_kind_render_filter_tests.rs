@@ -92,7 +92,7 @@ fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
     crate::render_dispatch::CachedRenderOutput {
         image: finished_pixels(),
         max_range_km: 230.0,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
     }
@@ -127,7 +127,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
             rendered: Some(crate::channels::RenderedImage {
                 image: finished_pixels(),
                 max_range_km: 230.0,
-                value_data: Arc::new(Vec::new()),
+                hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
                 melting_layer_source: None,
             }),
@@ -631,6 +631,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
                 max_range_km: 230.0,
                 nyquist_ms: None,
                 melting_layer_source: None,
+                polar: Default::default(),
             })
             .expect("the receiver lives on the App");
         app.poll_loop_render_results(&egui::Context::default());

@@ -22,7 +22,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
                 crate::offload::RenderedFrame {
                     image: Vec::new(),
                     max_range_km: 230.0,
-                    values: Vec::new(),
+                    polar: Default::default(),
                     nyquist_ms: None,
                     melting_layer_source: None,
                 },
@@ -470,7 +470,7 @@ fn cached(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
         max_range_km: range,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
     }

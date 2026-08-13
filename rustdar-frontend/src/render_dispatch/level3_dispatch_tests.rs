@@ -368,7 +368,7 @@ fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     CachedPaneRender {
         image: Arc::new(egui::ColorImage::default()),
         max_range_km: 230.0,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         product,
         elevation,
         nyquist_ms: None,
@@ -588,7 +588,7 @@ fn output() -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
         max_range_km: 230.0,
-        value_data: Arc::new(Vec::new()),
+        hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
     }

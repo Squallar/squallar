@@ -23,7 +23,16 @@ pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
 pub const IMAGE: &str = "image";
-pub const VALUES: &str = "values";
+/// Worker → page: the gates behind the raster, as
+/// [`rustdar_radar::render::polar::PolarField::to_bytes`] writes them.
+///
+/// It carried a `Float32Array` of the `side²` raster value grid until the
+/// readout stopped reading pixels: 16 MiB on this target, transferred but still
+/// copied once into the worker's linear memory to build and once out of the
+/// page's to read. This is the same numbers at the resolution the radar took
+/// them — about 5 MiB for the widest sweep, and a few kilobytes for a loop
+/// frame, which carries geometry and no values at all.
+pub const POLAR: &str = "polar";
 pub const MAX_RANGE: &str = "range";
 /// Worker → page: where the rendered sweep's cut declared its velocity folds,
 /// m/s, or **null** for a raster with no one cut behind it.

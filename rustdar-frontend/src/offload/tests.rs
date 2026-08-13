@@ -796,7 +796,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
         Some(JobOutput::Frame(RenderedFrame {
             image: vec![0; 4],
             max_range_km: 230.0,
-            values: vec![f32::NAN],
+            polar: Default::default(),
             nyquist_ms: None,
             melting_layer_source: None,
         })),
