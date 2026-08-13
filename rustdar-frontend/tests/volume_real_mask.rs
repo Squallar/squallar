@@ -138,7 +138,7 @@ use rustdar_frontend::volume::raymarch::{FLOOR_FORMAT, VolumePipelines};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{
-    DESKTOP_SHAPE, HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels_with_motion,
+    HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels_with_motion, default_shape,
 };
 
 /// The volume reader and the site it learns, shared with the other two live
@@ -171,10 +171,11 @@ fn render_a_real_volume_mask() {
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,
-        // The desktop shape unconditionally: this harness is measuring the
-        // renderer, and the runtime ladder that can step it down is a property
-        // of the device the application happens to be on.
-        shape: DESKTOP_SHAPE,
+        // What this adapter actually builds — see `production_shape`. Naming
+        // the budget constant here is what made every figure this harness
+        // produced since `shape_for_budget` landed a measurement of a grid the
+        // application does not render.
+        shape: production_shape(),
         // The indices are all the raymarch reads, and the value plane is 32 MiB
         // at this shape.
         values_wanted: false,
@@ -579,7 +580,7 @@ fn measure_boundary_honesty_and_smoothness() {
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,
-        shape: DESKTOP_SHAPE,
+        shape: production_shape(),
         values_wanted: false,
     };
     let motion = motion_from_env(product);
@@ -902,6 +903,33 @@ fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32
 }
 
 // ── The GPU, copied from `tests/volume_gpu.rs` ───────────────────────────────
+
+/// The grid shape this machine's adapter actually builds, asked the way the
+/// application asks it.
+///
+/// **Not `DESKTOP_SHAPE`.** That constant is the *budget* — the cell count a
+/// desktop may spend — and since `shape_for_budget` landed it stopped being the
+/// shape a desktop builds. On an adapter reporting 512 or more,
+/// [`default_shape`] answers 512 × 512 × 32, so a harness naming the constant
+/// rendered **half the horizontal resolution and four times the vertical** of
+/// what ships, silently, from the moment the two meanings diverged.
+///
+/// The instrument whose job is showing what the application draws has to ask
+/// the question the application asks. Restating the answer is what went stale;
+/// the same fault has now been found three times in this directory — a
+/// hard-coded camera the app never opens with, a `km_per_texel` taken from one
+/// axis and applied to both, and this.
+fn production_shape() -> rustdar_radar::voxel::VoxelShape {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::default(),
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("no wgpu adapter; this test is ignored by default for that reason");
+    default_shape(adapter.limits().max_texture_dimension_3d as usize)
+}
 
 /// A device on whatever adapter `WGPU_BACKEND` selects — the application's own
 /// constructor.
