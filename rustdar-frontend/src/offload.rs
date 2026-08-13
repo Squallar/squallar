@@ -101,14 +101,21 @@ pub enum JobRequest {
         /// Boxed because a `RenderInput` owns its gate bytes and is the largest
         /// thing in the enum by three orders of magnitude.
         input: Box<RenderInput>,
-        /// Whether the caller wants the per-pixel value grid back.
+        /// Whether the caller wants the numbers behind the gates, or only the
+        /// geometry of where they are.
         ///
-        /// Static pane renders do — it is what a hover reads. Loop frames drop
-        /// it on arrival, and it is the same size as the texture, so returning
-        /// it would copy `LOOP_IMAGE_SIZE² × 4` bytes across a worker boundary
-        /// per frame purely to discard them.
+        /// Static pane renders want both — the numbers are what a hover reads.
+        /// A **loop frame** wants only the geometry: 5.03 MiB of values for the
+        /// widest sweep, across a loop of up to 36 frames, is not affordable and
+        /// does not have to be paid, because the volume the frame was rendered
+        /// from is resident for as long as the loop lives and the wedges are
+        /// what turn a point back into a gate of it. See
+        /// [`rustdar_radar::hover::SweepGates`].
         ///
-        /// The texture is unaffected either way; only the grid is cleared.
+        /// It used to mean the `side²` `f32` raster grid, which no longer
+        /// leaves `rustdar-radar` on any path — see [`RenderedFrame::polar`].
+        /// The geometry is kept on both settings; only the values are dropped,
+        /// and the texture is unaffected either way.
         values_wanted: bool,
         /// The largest side this render's raster may have. See
         /// [`JobRequest::side_ceiling_px`].
@@ -817,12 +824,12 @@ impl<'a> Reader<'a> {
 /// observable between calls breaks the worker equivalence this paragraph
 /// promises, because a worker does not share this process's memory.
 ///
-/// The last pair is also the one place this function *writes* to that state: the
-/// `values_wanted: false` arm below hands the grid back rather than dropping it.
-/// That is still a claim about a buffer and not about a result — what the next
-/// call receives is a re-seeded buffer, which is what it would have allocated,
-/// so a call that finds the slot full and one that finds it empty return the
-/// same bytes. Worker equivalence is untouched by it and was re-measured with
+/// The last pair is also the one place this function *writes* to that state:
+/// `From<SweepRender> for RenderedFrame` hands the raster value grid back to
+/// the renderer's slot on every path through here. That is still a claim about
+/// a buffer and not about a result — what the next call receives is a re-seeded
+/// buffer, which is what it would have allocated, so a call that finds the slot
+/// full and one that finds it empty return the same bytes. Worker equivalence is untouched by it and was re-measured with
 /// the write in place; what a worker's write reaches is that instance's own
 /// slot, in its own linear memory, which is a fact about where the win lands
 /// and not about what comes back.
