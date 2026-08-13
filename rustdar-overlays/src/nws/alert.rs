@@ -263,12 +263,54 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
     alerts
 }
 
+/// GeoJSON permits a `GeometryCollection` to contain another one. Nothing the
+/// NWS publishes nests at all — every one of the 227 collections in the zone
+/// corpus is a flat list of `Polygon` and `MultiPolygon` — so this exists only
+/// so that a hand-rolled or hostile document cannot recurse without bound.
+const MAX_GEOMETRY_NESTING: u32 = 8;
+
 /// `None` for null or unsupported geometry.
 pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<GeoPolygon>> {
+    parse_geometry_at(geom, MAX_GEOMETRY_NESTING)
+}
+
+/// The three geometry types the NWS actually serves, `depth` guarding the one
+/// that contains the other two.
+///
+/// # Why `GeometryCollection` is here
+///
+/// It was not, and the omission took whole zones off the map. A zone made of
+/// separate landmasses arrives as a `GeometryCollection` of a `Polygon` and a
+/// `MultiPolygon` rather than as one `MultiPolygon` — the shape of the source
+/// data, not an error — and the `_ =>` arm turned every one of those into
+/// `ZoneFailure::NoBoundary`. Measured against the live feed: **227 of the
+/// 11,651 published NWS zones** are collections, and they are not obscure ones.
+/// 63 are in Virginia, 50 in Florida, 48 in Maryland, 36 in North Carolina;
+/// they include the Outer Banks, the Florida Keys, Chesapeake Bay's western
+/// shore and Kauai. Two consecutive live rounds resolved 1,791 and 1,806 zones
+/// with **28 failures each, all of them this, and nothing else failing at all**.
+fn parse_geometry_at(geom: Option<&serde_json::Value>, depth: u32) -> Option<Vec<GeoPolygon>> {
     let geom = geom?.as_object()?;
     let geom_type = geom.get("type")?.as_str()?;
-    let coords = geom.get("coordinates")?;
 
+    if geom_type == "GeometryCollection" {
+        if depth == 0 {
+            log::debug!("NWS geometry nests deeper than {MAX_GEOMETRY_NESTING}; giving up");
+            return None;
+        }
+        let members = geom.get("geometries")?.as_array()?;
+        // Flattened, not kept as a tree: a collection of a Polygon and a
+        // MultiPolygon means the same thing to this renderer as the one
+        // MultiPolygon holding all of their parts.
+        let polys: Vec<GeoPolygon> = members
+            .iter()
+            .filter_map(|member| parse_geometry_at(Some(member), depth - 1))
+            .flatten()
+            .collect();
+        return if polys.is_empty() { None } else { Some(polys) };
+    }
+
+    let coords = geom.get("coordinates")?;
     match geom_type {
         "Polygon" => {
             let poly = crate::types::parse_polygon_coords(coords)?;
