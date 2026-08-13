@@ -93,6 +93,32 @@ mod round_delivery_tests {
         })
     }
 
+    /// A handler in a file nobody listed above is a handler nobody checked, so
+    /// the list is checked against this module's own `mod` lines.
+    ///
+    /// Reading `mod.rs` back out of itself rather than trusting a hand-kept
+    /// number: adding a handler means adding a `mod`, and the whole point of
+    /// this test module is that the case which reintroduces the defect is the
+    /// one written after everybody stopped looking.
+    #[test]
+    fn every_handler_module_is_on_the_delivery_list() {
+        let src = include_str!("mod.rs");
+        let declarations = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first piece")
+            .lines()
+            .filter(|line| line.starts_with("mod ") || line.starts_with("pub(crate) mod "))
+            .count();
+        assert_eq!(
+            declarations,
+            HANDLER_SOURCES.len(),
+            "a handler module is declared here and not listed in \
+             HANDLER_SOURCES, so nothing checks how it takes delivery of its \
+             round",
+        );
+    }
+
     #[test]
     fn no_handler_takes_delivery_of_its_round_by_hand() {
         let mut checked = 0;
