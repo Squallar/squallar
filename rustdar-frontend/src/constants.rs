@@ -627,11 +627,19 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` is why every row of
 /// it is at least one grid wide.
 ///
+/// Every figure below is derived and checked — `the_loop_budget_table_is_the
+/// _one_the_constants_derive` reads these rows back out of this doc comment and
+/// fails if any of them has drifted from `resident_grid_bytes`. It is here
+/// because they had: the table went on quoting a 13-frame desktop row at
+/// `36.001 MiB` for a while after the mip pyramid was charged for and the
+/// constant a hundred lines below became 12, so the prose and the code
+/// contradicted each other in the same file.
+///
 /// | target  | frames | 3D texture | resident  | headroom | share   |
 /// |---------|-------:|-----------:|----------:|---------:|--------:|
-/// | wasm32  |      8 |  4.501 MiB |  36.0 MiB | 12.0 MiB |  48 MiB |
-/// | mobile  |     12 | 15.189 MiB | 182.3 MiB | 73.7 MiB | 256 MiB |
-/// | desktop |     13 | 36.001 MiB | 468.0 MiB | 44.0 MiB | 512 MiB |
+/// | wasm32  |      8 |  4.598 MiB |  36.78 MiB | 11.22 MiB |  48 MiB |
+/// | mobile  |     12 | 15.550 MiB | 186.60 MiB | 69.40 MiB | 256 MiB |
+/// | desktop |     12 | 36.598 MiB | 439.17 MiB | 72.83 MiB | 512 MiB |
 ///
 /// # Why this is the *floor* rather than a number of its own
 ///
@@ -862,7 +870,7 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 12;
 /// without the feature still sees and what a device with one sees on a frame its
 /// ring could not serve.
 ///
-/// One per frame means a full desktop set of 13 is dispatched over 13 frames —
+/// One per frame means a full desktop set of 12 is dispatched over 12 frames —
 /// under a quarter of a second at 60 fps — and every grid that lands is shown
 /// as it lands rather than the pane blocking on the batch.
 ///
