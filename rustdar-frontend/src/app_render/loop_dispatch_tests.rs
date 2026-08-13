@@ -994,3 +994,115 @@ fn the_renderer_is_given_the_snapped_sweep_not_the_selection() {
     assert_eq!(params.lat, 35.0);
     assert_eq!(params.lon, -97.0);
 }
+
+/// **The render set is the span budget at the site's own cadence, and the
+/// same budget is the same wall clock on every radar.**
+///
+/// The three cadences the campaign of 2026-08-11 measured, against the frames
+/// each buys: a TDWR volume is 360 s on both VCP 80 and VCP 90, a WSR-88D
+/// precip volume 259 s, a WSR-88D clear-air volume 517 s. The frame counts
+/// differ by more than 2x and the wall clock does not, which is the whole
+/// point — before this the counts were equal and it was the wall clock that
+/// differed by 2x, with nothing on screen saying so.
+///
+/// Driven through [`loop_render_budget`] rather than through
+/// `Budgets::frames_for_span` directly, because the minimum with the pool's
+/// share is the part that could be dropped without any budget test noticing.
+#[test]
+fn a_loops_render_set_is_its_span_budget_at_its_own_sites_cadence() {
+    let ctx = egui::Context::default();
+    let budgets = test_budgets();
+    let allocation = test_loop_allocation();
+    let span = budgets.loop_span_secs;
+
+    for (radar, cadence) in [
+        ("TDWR VCP 80/90", 360u32),
+        ("WSR-88D precip", 259),
+        ("WSR-88D clear air", 517),
+    ] {
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        ls.scan_step_secs = Some(cadence);
+        let frames = loop_render_budget(allocation, &ls, &budgets);
+        assert!(
+            frames >= crate::constants::MIN_LOOP_FRAMES_PER_PANE,
+            "{radar}: {frames} frames is not a loop"
+        );
+        // The pool's share can bind first on a crowded screen; this is the
+        // idle allocation, so the span is what binds unless the arm ran out of
+        // frames before it ran out of budget.
+        if frames < budgets.loop_render_budget {
+            let covered = (frames - 1) * cadence as usize;
+            assert!(
+                covered <= span && covered + cadence as usize > span,
+                "{radar}: {frames} frames span {covered} s of a {span} s \
+                 budget, which is either over the cap or short of it by a \
+                 whole volume"
+            );
+        }
+    }
+}
+
+/// A loop that has not learned a cadence yet keeps the whole render budget.
+///
+/// `scan_step_secs` is `None` from `new_for_loop` until a listing is accepted,
+/// and again after a site switch, which rebuilds the state. There is no honest
+/// conversion without it, so the loop behaves exactly as it did before the span
+/// budget existed — erring the other way, by assuming the fastest radar, would
+/// make a loop visibly shed frames a second after opening.
+#[test]
+fn a_loop_that_has_not_learned_a_cadence_keeps_the_whole_budget() {
+    let ctx = egui::Context::default();
+    let budgets = test_budgets();
+    let ls = loop_on(&ctx, "KTLX", &[]);
+    assert_eq!(
+        ls.scan_step_secs, None,
+        "precondition: a freshly built loop knows nothing about its site's cadence"
+    );
+    assert_eq!(
+        loop_render_budget(test_loop_allocation(), &ls, &budgets),
+        test_loop_allocation().frames_for(ls.view),
+        "a loop with no cadence is held only by the pool's share"
+    );
+}
+
+/// **A listing teaches the loop its cadence before anything spends against it.**
+///
+/// `accept_scan_listing` writes `scan_step_secs` from the median gap of the
+/// *unsampled* listing and then computes the frame count — so the very first
+/// dispatch already has the site's own figure, and a 3D loop's frame list, which
+/// **is** its resident set, is sized by it in the same call rather than a poll
+/// later. A gap in the listing is what the median is a median for: one missing
+/// scan doubles one gap and moves nothing.
+#[test]
+fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
+    let ctx = egui::Context::default();
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    ls.phase = LoopPhase::FetchingScanList;
+    // Six-minute volumes, TDWR's own cadence, with the fourth scan missing —
+    // one gap of twelve minutes among eleven of six.
+    let scans: Vec<_> = (0..13u32)
+        .filter(|i| *i != 4)
+        .map(|i| (ts(i * 6), identifier(&format!("KTLX2024010{i}_V06"))))
+        .collect();
+
+    accept_scan_listing(
+        test_loop_allocation(),
+        &test_budgets(),
+        &mut ls,
+        "KTLX",
+        scans,
+    )
+    .expect("accepted");
+
+    assert_eq!(
+        ls.scan_step_secs,
+        Some(360),
+        "the median rides over the missing scan rather than being pulled by it"
+    );
+    let budgets = test_budgets();
+    assert_eq!(
+        budgets.frames_for_span(ls.scan_step_secs),
+        (1 + budgets.loop_span_secs / 360).min(budgets.loop_render_budget),
+        "and the count spends that figure, not the arm's ceiling"
+    );
+}
