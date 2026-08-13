@@ -2974,3 +2974,7 @@ mod tests {
         assert!(names.contains(&"ZZZX"));
     }
 }
+
+#[path = "ui_map_pane/raster_registration_tests.rs"]
+#[cfg(test)]
+mod raster_registration_tests;
