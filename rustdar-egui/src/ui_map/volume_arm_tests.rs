@@ -2664,9 +2664,11 @@ fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
 /// control that visibly does something and leaves the pane still looking at
 /// the wrong place.
 ///
-/// It used to reset the region and its source pane too. Neither exists: the
-/// box is the pane's viewport, so the way back to a wider one is to zoom the
-/// map out, and this button deliberately does not move the user's map.
+/// The reset also returns the **region** and its source pane — both to `None`,
+/// the volume's own reach — but that half of the contract is pinned where the
+/// region machinery lives, by
+/// `region_pick_tests::reset_view_returns_the_region_as_well_as_the_camera`.
+/// This test's subject is the camera half.
 #[test]
 fn the_reset_returns_the_pivot_as_well_as_the_angles_and_keeps_the_view_mode() {
     let mut volume = crate::pane::VolumePane {

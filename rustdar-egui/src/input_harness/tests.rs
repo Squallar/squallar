@@ -12533,14 +12533,14 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
         "an armed draw must not fade"
     );
     h.set_section_draw_armed(false);
-    h.set_section_draw_armed(true);
+    h.set_region_pick_armed(true);
     h.mouse_click(spot);
     h.warm_up();
     assert!(
         !h.faded() && chrome_on_screen(&h),
         "an armed region must not fade"
     );
-    h.set_section_draw_armed(false);
+    h.set_region_pick_armed(false);
 
     // A consumed click does not fade: the site icon answered it.
     h.close_layers();
@@ -12598,14 +12598,14 @@ fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
     let spot = h.pane_rects()[0].center();
     assert!(chrome_on_screen(&h), "precondition: the cluster is up");
 
-    h.set_section_draw_armed(true);
+    h.set_region_pick_armed(true);
     h.mouse_click(spot);
     h.warm_up();
     assert!(
         !h.faded() && chrome_on_screen(&h),
         "an armed region must not fade"
     );
-    h.set_section_draw_armed(false);
+    h.set_region_pick_armed(false);
 
     h.mouse_click(spot);
     h.warm_up();
