@@ -283,20 +283,9 @@ impl OverlayHandler for StormReportsHandler {
             .iter()
             .map(|i| i.clone() as Arc<dyn OverlayItem>)
             .collect();
-        let zoom = ctx.zoom;
-        let is_dark = ctx.is_dark;
-        let device_scale = ctx.device_scale;
+        let ctx = *ctx;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_storm_reports(
-                &reports,
-                &items,
-                bounds,
-                width,
-                height,
-                zoom,
-                is_dark,
-                device_scale,
-            )
+            rasterize::rasterize_storm_reports(&reports, &items, bounds, width, height, &ctx)
         }))
     }
 

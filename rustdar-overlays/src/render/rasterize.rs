@@ -525,11 +525,10 @@ pub fn rasterize_storm_reports(
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    zoom: f64,
-    is_dark: bool,
-    device_scale: f32,
+    ctx: &crate::render::overlay_state::RasterizeContext,
 ) -> RasterizeOutput {
-    let scale = sane_device_scale(device_scale);
+    let (zoom, is_dark) = (ctx.zoom, ctx.is_dark);
+    let scale = sane_device_scale(ctx.device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_storm_reports ({}×{})",

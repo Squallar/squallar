@@ -382,7 +382,19 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
         AlphaMode::Premultiplied,
     );
     assert_eq!(
-        rasterize_storm_reports(&[report_fixture()], &[], &BOUNDS, 0, 0, 7.0, false, 1.0).alpha,
+        rasterize_storm_reports(
+            &[report_fixture()],
+            &[],
+            &BOUNDS,
+            0,
+            0,
+            &RasterizeContext {
+                is_dark: false,
+                zoom: 7.0,
+                device_scale: 1.0,
+            },
+        )
+        .alpha,
         AlphaMode::Premultiplied,
     );
     assert_eq!(

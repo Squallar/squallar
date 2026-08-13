@@ -1566,6 +1566,28 @@ fn sweep_ground_factor(radials: &[Radial]) -> f64 {
     }
 }
 
+/// How far a field's samples go along a radial and how far apart they are, both
+/// in the ground coordinate the caller paints in.
+///
+/// One argument and not two because they are one fact read off one place — the
+/// moment, or the derived grid that stands in for it — and because they have to
+/// agree about their coordinate. The four per-tilt paths fold
+/// [`sweep_ground_factor`] into both, and a reach in ground kilometres beside a
+/// spacing in slant ones would size the raster for a sweep neither of them
+/// describes. Passed by value: it is two `f64`s.
+#[derive(Clone, Copy)]
+struct FieldRadial {
+    /// How far the outermost sample reaches, km. `0.0` where no radial carries
+    /// the product, which [`types::plan_view_extent_km`] reads as "a picture of
+    /// nothing" and answers with the fallback extent.
+    reach_km: f64,
+    /// The distance between two consecutive samples along a radial, km. A
+    /// non-positive figure says nothing about sampling, and
+    /// [`types::data_limited_side_px`] answers it with the display's calibrated
+    /// scale rather than dividing by it.
+    sample_km: f64,
+}
+
 /// Project a field onto the image, at the extent its own data asks for.
 ///
 /// Every render path in this module comes through here, and each already knew
@@ -1605,13 +1627,16 @@ fn sweep_ground_factor(radials: &[Radial]) -> f64 {
 fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
-    reach_km: f64,
-    sample_km: f64,
+    field: FieldRadial,
     product: types::RadarProduct,
     side_ceiling_px: usize,
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
 ) -> SweepRender {
+    let FieldRadial {
+        reach_km,
+        sample_km,
+    } = field;
     let extent_km = types::plan_view_extent_km(reach_km);
     let side_px = types::raster_side_px(extent_km, side_ceiling_px, sample_km);
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
@@ -1863,8 +1888,10 @@ pub fn render_radar_to_image_full_sized(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        ground_reach_km,
-        ground_sample_km,
+        FieldRadial {
+            reach_km: ground_reach_km,
+            sample_km: ground_sample_km,
+        },
         product,
         side_ceiling_px,
         "Radar",
@@ -2002,8 +2029,10 @@ fn render_nrot_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        ground_reach_km,
-        vg.gate_interval_km * cos_e,
+        FieldRadial {
+            reach_km: ground_reach_km,
+            sample_km: vg.gate_interval_km * cos_e,
+        },
         types::RadarProduct::NormalizedRotation,
         side_ceiling_px,
         "NROT",
@@ -2104,8 +2133,10 @@ fn render_srv_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        ground_reach_km,
-        grid.gate_interval_km * cos_e,
+        FieldRadial {
+            reach_km: ground_reach_km,
+            sample_km: grid.gate_interval_km * cos_e,
+        },
         types::RadarProduct::StormRelativeVelocity,
         side_ceiling_px,
         "SRV",
@@ -2152,8 +2183,10 @@ pub fn render_echo_tops_interp_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        max_range,
-        crate::volumetric::RANGE_BIN_KM,
+        FieldRadial {
+            reach_km: max_range,
+            sample_km: crate::volumetric::RANGE_BIN_KM,
+        },
         types::RadarProduct::EchoTopsInterpolated,
         side_ceiling_px,
         "Radar",
@@ -2224,8 +2257,10 @@ pub fn render_derived_vild_to_image_sized(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        max_range,
-        crate::volumetric::RANGE_BIN_KM,
+        FieldRadial {
+            reach_km: max_range,
+            sample_km: crate::volumetric::RANGE_BIN_KM,
+        },
         types::RadarProduct::VilDensity,
         side_ceiling_px,
         "Radar",
@@ -2323,8 +2358,10 @@ pub fn render_hail_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        max_range,
-        crate::volumetric::RANGE_BIN_KM,
+        FieldRadial {
+            reach_km: max_range,
+            sample_km: crate::volumetric::RANGE_BIN_KM,
+        },
         product,
         side_ceiling_px,
         "Radar",
@@ -2469,8 +2506,10 @@ pub fn render_hhc_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        max_range,
-        grid.gate_interval_km,
+        FieldRadial {
+            reach_km: max_range,
+            sample_km: grid.gate_interval_km,
+        },
         types::RadarProduct::HydrometeorClassification,
         side_ceiling_px,
         "Radar",
@@ -2535,8 +2574,10 @@ pub fn render_derived_kdp_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        ground_reach_km,
-        derived.gate_interval_km * cos_e,
+        FieldRadial {
+            reach_km: ground_reach_km,
+            sample_km: derived.gate_interval_km * cos_e,
+        },
         types::RadarProduct::SpecificDifferentialPhase,
         side_ceiling_px,
         "KDP",
@@ -2654,8 +2695,10 @@ fn render_level3_radial_with_gate_km(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        actual_max_range,
-        gate_interval,
+        FieldRadial {
+            reach_km: actual_max_range,
+            sample_km: gate_interval,
+        },
         product,
         side_ceiling_px,
         "Level III",

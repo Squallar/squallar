@@ -115,6 +115,7 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
         W,
         H,
         [0, 0, 0, 0],
+        1.0,
     );
 
     // The projection `MercatorBounds` applies, restated: lon is linear, lat is

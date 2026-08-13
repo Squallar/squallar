@@ -142,6 +142,7 @@ fn req(w: u32, h: u32, overdraw: f32, data_gen: u64, zoom: i32) -> fetch::Overla
             width: w,
             height: h,
             overdraw,
+            pixels_per_point: 1.0,
         },
         data_generation: data_gen,
         zoom,
