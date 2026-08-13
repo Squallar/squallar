@@ -73,6 +73,28 @@ fn refl_sweep(
     az_offset: f32,
     sails_shift: bool,
 ) -> Sweep {
+    refl_sweep_lifted(
+        elevation_number,
+        elevation_deg,
+        n_radials,
+        az_offset,
+        sails_shift,
+        0.0,
+    )
+}
+
+/// [`refl_sweep`] with every gate's reflectivity raised by `lift_dbz` before
+/// encoding — the second volume
+/// [`lifting_every_gate_never_lowers_an_echo_top`] needs, identical to the
+/// first but for a uniform shift of the field.
+fn refl_sweep_lifted(
+    elevation_number: u8,
+    elevation_deg: f32,
+    n_radials: usize,
+    az_offset: f32,
+    sails_shift: bool,
+    lift_dbz: f64,
+) -> Sweep {
     let spacing = 360.0 / n_radials as f32;
     let radials = (0..n_radials)
         .map(|i| {
@@ -83,7 +105,8 @@ fn refl_sweep(
                     let h_km = beam_height_km(r_km, elevation_deg as f64);
                     match dbz_at(az as f64, r_km, h_km, sails_shift) {
                         None => 0, // below threshold: skipped by the grid
-                        Some(dbz) => ((dbz * SCALE as f64 + OFFSET as f64).round() as i64)
+                        Some(dbz) => (((dbz + lift_dbz) * SCALE as f64 + OFFSET as f64).round()
+                            as i64)
                             .clamp(2, 255) as u8,
                     }
                 })
@@ -337,6 +360,37 @@ pub(crate) fn fnv1a64(grid: &VolumetricGrid) -> u64 {
 /// The golden pin for `compute_echo_tops`: the full grid digest, the
 /// defined-cell count, and spot values. Any change to the gridding, dedup,
 /// beam-height or interpolation arithmetic moves at least the digest.
+///
+/// # What this test is, and what it is not
+///
+/// It is a **change detector**. It hashes this function's own output, so it
+/// can report that a number moved; it cannot report that a number is right,
+/// and it says nothing about whether the conventions above it are the ones
+/// this product should have. For a long time it was the whole of
+/// `compute_echo_tops`'s test coverage, which is how a product with an unnamed
+/// reference came to look validated. The property tests at the foot of this
+/// file carry the "is it right" half now, and the function's own doc carries
+/// the measurement against [`crate::eet`].
+///
+/// Its blind spot is not the one you would guess. This fixture's background is
+/// a **reported** 15 dBZ rather than an absence, so `z_up` is never `NaN` at a
+/// cell that has data — and the echo-absent-above **clamp branch is therefore
+/// unreachable from [`golden_scan`]**. A mutation that changed the clamped
+/// height outright leaves this digest untouched, and is caught only by
+/// [`a_crossing_with_nothing_above_it_clamps_to_its_own_tilt`]. That branch is
+/// no corner case: in the RPG twin it governs 2 % of columns below 15 kft and
+/// 52.7 % above 45 kft, and [`crate::eet`] names it the dominant term in its
+/// own depth-dependent bias.
+///
+/// # The implementation itself is independently confirmed
+///
+/// Separately from this digest, an implementation written from
+/// `compute_echo_tops`'s *documented* rule alone — Py-ART decoding the same
+/// nine archives, no sight of this code — reproduces it with **footprint IoU
+/// 1.000 at all nine sites** and **100 % of cells inside 1 kft**, RMS
+/// 0.03–0.18 kft. So the arithmetic here does what the doc says it does; what
+/// remains open is whether the conventions are the right ones, which no test
+/// in this file can settle.
 ///
 /// # Re-pinned when the cube learned [`RangeBinning`]
 ///
@@ -1245,4 +1299,383 @@ fn the_cubes_status_plane_says_value_exactly_where_its_grid_has_a_number() {
          measurements, which is exactly why the populations are measured on \
          real volumes and not here",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Property tests for `compute_echo_tops`
+//
+// `golden_echo_tops_grid_is_pinned` above is a **change detector**: it hashes
+// this function's own output, so it can tell you a number moved and can never
+// tell you a number is right. Everything below asserts a property that is true
+// of an echo top by construction — checked against a height derived in the
+// test from `crate::beam`, or against an analytic interpolation, or against
+// the same volume scanned twice — so each one fails on a real regression
+// rather than on any change at all.
+//
+// They are deliberately *not* an oracle for the algorithm's conventions. What
+// this product's cell statistic, binning and datum ought to be is a question
+// only an external reference can settle; these bound the arithmetic given
+// those conventions.
+// ---------------------------------------------------------------------------
+
+/// kft above the radar of a tilt's beam centre over ground range cell `r`,
+/// derived in the test from the crate's own beam geometry rather than copied
+/// from a pinned literal. `compute_echo_tops` bins on the ground, so this is
+/// [`crate::beam::height_at_ground_km`] and not the slant-range formula.
+fn expected_centre_kft(r: usize, elev_deg: f64) -> f64 {
+    crate::beam::height_at_ground_km(r as f64 + 0.5, elev_deg) * 3.28084
+}
+
+/// A sweep whose every gate carries the same reflectivity — or, for `None`,
+/// no return at all, which the grid must leave undefined.
+fn flat_sweep(elevation_number: u8, elevation_deg: f32, dbz: Option<f64>) -> Sweep {
+    let n_radials = 360;
+    let radials = (0..n_radials)
+        .map(|i| {
+            let az = 0.5 + i as f32;
+            let bytes: Vec<u8> = (0..GATES)
+                .map(|_| match dbz {
+                    None => 0,
+                    Some(z) => {
+                        ((z * SCALE as f64 + OFFSET as f64).round() as i64).clamp(2, 255) as u8
+                    }
+                })
+                .collect();
+            Radial::new(
+                0,
+                i as u16,
+                az,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                elevation_number,
+                elevation_deg,
+                Some(MomentData::from_fixed_point(
+                    GATES as u16,
+                    0,
+                    GATE_INTERVAL_M,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    bytes,
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Sweep::new(elevation_number, radials)
+}
+
+fn defined_cells(grid: &VolumetricGrid) -> usize {
+    grid.values.iter().flatten().filter(|v| !v.is_nan()).count()
+}
+
+/// **No column reports above the volume's ceiling, and none below its floor.**
+///
+/// The ceiling half is the load-bearing one: `compute_echo_tops` deliberately
+/// does *not* extrapolate upward — a column still above threshold at the
+/// highest tilt is clamped to that tilt's own centre height. A regression that
+/// reintroduced upward extrapolation (the fixture's core A is exactly that
+/// case) would leave the digest looking merely "moved" and would fail here
+/// with the cell that broke the rule.
+///
+/// The bracket is derived per range cell from the tilt ladder the cube
+/// actually built, so it follows the fixture rather than restating it.
+#[test]
+fn every_echo_top_sits_inside_the_tilt_ladder_it_was_scanned_from() {
+    let scan = golden_scan();
+    let grid = compute_echo_tops(&scan);
+    let cube = VolumeCube::build(
+        &scan,
+        &[RadarProduct::Reflectivity],
+        DedupPolicy::NewestWins,
+        RangeBinning::Ground,
+    );
+    let elevs: Vec<f64> = cube
+        .tilts
+        .iter()
+        .enumerate()
+        .filter(|(ti, _)| cube.grid(*ti, RadarProduct::Reflectivity).is_some())
+        .map(|(_, t)| t.elevation_deg)
+        .collect();
+    let (lowest, highest) = (elevs[0], elevs[elevs.len() - 1]);
+
+    let mut checked = 0usize;
+    for (az, row) in grid.values.iter().enumerate() {
+        for (r, v) in row.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            checked += 1;
+            let (floor, ceil) = (
+                expected_centre_kft(r, lowest),
+                expected_centre_kft(r, highest),
+            );
+            let v = f64::from(*v);
+            assert!(
+                v >= floor - 1e-3,
+                "az {az}° r {r} km: top {v} kft is below the lowest tilt's centre {floor} kft"
+            );
+            assert!(
+                v <= ceil + 1e-3,
+                "az {az}° r {r} km: top {v} kft is above the highest tilt's centre {ceil} kft — \
+                 the ceiling clamp has been lost and the scan is extrapolating upward"
+            );
+        }
+    }
+    assert!(checked > 1000, "fixture defined only {checked} cells");
+}
+
+/// **Lifting every gate by a constant never lowers an echo top, and never
+/// takes one away.**
+///
+/// True by construction and independent of every convention: raising the whole
+/// field either leaves the crossing tilt where it was and moves the
+/// interpolation fraction up — the denominator `z − z_up` is unchanged by a
+/// uniform shift while the numerator `z − t` grows — or promotes the crossing
+/// to a higher tilt. Neither can lower the answer.
+///
+/// This is the one test here that would catch an inverted interpolation
+/// fraction, swapped `h`/`h_up`, or a `<`/`>` flip in the top-down scan, none
+/// of which a digest can distinguish from a legitimate re-pin.
+#[test]
+fn lifting_every_gate_never_lowers_an_echo_top() {
+    let lifted = Scan::new(
+        vcp(),
+        vec![
+            refl_sweep_lifted(1, 0.5, 720, 0.1, false, 3.0),
+            velocity_only_sweep(2, 0.5),
+            refl_sweep_lifted(3, 1.5, 360, 0.5, false, 3.0),
+            refl_sweep_lifted(4, 2.4, 360, 0.5, false, 3.0),
+            refl_sweep_lifted(5, 3.4, 360, 0.5, false, 3.0),
+            refl_sweep_lifted(6, 0.5, 720, 0.1, true, 3.0),
+            refl_sweep_lifted(7, 4.3, 360, 0.5, false, 3.0),
+        ],
+    );
+    let base = compute_echo_tops(&golden_scan());
+    let up = compute_echo_tops(&lifted);
+
+    let mut compared = 0usize;
+    for az in 0..360 {
+        for r in 0..RANGE_BINS {
+            let (b, u) = (base.values[az][r], up.values[az][r]);
+            if b.is_nan() {
+                continue;
+            }
+            assert!(
+                !u.is_nan(),
+                "az {az}° r {r} km: a cell defined at {b} kft went undefined when every gate rose"
+            );
+            compared += 1;
+            assert!(
+                u >= b - 1e-3,
+                "az {az}° r {r} km: top fell from {b} to {u} kft when every gate rose by 3 dBZ"
+            );
+        }
+    }
+    assert!(compared > 1000, "compared only {compared} cells");
+    assert!(
+        defined_cells(&up) >= defined_cells(&base),
+        "the lifted volume defines fewer cells ({}) than the base one ({})",
+        defined_cells(&up),
+        defined_cells(&base),
+    );
+}
+
+/// **A volume with nothing above the threshold reports nothing at all.**
+///
+/// Three tilts uniformly at 15 dBZ — reported everywhere, below threshold
+/// everywhere. The distinction matters: these gates are *not* absent, so a
+/// regression that treated "reported but weak" as a crossing would fill the
+/// whole grid, and one that lowered the threshold below 15 dBZ would too.
+#[test]
+fn a_volume_entirely_below_the_threshold_reports_no_echo_tops() {
+    let scan = Scan::new(
+        vcp(),
+        vec![
+            flat_sweep(1, 0.5, Some(15.0)),
+            flat_sweep(2, 1.5, Some(15.0)),
+            flat_sweep(3, 2.5, Some(15.0)),
+        ],
+    );
+    assert_eq!(defined_cells(&compute_echo_tops(&scan)), 0);
+}
+
+/// **The threshold is the boundary it says it is.**
+///
+/// 18.0 dBZ everywhere defines nothing; 18.5 dBZ everywhere defines the grid.
+/// Both are exactly representable through scale 2 / offset 66, so this brackets
+/// [`ET_THRESHOLD_DBZ`] without depending on the encoding's rounding — and it
+/// fails if the constant moves in either direction by more than 0.2 dBZ.
+#[test]
+fn the_echo_top_threshold_brackets_between_18_0_and_18_5_dbz() {
+    let at = |dbz: f64| {
+        defined_cells(&compute_echo_tops(&Scan::new(
+            vcp(),
+            vec![flat_sweep(1, 0.5, Some(dbz)), flat_sweep(2, 1.5, Some(dbz))],
+        )))
+    };
+    assert_eq!(
+        at(18.0),
+        0,
+        "18.0 dBZ is below the threshold and must not cross"
+    );
+    assert!(
+        at(18.5) > 0,
+        "18.5 dBZ is above the threshold and must cross"
+    );
+}
+
+/// **A single-tilt volume reports that tilt's own centre height, everywhere.**
+///
+/// With no tilt above there is nothing to interpolate toward, so every defined
+/// cell must land exactly on the beam centre over its own ground range — the
+/// degenerate case the interpolation branch must not touch. Checked against
+/// [`crate::beam::height_at_ground_km`] evaluated in the test, so it also pins
+/// that `compute_echo_tops` reads its heights on the **ground** binning: the
+/// slant-range formula gives a visibly different number at every cell.
+#[test]
+fn a_single_tilt_volume_reports_that_tilts_centre_height() {
+    let elev = 2.0;
+    let grid = compute_echo_tops(&Scan::new(
+        vcp(),
+        vec![flat_sweep(1, elev as f32, Some(40.0))],
+    ));
+    let mut checked = 0usize;
+    for row in grid.values.iter() {
+        for (r, v) in row.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            checked += 1;
+            let want = expected_centre_kft(r, elev);
+            assert!(
+                (f64::from(*v) - want).abs() < 1e-2,
+                "r {r} km: got {v} kft, beam centre over that ground range is {want} kft"
+            );
+        }
+    }
+    assert!(checked > 1000, "checked only {checked} cells");
+}
+
+/// **A crossing with no data above clamps to its own tilt's centre height.**
+///
+/// The lower tilt is above threshold everywhere and the upper carries no
+/// return at all. This is the documented "echo absent above" rule, and it is
+/// the same clamp [`crate::eet`] applies — asserted here against a derived
+/// height rather than a pinned one, so it survives a change to the beam model
+/// and fails on a change to the rule.
+#[test]
+fn a_crossing_with_nothing_above_it_clamps_to_its_own_tilt() {
+    let elev = 1.5;
+    let grid = compute_echo_tops(&Scan::new(
+        vcp(),
+        vec![
+            flat_sweep(1, elev as f32, Some(40.0)),
+            flat_sweep(2, 2.5, None),
+        ],
+    ));
+    let mut checked = 0usize;
+    for row in grid.values.iter() {
+        for (r, v) in row.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            checked += 1;
+            let want = expected_centre_kft(r, elev);
+            assert!(
+                (f64::from(*v) - want).abs() < 1e-2,
+                "r {r} km: clamped top {v} kft, its own tilt's centre is {want} kft"
+            );
+        }
+    }
+    assert!(checked > 1000, "checked only {checked} cells");
+}
+
+/// **An interpolated top lands where the two tilts say it does.**
+///
+/// 25 dBZ below, 10 dBZ above: the crossing sits a fraction
+/// `(25 − 18.3)/(25 − 10)` of the way from the lower tilt's centre to the
+/// upper's, at every range cell. The expected value is computed here from the
+/// arithmetic the module documents — not read back from the module — so this
+/// is an independent check of the interpolation rather than a restatement of
+/// it, and it is the test that would catch the fraction being inverted.
+#[test]
+fn an_interpolated_top_lands_between_its_two_tilts_by_reflectivity() {
+    let (lo, up) = (1.5f64, 2.5f64);
+    let grid = compute_echo_tops(&Scan::new(
+        vcp(),
+        vec![
+            flat_sweep(1, lo as f32, Some(25.0)),
+            flat_sweep(2, up as f32, Some(10.0)),
+        ],
+    ));
+    let frac = (25.0 - 18.3) / (25.0 - 10.0);
+    let mut checked = 0usize;
+    for row in grid.values.iter() {
+        for (r, v) in row.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            checked += 1;
+            let (h_lo, h_up) = (expected_centre_kft(r, lo), expected_centre_kft(r, up));
+            let want = h_lo + (h_up - h_lo) * frac;
+            assert!(
+                (f64::from(*v) - want).abs() < 2e-2,
+                "r {r} km: got {v} kft, the two tilts ({h_lo}, {h_up}) put the 18.3 dBZ \
+                 crossing at {want} kft"
+            );
+            assert!(
+                f64::from(*v) > h_lo && f64::from(*v) < h_up,
+                "r {r} km: interpolated top {v} kft escaped its bracket ({h_lo}, {h_up})"
+            );
+        }
+    }
+    assert!(checked > 1000, "checked only {checked} cells");
+}
+
+/// **A sector the volume never scanned stays undefined.**
+///
+/// The fixture reports nothing at all between 200° and 240°. An echo top there
+/// would mean the column scan had read a neighbouring azimuth's data, which no
+/// amount of re-pinning would reveal.
+#[test]
+fn an_unscanned_sector_reports_no_echo_tops() {
+    let grid = compute_echo_tops(&golden_scan());
+    for az in 200..240 {
+        let defined = grid.values[az].iter().filter(|v| !v.is_nan()).count();
+        assert_eq!(
+            defined, 0,
+            "azimuth {az}° has {defined} tops in an unscanned sector"
+        );
+    }
+}
+
+/// **Along one tilt, the top rises with range.** Beam centre height is strictly
+/// increasing in ground range at any fixed elevation, so a uniformly filled
+/// single-tilt volume must report a monotonically rising column of numbers.
+/// A binning or height-lookup that read the wrong cell's range would break the
+/// ordering long before it moved any single value far enough to notice.
+#[test]
+fn along_one_tilt_the_echo_top_rises_with_range() {
+    let grid = compute_echo_tops(&Scan::new(vcp(), vec![flat_sweep(1, 3.0, Some(40.0))]));
+    let row = &grid.values[100];
+    let mut last = f32::NEG_INFINITY;
+    let mut seen = 0usize;
+    for (r, v) in row.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        assert!(
+            *v > last,
+            "r {r} km: top {v} kft did not rise above the previous cell's {last}"
+        );
+        last = *v;
+        seen += 1;
+    }
+    assert!(seen > 100, "saw only {seen} cells");
 }
