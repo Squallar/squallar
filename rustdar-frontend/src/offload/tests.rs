@@ -48,7 +48,7 @@ fn a_job() -> JobRequest {
             RenderInput::from_bytes(&sample_input_bytes()).expect("fixture payload decodes"),
         ),
         values_wanted: true,
-        full_res: true,
+        side_ceiling_px: 4096,
     }
 }
 
@@ -166,7 +166,7 @@ fn a_level3_job() -> JobRequest {
         product: rustdar_radar::types::RadarProduct::EchoTops,
         radar_lat: 35.0,
         radar_lon: -97.0,
-        full_res: true,
+        side_ceiling_px: 4096,
     }
 }
 
@@ -179,7 +179,7 @@ fn a_level3_pair_job() -> JobRequest {
         eet: std::sync::Arc::new(vec![4, 5, 6, 7, 0xFF, 0]),
         radar_lat: 35.0,
         radar_lon: -97.0,
-        full_res: true,
+        side_ceiling_px: 4096,
     }
 }
 
@@ -653,33 +653,36 @@ fn a_malformed_job_is_refused_rather_than_misread() {
         None,
         "no payload"
     );
-    // Both flags are booleans, and a byte outside `{0, 1}` is a build whose
-    // protocol is not this one — refused rather than guessed at, on each of
-    // the three variants that carries one.
+    // `values_wanted` is a boolean, and a byte outside `{0, 1}` is a build
+    // whose protocol is not this one — refused rather than guessed at.
     assert_eq!(
-        JobRequest::from_bytes(&[TAG_RADAR, 2, 1]),
+        JobRequest::from_bytes(&[TAG_RADAR, 2, 0, 0, 0, 0]),
         None,
         "values_wanted is a bool, not a byte"
     );
+    // The side ceiling beside it is four bytes, not one. A header holding
+    // fewer is a build that wrote the flag this replaced, and reading its one
+    // byte as a size would put a 1 px ceiling on every render rather than
+    // refusing the message.
     assert_eq!(
         JobRequest::from_bytes(&[TAG_RADAR, 1, 2]),
         None,
-        "full_res is a bool, not a byte"
+        "a side ceiling short of its four bytes"
     );
     for (tag, what) in [(TAG_LEVEL3, "level3"), (TAG_LEVEL3_PAIR, "level3 pair")] {
         assert_eq!(
             JobRequest::from_bytes(&[tag, 2]),
             None,
-            "{what}: full_res is a bool, not a byte"
+            "{what}: a side ceiling short of its four bytes"
         );
     }
 
     // A length prefix that claims more than the payload holds must be
     // refused, not read as a short object: the pair's first length is the
-    // one number on the wire that could lie. Byte 18, not 17: the tag, the
-    // `full_res` flag and two `f64`s precede it.
+    // one number on the wire that could lie. Byte 21: the tag, the four-byte
+    // side ceiling and two `f64`s precede it.
     let mut overlong = a_level3_pair_job().to_bytes();
-    overlong[18] = 0xFF;
+    overlong[21] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&overlong),
         None,
@@ -700,9 +703,11 @@ fn a_malformed_job_is_refused_rather_than_misread() {
         );
     }
 
+    // Bytes 5 and 6: the tag and the four-byte side ceiling precede the
+    // product code.
     let mut bad_product = a_level3_job().to_bytes();
-    bad_product[2] = 0xFE;
-    bad_product[3] = 0xFF;
+    bad_product[5] = 0xFE;
+    bad_product[6] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&bad_product),
         None,

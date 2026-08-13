@@ -103,8 +103,15 @@ pub enum FormFactor {
 /// own machines: Firefox on an RTX 3090 reports `MAX_TEXTURE_SIZE` 32768 and
 /// refuses to allocate above 16384, while Chrome on an AMD Radeon 890M reports
 /// 16384 and allocates it. Anything that spends against these has to cap
-/// against what the device will actually hand back, which is why nothing spends
-/// against them yet.
+/// against what the device will actually hand back.
+///
+/// **One thing now spends against `max_texture_dimension_2d`**, and it is the
+/// worked example of how: [`Budgets::raster_side_for_adapter`] takes *half* of
+/// what is reported, which is the margin those two readings force — one of them
+/// overstates by a doubling and the number alone does not say which — and then
+/// holds the result inside a bracket whose floor is what this build already
+/// ships. So the reading can only ever add, and it can only add as far as a
+/// figure that was argued in bytes rather than taken from the adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterCeilings {
     /// The largest 2D texture, per axis, the adapter says it will accept.
@@ -330,6 +337,20 @@ pub struct BudgetLimits {
     /// deliberately, and let `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling`
     /// bite and be re-argued.
     pub app_texture_ceiling_bytes: Bracket,
+    /// The largest side a static plan-view raster may reach on this class,
+    /// however much the adapter offers.
+    ///
+    /// Already a ceiling, so like [`Self::quality_ceiling`] it has no pair: its
+    /// floor is [`Self::long_range_image_side_px`], because the whole point of
+    /// reading the device is that it may only ever *add* to what this build
+    /// already draws. [`Budgets::raster_side_for_adapter`] spends between them.
+    ///
+    /// **This is the first field whose ceiling sits off its floor**, which is
+    /// the step [`Bracket::pinned`]'s doc describes as costing a measurement.
+    /// That measurement is on `constants::DESKTOP_RASTER_SIDE_CEILING`; the two
+    /// classes that stay pinned are pinned because no such measurement exists
+    /// for them, not because they could not use one.
+    pub raster_side_ceiling_px: usize,
 }
 
 impl BudgetLimits {
@@ -358,6 +379,7 @@ impl BudgetLimits {
         quality_ceiling: crate::volume::quality::WASM_PLATFORM_CEILING,
         max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_DESKTOP),
         app_texture_ceiling_bytes: Bracket::pinned(constants::WASM_APP_TEXTURE_BUDGET_BYTES),
+        raster_side_ceiling_px: constants::WASM_RASTER_SIDE_CEILING,
     };
 
     /// The mobile bracket — native Android and iOS.
@@ -383,6 +405,7 @@ impl BudgetLimits {
         quality_ceiling: crate::volume::quality::MOBILE_PLATFORM_CEILING,
         max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_MOBILE),
         app_texture_ceiling_bytes: Bracket::pinned(constants::MOBILE_APP_TEXTURE_BUDGET_BYTES),
+        raster_side_ceiling_px: constants::MOBILE_RASTER_SIDE_CEILING,
     };
 
     /// The desktop bracket.
@@ -410,6 +433,7 @@ impl BudgetLimits {
         quality_ceiling: crate::volume::quality::DESKTOP_PLATFORM_CEILING,
         max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_DESKTOP),
         app_texture_ceiling_bytes: Bracket::pinned(constants::DESKTOP_APP_TEXTURE_BUDGET_BYTES),
+        raster_side_ceiling_px: constants::DESKTOP_RASTER_SIDE_CEILING,
     };
 
     /// The bracket this build compiled.
@@ -496,6 +520,18 @@ pub struct Budgets {
     pub max_panes: usize,
     /// The whole-application GPU texture ceiling the sum is held to.
     pub app_texture_ceiling_bytes: usize,
+    /// The largest side a static plan-view raster may reach on this class.
+    ///
+    /// Carried as the *ceiling* of a pair whose floor is
+    /// [`Self::long_range_image_side_px`], rather than as one resolved figure,
+    /// for the same reason [`Self::loop_pool_floor_bytes`] is: the number is
+    /// settled at a seam this resolver runs before. The pool's seam is a
+    /// failure it learns from; this one is simply **the adapter arriving** —
+    /// `AppState::new` is where a real `max_texture_dimension_2d` first exists,
+    /// and [`resolve`] runs before it, against
+    /// [`AdapterCeilings::WEBGL2_GUARANTEE`].
+    /// [`Self::raster_side_for_adapter`] is what closes it.
+    pub raster_side_ceiling_px: usize,
 }
 
 impl Budgets {
@@ -519,10 +555,62 @@ impl Budgets {
     }
 
     /// Bytes one **static** pane render's texture occupies, worst case: the
-    /// long-range side, since that is what a device passing the gate can be
+    /// raster ceiling, since that is the most a device on this class can be
     /// asked to hold.
+    ///
+    /// [`Self::raster_side_ceiling_px`] and not `long_range_image_side_px`,
+    /// which is what this read before the ceiling could leave its floor. The
+    /// two are still the same number on every class whose ceiling is pinned;
+    /// where they differ, the larger is the honest worst case, and
+    /// `the_static_render_textures_are_named_even_though_the_ceiling_omits_them`
+    /// is where the difference is stated in megabytes.
     pub fn static_frame_bytes(&self) -> usize {
-        self.long_range_image_side_px * self.long_range_image_side_px * 4
+        self.raster_side_ceiling_px * self.raster_side_ceiling_px * 4
+    }
+
+    /// The largest static plan-view raster a device reporting
+    /// `max_texture_dimension_2d` may be asked for.
+    ///
+    /// The one place in this module that spends an [`AdapterCeilings`] figure,
+    /// and the shape any other field promoted off its floor should copy.
+    ///
+    /// # Half of what is reported
+    ///
+    /// Because a reported limit is not an allocatable one and the number alone
+    /// does not say which kind it is. Measured: this project's RTX 3090 reports
+    /// 32768 through Vulkan and refuses to allocate 32768 in either browser
+    /// (`GL_OUT_OF_MEMORY` in Firefox 153, `GL_INVALID_VALUE` in Chrome) while
+    /// allocating 16384; an AMD 890M reports 16384 and allocates it. Halving is
+    /// what makes one rule safe on both, and it costs nothing here because both
+    /// then land at or under 8192 — a full doubling below the 16384 each was
+    /// measured to hand back.
+    ///
+    /// # It can only add
+    ///
+    /// [`Self::long_range_image_side_px`] is the floor, so a device reporting
+    /// exactly that much keeps the raster it draws today rather than losing it
+    /// to the halving. The `min` afterwards is the other end: a device is never
+    /// offered more than it just said it has, which is what makes a machine
+    /// reporting the GLES 3.0 floor fall to the base size instead of to a
+    /// texture creation that fails and leaves the pane blank.
+    ///
+    /// | reports | half | result on desktop |
+    /// |--------:|-----:|------------------:|
+    /// |   32768 |16384 | 8192 (the ceiling)|
+    /// |   16384 | 8192 | 8192 (the ceiling)|
+    /// |    8192 | 4096 | 4096 (unchanged)  |
+    /// |    4096 | 2048 | 4096 (the floor)  |
+    /// |    2048 | 1024 | 2048 (the report) |
+    ///
+    /// The ceiling is a ceiling and not a size:
+    /// `rustdar_radar::types::raster_side_px` spends it only as far as a
+    /// sweep's own gates justify, which for the widest cut a WSR-88D flies is
+    /// 7362 px.
+    pub fn raster_side_for_adapter(&self, max_texture_dimension_2d: u32) -> usize {
+        let reported = max_texture_dimension_2d as usize;
+        Bracket::new(self.long_range_image_side_px, self.raster_side_ceiling_px)
+            .hold(reported / 2)
+            .min(reported.max(1))
     }
 
     /// Bytes one **cross-section** loop frame occupies: RGBA at
@@ -635,6 +723,9 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
         quality_ceiling: limits.quality_ceiling,
         max_panes: limits.max_panes.floor,
         app_texture_ceiling_bytes: limits.app_texture_ceiling_bytes.floor,
+        raster_side_ceiling_px: limits
+            .raster_side_ceiling_px
+            .max(limits.long_range_image_side_px.floor),
     }
 }
 

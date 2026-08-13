@@ -22,8 +22,14 @@ fn both_image_size_arms_are_pinned_not_just_the_compiled_one() {
         // allocation and `ImageBounds` divides the extent by it, so zero is
         // a division by zero before it is an empty image.
         assert!(size > 0, "{target}");
-        // The projection assumes a power of two; `constants.rs` asserts the
-        // same thing at compile time for whichever arm it compiled.
+        // Not a power of two because anything requires it — that claim was
+        // made here and in `constants.rs`, checked, and found false; a real
+        // surveillance cut is rasterized at 7362 px, which is not even a
+        // multiple of four, and the projection, the gate loop and the texture
+        // upload all take it unchanged. Both arms are powers of two because
+        // both are `2 · BASE_EXTENT_KM` at the scale this display is
+        // calibrated at, which is a fact about the number and worth pinning
+        // as one.
         assert!(size.is_power_of_two(), "{target}: {size}");
         // A browser may legitimately report exactly the WebGL2 guarantee, so
         // *both* arms have to fit it. This is the assertion the 4096 mutation

@@ -75,6 +75,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             quality_ceiling: WASM_PLATFORM_CEILING,
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
             app_texture_ceiling_bytes: WASM_APP_TEXTURE_BUDGET_BYTES,
+            raster_side_ceiling_px: WASM_RASTER_SIDE_CEILING,
         },
         Budgets {
             name: "mobile",
@@ -96,6 +97,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             quality_ceiling: MOBILE_PLATFORM_CEILING,
             max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
             app_texture_ceiling_bytes: MOBILE_APP_TEXTURE_BUDGET_BYTES,
+            raster_side_ceiling_px: MOBILE_RASTER_SIDE_CEILING,
         },
         Budgets {
             name: "desktop",
@@ -117,6 +119,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             quality_ceiling: DESKTOP_PLATFORM_CEILING,
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
             app_texture_ceiling_bytes: DESKTOP_APP_TEXTURE_BUDGET_BYTES,
+            raster_side_ceiling_px: DESKTOP_RASTER_SIDE_CEILING,
         },
     ];
 

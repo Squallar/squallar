@@ -1484,7 +1484,7 @@ impl super::App {
                             // at once, and at 4096² that is 30 × 64 MiB =
                             // 1.9 GiB a pane against a 512 MiB loop budget.
                             // See `JobRequest::side_ceiling_px`.
-                            full_res: false,
+                            side_ceiling_px: crate::constants::LOOP_IMAGE_SIZE as u32,
                         })
                     }
                     None => crate::offload::Job::renders_nothing(),
@@ -1506,8 +1506,8 @@ impl super::App {
                     product,
                     radar_lat: lat,
                     radar_lon: lon,
-                    // A loop frame, so the base size — see the Level II arm.
-                    full_res: false,
+                    // A loop frame, so the loop size — see the Level II arm.
+                    side_ceiling_px: crate::constants::LOOP_IMAGE_SIZE as u32,
                 }),
                 None => crate::offload::Job::renders_nothing(),
             },

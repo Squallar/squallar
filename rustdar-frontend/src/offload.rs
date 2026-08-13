@@ -110,9 +110,9 @@ pub enum JobRequest {
         ///
         /// The texture is unaffected either way; only the grid is cleared.
         values_wanted: bool,
-        /// Whether this render may take the long-range raster size. See
+        /// The largest side this render's raster may have. See
         /// [`JobRequest::side_ceiling_px`].
-        full_res: bool,
+        side_ceiling_px: u32,
     },
     /// Rasterize a Level III radial product.
     ///
@@ -127,7 +127,7 @@ pub enum JobRequest {
         radar_lat: f64,
         radar_lon: f64,
         /// See [`JobRequest::side_ceiling_px`].
-        full_res: bool,
+        side_ceiling_px: u32,
     },
     /// Rasterize a Level III product **derived from two objects of the same
     /// volume**: VIL density, Digital VIL over Enhanced Echo Tops
@@ -144,7 +144,7 @@ pub enum JobRequest {
         radar_lat: f64,
         radar_lon: f64,
         /// See [`JobRequest::side_ceiling_px`].
-        full_res: bool,
+        side_ceiling_px: u32,
     },
     /// Draw a vertical cross-section through a volume.
     ///
@@ -376,12 +376,12 @@ impl JobRequest {
             Self::Radar {
                 input,
                 values_wanted,
-                full_res,
+                side_ceiling_px,
             } => {
                 let mut out = Vec::new();
                 out.push(TAG_RADAR);
                 out.push(u8::from(*values_wanted));
-                out.push(u8::from(*full_res));
+                out.extend_from_slice(&side_ceiling_px.to_le_bytes());
                 out.extend_from_slice(&input.to_bytes());
                 out
             }
@@ -390,10 +390,10 @@ impl JobRequest {
                 product,
                 radar_lat,
                 radar_lon,
-                full_res,
+                side_ceiling_px,
             } => {
                 let mut out = vec![TAG_LEVEL3];
-                out.push(u8::from(*full_res));
+                out.extend_from_slice(&side_ceiling_px.to_le_bytes());
                 out.extend_from_slice(&product.wire_code().to_le_bytes());
                 out.extend_from_slice(&radar_lat.to_le_bytes());
                 out.extend_from_slice(&radar_lon.to_le_bytes());
@@ -405,12 +405,12 @@ impl JobRequest {
                 eet,
                 radar_lat,
                 radar_lon,
-                full_res,
+                side_ceiling_px,
             } => {
                 // The first object is length-prefixed and the second takes the
                 // rest, so neither length can lie about the other.
                 let mut out = vec![TAG_LEVEL3_PAIR];
-                out.push(u8::from(*full_res));
+                out.extend_from_slice(&side_ceiling_px.to_le_bytes());
                 out.extend_from_slice(&radar_lat.to_le_bytes());
                 out.extend_from_slice(&radar_lon.to_le_bytes());
                 out.extend_from_slice(&(dvl.len() as u32).to_le_bytes());
@@ -444,17 +444,17 @@ impl JobRequest {
         match *tag {
             TAG_RADAR => {
                 let (values_wanted, rest) = rest.split_first()?;
-                let (full_res, rest) = rest.split_first()?;
+                let (ceiling, rest) = rest.split_at_checked(4)?;
                 Some(Self::Radar {
                     values_wanted: flag(*values_wanted)?,
-                    full_res: flag(*full_res)?,
+                    side_ceiling_px: u32::from_le_bytes(ceiling.try_into().ok()?),
                     input: Box::new(RenderInput::from_bytes(rest)?),
                 })
             }
             TAG_LEVEL3 => {
                 let mut r = Reader::new(rest);
                 Some(Self::Level3 {
-                    full_res: flag(r.u8()?)?,
+                    side_ceiling_px: r.u32()?,
                     product: rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?,
                     radar_lat: r.f64()?,
                     radar_lon: r.f64()?,
@@ -463,12 +463,12 @@ impl JobRequest {
             }
             TAG_LEVEL3_PAIR => {
                 let mut r = Reader::new(rest);
-                let full_res = flag(r.u8()?)?;
+                let side_ceiling_px = r.u32()?;
                 let radar_lat = r.f64()?;
                 let radar_lon = r.f64()?;
                 let dvl_len = r.u32()? as usize;
                 Some(Self::Level3Pair {
-                    full_res,
+                    side_ceiling_px,
                     radar_lat,
                     radar_lon,
                     dvl: std::sync::Arc::new(r.take(dvl_len)?.to_vec()),
@@ -501,45 +501,45 @@ impl JobRequest {
 
     /// The largest raster side this job's render may produce.
     ///
-    /// One byte on the wire — `full_res` — and two questions answered by it,
-    /// which is deliberate rather than a conflation. The renderer needs a
-    /// single number; what it is *for* is "how big a texture is this result
-    /// allowed to become", and there are exactly two reasons to say "the base
-    /// one":
+    /// **Four bytes on the wire, and a size rather than a flag.** It used to be
+    /// one `full_res` byte selecting between two constants, which could only
+    /// ever answer "the long-range size" or "the base size" — and the
+    /// long-range size was itself a literal, so a device offering eight times
+    /// it per axis was told about none of that. What the renderer needs is one
+    /// number, "how big a texture is this result allowed to become", and there
+    /// are two callers who know one:
     ///
-    ///   * **This is a loop frame.** A loop holds frames by the dozen, so it
-    ///     renders leaner by policy — it already drops the value grid for the
-    ///     same reason. [`crate::constants::LOOP_IMAGE_SIZE`] is the base size
-    ///     natively and 1024 on the web, where the per-pane loop budget is what
-    ///     it is.
-    ///   * **This device cannot take the long-range texture.** The gate is
-    ///     `AppState::long_range_raster_ok`, a `max_texture_dimension_2d`
-    ///     comparison made once at device creation; a sub-4096 GLES handheld
-    ///     degrades to a correct base-size picture instead of a texture
-    ///     creation that fails and leaves the pane blank.
+    ///   * **A loop frame** says [`crate::constants::LOOP_IMAGE_SIZE`]. A loop
+    ///     holds frames by the dozen, so it renders leaner by policy — it
+    ///     already drops the value grid for the same reason.
+    ///   * **A static render** says what the device can hold,
+    ///     `crate::constants::raster_side_ceiling_px` of this adapter's
+    ///     `max_texture_dimension_2d`, which is a real measurement of a real
+    ///     device rather than a class the build guessed at. A handheld that
+    ///     reports the GLES floor still says the base size and still gets a
+    ///     correct picture rather than a texture creation that fails.
     ///
-    /// Both answers are "render this at the base size", so they are one flag.
-    /// That is not the same as "the picture the display always made": the
-    /// extent is the sweep's either way, so a base-size ceiling over a sweep
-    /// reaching past 230 km buys the ground and pays in scale —
-    /// `rustdar_radar::types::raster_side_px` costs that out. The gate is
-    /// applied at the dispatch site rather than here because this type travels
+    /// Neither is "the picture the display always made": the extent is the
+    /// sweep's either way, and `rustdar_radar::types::raster_side_px` spends
+    /// this ceiling only as far as the sweep's own gates justify. The figure is
+    /// resolved at the dispatch site rather than here because this type travels
     /// to a worker that has no device to ask.
     ///
-    /// The [`JobRequest::Section`] and [`JobRequest::Voxels`] arms have no such
-    /// byte: a section's raster is a constant of the view (`xsect`'s
+    /// The [`JobRequest::Section`] and [`JobRequest::Voxels`] arms carry no
+    /// ceiling: a section's raster is a constant of the view (`xsect`'s
     /// `SECTION_WIDTH`) and a voxel grid's shape is already on the wire.
     fn side_ceiling_px(&self) -> usize {
-        let full_res = match self {
-            Self::Radar { full_res, .. }
-            | Self::Level3 { full_res, .. }
-            | Self::Level3Pair { full_res, .. } => *full_res,
-            Self::Section { .. } | Self::Voxels { .. } => return 0,
-        };
-        if full_res {
-            crate::constants::LONG_RANGE_IMAGE_SIZE
-        } else {
-            crate::constants::LOOP_IMAGE_SIZE
+        match self {
+            Self::Radar {
+                side_ceiling_px, ..
+            }
+            | Self::Level3 {
+                side_ceiling_px, ..
+            }
+            | Self::Level3Pair {
+                side_ceiling_px, ..
+            } => *side_ceiling_px as usize,
+            Self::Section { .. } | Self::Voxels { .. } => 0,
         }
     }
 
