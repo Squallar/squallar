@@ -4,9 +4,19 @@
 //! being asserted is *where a statement is written*, and no runtime observation
 //! distinguishes a conversion that ran on the frame thread from one that ran on
 //! the rasterizer's — both produce the same pixels, which is the whole point.
+//!
+//! There are now two ways a full-size buffer can be kept off the frame thread,
+//! and the distinction is what this module is about. The **overlay** rasters
+//! convert in the `offload` closure that drew them, because their producer is
+//! opaque to the job funnel. The **radar** rasters — plan view and section
+//! alike — do not convert on arrival at all: `offload::execute` premultiplies
+//! them inside the job, so what every consumer holds is already egui's own
+//! bytes. That is why the assertions below look for a *missing* unmultiply in
+//! `app_render` and a *present* conversion in `app_fetch`'s overlay spawn.
 
 const APP_RENDER: &str = include_str!("../app_render.rs");
 const APP_FETCH: &str = include_str!("../app_fetch.rs");
+const OFFLOAD: &str = include_str!("../offload.rs");
 
 /// The body of the function `signature` opens, up to its closing brace at
 /// method indentation.
@@ -15,6 +25,21 @@ fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
         .split_once(signature)
         .unwrap_or_else(|| panic!("`{signature}` is no longer written here"));
     rest.split_once("\n    }")
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("`{signature}` has no recognisable body"))
+}
+
+/// [`body_of`] for a **free** function, whose closing brace is at column 0.
+///
+/// A separate helper and not a parameter, because the two terminators are not
+/// interchangeable: `"\n    }"` matches the first four-space brace inside a free
+/// function — `execute`'s `match` closes on one — and would cut the body off
+/// before the line this module reads.
+fn free_body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+    let (_, rest) = source
+        .split_once(signature)
+        .unwrap_or_else(|| panic!("`{signature}` is no longer written here"));
+    rest.split_once("\n}")
         .map(|(body, _)| body)
         .unwrap_or_else(|| panic!("`{signature}` has no recognisable body"))
 }
@@ -43,6 +68,14 @@ const OVERLAY_CONVERT_CALL: &str = "Self::overlay_color_image(";
 /// every data pixel takes the slow arm of `Color32::from_rgba_unmultiplied`,
 /// neither the `a == 0` nor the `a == 255` fast path, at 31.8× the instructions
 /// of the premultiplied constructor.
+///
+/// `upload_section_raster` joined the list when the premultiply moved into
+/// `offload::execute`. It was the known exception this module used to name: a
+/// section pane **retains** its `CrossSection`, so converting before the send
+/// once meant carrying a `ColorImage` beside the cut for the life of the
+/// session. Premultiplying the cut's own raster inside the job is what made the
+/// exception unnecessary rather than merely paid for — there is one buffer, in
+/// one convention, and the upload and the resume re-upload both read it.
 #[test]
 fn no_poller_unmultiplies_on_the_frame_thread() {
     for signature in [
@@ -50,6 +83,7 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
         "fn apply_render_to_pane(",
         "fn poll_overlay_render_results(",
         "pub(super) fn restore_cached_render(",
+        "fn upload_section_raster(",
     ] {
         let body = body_of(APP_RENDER, signature);
         assert!(
@@ -106,28 +140,56 @@ fn both_overlay_rasterizers_convert_before_they_send() {
     );
 }
 
-/// The one full-size unmultiply still on the frame thread, named so that it is
-/// a decision rather than an oversight.
+/// The radar rasters are converted by **the job**, at the one place every
+/// rasterizing arm funnels through.
 ///
-/// A section raster is `SECTION_WIDTH × SECTION_HEIGHT` — 8 MiB natively,
-/// against the plan view's 16 MiB and the overlay's 71.2 MiB — and it is the
-/// only one of the three whose producer does not already hold the pixels in a
-/// throwaway buffer. `SectionResponse` carries the `CrossSection` itself,
-/// which the pane **retains**: the hover reads it, and
-/// `restore_section_textures` re-uploads from it after a suspend rather than
-/// walking a 15.6 MB volume again. Converting before the send would mean
-/// carrying the `ColorImage` *as well as* the cut, permanently, per section
-/// pane — a memory cost paid for the life of the session to save 8 MiB of
-/// frame thread once per cut.
+/// The counterpart of the assertions above: they say the conversion is not on
+/// the frame thread, and this says where it went instead. `execute`'s output
+/// stage, rather than any of its five arms, because an arm-by-arm conversion is
+/// one a sixth arm can be added without — and the two consumers that would then
+/// read a straight-alpha buffer through `from_rgba_premultiplied` would draw it
+/// too bright with nothing to catch them.
 ///
-/// If that trade is ever taken, delete this test rather than editing it.
+/// Read off the source for the module's reason: what is being asserted is that
+/// the statement is written *inside the job*, and a job that ran on this thread
+/// produces pixels indistinguishable from one that ran in a worker.
 #[test]
-fn the_section_raster_is_the_known_exception() {
+fn the_job_converts_its_own_rasters() {
+    let body = free_body_of(OFFLOAD, "pub fn execute(");
+    assert!(
+        body.contains("output.map(premultiplied)"),
+        "`execute` no longer premultiplies what it answers with. Every radar \
+         consumer reads its buffers through \
+         `ColorImage::from_rgba_premultiplied`, which computes nothing — so a \
+         straight-alpha raster reaching one is not an error, it is a picture \
+         drawn at the wrong opacity.",
+    );
+    assert!(
+        !body.contains(UNMULTIPLY),
+        "`execute` names the unmultiply in one of its arms. It belongs in the \
+         output stage after all of them, which is what stops a sixth arm from \
+         being added without it.",
+    );
+}
+
+/// The section raster is no longer the known exception.
+///
+/// It was, and the note that stood here explained why: a section pane
+/// **retains** its `CrossSection` — the hover reads it and
+/// `restore_section_textures` re-uploads from it after a suspend — so
+/// converting before the send would have meant carrying a `ColorImage` beside
+/// the cut for the life of the session, to save 8 MiB of frame thread once per
+/// cut. That trade was never taken. Premultiplying the cut's *own* raster
+/// inside the job removed the choice: there is one buffer, the pane retains it,
+/// and both uploads read it through a constructor that computes nothing.
+#[test]
+fn the_section_upload_reads_a_converted_raster() {
     let body = body_of(APP_RENDER, "fn upload_section_raster(");
     assert!(
-        body.contains(UNMULTIPLY),
-        "`upload_section_raster` no longer converts, so either the section \
-         raster now arrives converted — in which case this test has been \
-         superseded and should go — or the upload has stopped happening.",
+        body.contains("from_rgba_premultiplied"),
+        "`upload_section_raster` no longer reads the cut as premultiplied, so \
+         either the section raster has stopped arriving converted — in which \
+         case `offload::execute`'s output stage has lost its `Section` arm — or \
+         the upload has stopped happening.",
     );
 }

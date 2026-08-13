@@ -38,7 +38,7 @@ fn every_raster_size_this_build_renders_converts_at_its_own_side() {
 
 /// A length no render produces is refused rather than converted.
 ///
-/// Not defensive padding. `ColorImage::from_rgba_unmultiplied` asserts on a
+/// Not defensive padding. `ColorImage::from_rgba_premultiplied` asserts on a
 /// mismatch and this runs on a native render thread: a panic there sends no
 /// `RenderResponse` at all, so `render_in_flight` never clears and the pane
 /// stops asking for renders for the rest of its life. `None` routes the same

@@ -1559,8 +1559,9 @@ impl super::App {
                     // of this scope and only one of the two buffers is ever in
                     // the channel. On a thread that is off the frame entirely;
                     // in a browser with a worker it is the one part of the
-                    // render that lands on the main thread, and it is a
-                    // reinterpretation of 4 MiB rather than a rasterization.
+                    // render that lands on the main thread, and what it does
+                    // there is copy 4 MiB — the premultiply behind it belongs
+                    // to `offload::execute` and ran in the worker.
                     let converted = match loop_frame_image(&frame.image) {
                         Some(image) => (
                             Some(image),
@@ -1918,18 +1919,22 @@ impl super::App {
 /// frame of any other size is a job that came back at the wrong ceiling, which
 /// is a bug to log rather than a picture to place.
 ///
-/// The length check is not defensive padding. `ColorImage::from_rgba_unmultiplied`
+/// The length check is not defensive padding. `ColorImage::from_rgba_premultiplied`
 /// asserts on a mismatch, and this now runs on the render worker rather than the
 /// main thread: a panic there kills only that thread, so no `LoopRenderResponse`
 /// would ever arrive, `render_in_flight` would never clear, and the frame would stay
 /// blank and be skipped for the life of the loop. Returning `None` routes a
 /// malformed buffer down the same path as "no matching sweep", which the dispatcher
 /// already knows how to retire.
+///
+/// Premultiplied and not unmultiplied because `offload::execute` has already
+/// done the per-pixel walk, in the instance the job ran in. See
+/// `offload::premultiply_raster`.
 fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     if rgba.len() != LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4 {
         return None;
     }
-    Some(egui::ColorImage::from_rgba_unmultiplied(
+    Some(egui::ColorImage::from_rgba_premultiplied(
         [LOOP_IMAGE_SIZE, LOOP_IMAGE_SIZE],
         rgba,
     ))
@@ -1941,7 +1946,7 @@ fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
 /// A separate function rather than a length parameter on the one above, because
 /// the whole point of both is that the shape is a *constant of the view* and not
 /// something a caller supplies: a caller free to pass a length is a caller free
-/// to pass the other view's, and `ColorImage::from_rgba_unmultiplied` would then
+/// to pass the other view's, and `ColorImage::from_rgba_premultiplied` would then
 /// assert on the worker with the frame left in flight for ever. The two
 /// constants are named at the two call sites and nowhere else.
 fn loop_section_image(rgba: &[u8]) -> Option<egui::ColorImage> {
@@ -1949,7 +1954,7 @@ fn loop_section_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     if rgba.len() != SECTION_WIDTH * SECTION_HEIGHT * 4 {
         return None;
     }
-    Some(egui::ColorImage::from_rgba_unmultiplied(
+    Some(egui::ColorImage::from_rgba_premultiplied(
         [SECTION_WIDTH, SECTION_HEIGHT],
         rgba,
     ))

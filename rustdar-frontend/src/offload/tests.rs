@@ -42,7 +42,7 @@ fn detach() {
 /// A job that is cheap to execute and easy to recognize. It renders
 /// nothing, which is fine: the funnel's contract is about *where* and
 /// *whether* `deliver` runs, not what the renderer drew.
-fn a_job() -> JobRequest {
+pub(super) fn a_job() -> JobRequest {
     JobRequest::Radar {
         input: Box::new(
             RenderInput::from_bytes(&sample_input_bytes()).expect("fixture payload decodes"),
@@ -198,7 +198,7 @@ fn a_volume_input() -> RenderInput {
     .expect("the fixture carries reflectivity")
 }
 
-fn a_section_job() -> JobRequest {
+pub(super) fn a_section_job() -> JobRequest {
     JobRequest::Section {
         input: Box::new(a_volume_input()),
         request: SectionRequest {
@@ -210,7 +210,7 @@ fn a_section_job() -> JobRequest {
     }
 }
 
-fn a_voxel_job() -> JobRequest {
+pub(super) fn a_voxel_job() -> JobRequest {
     JobRequest::Voxels {
         input: Box::new(a_volume_input()),
         request: VoxelRequest {

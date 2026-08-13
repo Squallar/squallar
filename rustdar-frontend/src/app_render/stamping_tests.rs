@@ -59,8 +59,9 @@ pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
 }
 
 /// A finished render, as `poll_render_results` builds one. The pixels are
-/// blank but full size, and already converted: the unmultiply moved to the
-/// render thread, so what reaches a pane is a `ColorImage`.
+/// blank but full size, and already converted: the premultiply moved into the
+/// job and the `ColorImage` is built in `deliver`, so what reaches a pane is a
+/// `ColorImage`.
 fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     let side = rustdar_radar::types::IMAGE_SIZE;
     CachedPaneRender {

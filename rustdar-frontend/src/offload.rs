@@ -794,12 +794,86 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Rewrite an RGBA8 raster from the rasterizers' straight alpha into the
+/// premultiplied bytes a [`egui::Color32`] *is*, in place.
+///
+/// # This is the whole of the premultiply, and it is deliberately not new
+/// arithmetic
+///
+/// It calls [`egui::Color32::from_rgba_unmultiplied`] — the same function every
+/// consumer used to call on this buffer — and writes the four bytes back where
+/// they came from. `Color32::from_rgba_premultiplied` is
+/// `Self([r, g, b, a])`, a constructor that computes nothing, so a consumer
+/// reading this buffer through it lands on exactly the `Color32` the old
+/// consumer computed. Not "within a tolerance": the same call, on the same
+/// inputs, in the same order, moved earlier. `premultiply_tests` proves it
+/// exhaustively — the conversion is per-channel independent given the alpha, so
+/// 256 × 256 pairs cover every pixel that can exist.
+///
+/// Reimplementing the arithmetic here would have been the mistake. It is not
+/// `channel * alpha / 255`: the α = 0 arm answers `TRANSPARENT` rather than a
+/// zeroed channel triple, the α = 255 arm skips the multiply, and the arm in
+/// between reads a 64 KiB lookup table `ecolor` builds once. Any of the three
+/// written out by hand is a picture that shifts.
+///
+/// In place, because the buffer is a plan view's `POOLED_IMAGE` texture or a
+/// section's pooled plane and the point of the pools is that neither is
+/// reallocated per render. A second buffer here would hand back the allocation
+/// those slots exist to avoid, at the raster sizes where it matters most —
+/// 206.75 MiB at the 7362 px desktop ceiling.
+fn premultiply_raster(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        let converted =
+            egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3]);
+        pixel.copy_from_slice(&converted.to_array());
+    }
+}
+
+/// [`execute`]'s output stage: every raster an output carries leaves in egui's
+/// premultiplied convention.
+///
+/// # Why it is here and not at the consumer
+///
+/// Because *here* is wherever the job ran, and the consumer is wherever the
+/// picture is drawn, and on the web those are two different threads. The
+/// per-pixel walk this performs is 4.2–4.6 ms at the 2048 px browser ceiling
+/// against a 16.7 ms frame budget, and it used to be spent on the browser's
+/// main thread; it is now spent in the worker. Natively both were already the
+/// same spawned thread, so what moves there is the line and not the cost —
+/// except for the static cross-section, whose upload
+/// (`app_render::upload_section_raster`) converted **on the frame thread** on
+/// both targets and now converts on neither.
+///
+/// A `Voxels` output carries no raster. It is listed rather than caught by a
+/// wildcard so that a fourth output kind carrying pixels has to say here
+/// whether it is premultiplied, instead of silently declining to be.
+fn premultiplied(output: JobOutput) -> JobOutput {
+    match output {
+        JobOutput::Frame(mut frame) => {
+            premultiply_raster(&mut frame.image);
+            JobOutput::Frame(frame)
+        }
+        JobOutput::Section(mut section) => {
+            premultiply_raster(section.image_mut());
+            JobOutput::Section(section)
+        }
+        JobOutput::Voxels(grid) => JobOutput::Voxels(grid),
+    }
+}
+
 /// Do the work.
 ///
 /// Pure, and the *only* implementation: the worker calls it, the native thread
 /// calls it, and the inline fallback calls it. That is what makes a frame
 /// rendered in a worker byte-identical to one rendered on this thread — the
 /// two are not two renderers that agree, they are one renderer.
+///
+/// Every raster that leaves here is **premultiplied**, which is the one thing
+/// this function does that the rasterizers underneath it do not — see
+/// [`premultiplied`], and [`premultiply_raster`] for why the conversion is a
+/// call to egui's own constructor rather than arithmetic written out again.
+/// It runs here rather than at the consumer because here is off the browser's
+/// main thread and off the frame thread on both targets.
 ///
 /// "Pure" is a claim about what it *returns*, and it survives four pieces of
 /// process-wide state underneath, all of them buffer pools and all admissible
@@ -837,7 +911,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
     // Read once, off the request, so the three rasterizing arms cannot come to
     // disagree about how large a picture this job was allowed to make.
     let side_ceiling_px = request.side_ceiling_px();
-    match request {
+    let output = match request {
         JobRequest::Radar {
             input,
             values_wanted,
@@ -933,7 +1007,11 @@ pub fn execute(request: &JobRequest) -> JobResult {
             )
             .map(|grid| JobOutput::Voxels(Box::new(grid)))
         }
-    }
+    };
+    // One place, after every arm, so no rasterizing arm can be added that
+    // forgets it — the alternative is five call sites and a sixth that does not
+    // exist yet.
+    output.map(premultiplied)
 }
 
 /// The product these bytes decode to, or `None` — which the caller reports as a
@@ -1203,3 +1281,7 @@ pub fn jobs_in_worker() -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// The premultiply runs at the producer, and no pixel moved when it got there.
+#[cfg(test)]
+mod premultiply_tests;

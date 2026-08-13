@@ -71,8 +71,8 @@ fn section_line() -> rustdar_egui::pane::SectionLine {
 }
 
 /// Finished pixels at the base size, already converted — which is the shape
-/// `poll_render_results` now receives, the unmultiply having happened on the
-/// render thread.
+/// `poll_render_results` now receives, the premultiply having happened inside
+/// the job and the `ColorImage` having been built in `deliver`.
 fn finished_pixels() -> Arc<egui::ColorImage> {
     let side = rustdar_radar::types::IMAGE_SIZE;
     Arc::new(egui::ColorImage::from_rgba_unmultiplied(

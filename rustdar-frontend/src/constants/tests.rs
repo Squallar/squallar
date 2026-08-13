@@ -1836,7 +1836,7 @@ fn the_static_render_textures_are_named_even_though_the_ceiling_omits_them() {
 /// Every consumer of a render derives its side this way — see
 /// [`raster_side_from_rgba_len`] — so this is the one place the set is
 /// stated. The refusals matter as much as the acceptances: a length that
-/// slipped through would reach `ColorImage::from_rgba_unmultiplied`'s
+/// slipped through would reach `ColorImage::from_rgba_premultiplied`'s
 /// `assert_eq!`, which on a native render thread means no response ever
 /// arrives and the pane stays blank for good.
 #[test]

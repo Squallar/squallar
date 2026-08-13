@@ -49,11 +49,14 @@ pub struct RenderedImage {
     /// figure is two frames dropped every time a long-range render lands, which
     /// is what the binding rule about heavy work on the frame thread is for.
     ///
-    /// It now happens in `spawn_render`'s `deliver`, which is the render thread
-    /// natively and, in the browser, the main thread — the same place and for
-    /// the same reason a loop frame has always been converted there
-    /// (`loop_frame_image`): a browser has one thread to do it on, and it is a
-    /// reinterpretation rather than a rasterization.
+    /// The per-pixel half of it no longer happens anywhere near a frame.
+    /// `offload::execute` premultiplies the raster inside the job — the render
+    /// thread natively, the Web Worker in a browser — so `spawn_render`'s
+    /// `deliver` builds this through `ColorImage::from_rgba_premultiplied`,
+    /// whose per-pixel constructor is `Self([r, g, b, a])` and computes
+    /// nothing. On the browser that is the whole of the win: `deliver` runs on
+    /// the main thread there, and what it does on it is now a length assertion
+    /// and a copy.
     ///
     /// The `Arc` is what keeps it from being copied again: the render cache,
     /// the pane's restore copy and `Context::load_texture` all take this one
@@ -363,8 +366,10 @@ pub struct LoopRenderResponse {
     /// path entirely. In the browser, where the rasterization runs in a Web
     /// Worker that cannot build an `egui::ColorImage` and could not post one if
     /// it did, it happens in `spawn_loop_frame_render`'s `deliver` — on the main
-    /// thread, but as a reinterpretation of 4 MiB rather than a rasterization,
-    /// and against a 1024² loop frame rather than the 2048² a still frame is.
+    /// thread, and against a 1024² loop frame rather than the 2048² a still
+    /// frame is. What it costs there is a copy and nothing else: the premultiply
+    /// itself is `offload::execute`'s, done in the worker, so this end reads the
+    /// bytes through `ColorImage::from_rgba_premultiplied`.
     ///
     /// `None` replaces the previous empty-`Vec` sentinel; the meaning is unchanged.
     /// The receiver `take`s it rather than moving it out, so the rest of the response

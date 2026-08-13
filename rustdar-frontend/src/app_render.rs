@@ -1641,13 +1641,25 @@ impl super::App {
     /// vertical structure was measured continuously. The blockiness is the
     /// data. A resume that quietly re-uploaded the same pixels `LINEAR` would
     /// look like nothing at all had changed.
+    ///
+    /// # The last full-size unmultiply on the frame thread is gone from here
+    ///
+    /// This ran on the frame thread on **both** targets and was the one raster
+    /// walk that did — 8 MiB per cut natively — because the pane retains the
+    /// `CrossSection` rather than a converted copy, so converting before the
+    /// send used to mean carrying both for the life of the session. That trade
+    /// is not the one that was taken: `offload::execute` premultiplies the
+    /// section's own raster inside the job, so the cut the pane retains is
+    /// already in egui's convention and this is a length assertion and a copy.
+    /// The resume path below re-uploads from the same retained bytes and gets
+    /// the same picture, which is what makes one conversion enough.
     fn upload_section_raster(
         &mut self,
         ctx: &egui::Context,
         cut: &rustdar_radar::xsect::CrossSection,
     ) -> egui::TextureHandle {
         self.texture_counter += 1;
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        let color_image = egui::ColorImage::from_rgba_premultiplied(
             [
                 rustdar_radar::xsect::SECTION_WIDTH,
                 rustdar_radar::xsect::SECTION_HEIGHT,
@@ -4524,11 +4536,14 @@ mod frame_build_order_tests;
 
 /// Where the per-pixel unmultiply is allowed to run, and where it is not.
 ///
-/// The binding rule about heavy work on the frame thread, checked at the two
-/// places that kept breaking it: a full-size `ColorImage::from_rgba_unmultiplied`
-/// is 6.66 ms for a 2048² radar raster and ~47 ms for a desktop-sized overlay,
+/// The binding rule about heavy work on the frame thread, checked at the places
+/// that kept breaking it: a full-size `ColorImage::from_rgba_unmultiplied` is
+/// 6.66 ms for a 2048² radar raster and ~47 ms for a desktop-sized overlay,
 /// against a 16.7 ms budget, and both are ordinary per-volume events rather than
-/// rare ones.
+/// rare ones. The radar half of it has since stopped being a question of which
+/// poller converts: `offload::execute` premultiplies inside the job, so there is
+/// no unmultiply for a poller to take. The overlay half still converts in the
+/// closure that drew it, because its producer is not a job.
 #[path = "app_render/frame_thread_conversion_tests.rs"]
 #[cfg(test)]
 mod frame_thread_conversion_tests;
