@@ -2002,6 +2002,78 @@ const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 /// value at 1.2–14.5% of them — 387 bins at KTLX, 467 at KDDC, 191 at KCRP.
 /// The reference is not tolerating an incomplete footprint; it is computing
 /// from one.
+///
+/// # Computing from one was implemented, and its bins are not the reference's
+///
+/// Smith & Elmore (2004) P5.6 — the LLSD azimuthal shear MRMS reports — fits
+/// over the samples that are there and renormalizes the weights for the ones
+/// that are not. Translated to this tap list that is the least-squares
+/// projection of the profile onto the surviving weights, both mean-centred on
+/// the cells actually read, rescaled by the whole stencil's weight energy
+/// Σtₖ²: numerator and denominator over the same support, which is what
+/// renormalizing means and is the only form that never puts a number where the
+/// radar reported none. Substituting zero is not available — a below-threshold
+/// gate is the radar measuring *no scatterers*, not scatterers at rest, and a
+/// zero under a derivative is fabricated shear.
+///
+/// It is an extension and not a change. The mirrored weights sum to zero, so
+/// on a whole footprint the centred fit **is** Σtₖ·(v(i+k) − v(i−k)) and the
+/// arithmetic below is left to compute it; the nine dumps come back
+/// byte-identical to this tree with the relaxation compiled in and switched
+/// off, and no configuration of it loses a painted bin at any site. So what
+/// follows is only ever about bins that are ND today.
+///
+/// What each relaxation adds over the nine decoded fields — a bin the
+/// reference confirms, or a bin where it paints nothing at all:
+///
+/// ```text
+///                                    added  confirmed  refused   prec  ≥0.75  orphan
+///     drop the ±5 margin only         1011        494      517  0.489     78     247
+///     renormalize, 95% of Σtₖ² left    435        210      225  0.483     68     126
+///     renormalize, one cell short     1599        707      892  0.442    201     433
+///     renormalize, half the taps      2859        985     1874  0.345    435     954
+///     both of the last two            7926       1782     6144  0.225   1158    2995
+///     the published count rescale     5876       1060     4816  0.180   1231    3479
+///
+///     the field as it already is      8161       6104     2057  0.748
+/// ```
+///
+/// `orphan` is a refused bin standing in a painted cluster the reference never
+/// touches; `≥0.75` counts the refused bins loud enough to draw a couplet.
+/// Every row buys bins worse than the ones already here, the ordering is
+/// monotone in how much footprint is allowed to be missing, and there is no
+/// knee to operate at: even the most conservative rule that renormalizes
+/// anything — 95% of the weight energy surviving, so the rescale is barely a
+/// rescale — is right 210 times in 435 and leaves 68 loud bins on ground the
+/// reference reads as still.
+///
+/// The last row is the oracle's own formula as written: the numerator over the
+/// survivors against a full-support denominator, scaled by the count. It is the
+/// worst of the six, and structurally so — over an asymmetric footprint Σtₖ of
+/// the survivors is no longer zero, so a *constant* profile reads as shear. The
+/// Rankine-vortex harness that recovers 91–106% of a known truth never caught
+/// it, because its synthetic carries no holes and the renormalization it
+/// validates is multiplication by one.
+///
+/// The margin and the taps were asked **separately**, because the ±5 cells are
+/// read by no tap: they are an echo-edge sentinel, not part of the fit, and the
+/// published method has no such rule. Dropping them alone is the top row and
+/// the best-behaved thing on this page — and still 517 bins the reference does
+/// not have, 78 at |NROT| ≥ 0.75 and 247 in clusters it never touches. Refused
+/// on its own evidence, not by association.
+///
+/// The **coherence gate** below keeps its meaning rather than its arithmetic.
+/// It is the squared correlation between the profile and the weights, so over a
+/// partial footprint it is that same correlation over the cells actually read,
+/// with both centred on that support — recentring the weights is what keeps
+/// `Σ w` out of the numerator, and without it the statistic answers a different
+/// question at every hole. Wherever the footprint is whole the two definitions
+/// coincide, which is why nothing here changed.
+///
+/// KHNX decides nothing either way: all 62 272 of its annulus bins carrying
+/// velocity are set aside by [`incoherent_velocity`] before this function is
+/// reached, so its zero is held upstream and no rule on this page can move it.
+/// The control is passed, and passed vacuously.
 fn tap_stencil(prof: &[f64], taps: &[(i32, f64)]) -> Option<f64> {
     const C: usize = PROFILE_MAX_HALF;
     // Data-margin completeness: the outermost cells must be populated too, so
