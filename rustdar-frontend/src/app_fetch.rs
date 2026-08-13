@@ -1512,9 +1512,10 @@ impl super::App {
                             values_wanted: false,
                             // The same policy in the other dimension: a loop
                             // renders at `LOOP_IMAGE_SIZE` however far its
-                            // sweep reaches. A desktop loop textures 30 frames
-                            // at once, and at 4096² that is 30 × 64 MiB =
-                            // 1.9 GiB a pane against a 512 MiB loop budget.
+                            // sweep reaches. A desktop loop textures up to 36
+                            // frames at once, and at 4096² that is
+                            // 36 × 64 MiB = 2.3 GiB a pane against a 576 MiB
+                            // loop budget.
                             // See `JobRequest::side_ceiling_px`.
                             side_ceiling_px: crate::constants::LOOP_IMAGE_SIZE as u32,
                         })
