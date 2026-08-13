@@ -212,16 +212,48 @@ fn temp_weight_ramps_between_the_freezing_heights() {
     assert_eq!(temp_weight(2.0, 1.0, 0.5), 1.0);
 }
 
-/// WT at the paper's example heights, and the 20 J m⁻¹ s⁻¹ floor: below
-/// `H₀ = 141/57.5 ≈ 2.452` km the model line sits under the floor.
+/// WT on the RPG's unlisted-site offset, and the 20 J m⁻¹ s⁻¹ floor: below
+/// `H₀ = 116.3/57.5 ≈ 2.023` km the model line sits under the floor.
 #[test]
-fn warning_threshold_is_the_papers_line_with_the_20_floor() {
-    assert_close(warning_threshold(3.0), 51.5, 1e-12, "WT(3)");
-    assert_close(warning_threshold(5.0), 166.5, 1e-12, "WT(5)");
+fn warning_threshold_is_the_rpg_line_with_the_20_floor() {
+    assert_close(warning_threshold(3.0), 76.2, 1e-12, "WT(3)");
+    assert_close(warning_threshold(5.0), 191.2, 1e-12, "WT(5)");
     assert_eq!(warning_threshold(1.0), 20.0, "under the floor");
     assert_eq!(warning_threshold(0.0), 20.0);
-    assert_eq!(warning_threshold(2.4), 20.0, "just under the crossover");
-    assert!(warning_threshold(2.5) > 20.0, "just over the crossover");
+    assert_eq!(warning_threshold(2.0), 20.0, "just under the crossover");
+    assert!(warning_threshold(2.1) > 20.0, "just over the crossover");
+}
+
+/// The explicit-offset form is `a31599.ftn`'s `WT = WT_COF*HT0_ARL + WT_OFS`
+/// with the same floor, and the no-offset form is exactly it at the RPG's
+/// unlisted-site fallback.
+#[test]
+fn warning_threshold_takes_a_site_offset_and_floors_it_the_same_way() {
+    // KFSX's published +10.7 and KMOB's −115.9 — the extremes among the sites
+    // the NHI comparison covered.
+    assert_close(
+        warning_threshold_with_offset(3.0, 10.7),
+        57.5 * 3.0 + 10.7,
+        1e-12,
+        "KFSX",
+    );
+    assert_close(
+        warning_threshold_with_offset(4.0, -115.9),
+        57.5 * 4.0 - 115.9,
+        1e-12,
+        "KMOB",
+    );
+    assert_eq!(
+        warning_threshold_with_offset(1.0, -115.9),
+        20.0,
+        "the floor applies to the site form too",
+    );
+    for h0 in [0.0, 1.0, 2.5, 3.0, 5.0, 9.0] {
+        assert_eq!(
+            warning_threshold(h0),
+            warning_threshold_with_offset(h0, WT_OFFSET_OTHER_SITES),
+        );
+    }
 }
 
 /// The POSH curve: 50 % exactly at `SHI = WT`, the clamps at both ends,
@@ -519,7 +551,9 @@ fn the_paper_constants_are_pinned() {
     assert_eq!(HKE_REF_WGT_HIGH_DBZ, 50.0);
     assert_eq!(SHI_COEF, 0.1);
     assert_eq!(WT_COEF_PER_KM, 57.5);
-    assert_eq!(WT_OFFSET, -121.0);
+    // `hail.alg`'s `Other_sites` entry, not the paper's −121: see
+    // `the_rpg_reconstructs_its_own_posh_only_under_the_site_offset`.
+    assert_eq!(WT_OFFSET_OTHER_SITES, -96.3);
     assert_eq!(WT_FLOOR, 20.0);
     assert_eq!(POSH_COEF, 29.0);
     assert_eq!(POSH_OFFSET_PCT, 50.0);
@@ -528,4 +562,72 @@ fn the_paper_constants_are_pinned() {
     // The ORPG factoring is the same arithmetic: 0.0005 per km of depth
     // is 0.1 × 5e-6 per metre (`hke_coef1` in `hail.alg`).
     assert!((SHI_COEF * HKE_FLUX_COEF * 1000.0 - 0.0005).abs() < 1e-18);
+}
+
+/// The RPG derives POSH *and* MEHS from one SHI, and publishes both — plus
+/// the `WTSM OFFSET` and `HEIGHT (0 DEG CELSIUS)` it used — on every NHI
+/// product. So the oracle can be made to check our warning threshold against
+/// itself, with no rustdar quantity anywhere in the loop:
+///
+/// ```text
+/// SHI  = (MEHS_in / 0.10)^2          (invert `shi_hail_size_coef`)
+/// POSH = 29·ln(SHI / WT) + 50        (must return the published POSH)
+/// ```
+///
+/// Every row below is one admitted cell decoded by **MetPy** from the NHI
+/// products of the T18 comparison — the *first* qualifying cell at each of
+/// its 11 sites in file order, a values-blind pick, one row per site. The
+/// fields are the RPG's own: published offset, `H₀` km ARL, published POSH %,
+/// published MEHS in.
+///
+/// The oracle is quantised (POSH 10 points, MEHS ¼ in), so no single row
+/// reconstructs exactly and the test does not ask one to. It asserts the
+/// thing quantisation cannot manufacture: **pooled across the fleet, the
+/// published per-site offset reproduces the RPG's own POSH far better than
+/// the paper's −121 does.** That fails if `WT_OFFSET_OTHER_SITES` is reverted
+/// to −121, and it never consults our SHI, our grid, or our constant.
+#[test]
+fn the_rpg_reconstructs_its_own_posh_only_under_the_site_offset() {
+    // site, published WTSM OFFSET, H₀ km ARL, published POSH %, MEHS in
+    const ORACLE: [(&str, f64, f64, f64, f64); 11] = [
+        ("KBLX", -56.8, 2.864_880, 60.0, 1.25),
+        ("KFSX", 10.7, 2.647_760, 30.0, 1.25),
+        ("KGLD", -55.9, 3.561_920, 70.0, 1.75),
+        ("KGRB", -107.3, 3.773_360, 80.0, 2.00),
+        ("KILN", -100.5, 3.149_200, 50.0, 0.75),
+        ("KLWX", -114.5, 3.046_920, 30.0, 0.50),
+        ("KMOB", -115.9, 3.723_000, 40.0, 1.25),
+        ("KPDT", -93.3, 2.993_720, 40.0, 1.00),
+        ("KPUX", -27.9, 2.450_320, 50.0, 1.00),
+        ("KTLX", -98.6, 3.512_440, 70.0, 1.25),
+        ("KUEX", -85.0, 3.214_480, 90.0, 2.00),
+    ];
+    // The paper's figure, named here only so this test can reject it.
+    const PAPER_OFFSET: f64 = -121.0;
+
+    let (mut err_site, mut err_paper) = (0.0f64, 0.0f64);
+    for (site, offset, h0_km_arl, published_posh, mehs_in) in ORACLE {
+        // `shi_hail_size_coef = 0.10` with MEHS in inches (`a31559.ftn`).
+        let shi = (mehs_in / 0.10).powi(2);
+        let site_posh = posh_pct(shi, warning_threshold_with_offset(h0_km_arl, offset));
+        let paper_posh = posh_pct(shi, warning_threshold_with_offset(h0_km_arl, PAPER_OFFSET));
+        err_site += (site_posh - published_posh).abs();
+        err_paper += (paper_posh - published_posh).abs();
+
+        // The published offsets must sit inside `hail_algorithm.h`'s declared
+        // `@min -500.0 @max 500.0` — the header's bounds are trustworthy even
+        // where its `@default` is not.
+        assert!(
+            (-500.0..=500.0).contains(&offset),
+            "{site}: published offset {offset} outside the ORPG's declared range",
+        );
+    }
+
+    assert!(
+        err_site < err_paper / 2.0,
+        "the RPG's own POSH is reconstructed better by −121 than by the offsets \
+         the RPG published: site {err_site:.1} pts vs paper {err_paper:.1} pts \
+         over {} sites",
+        ORACLE.len(),
+    );
 }

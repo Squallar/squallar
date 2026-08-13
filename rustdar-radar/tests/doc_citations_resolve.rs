@@ -237,6 +237,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          lowercase in the source document. A spec identifier, not a test.",
     ),
     (
+        "rustdar-radar/src/hail.rs",
+        "warn_thr_sel_mod_off",
+        "The coefficient's sibling in the same `hail.alg` stanza, and the one \
+         parameter this module does NOT take from the paper: its `value =` is \
+         empty and its per-site `default =` table is what every RPG resolves. \
+         The paragraphs establishing that the offset is site-adaptable cannot \
+         avoid naming it. A spec identifier, not a test.",
+    ),
+    (
         "rustdar-radar/src/hca.rs",
         "rpg_b21_0r1_7_pub_src",
         "The filename of the ORPG build-21 source drop the HCA twin is \

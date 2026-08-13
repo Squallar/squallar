@@ -32,7 +32,10 @@
 //!   ```
 //!
 //! * **Warning threshold** (Eq. 8): `WT = 57.5·H₀ − 121` with `H₀` in km
-//!   ARL, floored at 20 J m⁻¹ s⁻¹.
+//!   ARL, floored at 20 J m⁻¹ s⁻¹. The paper's `−121` is a **fleet-wide
+//!   figure the operational RPG does not use**; the offset is site-adaptable
+//!   and this module ships the RPG's own fallback instead — see
+//!   [`WT_OFFSET_OTHER_SITES`] and the source cross-check below.
 //!
 //! * **POSH** (Eq. 9): `29·ln(SHI/WT) + 50`, clamped to [0, 100] % —
 //!   `SHI = WT` reads exactly 50 %.
@@ -49,8 +52,10 @@
 //!   (`a31539.ftn`: `HKE = HKE_COF1·REF_WF·(10^0.084)^Z`, summed as
 //!   `HKE·ΔH_km·W_T`). `0.0005` per **km** of depth is exactly the paper's
 //!   `0.1 × 5×10⁻⁶` per **metre**, so the two agree identically.
-//! * `warn_thr_sel_mod_coef = 57.5`, default offset `−121.0`, and the
-//!   hard floor `IF (WT .LT. 20.) WT = 20.` (`a31599.ftn`).
+//! * `warn_thr_sel_mod_coef = 57.5` and the hard floor
+//!   `IF (WT .LT. 20.) WT = 20.` (`a31599.ftn`, `WT = WT_COF·HT0_ARL +
+//!   WT_OFS`). The **offset** is the one constant here that is *not* the
+//!   paper's — it is per-site, and the next section is about why.
 //! * `posh_coef = 29.0`, `posh_offset = 50` (`a31559.ftn`, applied ×0.1 and
 //!   re-multiplied by 10 to round the *output* to the nearest 10 %).
 //! * `shi_hail_size_coef = 0.10`, exponent `0.5` — hail size in **inches**;
@@ -61,12 +66,34 @@
 //! **Where the released source differs from the paper** (noted per the
 //! campaign convention; none changes the arithmetic here):
 //!
-//! * The fleet's `hail.alg` carries a **per-site WT offset table**
-//!   (KDDC −74.2, KFSD −94.8, … full range −119.5 to +55.2) in place of the
-//!   paper's single −121. The *default* is still −121.0
-//!   (`hail_algorithm.h`), and that is what this module ships; the live
-//!   harness parses each site's actual offset out of the NHI product's own
-//!   adaptation page and scores against the site-tuned value too.
+//! * **The WT offset is per-site, and −121 is not a value the RPG ever
+//!   runs.** `hail.alg`'s `warn_thr_sel_mod_off` has an **empty `value =`**
+//!   and a `default =` table of **159 named sites** (KDDC −74.2, KFSD −94.8,
+//!   …) plus `Other_sites: -96.3`, the offset an RPG uses for a site not in
+//!   the table. The named range is **−119.5 (KBRO) to +66.8 (KICX)**, so the
+//!   paper's −121 is not merely absent: it sits below the entire fleet, and
+//!   every site's WT is therefore *higher* — and its POSH *lower* — than
+//!   −121 yields. `hail_algorithm.h` does say
+//!   `@default -121.0`, but the header carries *bounds*, not the shipped
+//!   value, and this is one more of the counterexamples the campaign has
+//!   collected. Three independent sources agree on the per-site reading:
+//!   (1) the `hail.alg` table; (2) each NHI product's own `HAIL DETECTION
+//!   ADAPTATION DATA` tabular page, which publishes `WTSM OFFSET` at `F6.1`
+//!   (`a3164f.ftn` format 913, reached from `a31509.ftn`'s
+//!   `HAIL_RADAP(HA_WTO)`) — byte-exact against the table at 11/11 sites
+//!   measured; and (3) inverting the RPG's *own* published POSH and MEHS,
+//!   which share one SHI, to recover the WT it ran — closer to the site value
+//!   than to −121 at 11/11 sites. FMH-11 Part C § 3.2.4.1 prints −121 as a
+//!   bare "operational parameter" and never calls it site-adaptable; that is
+//!   the provenance of the paper's figure, and it is silent rather than
+//!   contradictory (§ 3.5.3 shows the handbook declaring *other* algorithms'
+//!   coefficients site-adaptable when it means to).
+//!
+//!   So [`WT_OFFSET_OTHER_SITES`] ships the RPG's own unlisted-site fallback,
+//!   **not** the paper's −121. A caller that knows the site's published
+//!   offset should pass it to [`warning_threshold_with_offset`]; the table
+//!   itself is adaptation data and is deliberately not vendored here.
+//!   **This moves POSH only** — MEHS is `2.54·SHI^0.5`, with no WT term.
 //! * The operational POSH is **rounded to the nearest 10 %** and MEHS to the
 //!   nearest **¼ inch**, with sizes above 4 in flagged and displayed as
 //!   `> 4.00` (`a31559.ftn`, `a31644.ftn`). Those are cell-product display
@@ -179,10 +206,21 @@ pub const SHI_COEF: f64 = 0.1;
 /// `warn_thr_sel_mod_coef`).
 pub const WT_COEF_PER_KM: f64 = 57.5;
 
-/// Warning threshold offset, J m⁻¹ s⁻¹ (Eq. 8). The paper's −121 and the
-/// released source's default; the fleet's per-site `hail.alg` overrides are
-/// documented in the module doc and applied only by the live harness.
-pub const WT_OFFSET: f64 = -121.0;
+/// Warning threshold offset for a site the RPG's own table does not list,
+/// J m⁻¹ s⁻¹ — `hail.alg`'s `warn_thr_sel_mod_off` entry `Other_sites: -96.3`.
+///
+/// This is **not** the paper's −121 (Eq. 8), and the difference is not
+/// cosmetic: `hail.alg` gives `warn_thr_sel_mod_off` an *empty* `value =`, so
+/// every RPG resolves it from the per-site `default =` table, and −121 is not
+/// in that table for any site. A site whose real offset this module does not
+/// know is therefore better served by the RPG's own fallback than by a figure
+/// no RPG runs. See the module doc for the three sources that establish it.
+///
+/// Prefer [`warning_threshold_with_offset`] wherever the site's published
+/// offset is actually available — the spread across the fleet is wide
+/// (−119.5 to +66.8), so the fallback is a floor on correctness, not a
+/// substitute for the real value.
+pub const WT_OFFSET_OTHER_SITES: f64 = -96.3;
 
 /// The warning threshold's floor, J m⁻¹ s⁻¹ (`a31599.ftn`; WDTD states it
 /// too).
@@ -262,10 +300,21 @@ pub fn temp_weight(h_km_arl: f64, h0_km_arl: f64, hm20_km_arl: f64) -> f64 {
     }
 }
 
-/// The warning threshold of Eq. 8: `57.5·H₀ − 121`, floored at 20 J m⁻¹ s⁻¹,
-/// `H₀` in km ARL.
+/// The warning threshold of Eq. 8 under an **explicit** site offset:
+/// `57.5·H₀ + offset`, floored at 20 J m⁻¹ s⁻¹, `H₀` in km ARL.
+///
+/// `offset` is the site's `WTSM OFFSET` — the RPG publishes it on every NHI
+/// product's `HAIL DETECTION ADAPTATION DATA` page, so a caller holding that
+/// product has the exact value the RPG ran. `a31599.ftn` computes
+/// `WT = WT_COF * HT0_ARL + WT_OFS` and floors it identically.
+pub fn warning_threshold_with_offset(h0_km_arl: f64, offset: f64) -> f64 {
+    (WT_COEF_PER_KM * h0_km_arl + offset).max(WT_FLOOR)
+}
+
+/// The warning threshold of Eq. 8 for a site whose offset is unknown, using
+/// the RPG's own unlisted-site fallback [`WT_OFFSET_OTHER_SITES`].
 pub fn warning_threshold(h0_km_arl: f64) -> f64 {
-    (WT_COEF_PER_KM * h0_km_arl + WT_OFFSET).max(WT_FLOOR)
+    warning_threshold_with_offset(h0_km_arl, WT_OFFSET_OTHER_SITES)
 }
 
 /// POSH (Eq. 9), %: `29·ln(SHI/WT) + 50`, clamped to [0, 100]. A
