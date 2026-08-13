@@ -160,7 +160,7 @@ fn a_placed_render_dates_the_pane_it_lands_on() {
     let pane = app.gui.pane_mut(0).unwrap();
     assert!(
         pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar)
-            .current
+            .current()
             .is_some(),
         "precondition: no texture was placed at all",
     );
@@ -323,8 +323,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
     let pane = app.gui.pane_mut(0).unwrap();
     let cache = pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
     let placed = cache
-        .current
-        .as_ref()
+        .current()
         .expect("the long-range render must have been placed");
     assert_eq!(
         (placed.width, placed.height),
@@ -382,15 +381,14 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
         let pane = app.gui.pane_mut(0).unwrap();
         let cache =
             pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
-        cache.current = None;
+        cache.clear();
     }
     app.restore_cached_render(&ctx);
 
     let pane = app.gui.pane_mut(0).unwrap();
     let cache = pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
     let placed = cache
-        .current
-        .as_ref()
+        .current()
         .expect("the kept copy must have been re-uploaded");
     assert_eq!(
         placed.radar_meta.as_ref().and_then(|m| m.nyquist_ms),
@@ -433,7 +431,7 @@ fn a_resumed_velocity_pane_annotates_the_fold_again() {
         let pane = app.gui.pane_mut(0).unwrap();
         let cache =
             pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
-        cache.current = None;
+        cache.clear();
     }
     assert_eq!(
         app.gui.pane(0).unwrap().displayed_nyquist_ms(),

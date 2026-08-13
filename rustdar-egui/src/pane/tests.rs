@@ -1147,31 +1147,32 @@ fn pane_showing_render(
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     let mut pane = PaneState::new();
     pane.selected_product = product;
-    pane.overlay_cache_mut(OverlayKind::Radar).current = Some(OverlayTextureData {
-        texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
-        geo_bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 34.0,
-            max_lat: 36.0,
-            min_lon: -98.0,
-            max_lon: -96.0,
-        },
-        data_generation: 0,
-        render_zoom: 0,
-        width: 1,
-        height: 1,
-        radar_meta: Some(RadarTextureMeta {
-            hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
-            lat: 35.0,
-            lon: -97.0,
-            max_range_km: 100.0,
-            nyquist_ms,
-            melting_layer_source,
-            storm_motion_source,
-            product,
-            elevation: 0.5,
-        }),
-        hit_map: None,
-    });
+    pane.overlay_cache_mut(OverlayKind::Radar)
+        .show(OverlayTextureData {
+            texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
+            geo_bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 34.0,
+                max_lat: 36.0,
+                min_lon: -98.0,
+                max_lon: -96.0,
+            },
+            data_generation: 0,
+            render_zoom: 0,
+            width: 1,
+            height: 1,
+            radar_meta: Some(RadarTextureMeta {
+                hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
+                lat: 35.0,
+                lon: -97.0,
+                max_range_km: 100.0,
+                nyquist_ms,
+                melting_layer_source,
+                storm_motion_source,
+                product,
+                elevation: 0.5,
+            }),
+            hit_map: None,
+        });
     pane
 }
 

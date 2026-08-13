@@ -444,6 +444,26 @@ pub struct OverlayTextureData {
     pub hit_map: Option<HitMap>,
 }
 
+/// A picture that has been handed to the GPU and is not yet all there.
+///
+/// Everything that describes one raster, travelling together so that it can be
+/// put on screen in one step — see [`OverlayTextureCache`]'s type note for why
+/// the caption cannot land ahead of the pixels it captions.
+pub struct HeldOverlayTexture {
+    /// What goes on screen once the last band lands.
+    pub data: OverlayTextureData,
+    /// The pane's [`data_time`](crate::pane::PaneState::data_time) for these
+    /// pixels, applied by [`crate::pane::PaneState::promote_held_raster`].
+    ///
+    /// Here rather than on the pane for the reason
+    /// [`RadarTextureMeta::melting_layer_source`] gives about itself: it is a
+    /// property of *this* image, and a pane-level copy written when the render
+    /// arrived would date the previous picture with the new one's volume for as
+    /// long as the upload took. On a site that went down yesterday the two
+    /// differ by most of a day.
+    pub data_time: Option<chrono::NaiveDateTime>,
+}
+
 /// Per-overlay-type texture cache for a single pane.
 ///
 /// # There is no dispatch counter here, deliberately
@@ -466,9 +486,37 @@ pub struct OverlayTextureData {
 /// A result that arrived late is therefore superseded on the very next frame by
 /// the same test that would have asked for it in the first place — no sequence
 /// number required.
+///
+/// # A picture on screen is a whole picture
+///
+/// [`Self::current`] is private, and that is what [`Self::held`] is for. A
+/// raster crosses PCIe in bands over several frames
+/// (`rustdar_frontend::egui_renderer::texture_upload`), so the pixels behind a
+/// fresh `TextureHandle` are not all there on the frame it is minted. A cache
+/// that assigned the handle straight into `current` would draw a picture filling
+/// in top-down; one that assigned it and left the *placement* and the *caption*
+/// beside it would be worse, because those describe the new sweep while the
+/// texels under them are still the old one's.
+///
+/// So a new texture is [`held`](Self::hold) — with its bounds, its
+/// [`RadarTextureMeta`] and the pane stamp that dates it — and the whole set is
+/// swapped in one step by [`Self::promote`] once the upload path says the last
+/// band has landed. The previous picture stays on screen, entire and correctly
+/// captioned, until that moment. `current` is private so that there is no way to
+/// break the pair apart.
 pub struct OverlayTextureCache {
-    /// Currently displayed texture (if any).
-    pub current: Option<OverlayTextureData>,
+    /// Currently displayed texture (if any) — **whole**, always.
+    ///
+    /// Private; see the type note. [`Self::show`], [`Self::hold`] +
+    /// [`Self::promote`], and [`Self::clear`] are the three ways it moves, and
+    /// each of them resolves [`Self::held`] in the same breath.
+    current: Option<OverlayTextureData>,
+    /// A picture whose pixels have not all reached the GPU yet.
+    ///
+    /// `None` for every overlay kind but the radar raster: nothing else this
+    /// application draws is large enough for its upload to outlast the frame it
+    /// was handed over on.
+    held: Option<HeldOverlayTexture>,
     /// Whether a background render is in progress for this cache.
     pub render_in_flight: bool,
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
@@ -493,9 +541,103 @@ impl OverlayTextureCache {
     pub fn new() -> Self {
         Self {
             current: None,
+            held: None,
             render_in_flight: false,
             last_seen_zoom: None,
         }
+    }
+
+    /// The picture on screen. Whole, always — see the type note.
+    pub fn current(&self) -> Option<&OverlayTextureData> {
+        self.current.as_ref()
+    }
+
+    /// Put `data` on screen now, and let go of anything being held.
+    ///
+    /// For a texture whose pixels are already all on the GPU. Two callers have
+    /// one: `poll_overlay_render_results`, whose overlay rasters are small
+    /// enough to cross in the frame they are handed over on, and
+    /// `restore_cached_render`, which is rebuilding a dead context's textures
+    /// and so has no predecessor to keep on screen anyway.
+    ///
+    /// Dropping the hold is the point rather than a side effect: a picture the
+    /// caller has decided to show *now* supersedes one that was still arriving,
+    /// and leaving it queued would let it swap itself in a few frames later over
+    /// the top.
+    pub fn show(&mut self, data: OverlayTextureData) {
+        self.held = None;
+        self.current = Some(data);
+    }
+
+    /// Hold `data` until its pixels have all reached the GPU.
+    ///
+    /// The picture already on screen stays there, entire and with its own
+    /// bounds and caption, until [`Self::promote`] swaps the two. Replaces any
+    /// earlier hold — a newer render supersedes one still arriving, and the
+    /// superseded handle drops here, which is what lets egui retire it and
+    /// `TextureUploads::free` throw away the bands it had left.
+    pub fn hold(&mut self, data: OverlayTextureData, data_time: Option<chrono::NaiveDateTime>) {
+        self.held = Some(HeldOverlayTexture { data, data_time });
+    }
+
+    /// The texture being held, if one is.
+    pub fn held_texture(&self) -> Option<&egui::TextureHandle> {
+        self.held.as_ref().map(|held| &held.data.texture)
+    }
+
+    /// Whether a picture is waiting on its pixels.
+    ///
+    /// Read by `Gui::any_raster_held`, which is how the frame loop knows it owes
+    /// another frame: the app runs on `ControlFlow::Wait`, and a hold that
+    /// nothing wakes is a pane showing the previous sweep until an unrelated
+    /// input happens by.
+    pub fn is_holding(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Take the held picture if `delivered` says its pixels have all landed.
+    ///
+    /// `None` when there is nothing held or the last band has not arrived, and
+    /// then this cache is unchanged and the question can be asked again next
+    /// frame — which is the whole reason it is a question. The caller owes the
+    /// returned record a [`Self::show`]; it comes back rather than going
+    /// straight on screen because the pane stamp that travels with it does not
+    /// live in this type. [`crate::pane::PaneState::promote_held_raster`] is
+    /// that caller and the only one.
+    ///
+    /// The predicate is passed in because this crate has no renderer: the only
+    /// thing that knows how far an upload has got is
+    /// `rustdar_frontend::egui_renderer::EguiRenderer::is_delivered`.
+    pub fn take_held_if_delivered(
+        &mut self,
+        delivered: impl Fn(egui::TextureId) -> bool,
+    ) -> Option<HeldOverlayTexture> {
+        if !delivered(self.held.as_ref()?.data.texture.id()) {
+            return None;
+        }
+        self.held.take()
+    }
+
+    /// Forget the picture on screen and anything being held for it.
+    ///
+    /// Both, always. A clear that left the hold behind would put the raster on
+    /// screen a few frames later, after the very event — a site switch, a pane
+    /// with no scan, a graphics reset — that decided the pane should be showing
+    /// nothing.
+    pub fn clear(&mut self) {
+        self.current = None;
+        self.held = None;
+    }
+
+    /// Let go of a held picture without showing it.
+    ///
+    /// The one thing that ends a hold whose upload will never finish, which is a
+    /// hold whose renderer no longer exists: after a suspend/resume or a surface
+    /// loss the id belongs to a dead `egui::Context` and
+    /// `TextureUploads::is_delivered` will answer `false` about it for ever.
+    /// `App::restore_cached_render` calls this before it re-uploads.
+    pub fn release_hold(&mut self) {
+        self.held = None;
     }
 
     /// Whether this cache's texture is at a zoom other than the map's.
@@ -859,6 +1001,11 @@ pub fn viewport_geo_bounds(projector: &walkers::Projector, screen_rect: egui::Re
 pub fn current_quantized_zoom(zoom: f64) -> i32 {
     quantize_zoom(zoom)
 }
+
+/// A pane keeps its picture until the next one is whole: the four ways a hold
+/// ends, and the one thing that must not happen while it lasts.
+#[cfg(test)]
+mod hold_tests;
 
 #[cfg(test)]
 mod geo_click_tests;

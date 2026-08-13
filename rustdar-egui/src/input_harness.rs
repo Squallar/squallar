@@ -1589,7 +1589,7 @@ impl InputHarness {
             .pane_mut(idx)
             .unwrap()
             .overlay_cache_mut(OverlayKind::Radar);
-        cache.current = Some(OverlayTextureData {
+        cache.show(OverlayTextureData {
             texture,
             geo_bounds: rustdar_overlays::types::GeoBounds {
                 min_lat: bounds.min_lat,

@@ -294,7 +294,7 @@ pub(super) fn render_pane_map_content(
                         let meta_snapshot = ctx
                             .pane
                             .overlay_cache(OverlayKind::Radar)
-                            .and_then(|c| c.current.as_ref())
+                            .and_then(|c| c.current())
                             .and_then(|tex| tex.radar_meta.as_ref())
                             .map(|m| {
                                 (
@@ -308,7 +308,7 @@ pub(super) fn render_pane_map_content(
                         if let Some(tex) = ctx
                             .pane
                             .overlay_cache(OverlayKind::Radar)
-                            .and_then(|c| c.current.as_ref())
+                            .and_then(|c| c.current())
                         {
                             let screen_rect = ui.max_rect();
                             draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
@@ -385,11 +385,7 @@ pub(super) fn render_pane_map_content(
                 }
                 // Radar sites: texture + per-frame interactions (text labels, clicks)
                 OverlayKind::RadarSites => {
-                    if let Some(tex) = ctx
-                        .pane
-                        .overlay_cache(kind)
-                        .and_then(|c| c.current.as_ref())
-                    {
+                    if let Some(tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current()) {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
@@ -631,7 +627,7 @@ pub(super) fn render_pane_map_content(
                 settle_owed = true;
             }
             if !enabled {
-                cache.current = None;
+                cache.clear();
             }
         }
 
@@ -669,7 +665,7 @@ pub(super) fn render_pane_map_content(
         let raw_meta = ctx
             .pane
             .overlay_cache(OverlayKind::Radar)
-            .and_then(|c| c.current.as_ref())
+            .and_then(|c| c.current())
             .and_then(|tex| tex.radar_meta.as_ref())
             .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.hover)));
         if let Some((lat, lon, hover)) = raw_meta {
