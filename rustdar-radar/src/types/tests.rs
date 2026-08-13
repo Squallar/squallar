@@ -249,6 +249,12 @@ fn an_unstated_reach_is_the_only_way_to_reach_the_fallback_extent() {
 #[test]
 fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
     const LONG_RANGE: usize = 4096;
+    // The gate spacing every row is sampled at unless it says otherwise. A
+    // quarter-kilometre gate asks for more pixels than `LONG_RANGE` offers at
+    // every extent in this table, so the ceiling is what binds and these rows
+    // say what they always said. The rows where the *data* binds instead are
+    // `a_raster_is_never_asked_for_more_texels_than_its_samples_can_fill`.
+    const SUPER_RES_GATE_KM: f64 = 0.25;
     for (extent, ceiling, side, why) in [
         // At and below the reference extent: the base size, whatever is on
         // offer.
@@ -261,11 +267,17 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
             IMAGE_SIZE,
             "exactly the reference extent, with 4096 offered",
         ),
-        // Past it: the ceiling, because there is now ground to spend it on.
+        // Past it: the ceiling, because there is now ground to spend it on —
+        // once there is enough data to spend it *with*. A tenth of a kilometre
+        // past the reference extent there is not: 460.2 km of ground sampled
+        // every 0.25 km carries 3682 px at two texels a gate, and the raster
+        // stops there rather than taking the whole 4096. That used to be a
+        // cliff — 2048 px at 230.0 km and 4096 at 230.1 — and it is now a
+        // continuous rise, which is the same fact seen from the other side.
         (
             230.1,
             LONG_RANGE,
-            LONG_RANGE,
+            3682,
             "one tenth of a kilometre past the reference extent",
         ),
         (300.125, LONG_RANGE, LONG_RANGE, "a WSR-88D Doppler cut"),
@@ -307,11 +319,81 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
         (460.125, 1024, 1024, "a loop frame of a surveillance cut"),
     ] {
         assert_eq!(
-            raster_side_px(extent, ceiling),
+            raster_side_px(extent, ceiling, SUPER_RES_GATE_KM),
             side,
             "{extent} km under a {ceiling} px ceiling ({why})",
         );
     }
+}
+
+/// A raster is never asked for more texels than its own samples can fill, and
+/// never for fewer than this display's calibrated scale.
+///
+/// The ceiling the caller owns says what the *device* can hold; this says what
+/// the *data* is worth, and the smaller of the two is what gets painted. Both
+/// halves are asserted because each alone is a different bug: without the
+/// Nyquist term a device that reports 32768 would be handed 16384 px of a
+/// surveillance cut and spend three quarters of them interpolating between
+/// gates, and without the calibrated-scale floor a 1 km volumetric grid would
+/// be *narrowed* to 1840 px and lose the azimuthal detail it has today.
+///
+/// Every extent and spacing here is measured off a real volume through this
+/// crate — KDMX, KCRP, KFTG, KATX, KPDT and KTLX for the WSR-88D rows, TORD
+/// 2020-08-10 for the TDWR one.
+#[test]
+fn a_raster_is_never_asked_for_more_texels_than_its_samples_can_fill() {
+    // A ceiling far above anything either term asks for, so that these rows
+    // report the data's own answer rather than a device's.
+    const UNBOUNDED: usize = 1 << 20;
+    for (extent, sample, want, why) in [
+        // The Nyquist term binds: fine gates over a lot of ground.
+        (460.11, 0.25, 7362, "a WSR-88D surveillance cut, 1832 gates"),
+        (300.11, 0.25, 4802, "a WSR-88D Doppler cut, 1192 gates"),
+        (417.00, 0.30, 5560, "a TDWR long-range reflectivity cut"),
+        // The calibrated-scale term binds: a coarsely sampled field, which at
+        // two texels a bin would ask for only 1840 px.
+        (460.00, 1.00, 4096, "a 1 km volumetric grid over 460 km"),
+        // Exactly twice the reference extent is exactly twice the base side,
+        // which is what "the scale does not move" means arithmetically.
+        (
+            BASE_EXTENT_KM,
+            1.00,
+            IMAGE_SIZE,
+            "the reference extent itself",
+        ),
+        // Nothing to divide by: the sampling term says nothing and the scale
+        // term answers alone, rather than a division carrying an infinity or a
+        // `NaN` into the side.
+        (460.00, 0.0, 4096, "a field that states no spacing"),
+        (460.00, -1.0, 4096, "a negative spacing"),
+        (460.00, f64::NAN, 4096, "a spacing that is not a number"),
+        (460.00, f64::INFINITY, 4096, "an infinite spacing"),
+    ] {
+        assert_eq!(
+            data_limited_side_px(extent, sample),
+            want,
+            "±{extent} km sampled every {sample} km ({why})",
+        );
+        // And what the two together answer is never more than the data's own
+        // figure — which is the property `raster_side_px` is built on. Inside
+        // the reference extent the base branch answers instead, so the rows
+        // that sit there compare against the base size.
+        let expected = if extent > BASE_EXTENT_KM {
+            want
+        } else {
+            IMAGE_SIZE
+        };
+        assert_eq!(
+            raster_side_px(extent, UNBOUNDED, sample),
+            expected,
+            "±{extent} km under an unbounded ceiling ({why})",
+        );
+    }
+
+    // A degenerate extent paints nothing, and must still answer a side a
+    // buffer can be allocated at rather than zero.
+    assert!(data_limited_side_px(0.0, 0.25) >= 1);
+    assert!(data_limited_side_px(-5.0, 0.25) >= 1);
 }
 
 /// A sweep that stops short keeps the whole base texture and spends it on the
@@ -337,7 +419,10 @@ fn a_short_sweep_gets_the_base_texture_over_its_own_ground() {
     assert_eq!(extent, TDWR_DOPPLER_KM);
 
     // The side did not move, so the whole texture is still paid for.
-    let side = raster_side_px(extent, IMAGE_SIZE);
+    // A TDWR's Doppler gates are 0.15 km, which over this reach asks for 2368
+    // px — but the sweep is inside the reference extent, so the base branch
+    // answers and neither the ceiling nor the sampling moves it.
+    let side = raster_side_px(extent, IMAGE_SIZE, 0.15);
     assert_eq!(side, IMAGE_SIZE);
 
     // And the scale it buys, against what the same sweep used to get.
