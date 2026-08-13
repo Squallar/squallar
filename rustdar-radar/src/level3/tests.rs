@@ -244,6 +244,65 @@ fn shortening_a_site_code_is_idempotent() {
     assert_eq!(site_code("TLX"), "TLX");
 }
 
+/// Callers uppercase at the point of use, not on the way in, so a lowercase
+/// identifier still has to lose its leading letter here.
+///
+/// Guards the fix as much as the bug: an ASCII test written as "uppercase or
+/// digit" would leave `"ktlx"` four characters long, and `fetch_latest_product`
+/// would then build the prefix `KTLX_N0S_…` — four letters where the bucket
+/// keys on three — and find nothing, for every site, silently.
+#[test]
+fn a_lowercase_identifier_still_loses_its_leading_letter() {
+    assert_eq!(site_code("ktlx"), "tlx");
+    assert_eq!(site_code("pHkI"), "HkI");
+}
+
+/// Four *bytes* is not four characters, and this function is handed persisted
+/// text.
+///
+/// Each identifier below is exactly four bytes with a multi-byte leading
+/// character, so `&id[1..]` lands inside a UTF-8 sequence. Before the ASCII
+/// test this was not a wrong answer, it was
+/// `byte index 1 is not a char boundary` and a dead process — reachable by
+/// typing one of them into the `site` field of `ui.json`.
+#[test]
+fn a_four_byte_identifier_with_a_multibyte_head_is_not_sliced() {
+    for id in ["éab", "Ω12", "日a", "🌀"] {
+        assert_eq!(id.len(), 4, "{id:?} must be four bytes to exercise this");
+        assert!(!id.is_char_boundary(1), "{id:?} must straddle byte 1");
+        assert_eq!(site_code(id), id, "{id:?} must pass through untouched");
+    }
+}
+
+/// The other half of "four bytes is not four characters": an identifier whose
+/// byte 1 *is* a boundary never panicked, and was silently wrong instead.
+///
+/// `"aéb"` is four bytes, so the old length test accepted it, and `&id[1..]`
+/// happened to be legal — it returned `"éb"`, a two-character "site code"
+/// interpolated straight into an S3 key. Passing it through unchanged is what
+/// makes the failure legible: it comes back as `NoProduct` naming `"aéb"`.
+#[test]
+fn a_four_byte_identifier_that_slices_legally_is_still_not_a_site() {
+    assert_eq!("aéb".len(), 4);
+    assert!(
+        "aéb".is_char_boundary(1),
+        "byte 1 is legal here; that is the point"
+    );
+    assert_eq!(site_code("aéb"), "aéb");
+}
+
+/// Nothing shorter than an identifier may be indexed, including nothing at all.
+///
+/// `String::new()` is what the config falls back to for a site it refuses, so
+/// the empty case is not hypothetical — it is the value the rejection path
+/// produces, and it reaches here through `PaneState::with_site`.
+#[test]
+fn an_identifier_shorter_than_a_site_code_is_returned_whole() {
+    for id in ["", "K", "KT", "KTL", "é", "🌀🌀"] {
+        assert_eq!(site_code(id), id, "{id:?} must pass through untouched");
+    }
+}
+
 /// The newest key is chosen by *value*, not position. The fixture is
 /// shuffled: a `newest` returning `keys.last()` fails here.
 #[test]

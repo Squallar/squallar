@@ -32,7 +32,7 @@ struct PaneConfig {
     layers: BTreeMap<LayerKind, bool>,
     spc_day: OutlookDay,
     /// Radar site code for this pane (e.g. "KTLX").
-    #[serde(default = "default_site")]
+    #[serde(default = "default_site", deserialize_with = "site_or_default")]
     site: String,
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
@@ -478,6 +478,7 @@ struct UiConfig {
     /// Where that service lives. Empty means the built-in default.
     #[serde(default)]
     notifier_endpoint: String,
+    #[serde(deserialize_with = "site_or_default")]
     site: String,
     loop_lookback_secs: u64,
     loop_speed_fps: f32,
@@ -588,6 +589,43 @@ where
             Ok(RadarProduct::Reflectivity)
         }
     }
+}
+
+/// Deserialize a persisted radar site, dropping one built out of bytes no
+/// identifier contains.
+///
+/// This is the boundary the panic in [`site_code`](rustdar_radar::level3::site_code)
+/// arrived through. `ui.json` is a file on the user's disk with a `site` field
+/// in it, and until this existed nothing between an edit to that field and
+/// `site_code`'s `&id[1..]` looked at what the field held: a four-*byte*
+/// identifier whose first character is multi-byte — `"éab"` — put that byte
+/// range through the middle of a UTF-8 sequence and killed the process on the
+/// next Level III fetch.
+///
+/// Rejected rather than repaired, because there is no repair. A radar
+/// identifier is issued, not derived, and no transformation of `"éab"` names a
+/// radar; anything this could invent would be a different site's data drawn
+/// under the name of the one that was asked for. Rejected *here* rather than at
+/// each byte range downstream, because this file is the only place the value is
+/// unconstrained — identifiers off the network are already filtered to four
+/// uppercase characters by `parse_bucket_ids`, and every other writer of the
+/// field copies a `RadarSite`'s own name.
+///
+/// Empty rather than an error, for the reason [`product_or_default`] falls back
+/// instead of failing: one bad field must not cost the user their layout,
+/// curves and camera. Empty is already this field's [`default_site`], and
+/// `apply_to` reads it as "not set" and leaves whichever site startup picked —
+/// the nearest radar, exactly as on a first run.
+pub(crate) fn site_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let site = String::deserialize(deserializer)?;
+    if site.is_empty() || rustdar_radar::sites::is_ascii_site_id(&site) {
+        return Ok(site);
+    }
+    log::warn!("config names a site no radar could be called ({site:?}); ignoring it");
+    Ok(String::new())
 }
 
 /// Deserialize a [`PaneKindConfig`], falling back to `Map` when the name is one

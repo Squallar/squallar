@@ -63,8 +63,28 @@ pub type Result<T> = std::result::Result<T, Level3Error>;
 /// The rule is "drop the leading letter", *not* "strip a leading `K`" —
 /// stripping only `K` would miss every non-CONUS radar (`PA*`, `PH*`, `TJUA`,
 /// `PGUA`). Idempotent: a code already three characters is returned unchanged.
+///
+/// # Why the ASCII test
+///
+/// `id.len()` counts *bytes*. Four bytes is four characters only for an ASCII
+/// identifier, and `&id[1..]` on four bytes whose first character is multi-byte
+/// — `"éab"`, `"Ω12"` — lands inside a UTF-8 sequence and panics. `id` is not
+/// always a value this build chose: the site is a field of the user's
+/// `ui.json`, hand-editable, and the config load is the boundary that now
+/// refuses one that is not [`crate::sites::is_ascii_site_id`]. This is the
+/// same rule stated where the byte range is actually taken, because this is a
+/// public function over a bare `&str` and callers outside that one path exist.
+///
+/// An identifier that fails the test is returned unchanged rather than
+/// rejected, which is what every other length already got. It is not accepted
+/// silently: it goes on to a bucket prefix that matches no object, and comes
+/// back as [`Level3Error::NoProduct`] naming the value that was asked for.
 pub fn site_code(id: &str) -> &str {
-    if id.len() == 4 { &id[1..] } else { id }
+    if id.len() == 4 && crate::sites::is_ascii_site_id(id) {
+        &id[1..]
+    } else {
+        id
+    }
 }
 
 /// The latest key under one day's prefix, or `None` if the day has no objects.

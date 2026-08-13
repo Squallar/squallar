@@ -947,6 +947,37 @@ pub fn is_tdwr_id(site: &str) -> bool {
     site.starts_with('T') && site != "TJUA"
 }
 
+/// Whether an identifier is made of the bytes identifier handling assumes.
+///
+/// ASCII, and not empty. That is a weaker question than "is this a radar" —
+/// [`knows_site`] answers that one, and a fresh process knows none — and a
+/// weaker one than the four-character uppercase shape
+/// `catalogue::parse_bucket_ids` enforces on bucket prefixes, which decides
+/// *existence* and can afford to be strict because it is choosing what to put
+/// in a list. This is the floor underneath both: an identifier that fails it
+/// is not a radar this process could not find, it is a value nothing
+/// downstream has a meaning for.
+///
+/// Nothing downstream is prepared for one, either. [`crate::level3::site_code`]
+/// takes a byte range off the front to reach the Level III short code,
+/// [`is_tdwr_id`] reads the leading character, and the Level III bucket prefix
+/// is built by interpolating the code straight into an S3 key. Identifiers
+/// arriving over the network are already filtered to four uppercase characters
+/// before any of that sees them, so the boundary this exists for is the
+/// *persisted* one: the site is a field of the user's `ui.json`, hand-editable,
+/// and until this check nothing between that file and `site_code`'s byte range
+/// looked at it at all.
+///
+/// Deliberately not a length or case rule. A pane's site is the four-letter
+/// ICAO everywhere it is written, but `site_code` is documented idempotent on
+/// the three-letter short form, callers uppercase at the point of use rather
+/// than on the way in, and a scan that named no site carries
+/// [`UNKNOWN_SITE_NAME`]. Tightening past ASCII would reject values that work
+/// today, which is a different change from closing a panic.
+pub fn is_ascii_site_id(site: &str) -> bool {
+    !site.is_empty() && site.is_ascii()
+}
+
 /// The radar site closest to `lat`/`lon`, with its distance in kilometres.
 ///
 /// Considers every site including TDWRs. Callers picking a site to *display*
@@ -1282,6 +1313,47 @@ mod tests {
 
         let tdwr = table.get("TZZA").expect("built from its fix");
         assert!(tdwr.is_tdwr(), "every other T is one");
+    }
+
+    /// The identifier floor accepts every shape that reaches it legitimately.
+    ///
+    /// Deliberately broad: this is the test that would fail if the check were
+    /// tightened into a length or case rule, which is the tempting mistake.
+    /// Four-letter ICAOs, the three-letter Level III short form
+    /// [`crate::level3::site_code`] emits, the lowercase spellings callers
+    /// uppercase only at the point of use, and the `UNKNOWN` placeholder a
+    /// scan that named no site carries — all of them work today and all of
+    /// them must keep working.
+    #[test]
+    fn every_identifier_shape_in_use_clears_the_ascii_floor() {
+        for id in [
+            "KTLX",
+            "PAHG",
+            "PHKI",
+            "TJUA",
+            "PGUA",
+            "KCRI",
+            "TOKC",
+            "TLX",
+            "ktlx",
+            UNKNOWN_SITE_NAME,
+        ] {
+            assert!(is_ascii_site_id(id), "{id:?} is in use today");
+        }
+    }
+
+    /// Nothing a radar could not be called clears it — starting with the four
+    /// -byte identifiers that used to panic `site_code`.
+    ///
+    /// Empty is refused too, and that is not pedantry: the config's rejection
+    /// path writes `String::new()`, and a check that called empty a valid
+    /// identifier would let the fallback value be mistaken for a real answer
+    /// by anything that later asks this question instead of `is_empty`.
+    #[test]
+    fn no_identifier_built_from_non_ascii_bytes_clears_the_floor() {
+        for id in ["", "éab", "Ω12", "日a", "🌀", "aéb", "KTLX\u{200b}"] {
+            assert!(!is_ascii_site_id(id), "{id:?} is not an identifier");
+        }
     }
 
     // -- elevations: the hole that must stay closed ------------------------
