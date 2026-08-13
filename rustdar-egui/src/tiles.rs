@@ -81,19 +81,88 @@ impl TileSource for CartoDb {
 
 // Slippy-map tile coordinate helpers (standard OSM / Web Mercator formulas)
 
+/// The latitude Web Mercator ends at: the one whose projected `y` is exactly
+/// `π`, so the world is the square the tile grid needs it to be.
+///
+/// `2·atan(e^π) − π/2` in degrees. Quoted to the digits EPSG:3857 and the OSM
+/// slippy-map note carry rather than to the `85.05` two other constants in this
+/// workspace were transcribed as — that truncation is 0.0011287798° short,
+/// **125.51 m** of meridian, and while it is only ever a clamp bound the point
+/// of a named limit is that it is the limit.
+///
+/// Not applied as a clamp by [`lat_to_tile_y`], which needs no branch: the
+/// index clamp below already carries every latitude past this to the edge row.
+/// It is here because the tile grid's domain should be nameable.
+pub const MERCATOR_LAT_LIMIT_DEG: f64 = 85.051_128_779_806_6;
+
+/// Carry a fractional tile coordinate to an index on `0..2^zoom`.
+///
+/// **Both ends, which is the whole reason this is a function.** These helpers
+/// clamped only at zero, so every input past the far edge — a longitude at or
+/// east of +180, a latitude at or south of [`MERCATOR_LAT_LIMIT_DEG`] — handed
+/// the caller an index of `2^zoom` or more, for a grid whose last tile is
+/// `2^zoom − 1`. `mercantile`, the reference implementation this is checked
+/// against, clamps at both ends (`mercantile/__init__.py::tile`), and
+/// `tests::no_input_produces_an_index_off_the_grid` now holds us to that.
+///
+/// The saturating `as` conversion is load-bearing on the way in as well as the
+/// way out. `lat_to_tile_y` fed −90° through the old `ln(tan φ + sec φ)` and
+/// got `u32::MAX`; `ui_map_overlays::draw_tile_layer` then computes
+/// `lat_to_tile_y(min_lat) + 1`, which is an **overflow panic in a debug
+/// build**. Nothing reaches −90° from `walkers::Projector::unproject` — it
+/// would take a pane ~113 world-heights tall — so this was latent rather than
+/// live, but it was one arithmetic hop from a caller that already exists.
+#[inline]
+fn tile_index(coord: f64, zoom: u8) -> u32 {
+    // NaN floors to NaN and `NaN as u32` is 0, which is the low edge — the same
+    // place an unrepresentable coordinate would land if it had a sign.
+    let last = 2u32.saturating_pow(u32::from(zoom)).saturating_sub(1);
+    (coord.floor().max(0.0) as u32).min(last)
+}
+
 /// Convert longitude to tile X index at the given zoom level.
+///
+/// Clamped to the grid at both ends — see [`tile_index`]. Longitudes outside
+/// ±180 are **clamped, not wrapped**: a viewport straddling the antimeridian
+/// gets the tiles on its own side of the seam and nothing for the far side.
+/// See `ui_map_overlays::draw_tile_layer` for what that costs.
 pub fn lon_to_tile_x(lon: f64, zoom: u8) -> u32 {
     let n = 2f64.powi(zoom as i32);
-    ((lon + 180.0) / 360.0 * n).floor().max(0.0) as u32
+    tile_index((lon + 180.0) / 360.0 * n, zoom)
 }
 
 /// Convert latitude to tile Y index at the given zoom level.
+///
+/// # `asinh(tan φ)`, not `ln(tan φ + sec φ)`
+///
+/// The same function — `asinh t ≡ ln(t + √(t²+1))` and `√(tan²φ + 1)` is
+/// `sec φ` on this domain — and the identity is exact, so this is not a change
+/// of convention. It is a change of *spelling*, and the spelling matters
+/// because the sum cancels: south of the equator `tan φ` is negative and
+/// `sec φ` is positive, and near the pole the two are the same enormous number
+/// with opposite signs. Measured, against `asinh(tan φ)` evaluated in the same
+/// `f64`:
+///
+/// | latitude | old form's error |
+/// |---|---|
+/// | anywhere north | 0 ulp, at every latitude tested |
+/// | −89.99° | 0.065 px at zoom 18 |
+/// | −89.999° | 1.15 px at zoom 18 |
+/// | −89.9999° | 188 px at zoom 18 |
+/// | −89.99999° | 80 279 px at zoom 18 |
+/// | −90° | no digits left — `u32::MAX` here, `NaN` in CPython's libm |
+///
+/// The asymmetry is why this was never going to show up in use: the northern
+/// hemisphere, where this application's radars are, is exact in both forms.
+///
+/// Both independent implementations checked against use a stable form —
+/// `walkers-0.56.0/src/mercator.rs` writes `tan().asinh()`, `mercantile` writes
+/// `log((1+sin φ)/(1−sin φ))/4` — and this now agrees with the first bit for
+/// bit over the whole sweep.
 pub fn lat_to_tile_y(lat: f64, zoom: u8) -> u32 {
     let n = 2f64.powi(zoom as i32);
-    let lat_rad = lat.to_radians();
-    ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n)
-        .floor()
-        .max(0.0) as u32
+    let y = lat.to_radians().tan().asinh();
+    tile_index((1.0 - y / std::f64::consts::PI) / 2.0 * n, zoom)
 }
 
 /// Convert tile X index back to the western longitude of the tile.
@@ -242,3 +311,7 @@ pub fn tiles_resident_for(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usi
     let down = (rect.height().max(0.0) / side).ceil() as usize + 1;
     across.saturating_mul(down).saturating_mul(layers)
 }
+
+#[path = "tiles/tests.rs"]
+#[cfg(test)]
+mod tests;

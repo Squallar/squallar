@@ -6,7 +6,6 @@
 //! for radar images.  This makes per-frame overlay rendering a single
 //! `painter.image()` call per overlay type: truly near-zero cost.
 
-use std::f64::consts::PI;
 use std::sync::Arc;
 
 use rustdar_overlays::render::geo as overlay_geo;
@@ -190,7 +189,15 @@ const PAN_REBUILD_THRESHOLD: f32 = 0.7;
 
 /// Latitude beyond which Web Mercator stops being finite. Bounds are clamped to it
 /// rather than allowed to run to the pole.
-const MERCATOR_LAT_LIMIT: f64 = 85.05;
+///
+/// [`crate::tiles::MERCATOR_LAT_LIMIT_DEG`], not a second copy of it: the tile
+/// grid's edge and the overlay texture's edge are the same edge, and this file
+/// read `85.05` while the grid under it ended 0.0011287798° further north —
+/// **125.51 m** of meridian. Only ever a clamp bound, so what it cost was a
+/// viewport between the two figures being treated as looking past the map when
+/// it was still on it; but two numbers for one limit is how the next reader
+/// picks the wrong one.
+const MERCATOR_LAT_LIMIT: f64 = crate::tiles::MERCATOR_LAT_LIMIT_DEG;
 
 /// The texture an overlay render should actually allocate.
 ///
@@ -770,9 +777,15 @@ pub fn draw_overlay_texture(
 // ── Geo-coordinate click detection ───────────────────────────────────────
 
 /// Convert latitude (radians) to Web Mercator Y.
+///
+/// [`crate::volume_view::mercator_y_of_lat`], which that module's doc names as
+/// *the* spelling of this in this crate — "a second spelling of it there is
+/// precisely the drift this seam exists to prevent". This was that second
+/// spelling: byte-identical arithmetic, written out again forty lines from a
+/// hit test that has to agree with what the renderer drew.
 #[inline]
 fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
-    (PI / 4.0 + lat_rad / 2.0).tan().ln()
+    crate::volume_view::mercator_y(lat_rad)
 }
 
 /// Test whether a geographic point (lat, lon) falls inside any polygon of an
