@@ -975,10 +975,30 @@ fn elevation_cut(elevation_angle_degrees: f64) -> ElevationCut {
     )
 }
 
-/// Every sweep whose first radial carries `slot`'s moment, in input order.
-/// With `all_moments` (the HHC), a sweep carrying *any* moment qualifies —
-/// the split-cut Doppler halves carry no differential phase but donate the
-/// velocity the classification grafts in.
+/// Every sweep carrying `slot`'s moment, in input order. With `all_moments`
+/// (the HHC), a sweep carrying *any* moment qualifies — the split-cut Doppler
+/// halves carry no differential phase but donate the velocity the
+/// classification grafts in.
+///
+/// # Asked of every radial, not of the first one
+///
+/// This is the filter that decides what crosses the port, so a sweep it drops
+/// is a sweep no renderer on the far side can see — and it used to drop one on
+/// the evidence of `radials.first()`. One leading radial whose moment was
+/// missing therefore hid the other 719 from the whole worker path.
+///
+/// That is the same first-radial assumption
+/// [`crate::render::find_sweep_owner`] and [`crate::velocity::tilts`] dropped,
+/// and leaving it here left both of those unreachable for the products that
+/// need them: SRV and NROT are `reads_whole_volume`, so they arrive through
+/// this filter, and a blank leading radial made
+/// `RenderInput::extract` answer `None` for both — the pane rendered nothing at
+/// all, for a volume whose 719 good radials the wind fit was by then perfectly
+/// willing to fit.
+/// `a_sweep_whose_leading_radial_is_blank_still_reaches_the_worker` is the
+/// guard.
+///
+/// An empty sweep still qualifies for nothing: `any` over no radials is false.
 fn collect_sweeps<'s>(
     sweeps: impl Iterator<Item = &'s Sweep>,
     cuts: &CutTable<'_>,
@@ -988,12 +1008,13 @@ fn collect_sweeps<'s>(
     sweeps
         .filter_map(|sweep| {
             let radials = sweep.radials();
-            let first = radials.first()?;
-            let wanted = if all_moments {
-                ALL_SLOTS.iter().any(|s| s.read(first).is_some())
-            } else {
-                slot.read(first).is_some()
-            };
+            let wanted = radials.iter().any(|radial| {
+                if all_moments {
+                    ALL_SLOTS.iter().any(|s| s.read(radial).is_some())
+                } else {
+                    slot.read(radial).is_some()
+                }
+            });
             wanted.then(|| sweep_data(sweep, cuts, slot, all_moments))
         })
         .collect()
@@ -1060,12 +1081,16 @@ fn sweep_data(
         // are separate claims; the sampler reads this one.
         elevation_number: sweep.elevation_number(),
         cut_angle_deg: cuts.angle_for(sweep.elevation_number()),
-        // Read off the first radial, which is where every other per-sweep
-        // property in this module is read from and where the sampler's own
-        // chooser reads it.
+        // Read off **every** radial, like the two per-sweep properties above
+        // it: this is a claim about the sweep — "this is a split cut's Doppler
+        // half" — and one radial cannot make it for 720. Read off the first
+        // one, a blank leading radial left the marker off a Doppler half, and
+        // the reconstructed scan then offered that half to
+        // [`crate::render::find_sweep`]'s surveillance preference as if it
+        // were the surveillance cut beside it.
         carried_velocity: radials
-            .first()
-            .is_some_and(|r| MomentSlot::Velocity.read(r).is_some()),
+            .iter()
+            .any(|r| MomentSlot::Velocity.read(r).is_some()),
         // Filled in afterwards by `with_declared_nyquist`, never here: the
         // number is not on the radials — the model type dropped it — so this
         // function, which reads a `Sweep` and nothing else, has no honest way
