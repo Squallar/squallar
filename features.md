@@ -34,7 +34,7 @@ archive, MRMS, satellite and soundings), not the free app.
 | Normalized rotation (NROT)                    | ✅      | ❌         | ✅      |
 | Storm-relative velocity                       | ✅      | ✅         | ✅      |
 | 3D volumetric rendering                       | ✅      | ❌         | Partial |
-| Vertical cross-sections                       | ✅      | ❌         | 🚧      |
+| Vertical cross-sections                       | ✅      | ❌         | ✅      |
 | MRMS national mosaic                          | ❌      | ✅         | ❌      |
 | VAD wind profiles                             | ✅      | ❓         | ❌      |
 | Radar loop animation                          | ✅      | ✅         | ✅      |
@@ -70,13 +70,19 @@ Notes on the Rustdar column:
   the bottom of their scale, and a volume drawn through one of those saturates
   into a solid block rather than a picture — the pane says so rather than
   drawing it. Two limits behind that: the box is a fixed 160 × 160 × 18 km
-  around the site with no zoom or pan of its own, and the resample runs on the
-  frame thread (150–200 ms per volume, once per volume) until it is moved onto
-  the worker wire.
-- **Vertical cross-sections** — the volume sampler
+  around the site with no zoom or pan of its own, and the resample is
+  150–200 ms per volume. That resample is **not** on the frame thread: it is a
+  job kind of its own (`offload::JobRequest::Voxels`), dispatched through the
+  same funnel every raster goes through, so it runs on a render thread natively
+  and in the rasterization Web Worker in a browser.
+- **Vertical cross-sections** — arm "Draw cross-section" from the toolbar or
+  the View menu and drag a line across a map pane; the line and its endpoint
+  grab zones stay drawn on the map and the cut appears in a section pane
+  (`rustdar-egui/src/ui_section_pane.rs`). The volume sampler
   (`rustdar-radar/src/sampler.rs`) and the section rasterizer
-  (`rustdar-radar/src/xsect.rs`) exist and are tested. Nothing draws a section
-  line on the map and nothing displays the resulting raster.
+  (`rustdar-radar/src/xsect.rs`) are behind it, and the cut is a job kind
+  (`offload::JobRequest::Section`) so it is rasterized off the frame thread on
+  both targets. Loops cut a section per frame.
 - **VAD wind profiles** — a VAD fit *is* computed
   (`nrot::WindProfileBuilder`), but only as an input to storm-relative velocity
   and NROT. It is never displayed as a wind profile, so this is ❌ as a feature.
