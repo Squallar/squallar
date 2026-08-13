@@ -127,6 +127,15 @@ pub(crate) fn median_azimuth_step_deg(azimuths: impl IntoIterator<Item = f64>) -
 /// fall through near cases: a 90° sector accounts for a quarter of the circle,
 /// a half-received cut for half of it, and the abandoned 200° tail that
 /// [`median_azimuth_step_deg`] exists for covers 55%.
+///
+/// **The corpus behind "the least uniform complete cut measured" is not named
+/// anywhere and is not in this tree.** TPIT volume 277 is the exemplar, not
+/// the evidence: the load-bearing word is *least*, an extremum over a set of
+/// volumes nobody can enumerate from here, and the 0.2 % jitter figure beside
+/// it comes from the same unrecorded sweep. Treat both as observations. What
+/// does not depend on them is the shape of the argument — the fall-through
+/// cases at 25 %, 50 % and 55 % are arithmetic, and they are what put 0.98 in
+/// a wide gap rather than near an edge.
 const CLOSED_SWEEP_COVERAGE: f64 = 0.98;
 
 /// How a polar grid's rows sit in azimuth: the angle between adjacent rows, and

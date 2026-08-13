@@ -873,6 +873,36 @@ impl HsdaHeights {
 
     /// From the sounding's dry-bulb 0 °C / −20 °C heights (km MSL):
     /// −25 °C extrapolated by a quarter of the 0 → −20 °C depth.
+    ///
+    /// **Original — invented here, with no external counterpart.** The RPG
+    /// reads operator-maintained *wet-bulb* heights at this seam and has no
+    /// −20 °C level at all, so there is no published rule either half of this
+    /// can be checked against, and no twin whose disagreement would isolate
+    /// it: a wrong height here moves the HSDA size classes, which are the
+    /// product being scored.
+    ///
+    /// What each half was calibrated against, plainly:
+    ///
+    /// * **Dry-bulb standing in for wet-bulb — nothing.** The "within a few
+    ///   hundred metres in moist columns" on [`HsdaHeights`] is a stated
+    ///   expectation about moist thermodynamics, not a measurement: no survey
+    ///   over real columns is recorded here, and none is held on
+    ///   `campaign-harness` either. Its direction is at least known — wet-bulb
+    ///   never sits above dry-bulb — so the substitution biases the regime
+    ///   boundaries one way, upward.
+    /// * **The 0.25 — arithmetic, not a tuned number.** −25 °C is 5 °C past
+    ///   −20 °C and the sounding spans 20 °C, so 5/20 of that depth is the
+    ///   constant-lapse continuation of the layer the sounding measured. It
+    ///   needs no citation because it is not a fitted value; what it *does*
+    ///   assume, and cannot check, is that the lapse rate holds for another
+    ///   5 °C above the top of the interpolated span.
+    ///
+    /// So: an invention that keeps a product running where the RPG has an
+    /// operator, honest about which of its two steps is a guess (the first)
+    /// and which is a derivation (the second). Replacing it with something
+    /// checkable means a real wet-bulb profile from the same model column —
+    /// a standard computation with independent implementations (MetPy) — not
+    /// a better constant.
     pub fn from_env_heights(h0c_km_msl: f64, hm20c_km_msl: f64, radar_km_msl: f64) -> Self {
         let hm25 = hm20c_km_msl + 0.25 * (hm20c_km_msl - h0c_km_msl);
         Self::from_msl(h0c_km_msl, hm25, radar_km_msl)

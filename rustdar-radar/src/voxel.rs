@@ -738,6 +738,18 @@ impl HalfExtentKm {
 /// 300 km Doppler cut instead, and a TDWR follows its own much shorter one.
 /// Each still gets its own ring and nothing else.
 ///
+/// **That sweep is not in this tree and nothing here re-runs it**, so "no
+/// variance at all" is a historical reading of 150 volumes, not an invariant
+/// the build checks. Its 53 sites match the corpus [`crate::sites::NOMINAL_TOWER_M`]
+/// quotes, which points at `campaign/site-position-probe`'s fetch scripts —
+/// and that branch kept the apparatus and not the readings, so a re-run
+/// measures today's archive rather than confirming this one. Worth saying
+/// out loud because the claim travels: `rustdar-frontend`'s volume bridge
+/// restates it to justify *not* refusing to draw a held grid inside a pending
+/// build's box, which is a universal quantifier borrowed across a crate
+/// boundary to stand down a safety check. The code here does not lean on it —
+/// the reach is read per volume — only that argument does.
+///
 /// # The bounds
 ///
 /// Clamped into [`MIN_HALF_WIDTH_KM`]`..=`[`MAX_HALF_WIDTH_KM`], and the ceiling

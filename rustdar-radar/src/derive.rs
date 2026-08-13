@@ -123,6 +123,23 @@ pub fn volume_slot(product: RadarProduct) -> Option<MomentSlot> {
 /// * KDP: raw 2..=255 spans exactly
 ///   [`kdp::KDP_MIN_DISPLAY`]..[`kdp::KDP_MAX_DISPLAY`] (−2.05..10 °/km),
 ///   the estimator's own display clamp.
+///
+/// The NROT row is the one entry here with no external anchor. No authority
+/// publishes a scale for this field, so ±4 is set against where a closed
+/// commercial product puts its mesocyclone class — an authored span. A
+/// disagreement with another viewer's NROT banding is two authored spans
+/// meeting, not an error in either.
+///
+/// **Recorded rather than fixed: ±4 is narrower than the field's own ±5 clamp,
+/// and the gap between them is not empty.** [`crate::nrot`]'s nine-site record
+/// carries a KCRP cluster reaching **4.776** — the largest magnitude that
+/// module reports anywhere, on any cut — and this codec writes it as exactly
+/// 4.0, saturating at raw 255 with nothing in the UI marking a saturated bin.
+/// On the one cut in the record that produces it, the vertical views flatten
+/// the top of the feature the product exists to show. That wants a decision
+/// rather than a doc comment — widen this span to ±5 so one number bounds
+/// both, or clamp the field to ±4 — plus a count of how often real volumes
+/// cross 4 at all, which nothing currently measures.
 fn codec(product: RadarProduct) -> (f32, f32) {
     match product {
         RadarProduct::StormRelativeVelocity => (2.0, 129.0),

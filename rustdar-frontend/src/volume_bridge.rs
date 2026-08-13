@@ -175,6 +175,24 @@ pub const CLOUD_STEP_CELLS: f32 = 0.5;
 /// class of decision as [`EDGE_SOFT_WIDTH`]: the grid, the palette and the
 /// threshold anchor are untouched, and the instrument default
 /// (`VolumeUniform::new`) stays 0 — the bit-exact raw field.
+///
+/// **Original, and calibrated on one storm.** No authority says how much a
+/// volume render may be smoothed, so there is nothing external this or its two
+/// knee constants can be checked against; the only counterpart is another
+/// product's taste. What they *were* calibrated against is unusually well
+/// preserved for a look decision, and it is one volume: KCRP 2017-08-26 04:41Z
+/// (Harvey), one camera, one desktop shape, painted-pixel counts at the class
+/// cut — the whole table is in [`cloud_reconstruction_lod_for`]. Nothing has
+/// asked whether a shallow winter deck or a squall line wants the same knee.
+///
+/// Two consequences worth carrying with that. The taper is measured to erase
+/// nothing at the default box, which is what it was built for — but the 160 km
+/// region rung still runs at full LOD, where the same table reads −15 % of
+/// ≥35 dBZ and −51 % of ≥50 dBZ painted pixels against the raw field. That is
+/// smoothing changing what the user sees at a threshold, not only how it
+/// looks. And the GPU tests that measure this class of erasure need a real
+/// adapter and are `#[ignore]`d, so a default `cargo test` row says nothing
+/// about any of it.
 pub const CLOUD_RECONSTRUCTION_LOD: f32 = 1.0;
 
 /// Cell size at or below which the cloud rung smooths at the full

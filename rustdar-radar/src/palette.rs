@@ -1,3 +1,42 @@
+//! The colour scale every product is drawn with, and where each one came from.
+//!
+//! # Provenance, as a class
+//!
+//! **A colour scale is an authored claim about presentation, not a
+//! measurement.** There is no oracle for "the right colour", so no scale here
+//! is verified the way a derived field is. The one checkable question is the
+//! one each scale's own doc has to answer: does it *reproduce* a published
+//! table, or *depart* from one on purpose? Keep that answered per scale.
+//! Without it, a reader diffing this crate against AWIPS or a commercial
+//! viewer cannot tell a defect from a decision — and that reader is usually a
+//! future maintainer looking at a bug report about colour.
+//!
+//! Where the seventeen scales stand:
+//!
+//! * **Fidelity claims**, checkable against ORPG Build 21.0r1.7's own colour
+//!   tables (`colors/*.plt`, held offline): the velocity pair — byte-exact at
+//!   the extremes, interpolated where the RPG hand-tunes — plus spectrum
+//!   width, ZDR, ρHV, ΦDP and KDP. Each names the table it was read against.
+//! * **Deliberate departures**, where the doc says what it diverges from and
+//!   why: reflectivity, VIL, precipitation rate, echo tops.
+//! * **Authored around a published *breakpoint*, never a published colour**:
+//!   VIL density (Amburn & Wolf 1997), POSH (Witt et al. 1998 Eq. 9), MEHS
+//!   (NWS Instruction 10-511). Those citations are real and they are about the
+//!   thresholds; the colours beside them are ours.
+//! * **Categorical, keyed to codes rather than to a scheme**: HHC — the
+//!   thresholds are the ICD class codes, the colours are ours.
+//! * **No external counterpart of any kind**: the two NROT ramps, for a field
+//!   no authority publishes, whose class boundaries come from the algorithm
+//!   that produces it and whose colours were chosen here.
+//!
+//! Two tests in this module reach outside the tree and are the only ones that
+//! can: `spectrum_width_is_the_rpgs_sw_8_table` pins six stops against the
+//! RPG's `sw_8` table and has already caught a stray blue channel, and
+//! `every_rpg_hydrometeor_class_has_its_own_colour` reads `hc.lgd`'s class
+//! list. The rest — reachability, ordering, that no product's scale can reach
+//! [`RANGE_FOLDED`] — are internal consistency, which is all the authored
+//! scales admit.
+
 use crate::types::{MS_TO_MPH, RadarProduct};
 
 const TRANSPARENCY: u8 = 180;
@@ -641,6 +680,19 @@ static PRECIP_RATE: ColorScale = &(
 const NROT_FIRST_CLASS: f32 = crate::nrot::SIGNIFICANT as f32;
 
 /// NROT cyclonic / positive rotation (unitless)
+///
+/// **Original, and uniquely so: there is no published table to be faithful
+/// to.** Every other scale in this module either names an ORPG `.plt` it
+/// reproduces or names one it departs from; NROT has neither, because no
+/// authority publishes the field. What the boundaries *are* pinned to is
+/// internal — the class edges at 0.25/1.0/1.5/2.0/2.5/3.0 come from
+/// [`crate::nrot`]'s own thresholds, [`NROT_FIRST_CLASS`] by reference so the
+/// despeckle and the first visible colour cannot drift apart. The colours
+/// themselves were chosen here and were calibrated against nothing: the
+/// closed product this algorithm was reverse-engineered from clips its own
+/// colour bar at −2.00…+3.00, so even eyeballing it would not settle the top
+/// of this ramp. Read a disagreement with any other viewer's rotation colours
+/// as two authored schemes, never as a defect in this one.
 static NROT_CYCLONIC: ColorScale = &(
     &[
         (NROT_FIRST_CLASS, (64, 64, 128)), // weak: slate...

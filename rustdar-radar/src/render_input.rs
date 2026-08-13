@@ -91,6 +91,17 @@ pub struct RenderInput {
     /// See [`crate::hca::resolve_melting_layer`] for the chain that consumes
     /// it and what stands in when it is absent.
     ///
+    /// **"The twin campaign" is branch `campaign-harness`, and that pair of
+    /// figures cannot be reproduced from this tree** — re-running means
+    /// checking that branch out and running its `live_validation` rig for the
+    /// classifier. Named here rather than left implicit because this field's
+    /// doc is where a reader meets the numbers, and following the link above
+    /// to [`crate::hca`] is what it currently takes to learn they are
+    /// off-branch. Note also that [`crate::hhc`] quotes a *different* pair for
+    /// what reads as the same comparison (93.8–100 % against 16.0–27.3 %, at
+    /// three sites); the two have not been reconciled, and neither is
+    /// checkable from here.
+    ///
     /// Bytes rather than a decoded layer for the reason
     /// [`crate::level3::Level3Product::bytes`] gives: a `Level3Message` has no
     /// wire form, and shipping the object lets the worker run the same
@@ -664,7 +675,11 @@ impl RenderInput {
     /// [`crate::sampler::VolumeSampler`] keys its tilt ladder on
     /// `coverage_pattern().elevation_cuts()[sweep.elevation_number() - 1]`, a
     /// rule settled by measurement over 203 volumes because **no angular
-    /// threshold can substitute for it**. Both halves of that expression used
+    /// threshold can substitute for it** — a survey no longer reproducible
+    /// from this tree: the 203-volume corpus is named in three modules and
+    /// enumerated in none, and no in-tree test walks it. What the tree still
+    /// holds is the *conclusion* as an assertion, not the evidence for it.
+    /// Both halves of that expression used
     /// to be broken here, in ways that do not announce themselves:
     ///
     /// * the cut table was empty, so nothing could be indexed at all; and
