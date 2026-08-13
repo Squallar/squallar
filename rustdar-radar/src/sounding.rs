@@ -24,6 +24,38 @@
 //! [`fetch_env_heights`] does the network round-trip, [`parse_env_heights`] is
 //! pure and runs against `testdata/openmeteo_koax.json`, a response captured
 //! with `curl` on 2026-07-28 (KOAX: 41.320, −96.367).
+//!
+//! # Provenance: original, and calibrated against nothing
+//!
+//! **The numbers Open-Meteo supplies are someone else's; every choice made
+//! about them here is this module's own, and has no external counterpart.**
+//! Nobody publishes a "−20 °C height for a radar site" that this could be
+//! differenced against, so none of it is verified in the sense the Level III
+//! twins are. Three decisions carry that status, and each is an assertion
+//! rather than a measurement:
+//!
+//! * **The four levels are fixed at 600/500/400/300 hPa** — the four the URL
+//!   asks for. No sweep over other level sets is recorded, here or anywhere.
+//! * **The claim that this span brackets −20 °C "in any ordinary atmosphere"**
+//!   rests on the ~−13 °C / ~−45 °C endpoint averages quoted above. Those read
+//!   as standard-atmosphere values for those pressures, but this module names
+//!   no source for them and no count of real columns they were checked over.
+//!   Read them as a stated expectation, not as a survey result.
+//! * **Both out-of-span arms in `height_at_minus20_m` are invented here**,
+//!   for the cases the span is asserted not to reach.
+//!
+//! The interpolation itself is a standard operation with independent
+//! implementations, so what *would* settle it is real soundings — RAOB/IGRA at
+//! the nearest launch site, or MetPy over the same model column. No such
+//! comparison exists in this tree. The offline fixture pins this parser
+//! against one captured KOAX response, which cannot see a wrong level set: it
+//! would parse a bad choice of levels exactly as faithfully.
+//!
+//! State the blast radius with the provenance, because they belong together:
+//! these two heights feed POSH, MEHS, every HSDA size class and — through
+//! [`crate::hca::HsdaHeights::from_env_heights`] — every HCA and HHC class. A
+//! 500 m error moves all of them at once and leaves every one of them looking
+//! plausible.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;

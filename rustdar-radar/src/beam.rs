@@ -128,6 +128,15 @@
 //! that used to sit downstream of it, which was a hundred times larger; that
 //! one is gone and this one is deliberate.
 //!
+//! Say what that costs against an outside implementation, because it will turn
+//! up in every one of them: Py-ART's `antenna_to_cartesian` and the `+proj=aeqd`
+//! regrids take the spherical arc, so a bin-for-bin comparison against Py-ART,
+//! wradlib or pyproj shows an offset of the order above at **every** gate,
+//! coherently, with no scatter. That offset is this paragraph's choice becoming
+//! visible, not a defect on either side, and it is not something to fit away —
+//! the family both belong to is standard, and picking one member of it was the
+//! decision. Nothing in this crate is verified against the other member.
+//!
 //! Every drawn product in this crate now shares that choice. The plan view's
 //! four per-tilt rasterizers hoist `cos e` of their sweep's median elevation
 //! and paint at the ground range, the sampler converts a ground range back to

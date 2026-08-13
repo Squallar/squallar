@@ -91,6 +91,21 @@ const TUNING_SLIDER_WIDTH: f32 = 120.0;
 /// under 60 s can print the same number twice, and "4 to 4 min apart" is worse
 /// than saying nothing. Clearing this floor guarantees the two ends differ by
 /// at least one printed minute.
+///
+/// **Original: there is no convention here to be faithful to.** Nobody
+/// publishes a rule for when a radar loop's spacing becomes worth mentioning;
+/// this is a product decision about a sentence, and the only thing it can be
+/// wrong against is a reader's judgement. Both halves were tuned on **one
+/// site-day** — KPBZ, 2026-08-11, 342 volumes — which is one site, one
+/// climate and essentially one VCP regime. That record survives in the
+/// paragraphs above, which is better than most tunings manage, and it is
+/// still a single site: no holdout, no second regime, nothing measured at a
+/// site whose SAILS cadence differs.
+///
+/// The reason to say so rather than leave it implied: this caption is one the
+/// user cannot check. The gaps it describes are not on screen, so a wrong
+/// threshold does not look wrong — it produces a confident sentence about the
+/// loop's spacing and no tell that it is the wrong sentence.
 const NOTICEABLE_RATIO: f64 = 1.5;
 /// The absolute half of [`NOTICEABLE_RATIO`]'s rule, in seconds.
 const NOTICEABLE_FLOOR_SECS: i64 = 60;

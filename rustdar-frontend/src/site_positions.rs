@@ -39,6 +39,21 @@
 //! relocation, and the newer value is simply the right one. A vote would keep
 //! a relocated radar at its old site for as many years as it stood there,
 //! which is the `RKSG` failure that prompted all of this.
+//!
+//! **The 18-site, three-epoch reading is not reproducible from this tree.**
+//! Nothing here fetches an archive, and no fixture holds those volumes. The
+//! apparatus for it is `harness/sweep_site_epochs.sh` on branch
+//! `campaign/site-position-probe`, which sweeps one Level II prefix per site
+//! per epoch and exists precisely to read drift between epochs — but that
+//! branch kept the scripts and not the output, so re-running produces a new
+//! reading rather than confirming this one. Treat "bit-identical, span 0.0 m"
+//! as a dated observation of eighteen sites, not as a property of the archive.
+//!
+//! The policy does not actually need it, which is the useful thing to know if
+//! it is ever re-measured and comes back dirtier: "the fresh volume wins" is
+//! chosen because a vote cannot represent a relocation at all, and that
+//! argument holds however noisy the corpus turns out to be. The policy itself
+//! is pinned in-tree by `a_fresh_volume_wins_and_a_repeat_writes_nothing`.
 
 use rustdar_egui::config_store::ConfigStore;
 use rustdar_radar::site_position::SitePosition;

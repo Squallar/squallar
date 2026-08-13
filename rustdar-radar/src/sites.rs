@@ -63,7 +63,20 @@ pub enum Datum {
 ///
 /// The WSR-88D network is built to a small number of standard tower heights,
 /// and the population is the whole justification. Measured two independent
-/// ways:
+/// ways — **neither of which this tree can re-run**, so read both bullets as
+/// dated observations rather than as standing properties of the network:
+///
+/// * "The shared corpus" is defined nowhere in this tree. It reads as the one
+///   `campaign/site-position-probe` builds — `harness/fetch_site_corpus.sh`
+///   pulls a 4 MB Level II prefix per site per epoch and `site_elev_probe`
+///   reads each Volume Data Block — but that identification is an inference,
+///   and in any case **the branch kept the apparatus and not the readings**,
+///   so a check-out and re-run measures today's archive instead of confirming
+///   these counts.
+/// * The Level III derivation below needs no Level II and could be redone from
+///   this tree's own fetches. Nothing does, and no artifact of it survives.
+///
+/// The counts as read:
 ///
 /// * 53 sites of the shared corpus, from each site's own Volume Data Block:
 ///   towers of 14 / 19 / 24 / 29 / 34 m at 5 / 14 / 7 / 12 / 15 sites.
@@ -109,7 +122,11 @@ pub enum SiteHeights {
     ///
     /// Every TDWR volume reports `tower_height` byte-identical to
     /// `site_height`, and no WSR-88D volume does — the correspondence is
-    /// exact across all 205 volumes read. So a TDWR carries one figure, and
+    /// exact across all 205 volumes read. That read was the
+    /// `campaign/site-position-probe` sweep and **no record of it survives on
+    /// any branch**, so it is a historical observation and not a checked
+    /// invariant, while [`SitePosition::heights_over`] dispatches on it
+    /// live. So a TDWR carries one figure, and
     /// the published station record agrees with it to 3.2 ft. Hence no answer
     /// at all for [`Datum::SiteBase`]: the base is unknown, not equal to this.
     ///

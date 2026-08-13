@@ -18,9 +18,48 @@
 //! ```text
 //! cargo test -p rustdar-radar --release --lib -- --ignored --nocapture live_
 //! ```
+//!
+//! Because those rigs are not here, **every agreement percentage quoted in a
+//! doc comment in this crate is a historical reading, not something a check-out
+//! of this tree can reproduce.** The modules that quote one say so where they
+//! quote it. What re-running means is concrete and the same everywhere: check
+//! out `campaign-harness`, which carries `l3_twin`, the roster, the fetchers
+//! and each product's `validation_policy`, and run the command above. Nothing
+//! in this tree can stand in for that — the offline suites pin formulas and
+//! transcriptions, never agreement with a twin.
 
 /// Pure-math comparison of a derived grid against a decoded Level III radial
 /// product. Everything here is deterministic and network-free.
+///
+/// # Provenance: this is our instrument, not anyone's standard
+///
+/// **No authority defines the resampling below, so there is nothing external
+/// to check it against.** The ICD says how a Level III packet is laid out; it
+/// does not say how to put a 360 × 230 km derived grid and a packet of
+/// arbitrary radial width and gate spacing onto one grid so the two can be
+/// differenced. The four rules that decide that — the tenth-of-a-degree
+/// azimuth table read at the cell centre, nearest-gate-centre range selection,
+/// the 230 km cut, and levels 0/1 read as undefined — were chosen here. The
+/// azimuth mapping is [`crate::srm`]'s resampler reused, which is the only
+/// part with a stated ancestor; the rest carries no record of having been
+/// arbitrated against an alternative.
+///
+/// That matters more than the size of the code suggests. **Every "% exact" and
+/// "% within one level" anywhere in this crate is computed by this module**,
+/// so a systematic bias here moves every product's score in one direction at
+/// once and is invisible in all of them — including in the product-to-product
+/// comparisons the campaign uses to arbitrate cell statistics. One bug of
+/// exactly that shape is on the record: product 135's levels read through the
+/// scaled fallback instead of its LUT painted every EET bin 2 kft high, in
+/// every EET score, until it was found by hand — the codec selection that
+/// stops it is pinned by `for_message_selects_the_eet_lut_for_product_135`.
+///
+/// The check this class of instrument admits is an independent regrid — a
+/// second implementation written from the packet layout rather than from this
+/// file, differenced against this one. That does not exist in this tree and
+/// nothing here is a substitute for it, so read the level statistics as
+/// **self-consistent and unarbitrated**: they compare products to each other
+/// on equal terms; they do not establish an absolute agreement figure.
 pub mod compare {
     use crate::l3_values;
     use crate::volumetric::RANGE_BINS;

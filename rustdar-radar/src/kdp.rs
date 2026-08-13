@@ -234,6 +234,28 @@ impl KdpParams {
     /// from the data. A ±2 dB `dbz0` error moves only the no-echo boundary
     /// at the SNR-5 dB fringe; the twin-validated paths always read the
     /// real values via [`from_archive`](Self::from_archive).
+    ///
+    /// **Provenance, stated because this pair is original and it ships.**
+    /// Neither number is transcribed from anywhere: the ORPG reads both out of
+    /// the RDA headers and publishes no fleet-typical stand-in, so there is no
+    /// authority to check these two against. They are also not test-only —
+    /// [`crate::render`] and [`crate::derive`] both build a `KdpParams` from
+    /// this, and the same values reach the rendered HHC composite through
+    /// [`crate::hhc`], where a wrong `dbz0` is invisible rather than loud.
+    ///
+    /// Three separate honesty notes, because the three claims above have
+    /// three different standings:
+    ///
+    /// * **−43.5 dB "mid-range"** — no count of archives, no site list and no
+    ///   spread is recorded with it, here or on `campaign-harness`. It is a
+    ///   remembered reading, not a survey result.
+    /// * **−0.012 dB/km "every site surveyed"** — a real survey, whose record
+    ///   lives only on `campaign-harness`. It is a historical measurement this
+    ///   tree cannot reproduce; re-running it means checking out that branch
+    ///   and re-reading `atmos_atten` across the roster's volume headers.
+    /// * **"±2 dB moves only the SNR-5 dB fringe"** — an argument from where
+    ///   `dbz0` enters the SNR test, not a sweep. Nothing measured what a ±2 dB
+    ///   shift does to the classification, and no test bounds it.
     pub fn render_fallback() -> Self {
         Self {
             init_fdp_deg: None,

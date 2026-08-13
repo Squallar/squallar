@@ -63,6 +63,23 @@ const METRES_PER_FOOT: f64 = 0.3048;
 ///
 /// # Measured, and then placed in the gap
 ///
+/// **Where these figures come from, and what re-running them means.** Every
+/// count and metre in this section was read by `site_elev_probe`, which lives
+/// on branch `campaign/site-position-probe` together with the two scripts that
+/// feed it (`harness/fetch_site_corpus.sh` fetches one 4 MB volume prefix per
+/// site per epoch; `harness/sweep_site_epochs.sh` sweeps epochs into one TSV).
+/// **None of that is in this tree, and the branch kept the apparatus and not
+/// the readings** — so a check-out and a re-run produces a *new* measurement
+/// against today's archive, not a reproduction of the table below. Read the
+/// numbers as a dated observation of the archive, not as a property this build
+/// enforces. What this tree does enforce is in `site_position/tests.rs`, and
+/// it is the constant's behaviour, never the survey.
+///
+/// The argument survives that caveat better than the numbers do, and it is
+/// worth separating the two: what actually holds this constant is the *gap*,
+/// not the maximum. Nothing in the archive falls between 0.19 km and 4,180 km,
+/// so every threshold in that band accepts and refuses the same volumes.
+///
 /// A volume and the published station record are two descriptions of one
 /// antenna, so their disagreement is a quantity that can be read off the
 /// archive rather than guessed at. Over **170 volumes from 77 sites** — the
@@ -231,7 +248,11 @@ impl SitePosition {
     ///
     /// Every TDWR volume reports `tower_height` byte-identical to
     /// `site_height`, and no WSR-88D volume does — an exact correspondence
-    /// across all 205 volumes read when the table was built. So a volume whose
+    /// across all 205 volumes read when the table was built. **That read is
+    /// unreproducible from here**: it was the `campaign/site-position-probe`
+    /// sweep, which kept its scripts and not its output, so the branch would
+    /// re-measure rather than re-confirm. The dispatch below runs on it every
+    /// time, which is the reason to say so out loud. So a volume whose
     /// two heights are equal is reporting one feedhorn figure with no
     /// separable tower, and says so with [`SiteHeights::FeedhornOnly`]; the
     /// base is *unknown*, not equal to it.
