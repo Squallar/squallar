@@ -69,7 +69,7 @@ fn arms() -> [Arm; 3] {
                 ceiling: WASM_LOOP_POOL_CEILING_BYTES,
             },
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
-            volume_loop_frames: 8,
+            volume_loop_frames: 11,
         },
         Arm {
             name: "mobile",
@@ -84,7 +84,7 @@ fn arms() -> [Arm; 3] {
                 ceiling: MOBILE_LOOP_POOL_CEILING_BYTES,
             },
             max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
-            volume_loop_frames: 12,
+            volume_loop_frames: 17,
         },
         Arm {
             name: "desktop",
@@ -99,7 +99,7 @@ fn arms() -> [Arm; 3] {
                 ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
             },
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
-            volume_loop_frames: 12,
+            volume_loop_frames: 14,
         },
     ]
 }

@@ -2468,13 +2468,14 @@ impl super::App {
     /// release.
     pub(super) fn update_loop_readiness(&mut self) {
         let allocation = self.loop_allocation();
+        let budgets = self.budgets;
         let mut abandoned = Vec::new();
         for pidx in 0..self.gui.pane_count() {
             let loop_mgr = &self.loop_mgr;
             let Some(p) = self.gui.pane_mut(pidx) else {
                 continue;
             };
-            let budget = allocation.frames_for(p.loop_state.view);
+            let budget = loop_render_budget(allocation, &p.loop_state, &budgets);
             if settle_loop_phase(loop_mgr, pidx, &mut p.loop_state, budget) {
                 abandoned.push(pidx);
             }
@@ -2735,6 +2736,7 @@ impl super::App {
 
     fn dispatch_loop_renders(&mut self) {
         let allocation = self.observe_loop_demand();
+        let budgets = self.budgets;
         // Panes whose product moved to another datasource, so the frames now need
         // bytes nothing is fetching. Collected here and acted on below, because
         // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
@@ -2865,7 +2867,7 @@ impl super::App {
             }
 
             // Evict textures from frames far from the playhead to cap memory usage.
-            ls.evict_textures_outside_render_set(allocation.frames_for(ls.view));
+            ls.evict_textures_outside_render_set(loop_render_budget(allocation, ls, &budgets));
         }
         for pane_idx in retire_queues {
             self.loop_mgr.remove_pending(pane_idx);
@@ -2979,7 +2981,7 @@ impl super::App {
             // walking window the other two kinds use does not close here. The
             // count is `LoopAllocation::volume_frames`, which is what
             // `frames_for` answers on this view.
-            let indices = ls.render_set_indices(allocation.frames_for(ls.view));
+            let indices = ls.render_set_indices(loop_render_budget(allocation, ls, &budgets));
 
             // A 3D loop's frames are resident grids rather than rasters, so it
             // plans separately and against a different budget. Same branch
@@ -3688,7 +3690,7 @@ fn accept_scan_listing(
     // scan", and it is recorded here because here is the only place it exists:
     // one line further down the listing is gone and nothing left behind can
     // reconstruct it. See `LoopPlaybackState::listing_sampled`.
-    let held = loop_frames_held(allocation, ls.view, budgets);
+    let held = loop_frames_held(allocation, ls, budgets);
     let total = scans.len();
     let sample = rustdar_egui::pane::listing_sample_indices(total, held);
     ls.listing_sampled = Some(sample.is_some());
@@ -4186,8 +4188,8 @@ fn frame_section(
 ///
 /// The tests below are written against the numbers this target ships, and the
 /// pool reproduces them exactly for a single loop at the floor — that is the
-/// continuity property `one_loop_at_the_floor_is_exactly_what_a_pane_used_to_
-/// get` pins. So a test that is about dispatch rather than about division takes
+/// continuity property `one_loop_at_the_floor_gets_the_whole_span_budget`
+/// pins. So a test that is about dispatch rather than about division takes
 /// this and reads unchanged; a test that is about division builds its own.
 #[cfg(test)]
 pub(crate) fn test_loop_allocation() -> LoopAllocation {
@@ -4208,26 +4210,61 @@ pub(crate) fn test_budgets() -> crate::budget::Budgets {
     crate::budget::resolve(&crate::budget::DeviceProfile::for_target())
 }
 
+/// Frames this loop may keep **textured**, which is the term that bounds memory.
+///
+/// Two bounds and both are real:
+///
+/// * `LoopAllocation::frames_for` — the loop pool's share, which is what a
+///   *second* pane opening a loop takes back;
+/// * `Budgets::frames_for_span` — `constants::LOOP_SPAN_BUDGET_SECS` converted
+///   at this loop's own site cadence, which is what a *slower radar* takes
+///   back. A TDWR volume is 360 s and a WSR-88D precip volume 259 s, so the
+///   same two hours is 21 frames at one site and 28 at the other, and paying
+///   the higher figure everywhere is how a loop came to mean three different
+///   amounts of weather depending on which radar it was pointed at.
+///
+/// The pool's share is not itself cadence-aware and must not become so: it is
+/// one application-wide plan over panes whose sites differ, and a per-site term
+/// inside it would make one pane's radar decide another pane's frame count.
+/// Taking the minimum here is where the two questions meet, once, per loop.
+///
+/// Both bounds are at or above `MIN_LOOP_FRAMES_PER_PANE`, so their minimum is
+/// too — a loop that is not a loop is not reachable from here.
+fn loop_render_budget(
+    allocation: LoopAllocation,
+    ls: &rustdar_egui::pane::LoopPlaybackState,
+    budgets: &crate::budget::Budgets,
+) -> usize {
+    allocation
+        .frames_for(ls.view)
+        .min(budgets.frames_for_span(ls.scan_step_secs))
+}
+
 /// Frames a loop of this view **holds**.
 ///
 /// `Budgets::loop_frames_held` for the two raster kinds, which hold more than they
 /// texture and re-render as the playhead walks — a held frame is scan data and
 /// a timestamp, not a texture, so it is not what the loop pool is spent on and
-/// it does not shrink when a pane arrives.
+/// it does not shrink when a pane arrives. It is deliberately **not** held to
+/// the span budget either: the frame list is what the loop shows over the
+/// user's whole lookback, and a lookback wider than the span budget is answered
+/// by sampling, which is the resolution the caption already reports. Capping
+/// the list at the span budget would throw away detail that costs no textures.
 ///
 /// A 3D loop's frames are resident grids and re-entering one costs ~140 ms
 /// against a 200 ms playback interval, so its list *is* its resident set: both
-/// are the pool's answer, and both shrink together. See
-/// `crate::loop_pool::LoopAllocation`.
+/// are [`loop_render_budget`]'s answer, so a 3D loop's list follows the span
+/// budget where a raster loop's does not — because for that kind the list is
+/// the thing that costs memory.
 ///
 /// Exhaustive, like every other classification by view in this workspace.
 pub(super) fn loop_frames_held(
     allocation: LoopAllocation,
-    view: rustdar_radar::types::RenderView,
+    ls: &rustdar_egui::pane::LoopPlaybackState,
     budgets: &crate::budget::Budgets,
 ) -> usize {
-    match view {
-        rustdar_radar::types::RenderView::Volume => allocation.volume_frames,
+    match ls.view {
+        rustdar_radar::types::RenderView::Volume => loop_render_budget(allocation, ls, budgets),
         rustdar_radar::types::RenderView::PlanView
         | rustdar_radar::types::RenderView::CrossSection => budgets.loop_frames_held,
     }

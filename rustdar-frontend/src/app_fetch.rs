@@ -2030,7 +2030,7 @@ fn append_polled_frame_to_loops(
     budgets: &crate::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
-        let held = super::render::loop_frames_held(allocation, pane.loop_state.view, budgets);
+        let held = super::render::loop_frames_held(allocation, &pane.loop_state, budgets);
         if append_polled_frame(&mut pane.loop_state, site, timestamp, held) {
             log::info!(
                 "Appended {} scan {} to loop on pane {} ({} frames)",

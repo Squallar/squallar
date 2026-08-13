@@ -305,7 +305,15 @@ pub struct BudgetLimits {
     pub concurrent_loop_downloads: Bracket,
     /// `constants::MAX_LOOP_FRAMES`.
     pub loop_frames_held: Bracket,
-    /// `constants::MAX_LOOP_RENDER_BUDGET`.
+    /// `constants::LOOP_SPAN_BUDGET_SECS` — the loop budget, in seconds of
+    /// wall clock. The one budget in this struct whose unit is not bytes,
+    /// pixels or a count, and deliberately so: a frame is a volume scan and a
+    /// volume scan is 259 s on a WSR-88D in precip against 360 s on a TDWR, so
+    /// a frame count is not a statement about anything a user reads.
+    pub loop_span_secs: Bracket,
+    /// `constants::MAX_LOOP_RENDER_BUDGET` — what [`Self::loop_span_secs`]
+    /// costs in frames at the fastest radar measured, and so the ceiling on the
+    /// per-site figure [`Budgets::frames_for_span`] resolves.
     pub loop_render_budget: Bracket,
     /// `constants::LOOP_POOL_FLOOR_BYTES` and `LOOP_POOL_CEILING_BYTES` — the
     /// one bracket in this struct that was already a bracket in the source.
@@ -366,6 +374,7 @@ impl BudgetLimits {
             constants::NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS,
         ),
         loop_frames_held: Bracket::pinned(constants::WASM_MAX_LOOP_FRAMES),
+        loop_span_secs: Bracket::pinned(constants::WASM_LOOP_SPAN_BUDGET_SECS),
         loop_render_budget: Bracket::pinned(constants::WASM_MAX_LOOP_RENDER_BUDGET),
         loop_pool_bytes: Bracket::new(
             constants::WASM_LOOP_POOL_FLOOR_BYTES,
@@ -392,6 +401,7 @@ impl BudgetLimits {
         concurrent_renders: Bracket::pinned(constants::MOBILE_MAX_CONCURRENT_RENDERS),
         concurrent_loop_downloads: Bracket::pinned(constants::MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS),
         loop_frames_held: Bracket::pinned(constants::MOBILE_MAX_LOOP_FRAMES),
+        loop_span_secs: Bracket::pinned(constants::MOBILE_LOOP_SPAN_BUDGET_SECS),
         loop_render_budget: Bracket::pinned(constants::MOBILE_MAX_LOOP_RENDER_BUDGET),
         loop_pool_bytes: Bracket::new(
             constants::MOBILE_LOOP_POOL_FLOOR_BYTES,
@@ -420,6 +430,7 @@ impl BudgetLimits {
             constants::NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS,
         ),
         loop_frames_held: Bracket::pinned(constants::DESKTOP_MAX_LOOP_FRAMES),
+        loop_span_secs: Bracket::pinned(constants::DESKTOP_LOOP_SPAN_BUDGET_SECS),
         loop_render_budget: Bracket::pinned(constants::DESKTOP_MAX_LOOP_RENDER_BUDGET),
         loop_pool_bytes: Bracket::new(
             constants::DESKTOP_LOOP_POOL_FLOOR_BYTES,
@@ -493,7 +504,12 @@ pub struct Budgets {
     pub concurrent_loop_downloads: usize,
     /// Frames a loop may *hold*.
     pub loop_frames_held: usize,
-    /// Frames a loop may keep *textured*, which is the binding term.
+    /// **The loop budget**: the wall clock one loop keeps ready to draw.
+    /// [`Budgets::frames_for_span`] converts it at the site's own cadence.
+    pub loop_span_secs: usize,
+    /// Frames a loop may keep *textured* — what [`Self::loop_span_secs`] costs
+    /// at the fastest radar measured, so the ceiling on the per-site figure
+    /// rather than the figure itself.
     pub loop_render_budget: usize,
     /// The loop pool's floor. Carried as a pair rather than as one resolved
     /// figure because the pool is the one budget that already learns from
@@ -650,8 +666,55 @@ impl Budgets {
     /// Frames that hold a texture at once. `evict_textures_outside_render_set`
     /// runs every dispatch with the render budget, so a loop holding
     /// [`Self::loop_frames_held`] keeps only the render set textured.
+    ///
+    /// The **worst case** over every site: [`Self::frames_for_span`] is what a
+    /// given loop actually gets, and it is this only where the radar is as fast
+    /// as the fastest one measured.
     pub fn textured_frames(&self) -> usize {
         self.loop_render_budget.min(self.loop_frames_held)
+    }
+
+    /// Frames of `cadence_secs` apiece it takes to cover [`Self::loop_span_secs`].
+    ///
+    /// **This is where the loop budget stops being a frame count.** `n` frames
+    /// span `n - 1` gaps, so the answer is `1 + span / cadence` with a
+    /// truncating divide — the most frames whose span does not *exceed* the
+    /// budget, which is what makes it a cap rather than a target. At the
+    /// measured medians a two-hour desktop budget is 21 frames on a TDWR, 28 on
+    /// a WSR-88D in precip and 14 on the same WSR-88D in clear air.
+    ///
+    /// # The two clamps are the two rules this must not break
+    ///
+    /// * `MIN_LOOP_FRAMES_PER_PANE` — a one-frame loop is not a loop, and a
+    ///   site slow enough that one volume outlasts the whole budget still gets
+    ///   a loop. Never degraded, whatever the cadence says.
+    /// * [`Self::loop_render_budget`] — the memory the ceiling was re-derived
+    ///   against. A listing whose median gap is implausibly short (a duplicated
+    ///   key, a backfill landing all at once) cannot buy frames the pool cannot
+    ///   pay for.
+    ///
+    /// # `None` is the *safe* arm, not the degraded one
+    ///
+    /// `LoopPlaybackState::scan_step_secs` is `None` until a listing has been
+    /// accepted, and after a site switch, which rebuilds the state. With no
+    /// cadence there is no honest conversion, so the answer is the arm's full
+    /// render budget: the loop behaves exactly as it did before this budget
+    /// existed until the listing that tells us what a frame is worth arrives.
+    /// Erring the other way — assuming the fastest radar and then shrinking —
+    /// would make a loop visibly lose frames a second after opening.
+    ///
+    /// A zero cadence takes the same arm rather than dividing: `median_step_secs`
+    /// already drops non-positive gaps, so it is unreachable from the listing
+    /// path, and a caller who reaches it is asking a question with no answer.
+    pub fn frames_for_span(&self, cadence_secs: Option<u32>) -> usize {
+        let Some(cadence) = cadence_secs.filter(|secs| *secs > 0) else {
+            return self.loop_render_budget;
+        };
+        (1 + self.loop_span_secs / cadence as usize).clamp(
+            constants::MIN_LOOP_FRAMES_PER_PANE,
+            self.loop_render_budget
+                .max(constants::MIN_LOOP_FRAMES_PER_PANE),
+        )
     }
 
     /// Bytes one resident voxel grid costs the device: every mip level it is
@@ -737,6 +800,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
         concurrent_renders: limits.concurrent_renders.floor,
         concurrent_loop_downloads: limits.concurrent_loop_downloads.floor,
         loop_frames_held: limits.loop_frames_held.floor,
+        loop_span_secs: limits.loop_span_secs.floor,
         loop_render_budget: limits.loop_render_budget.floor,
         loop_pool_floor_bytes: limits.loop_pool_bytes.floor,
         loop_pool_ceiling_bytes: limits

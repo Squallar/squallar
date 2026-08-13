@@ -422,7 +422,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
     for minute in [0, 4, 8] {
         let held = crate::app::render::loop_frames_held(
             crate::app::render::test_loop_allocation(),
-            pane.loop_state.view,
+            &pane.loop_state,
             &crate::app::render::test_budgets(),
         );
         super::append_polled_frame(&mut pane.loop_state, WSR88D, at(minute), held);

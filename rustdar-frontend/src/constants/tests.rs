@@ -66,7 +66,7 @@ fn volume_bytes(arm: &Budgets) -> usize {
 /// planner to these same figures, and
 /// [`the_3d_loop_holds_exactly_what_it_marches`] binds them to the budget
 /// arithmetic they came out of.
-const SHIPPED_VOLUME_LOOP_FRAMES: [usize; 3] = [8, 12, 12];
+const SHIPPED_VOLUME_LOOP_FRAMES: [usize; 3] = [11, 17, 14];
 
 /// The section raster is `SECTION_WIDTH` by half of it, which is what makes
 /// [`Budgets::section_frame_bytes`] a reconstruction rather than a guess.
@@ -95,26 +95,36 @@ fn the_section_raster_is_its_width_by_half_of_it() {
     );
 }
 
-/// **One loop, on the worst device this target admits, gets exactly what one
-/// pane used to get.**
+/// **One loop, on the worst device this target admits, gets the whole of
+/// [`LOOP_SPAN_BUDGET_SECS`] — at the fastest radar there is.**
 ///
 /// The property that makes the pool safe to ship, and the reason
-/// [`LOOP_POOL_FLOOR_BYTES`] carries the numbers the per-pane budget carried
-/// rather than numbers of its own. Nobody with a single loop open loses a
-/// frame of history on any device; what changed is that six of them no longer
-/// cost six times it.
+/// [`LOOP_POOL_FLOOR_BYTES`] carries no numbers of its own: the floor **is**
+/// [`MAX_LOOP_RENDER_BUDGET`] frames, to the byte. Nobody with a single loop
+/// open loses a minute of the span budget on any device; what the pool changed
+/// is that six of them no longer cost six times it.
+///
+/// This was named for what one pane used to get, and the equality was the same
+/// one read off the frame count instead of the span — 480 / 192 / 32 MiB
+/// against 512 / 256 / 48 MiB floors, where the rounding up to a power of two
+/// was the only slack in it. Pricing the span removed even that, so the
+/// assertion is an **equality** now rather than a bound: a floor
+/// above what the render budget spends is memory reserved for frames no loop
+/// will ever ask for, and one below it is a span budget the device silently
+/// cannot deliver.
 ///
 /// This is the table in [`LOOP_POOL_FLOOR_BYTES`]' doc comment, executed, on
 /// **every** arm rather than the one this build compiled.
 #[test]
-fn one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get() {
+fn one_loop_at_the_floor_gets_the_whole_span_budget() {
     for arm in arms() {
         let total = arm.textured_frames() * arm.loop_frame_bytes();
-        assert!(
-            total <= arm.loop_pool_floor_bytes,
-            "{}: {} textured frames x {}^2 x 4B = {} MiB, over the {} MiB floor \
-             — a single loop on this target no longer gets the history it does \
-             today",
+        assert_eq!(
+            total,
+            arm.loop_pool_floor_bytes,
+            "{}: {} textured frames x {}^2 x 4B = {} MiB against a {} MiB floor \
+             — a single loop on this target no longer gets exactly the span it \
+             is budgeted",
             arm.name,
             arm.textured_frames(),
             arm.loop_image_side_px,
@@ -135,9 +145,11 @@ fn one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get() {
 /// on a browser would take a loop to zero frames, which reads as a bug and
 /// which the user has no way to undo except by guessing.
 ///
-/// wasm32's row is **exact** — six loops at two frames of 4 MiB is 48 MiB to
-/// the byte — so this is the line a change to the browser floor, the minimum,
-/// the pane count or the web image size has to come past.
+/// wasm32 is the tight row — six loops at two frames of 4 MiB is 48 MiB against
+/// a 56 MiB floor, one frame of margin in the whole browser arm — so this is the
+/// line a change to the browser floor, the minimum, the pane count or the web
+/// image size has to come past. It was exact to the byte until
+/// [`LOOP_SPAN_BUDGET_SECS`] took the browser floor from 48 MiB to 56.
 #[test]
 fn the_floor_seats_every_pane_without_blanking_one() {
     for arm in arms() {
@@ -437,6 +449,151 @@ fn the_app_ceiling_is_not_slack_enough_to_hide_a_doubling() {
     }
 }
 
+/// **What a loop of a given wall clock costs in frames, measured.**
+///
+/// `(window seconds, frames)`, where the frames are the largest render set a
+/// loop of that window can ever be asked for, over every site and every
+/// listing in the campaign of 2026-08-11: six TDWR and four WSR-88D sites, a
+/// full 24 h, 2560 objects, with each object's VCP decoded from message 5
+/// rather than inferred from its interval. The holdout was TPIT, TMIA and THOU
+/// on 2026-06-15 and 2026-02-03, which agreed.
+///
+/// # Why it is not `window / median`
+///
+/// Two reasons, and the first is the one that bites:
+///
+/// * `accept_scan_listing` reads the median over the **whole listing**, which
+///   covers the user's lookback rather than the span budget — so a 30-minute
+///   lookback taken during a burst hands `frames_for_span` a median no daily
+///   figure predicts. KPBZ's lowest 30-minute median is 198 s against a 259 s
+///   daily median for the same VCP, and `1 + 7200/198` is 37 where
+///   `1 + 7200/259` is 28.
+/// * `render_set_indices` clamps to the frame count, so a window can only ever
+///   be charged for volumes that exist in it — which is what takes that 37
+///   back down to 36.
+///
+/// So each row is `max over every listing window of min(1 + window/median, n)`,
+/// which is the arithmetic the application runs, swept over the measured day.
+/// Per site, at the three shipped windows:
+///
+/// | window | TDWR (all six) | KPBZ | KLOT | KFTG | KOKX |
+/// |---|---:|---:|---:|---:|---:|
+/// | 45 min |  8 | 14 | 14 | 12 | 12 |
+/// | 1 h    | 11 | 18 | 18 | 16 | 16 |
+/// | 2 h    | 21 | 36 | 35 | 30 | 30 |
+///
+/// **The worst case is a WSR-88D in precip and never a TDWR** — a TDWR volume
+/// is 360 s where a WSR-88D precip volume is 259 s, so a TDWR loop covers more
+/// wall clock per frame, not less. Sizing an arm against "the fastest-cadence
+/// radar" as that phrase is usually meant would pick TDWR and under-budget the
+/// real worst case by 71%.
+///
+/// # The rows are round windows, and that is a decision
+///
+/// Half an hour, three quarters, an hour, and so on — not the byte-maximal
+/// figure each arm could reach. A span budget is the one number in
+/// [`crate::constants`] a *user* can read off the screen, so it is chosen from
+/// windows a user already thinks in: wasm32 could pay for 50 minutes and takes
+/// 45, and the six it leaves are margin on the one arm whose answer to running
+/// out of texture memory is to restart the browser's whole GPU process — see
+/// [`LOOP_POOL_FLOOR_BYTES`]. [`the_span_budget_is_the_longest_the_ceiling_can_pay_for`]
+/// holds each arm to the longest *row* it can pay for, so adding a row between
+/// two of these is a real change and has to be argued here.
+const MEASURED_PEAK_LOOP_FRAMES: [(usize, usize); 7] = [
+    (30 * 60, 10),
+    (45 * 60, 14),
+    (60 * 60, 18),
+    (75 * 60, 23),
+    (90 * 60, 27),
+    (120 * 60, 36),
+    (150 * 60, 44),
+];
+
+/// Frames [`MEASURED_PEAK_LOOP_FRAMES`] says a window of `secs` costs.
+fn peak_frames(secs: usize) -> usize {
+    MEASURED_PEAK_LOOP_FRAMES
+        .into_iter()
+        .find_map(|(window, frames)| (window == secs).then_some(frames))
+        .unwrap_or_else(|| {
+            panic!(
+                "{secs} s is not a window the campaign measured — a span budget \
+                 has to be a row of MEASURED_PEAK_LOOP_FRAMES, because the frame \
+                 count it costs is a fact about radars rather than arithmetic on \
+                 a median"
+            )
+        })
+}
+
+/// **The span budget is priced at the fastest radar, and the render budget is
+/// that price.**
+///
+/// Not an inequality. A render budget above the price is memory reserved for
+/// frames no site will ever produce; one below it is a loop that silently stops
+/// short of the wall clock it was budgeted, on exactly the site — a WSR-88D in
+/// precip — where a user is most likely to be watching.
+#[test]
+fn the_render_budget_is_the_span_priced_at_the_fastest_radar() {
+    for arm in arms() {
+        assert_eq!(
+            arm.loop_render_budget,
+            peak_frames(arm.loop_span_secs),
+            "{}: a {} min loop costs {} frames at the fastest measured site, not {}",
+            arm.name,
+            arm.loop_span_secs / 60,
+            peak_frames(arm.loop_span_secs),
+            arm.loop_render_budget,
+        );
+    }
+}
+
+/// **Each arm's span is the longest window its GPU ceiling can pay for.**
+///
+/// The budget the span had to fit inside is [`APP_TEXTURE_BUDGET_BYTES`] minus
+/// the two terms that do not move with it — the pool ceiling and the per-pane
+/// raymarch offscreens — because the third term *is* [`LOOP_POOL_FLOOR_BYTES`],
+/// which is the span priced in frames. Divided by a loop frame, that headroom
+/// is 16 frames on wasm32, 22 on mobile and 40 on desktop.
+///
+/// So this checks both halves: that the shipped window fits, and that the next
+/// window the campaign measured does **not**. Without the second half a span
+/// could be quietly shortened and nothing would notice; with it, lengthening
+/// one means either finding memory somewhere real or moving
+/// [`APP_TEXTURE_BUDGET_BYTES`] deliberately and re-arguing
+/// [`the_app_ceiling_is_not_slack_enough_to_hide_a_doubling`].
+#[test]
+fn the_span_budget_is_the_longest_the_ceiling_can_pay_for() {
+    for arm in arms() {
+        let fixed = arm.loop_pool_ceiling_bytes + arm.max_panes * arm.offscreen_bytes;
+        let headroom = arm
+            .app_texture_ceiling_bytes
+            .checked_sub(fixed)
+            .unwrap_or_else(|| panic!("{}: the ceiling no longer covers the pool", arm.name));
+        let affordable = headroom / arm.loop_frame_bytes();
+        assert!(
+            arm.loop_render_budget <= affordable,
+            "{}: a {} min loop wants {} frames and the app ceiling leaves room for {}",
+            arm.name,
+            arm.loop_span_secs / 60,
+            arm.loop_render_budget,
+            affordable,
+        );
+        let longer = MEASURED_PEAK_LOOP_FRAMES
+            .into_iter()
+            .find(|(window, _)| *window > arm.loop_span_secs)
+            .expect("the campaign measured a window longer than every shipped span");
+        assert!(
+            longer.1 > affordable,
+            "{}: the next measured window up ({} min) needs {} frames and the \
+             ceiling affords {} — the span budget is short of what this arm can \
+             pay for",
+            arm.name,
+            longer.0 / 60,
+            longer.1,
+            affordable,
+        );
+    }
+}
+
 /// The 3D loop's pacing cap is a real cap, on the same terms
 /// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`]'s is.
 ///
@@ -521,7 +678,7 @@ fn the_render_budget_is_what_bounds_the_textured_frames() {
 }
 
 /// Every arm is held to its own volume budget, exactly as
-/// `one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get` holds it to its
+/// `one_loop_at_the_floor_gets_the_whole_span_budget` holds it to its
 /// loop budget.
 #[test]
 fn the_volume_grid_fits_the_target_texture_budget() {
@@ -588,9 +745,9 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
             1024,
             1024,
             1,
-            12,
-            8,
-            48,
+            14,
+            14,
+            56,
             192,
             6 * 1024 * 1024,
         ),
@@ -602,8 +759,8 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
             2048,
             3,
             20,
-            12,
-            256,
+            18,
+            288,
             640,
             20 * 1024 * 1024,
         ),
@@ -615,8 +772,8 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
             2048,
             6,
             60,
-            30,
-            512,
+            36,
+            576,
             3072,
             48 * 1024 * 1024,
         ),
@@ -845,6 +1002,11 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         "LONG_RANGE_IMAGE_SIZE",
         "LOOP_IMAGE_SIZE",
         "MAX_CONCURRENT_RENDERS",
+        // The loop budget and what it costs. `LOOP_SPAN_BUDGET_SECS` landed as
+        // a cascade of its own rather than as one figure because the window an
+        // arm can afford is a fact about that arm's texture ceiling, not about
+        // radars.
+        "LOOP_SPAN_BUDGET_SECS",
         "MAX_LOOP_RENDER_BUDGET",
         "MAX_LOOP_FRAMES",
         // The pool's two bounds, landed when the loop budget stopped being a

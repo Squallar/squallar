@@ -74,7 +74,7 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
     for &minute in frames {
         let held = crate::app::render::loop_frames_held(
             crate::app::render::test_loop_allocation(),
-            pane.loop_state.view,
+            &pane.loop_state,
             &crate::app::render::test_budgets(),
         );
         append_polled_frame(&mut pane.loop_state, site.name, ts(minute), held);
@@ -94,6 +94,26 @@ fn allocation() -> crate::loop_pool::LoopAllocation {
 /// from. Named beside [`allocation`] because `loop_frames_held` reads both.
 fn budgets() -> crate::budget::Budgets {
     crate::app::render::test_budgets()
+}
+
+/// The cap the append path will hold this pane's loop to, through the function
+/// the append path itself calls.
+///
+/// It takes a **pane** rather than a view because the cap is resolved from the
+/// loop state now, not from the view alone: a 3D loop's frame list is its
+/// resident set, so `constants::LOOP_SPAN_BUDGET_SECS` reaches it through
+/// `LoopPlaybackState::scan_step_secs`. For the two raster kinds it does not —
+/// a held frame is scan data and a timestamp rather than a texture — so a
+/// plan-view loop answers `Budgets::loop_frames_held` whatever its site's
+/// cadence, and whether it has learned one yet.
+///
+/// That is why the tests below may ask an **empty** loop for the cap they are
+/// about to fill it to. It is deliberately not the `scan_step_secs == None`
+/// arm in disguise: for a plan-view loop the cadence is never consulted at all,
+/// so the empty loop and the full one give the same answer for the same reason
+/// rather than by coincidence.
+fn held_for(pane: &PaneState) -> usize {
+    crate::app::render::loop_frames_held(allocation(), &pane.loop_state, &budgets())
 }
 
 fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
@@ -400,11 +420,7 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
 #[test]
 fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     let ktlx = site("KTLX", 35.33, -97.27);
-    let held = crate::app::render::loop_frames_held(
-        allocation(),
-        rustdar_radar::types::RenderView::PlanView,
-        &budgets(),
-    );
+    let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
     // Three days of lookback against a day and a bit of frames, so the window
     // eviction never fires and the cap is the only thing standing between this
     // loop and unbounded growth.
@@ -450,11 +466,7 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
 #[test]
 fn capping_an_appended_loop_keeps_its_whole_window() {
     let ktlx = site("KTLX", 35.33, -97.27);
-    let held = crate::app::render::loop_frames_held(
-        allocation(),
-        rustdar_radar::types::RenderView::PlanView,
-        &budgets(),
-    );
+    let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
     let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
     panes[0].loop_state.listing_sampled = Some(true);
