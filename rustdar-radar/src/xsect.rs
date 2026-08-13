@@ -54,9 +54,9 @@
 //! # The height axis is MSL
 //!
 //! The default axis is `[site_elev, site_elev + 20 km]` **km above mean sea
-//! level**. 20 km above the antenna is over anything in the volume at any
-//! range — the 19.5° cut reaches it at 55.9 km ground range and the 0.5° cut
-//! never does — so the default never clips real data. MSL rather than
+//! level**. It is above everything a forecaster reads a section for, and it
+//! **does** cut the top off the ladder — see [`DEFAULT_AXIS_HEIGHT_KM`], which
+//! carries the measurement. MSL rather than
 //! above-radar because that is the datum a sounding, a flight level and a
 //! melting-layer height are all quoted in; a section is read *against* those.
 //! The site height comes from [`crate::eet::radar_height_ft_near`] on
@@ -195,11 +195,40 @@ pub const SECTION_HEIGHT: usize = SECTION_WIDTH / 2;
 
 /// How far above the site the default height axis reaches, km.
 ///
-/// Above every beam in the volume at every range: the 19.5° cut — the highest
-/// any operational VCP flies — passes 20 km above the antenna at 55.9 km of
-/// ground range and only climbs from there, and no lower cut gets there at all.
-/// So the default axis clips no data anywhere, which is what lets it be a
-/// default rather than a guess.
+/// # This axis does clip the top of the ladder, and the number is small
+///
+/// The claim here used to be that it does not: "the 19.5° cut passes 20 km at
+/// 55.9 km of ground range and no lower cut gets there at all, so the default
+/// clips no data anywhere." The arithmetic is right — a 19.5° beam is at 20 km
+/// over 55.89 km of ground — and the conclusion drawn from it is backwards.
+/// 55.9 km is where that cut *starts* being clipped, not where it stops: the
+/// upper cuts are range-truncated near 70 km of slant range, so the 19.5° cut
+/// carries gates to about 66 km of ground and is above this axis over the last
+/// ten of them.
+///
+/// The second half of the old claim — "no lower cut gets there at all" — is the
+/// larger error, because it compares only the two ends of the ladder. A cut's
+/// beam is highest at *its own* maximum range, and the middle cuts reach much
+/// further than the top one: an ordinary **4.53° cut at 229.4 km of ground is
+/// at 21.28 km**, over this axis without being anywhere near the top of the
+/// pattern.
+///
+/// Measured over the 158-volume corpus, on the highest cut each volume actually
+/// flew: **115 of 158 volumes carry gates above this axis**. The highest beam
+/// centre any of them reaches is 21.28 km, and the shallowest cut that gets
+/// there is 4.48°. So the clipping is real, it is ordinary rather than a corner
+/// case, and it is **at most 1.3 km deep**.
+///
+/// That is why 20 km is still the default. What is cut off is the top 1.3 km of
+/// a beam that is already three kilometres above the tropopause, carrying the
+/// noise and the occasional ice cloud that live up there and nothing a section
+/// is read for. A caller who wants it can name its own `top_km_msl`. The number
+/// is a deliberate trade with a measured cost, which is what this doc used to
+/// assert it did not have to be.
+///
+/// `the_default_axis_clips_the_top_of_an_ordinary_ladder` pins the 4.53° case
+/// against the exact spherical beam height rather than against this crate's
+/// quadratic, so what it holds is the geometry and not our spelling of it.
 pub const DEFAULT_AXIS_HEIGHT_KM: f64 = 20.0;
 
 /// Feet to kilometres, for the feedhorn height

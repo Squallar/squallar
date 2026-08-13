@@ -1961,6 +1961,92 @@ fn every_axis_number_of_a_rendered_section_is_finite() {
     }
 }
 
+/// The default height axis **does** cut the top off an ordinary tilt ladder,
+/// and it is a middle cut at long range that reaches over it — not the top of
+/// the pattern at short range.
+///
+/// # Why this test exists
+///
+/// [`DEFAULT_AXIS_HEIGHT_KM`]'s doc used to claim the opposite: that 20 km
+/// clears "every beam in the volume at every range", because the 19.5° cut only
+/// passes it at 55.9 km of ground and "no lower cut gets there at all". The
+/// second clause compares the two *ends* of the ladder and skips its middle,
+/// where the beams that reach highest actually are — a cut's beam peaks at that
+/// cut's own maximum range, and the middle cuts outrange the top one by a
+/// factor of three. Over a 158-volume corpus, 115 volumes carry gates above
+/// this axis; the shallowest cut that does is 4.48°, and the highest beam
+/// centre reached is 21.28 km.
+///
+/// # Why it is not circular
+///
+/// The height is recomputed here from the **exact spherical** form
+///
+/// ```text
+/// h = √(r² + Rₑ² + 2·r·Rₑ·sin e) − Rₑ
+/// ```
+///
+/// — Doviak & Zrnić (1993) eq. 2.28, which is what
+/// `nexrad_model::geo::RadarCoordinateSystem::polar_to_geo` and Py-ART's
+/// `antenna_to_cartesian` both evaluate — rather than from
+/// [`crate::beam::height_at_ground_km`]'s quadratic, which is the form under
+/// test. The two agree to 23.5 m anywhere below 20 km (the identity is derived
+/// in [`crate::beam`]'s module doc), so either would land this assertion;
+/// running the independent one is what makes the claim about beam geometry
+/// instead of about this crate's spelling of it. Nothing here reads a stored
+/// digest of our own output.
+///
+/// The **radius** is deliberately [`crate::beam::RE_EFF_KM`] rather than a
+/// second literal, and that is not the circularity this guards against. What
+/// has to be independent is the *equation*; the sphere has to be **shared**, or
+/// the two forms differ by their refraction model and the comparison stops
+/// measuring the geometry at all. `geodesy_one_definition` refuses a second
+/// spelling of an earth radius anywhere in the crate for the same reason, and
+/// caught this test writing one.
+#[test]
+fn the_default_axis_clips_the_top_of_an_ordinary_ladder() {
+    /// Doviak & Zrnić eq. 2.28 on the 4/3 effective earth, spelled out rather
+    /// than called: the point is to not go through the module under test.
+    fn spherical_height_km(slant_km: f64, elev_deg: f64) -> f64 {
+        let re = crate::beam::RE_EFF_KM;
+        (slant_km * slant_km + re * re + 2.0 * slant_km * re * elev_deg.to_radians().sin()).sqrt()
+            - re
+    }
+
+    // A 4.53° cut carrying gates to 230.12 km of slant range — the reach a
+    // VCP 21/32 mid cut has, and the case measured at KLOT and KGRB.
+    let (elev_deg, slant_km) = (4.53, 230.12);
+    let height_km = spherical_height_km(slant_km, elev_deg);
+    assert!(
+        height_km > DEFAULT_AXIS_HEIGHT_KM,
+        "a {elev_deg}° cut at {slant_km} km is at {height_km} km, which the doc \
+         used to claim a {DEFAULT_AXIS_HEIGHT_KM} km axis clears",
+    );
+
+    // And it is *shallow*: the top of the pattern is four times this angle, so
+    // this cannot be dismissed as the ladder's extreme rung.
+    assert!(
+        elev_deg < 5.0,
+        "the point of this case is that an ordinary middle cut reaches over the \
+         axis, so it stops being evidence if {elev_deg}° is near the top of a VCP",
+    );
+
+    // The clipping is shallow — the other half of the corrected doc, and the
+    // reason 20 km is still the default rather than a defect.
+    assert!(
+        height_km < DEFAULT_AXIS_HEIGHT_KM + 1.5,
+        "a {height_km} km beam is further over the axis than the corpus's worst \
+         (21.28 km); the doc's \"at most 1.3 km deep\" would need re-measuring",
+    );
+
+    // The half of the old claim that was true stays pinned: the 0.5° cut really
+    // does stay under the axis, at every range a volume reaches.
+    let base_tilt_km = spherical_height_km(470.0, 0.5);
+    assert!(
+        base_tilt_km < DEFAULT_AXIS_HEIGHT_KM,
+        "the 0.5° cut reaches {base_tilt_km} km at 470 km, over the axis",
+    );
+}
+
 /// A section of nothing equals a copy of itself.
 ///
 /// This is the property a derived `PartialEq` destroys: every pixel of a
