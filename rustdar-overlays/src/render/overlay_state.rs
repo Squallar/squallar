@@ -135,7 +135,7 @@ impl<T> OverlayState<T, Assembled> {
     /// the way it was written the first time — take the observations, hand them
     /// to `set_data`, say nothing about the network that refused:
     ///
-    /// ```compile_fail,E0599
+    /// ```compile_fail
     /// use rustdar_overlays::fetch_policy::Assembled;
     /// use rustdar_overlays::render::overlay_state::OverlayState;
     ///
@@ -152,9 +152,17 @@ impl<T> OverlayState<T, Assembled> {
     /// state.set_data(round.observations);
     /// ```
     ///
-    /// The same round, the same state, the same data, the same clock — the only
-    /// difference being that the report of what is not on the map comes with
-    /// it:
+    /// `error[E0599]: no method named set_data found for struct
+    /// OverlayState<Vec<u8>, Assembled> in the current scope`, with rustc
+    /// adding `the method was found for OverlayState<T, Whole>`.
+    ///
+    /// The **pair** is what makes that mean anything, not the `compile_fail`
+    /// alone: a `compile_fail` block passes on any error at all, a typo
+    /// included, and rustdoc's `,E0599` annotation is checked on nightly only,
+    /// so on a stable toolchain it is decoration. So here is the same round,
+    /// the same state, the same data and the same clock, differing in one
+    /// thing — that the report of what is not on the map comes with it — and it
+    /// compiles and runs:
     ///
     /// ```
     /// use rustdar_overlays::fetch_policy::{Assembled, DataCompleteness};
@@ -246,7 +254,7 @@ impl<T, S: RoundShape> OverlayState<T, S> {
     /// tornado report in the country missing from it. A handler that files that
     /// round into a `Whole` state does not get as far as `set_data`:
     ///
-    /// ```compile_fail,E0271
+    /// ```compile_fail
     /// use rustdar_overlays::fetch_policy::{Assembled, FetchRound, Whole};
     /// use rustdar_overlays::render::overlay_state::{FetchPayload, OverlayState};
     ///
@@ -264,6 +272,35 @@ impl<T, S: RoundShape> OverlayState<T, S> {
     ///     failed_kinds: vec!["tornado"],
     /// });
     /// let _round = state.downcast_round::<StormReportsFetchResult>(payload);
+    /// ```
+    ///
+    /// `error[E0271]: type mismatch resolving <StormReportsFetchResult as
+    /// FetchRound>::Shape == Whole`.
+    ///
+    /// Its pair, which is the identical program with the layer declaring the
+    /// shape its round declared, and which compiles and hands the round over:
+    ///
+    /// ```
+    /// use rustdar_overlays::fetch_policy::{Assembled, FetchRound};
+    /// use rustdar_overlays::render::overlay_state::{FetchPayload, OverlayState};
+    ///
+    /// struct StormReportsFetchResult {
+    ///     reports: Vec<u8>,
+    ///     failed_kinds: Vec<&'static str>,
+    /// }
+    /// impl FetchRound for StormReportsFetchResult {
+    ///     type Shape = Assembled;
+    /// }
+    ///
+    /// let state: OverlayState<Vec<u8>, Assembled> = OverlayState::new();
+    /// let payload: FetchPayload = Box::new(StormReportsFetchResult {
+    ///     reports: vec![1, 2, 3],
+    ///     failed_kinds: vec!["tornado"],
+    /// });
+    /// let round = state
+    ///     .downcast_round::<StormReportsFetchResult>(payload)
+    ///     .expect("the payload is this layer's own");
+    /// assert_eq!(round.failed_kinds, ["tornado"]);
     /// ```
     ///
     /// Declaring the same round [`Whole`] is the one step left that a person
