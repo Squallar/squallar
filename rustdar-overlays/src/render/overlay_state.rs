@@ -198,9 +198,7 @@ impl<T> OverlayState<T, Assembled> {
     }
 
     /// Coverage on its own, for the assembled layer that **stamps its own map**
-    /// rather than replacing it — the same exception
-    /// [`record_success`](OverlayState::record_success) exists for, one axis
-    /// over.
+    /// rather than replacing it.
     ///
     /// SPC outlooks are keyed by `(day, product)` and arrive one product per
     /// payload, so there is no moment at which the layer holds a finished
@@ -313,13 +311,19 @@ impl<T, S: RoundShape> OverlayState<T, S> {
         payload.downcast::<R>().ok().map(|round| *round)
     }
 
-    /// A good answer that replaced no data — the outlook handler stamps its own
-    /// map rather than going through [`set_data`](Self::set_data).
-    pub fn record_success(&mut self) {
-        self.fetch_time = Some(web_time::Instant::now());
-        self.fetching = false;
-        self.retry.record_success();
-    }
+    // `record_success()` used to live here — stamp the clock, end the fetch,
+    // clear the ladder — documented as "a good answer that replaced no data,
+    // for the outlook handler". It had **no callers at all**: the outlook
+    // handler writes `state.retry.record_success()` itself, from
+    // `file_round_verdict`, because its ledger is written once per round and
+    // not once per payload.
+    //
+    // Deleted rather than left as a correct-looking helper, for the same
+    // reason `needs_refresh` below it was: on an `Assembled` state it was the
+    // whole silence in two lines. `state.data = whatever; state.record_success()`
+    // installs data, stamps a fresh clock, resets the ladder and leaves the
+    // previous coverage report standing — everything `set_data` used to do
+    // wrong, reachable on exactly the layers that must not be able to do it.
 
     /// End a fetch that did not produce data, filing it against the ladder.
     ///

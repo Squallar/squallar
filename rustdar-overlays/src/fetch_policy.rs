@@ -563,6 +563,17 @@ impl DataCompleteness {
 /// what put it out of scope is the round type the layer takes delivery of — see
 /// [`FetchRound`].
 ///
+/// # What this does and does not guarantee
+///
+/// It guarantees a layer **cannot install data without declaring coverage**. It
+/// does not, and cannot, guarantee that the declaration is *true*: writing
+/// [`Whole`] on a round type that holds a `Vec` of failures is a step a person
+/// can still take, and [`FetchRetry::record_coverage`] will still accept a
+/// whole report from a round that under-delivered. What changed is that both of
+/// those are now something written on purpose, in a file that has the failures
+/// on screen — where before, saying nothing at all was the ergonomic default
+/// and said "whole".
+///
 /// Sealed. The two shapes below are the whole question, the same way
 /// [`crate::nws::zones::ZoneFailure`] has no fall-through: a third shape would
 /// be a place for a round to be neither, which is where a silence would live.
@@ -579,10 +590,19 @@ pub trait RoundShape: sealed::Sealed {}
 /// apart and keeps whichever answers, so it looks multi-request — and it is not
 /// assembled, because either run alone is the same product and a whole answer
 /// to the question asked. A round that fell back to the older run has not
-/// under-delivered; it has answered. The line this trait draws is *can the
-/// answer be missing pieces*, never *how many requests did it take*, and a
-/// design that made HRRR declare coverage would be a design HRRR was worked
-/// around.
+/// under-delivered; it has answered. The line this axis draws is **can a piece
+/// of this round have failed on its own**, never *how many requests did it
+/// take*, and a design that made HRRR declare coverage would be a design HRRR
+/// was worked around.
+///
+/// That line is drawn at the **request**, deliberately, and there is a second
+/// question it does not answer: a parser that skips a malformed element inside
+/// one document has also delivered less than arrived. `parse_md_rss` keeps a
+/// discussion whose polygon would not parse, `spc::outlook::parse_geojson`
+/// skips a degenerate feature, `nws::alert::parse_alerts` skips an alert it
+/// cannot read. No layer reports any of those today, on either axis, and none
+/// of them is what [`Assembled`] means. Naming it here so the next person can
+/// tell an unanswered question from an overlooked one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Whole;
 
