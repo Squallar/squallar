@@ -442,7 +442,8 @@ async fn live_one_pass_decode_matches_the_two_pass_decode() {
     let meta = metas.first().expect("the day is not empty").clone();
     println!("volume: {}", meta.name());
 
-    let file = download_file(meta).await.expect("a downloaded volume");
+    let file =
+        nexrad_data::volume::File::new(download_file(meta).await.expect("a downloaded volume"));
 
     let upstream = file.scan().expect("upstream decodes it");
     let independent = crate::nyquist::DeclaredNyquist::from_archive(&file);

@@ -115,6 +115,59 @@ impl super::App {
         });
     }
 
+    /// Hand a downloaded archive's **decode** to the job funnel, then answer on
+    /// `sender`.
+    ///
+    /// # This is the whole of the fix, and it is a split rather than a move
+    ///
+    /// `scan::fetch_scan` and its three siblings used to download *and* decode
+    /// inside one `async fn`, and on the web that future runs on the browser's one
+    /// thread — `spawn_detached` is `wasm_bindgen_futures::spawn_local` there. The
+    /// frame-thread audit measured what that cost: **1021.9 ms in Firefox 153 and
+    /// 911.4 ms in Chrome 151** for a 16.9 MB volume, paid on cold start, on every
+    /// timeline scrub, on every "next scan", on every site switch and once per loop
+    /// frame. Nothing else this application does blocks a frame for a second.
+    ///
+    /// The network half has to stay on the async task, because that is where the
+    /// fetch stack is. The CPU half does not, and now does not: it goes through
+    /// [`crate::offload::offload_job`] as a
+    /// [`JobRequest::Decode`](crate::offload::JobRequest::Decode), which means a
+    /// Web Worker where there is one and this thread where there is not — the same
+    /// fallback every render already has, and the same behaviour the build had
+    /// before any of this existed.
+    ///
+    /// An associated function rather than a method: it is called from inside the
+    /// spawned future, which has already moved everything it needs out of `&self`
+    /// and cannot borrow it again.
+    ///
+    /// `respond` answers `None` to send nothing at all, which is what the auto-poll
+    /// path needs: a round that found no new volume must not wake the timeline.
+    fn decode_offloaded<T: Send + 'static>(
+        window: Option<crate::WindowRef>,
+        sender: Sender<T>,
+        archive: Vec<u8>,
+        respond: impl FnOnce(Option<rustdar_radar::scan::DecodedScan>) -> Option<T> + Send + 'static,
+    ) {
+        crate::offload::offload_job(
+            "level2-decode",
+            crate::offload::Job::Described(crate::offload::JobRequest::Decode {
+                archive: std::sync::Arc::new(archive),
+            }),
+            move |result| {
+                // `None` here is an archive that did not decode, which
+                // `execute`'s arm has already logged. Every caller treats it as
+                // the failed fetch it is.
+                let volume = result
+                    .and_then(crate::offload::JobOutput::volume)
+                    .map(|boxed| *boxed);
+                if let Some(message) = respond(volume) {
+                    let _ = sender.send(message);
+                }
+                crate::app::notify_redraw(&window);
+            },
+        );
+    }
+
     /// Refresh the cached network site catalogue, once per launch, detached.
     ///
     /// # Nothing here is on the critical path, by construction
@@ -152,30 +205,52 @@ impl super::App {
     /// Handles generation tracking, result sending, and redraw requests.
     pub fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {
         let generation = self.render.next_fetch_generation(&site);
-        self.spawn_async_task(self.channels.scan_sender.clone(), async move {
+        let window = self.window.clone();
+        let sender = self.channels.scan_sender.clone();
+        self.spawn_detached(async move {
             log::info!("Fetching {} @ {} UTC", site, timestamp);
-            let msg = match scan::get_scan(&site, timestamp).await {
-                Ok(data) => {
-                    log::info!("Fetched scan: {} @ {}", site, timestamp);
-                    Ok(ScanData {
-                        scan: data.scan,
-                        declared_nyquist: data.declared_nyquist,
-                        site: site.clone(),
-                        timestamp,
-                    })
-                }
+            // The download stays on this task; the decode goes to the funnel.
+            let archive = match scan::fetch_scan(&site, timestamp).await {
+                Ok(archive) => archive,
                 Err(e) => {
                     let err = format!("Failed to fetch radar scan: {:?}", e);
                     log::error!("{}", err);
-                    Err(err)
+                    let _ = sender.send(ScanResponse {
+                        generation,
+                        site,
+                        result: Err(err),
+                        is_auto_poll: false,
+                    });
+                    crate::app::notify_redraw(&window);
+                    return;
                 }
             };
-            ScanResponse {
-                generation,
-                site,
-                result: msg,
-                is_auto_poll: false,
-            }
+            Self::decode_offloaded(window, sender, archive, move |volume| {
+                let result = match volume {
+                    Some(volume) => {
+                        log::info!("Fetched scan: {} @ {}", site, timestamp);
+                        Ok(ScanData {
+                            scan: volume.scan,
+                            declared_nyquist: volume.declared_nyquist,
+                            site: site.clone(),
+                            timestamp,
+                        })
+                    }
+                    // The archive arrived and would not decode. `execute` has
+                    // logged why; this is what the pane is told.
+                    None => {
+                        let err = format!("Could not decode the volume for {site} @ {timestamp}");
+                        log::error!("{err}");
+                        Err(err)
+                    }
+                };
+                Some(ScanResponse {
+                    generation,
+                    site,
+                    result,
+                    is_auto_poll: false,
+                })
+            });
         });
     }
 
@@ -495,25 +570,33 @@ impl super::App {
 
                 // Not using spawn_async_task: conditional send (only on new data)
                 self.spawn_detached(async move {
-                    match scan::check_and_fetch_latest(
+                    match scan::fetch_latest_if_newer(
                         &site,
                         &utc_timestamp.date(),
                         current_scan_timestamp,
                     )
                     .await
                     {
-                        Ok(Some((data, timestamp))) => {
-                            let _ = sender.send(crate::channels::ScanResponse {
-                                generation,
-                                site: site.clone(),
-                                result: Ok(crate::channels::ScanData {
-                                    scan: data.scan,
-                                    declared_nyquist: data.declared_nyquist,
-                                    site,
-                                    timestamp,
-                                }),
-                                is_auto_poll: true,
+                        Ok(Some((archive, timestamp))) => {
+                            // The decode goes to the funnel; the answer is
+                            // still conditional, which is what the `Option`
+                            // `decode_offloaded` takes back is for.
+                            Self::decode_offloaded(window, sender, archive, move |volume| {
+                                let volume = volume?;
+                                Some(crate::channels::ScanResponse {
+                                    generation,
+                                    site: site.clone(),
+                                    result: Ok(crate::channels::ScanData {
+                                        scan: volume.scan,
+                                        declared_nyquist: volume.declared_nyquist,
+                                        site,
+                                        timestamp,
+                                    }),
+                                    is_auto_poll: true,
+                                })
                             });
+                            // `decode_offloaded` redraws when it answers.
+                            return;
                         }
                         Ok(None) => { /* already latest or no data */ }
                         Err(e) => {
@@ -1151,28 +1234,44 @@ impl super::App {
 
         let generation = self.render.next_fetch_generation(&site);
 
-        self.spawn_async_task(self.channels.scan_sender.clone(), async move {
-            match scan::get_adjacent_scan(&site, current_utc, forward).await {
-                Ok((data, timestamp)) => crate::channels::ScanResponse {
-                    generation,
-                    site: site.clone(),
-                    result: Ok(crate::channels::ScanData {
-                        scan: data.scan,
-                        declared_nyquist: data.declared_nyquist,
-                        site,
-                        timestamp,
-                    }),
-                    is_auto_poll: false,
-                },
+        let window = self.window.clone();
+        let sender = self.channels.scan_sender.clone();
+        self.spawn_detached(async move {
+            match scan::fetch_adjacent_scan(&site, current_utc, forward).await {
+                Ok((archive, timestamp)) => {
+                    Self::decode_offloaded(window, sender, archive, move |volume| {
+                        let result = match volume {
+                            Some(volume) => Ok(crate::channels::ScanData {
+                                scan: volume.scan,
+                                declared_nyquist: volume.declared_nyquist,
+                                site: site.clone(),
+                                timestamp,
+                            }),
+                            None => {
+                                let err =
+                                    format!("Could not decode the adjacent volume for {site}");
+                                log::error!("{err}");
+                                Err(err)
+                            }
+                        };
+                        Some(crate::channels::ScanResponse {
+                            generation,
+                            site,
+                            result,
+                            is_auto_poll: false,
+                        })
+                    });
+                }
                 Err(e) => {
                     let err = format!("Failed to find adjacent scan: {:?}", e);
                     log::error!("{}", err);
-                    crate::channels::ScanResponse {
+                    let _ = sender.send(crate::channels::ScanResponse {
                         generation,
                         site,
                         result: Err(err),
                         is_auto_poll: false,
-                    }
+                    });
+                    crate::app::notify_redraw(&window);
                 }
             }
         });
@@ -1260,39 +1359,55 @@ impl super::App {
         timestamp: NaiveDateTime,
         identifier: rustdar_radar::archive::Identifier,
     ) {
-        self.spawn_async_task(
-            self.channels.loop_scan_download_sender.clone(),
-            async move {
-                let scan = match scan::download_scan(identifier).await {
-                    // Both halves, because a loop frame is dealiased on the same
-                    // terms as the still frame beside it: NROT and SRV unfold
-                    // around the limit the cut declared, and a frame that
-                    // arrived without the declaration would unfold around an
-                    // estimate instead — a loop stepping through pictures of
-                    // one storm computed two different ways.
-                    Ok(decoded) => Some((
-                        std::sync::Arc::new(decoded.scan),
-                        std::sync::Arc::new(decoded.declared_nyquist),
-                    )),
-                    Err(e) => {
-                        log::error!(
-                            "Loop scan download failed for pane {} ({} @ {}): {:?}",
-                            pane_idx,
-                            site,
-                            timestamp,
-                            e
-                        );
-                        None
-                    }
-                };
-                crate::channels::LoopScanDownloadResponse {
+        let window = self.window.clone();
+        let sender = self.channels.loop_scan_download_sender.clone();
+        self.spawn_detached(async move {
+            let archive = match scan::fetch_scan_object(identifier).await {
+                Ok(archive) => archive,
+                Err(e) => {
+                    log::error!(
+                        "Loop scan download failed for pane {} ({} @ {}): {:?}",
+                        pane_idx,
+                        site,
+                        timestamp,
+                        e
+                    );
+                    let _ = sender.send(crate::channels::LoopScanDownloadResponse {
+                        pane_idx,
+                        site,
+                        timestamp,
+                        scan: None,
+                    });
+                    crate::app::notify_redraw(&window);
+                    return;
+                }
+            };
+            // **Every loop frame comes through here**, and on wasm that is up
+            // to `MAX_LOOP_FRAMES` of them — 14, not the 60 desktop holds. Each
+            // is its own job: the funnel posts them as they are downloaded and
+            // the worker takes them in order, so a loop fills progressively
+            // rather than freezing the tab once per frame.
+            Self::decode_offloaded(window, sender, archive, move |volume| {
+                // Both halves, because a loop frame is dealiased on the same
+                // terms as the still frame beside it: NROT and SRV unfold
+                // around the limit the cut declared, and a frame that arrived
+                // without the declaration would unfold around an estimate
+                // instead — a loop stepping through pictures of one storm
+                // computed two different ways.
+                let scan = volume.map(|volume| {
+                    (
+                        std::sync::Arc::new(volume.scan),
+                        std::sync::Arc::new(volume.declared_nyquist),
+                    )
+                });
+                Some(crate::channels::LoopScanDownloadResponse {
                     pane_idx,
                     site,
                     timestamp,
                     scan,
-                }
-            },
-        );
+                })
+            });
+        });
     }
 
     /// Spawn the key listing a pane's Level III loop pairings will be ranked
