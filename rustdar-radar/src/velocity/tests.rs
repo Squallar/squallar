@@ -237,3 +237,90 @@ fn the_walk_refuses_a_moment_less_sweep_and_a_two_radial_one() {
     assert_eq!(tilts(&scan).count(), 0);
     assert!(volume_wind_profile(&scan).is_none());
 }
+
+/// Each gate's status is the decoder's own answer, verbatim — no aggregation,
+/// because one gate is one cell here — and a radial carrying no velocity is a
+/// row of absences rather than a row that merely looks empty.
+///
+/// Non-circular by construction: the raw bytes are the input and
+/// `nexrad_model`'s `MomentData::from_fixed_point` is what turns raw 0 into
+/// `BelowThreshold` and raw 1 into `RangeFolded`. This asserts that
+/// [`grid`] carries the decoder's answer through, not that it agrees with a
+/// table of ours.
+#[test]
+fn a_gates_status_is_the_decoders_answer_and_a_dry_radial_is_absent() {
+    use crate::types::GateReport;
+
+    const SCALE: f32 = 2.0;
+    const OFFSET: f32 = 129.0;
+    // raw 0 -> below threshold, 1 -> range folded, >= 2 -> a number.
+    let bytes: Vec<u8> = vec![0, 1, 200, 2, 0];
+    let with = Radial::new(
+        0,
+        0,
+        10.0,
+        1.0,
+        RadialStatus::IntermediateRadialData,
+        1,
+        0.5,
+        None,
+        Some(MomentData::from_fixed_point(
+            bytes.len() as u16,
+            0,
+            250,
+            8,
+            SCALE,
+            OFFSET,
+            bytes,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    // Same sweep, one radial that never reported the moment at all.
+    let without = Radial::new(
+        0,
+        1,
+        11.0,
+        1.0,
+        RadialStatus::IntermediateRadialData,
+        1,
+        0.5,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let g = grid(&[with, without]).expect("the first radial carries velocity");
+    assert_eq!(
+        g.status[0],
+        vec![
+            GateReport::BelowThreshold,
+            GateReport::RangeFolded,
+            GateReport::Value,
+            GateReport::Value,
+            GateReport::BelowThreshold,
+        ],
+        "the decoder's four answers arrive apart",
+    );
+    // The row that carries nothing: absence, and distinguishable from the
+    // below-threshold gates of the row above it, which is the whole point.
+    assert_eq!(
+        g.status[1],
+        vec![GateReport::NotReported; g.gate_count],
+        "a radial with no velocity moment reports nothing, it does not measure emptiness",
+    );
+
+    // And the invariant, on both rows.
+    for (row_v, row_s) in g.values.iter().zip(g.status.iter()) {
+        for (v, s) in row_v.iter().zip(row_s.iter()) {
+            assert_eq!(v.is_finite(), *s == GateReport::Value);
+        }
+    }
+}

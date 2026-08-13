@@ -865,6 +865,87 @@ impl MomentSlot {
     }
 }
 
+/// Why a cell of a decoded grid has no number — or, for [`GateReport::Value`],
+/// that it has one.
+///
+/// The decoder answers a gate query four ways and a dense `f64`/`f32` grid can
+/// only write one of them, so the other three arrive as the same `NaN` and the
+/// consumer cannot tell them apart. They are not the same fact:
+///
+/// * [`BelowThreshold`](Self::BelowThreshold) is a **measurement**. The radar
+///   illuminated that gate and found nothing above the moment's signal
+///   threshold. "Empty" is what it observed.
+/// * [`RangeFolded`](Self::RangeFolded) is also a measurement, and the
+///   *opposite* one: there is signal, and only its range is ambiguous.
+/// * [`NotReported`](Self::NotReported) is the sole genuine absence — no gate
+///   exists there to have said anything.
+///
+/// An occupancy rule, a stencil that demands intact taps, and a column scan
+/// that has to decide where an echo stops all want to weigh those differently,
+/// and none of them can while the three share a bit pattern.
+///
+/// # Relationship to the two neighbouring types
+///
+/// The first three arms mirror `nexrad_model::data::MomentValue`'s own, which
+/// is the point: this is that enum with its `f32` split off into a parallel
+/// plane, plus the fourth case a *grid* has and a single gate does not.
+///
+/// [`crate::sampler::SampleStatus`] is the richer cousin and stays separate.
+/// Four of its seven arms — `BelowLowestBeam`, `AboveVolume`, `BeyondRange`,
+/// `NoCoverage` — describe where a *query* fell in a ladder, which a decoded
+/// grid has no way to be and no business claiming. Reusing it here would let a
+/// grid cell answer `BelowLowestBeam`, so it does not.
+///
+/// # Ordering is precedence, and it is load-bearing
+///
+/// [`Ord`] is derived over the declaration order below, so `max` is the rule
+/// for collapsing several gates into one cell: a measured number beats
+/// ambiguous signal, ambiguous signal beats measured emptiness, and measured
+/// emptiness beats no gate at all. Reordering the variants silently changes
+/// what every aggregating grid reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(u8)]
+pub enum GateReport {
+    /// No gate covered this cell: the radial carried no such moment, the cell
+    /// is past the moment's last gate, or no radial served the azimuth. The
+    /// default, because a grid starts out having been told nothing.
+    #[default]
+    NotReported = 0,
+    /// Every gate under this cell was below the moment's signal threshold
+    /// (raw code 0). The radar looked and saw nothing — a measurement of
+    /// absence, not an absence of measurement.
+    BelowThreshold = 1,
+    /// A gate under this cell was range folded (raw code 1) and none carried a
+    /// value: signal is present, and only its range is ambiguous past the
+    /// unambiguous range of the cut's PRF.
+    RangeFolded = 2,
+    /// At least one gate under this cell carried a number, so the grid's own
+    /// value is defined here.
+    Value = 3,
+}
+
+impl GateReport {
+    /// What one `MomentValue` reports, before any cell aggregation.
+    pub fn of(value: &nexrad_model::data::MomentValue) -> Self {
+        match value {
+            nexrad_model::data::MomentValue::Value(_) => Self::Value,
+            nexrad_model::data::MomentValue::BelowThreshold => Self::BelowThreshold,
+            nexrad_model::data::MomentValue::RangeFolded => Self::RangeFolded,
+        }
+    }
+
+    /// Whether the radar *looked* at this cell, whatever it found.
+    ///
+    /// True for all three of the decoder's answers and false only for
+    /// [`NotReported`](Self::NotReported). This is the question a consumer
+    /// deciding "is this gap real data or missing data" is actually asking,
+    /// and naming it keeps that question from being spelt three different
+    /// ways at three call sites.
+    pub fn is_measured(self) -> bool {
+        self != Self::NotReported
+    }
+}
+
 /// What a render *draws*, as opposed to what it draws it of.
 ///
 /// Three products of one moment can share a renderer; three views of one

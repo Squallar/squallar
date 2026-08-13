@@ -85,14 +85,37 @@ use std::borrow::Borrow;
 /// found nothing*, which an occupancy rule ought to weigh differently from *no
 /// gate was reported*; range-folded means *there is signal and its velocity is
 /// ambiguous*, which is the opposite of absence, and it peaks on the
-/// mesocyclone volume. Nothing yet reads the distinction — recorded because a
-/// measurement that says a gap is real is what any future consumer has to
-/// argue against, and because the synthetic corpus cannot show it (its patcher
-/// repaints every gate, so it reads zero folded everywhere).
+/// mesocyclone volume. The census stands as measured — the numbers above were
+/// re-measured against it and reproduced (see [`status`](Self::status)) — and
+/// the synthetic corpus still cannot show it, because its patcher repaints
+/// every gate and so reads zero folded everywhere.
+///
+/// **The flattening is now recoverable**: [`status`](Self::status) carries the
+/// three apart. What has *not* changed is any number this grid reports, or any
+/// consumer's behaviour — see that field for what still reads only `values`.
 #[derive(Debug, Clone)]
 pub struct VelocityGrid {
     /// m/s per (radial, gate); NaN is no data.
     pub values: Vec<Vec<f64>>,
+    /// Why each gate of [`values`](Self::values) is `NaN`, at the same
+    /// `(radial, gate)` indices — the distinction the census above measures
+    /// the size of. [`GateReport::Value`] exactly where `values` is finite.
+    ///
+    /// One byte per gate against the value's eight: about 12% on top of a
+    /// super-res cut, which is why [`tilts`] stays lazy for the callers that
+    /// only want a wind fit. The alternatives, and why a parallel plane beat
+    /// them, are argued at [`crate::volumetric`]'s `sweep_to_grid`; the same
+    /// reasoning applies here and the pattern is already shipped in
+    /// `xsect.rs`.
+    ///
+    /// **Nothing reads this yet.** That is deliberate and is the scope line:
+    /// the channel is what this delivers, and every consumer that could use it
+    /// — the dealiaser's coverage rules, the median filter's two occupancy
+    /// cliffs (`crate::nrot`'s `MEDIAN_MIN_RAW_OCC` and
+    /// `MEDIAN_MIN_DEALIASED_OCC`), `tap_stencil`'s demand that every tap be
+    /// intact, and NROT's data-margin rule — is a separate change with its own
+    /// measurement, because each of them would move painted pixels.
+    pub status: Vec<Vec<crate::types::GateReport>>,
     /// Radial **centre** azimuths, degrees, in sweep order.
     pub azimuths_deg: Vec<f64>,
     pub gate_count: usize,
@@ -132,35 +155,52 @@ impl VelocityGrid {
 /// of NaN rather than a missing row, so the row count and `azimuths_deg`
 /// always match the sweep the caller handed in.
 ///
-/// Range-folded and below-threshold gates both become NaN — see
-/// [`VelocityGrid`] for how much of a real sweep that flattens.
+/// Range-folded and below-threshold gates both become NaN in `values` — see
+/// [`VelocityGrid`] for how much of a real sweep that flattens, and
+/// [`VelocityGrid::status`] for the plane that now says which is which.
+///
+/// A radial carrying no velocity moment at all is a row of
+/// [`GateReport::NotReported`], which is the honest answer and the one the
+/// row-of-NaN convention could not give.
 pub fn grid(radials: &[Radial]) -> Option<VelocityGrid> {
+    use crate::types::GateReport;
     let first_vel = radials.iter().find_map(|r| r.velocity())?;
     let gate_count = first_vel.gate_count() as usize;
     let first_gate_range_km = first_vel.first_gate_range_km();
     let gate_interval_km = first_vel.gate_interval_km();
 
     let mut values: Vec<Vec<f64>> = Vec::with_capacity(radials.len());
+    let mut status: Vec<Vec<GateReport>> = Vec::with_capacity(radials.len());
     let mut azimuths_deg: Vec<f64> = Vec::with_capacity(radials.len());
     for radial in radials {
         azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
         let mut gates = vec![f64::NAN; gate_count];
+        // One gate is one cell here — no aggregation — so this is the
+        // decoder's answer verbatim, not a `max` over several.
+        let mut reports = vec![GateReport::NotReported; gate_count];
         if let Some(moment) = radial.velocity() {
             // `iter`, not `values`: sequential, and `take` then stops decoding
             // at `gate_count` instead of collecting every gate first.
             for (j, val) in moment.iter().enumerate().take(gate_count) {
-                if let nexrad_model::data::MomentValue::Value(v) = val
-                    && !v.is_nan()
-                    && v < 999.0
-                {
-                    gates[j] = v as f64;
+                reports[j] = GateReport::of(&val);
+                if let nexrad_model::data::MomentValue::Value(v) = val {
+                    if !v.is_nan() && v < 999.0 {
+                        gates[j] = v as f64;
+                    } else {
+                        // A reported gate whose number is the decoder's
+                        // out-of-range sentinel. It says nothing this plane
+                        // can carry, so it does not claim to be a value.
+                        reports[j] = GateReport::NotReported;
+                    }
                 }
             }
         }
         values.push(gates);
+        status.push(reports);
     }
     Some(VelocityGrid {
         values,
+        status,
         azimuths_deg,
         gate_count,
         first_gate_range_km,
