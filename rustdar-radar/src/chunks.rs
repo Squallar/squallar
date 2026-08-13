@@ -1912,7 +1912,7 @@ pub async fn list_chunks(
     volume: VolumeIndex,
 ) -> Result<Vec<ChunkId>> {
     let client = crate::archive::shared_client();
-    let bucket = sources.level2_chunks_bucket.clone();
+    let bucket = sources.s3_bucket_url(&sources.level2_chunks_bucket);
     let prefix = volume.prefix(site);
 
     let keys =
@@ -1935,7 +1935,7 @@ pub async fn download_chunk(
     id: &ChunkId,
 ) -> Result<Vec<u8>> {
     let client = crate::archive::shared_client();
-    let url = crate::sources::DataSources::s3_object_url(&sources.level2_chunks_bucket, &id.key());
+    let url = sources.s3_object_url(&sources.level2_chunks_bucket, &id.key());
     Ok(crate::archive::get_bytes(client, url).await?)
 }
 
@@ -1949,7 +1949,7 @@ pub async fn list_volume_indices(
     site: &str,
 ) -> Result<Vec<VolumeIndex>> {
     let client = crate::archive::shared_client();
-    let bucket = sources.level2_chunks_bucket.clone();
+    let bucket = sources.s3_bucket_url(&sources.level2_chunks_bucket);
     let prefix = format!("{site}/");
 
     let prefixes = crate::archive::collect_common_prefixes(&bucket, &prefix, DELIMITER, |url| {

@@ -1152,3 +1152,212 @@ fn a_listing_round_is_refused_only_when_every_satellite_was() {
         );
     }
 }
+
+// ── The satellite loop, over a real socket ──────────────────────────────────
+//
+// The loop these drive — one listing per satellite, keeping whatever answered —
+// is the half of `fetch_glm_flashes` that decides whether one dead satellite
+// takes the other's flashes off the map. It had no test that ran it, because
+// the S3 origin was built literally inside the listing and could not be pointed
+// anywhere else; `DataSources::s3_base` is that obstacle removed, and these are
+// what it was removed for. The verdict merge alone is pinned above, at
+// `a_listing_round_is_refused_only_when_every_satellite_was`, and pinning a
+// helper is not pinning the caller: the loop reached `of_round` correctly and
+// could still have returned early, dropped the survivor, or counted a failed
+// listing as a live feed.
+
+/// An S3 `ListBucketResult` carrying one key, in the shape
+/// [`list_glm_files`] parses.
+fn listing_xml(key: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>bucket</Name><IsTruncated>false</IsTruncated>\
+         <Contents><Key>{key}</Key><Size>1</Size></Contents>\
+         </ListBucketResult>"
+    )
+}
+
+fn http_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/xml\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    )
+}
+
+/// A granule key whose encoded start time is years outside any live window.
+///
+/// So the listing is answered and **counted** — `objects_seen` is what tells a
+/// dead feed from a quiet sky — while nothing is queued for download, which
+/// keeps these tests to the listing round they are about.
+const STALE_GRANULE: &str =
+    "GLM-L2-LCFA/2020/001/00/OR_GLM-L2-LCFA_G18_s20200010000000_e20200010000200_c20200010000210.nc";
+
+/// Serve canned S3 responses from loopback, picked by which bucket the request
+/// names, and return sources that address every bucket there.
+///
+/// The whole point of [`DataSources::s3_base`]: production reads
+/// `https://{bucket}.s3.amazonaws.com`, a test reads `http://127.0.0.1:{port}/{bucket}`,
+/// and the fetch under test cannot tell the difference because it never spells
+/// either one.
+fn s3_serving(responses: Vec<(&'static str, String)>) -> DataSources {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut scratch = [0u8; 4096];
+            let read = stream.read(&mut scratch).unwrap_or(0);
+            let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+            let response = responses
+                .iter()
+                .find(|(bucket, _)| request.contains(&format!("/{bucket}/")))
+                .map(|(_, response)| response.clone())
+                .unwrap_or_else(|| http_response("404 Not Found", "<Error/>"));
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    DataSources {
+        goes_east_bucket: "east".into(),
+        goes_west_bucket: "west".into(),
+        s3_base: format!("http://127.0.0.1:{port}/{{bucket}}").into(),
+        ..DataSources::production()
+    }
+}
+
+/// A cleartext-capable client: `tls::client` sets `https_only`, which a
+/// loopback URL cannot satisfy, and `tls::init` is still required because
+/// `reqwest` is pinned to `rustls-no-provider`.
+fn loopback_client() -> reqwest::Client {
+    rustdar_radar::tls::init();
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("client")
+}
+
+/// One flash already in the cache from an earlier poll.
+fn cached_flash(cache: &mut GlmCache, key: &str, satellite: GlmSatellite) {
+    let time = Utc::now().naive_utc() - TimeDelta::seconds(10);
+    cache.insert(
+        key.to_string(),
+        time,
+        vec![GlmFlash {
+            lat: 35.0,
+            lon: -97.0,
+            energy: Some(1.0),
+            area: Some(1.0),
+            time,
+            satellite,
+            level: GlmDataLevel::Flash,
+        }],
+    );
+}
+
+fn poll(sources: &DataSources, cache: &mut GlmCache) -> Result<GlmFetchOutcome, FetchError> {
+    let client = loopback_client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(fetch_glm_flashes(
+        &client,
+        sources,
+        &[GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        GLM_MIN_TIME_WINDOW_SECS,
+        &[GlmDataLevel::Flash],
+        cache,
+    ))
+}
+
+/// **One dead satellite must not blank the other.**
+///
+/// The loop was `list_glm_files(...).await?`, so the first satellite to fail
+/// returned for the whole round: a dead GOES-East silently took GOES-West's
+/// flashes with it, on a layer where the survivor still covers most of CONUS.
+/// The round is `Ok` now, and says which half of the sky stopped arriving
+/// rather than reporting a green poll over a half-empty map.
+#[test]
+fn one_dead_satellite_does_not_blank_the_others_flashes() {
+    let sources = s3_serving(vec![
+        (
+            "east",
+            http_response("500 Internal Server Error", "<Error/>"),
+        ),
+        ("west", http_response("200 OK", &listing_xml(STALE_GRANULE))),
+    ]);
+    let mut cache = GlmCache::default();
+    cached_flash(&mut cache, "east/granule.nc", GlmSatellite::GoesEast);
+    cached_flash(&mut cache, "west/granule.nc", GlmSatellite::GoesWest);
+
+    let outcome = poll(&sources, &mut cache).expect("one satellite answered; the round stands");
+
+    assert_eq!(
+        outcome.queried,
+        vec![GlmSatellite::GoesWest],
+        "a satellite whose listing never answered must not be counted as queried \
+         — absence from `dead_feeds` reads as recovery for anything in there",
+    );
+    let (dead, why) = outcome
+        .listing_failures
+        .first()
+        .expect("the failed listing must be reported, not swallowed");
+    assert_eq!(*dead, GlmSatellite::GoesEast);
+    assert!(why.message.contains("500"), "{}", why.message);
+    assert!(
+        outcome.dead_feeds.is_empty(),
+        "the satellite that answered had objects; only a zero-object listing is \
+         a dead feed",
+    );
+
+    let mut satellites: Vec<GlmSatellite> = outcome.flashes.iter().map(|f| f.satellite).collect();
+    satellites.sort_by_key(|s| format!("{s:?}"));
+    assert_eq!(
+        satellites,
+        vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        "the survivor's flashes were dropped with the failed satellite's — and \
+         so were the failed satellite's own earlier granules, which are still \
+         real flashes inside the window",
+    );
+}
+
+/// A round fails only when **nothing** could be listed — and even then, one
+/// bucket refusing while the other times out is not the product refusing us.
+///
+/// The verdict reaches the layer's ledger, so the difference is a ladder rung
+/// against `REFUSALS_BEFORE_BROKEN` versus an ordinary backoff.
+#[test]
+fn a_round_fails_only_when_no_satellite_could_be_listed() {
+    let sources = s3_serving(vec![
+        ("east", http_response("400 Bad Request", "<Error/>")),
+        ("west", http_response("503 Service Unavailable", "<Error/>")),
+    ]);
+    let mut cache = GlmCache::default();
+    cached_flash(&mut cache, "west/granule.nc", GlmSatellite::GoesWest);
+
+    let Err(err) = poll(&sources, &mut cache) else {
+        panic!("no satellite could be listed, so the round has nothing to stand on");
+    };
+
+    assert_eq!(
+        err.failure,
+        crate::fetch_policy::FetchFailure::Transient,
+        "one bucket refusing while the other is unavailable is not the product \
+         refusing us: {}",
+        err.message,
+    );
+    assert!(
+        err.message
+            .contains("no GLM satellite could be listed (2 failed)"),
+        "{}",
+        err.message,
+    );
+    assert!(
+        err.message.contains("400") && err.message.contains("503"),
+        "the round must keep both origins' own words: {}",
+        err.message,
+    );
+}

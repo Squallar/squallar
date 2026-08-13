@@ -127,12 +127,12 @@ impl Identifier {
 /// opaque blobs that routinely contain `/` and can contain `+` and `=`; an
 /// unencoded `+` reaches S3 as a space and the page is rejected.
 pub(crate) fn list_url(
-    bucket: &str,
+    bucket_url: &str,
     prefix: &str,
     max_keys: Option<u32>,
     continuation_token: Option<&str>,
 ) -> Result<String> {
-    list_url_inner(bucket, prefix, None, max_keys, continuation_token)
+    list_url_inner(bucket_url, prefix, None, max_keys, continuation_token)
 }
 
 /// [`list_url`] plus a `delimiter`, which makes S3 collapse everything below it
@@ -143,23 +143,34 @@ pub(crate) fn list_url(
 /// [`list_url_inner`] so the `query_pairs_mut` encoding discipline applies to
 /// the delimiter too.
 pub(crate) fn list_url_delimited(
-    bucket: &str,
+    bucket_url: &str,
     prefix: &str,
     delimiter: &str,
     continuation_token: Option<&str>,
 ) -> Result<String> {
-    list_url_inner(bucket, prefix, Some(delimiter), None, continuation_token)
+    list_url_inner(
+        bucket_url,
+        prefix,
+        Some(delimiter),
+        None,
+        continuation_token,
+    )
 }
 
 fn list_url_inner(
-    bucket: &str,
+    bucket_url: &str,
     prefix: &str,
     delimiter: Option<&str>,
     max_keys: Option<u32>,
     continuation_token: Option<&str>,
 ) -> Result<String> {
-    let mut url = reqwest::Url::parse(&format!("https://{bucket}.s3.amazonaws.com/"))
-        .map_err(|e| ArchiveError::MalformedListing(format!("bad bucket {bucket:?}: {e}")))?;
+    // The bucket's **root URL**, from `DataSources::s3_bucket_url`, rather than
+    // its name with the origin built here: the shape of an S3 URL has one
+    // definition, in the table that declares the origins, and a listing that
+    // built its own could not be pointed anywhere the object GETs went.
+    let mut url = reqwest::Url::parse(&format!("{bucket_url}/")).map_err(|e| {
+        ArchiveError::MalformedListing(format!("bad bucket url {bucket_url:?}: {e}"))
+    })?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("list-type", "2");
@@ -175,12 +186,6 @@ fn list_url_inner(
         }
     }
     Ok(url.into())
-}
-
-/// Build the object URL for a full bucket key. The key is interpolated, not
-/// encoded: archive keys are drawn from `[A-Za-z0-9_/]`.
-fn object_url(bucket: &str, key: &str) -> String {
-    crate::sources::DataSources::s3_object_url(bucket, key)
 }
 
 /// The prefix under which one site's volumes for one day are stored.
@@ -308,7 +313,7 @@ fn parse_list_page(body: &str) -> Result<ListPage> {
 /// Paging keys off `IsTruncated`, not off the presence of a token: a final page
 /// that echoed a stale token would otherwise loop forever.
 pub(crate) async fn collect_keys<F, Fut>(
-    bucket: &str,
+    bucket_url: &str,
     prefix: &str,
     max_keys: Option<u32>,
     mut fetch_page: F,
@@ -321,7 +326,7 @@ where
     let mut token: Option<String> = None;
 
     for _ in 0..MAX_LIST_PAGES {
-        let url = list_url(bucket, prefix, max_keys, token.as_deref())?;
+        let url = list_url(bucket_url, prefix, max_keys, token.as_deref())?;
         let page = parse_list_page(&fetch_page(url).await?)?;
         keys.extend(page.keys);
 
@@ -354,7 +359,7 @@ where
 /// rather than silent loss, and the page cap stops a server that never stops
 /// saying `IsTruncated`.
 pub(crate) async fn collect_common_prefixes<F, Fut>(
-    bucket: &str,
+    bucket_url: &str,
     prefix: &str,
     delimiter: &str,
     mut fetch_page: F,
@@ -367,7 +372,7 @@ where
     let mut token: Option<String> = None;
 
     for _ in 0..MAX_LIST_PAGES {
-        let url = list_url_delimited(bucket, prefix, delimiter, token.as_deref())?;
+        let url = list_url_delimited(bucket_url, prefix, delimiter, token.as_deref())?;
         let page = parse_list_page(&fetch_page(url).await?)?;
         prefixes.extend(page.common_prefixes);
 
@@ -499,9 +504,12 @@ pub async fn list_files(
     let prefix = day_prefix(site, date);
 
     log::debug!("Listing archive objects for prefix {prefix:?}");
-    let keys = collect_keys(&sources.level2_bucket, &prefix, None, |url| {
-        get_text(client, url)
-    })
+    let keys = collect_keys(
+        &sources.s3_bucket_url(&sources.level2_bucket),
+        &prefix,
+        None,
+        |url| get_text(client, url),
+    )
     .await?;
     log::debug!("Listing for {prefix:?} returned {} keys", keys.len());
 
@@ -525,7 +533,7 @@ pub async fn download_file(
         .ok_or_else(|| ArchiveError::UnkeyableIdentifier(identifier.name().to_string()))?;
 
     let key = format!("{}/{}/{}", date.format("%Y/%m/%d"), site, identifier.name());
-    let url = object_url(&sources.level2_bucket, &key);
+    let url = sources.s3_object_url(&sources.level2_bucket, &key);
 
     log::debug!("Downloading archive object {key:?}");
     let response = client.get(&url).send().await?;

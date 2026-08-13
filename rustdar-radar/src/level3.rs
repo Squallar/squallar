@@ -168,9 +168,12 @@ pub(crate) async fn list_day(
     // Paged, not single-shot: ~342 objects per product-day fits one 1000-key
     // page today, but the page size is S3's choice and a truncated listing
     // would drop the newest keys — the ones this exists to find.
-    let keys = archive::collect_keys(&sources.level3_bucket, &prefix, None, |url| {
-        archive::get_text(client, url)
-    })
+    let keys = archive::collect_keys(
+        &sources.s3_bucket_url(&sources.level3_bucket),
+        &prefix,
+        None,
+        |url| archive::get_text(client, url),
+    )
     .await?;
     Ok(keys)
 }

@@ -64,7 +64,13 @@ fn day_prefix_is_zero_padded_and_date_partitioned() {
 /// A first-page URL is a `list-type=2` prefix query with no cursor.
 #[test]
 fn list_url_is_a_v2_prefix_query() {
-    let url = list_url("bkt", "2024/05/20/KTLX", None, None).expect("url");
+    let url = list_url(
+        "https://bkt.s3.amazonaws.com",
+        "2024/05/20/KTLX",
+        None,
+        None,
+    )
+    .expect("url");
     assert!(url.starts_with("https://bkt.s3.amazonaws.com/?"), "{url}");
     assert!(url.contains("list-type=2"), "{url}");
     // The live bucket accepts the percent-encoded separators.
@@ -78,9 +84,9 @@ fn list_url_is_a_v2_prefix_query() {
 /// `max-keys` is only present when asked for.
 #[test]
 fn list_url_carries_max_keys_only_when_set() {
-    let bare = list_url("bkt", "p", None, None).expect("url");
+    let bare = list_url("https://bkt.s3.amazonaws.com", "p", None, None).expect("url");
     assert!(!bare.contains("max-keys"), "{bare}");
-    let capped = list_url("bkt", "p", Some(7), None).expect("url");
+    let capped = list_url("https://bkt.s3.amazonaws.com", "p", Some(7), None).expect("url");
     assert!(capped.contains("max-keys=7"), "{capped}");
 }
 
@@ -90,7 +96,7 @@ fn list_url_carries_max_keys_only_when_set() {
 #[test]
 fn list_url_percent_encodes_the_continuation_token() {
     let token = "abc/def+ghi=";
-    let url = list_url("bkt", "p", None, Some(token)).expect("url");
+    let url = list_url("https://bkt.s3.amazonaws.com", "p", None, Some(token)).expect("url");
     assert!(
         url.contains("continuation-token=abc%2Fdef%2Bghi%3D"),
         "token not encoded into the query: {url}"
@@ -101,11 +107,13 @@ fn list_url_percent_encodes_the_continuation_token() {
     );
 }
 
-/// Object URLs are bucket-host plus the full key path.
+/// Object URLs are bucket-host plus the full key path, from the one place the
+/// S3 URL shape is declared.
 #[test]
 fn object_url_is_the_key_under_the_bucket_host() {
     assert_eq!(
-        object_url("bkt", "2024/05/20/KTLX/KTLX20240520_000004_V06"),
+        crate::sources::DataSources::production()
+            .s3_object_url("bkt", "2024/05/20/KTLX/KTLX20240520_000004_V06"),
         "https://bkt.s3.amazonaws.com/2024/05/20/KTLX/KTLX20240520_000004_V06"
     );
 }
@@ -252,11 +260,12 @@ fn parse_list_page_reads_a_delimited_listing() {
 /// The delimiter reaches the wire, and a plain listing still carries none.
 #[test]
 fn list_url_delimited_asks_for_directories() {
-    let url = list_url_delimited("bucket", "KTLX/", "/", None).expect("url");
+    let url =
+        list_url_delimited("https://bucket.s3.amazonaws.com", "KTLX/", "/", None).expect("url");
     assert!(url.contains("delimiter=%2F"), "{url}");
     assert!(url.contains("prefix=KTLX%2F"), "{url}");
 
-    let plain = list_url("bucket", "KTLX/", None, None).expect("url");
+    let plain = list_url("https://bucket.s3.amazonaws.com", "KTLX/", None, None).expect("url");
     assert!(
         !plain.contains("delimiter"),
         "an undelimited listing must stay undelimited: {plain}"
@@ -284,8 +293,9 @@ fn paginate(
     let remaining = std::cell::RefCell::new(std::collections::VecDeque::from(pages));
 
     let sources = DataSources::production();
+    let bucket_url = sources.s3_bucket_url(&sources.level2_bucket);
     let outcome = {
-        let fut = collect_keys(&sources.level2_bucket, "2024/05/20/KTLX", Some(2), |url| {
+        let fut = collect_keys(&bucket_url, "2024/05/20/KTLX", Some(2), |url| {
             urls.borrow_mut().push(url);
             let next = remaining
                 .borrow_mut()
@@ -555,18 +565,28 @@ async fn live_paged_listing_equals_the_single_page_listing() {
     let prefix = day_prefix("KTLX", &date(2024, 5, 20));
 
     let mut single_page_requests = 0;
-    let whole = collect_keys(&sources.level2_bucket, &prefix, None, |url| {
-        single_page_requests += 1;
-        get_text(client, url)
-    })
+    let whole = collect_keys(
+        &sources.s3_bucket_url(&sources.level2_bucket),
+        &prefix,
+        None,
+        |url| {
+            single_page_requests += 1;
+            get_text(client, url)
+        },
+    )
     .await
     .expect("unpaginated listing");
 
     let mut paged_requests = 0;
-    let paged = collect_keys(&sources.level2_bucket, &prefix, Some(20), |url| {
-        paged_requests += 1;
-        get_text(client, url)
-    })
+    let paged = collect_keys(
+        &sources.s3_bucket_url(&sources.level2_bucket),
+        &prefix,
+        Some(20),
+        |url| {
+            paged_requests += 1;
+            get_text(client, url)
+        },
+    )
     .await
     .expect("paginated listing");
 
@@ -615,7 +635,13 @@ async fn live_missing_volume_is_reported_as_not_found() {
 #[tokio::test]
 async fn live_listing_needs_no_credentials() {
     let sources = DataSources::production();
-    let url = list_url(&sources.level2_bucket, "2024/05/20/KTLX", Some(1), None).expect("url");
+    let url = list_url(
+        &sources.s3_bucket_url(&sources.level2_bucket),
+        "2024/05/20/KTLX",
+        Some(1),
+        None,
+    )
+    .expect("url");
     let response = shared_client()
         .get(&url)
         .send()

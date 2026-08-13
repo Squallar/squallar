@@ -157,7 +157,7 @@ pub async fn fetch_glm_flashes(
 
     for &sat in satellites {
         let bucket = sat.bucket(sources);
-        let listing = match list_glm_files(client, bucket, start, now).await {
+        let listing = match list_glm_files(client, sources, bucket, start, now).await {
             Ok(listing) => listing,
             Err(e) => {
                 log::warn!("GLM: {} listing failed: {e}", sat.display_name());
@@ -197,7 +197,7 @@ pub async fn fetch_glm_flashes(
         );
 
         // Download in concurrent batches of 20
-        let batch = download_and_parse_batch(client, sat, bucket, &new_keys, levels).await;
+        let batch = download_and_parse_batch(client, sources, sat, bucket, &new_keys, levels).await;
         acc.absorb(sat, levels, batch);
     }
 
@@ -372,12 +372,15 @@ struct GlmListing {
 }
 
 /// List GLM LCFA file keys on S3 for the given time range. `bucket` is the
-/// slot's declared origin — see [`GlmSatellite::bucket`].
+/// slot's declared origin — see [`GlmSatellite::bucket`] — and `sources` is
+/// where that bucket is addressed, so a test can serve this listing from a
+/// loopback socket.
 ///
 /// S3 path: `GLM-L2-LCFA/{year}/{day_of_year}/{hour}/`
 /// Files: `OR_GLM-L2-LCFA_G{sat}_s{start}_e{end}_c{creation}.nc`
 async fn list_glm_files(
     client: &reqwest::Client,
+    sources: &DataSources,
     bucket: &str,
     start: NaiveDateTime,
     end: NaiveDateTime,
@@ -420,7 +423,10 @@ async fn list_glm_files(
     for prefix in &prefixes {
         let mut continuation_token: Option<String> = None;
         loop {
-            let mut url = format!("https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}");
+            let mut url = format!(
+                "{}/?list-type=2&prefix={prefix}",
+                sources.s3_bucket_url(bucket),
+            );
             if let Some(ref token) = continuation_token {
                 url.push_str("&continuation-token=");
                 url.push_str(&urlencoded(token));
@@ -559,6 +565,7 @@ struct BatchOutcome {
 /// the slot's declared origin — see [`GlmSatellite::bucket`].
 async fn download_and_parse_batch(
     client: &reqwest::Client,
+    sources: &DataSources,
     satellite: GlmSatellite,
     bucket: &str,
     keys: &[&str],
@@ -571,7 +578,7 @@ async fn download_and_parse_batch(
         .iter()
         .map(|&key| {
             let client = client.clone();
-            let url = DataSources::s3_object_url(bucket, key);
+            let url = sources.s3_object_url(bucket, key);
             let key_owned = key.to_string();
             let lvls = levels_owned.clone();
             async move {

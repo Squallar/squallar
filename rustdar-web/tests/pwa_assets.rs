@@ -149,13 +149,14 @@ fn html_url_attributes(html: &str) -> Vec<(String, String)> {
 
 /// The hostname rustdar will contact for one declared origin.
 ///
-/// [`DataSources`] stores S3 sources as bare bucket names and everything else as
-/// a full `https://` base, exactly as [`DataSources::s3_object_url`] and the
-/// fetch modules consume them.
+/// [`DataSources`] stores S3 sources as bare bucket names — addressed through
+/// its own `s3_base` template — and everything else as a full `https://` base,
+/// exactly as [`DataSources::s3_object_url`] and the fetch modules consume
+/// them.
 fn host_of(source: &str) -> String {
     match source.strip_prefix("https://") {
         Some(rest) => rest.split('/').next().unwrap().to_string(),
-        None => format!("{source}.s3.amazonaws.com"),
+        None => host_of(&DataSources::production().s3_bucket_url(source)),
     }
 }
 
@@ -356,6 +357,11 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
         "spc_base",
         "iem_base",
         "sounding_base",
+        // Not an origin of its own: the URL template the six bucket names above
+        // are addressed through, so every host it can produce is already listed
+        // by one of them. It is here because it is what makes those buckets
+        // injectable — see `DataSources::s3_bucket_url`.
+        "s3_base",
         // Not origins: flags selecting which TLS client the SPC and METAR
         // fetches use. Listed so this set stays an exact match on the struct,
         // which is what makes a *new origin* impossible to add unnoticed.

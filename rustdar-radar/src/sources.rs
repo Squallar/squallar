@@ -95,6 +95,24 @@ pub struct DataSources {
     pub spc_base: Source,
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
+    /// Where the six bucket fields above are addressed — the one definition of
+    /// the S3 URL shape, with `{bucket}` substituted by
+    /// [`Self::s3_bucket_url`].
+    ///
+    /// A **template** rather than a plain base because S3 is addressed
+    /// virtual-host style: the bucket is a subdomain, not a path segment, and
+    /// that is the shape every CORS result in this module's header was measured
+    /// against. Path-style addressing would need no placeholder and would also
+    /// be a different origin from the one that was probed.
+    ///
+    /// It exists so the S3 origins are injectable like every other origin here.
+    /// `nws_api_base`, `spc_base`, `iem_base` and `sounding_base` have always
+    /// been full bases a test can point at a local listener; the buckets were
+    /// bare names with the origin built literally at each call site, and that
+    /// one difference is the whole reason the GLM poll — the loop that decides
+    /// whether one dead satellite blanks the other — had no test that ran it.
+    /// See `one_dead_satellite_does_not_blank_the_others_flashes`.
+    pub s3_base: Source,
     /// Open-Meteo forecast API: environmental sounding heights (0 °C and
     /// −20 °C levels) per radar site, for the products
     /// [`crate::types::RadarProduct::reads_env_heights`] names. See
@@ -128,6 +146,7 @@ impl DataSources {
             nws_api_base: Cow::Borrowed("https://api.weather.gov"),
             spc_base: Cow::Borrowed("https://www.spc.noaa.gov"),
             iem_base: Cow::Borrowed("https://mesonet.agron.iastate.edu"),
+            s3_base: Cow::Borrowed("https://{bucket}.s3.amazonaws.com"),
             sounding_base: Cow::Borrowed("https://api.open-meteo.com"),
             metar_sends_user_agent: false,
             spc_sends_user_agent: false,
@@ -146,18 +165,29 @@ impl DataSources {
         crate::tls::client_for(self.spc_sends_user_agent, timeout)
     }
 
+    /// Where one bucket lives: `https://{bucket}.s3.amazonaws.com` in
+    /// production, from [`s3_base`](Self::s3_base).
+    ///
+    /// The root of both halves of every S3 conversation — the `?list-type=2`
+    /// listing queries and the object GETs — so pointing this at a local
+    /// listener points a whole fetch at it, which is what
+    /// `one_dead_satellite_does_not_blank_the_others_flashes` needs.
+    pub fn s3_bucket_url(&self, bucket: &str) -> String {
+        self.s3_base.replace("{bucket}", bucket)
+    }
+
     /// `https://{bucket}.s3.amazonaws.com/{key}`.
     ///
     /// The key is interpolated, not encoded: every key rustdar builds is drawn
     /// from `[A-Za-z0-9_./-]`, and encoding would have to leave the `/`
     /// separators intact anyway.
-    pub fn s3_object_url(bucket: &str, key: &str) -> String {
-        format!("https://{bucket}.s3.amazonaws.com/{key}")
+    pub fn s3_object_url(&self, bucket: &str, key: &str) -> String {
+        format!("{}/{key}", self.s3_bucket_url(bucket))
     }
 
     /// Object URL for one Level III product file.
     pub fn level3_object_url(&self, key: &str) -> String {
-        Self::s3_object_url(&self.level3_bucket, key)
+        self.s3_object_url(&self.level3_bucket, key)
     }
 
     /// The flat key prefix for one site/product/day in the Level III bucket.
@@ -185,7 +215,7 @@ impl DataSources {
         run_hour: u8,
         forecast_hour: u8,
     ) -> String {
-        Self::s3_object_url(
+        self.s3_object_url(
             &self.hrrr_bucket,
             &Self::hrrr_key(date, run_hour, forecast_hour),
         )
@@ -272,9 +302,9 @@ mod tests {
             s.metar_state_url("OK"),
             s.nws_alerts_url(),
             s.sounding_url(41.320, -96.367),
-            DataSources::s3_object_url(&s.level2_bucket, "k"),
-            DataSources::s3_object_url(&s.goes_east_bucket, "k"),
-            DataSources::s3_object_url(&s.goes_west_bucket, "k"),
+            s.s3_object_url(&s.level2_bucket, "k"),
+            s.s3_object_url(&s.goes_east_bucket, "k"),
+            s.s3_object_url(&s.goes_west_bucket, "k"),
             s.spc_base.to_string(),
         ];
         for url in urls {
@@ -291,6 +321,46 @@ mod tests {
             }
             assert!(url.starts_with("https://"), "{url} is not https");
         }
+    }
+
+    /// The S3 origins are injectable like every other origin in this table, and
+    /// the production shape is unchanged by making them so.
+    ///
+    /// Both halves are the point. The first is what
+    /// `one_dead_satellite_does_not_blank_the_others_flashes` needed and could
+    /// not have: the GLM listing built `https://{bucket}.s3.amazonaws.com`
+    /// inline, so no test could put a socket where S3 was. The second is why the
+    /// field is a template with a placeholder rather than a plain base — S3 is
+    /// addressed virtual-host style, and every CORS result in this module's
+    /// header was measured against that exact shape.
+    #[test]
+    fn the_s3_origin_is_injectable_and_production_still_addresses_the_bucket_host() {
+        let s = DataSources::production();
+        assert_eq!(
+            s.s3_bucket_url("noaa-goes19"),
+            "https://noaa-goes19.s3.amazonaws.com",
+        );
+        assert_eq!(
+            s.s3_object_url("noaa-goes19", "GLM-L2-LCFA/2026/225/01/OR_x.nc"),
+            "https://noaa-goes19.s3.amazonaws.com/GLM-L2-LCFA/2026/225/01/OR_x.nc",
+        );
+
+        let local = DataSources {
+            s3_base: "http://127.0.0.1:9/{bucket}".into(),
+            ..DataSources::production()
+        };
+        assert_eq!(
+            local.s3_object_url("noaa-goes19", "k"),
+            "http://127.0.0.1:9/noaa-goes19/k",
+            "an overridden base must carry the bucket and the key, or a test \
+             server is serving somebody else's request",
+        );
+        assert_eq!(
+            local.level3_object_url("TLX_N0S_2026_07_25_01_20_27"),
+            "http://127.0.0.1:9/unidata-nexrad-level3/TLX_N0S_2026_07_25_01_20_27",
+            "every S3 URL in the tree must come from this one definition, not \
+             only the one the caller remembered to route",
+        );
     }
 
     /// The network site catalogue reaches for two hosts, and **both are
@@ -326,7 +396,7 @@ mod tests {
         // `.tar`-bundled volumes. Either would compile and pass every other
         // test in this file, which is why the host is pinned here by name.
         for url in [
-            DataSources::s3_object_url(&s.level2_chunks_bucket, "KTLX/"),
+            s.s3_object_url(&s.level2_chunks_bucket, "KTLX/"),
             format!("{}/radar/stations", s.nws_api_base),
         ] {
             for rejected in ["noaa-nexrad-level2", "storage.googleapis.com"] {

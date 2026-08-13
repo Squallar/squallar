@@ -245,7 +245,7 @@ async fn fetch_bucket_ids(sources: &DataSources) -> crate::archive::Result<Vec<S
     crate::tls::init();
     let client = crate::archive::shared_client();
     let prefixes = crate::archive::collect_common_prefixes(
-        &sources.level2_chunks_bucket,
+        &sources.s3_bucket_url(&sources.level2_chunks_bucket),
         "",
         DELIMITER,
         |url| crate::archive::get_text(client, url),

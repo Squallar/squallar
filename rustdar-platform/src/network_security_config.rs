@@ -118,7 +118,7 @@ mod tests {
             &s.goes_east_bucket,
             &s.goes_west_bucket,
         ] {
-            hosts.insert(host_of(&DataSources::s3_object_url(bucket, "k")));
+            hosts.insert(host_of(&s.s3_object_url(bucket, "k")));
         }
 
         for base in [&s.nws_api_base, &s.spc_base, &s.iem_base, &s.sounding_base] {

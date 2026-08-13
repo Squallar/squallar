@@ -1007,7 +1007,10 @@ mod tests {
     /// this round is owed.
     fn round(
         handler: &mut SpcOutlookHandler,
-        results: Vec<(OutlookProduct, Result<SpcOutlook, crate::fetch_policy::FetchError>)>,
+        results: Vec<(
+            OutlookProduct,
+            Result<SpcOutlook, crate::fetch_policy::FetchError>,
+        )>,
     ) {
         handler.set_fetching(true);
         for (product, result) in results {
