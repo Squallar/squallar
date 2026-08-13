@@ -13,6 +13,22 @@ use super::colors::alert_color;
 #[cfg(not(target_arch = "wasm32"))]
 const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
 
+/// Which simplification produced the polygons on disk.
+///
+/// The cache stores the *simplified* rings, not what the origin sent, and it
+/// holds them for a year. So a change to [`crate::render::geo::simplify_ring`]
+/// does not reach a zone anyone has already looked at — it reaches it next
+/// August. Without this, fixing a simplifier that was deleting small islands
+/// would have left every island already deleted on this machine deleted, and
+/// the fix would have read as working only on a cache nobody has.
+///
+/// Bump it whenever the geometry written here changes shape. An entry with a
+/// different value — or with no `schema` field at all, which is every entry
+/// written before this existed — fails to deserialize or fails the check, and
+/// is refetched.
+#[cfg(not(target_arch = "wasm32"))]
+const ZONE_CACHE_SCHEMA: u32 = 1;
+
 #[cfg(not(target_arch = "wasm32"))]
 static CACHE_WRITE_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -33,6 +49,9 @@ fn log_cache_write_failure(msg: &str) {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedZone {
+    /// [`ZONE_CACHE_SCHEMA`]. No `serde` default, so an entry from before it
+    /// existed does not parse and is refetched rather than trusted.
+    schema: u32,
     /// Unix seconds.
     fetched_at: u64,
     /// Already simplified.
@@ -56,8 +75,15 @@ pub enum ZoneFailure {
     /// A body that would not read, or would not parse as JSON.
     Unreadable,
     /// Parsed, and carried nothing this renderer can draw: a null `geometry`,
-    /// a type that is not Polygon or MultiPolygon, or rings that simplify away
-    /// to fewer than three points.
+    /// or a type that is not `Polygon`, `MultiPolygon`, or a
+    /// `GeometryCollection` of those.
+    ///
+    /// It used to mean two further things, and both of them were us rather than
+    /// the origin: a `GeometryCollection`, which is how the NWS serves 227 of
+    /// its 11,651 zones, and a zone every one of whose rings the simplifier ate.
+    /// With those closed, **no zone in the published corpus reaches this
+    /// variant** — see [`zone_geometry_tests`]. A count against it now really
+    /// does mean the origin sent something undrawable.
     NoBoundary,
 }
 
@@ -338,6 +364,14 @@ async fn fetch_zone_json(
 /// is at the top level. County rings run 100+ vertices each, which is finer
 /// than the map shows, so they are simplified here: fewer vertices to project
 /// and fill on every render, and smaller files in the on-disk zone cache.
+///
+/// The `len() >= 3` filter is defence, not policy, and it can no longer fire:
+/// [`parse_polygon_coords`](crate::types::parse_polygon_coords) admits no ring
+/// shorter than that and [`simplify_ring`](crate::render::geo::simplify_ring)
+/// no longer shortens one past it. When it *could* fire it was the whole
+/// mechanism by which small islands left the map, and — because it ran over
+/// every ring of a polygon including the first — a way for a surviving hole to
+/// be promoted to an exterior ring and painted solid.
 fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPolygon>> {
     let polys = super::alert::parse_geometry(json.get("geometry"))?;
 
@@ -384,20 +418,35 @@ fn zone_cache_key(url: &str) -> Option<String> {
     Some(format!("{kind}_{id}"))
 }
 
-/// `None` if missing, corrupt, or past the TTL.
+/// `None` if missing, corrupt, written by a different simplification, or past
+/// the TTL.
+///
+/// The last three are one case, not three, and the reason to say so is the
+/// removal: a file that will not parse will not parse next poll either, and one
+/// left in place is re-read for every alert that names its zone until its
+/// year-long TTL — which it cannot reach, because reaching it requires parsing
+/// the timestamp inside it. Corrupt entries used to be exactly that, silently
+/// skipped and never cleared.
 #[cfg(not(target_arch = "wasm32"))]
 async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
     let key = zone_cache_key(url)?;
     let path = cache_dir.join(format!("{key}.json"));
     let data = tokio::fs::read_to_string(&path).await.ok()?;
-    let cached: CachedZone = serde_json::from_str(&data).ok()?;
 
-    if unix_now().saturating_sub(cached.fetched_at) > CACHE_TTL_SECS {
+    let usable = match serde_json::from_str::<CachedZone>(&data) {
+        Ok(cached)
+            if cached.schema == ZONE_CACHE_SCHEMA
+                && unix_now().saturating_sub(cached.fetched_at) <= CACHE_TTL_SECS =>
+        {
+            Some(cached.polygons)
+        }
+        _ => None,
+    };
+
+    if usable.is_none() {
         let _ = tokio::fs::remove_file(&path).await;
-        return None;
     }
-
-    Some(cached.polygons)
+    usable
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -410,6 +459,7 @@ async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon])
         return;
     }
     let entry = CachedZone {
+        schema: ZONE_CACHE_SCHEMA,
         fetched_at: unix_now(),
         polygons: polygons.to_vec(),
     };
@@ -442,6 +492,10 @@ async fn read_cached_zone(_cache_dir: &Path, _url: &str) -> Option<Vec<GeoPolygo
 
 #[cfg(target_arch = "wasm32")]
 async fn write_cached_zone(_cache_dir: &Path, _url: &str, _polygons: &[GeoPolygon]) {}
+
+/// Why a boundary goes missing, against the geometry the NWS really serves.
+#[cfg(test)]
+mod zone_geometry_tests;
 
 // ── Tests ────────────────────────────────────────────────────────────────
 //
