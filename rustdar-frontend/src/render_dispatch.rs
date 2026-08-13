@@ -1439,22 +1439,32 @@ impl RenderDispatcher {
     /// reports the newer stamp for the frame or two before the re-render it
     /// triggered arrives. `poll_level3_results` clears `last_rendered` for
     /// every pane on the site, so that re-render is already queued.
-    pub fn stamp_pane_with_data_time(
+    /// # Returned rather than assigned
+    ///
+    /// It used to write `pane.data_time` itself, and it must not: the value
+    /// dates *this render's pixels*, and those pixels are not on screen when it
+    /// is called — they are still crossing to the GPU, and the pane is showing
+    /// the previous sweep for as long as that takes. Assigning here dated the
+    /// picture on screen with the volume of the picture behind it, which on a
+    /// site that went down yesterday is a difference of most of a day. It
+    /// travels in the held record instead and lands with the pixels; see
+    /// `rustdar_egui::overlay_cache::HeldOverlayTexture::data_time`.
+    pub fn data_time_for_render(
         &self,
-        pane: &mut rustdar_egui::pane::PaneState,
+        pane: &rustdar_egui::pane::PaneState,
         render: &CachedPaneRender,
-    ) {
+    ) -> Option<chrono::NaiveDateTime> {
         // A Level III product's own object, or — for anything read off the volume,
         // derived products included — the volume this pane has loaded. Falling back
         // to the scan time for a Level III product whose stamp is unreadable would
         // report a bucket object as being as fresh as the volume, so the branch is
         // on the product rather than on whether a stamp was found.
-        pane.data_time = if render.product.is_level3() {
+        if render.product.is_level3() {
             self.nearest_tilt(render.product, &pane.site, render.elevation)
                 .and_then(|tilt| tilt.stamp.time)
         } else {
             pane.scan_info.as_ref().map(|info| info.timestamp)
-        };
+        }
     }
 
     /// The storm motion override as the `(speed_kt, direction_deg)` pair the

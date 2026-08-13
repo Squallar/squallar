@@ -193,7 +193,8 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
     assert_eq!(
         app.gui.pane(0).unwrap().data_time,
         Some(object_time()),
-        "precondition: dated from the bucket object",
+        "precondition: dated from the bucket object — the pane's first raster, \
+             which has no predecessor to keep on screen and so goes up at once",
     );
 
     app.apply_render_to_pane(
@@ -202,7 +203,16 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
         &finished(RadarProduct::Reflectivity, 0.5),
         &mut PlanViewUploads::default(),
     );
+    // The date travels with the pixels. Until they land the pane is still
+    // showing the bucket object, and saying otherwise would caption a Level III
+    // field with the volume's age.
+    assert_eq!(
+        app.gui.pane(0).unwrap().data_time,
+        Some(object_time()),
+        "the pane was redated while it was still showing the previous picture",
+    );
 
+    app.deliver_held_rasters();
     assert_eq!(
         app.gui.pane(0).unwrap().data_time,
         Some(volume_time()),
@@ -258,13 +268,23 @@ fn a_placed_render_describes_what_it_depicts() {
     );
 
     // And the other way round — a Level II image under a Level III selection,
-    // through the same call.
+    // through the same call. This one has a predecessor, so it is held: the
+    // description on screen goes on describing the picture on screen, which is
+    // still the Level III one and still matches the selection.
     app.apply_render_to_pane(
         &ctx,
         0,
         &finished(RadarProduct::Reflectivity, 0.5),
         &mut PlanViewUploads::default(),
     );
+    assert_eq!(
+        app.gui.pane(0).unwrap().stale_image_on_screen(),
+        None,
+        "the pane disowned the picture it was still showing, on the strength of \
+             one that had not arrived",
+    );
+
+    app.deliver_held_rasters();
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
         Some((RadarProduct::Reflectivity, 0.5)),

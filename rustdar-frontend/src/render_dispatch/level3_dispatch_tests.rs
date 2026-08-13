@@ -306,7 +306,7 @@ fn a_tilt_is_never_taken_from_another_site() {
 /// at all. Its two inputs are whole-volume objects — same elevation angle,
 /// and real `DVL`/`EET` product description blocks number them both 0 — so
 /// angle and cut number both compare `Equal` and only the code separates
-/// them. `stamp_pane_with_data_time` resolves through here, so without a
+/// them. `data_time_for_render` resolves through here, so without a
 /// total order the age the status bar reports for a VIL density pane would
 /// flip between the numerator's stamp and the denominator's from one process
 /// to the next.
@@ -430,34 +430,34 @@ fn a_render_stamps_its_pane_with_its_own_datas_time() {
     let mut d = RenderDispatcher::new();
     cache(&mut d, "EET", "KMPX", product(135, 5, 1));
 
-    let mut pane = pane_with_volume("KMPX");
-    d.stamp_pane_with_data_time(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
-    let l3_time = pane.data_time.expect("the EET stamp is readable");
+    let pane = pane_with_volume("KMPX");
+    let l3_time = d
+        .data_time_for_render(&pane, &rendered(RadarProduct::EchoTops, 0.5))
+        .expect("the EET stamp is readable");
     assert_ne!(
         l3_time,
         volume_time(),
         "the object's own time, not the volume it sits beside",
     );
 
-    let mut elsewhere = pane_with_volume("KTLX");
-    d.stamp_pane_with_data_time(&mut elsewhere, &rendered(RadarProduct::EchoTops, 0.5));
+    let elsewhere = pane_with_volume("KTLX");
     assert_eq!(
-        elsewhere.data_time, None,
+        d.data_time_for_render(&elsewhere, &rendered(RadarProduct::EchoTops, 0.5)),
+        None,
         "another site's products are not this pane's, and its volume is not a \
              substitute for the object it has not got",
     );
 
     // Storm-relative velocity derives from the volume, so its data time is the
     // volume's — not the last Level III object's, and not nothing.
-    let mut srv = pane_with_volume("KMPX");
-    d.stamp_pane_with_data_time(&mut srv, &rendered(RadarProduct::EchoTops, 0.5));
-    assert_eq!(srv.data_time, Some(l3_time), "precondition: it was dated");
-    d.stamp_pane_with_data_time(
-        &mut srv,
-        &rendered(RadarProduct::StormRelativeVelocity, 0.5),
+    let srv = pane_with_volume("KMPX");
+    assert_eq!(
+        d.data_time_for_render(&srv, &rendered(RadarProduct::EchoTops, 0.5)),
+        Some(l3_time),
+        "precondition: it was dated",
     );
     assert_eq!(
-        srv.data_time,
+        d.data_time_for_render(&srv, &rendered(RadarProduct::StormRelativeVelocity, 0.5)),
         Some(volume_time()),
         "SRV derives from the Level II volume, so that is the age of what is drawn",
     );
@@ -480,13 +480,15 @@ fn an_unreadable_key_reports_no_time_rather_than_the_volumes() {
         "precondition: the product is still drawn — an unreadable key is worth \
              rendering, just not worth dating",
     );
-    let mut pane = pane_with_volume("KMPX");
+    let pane = pane_with_volume("KMPX");
     assert!(
         pane.scan_info.is_some(),
         "precondition: a volume time is in reach and must not be borrowed",
     );
-    d.stamp_pane_with_data_time(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
-    assert_eq!(pane.data_time, None);
+    assert_eq!(
+        d.data_time_for_render(&pane, &rendered(RadarProduct::EchoTops, 0.5)),
+        None,
+    );
 }
 
 /// The override wins, routes into the Level II render parameters, and

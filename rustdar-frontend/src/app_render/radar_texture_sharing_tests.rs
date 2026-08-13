@@ -445,12 +445,18 @@ fn a_tilt_click_on_a_tilt_independent_pane_reuploads_nothing() {
 }
 
 /// The control: a pane handed genuinely different pixels still uploads them,
-/// and retires the texture it was showing.
+/// and retires the texture it was showing — **once the new one is whole**.
 ///
 /// Buffer identity is what the skip is keyed on, and this is the case that must
 /// not be caught by it. A skip keyed on anything coarser — the product, the
 /// pane, "this pane already has a texture" — passes the test above and freezes
 /// the map here.
+///
+/// The upload and the swap are separate events now, and this pins both: the
+/// pixels go to the GPU the moment the render lands, and the pane goes on
+/// drawing the sweep it has until they have all arrived. The old texture is
+/// retired by the swap and not before, which is the one thing that costs
+/// anything — see the peak-residency note in `App::apply_render_to_pane`.
 #[test]
 fn a_pane_handed_a_different_raster_uploads_it() {
     let ctx = egui::Context::default();
@@ -478,6 +484,20 @@ fn a_pane_handed_a_different_raster_uploads_it() {
         uploads[0].pixels, second_raster.pixels,
         "the pane uploaded something other than the sweep it was given"
     );
+    // Uploaded, and *not yet shown*: the pane keeps a whole picture rather than
+    // filling a new one in top-down over the frames its bands take.
+    assert_eq!(
+        placed(&mut app, 0),
+        first,
+        "the pane swapped onto a raster whose pixels had not all arrived"
+    );
+    assert!(
+        ctx.tex_manager().read().meta(first).is_some(),
+        "the picture still on screen was freed while it was the only whole one \
+         the pane had"
+    );
+
+    app.deliver_held_rasters();
     assert_ne!(
         placed(&mut app, 0),
         first,

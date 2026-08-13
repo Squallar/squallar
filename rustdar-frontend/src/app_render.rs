@@ -252,6 +252,11 @@ impl super::App {
         // `Context::load_texture` has ever needed.
         let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
 
+        // Before the pollers, which is before `Gui::ui` builds the paint list: a
+        // raster whose last band landed on the previous frame goes on screen in
+        // *this* frame's paint list rather than the next one. See the callee.
+        self.promote_uploaded_rasters();
+
         self.poll_render_results(&ctx);
         self.poll_section_results(&ctx);
         self.poll_level3_results();
@@ -471,12 +476,14 @@ impl super::App {
         // Whether the picture being applied is the picture already on this
         // pane — the *same buffer*, not a buffer that compares equal.
         //
-        // `cached_render.image` is the `Arc` this pane's live texture was
-        // uploaded from, and the two are only ever written together: here, and
-        // in `restore_cached_render`. Everything that invalidates one clears the
-        // other or clears `current` outright (`clear_graphics_state`,
+        // `cached_render.image` is the `Arc` this pane's **newest** texture was
+        // uploaded from — the one it is showing, or the one it is holding while
+        // the pixels arrive — and the two are only ever written together: here,
+        // and in `restore_cached_render`. Everything that invalidates one clears
+        // the other or clears the cache outright (`clear_graphics_state`,
         // `dispatch_pane_renders`' no-scan arm, `reset_panes*`), so a `true`
-        // here means the pixels on the GPU are these pixels.
+        // here means these pixels are the ones already on their way to the GPU
+        // or already there.
         //
         // # The case this exists for
         //
@@ -584,8 +591,23 @@ impl super::App {
             return;
         };
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
+        // The pane's own handle for these exact pixels, if it has one, and
+        // whether that handle is **whole**.
+        //
+        // Two slots to look in, and the order matters: `cached_render.image`
+        // describes whichever of the two is newer, and a hold is only ever newer
+        // than the picture it will replace. A raster still arriving is reused
+        // *and kept held* — re-describing it here does not put another texel on
+        // the wire, so a second `hold` for the same id will be promoted by the
+        // same completion the first was waiting for. One already on screen is
+        // reused and shown at once, which is what stops a tilt click on a
+        // tilt-independent product blanking a pane for the length of an upload
+        // that is not going to happen.
         let retained = already_on_screen
-            .then(|| cache.current().map(|old| old.texture.clone()))
+            .then(|| match cache.held_texture() {
+                Some(arriving) => Some((arriving.clone(), false)),
+                None => cache.current().map(|old| (old.texture.clone(), true)),
+            })
             .flatten();
 
         // The picture's own dimensions, not a constant: a sweep reaching past
@@ -594,24 +616,28 @@ impl super::App {
         // refused anything that is not a size this build makes, so there is
         // nothing left here to validate.
         let side = render.image.width();
-        let texture = match retained {
+        let (texture, whole) = match retained {
             // The pane's own handle, preferred over anything `uploads` may hold
             // for the same raster. Not a lifetime question — see the note above
             // on why a replaced handle can just be dropped — but a churn one:
             // taking the memo's copy would free this one and retain that one to
             // no purpose, when the pane is already holding the texture it is
             // about to be told to draw.
-            Some(texture) => texture,
+            Some(pair) => pair,
             None => {
                 let counter = &mut self.texture_counter;
-                uploads.handle(&render.image, || {
+                let texture = uploads.handle(&render.image, || {
                     *counter += 1;
                     ctx.load_texture(
                         format!("radar_image_{counter}"),
                         Arc::clone(&render.image),
                         egui::TextureOptions::NEAREST,
                     )
-                })
+                });
+                // A texture minted this frame — by this call or by an earlier
+                // pane in the same drain — has handed egui pixels that
+                // `end_pass` has not seen yet, let alone moved. Never whole.
+                (texture, false)
             }
         };
 
@@ -644,12 +670,12 @@ impl super::App {
         let pane = self.gui.pane_mut(pane_idx).unwrap();
         // Dropping this call is silent: the pane simply keeps whatever time it
         // was last stamped with, which reads as a current image of another
-        // volume. The lookup and the assignment inside the callee are the
-        // dispatcher's own tests' business; that this function *makes the call*
-        // is `stamping_tests` below.
-        self.render.stamp_pane_with_data_time(pane, render);
-        let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-        cache.show(OverlayTextureData {
+        // volume. The lookup inside the callee is the dispatcher's own tests'
+        // business; that this function *makes the call* is `stamping_tests`
+        // below. It travels with the picture rather than being written now —
+        // see `RenderDispatcher::data_time_for_render`.
+        let data_time = self.render.data_time_for_render(pane, render);
+        let placed = OverlayTextureData {
             texture,
             geo_bounds,
             data_generation: 0,
@@ -681,12 +707,94 @@ impl super::App {
                 elevation: render.elevation,
             }),
             hit_map: None,
-        });
+        };
+
+        // **The swap, or the promise of one.**
+        //
+        // A texture the pane already had, whole, goes up now: there is no
+        // upload to wait for and waiting on one that will never come is a pane
+        // that never changes again. Everything else is *held* — the picture the
+        // pane is showing stays on screen, entire, with its own ground and its
+        // own caption, until `promote_uploaded_rasters` finds that the last band
+        // has landed and swaps the lot in one step.
+        //
+        // # What ends a hold, and why it always ends
+        //
+        // Four things, and between them they cover every way a raster can fail
+        // to arrive:
+        //
+        // 1. **Its own delivery.** Bounded by construction: `BandPlan::of`
+        //    guarantees at least one row of progress per band, `DECLINE_PATIENCE`
+        //    bounds a ring that will not hand a slot over, and
+        //    `Gui::any_raster_held` keeps `handle_redraw` asking for the frames
+        //    those bands move on.
+        // 2. **A newer render.** The `hold` below replaces one still arriving —
+        //    a site switch, a product change or a tilt click mid-upload lands
+        //    here, and the superseded handle drops on the spot.
+        // 3. **The cache being cleared.** `OverlayTextureCache::clear` takes both
+        //    slots, so a pane that loses its scan, or the whole graphics state,
+        //    is not holding a picture it has decided not to show.
+        // 4. **A renderer rebuild.** `restore_cached_render` releases every hold
+        //    before it re-uploads, because an id from a dead `egui::Context` is
+        //    the one id `is_delivered` will answer `false` about for ever.
+        //
+        // A render that never arrives at all — a failed decode, a cancelled job,
+        // a tilt with no sweep — reaches none of this: `poll_render_results`
+        // returns before `apply_render_to_pane` and the pane keeps what it had,
+        // exactly as it did before any of this existed.
+        //
+        // The one raster that is not held is the one with nothing to hold *for*;
+        // see `PaneState::place_radar_raster`.
+        pane.place_radar_raster(placed, data_time, whole);
 
         if pane_idx < self.render.pane_render.len() {
             self.render.pane_render[pane_idx].last_rendered =
                 Some((render.product, render.elevation));
         }
+    }
+
+    /// Show every held raster whose last band has landed.
+    ///
+    /// # Where this runs, and why it is the first thing in the frame
+    ///
+    /// At the top of [`Self::setup_egui_frame`], ahead of the pollers that stage
+    /// new holds and well ahead of `Gui::ui`. A raster whose bands finished on
+    /// the previous frame's `end_pass_and_upload` is therefore on screen in the
+    /// paint list of the very next frame — the swap costs one frame and never
+    /// two, and a hold staged by a poller a few lines below is not asked about
+    /// on the frame it was staged, when the answer could only be no.
+    ///
+    /// # Why it asks rather than being told
+    ///
+    /// `TextureUploads` could have handed out a list of ids that finished this
+    /// frame, and that list would have to be consumed exactly once by a frame
+    /// that is guaranteed to happen. This asks instead, every frame, and a frame
+    /// that does not run costs nothing — the same level-triggered reasoning
+    /// `OverlayTextureCache` gives for having no sequence number.
+    ///
+    /// With no renderer there is nothing to ask, and holds simply stand: a
+    /// headless `App` has no GPU, and the frame that builds one goes on to
+    /// release every hold in `restore_cached_render` anyway.
+    fn promote_uploaded_rasters(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let renderer = &state.egui_renderer;
+        self.gui
+            .promote_held_rasters(|id| renderer.is_delivered(id));
+    }
+
+    /// Promote every held raster, as the frame after the last band lands does.
+    ///
+    /// A headless `App` has no renderer to ask, so `promote_uploaded_rasters`
+    /// above returns before it can promote anything. This says "they all
+    /// landed", which is the only thing a test with no GPU can honestly say —
+    /// what a band costs and how many frames it takes belong to
+    /// `texture_upload`'s own tests and to `tests/raster_upload_gpu.rs`, and
+    /// what a pane *shows* once they have landed belongs here.
+    #[cfg(test)]
+    pub(super) fn deliver_held_rasters(&mut self) {
+        self.gui.promote_held_rasters(|_| true);
     }
 
     /// Take the launch's one catalogue refresh and write it to the cache.
@@ -1804,6 +1912,26 @@ impl super::App {
         use rustdar_overlays::render::overlay_state::OverlayKind;
         use rustdar_overlays::types::GeoBounds;
         use rustdar_radar::types::ImageBounds;
+
+        // Every raster still arriving is let go of first, on **every** pane and
+        // whether or not this goes on to restore one.
+        //
+        // This runs when a new `AppState` has just been built, so every
+        // `TextureHandle` in the application belongs to an `egui::Context` that
+        // no longer exists. The upload path that would have finished those
+        // uploads went with it, and a fresh `TextureUploads` answers
+        // `is_delivered` with `false` about an id it has never seen — correctly,
+        // because those texels are on no GPU. So a hold left here is the one
+        // hold nothing would ever end: the pane would keep a dead handle on
+        // screen and `any_raster_held` would keep the event loop at refresh rate
+        // for the rest of the session, asking a question whose answer cannot
+        // change.
+        //
+        // On every pane, not only the ones restored below, because the panes
+        // this skips are exactly the ones nothing else would come back for: a
+        // pane with no `cached_render` and a pane that has stopped being a map
+        // both fall out of the loop before they reach a `show`.
+        self.gui.release_held_rasters();
 
         // Section panes first, and through their own loop: the one below is
         // bounded by `pane_render.len()` and skips every pane with no plan
@@ -4727,6 +4855,17 @@ mod section_dispatch_tests;
 #[path = "app_render/sounding_poll_tests.rs"]
 #[cfg(test)]
 mod sounding_poll_tests;
+
+/// A pane keeps the picture it has until the next one is whole.
+///
+/// The app-level half of the hold: which raster is held and which goes up as it
+/// arrives, what the second copy costs and when it is given back, what a
+/// renderer rebuild does to a hold, and the two positional facts — the swap
+/// happens before the frame is laid out, and a hold keeps the loop awake — that
+/// nothing has a type to carry.
+#[path = "app_render/raster_hold_tests.rs"]
+#[cfg(test)]
+mod raster_hold_tests;
 
 /// What `apply_render_to_pane` does with a finished image beyond placing it.
 ///
