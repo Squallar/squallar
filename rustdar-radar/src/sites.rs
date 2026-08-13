@@ -14,35 +14,80 @@ use std::sync::{LazyLock, RwLock};
 /// two datums are a property of the measurement rather than of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Datum {
-    /// The ground under the tower — `site_height` in a Volume Data Block.
+    /// The ground under the tower — `site_height` in a Volume Data Block, and
+    /// **also what `api.weather.gov/radar/stations` publishes**.
     ///
-    /// **Learned-only, and asked for by nothing.** The first is pinned by
-    /// `only_a_volume_can_answer_the_base_datum`; the second by the tripwire
-    /// each geometry consumer already carries —
-    /// `the_render_paths_site_height_is_the_feedhorn` in [`crate::render`],
-    /// and the equivalents in [`crate::voxel`] and [`crate::xsect`], every one
-    /// of which fails if its call is switched back to this variant.
+    /// Asked for by no render path, and the tripwire each geometry consumer
+    /// carries says so: `the_render_paths_site_height_is_the_feedhorn` in
+    /// [`crate::render`] and the equivalents in [`crate::voxel`] and
+    /// [`crate::xsect`] all fail if their call is switched to this variant.
+    /// It is **not** what a beam height should be added to: [`crate::beam`]
+    /// measures above the antenna, so that is [`Datum::Feedhorn`].
     ///
-    /// The only source that separates a base from a tower is a WSR-88D's own
-    /// Volume Data Block, which reports the two fields independently. A
-    /// published station record gives one elevation and no way to split it, so
-    /// a radar this install has only ever read about answers `None` here. That
-    /// became the common case when the compiled-in table was deleted: before,
-    /// 161 rows shipped with both figures; now a row has both only if a volume
-    /// this install decoded said so.
-    ///
-    /// It survives that narrowing because the distinction is 30–115 ft and is
-    /// still in the data — [`SiteHeights::BaseAndTower`] is what every learned
-    /// WSR-88D row holds — and because naming a datum at the call is what
-    /// stops the four geometry consumers drifting back onto the ground. It is
-    /// **not** what a beam height should be added to: [`crate::beam`] measures
-    /// above the antenna, so that is [`Datum::Feedhorn`].
+    /// Two sources answer it. A WSR-88D's own Volume Data Block reports the
+    /// ground and the tower as independent fields
+    /// ([`SiteHeights::BaseAndTower`]), and a published station record reports
+    /// the ground alone ([`SiteHeights::GroundOnly`]) — measured, not derived,
+    /// on both. Only a TDWR leaves it unknown, because a TDWR volume states
+    /// one height twice and nothing separates the two;
+    /// `only_a_tdwr_row_cannot_answer_the_base_datum` is that rule.
     SiteBase,
     /// The feedhorn — `site_height + tower_height`, the point [`crate::beam`]
-    /// measures every height above, and the figure a published station record
-    /// quotes as the radar's elevation.
+    /// measures every height above.
+    ///
+    /// Measured wherever the row was built from a WSR-88D volume, which
+    /// reports the tower. **Estimated** on a row a published station record
+    /// placed, because that record quotes the ground and carries no tower to
+    /// add — see [`SiteHeights::GroundOnly`] and [`NOMINAL_TOWER_M`] for what
+    /// is added there and what it costs.
     Feedhorn,
 }
+
+/// The tower height assumed for a WSR-88D that only a published station record
+/// has placed, metres.
+///
+/// # Why a figure has to be assumed at all
+///
+/// `api.weather.gov/radar/stations` quotes the **ground**, and every render
+/// path needs the **antenna**. Answering [`Datum::Feedhorn`] with the ground
+/// would put the lie this constant exists to remove straight back into the
+/// type; answering `None` is worse still, because
+/// [`crate::eet::radar_height_ft_near`] skips a row that cannot answer and
+/// walks on to the nearest row that can — which, on an install that has
+/// decoded one volume, is one radar's height applied to the whole country, and
+/// on an install that has decoded none is the sea level of the `KLWX` defect.
+/// So the choice is not between a measurement and an estimate, it is between
+/// an estimate and a worse estimate.
+///
+/// # Why 29
+///
+/// The WSR-88D network is built to a small number of standard tower heights,
+/// and the population is the whole justification. Measured two independent
+/// ways:
+///
+/// * 53 sites of the shared corpus, from each site's own Volume Data Block:
+///   towers of 14 / 19 / 24 / 29 / 34 m at 5 / 14 / 7 / 12 / 15 sites.
+/// * 145 of the network's 159 WSR-88D, as Level III feedhorn MSL minus the
+///   station record's ground, needing no Level II at all: 9 / 25 / 29 / 33 /
+///   49 sites on the same five builds, spanning 9.75–34.76 m with **no site
+///   near zero and none near 50**. Two Alaskan sites (`PABC`, `PAEC`) land at
+///   9.76 and 9.75 m — 1 cm apart, so a sixth and shorter build rather than
+///   scatter, and inferred rather than read out of a volume because neither
+///   has one here.
+///
+/// Both samples put the median on **29 m**, which is what this is. Against the
+/// 145-site population that is a mean absolute error of **5.3 m** and a worst
+/// case of **19.3 m**, at the two short Alaskan sites. The figure it replaces
+/// was the ground itself: wrong at every site, always low, by 9.75–34.76 m and
+/// 27.6 m on average.
+///
+/// # It is a floor under the answer, not the answer
+///
+/// [`SiteFixRank::Learned`] outranks [`SiteFixRank::Network`], so the first
+/// volume this install decodes for a radar replaces this with that radar's own
+/// tower and the estimate is gone for good. It is what a row carries until
+/// then.
+pub const NOMINAL_TOWER_M: i32 = 29;
 
 /// What a row knows about its own height, and on which datum.
 ///
@@ -60,20 +105,50 @@ pub enum SiteHeights {
     /// precision of the source, and it is two orders below the 30–115 ft this
     /// type exists to stop losing.
     BaseAndTower { base_ft: i32, tower_ft: i32 },
-    /// One height, on the feedhorn, with no separable tower.
+    /// One height, on the feedhorn, with no separable tower. **A TDWR.**
     ///
     /// Every TDWR volume reports `tower_height` byte-identical to
     /// `site_height`, and no WSR-88D volume does — the correspondence is
     /// exact across all 205 volumes read. So a TDWR carries one figure, and
-    /// the published station record agrees with it to 3.2 ft while agreeing
-    /// with the *feedhorn* everywhere it can be checked on a WSR-88D. Hence
-    /// feedhorn, and hence no answer at all for [`Datum::SiteBase`]: the base
-    /// is unknown, not equal to this.
+    /// the published station record agrees with it to 3.2 ft. Hence no answer
+    /// at all for [`Datum::SiteBase`]: the base is unknown, not equal to this.
     ///
-    /// This is also the only shape [`SiteFix::Network`] can produce, because a
-    /// published station record quotes one elevation and offers nothing to
-    /// split it with.
+    /// **Which datum that single figure is on is not settled**, and this
+    /// variant asserts the feedhorn on thin evidence: exactly one TDWR volume
+    /// is available here, `TORD`, whose 226 m is matched by the station
+    /// record's 226.77 m. Since the station record demonstrably quotes the
+    /// *ground* for a WSR-88D (see [`GroundOnly`](Self::GroundOnly)), the
+    /// agreement is equally consistent with both TDWR fields carrying the
+    /// ground. It is left alone because one volume cannot decide it and
+    /// because a TDWR is 89 km of Doppler range around an airport, so the
+    /// question is worth a second volume before it is worth a change.
     FeedhornOnly { feedhorn_ft: i32 },
+    /// One height, on the **ground under the tower**, with no tower to add.
+    ///
+    /// What a published station record gives for a WSR-88D, and the only shape
+    /// [`SiteFix::Network`] produces for one.
+    ///
+    /// # The datum is measured, not assumed
+    ///
+    /// `api.weather.gov/radar/stations` and a Volume Data Block's `site_height`
+    /// are the same number: over the 53 corpus WSR-88D that have both, the
+    /// difference is a **mean of −0.004 m and an rms of 0.237 m**, which is
+    /// the volume's own truncation to whole metres and nothing else. Against
+    /// the *feedhorn* the same comparison is a mean of −25.7 m and an rms of
+    /// 26.6 m. Network-wide the finding is 145 of 159 WSR-88D with no
+    /// exception. `the_station_record_elevation_is_the_ground_its_volume_reports`
+    /// pins it against real bytes from both sources.
+    ///
+    /// This variant is what that measurement cost: the elevation used to be
+    /// read into [`FeedhornOnly`](Self::FeedhornOnly), so every catalogue-placed
+    /// radar answered [`Datum::Feedhorn`] with the ground and sat one whole
+    /// tower low — 32 to 114 ft, at every site, in one direction.
+    ///
+    /// # What it answers
+    ///
+    /// [`Datum::SiteBase`] exactly, and [`Datum::Feedhorn`] as
+    /// `ground_ft + `[`NOMINAL_TOWER_M`], which is an estimate and says so.
+    GroundOnly { ground_ft: i32 },
 }
 
 /// `PartialEq` because [`extended`] compares the row a fix would produce
@@ -109,6 +184,13 @@ impl RadarSite {
     /// row has no base, and returning its feedhorn for [`Datum::SiteBase`]
     /// would be the same silent substitution this type was introduced to
     /// remove.
+    ///
+    /// One answer here is an estimate rather than a measurement, and it is the
+    /// only one: a [`SiteHeights::GroundOnly`] row reaches [`Datum::Feedhorn`]
+    /// by adding [`NOMINAL_TOWER_M`], because a published station record
+    /// carries no tower and the alternatives are a known-wrong ground or a
+    /// `None` that degrades to a distant neighbour. Both datums are exact on
+    /// every other shape.
     pub fn height_ft(&self, datum: Datum) -> Option<i32> {
         match (self.heights?, datum) {
             (SiteHeights::BaseAndTower { base_ft, .. }, Datum::SiteBase) => Some(base_ft),
@@ -117,6 +199,10 @@ impl RadarSite {
             }
             (SiteHeights::FeedhornOnly { feedhorn_ft }, Datum::Feedhorn) => Some(feedhorn_ft),
             (SiteHeights::FeedhornOnly { .. }, Datum::SiteBase) => None,
+            (SiteHeights::GroundOnly { ground_ft }, Datum::SiteBase) => Some(ground_ft),
+            (SiteHeights::GroundOnly { ground_ft }, Datum::Feedhorn) => {
+                Some(ground_ft + crate::site_position::feet_from_metres(NOMINAL_TOWER_M))
+            }
         }
     }
 }
@@ -346,19 +432,37 @@ pub enum SiteFix {
     Learned(SitePosition),
     /// What the fetched catalogue says: a position, and **one** elevation.
     ///
-    /// The elevation is on the feedhorn. `api.weather.gov/radar/stations`
-    /// agreed with the measured figures the deleted seed carried — read out of
-    /// the volumes themselves — to a median of 1.5 m with no row past 187 m,
-    /// and agrees with the *feedhorn* wherever a WSR-88D lets the two be told
-    /// apart. There is no tower figure and none can be derived, which is why
-    /// this is one number and not two.
+    /// # The elevation is the ground under the tower
+    ///
+    /// It was read here as the feedhorn until 2026-08-13, on the strength of a
+    /// comparison against the compiled-in seed rather than against the
+    /// volumes. That comparison could not have detected this: it agreed
+    /// because the two lists agreed, and it kept agreeing after the seed was
+    /// deleted only because nothing re-ran it. The check that settles the
+    /// question is against the archive, and it says the opposite —
+    /// `api.weather.gov/radar/stations` matches a Volume Data Block's
+    /// `site_height` to **−0.004 m mean, 0.237 m rms** over the 53 corpus
+    /// WSR-88D, and misses the feedhorn by **−25.7 m mean**. See
+    /// [`SiteHeights::GroundOnly`] for the network-wide figures and
+    /// `the_station_record_elevation_is_the_ground_its_volume_reports` for the
+    /// test, which reads real bytes from both sources and can therefore
+    /// disagree with this crate.
+    ///
+    /// There is still no tower figure and none can be derived, which is why
+    /// this is one number and not two — but it is one number on a *named*
+    /// datum now, and [`applied`](Self::applied) is where the naming happens.
     Network {
         /// Latitude, micro-degrees north.
         lat_udeg: i32,
         /// Longitude, micro-degrees east.
         lon_udeg: i32,
-        /// Feedhorn height, whole metres MSL.
-        feedhorn_m: i32,
+        /// The station record's one elevation, whole metres MSL.
+        ///
+        /// The ground for a WSR-88D. For a TDWR the record agrees with the
+        /// single height its volume states twice, which
+        /// [`SiteHeights::FeedhornOnly`] reads as the feedhorn and records as
+        /// unsettled.
+        elevation_m: i32,
     },
     /// The radar exists and nothing here knows where it is.
     ///
@@ -399,11 +503,22 @@ impl SiteFix {
     ///   `known`'s finer foot figures wherever the volume's whole metre cannot
     ///   contradict them, and takes the volume's where it can.
     /// * **Network** keeps `known` untouched whenever there is one. Its single
-    ///   feedhorn metre is strictly less than a `BaseAndTower` row already
-    ///   holds, so overwriting would *lose* the base datum: a radar this
-    ///   install has learned from a volume would stop answering
-    ///   [`Datum::SiteBase`] the first time a catalogue landed on it. It fills
-    ///   in only where the row had nothing.
+    ///   metre is strictly less than a `BaseAndTower` row already holds — the
+    ///   same ground, without the tower beside it — so overwriting would trade
+    ///   a measured feedhorn for an estimated one and lose nothing else in
+    ///   exchange. It fills in only where the row had nothing.
+    ///
+    /// # The datum a Network fix produces depends on the instrument
+    ///
+    /// A station record states one elevation and does not say which datum it
+    /// is on, so the identifier decides: a WSR-88D's is the ground
+    /// ([`SiteHeights::GroundOnly`]), measured that way at 145 of the
+    /// network's 159; a TDWR's is read as the feedhorn
+    /// ([`SiteHeights::FeedhornOnly`]), which is what its own volume's single
+    /// figure is read as, so the two sources for one radar cannot disagree
+    /// about the datum by arriving in a different order.
+    /// [`is_tdwr_id`] is the one spelling of that split, shared with the
+    /// site list, so a radar cannot be a TDWR in one place and not the other.
     ///
     /// # Every row this produces records an elevation
     ///
@@ -421,13 +536,18 @@ impl SiteFix {
             Self::Network {
                 lat_udeg,
                 lon_udeg,
-                feedhorn_m,
+                elevation_m,
             } => Some(RadarSite {
                 name,
                 lat: crate::site_position::degrees_from_micro(lat_udeg),
                 lon: crate::site_position::degrees_from_micro(lon_udeg),
-                heights: known.or(Some(SiteHeights::FeedhornOnly {
-                    feedhorn_ft: crate::site_position::feet_from_metres(feedhorn_m),
+                heights: known.or(Some({
+                    let ft = crate::site_position::feet_from_metres(elevation_m);
+                    if is_tdwr_id(name) {
+                        SiteHeights::FeedhornOnly { feedhorn_ft: ft }
+                    } else {
+                        SiteHeights::GroundOnly { ground_ft: ft }
+                    }
                 })),
             }),
             Self::Unplaced => None,
@@ -907,12 +1027,13 @@ mod tests {
         learned(lat_udeg, lon_udeg, height_m, height_m)
     }
 
-    /// A published station record: a position and one feedhorn elevation.
-    fn network(lat_udeg: i32, lon_udeg: i32, feedhorn_m: i32) -> SiteFix {
+    /// A published station record: a position and one elevation, on the
+    /// ground for a WSR-88D identifier and on the feedhorn for a TDWR one.
+    fn network(lat_udeg: i32, lon_udeg: i32, elevation_m: i32) -> SiteFix {
         SiteFix::Network {
             lat_udeg,
             lon_udeg,
-            feedhorn_m,
+            elevation_m,
         }
     }
 
@@ -1224,35 +1345,50 @@ mod tests {
         );
     }
 
-    /// Only a volume can answer [`Datum::SiteBase`], and it answers only for a
-    /// WSR-88D.
+    /// Only a TDWR row cannot answer [`Datum::SiteBase`].
     ///
-    /// The successor to `only_the_single_height_rows_lack_a_base`, which named
-    /// the 46 shipped rows that could not answer. The set is no longer a list
-    /// of radars, it is a rule about sources: a Volume Data Block reports the
-    /// ground and the tower as two fields, a published station record reports
-    /// one elevation with nothing to split it by, and a TDWR volume reports
-    /// the same number twice — so the base is *unknown* for both of the
-    /// latter, not equal to the feedhorn.
+    /// This replaces `only_a_volume_can_answer_the_base_datum`, which asserted
+    /// that a station record leaves the base unknown. That was the false claim
+    /// in miniature: the record's one elevation **is** the base, so the row it
+    /// builds answers that datum exactly, and it is the *feedhorn* it cannot
+    /// state without assuming a tower. The rule is about the instrument rather
+    /// than the source — a WSR-88D reports, or is reported at, the ground; a
+    /// TDWR states one number twice and nothing splits it.
     ///
-    /// This is what the seed's deletion did to the datum, made explicit: what
-    /// used to be answerable for 161 shipped rows is now answerable only where
-    /// this install has decoded that radar's own WSR-88D volume.
+    /// `ZZZC` is deliberately not `T`-prefixed and `TZZZ` deliberately is,
+    /// because [`is_tdwr_id`] is what routes a station record to one shape or
+    /// the other and a test that used one identifier could not tell the two
+    /// arms apart.
     #[test]
-    fn only_a_volume_can_answer_the_base_datum() {
+    fn only_a_tdwr_row_cannot_answer_the_base_datum() {
         let table = build_table([
             ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
             ("ZZZB", learned_single_height(-10_000_000, -140_000_000, 60)),
             ("ZZZC", network(-20_000_000, -140_000_000, 400)),
+            ("TZZZ", network(-40_000_000, -140_000_000, 400)),
         ]);
 
         let wsr88d = table.get("ZZZA").expect("a learned two-field row");
         assert_eq!(wsr88d.height_ft(Datum::SiteBase), Some(328), "100 m");
         assert_eq!(wsr88d.height_ft(Datum::Feedhorn), Some(394), "120 m");
 
+        // A station record for a WSR-88D: the ground, exactly, and a feedhorn
+        // one nominal tower above it.
+        let fetched = table.get("ZZZC").expect("built from its fix");
+        assert_eq!(
+            fetched.height_ft(Datum::SiteBase),
+            Some(1312),
+            "400 m of ground is what the record states",
+        );
+        assert_eq!(
+            fetched.height_ft(Datum::Feedhorn),
+            Some(1312 + 95),
+            "and the feedhorn is one nominal 29 m tower above it",
+        );
+
         for (name, why) in [
             ("ZZZB", "a TDWR volume states one height twice"),
-            ("ZZZC", "a station record states one height"),
+            ("TZZZ", "a TDWR station record states that same one height"),
         ] {
             let row = table.get(name).expect("built from its fix");
             assert_eq!(row.height_ft(Datum::SiteBase), None, "{name}: {why}");
@@ -1270,6 +1406,11 @@ mod tests {
     /// nothing about [`Datum`] would matter. The five standard towers are 48,
     /// 65, 81, 97 and 114 ft, and the archive states them in truncated whole
     /// metres, so the gap a row records is those figures to within 3 ft.
+    ///
+    /// The last case is the estimated one — a station record, whose gap is
+    /// [`NOMINAL_TOWER_M`] rather than a measurement. It belongs in the same
+    /// bound: the point of the constant is that it is a tower, and a change
+    /// that put it outside the range of real ones should fail here.
     #[test]
     fn the_two_datums_are_a_tower_apart() {
         for (tower_m, want_ft) in [(14, 46), (19, 62), (24, 79), (29, 95), (34, 112)] {
@@ -1283,6 +1424,17 @@ mod tests {
                 "{gap} ft is not a tower — the datums have collapsed",
             );
         }
+
+        let table = build_table([("ZZZA", network(-30_000_000, -140_000_000, 100))]);
+        let row = table.get("ZZZA").expect("a fetched row");
+        let gap = row.height_ft(Datum::Feedhorn).expect("feedhorn")
+            - row.height_ft(Datum::SiteBase).expect("base");
+        assert_eq!(gap, 95, "the nominal tower, in feet");
+        assert!(
+            (30..=115).contains(&gap),
+            "{gap} ft is not a tower — the nominal has left the range of real \
+             ones and a catalogue-placed site is no longer plausibly placed",
+        );
     }
 
     // -- precedence and identity -------------------------------------------
@@ -1325,7 +1477,7 @@ mod tests {
             lat_udeg: -30_000_000,
             lon_udeg: -140_000_000,
             // Whatever the row already records wins, so this is ignored.
-            feedhorn_m: 1,
+            elevation_m: 1,
         };
 
         assert!(
@@ -1524,7 +1676,7 @@ mod tests {
 /// Osan's. A synthetic elevation would turn those into assertions about
 /// arithmetic.
 ///
-/// Nine rows, not two hundred. That is the difference between a fixture and a
+/// Twelve rows, not two hundred. That is the difference between a fixture and a
 /// table: this cannot rot into a wrong answer for a user, because it is
 /// `#[cfg(test)]` and no build ships it, and it cannot silently go stale
 /// either — a figure here is only ever compared against another figure in the

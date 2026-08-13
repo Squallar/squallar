@@ -259,6 +259,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          and why the per-product decision it pinned no longer exists.",
     ),
     (
+        "rustdar-radar/src/sites.rs",
+        "only_a_volume_can_answer_the_base_datum",
+        "\"This replaces …\", and what it replaced asserted the *opposite* of \
+         the truth: that a published station record leaves the base datum \
+         unknown, when the record's one elevation **is** the base. The \
+         successor cannot explain why it exists without naming it.",
+    ),
+    (
         "rustdar-frontend/src/volume_bridge/tests.rs",
         "no_data_blends_at_ramp_bottom",
         "A sketch of the shader code that used to name it, in the comment \
@@ -279,13 +287,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "\"The successor to …, which walked the compiled-in table.\" The \
          paragraph exists to say what the predecessor covered and why the \
          successor is wider.",
-    ),
-    (
-        "rustdar-radar/src/sites.rs",
-        "only_the_single_height_rows_lack_a_base",
-        "\"The successor to …, which named the 46 shipped rows that could not \
-         answer.\" Same shape: the old set was a list of radars, the new one \
-         is a rule about sources.",
     ),
     (
         "rustdar-frontend/tests/floor_alignment.rs",

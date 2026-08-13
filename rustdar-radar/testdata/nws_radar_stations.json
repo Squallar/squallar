@@ -85,6 +85,66 @@
         "elevation": { "unitCode": "wmoUnit:m", "value": 396.8 },
         "timeZone": "America/Chicago"
       }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KMAX",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-122.71735, 42.08111] },
+      "properties": {
+        "id": "KMAX",
+        "name": "Medford",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 2289.96 },
+        "timeZone": "GMT"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KMKX",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-88.55055, 42.96777] },
+      "properties": {
+        "id": "KMKX",
+        "name": "Milwaukee",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 292.0 },
+        "timeZone": "GMT"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KINX",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-95.56413, 36.17499] },
+      "properties": {
+        "id": "KINX",
+        "name": "Tulsa",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 203.61 },
+        "timeZone": "GMT"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KCRP",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-97.51083, 27.78388] },
+      "properties": {
+        "id": "KCRP",
+        "name": "Corpus Christi",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 13.72 },
+        "timeZone": "GMT"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KCBW",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-67.80642, 46.03916] },
+      "properties": {
+        "id": "KCBW",
+        "name": "Caribou",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 227.38 },
+        "timeZone": "GMT"
+      }
     }
   ]
 }

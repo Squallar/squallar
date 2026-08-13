@@ -11,6 +11,11 @@ use super::*;
 
 /// The response captured from `api.weather.gov/radar/stations`, trimmed to the
 /// rows these tests need and to the awkward shapes the live body contains.
+///
+/// The last five rows — `KMAX`, `KMKX`, `KINX`, `KCRP`, `KCBW` — are verbatim
+/// from the live body and are not trimmed or rounded, because `datum_tests`
+/// compares their elevations against the same radars' Level II volumes and a
+/// hand-adjusted figure would be this crate checking its own arithmetic again.
 const STATIONS: &str = include_str!("../../testdata/nws_radar_stations.json");
 
 fn positions() -> BTreeMap<String, CataloguePosition> {
@@ -44,7 +49,7 @@ fn the_bucket_decides_which_radars_exist_and_the_nws_decides_where() {
             Some(CataloguePosition {
                 lat_udeg: 35_333_340,
                 lon_udeg: -97_277_500,
-                feedhorn_m: 370,
+                elevation_m: 370,
             }),
         ),
         (
@@ -170,7 +175,7 @@ fn a_station_is_placed_only_when_the_record_is_complete_and_in_metres() {
         Some(&CataloguePosition {
             lat_udeg: 41_320_280,
             lon_udeg: -96_366_830,
-            feedhorn_m: 350,
+            elevation_m: 350,
         }),
         "GeoJSON coordinates are [lon, lat]; a swap puts Omaha in the \
          Indian Ocean",
@@ -187,7 +192,12 @@ fn a_station_is_placed_only_when_the_record_is_complete_and_in_metres() {
         assert!(!placed.contains_key(id), "{case}: {id} must stay unplaced");
     }
 
-    assert_eq!(placed.len(), 4, "KTLX, KOAX, KRAX and TDJT");
+    assert_eq!(
+        placed.len(),
+        9,
+        "KTLX, KOAX, KRAX and TDJT, plus the five the datum check reads: \
+         KMAX, KMKX, KINX, KCRP, KCBW",
+    );
 }
 
 /// An unreadable body places nothing rather than propagating.
@@ -228,6 +238,36 @@ fn the_catalogue_round_trips_through_its_persisted_form() {
     ))
     .expect("integers serialize");
     assert_eq!(json, again, "insertion order must not reach the blob");
+}
+
+/// A cache written before the elevation field was renamed still loads.
+///
+/// The field was called `feedhorn_m` while the elevation was believed to be on
+/// the feedhorn, and every install that has launched since the catalogue
+/// shipped has a blob on disk spelling it that way. A rename with no alias
+/// would fail the whole `SiteCatalogue` parse — `serde` rejects the missing
+/// field, and the map is `serde(transparent)`, so one stale key costs every
+/// position in the file. The user-visible shape of that is a launch with an
+/// empty site list on a machine that is offline, which is the state the cache
+/// exists to prevent.
+///
+/// The blob here is written by hand rather than by an older build, so what it
+/// pins is the alias and not the whole historical format. That is the part
+/// that can regress: the rest of the record never changed.
+#[test]
+fn a_cache_written_under_the_old_field_name_still_loads() {
+    let old = r#"{"KTLX":{"lat_udeg":35333340,"lon_udeg":-97277500,"feedhorn_m":370},"TPBI":null}"#;
+    let back: SiteCatalogue = serde_json::from_str(old).expect("an old cache still parses");
+
+    assert_eq!(
+        back.position("KTLX").map(|p| p.elevation_m),
+        Some(370),
+        "the old spelling carries the same number onto the renamed field",
+    );
+    assert!(
+        back.contains("TPBI"),
+        "and the rest of the blob survives with it",
+    );
 }
 
 /// The live bucket root really does answer with the whole network in one page.

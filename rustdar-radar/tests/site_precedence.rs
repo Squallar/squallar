@@ -78,7 +78,7 @@ fn network() -> SiteFix {
     SiteFix::Network {
         lat_udeg: NETWORK_LAT_UDEG,
         lon_udeg: LON_UDEG,
-        feedhorn_m: 400,
+        elevation_m: 400,
     }
 }
 
@@ -237,17 +237,17 @@ fn the_precedence_is_volume_learned_network_unplaced() {
     assert_eq!(orphan.site_source, SitePositionSource::Unknown);
 }
 
-/// A fetched elevation must not take a learned row's base datum away.
+/// A fetched elevation must not take a learned row's measured tower away.
 ///
 /// The catalogue has *one* height where a Volume Data Block has two, so a fix
 /// that overwrote heights the way it overwrites position would turn every
-/// `BaseAndTower` row into a `FeedhornOnly` one — and every
-/// [`Datum::SiteBase`] query about that radar would start answering `None` the
-/// first time a catalogue landed. Position and heights come from different
+/// `BaseAndTower` row into a `GroundOnly` one — trading a tower this install
+/// measured for the nominal one `GroundOnly` has to assume, and moving the
+/// radar's feedhorn for no reason. Position and heights come from different
 /// places and are allowed to move independently.
 ///
-/// The row it lands on is one this test learned, because a learned volume is
-/// now the only thing that ever separates a base from a tower.
+/// The row it lands on is one this test learned, because a volume is the only
+/// thing that ever states a *measured* tower.
 #[test]
 fn a_fetched_position_moves_a_row_without_taking_its_base_datum() {
     let _gate = serialized();
@@ -270,8 +270,8 @@ fn a_fetched_position_moves_a_row_without_taking_its_base_datum() {
     assert_eq!(
         row.height_ft(Datum::SiteBase),
         Some(base),
-        "and the base datum did not: the catalogue has no tower figure to \
-         separate, so it has nothing better to say here",
+        "and the heights did not: the catalogue restates the same ground with \
+         no tower beside it, so it has nothing better to say here",
     );
     assert_eq!(
         row.height_ft(Datum::Feedhorn),
@@ -290,13 +290,18 @@ fn an_arrival_only_the_catalogue_knows_takes_its_elevation() {
     sites::resolve([("ZZPZ", network())]);
 
     let row = sites::get_radar_site("ZZPZ").expect("the catalogue placed it");
-    // 400 m, the fix's feedhorn, in feet.
-    assert_eq!(row.height_ft(Datum::Feedhorn), Some(1312));
+    // 400 m, the fix's elevation, in feet. `ZZPZ` is not `T`-prefixed, so the
+    // record is read as the ground it is.
     assert_eq!(
         row.height_ft(Datum::SiteBase),
-        None,
-        "the catalogue cannot separate a tower, so the base is unknown \
-         rather than equal to the feedhorn",
+        Some(1312),
+        "the station record's elevation is the ground, and is stated exactly",
+    );
+    assert_eq!(
+        row.height_ft(Datum::Feedhorn),
+        Some(1312 + 95),
+        "and the feedhorn is that ground plus the nominal tower, because the \
+         record carries no tower of its own",
     );
     assert!(
         sites::radars().iter().any(|r| r.name == "ZZPZ"),

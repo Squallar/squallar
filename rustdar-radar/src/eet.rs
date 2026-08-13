@@ -316,15 +316,26 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// `every_placed_row_records_an_elevation` walks a table built from every
 /// shape a fix can take — a WSR-88D volume, a TDWR volume, a station record
 /// onto nothing, and a station record onto a row that already had heights —
-/// and pins that none of them answers `None`. Which rows cannot answer
-/// [`Datum::SiteBase`] is no longer a list of radars but a rule about
-/// sources, because the compiled-in table is gone: only a WSR-88D volume
-/// reports the ground and the tower as two fields, so a published station
-/// record and a TDWR volume both leave the base *unknown* rather than equal
-/// to the feedhorn, which `only_a_volume_can_answer_the_base_datum` states.
-/// For those this returns a neighbour's ground, which is why no render path
-/// asks for that datum. An empty table answers `None`, having nothing else
-/// to say.
+/// and pins that none of them answers `None`.
+///
+/// **That property is why the feedhorn of a catalogue-placed WSR-88D is
+/// estimated rather than absent.** A station record states the ground and no
+/// tower (see [`crate::sites::SiteHeights::GroundOnly`]), so the honest
+/// alternative to adding [`crate::sites::NOMINAL_TOWER_M`] would be to answer
+/// `None` — and the skip above would then walk past every catalogue-placed row
+/// to whichever *learned* row happens to be nearest. On an install that has
+/// decoded one volume that is one radar's antenna height applied to the whole
+/// country; on an install that has decoded none it is the `None` that
+/// consumers turn into sea level. A 29 m assumption is a smaller error than
+/// either, by orders of magnitude, and it disappears the moment that radar's
+/// own volume is decoded.
+///
+/// Which rows cannot answer [`Datum::SiteBase`] is a rule about the
+/// instrument: a TDWR states one height twice and nothing separates it, so a
+/// TDWR row leaves the base unknown rather than equal to the feedhorn, which
+/// `only_a_tdwr_row_cannot_answer_the_base_datum` states. For those this
+/// returns a neighbour's ground, which is why no render path asks for that
+/// datum. An empty table answers `None`, having nothing else to say.
 pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
     let (nearest, _) = crate::sites::nearest_radar_site(lat, lon)?;
     if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::BASE_EXTENT_KM

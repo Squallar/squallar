@@ -1,9 +1,10 @@
 //! Which radars exist, and where they are — fetched, not compiled in.
 //!
-//! `sites::SEED` is a snapshot of the network on the day the binary was
-//! built, and a binary that can only ever know those 207 rows rots: a radar
-//! commissioned afterwards is one the app cannot name, cannot draw and cannot
-//! centre on. This module is where the answer comes from instead.
+//! The binary used to carry `sites::SEED`, a snapshot of the network on the
+//! day it was built, and a binary that can only ever know those 207 rows rots:
+//! a radar commissioned afterwards is one the app cannot name, cannot draw and
+//! cannot centre on. The seed is deleted and this module is where the answer
+//! comes from instead.
 //!
 //! # It is a union of two sources, and neither one alone is correct
 //!
@@ -15,9 +16,12 @@
 //!   live feed carries.
 //! * **Where they are** — `api.weather.gov/radar/stations`. 208 stations (159
 //!   WSR-88D, 45 TDWR, 4 profiler) with identifier, position and elevation;
-//!   510 KB raw and 22 KB gzipped. It agrees with the seed — whose figures were
-//!   read out of the volumes themselves — to a median of 1.5 m, a maximum of
-//!   187 m, and not one row past a kilometre.
+//!   510 KB raw and 22 KB gzipped. Its **positions** agree with the archive:
+//!   against each site's own Volume Data Block over 54 corpus sites the median
+//!   separation is 1.7 m and the largest is 73.4 m, a third of one 250 m gate.
+//!   Its **elevation** is the ground under the tower and not the feedhorn, and
+//!   that is worth stating here because the two were confused for a while —
+//!   see [`SiteFix::Network`] and [`crate::sites::SiteHeights::GroundOnly`].
 //!
 //! Three live counterexamples are why it has to be both:
 //!
@@ -98,9 +102,19 @@ pub struct CataloguePosition {
     pub lat_udeg: i32,
     /// Longitude, micro-degrees east.
     pub lon_udeg: i32,
-    /// Feedhorn height, whole metres MSL. See [`SiteFix::Network`] for why the
-    /// datum is the feedhorn and why there is only one figure.
-    pub feedhorn_m: i32,
+    /// The station record's one elevation, whole metres MSL — the **ground**
+    /// under the tower for a WSR-88D, not the feedhorn.
+    ///
+    /// See [`SiteFix::Network`] for the measurement that settles the datum and
+    /// for why this field carried the opposite name until 2026-08-13.
+    ///
+    /// `serde(alias)` for that old name so a cache written before the rename
+    /// still loads. Without it every install would silently drop its cached
+    /// catalogue on the first launch after the upgrade and run with no radars
+    /// until a fetch came back — which on an offline launch is the whole site
+    /// list. `a_cache_written_under_the_old_field_name_still_loads` pins it.
+    #[serde(alias = "feedhorn_m")]
+    pub elevation_m: i32,
 }
 
 /// Every radar the live archive carries, with a position where one is
@@ -196,7 +210,7 @@ impl SiteCatalogue {
                 Some(position) => SiteFix::Network {
                     lat_udeg: position.lat_udeg,
                     lon_udeg: position.lon_udeg,
-                    feedhorn_m: position.feedhorn_m,
+                    elevation_m: position.elevation_m,
                 },
                 None => SiteFix::Unplaced,
             };
@@ -383,8 +397,8 @@ pub(crate) fn parse_stations(body: &str) -> BTreeMap<String, CataloguePosition> 
             if elevation.unit_code.as_deref() != Some("wmoUnit:m") {
                 return None;
             }
-            let feedhorn_m = elevation.value?;
-            if !lat.is_finite() || !lon.is_finite() || !feedhorn_m.is_finite() {
+            let elevation_m = elevation.value?;
+            if !lat.is_finite() || !lon.is_finite() || !elevation_m.is_finite() {
                 return None;
             }
             if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
@@ -398,7 +412,7 @@ pub(crate) fn parse_stations(body: &str) -> BTreeMap<String, CataloguePosition> 
                 CataloguePosition {
                     lat_udeg: crate::site_position::micro_from_degrees(lat),
                     lon_udeg: crate::site_position::micro_from_degrees(lon),
-                    feedhorn_m: feedhorn_m.round() as i32,
+                    elevation_m: elevation_m.round() as i32,
                 },
             ))
         })
@@ -411,3 +425,10 @@ pub(crate) fn parse_stations(body: &str) -> BTreeMap<String, CataloguePosition> 
 // `cargo check --target wasm32-unknown-unknown`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
+
+// Split from `tests` because it is a different kind of test: everything in
+// there is this crate checking its own arithmetic, and everything in here is
+// this crate being checked against two outside sources that have never heard
+// of it. Its module doc is the argument for why that distinction matters.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod datum_tests;
