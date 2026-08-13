@@ -20,10 +20,10 @@
 //!   [`crate::srv::compute_srv_grid`] (dealias against the volume wind fit,
 //!   then subtract the storm motion). The motion vector is the user's
 //!   override where set, else Bunkers from the volume's own
-//!   [`crate::srv::volume_wind_profile`]; with neither, the product refuses —
-//!   painting base velocity under a storm-relative label is the failure the
-//!   whole arrangement exists to prevent. The derived field is dealiased by
-//!   construction, which is why the sampler's velocity fold guard stays
+//!   [`crate::velocity::volume_wind_profile`]; with neither, the product
+//!   refuses — painting base velocity under a storm-relative label is the
+//!   failure the whole arrangement exists to prevent. The derived field is
+//!   dealiased by construction, which is why the sampler's fold guard stays
 //!   **unarmed** for SRV (`Blend::folds_at_measured_limit`).
 //! * **Normalized rotation** — per velocity sweep:
 //!   [`crate::nrot::compute_nrot_grid_with_profile`], the measured GR-parity
@@ -168,35 +168,26 @@ pub fn prepare<'s>(
     Some(Prepared::Derived(Box::new(derived)))
 }
 
-/// Every velocity-carrying sweep of the volume with its decoded grid and the
-/// fold limit its cut declared, in scan order — the shared walk SRV and NROT
-/// derive over.
+/// Every velocity-carrying tilt of the volume, decoded once, each paired with
+/// the fold limit its cut declared — the shared walk SRV and NROT derive over.
 ///
-/// The declaration is looked up here, by `elevation_number`, because that is
-/// the key [`crate::nyquist::DeclaredNyquist`] is written under and the one
-/// thing about a sweep that survives every hop the table takes. `None` for a
-/// cut the volume did not name, which both derivations pass on to the
-/// dealiaser as "estimate it".
-fn velocity_sweeps(
+/// The walk itself is [`crate::velocity::tilts`]; what this adds is the
+/// declaration, looked up by `elevation_number` because that is the key
+/// [`crate::nyquist::DeclaredNyquist`] is written under and the one thing
+/// about a sweep that survives every hop the table takes. `None` for a cut the
+/// volume did not name, which both derivations pass on to the dealiaser as
+/// "estimate it".
+///
+/// Collected rather than streamed: both derivations fit the volume's wind
+/// profile from these tilts *and then* render every one of them, so the
+/// alternative is decoding the whole velocity volume twice.
+fn velocity_tilts(
     volume: crate::nyquist::Volume<'_>,
-) -> Vec<(&Sweep, f64, srv::VelocityGrid, Option<f64>)> {
-    volume
-        .scan()
-        .sweeps()
-        .iter()
-        .filter_map(|sweep| {
-            let radials = sweep.radials();
-            let first = radials.first()?;
-            if first.velocity().is_none() || radials.len() < 3 {
-                return None;
-            }
-            let grid = srv::velocity_grid(radials)?;
-            Some((
-                sweep,
-                f64::from(first.elevation_angle_degrees()),
-                grid,
-                volume.declared_nyquist().get(sweep.elevation_number()),
-            ))
+) -> Vec<(crate::velocity::VelocityTilt<'_>, Option<f64>)> {
+    crate::velocity::tilts(volume.scan())
+        .map(|tilt| {
+            let declared = volume.declared_nyquist().get(tilt.sweep.elevation_number());
+            (tilt, declared)
         })
         .collect()
 }
@@ -206,7 +197,8 @@ fn derive_srv(
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<Scan> {
     let scan = volume.scan();
-    let profile = srv::volume_wind_profile(scan);
+    let tilts = velocity_tilts(volume);
+    let profile = crate::velocity::wind_profile_of(tilts.iter().map(|(tilt, _)| tilt));
     let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
         srv::SrvMotion::user_override(speed_kt, direction_deg)
     });
@@ -220,24 +212,24 @@ fn derive_srv(
         return None;
     };
 
-    let sweeps: Vec<Sweep> = velocity_sweeps(volume)
+    let sweeps: Vec<Sweep> = tilts
         .into_iter()
-        .filter_map(|(sweep, elevation_deg, _, declared_nyquist_ms)| {
-            let grid = srv::compute_srv_grid(
-                sweep.radials(),
-                elevation_deg,
+        .map(|(tilt, declared_nyquist_ms)| {
+            let grid = srv::storm_relative_grid(
+                tilt.grid,
+                tilt.elevation_deg,
                 profile.as_ref(),
                 &motion,
                 declared_nyquist_ms,
-            )?;
-            Some(synth_sweep(
-                sweep,
+            );
+            synth_sweep(
+                tilt.sweep,
                 &grid.values,
                 &grid.azimuths_deg,
                 grid.first_gate_range_km,
                 grid.gate_interval_km,
                 RadarProduct::StormRelativeVelocity,
-            ))
+            )
         })
         .collect();
     non_empty_scan(scan, sweeps)
@@ -245,24 +237,19 @@ fn derive_srv(
 
 fn derive_nrot(volume: crate::nyquist::Volume<'_>) -> Option<Scan> {
     let scan = volume.scan();
-    let profile = srv::volume_wind_profile(scan);
-    let sweeps: Vec<Sweep> = velocity_sweeps(volume)
-        .into_iter()
-        .map(|(sweep, elevation_deg, grid, declared_nyquist_ms)| {
+    let tilts = velocity_tilts(volume);
+    let profile = crate::velocity::wind_profile_of(tilts.iter().map(|(tilt, _)| tilt));
+    let sweeps: Vec<Sweep> = tilts
+        .iter()
+        .map(|(tilt, declared_nyquist_ms)| {
+            let grid = &tilt.grid;
             let values = nrot::compute_nrot_grid_with_profile(
-                &nrot::VelocitySweep {
-                    vel_grid: &grid.values,
-                    azimuths_deg: &grid.azimuths_deg,
-                    gate_count: grid.gate_count,
-                    first_gate_range_km: grid.first_gate_range_km,
-                    gate_interval_km: grid.gate_interval_km,
-                    declared_nyquist_ms,
-                },
-                elevation_deg,
+                &grid.sweep(*declared_nyquist_ms),
+                tilt.elevation_deg,
                 profile.as_ref(),
             );
             synth_sweep(
-                sweep,
+                tilt.sweep,
                 &values,
                 &grid.azimuths_deg,
                 grid.first_gate_range_km,

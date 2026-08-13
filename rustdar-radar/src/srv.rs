@@ -74,8 +74,8 @@
 //! fetch. The local default is the **Bunkers right-mover** (Bunkers et al.
 //! 2000, *Wea. Forecasting*, 15, 61–79: "Predicting Supercell Motion Using
 //! a New Hodograph Technique", the ID method), computed from the volume's
-//! own VAD-fitted wind profile ([`crate::nrot::WindProfileBuilder`], the
-//! same fit NROT's dealiaser seeds from):
+//! own VAD-fitted wind profile ([`crate::velocity::volume_wind_profile`],
+//! the same fit NROT's dealiaser seeds from):
 //!
 //! ```text
 //! V_rm = V_mean + 7.5 m/s · (S × k̂) / |S|
@@ -115,8 +115,9 @@
 //! [`crate::srm::quantize_to_rpg_levels`] and the derived 0.5 kt levels
 //! exist only so the validation below can compare like with like.
 
-use crate::nrot::{DealiasProfile, VelocitySweep, WindProfile, WindProfileBuilder};
-use nexrad_model::data::{DataMoment, Radial, Scan};
+use crate::nrot::{DealiasProfile, VelocitySweep, WindProfile};
+use crate::velocity::VelocityGrid;
+use nexrad_model::data::Radial;
 
 /// Metres per second per knot.
 pub const KT_TO_MS: f64 = 0.514_444;
@@ -166,93 +167,31 @@ impl SrvMotion {
     }
 }
 
-/// A velocity field as a dense azimuth × range grid in m/s, NaN where
-/// undefined — the shape [`crate::nrot::VelocitySweep`] borrows, with the
-/// geometry the renderer needs carried alongside.
-#[derive(Debug, Clone)]
-pub struct VelocityGrid {
-    /// m/s per (radial, gate); NaN is no data.
-    pub values: Vec<Vec<f64>>,
-    /// Radial **centre** azimuths, degrees, in sweep order.
-    pub azimuths_deg: Vec<f64>,
-    pub gate_count: usize,
-    /// Range to the **centre** of the first gate, km — the Level II moment
-    /// header's convention, and what the renderer centres gate strips on.
-    pub first_gate_range_km: f64,
-    pub gate_interval_km: f64,
-}
-
-impl VelocityGrid {
-    /// The sweep view [`WindProfileBuilder`] reads.
-    ///
-    /// `declared_nyquist_ms` is `None` and that is not an omission: the VAD fit
-    /// never unfolds anything — it trims folded samples out of each layer
-    /// statistically — so it has no use for a fold limit, and handing it one
-    /// would suggest it did.
-    fn sweep(&self) -> VelocitySweep<'_> {
-        VelocitySweep {
-            vel_grid: &self.values,
-            azimuths_deg: &self.azimuths_deg,
-            gate_count: self.gate_count,
-            first_gate_range_km: self.first_gate_range_km,
-            gate_interval_km: self.gate_interval_km,
-            declared_nyquist_ms: None,
-        }
-    }
-}
-
-/// The raw velocity of one sweep as a grid, or `None` when no radial
-/// carries the moment. The same extraction the NROT render makes.
-pub fn velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
-    let first_vel = radials.iter().find_map(|r| r.velocity())?;
-    let gate_count = first_vel.gate_count() as usize;
-    let first_gate_range_km = first_vel.first_gate_range_km();
-    let gate_interval_km = first_vel.gate_interval_km();
-
-    let mut values: Vec<Vec<f64>> = Vec::with_capacity(radials.len());
-    let mut azimuths_deg: Vec<f64> = Vec::with_capacity(radials.len());
-    for radial in radials {
-        azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
-        let mut gates = vec![f64::NAN; gate_count];
-        if let Some(moment) = radial.velocity() {
-            // `iter`, not `values`: sequential, and `take` then stops decoding
-            // at `gate_count` instead of collecting every gate first.
-            for (j, val) in moment.iter().enumerate().take(gate_count) {
-                if let nexrad_model::data::MomentValue::Value(v) = val
-                    && !v.is_nan()
-                    && v < 999.0
-                {
-                    gates[j] = v as f64;
-                }
-            }
-        }
-        values.push(gates);
-    }
-    Some(VelocityGrid {
-        values,
-        azimuths_deg,
-        gate_count,
-        first_gate_range_km,
-        gate_interval_km,
-    })
-}
-
-/// One sweep's velocity, dealiased for display: the Coverage profile,
-/// **no median filter** — see the module docs for both choices.
+/// One already-decoded grid, dealiased in place for display: the Coverage
+/// profile, **no median filter** — see the module docs for both choices.
 ///
 /// `declared_nyquist_ms` is what this cut declared its velocity folds at, from
 /// [`crate::nyquist::DeclaredNyquist`]; `None` leaves the dealiaser to estimate
 /// the limit off the sweep, which is what it did for every caller before the
 /// declaration crossed the model boundary.
-pub fn dealiased_grid(
-    radials: &[Radial],
+///
+/// Takes the grid rather than the radials so a caller that already has one —
+/// [`crate::derive`], which decoded the whole velocity volume once for the
+/// wind fit — does not decode the same sweep a second time.
+pub fn dealias_grid(
+    grid: &mut VelocityGrid,
     elevation_deg: f64,
     profile: Option<&WindProfile>,
     declared_nyquist_ms: Option<f64>,
-) -> Option<VelocityGrid> {
-    let mut grid = velocity_grid(radials)?;
+) {
+    // The dealiaser writes the values it is also reading the sweep's geometry
+    // from, so the borrow it is handed has to be a copy. Only the geometry and
+    // the declaration are read off this view — the values it unfolds are the
+    // `&mut` — but the field is there and a stale slice is a worse answer than
+    // a clone.
+    let reported = grid.values.clone();
     let sweep_view = VelocitySweep {
-        vel_grid: &grid.values.clone(),
+        vel_grid: &reported,
         azimuths_deg: &grid.azimuths_deg,
         gate_count: grid.gate_count,
         first_gate_range_km: grid.first_gate_range_km,
@@ -266,6 +205,18 @@ pub fn dealiased_grid(
         profile,
         DealiasProfile::Coverage,
     );
+}
+
+/// [`dealias_grid`] straight off a sweep's radials, decoding it first.
+/// `None` when the sweep carries no velocity.
+pub fn dealiased_grid(
+    radials: &[Radial],
+    elevation_deg: f64,
+    profile: Option<&WindProfile>,
+    declared_nyquist_ms: Option<f64>,
+) -> Option<VelocityGrid> {
+    let mut grid = crate::velocity::grid(radials)?;
+    dealias_grid(&mut grid, elevation_deg, profile, declared_nyquist_ms);
     Some(grid)
 }
 
@@ -288,8 +239,22 @@ pub fn apply_storm_motion(grid: &mut VelocityGrid, motion: &SrvMotion) {
     }
 }
 
-/// The full per-tilt derivation: dealias (Coverage, no median filter), then
-/// the storm-motion correction. `None` when the sweep carries no velocity.
+/// The full per-tilt derivation on an already-decoded grid: dealias
+/// (Coverage, no median filter), then the storm-motion correction.
+pub fn storm_relative_grid(
+    mut grid: VelocityGrid,
+    elevation_deg: f64,
+    profile: Option<&WindProfile>,
+    motion: &SrvMotion,
+    declared_nyquist_ms: Option<f64>,
+) -> VelocityGrid {
+    dealias_grid(&mut grid, elevation_deg, profile, declared_nyquist_ms);
+    apply_storm_motion(&mut grid, motion);
+    grid
+}
+
+/// [`storm_relative_grid`] straight off a sweep's radials, decoding it first.
+/// `None` when the sweep carries no velocity.
 pub fn compute_srv_grid(
     radials: &[Radial],
     elevation_deg: f64,
@@ -297,30 +262,13 @@ pub fn compute_srv_grid(
     motion: &SrvMotion,
     declared_nyquist_ms: Option<f64>,
 ) -> Option<VelocityGrid> {
-    let mut grid = dealiased_grid(radials, elevation_deg, profile, declared_nyquist_ms)?;
-    apply_storm_motion(&mut grid, motion);
-    Some(grid)
-}
-
-/// Fit the volume wind profile from every velocity tilt in the scan — the
-/// same fit `render::build_wind_profile` makes for NROT, exposed here so the
-/// SRV harness and the render path share one.
-pub fn volume_wind_profile(scan: &Scan) -> Option<WindProfile> {
-    let mut builder = WindProfileBuilder::new();
-    for sweep in scan.sweeps() {
-        let radials = sweep.radials();
-        let Some(first) = radials.first() else {
-            continue;
-        };
-        if first.velocity().is_none() || radials.len() < 3 {
-            continue;
-        }
-        let Some(grid) = velocity_grid(radials) else {
-            continue;
-        };
-        builder.add_sweep(&grid.sweep(), first.elevation_angle_degrees() as f64);
-    }
-    builder.finish()
+    Some(storm_relative_grid(
+        crate::velocity::grid(radials)?,
+        elevation_deg,
+        profile,
+        motion,
+        declared_nyquist_ms,
+    ))
 }
 
 /// The Bunkers et al. 2000 right-mover from a fitted wind profile, as a

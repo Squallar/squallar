@@ -1280,10 +1280,10 @@ impl RadarProduct {
             // The SHI column integral reads every reflectivity tilt, over the
             // same local VIL machinery echo tops uses (`crate::hail`).
             RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
-            // The selected sweep is what rasterizes, but `build_wind_profile`
-            // fits the dealias-seeding profile from every velocity tilt of the
-            // volume — the only wind source since the NVW fetch left
-            // (`crate::nrot`).
+            // The selected sweep is what rasterizes, but
+            // `crate::velocity::volume_wind_profile` fits the dealias-seeding
+            // profile from every velocity tilt of the volume — the only wind
+            // source since the NVW fetch left (`crate::nrot`).
             //
             // Storm-relative velocity has the same shape and one more reason:
             // the profile is also where its default Bunkers vector comes from

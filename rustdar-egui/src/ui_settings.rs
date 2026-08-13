@@ -444,7 +444,7 @@ impl super::Gui {
             // SCIT average from the N0S Product Description Block — a
             // source that left with the five Level III SRM fetches. With
             // the switch off, storm-relative velocity now uses the
-            // Bunkers right-mover `rustdar_radar::srv::volume_wind_profile`
+            // Bunkers right-mover `rustdar_radar::velocity::volume_wind_profile`
             // fits from the volume's own winds; there is no RPG vector to
             // override any more. An override replaces it everywhere at
             // once: every storm-relative tilt, the 3D volume and the

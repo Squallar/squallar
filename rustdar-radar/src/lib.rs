@@ -30,6 +30,7 @@ pub mod srv;
 pub mod tls;
 pub mod twin;
 pub mod types;
+pub mod velocity;
 pub mod vil;
 pub mod vild;
 pub mod volumetric;

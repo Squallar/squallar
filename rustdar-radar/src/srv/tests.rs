@@ -365,11 +365,11 @@ fn the_display_dealias_keeps_isolated_pockets_the_nrot_posture_drops() {
 
     // The same sweep through NROT's preprocessing censors it — the two
     // profiles really are different postures over one dealiaser.
-    let raw = velocity_grid(&radials).expect("velocity present");
+    let raw = crate::velocity::grid(&radials).expect("velocity present");
     let mut strict = raw.values.clone();
     crate::nrot::dealias(
         &mut strict,
-        &raw.sweep(),
+        &raw.sweep(None),
         0.5,
         None,
         DealiasProfile::NoFalseShear,

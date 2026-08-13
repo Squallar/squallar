@@ -28,7 +28,7 @@
 //! [`RenderInput::to_scan`] rebuilds a `nexrad_model::data::Scan` holding
 //! exactly the extracted sweeps, and [`crate::render::render_from`] runs the
 //! ordinary renderer over it. The alternative — reshaping four rasterizers,
-//! `build_velocity_grid`, `build_wind_profile` and `VolumeCube` to consume a
+//! `crate::velocity`'s decode and wind fit, and `VolumeCube`, to consume a
 //! second input type — would give the project two descriptions of the same
 //! data and two chances for them to disagree about a pixel.
 //!

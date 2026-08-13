@@ -1530,7 +1530,8 @@ pub fn render_from_sized(
 ///
 /// The environmental wind profile NROT's and SRV's dealiasers seed from is
 /// not a parameter: it is fit from the volume's own velocity tilts
-/// ([`build_wind_profile`]). The RPG's NVW product used to be an alternate
+/// ([`crate::velocity::volume_wind_profile`]). The RPG's NVW product used to
+/// be an alternate
 /// source, until the local VAD fit was validated against the RPG's own
 /// dealiased velocity and the fetch dropped.
 ///
@@ -1765,7 +1766,7 @@ fn render_nrot_to_image(
         return None;
     }
 
-    let vg = build_velocity_grid(radials)?;
+    let vg = crate::velocity::grid(radials)?;
 
     let cos_e = sweep_ground_factor(radials);
     let ground_reach_km =
@@ -1784,16 +1785,9 @@ fn render_nrot_to_image(
         .first()
         .map(|r| r.elevation_angle_degrees() as f64)
         .unwrap_or(0.5);
-    let profile = build_wind_profile(scan);
+    let profile = crate::velocity::volume_wind_profile(scan);
     let nrot_grid = crate::nrot::compute_nrot_grid_with_profile(
-        &crate::nrot::VelocitySweep {
-            vel_grid: &vg.vel_grid,
-            azimuths_deg: &vg.azimuths_deg,
-            gate_count: vg.gate_count,
-            first_gate_range_km: vg.first_gate_range_km,
-            gate_interval_km: vg.gate_interval_km,
-            declared_nyquist_ms,
-        },
+        &vg.sweep(declared_nyquist_ms),
         elevation_deg,
         profile.as_ref(),
     );
@@ -1874,7 +1868,7 @@ fn render_srv_to_image(
         .first()
         .map(|r| r.elevation_angle_degrees() as f64)
         .unwrap_or(0.5);
-    let profile = build_wind_profile(scan);
+    let profile = crate::velocity::volume_wind_profile(scan);
     let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
         crate::srv::SrvMotion::user_override(speed_kt, direction_deg)
     });
@@ -1932,111 +1926,6 @@ fn render_srv_to_image(
         },
     );
     Some(output.declaring(declared_nyquist_ms))
-}
-
-/// Velocity as a 2D grid (azimuth × range).
-///
-/// **Three of the decoder's four answers arrive here as the same NaN.**
-/// [`build_velocity_grid`] initialises every gate to `f64::NAN` and writes only
-/// `MomentValue::Value`, so `BelowThreshold`, `RangeFolded` and a gate the
-/// radar never reported are indistinguishable to everything downstream — the
-/// dealiaser, the median filter's occupancy rules, and the stencils' demand
-/// that every tap cell be intact. `sampler.rs` keeps the distinction
-/// (`SampleStatus`), `xsect.rs` consumes it and `palette.rs` paints
-/// range-folded deliberately; this path alone flattens it.
-///
-/// Measured 2026-08-12 on real archive volumes, lowest Doppler cut, over the
-/// 7.05–20 nm annulus the reference comparison uses:
-///
-/// | volume | below threshold | range folded |
-/// |---|---|---|
-/// | KDMX 2022-03-05 | 19.7% | 2.9% |
-/// | KTLX 2024-12-16 | 21.0% | 1.0% |
-/// | KHNX 2024-12-16 | 9.9% | **0.0%** |
-/// | KFTG 2023-06-22 | 3.1% | **4.5%** |
-/// | KMSX 2022-06-04 | 7.3% | 1.3% |
-/// | KCRP 2017-08-26 | 0.6% | 0.0% |
-///
-/// So neither is a rounding error. Below-threshold means *the radar looked and
-/// found nothing*, which an occupancy rule ought to weigh differently from *no
-/// gate was reported*; range-folded means *there is signal and its velocity is
-/// ambiguous*, which is the opposite of absence, and it peaks on the
-/// mesocyclone volume. Nothing yet reads the distinction — recorded because a
-/// measurement that says a gap is real is what any future consumer has to
-/// argue against, and because the synthetic corpus cannot show it (its patcher
-/// repaints every gate, so it reads zero folded everywhere).
-struct VelocityGrid {
-    vel_grid: Vec<Vec<f64>>,
-    azimuths_deg: Vec<f64>,
-    gate_count: usize,
-    first_gate_range_km: f64,
-    gate_interval_km: f64,
-}
-
-/// Fit the volume wind profile from every velocity tilt in the scan
-fn build_wind_profile(scan: &Scan) -> Option<crate::nrot::WindProfile> {
-    let mut builder = crate::nrot::WindProfileBuilder::new();
-    for sweep in scan.sweeps() {
-        let radials = sweep.radials();
-        let Some(first) = radials.first() else {
-            continue;
-        };
-        if first.velocity().is_none() || radials.len() < 3 {
-            continue;
-        }
-        let Some(vg) = build_velocity_grid(radials) else {
-            continue;
-        };
-        builder.add_sweep(
-            &crate::nrot::VelocitySweep {
-                vel_grid: &vg.vel_grid,
-                azimuths_deg: &vg.azimuths_deg,
-                gate_count: vg.gate_count,
-                first_gate_range_km: vg.first_gate_range_km,
-                gate_interval_km: vg.gate_interval_km,
-                // The VAD fit unfolds nothing — see `VelocityGrid::sweep`.
-                declared_nyquist_ms: None,
-            },
-            first.elevation_angle_degrees() as f64,
-        );
-    }
-    builder.finish()
-}
-
-fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
-    let first_vel = radials.iter().find_map(|r| r.velocity())?;
-    let gate_count = first_vel.gate_count() as usize;
-    let first_gate_range_km = first_vel.first_gate_range_km();
-    let gate_interval_km = first_vel.gate_interval_km();
-
-    let mut vel_grid: Vec<Vec<f64>> = Vec::with_capacity(radials.len());
-    let mut azimuths_deg: Vec<f64> = Vec::with_capacity(radials.len());
-
-    for radial in radials.iter() {
-        azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
-        let mut gates = vec![f64::NAN; gate_count];
-        if let Some(moment) = radial.velocity() {
-            // `iter`, not `values`: sequential, and `take` then stops decoding
-            // at `gate_count` instead of collecting every gate first.
-            for (j, val) in moment.iter().enumerate().take(gate_count) {
-                if let nexrad_model::data::MomentValue::Value(v) = val
-                    && !v.is_nan()
-                    && v < 999.0
-                {
-                    gates[j] = v as f64;
-                }
-            }
-        }
-        vel_grid.push(gates);
-    }
-
-    Some(VelocityGrid {
-        vel_grid,
-        azimuths_deg,
-        gate_count,
-        first_gate_range_km,
-        gate_interval_km,
-    })
 }
 
 /// Render interpolated echo tops: the whole reflectivity volume reduced to a
