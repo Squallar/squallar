@@ -561,11 +561,14 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 3;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 3. Version 3 is \
-         the one that added the `nyq` field, where a plan-view reply began \
-         reporting the fold limit of the sweep it drew; changing the message \
-         shapes without changing this number is the whole failure it prevents."
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 4;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 4. Version 3 \
+         added the `nyq` field, where a plan-view reply began reporting the \
+         fold limit of the sweep it drew; version 4 added `mls`, where it \
+         began reporting which melting layer the classification stood on — a \
+         reply that omits it is a reply whose classification cannot say \
+         whether it was measured or guessed. Changing the message shapes \
+         without changing this number is the whole failure it prevents."
     );
     assert!(
         WORKER_PROTOCOL.contains("PROTOCOL_VERSION,"),
