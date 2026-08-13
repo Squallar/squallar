@@ -117,33 +117,58 @@ pub fn volume_slot(product: RadarProduct) -> Option<MomentSlot> {
 ///
 /// * SRV reuses velocity's own `(2, 129)` — same units, same resolution, and
 ///   raw 2..=255 spans −63.5..+63.0 m/s.
-/// * NROT: raw 2..=255 spans exactly −4..+4 (unitless); GR pins the meso
-///   class near |1|, so ±4 headroom keeps extreme couplets on scale at
-///   0.0316 resolution.
+/// * NROT: raw 2..=255 spans exactly −5..+5 (unitless) at 0.0395 resolution —
+///   one number with the field's own `nrot::NROT_LIMIT` clamp, so no value
+///   the algorithm can produce is outside what this can write.
 /// * KDP: raw 2..=255 spans exactly
 ///   [`kdp::KDP_MIN_DISPLAY`]..[`kdp::KDP_MAX_DISPLAY`] (−2.05..10 °/km),
 ///   the estimator's own display clamp.
 ///
-/// The NROT row is the one entry here with no external anchor. No authority
-/// publishes a scale for this field, so ±4 is set against where a closed
-/// commercial product puts its mesocyclone class — an authored span. A
-/// disagreement with another viewer's NROT banding is two authored spans
-/// meeting, not an error in either.
+/// # NROT's span is the reference's own lattice, and was measured onto it
 ///
-/// **Recorded rather than fixed: ±4 is narrower than the field's own ±5 clamp,
-/// and the gap between them is not empty.** [`crate::nrot`]'s nine-site record
-/// carries a KCRP cluster reaching **4.776** — the largest magnitude that
-/// module reports anywhere, on any cut — and this codec writes it as exactly
-/// 4.0, saturating at raw 255 with nothing in the UI marking a saturated bin.
-/// On the one cut in the record that produces it, the vertical views flatten
-/// the top of the feature the product exists to show. That wants a decision
-/// rather than a doc comment — widen this span to ±5 so one number bounds
-/// both, or clamp the field to ±4 — plus a count of how often real volumes
-/// cross 4 at all, which nothing currently measures.
+/// This row spanned ±4 until it was measured. That was narrower than the
+/// field's ±5 clamp, and the encoder below saturates at raw 255 with nothing
+/// marking a saturated bin — so a bin over 4 was silently flattened. Both the
+/// incidence of that and the cost of fixing it were measured before it moved.
+///
+/// **Incidence.** Over all 158 volumes of the Nyquist corpus, every velocity
+/// tilt, 32 201 946 finite bins: 117 reach |NROT| ≥ 3.0 in 8 volumes, **15
+/// reach ≥ 4.0 in 2**, 6 reach ≥ 4.5, and **4 sit exactly on the ±5 clamp**.
+/// All fifteen are KCRP 2017-08-26 — Harvey's landfall — at 00:30:35 and
+/// 00:52:37. On the old span those four were written as exactly 4.0, an error
+/// of 1.0 against an eighth of full scale. The nine-cut record in
+/// [`crate::nrot`] cannot see any of this: nothing on those nine volumes
+/// exceeds 3.07, so the count had to come from the corpus rather than from the
+/// record. (A reader who remembers a KCRP **4.776** in that record is
+/// remembering a bin `MEDIAN_MIN_DEALIASED_OCC` removed — the loudest
+/// magnitude on the nine cuts has been 2.1445 since it landed.)
+///
+/// **Cost.** The step coarsens 0.0316 → 0.0395. Scored against the nine
+/// decoded GR2Analyst captures on `campaign-harness`, ±4 → ±5 moves aggregate
+/// precision 0.7225 → 0.7152 and recall 0.2885 → 0.3355, with mean |Δ| over a
+/// fixed comparable bin set flat at 0.0775 → 0.0768; the KDDC holdout moves
+/// the same way. The recall is bins the coarser lattice lifts across
+/// [`nrot::SIGNIFICANT`], which is also `crate::palette`'s first visible
+/// class. They are the reference's bins and not manufactured: the lifted band
+/// is reference-painted at **0.642** against **0.456** in the equal-width band
+/// below it, and the lift adds 626 agreeing bins against 304 spurious.
+///
+/// **Why ±5 exactly.** 254 codes across ±5 decode onto `(raw − 128.5)·10/253`
+/// — spacing 10/253 = 0.0395257, offset half a step, zero deliberately not a
+/// lattice point. That is GR2Analyst's own lattice, and not approximately so:
+/// pooled over 14 780 hovered NROT readouts in the `campaign-harness` record,
+/// every one falls within 0.005 — the 2-dp readout bound — of a point on it,
+/// while the denominators 252 and 254 are both infeasible against those same
+/// readings. So this span adopts the reference's quantisation rather than
+/// authoring one, and the pin below asserts it against the reference's
+/// numbers rather than against these. (The record's own prose quotes the
+/// lattice as `n·0.03950 + 0.0210`; that offset is a stray fit which breaks
+/// 6.6% of the readings it was drawn from, and the half-step here is what
+/// survives them all.)
 fn codec(product: RadarProduct) -> (f32, f32) {
     match product {
         RadarProduct::StormRelativeVelocity => (2.0, 129.0),
-        RadarProduct::NormalizedRotation => (253.0 / 8.0, 2.0 + 4.0 * (253.0 / 8.0)),
+        RadarProduct::NormalizedRotation => (253.0 / 10.0, 2.0 + 5.0 * (253.0 / 10.0)),
         RadarProduct::SpecificDifferentialPhase => {
             let scale = 253.0 / (kdp::KDP_MAX_DISPLAY - kdp::KDP_MIN_DISPLAY);
             (scale, 2.0 - kdp::KDP_MIN_DISPLAY * scale)
