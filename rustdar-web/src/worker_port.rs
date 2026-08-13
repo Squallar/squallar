@@ -118,9 +118,13 @@ fn deliver(data: &JsValue) {
             max_range_km: proto::field(data, proto::MAX_RANGE)
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0),
-            values: proto::field(data, proto::VALUES)
+            // A message this build did not write, or one whose two halves
+            // disagree about the picture, decodes to nothing — the readout goes
+            // quiet rather than the page panicking on a slice index in a
+            // browser. See `PolarField::from_bytes`.
+            polar: proto::field(data, proto::POLAR)
                 .filter(|v| !v.is_null())
-                .map(|v| js_sys::Float32Array::new(&v).to_vec())
+                .map(|v| offload::decode_polar(&js_sys::Uint8Array::new(&v).to_vec()))
                 .unwrap_or_default(),
             // `as_f64` is `None` for the null this field carries whenever the
             // rendered raster had no one cut behind it, so the absence needs no

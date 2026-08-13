@@ -125,7 +125,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
                 max_range_km: 100.0,
                 nyquist_ms: None,
                 melting_layer_source: None,
-                value_data: Arc::new(Vec::new()),
+                hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
             },
         ));
     }
@@ -157,6 +157,7 @@ fn response(
         max_range_km: 100.0,
         nyquist_ms: None,
         melting_layer_source: None,
+        polar: Default::default(),
     }
 }
 
@@ -675,7 +676,7 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
     );
     assert_ne!(rr.site_lon, ls.site_lon);
 
-    let texture = accept_render_result(&mut ls, &mut rr, |_| dummy_texture(&ctx))
+    let texture = accept_render_result(&mut ls, &mut rr, None, |_| dummy_texture(&ctx))
         .expect("the loop is awaiting this result");
 
     let image = ls.frames[1]
@@ -696,7 +697,7 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
 
     // The same image, described identically, is what the broadcast hands on — so
     // a sibling taking it is told where it was drawn rather than assuming.
-    let broadcast = rendered_image(&rr, &texture);
+    let broadcast = rendered_image(&rr, &texture, None);
     assert_eq!((broadcast.lat, broadcast.lon), (image.lat, image.lon));
 }
 
@@ -712,7 +713,7 @@ fn a_refused_result_is_never_uploaded() {
     let mut stale = response(ts(1), target("KTLX", 2.4));
 
     let mut uploads = 0;
-    let placed = accept_render_result(&mut ls, &mut stale, |_| {
+    let placed = accept_render_result(&mut ls, &mut stale, None, |_| {
         uploads += 1;
         dummy_texture(&ctx)
     });
@@ -743,7 +744,7 @@ fn a_failed_render_retires_its_frame_without_a_texture() {
     };
 
     let mut uploads = 0;
-    let placed = accept_render_result(&mut ls, &mut failed, |_| {
+    let placed = accept_render_result(&mut ls, &mut failed, None, |_| {
         uploads += 1;
         dummy_texture(&ctx)
     });
@@ -1178,4 +1179,161 @@ fn the_caption_fixtures_name_caps_this_workspace_ships() {
              against the arm that moved.",
         );
     }
+}
+
+// ── A hover over a looping pane ─────────────────────────────────────────────
+
+/// A one-sweep volume at 0.5° with 360 radials of 300 reflectivity gates, whose
+/// bytes vary in both axes so a wrong gate is visible in the number.
+fn scan_with_echo() -> Arc<Scan> {
+    let radials = (0..360)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                0.5,
+                Some(MomentData::from_fixed_point(
+                    300,
+                    0,
+                    250,
+                    8,
+                    2.0,
+                    66.0,
+                    (0..300)
+                        .map(|g| ((i * 5 + g * 3) % 200 + 20) as u8)
+                        .collect(),
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Arc::new(Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    ))
+}
+
+/// **Hovering a looping pane gives a number.**
+///
+/// It did not. Every loop frame shipped an empty value grid on purpose —
+/// `MAX_LOOP_RENDER_BUDGET × side² × 4` was not affordable and still is not —
+/// so the readout went quiet the moment a loop started and came back when it
+/// stopped, over the same pixel of the same sweep. That was the defect this
+/// change is for.
+///
+/// What makes it affordable is that the frame does not have to *carry* the
+/// numbers. The loop's download cache is already holding every frame's volume
+/// for as long as the loop lives, so the frame keeps 5.8 KiB of geometry and an
+/// `Arc`, and [`frame_gates`] is the lookup that pairs them.
+///
+/// This fails without that pairing: with no volume attached, every point inside
+/// the picture reads [`rustdar_radar::hover::Reading::NotResident`], which the
+/// second half asserts.
+#[test]
+fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
+    let (lat, lon) = (35.3333, -97.2778);
+    let scan = scan_with_echo();
+
+    // The geometry a loop frame carries: the render's own, with the numbers
+    // stripped exactly as `deliver` strips them.
+    let mut polar = rustdar_radar::render::render_radar_to_image(
+        &scan,
+        0.5,
+        RadarProduct::Reflectivity,
+        lat,
+        lon,
+    )
+    .expect("the fixture carries reflectivity at 0.5")
+    .polar;
+    let resident = polar.clone();
+    polar.strip_values();
+
+    let mut mgr = LoopDownloadManager::new();
+    mgr.cache_scan("KTLX", ts(0), (Arc::clone(&scan), Arc::default()));
+
+    let mut rr = response(
+        ts(0),
+        RenderTarget {
+            site: "KTLX".into(),
+            product: RadarProduct::Reflectivity,
+            elevation: 0.5,
+        },
+    );
+    rr.site_lat = lat;
+    rr.site_lon = lon;
+    rr.polar = polar;
+
+    let gates = frame_gates(&mgr, &rr);
+    assert!(
+        gates.is_some(),
+        "the frame's volume is in the loop's own cache",
+    );
+
+    let ctx = egui::Context::default();
+    let texture = dummy_texture(&ctx);
+    let img = rendered_image(&rr, &texture, gates);
+
+    // Every point the still render has a number for, the looping frame has the
+    // same number for.
+    let mut read = 0u32;
+    let mut az = 0.5f64;
+    while az < 360.0 {
+        let mut km = 1.0f64;
+        while km < 70.0 {
+            let looping = img.hover.read(az, km);
+            assert_eq!(
+                looping,
+                resident.geometry().pick(az, km).map_or(
+                    rustdar_radar::hover::Reading::Unpainted,
+                    |at| resident.at(at).map_or(
+                        rustdar_radar::hover::Reading::Unpainted,
+                        rustdar_radar::hover::Reading::Value,
+                    )
+                ),
+                "({az}°, {km} km)",
+            );
+            if matches!(looping, rustdar_radar::hover::Reading::Value(_)) {
+                read += 1;
+            }
+            km *= 1.3;
+        }
+        az += 7.0;
+    }
+    assert!(
+        read > 300,
+        "only {read} points on the loop frame had a value"
+    );
+
+    // And with no volume attached — a frame whose scan has been evicted, or a
+    // product computed rather than measured — the readout says so rather than
+    // reading as a blank sky.
+    let orphan = rendered_image(&rr, &texture, None);
+    assert_eq!(
+        orphan.hover.read(90.0, 20.0),
+        rustdar_radar::hover::Reading::NotResident,
+    );
 }

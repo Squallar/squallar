@@ -1553,8 +1553,8 @@ impl super::App {
             // section's differently-shaped buffers. See `JobOutput::frame`.
             let frame = output.and_then(crate::offload::JobOutput::frame);
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let (image, max_range_km, nyquist_ms, melting_layer_source) = match frame {
-                Some(frame) => {
+            let (image, max_range_km, nyquist_ms, melting_layer_source, polar) = match frame {
+                Some(mut frame) => {
                     // Converted here, in `deliver`, so `rgba` drops at the end
                     // of this scope and only one of the two buffers is ever in
                     // the channel. On a thread that is off the frame entirely;
@@ -1583,22 +1583,33 @@ impl super::App {
                     // buffers up, because a frame whose length the loop refused
                     // is exactly as dead as one it accepted.
                     //
-                    // The grid is not already covered by `offload::execute`.
+                    // The numbers are not already dropped by `offload::execute`.
                     // That one runs off `JobRequest::Radar`'s `values_wanted:
                     // false`, which only the Level II half of the dispatch above
                     // has: `JobRequest::Level3` carries no such field, so half
                     // the frames passing this site — every Level III loop —
-                    // arrive still holding a `LOOP_IMAGE_SIZE²` grid, and this
-                    // is the only place it dies. One call covers both halves
-                    // because the Level II half arrives holding the capacity-0
-                    // husk `execute`'s `mem::take` left behind, which
-                    // `recycle_values` declines; so the line is free where it is
-                    // redundant and is the whole of the win where it is not.
-                    rustdar_radar::render::recycle_values(frame.values);
+                    // arrive still holding their gates, and this is the only
+                    // place those die. One call covers both halves, because
+                    // stripping a field the Level II half already stripped is a
+                    // no-op; so the line is free where it is redundant and is
+                    // the whole of the win where it is not.
+                    //
+                    // The geometry stays either way. It is 5.8 KiB, and it is
+                    // what lets a hover over this frame find its gate in the
+                    // volume the frame was rendered from — see
+                    // `rustdar_radar::hover::SweepGates`.
+                    frame.polar.strip_values();
                     rustdar_radar::render::recycle_image(frame.image);
-                    converted
+                    let (image, max_range_km, nyquist_ms, melting_layer_source) = converted;
+                    (
+                        image,
+                        max_range_km,
+                        nyquist_ms,
+                        melting_layer_source,
+                        frame.polar,
+                    )
                 }
-                None => (None, 0.0, None, None),
+                None => (None, 0.0, None, None, Default::default()),
             };
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them. It describes the render that was dispatched — the sweep
@@ -1618,6 +1629,7 @@ impl super::App {
                 max_range_km,
                 nyquist_ms,
                 melting_layer_source,
+                polar,
             });
             super::notify_redraw(&window);
         });

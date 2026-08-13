@@ -254,7 +254,16 @@ impl JobOutput {
 pub struct RenderedFrame {
     pub image: Vec<u8>,
     pub max_range_km: f64,
-    pub values: Vec<f32>,
+    /// The gates behind the pixels, at the resolution the radar measured them.
+    ///
+    /// **The `side²` `f32` raster grid is not here and does not leave the
+    /// renderer.** It used to: `7362² × 4` = 206.75 MiB on desktop, and 16 MiB
+    /// through the browser's `postMessage` — transferred, but still copied once
+    /// into the worker's linear memory and once back out of the page's. This is
+    /// the same numbers at the resolution they were measured at, about 5 MiB
+    /// for the widest sweep the fleet flies, and it is what a hover reads. See
+    /// [`rustdar_radar::render::polar`].
+    pub polar: rustdar_radar::render::polar::PolarField,
     /// Where the rendered sweep's cut declared its velocity folds, m/s, or
     /// `None` for a raster with no one cut behind it — every Level III
     /// product and every volume product — and for a volume that declared
@@ -328,10 +337,22 @@ impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
     /// rasterizing arms, so a Level III frame and a Level II one cannot come to
     /// describe themselves differently.
     fn from(render: rustdar_radar::render::SweepRender) -> Self {
+        // **Where the raster value grid dies, on every path.** It is the
+        // rasterizer's own instrument — its tests measure painted ranges and
+        // ring bounds off it, and the colouring pass writes through it — and
+        // nothing outside that crate has needed it since the readout started
+        // reading gates. This is the one conversion all three rasterizing arms
+        // come through, so putting it here is what makes "it never leaves the
+        // renderer" a property of the type rather than of three call sites.
+        //
+        // Handed back rather than freed: the slot is waiting for it, and on
+        // desktop this is a 206.75 MiB allocation glibc can never recycle. See
+        // `rustdar_radar::render::POOLED_VALUES`.
+        rustdar_radar::render::recycle_values(render.values);
         Self {
             image: render.image,
             max_range_km: render.max_range_km,
-            values: render.values,
+            polar: render.polar,
             nyquist_ms: render.nyquist_ms,
             melting_layer_source: render.melting_layer_source,
         }
@@ -817,22 +838,19 @@ pub fn execute(request: &JobRequest) -> JobResult {
         } => rustdar_radar::render::render_from_sized(input, side_ceiling_px).map(|render| {
             let mut frame = RenderedFrame::from(render);
             if !*values_wanted {
-                // Dropped rather than never produced: the grid is what the
-                // rasterizer writes into, and the texture is derived from it.
-                // Clearing it here costs nothing and keeps the renderer's
-                // output the one thing it has always been.
+                // A loop frame keeps its geometry and drops its numbers. 5.03
+                // MiB apiece across a loop of up to 36 frames is not affordable
+                // and does not have to be paid: the volume the frame was
+                // rendered from is resident for as long as the loop lives, and
+                // 5.8 KiB of wedges is what turns a point back into a gate of
+                // it. See `rustdar_radar::hover::SweepGates`.
                 //
-                // Handed back rather than freed, because this is the moment it
-                // dies and the renderer has a slot waiting for it —
-                // `rustdar_radar::render::POOLED_VALUES`. A *Level II* loop
-                // frame is the one render that reaches this arm, and it is also
-                // one of the two that repeat sixty times over, so this is where
-                // its grid's 4,096 pages stop being re-faulted per frame. The
-                // Level III loop has no `values_wanted` to reach it by and gives
-                // its grid back at the consumer instead; `app_fetch`'s `deliver`
-                // is the site, and the husk this `take` leaves is what makes the
-                // one call there safe for both.
-                rustdar_radar::render::recycle_values(std::mem::take(&mut frame.values));
+                // A *Level II* loop frame is the one render that reaches this
+                // arm. The Level III loop has no `values_wanted` to reach it by
+                // and strips at the consumer instead; `app_fetch`'s `deliver`
+                // is the site, and stripping an already-stripped field there is
+                // what makes the one call safe for both.
+                frame.polar.strip_values();
             }
             JobOutput::Frame(frame)
         }),
@@ -958,6 +976,28 @@ pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
             None
         }
     }
+}
+
+/// The gates behind a rendered frame, back from the bytes a worker posted.
+///
+/// Here for the two reasons [`decode_output`] is here — the browser crate is
+/// the adapter and this crate owns what a job means, and it keeps `rustdar-web`
+/// from needing a `rustdar-radar` dependency of its own — and for a third: a
+/// frame arrives through the `IMAGE` field rather than through `OUT`, so it
+/// does not go past `decode_output` at all.
+///
+/// An empty field for anything this build did not write. That is the same
+/// answer a loop frame gives on purpose, and it reads the same way at the far
+/// end: a readout with no gates to find says nothing rather than panicking on a
+/// slice index in a browser, where nobody would see the panic.
+pub fn decode_polar(bytes: &[u8]) -> rustdar_radar::render::polar::PolarField {
+    rustdar_radar::render::polar::PolarField::from_bytes(bytes).unwrap_or_else(|| {
+        log::error!(
+            "a worker sent {} bytes of gates this build cannot read",
+            bytes.len()
+        );
+        rustdar_radar::render::polar::PolarField::default()
+    })
 }
 
 // ── The worker port ──────────────────────────────────────────────────────────

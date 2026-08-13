@@ -133,7 +133,7 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
         CachedRenderOutput {
             image: Arc::new(egui::ColorImage::default()),
             max_range_km: 100.0,
-            value_data: Arc::new(Vec::new()),
+            hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
             nyquist_ms: None,
             melting_layer_source: None,
         },

@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::render::polar::{PolarField, PolarGeometry, Wedge};
 
 /// The committed ground track follows the great circle the cut follows, not
 /// the rhumb line a straight screen segment would draw.
@@ -126,16 +127,14 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
     let prefs = UserPreferences::default();
     let readout = |hover_lat: f64, hover_lon: f64| {
         compute_hover_info_raw(
-            &[],
+            // A source over no picture at all, so nothing is appended and the
+            // assertion is on the geometry alone.
+            &HoverSource::empty(),
             &HoverInput {
                 site_lat,
                 site_lon,
                 hover_lat,
                 hover_lon,
-                // Outside the rect, so no gate value is appended and the
-                // assertion is on the geometry alone.
-                hover_pos: egui::pos2(-1.0, -1.0),
-                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
             },
             RadarProduct::Reflectivity,
             &prefs,
@@ -159,79 +158,122 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
     );
 }
 
-/// The hover reads a value grid at the grid's *own* side, not at a constant.
+/// The hover reads the gate the point falls in, on the render's own geometry.
 ///
-/// A grid arrives from a render whose raster size depends on how far the sweep
-/// reached, and this crate is never told which ceiling the frontend offered
-/// it. So the readout has to derive the side, and the derivation has to be
-/// exercised on a grid that is **not** the default size — a test on a
-/// `IMAGE_SIZE`-square grid would pass just as well against the old constant.
+/// This replaced a test that the readout derived a raster grid's side from its
+/// length. There is no grid and no side any more: the pointer's position stops
+/// being a pixel and becomes an azimuth and a ground range, and the answer
+/// comes from the same wedge-and-gate rule
+/// [`rustdar_radar::render::polar::PolarGeometry::pick`] states once for the
+/// whole workspace.
 ///
-/// The fixture is a 64 × 64 grid with one non-`NaN` cell, placed so that a
-/// side read as anything else lands somewhere else: at row 16, column 48, the
-/// pointer three quarters across and a quarter down finds it, and the same
-/// pointer on a 2048-wide reading would index past the end and report nothing.
+/// The fixture gives every gate a different number, so reading the wrong one is
+/// visible in the string rather than aliasing onto the right answer — which is
+/// the same property the 64-wide grid fixture was chosen for.
 #[test]
-fn the_hover_reads_a_value_grid_at_the_side_its_length_implies() {
-    const SIDE: usize = 64;
-    let mut grid = vec![f32::NAN; SIDE * SIDE];
-    grid[16 * SIDE + 48] = 42.5;
-
+fn the_hover_reads_the_gate_the_point_falls_in() {
+    let (site_lat, site_lon) = (35.3333, -97.2778);
     let prefs = UserPreferences::default();
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
-    let readout = |values: &[f32], x: f32, y: f32| {
+
+    // One radial over the whole compass, 200 gates of 1 km from 0.5 km out.
+    // Gate g therefore spans [g, g + 1) km and carries `g` dBZ.
+    const GATES: usize = 200;
+    let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, GATES);
+    let values: Vec<f32> = (0..GATES).map(|g| g as f32).collect();
+    let source = HoverSource::resident(PolarField::from_parts(geometry, values));
+
+    let readout = |hover_lat: f64, hover_lon: f64| {
         compute_hover_info_raw(
-            values,
+            &source,
             &HoverInput {
-                site_lat: 35.3333,
-                site_lon: -97.2778,
-                hover_lat: 35.3333,
-                hover_lon: -97.2778,
-                hover_pos: egui::pos2(x, y),
-                rect,
+                site_lat,
+                site_lon,
+                hover_lat,
+                hover_lon,
             },
             RadarProduct::Reflectivity,
             &prefs,
         )
     };
 
-    // Three quarters across, a quarter down — column 48, row 16 of 64.
+    // One degree due north of the site is 111.19 km, which is gate 111.
+    let north = readout(site_lat + 1.0, site_lon);
     assert!(
-        readout(&grid, 75.5, 25.5).ends_with("| Reflectivity: 42.5 dBZ"),
-        "the gate at (48, 16) of a 64-wide grid was not found: {}",
-        readout(&grid, 75.5, 25.5),
+        north.ends_with("| Reflectivity: 111.0 dBZ"),
+        "one degree north is 111.19 km and so gate 111: {north}",
     );
-    // And a pointer elsewhere in the same grid finds the NaN that is there.
+    // Half a degree north is 55.6 km — gate 55, not gate 111 scaled by
+    // anything, which is what a rule reading the range at the wrong interval
+    // would give.
+    let half = readout(site_lat + 0.5, site_lon);
     assert!(
-        readout(&grid, 25.5, 75.5).ends_with("\u{b0} "),
-        "a cell with no gate in it must append nothing",
+        half.ends_with("| Reflectivity: 55.0 dBZ"),
+        "half a degree north is 55.60 km and so gate 55: {half}",
     );
-
-    // A loop frame's grid: empty on purpose, because a hover goes quiet under
-    // a loop. `poll_loop_render_results` stores `Vec::new()` for every frame,
-    // so this is the routine case and it must not divide by a zero side.
+    // Two degrees north is 222.4 km, past the last gate this field has.
+    let past = readout(site_lat + 2.0, site_lon);
     assert!(
-        readout(&[], 50.0, 50.0).ends_with("\u{b0} "),
-        "an empty value grid must read as no value rather than dividing by \
-         a side of zero",
+        past.ends_with("\u{b0} "),
+        "past the end of every radial there is no gate to read: {past}",
     );
-
-    // A length that is not a square is not a grid this display makes, and is
-    // refused rather than indexed into at some rounded-down side.
-    assert!(readout(&vec![1.0; SIDE * SIDE - 1], 50.0, 50.0).ends_with("\u{b0} "));
 }
 
-/// The side derivation itself, at the two ends and at the sizes that are not
-/// grids.
+/// **A loop frame with no numbers says so, rather than reading as no data.**
+///
+/// The state a looping pane is in for a product the volume behind it cannot
+/// answer for. A blank readout already means "the radar looked here and found
+/// nothing"; letting a frame that kept no values wear that meaning shows the
+/// reader a hole in the weather that is really a hole in the application.
+///
+/// The counterpart claim — that a looping pane of a wire moment reads a real
+/// number — is `rustdar_radar::hover::hover_tests::
+/// a_looping_pane_and_a_still_pane_read_one_point_alike`, which is where a
+/// volume is available to read from.
 #[test]
-fn a_value_grids_side_is_its_exact_integer_square_root_or_nothing() {
-    for side in [1usize, 64, 1024, 2048, 4096] {
-        assert_eq!(value_grid_side(side * side), Some(side), "{side}");
-    }
-    for len in [0, 2, 3, 5, 2048 * 2048 - 1, 2048 * 2048 + 1] {
-        assert_eq!(value_grid_side(len), None, "{len}");
-    }
+fn a_loop_frame_with_no_values_says_so_rather_than_reading_as_no_data() {
+    let (site_lat, site_lon) = (35.3333, -97.2778);
+    let prefs = UserPreferences::default();
+
+    let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, 200);
+    let mut field = PolarField::from_parts(geometry, vec![7.5; 200]);
+    // What a loop frame carries: the geometry, and no numbers.
+    field.strip_values();
+    let source = HoverSource::from_volume(field, None);
+
+    let readout = |hover_lat: f64| {
+        compute_hover_info_raw(
+            &source,
+            &HoverInput {
+                site_lat,
+                site_lon,
+                hover_lat,
+                hover_lon: site_lon,
+            },
+            RadarProduct::NormalizedRotation,
+            &prefs,
+        )
+    };
+
+    // Inside the picture: the gate is there and its number is not.
+    let inside = readout(site_lat + 1.0);
+    assert!(
+        inside.ends_with(NOT_RESIDENT),
+        "a frame holding no values must say so: {inside}",
+    );
+    // Outside it: nothing was painted, which is the ordinary blank.
+    let outside = readout(site_lat + 2.0);
+    assert!(
+        outside.ends_with("\u{b0} "),
+        "past the last gate there is nothing to be missing: {outside}",
+    );
 }
+
+/// A radial painted over the whole compass, so a fixture can put a point in it
+/// without arranging an azimuth.
+const WHOLE_COMPASS: Wedge = Wedge {
+    azimuth_deg: 0.0,
+    half_width_deg: 180.0,
+};
 
 /// **Every digit the status bar shows, pinned.**
 ///
@@ -371,10 +413,13 @@ fn pinned_cases() -> Vec<(RadarProduct, UserPreferences, Option<f32>)> {
 /// See [`PINNED_READOUTS`].
 #[test]
 fn the_hover_readouts_digits_do_not_move() {
-    const SIDE: usize = 8;
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 80.0));
-    // Row 3, column 5 of an 8 x 8 grid.
-    let hover_pos = egui::pos2(55.0, 35.0);
+    const GATES: usize = 200;
+    let input = HoverInput {
+        site_lat: 35.3333,
+        site_lon: -97.2778,
+        hover_lat: 35.9,
+        hover_lon: -96.8,
+    };
     let cases = pinned_cases();
     assert_eq!(
         cases.len(),
@@ -383,23 +428,26 @@ fn the_hover_readouts_digits_do_not_move() {
     );
 
     for ((product, prefs, value), &(label, expected)) in cases.iter().zip(PINNED_READOUTS) {
-        let mut grid = vec![f32::NAN; SIDE * SIDE];
+        // The value goes in the gate the point actually falls in, found through
+        // the same `pick` the readout will use — so a row with a value is a row
+        // where the readout has one to find, whatever the geometry.
+        let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, GATES);
+        let mut values = vec![f32::NAN; GATES];
         if let Some(v) = value {
-            grid[3 * SIDE + 5] = *v;
+            let (azimuth, ground_km) = rustdar_radar::beam::site_bearing_range_km(
+                input.site_lat,
+                input.site_lon,
+                input.hover_lat,
+                input.hover_lon,
+            );
+            let at = geometry
+                .pick(azimuth, ground_km)
+                .expect("the pinned point is inside the fixture's radial");
+            values[at.gate] = *v;
         }
-        let got = compute_hover_info_raw(
-            &grid,
-            &HoverInput {
-                site_lat: 35.3333,
-                site_lon: -97.2778,
-                hover_lat: 35.9,
-                hover_lon: -96.8,
-                hover_pos,
-                rect,
-            },
-            *product,
-            prefs,
-        );
+        let source = HoverSource::resident(PolarField::from_parts(geometry, values));
+
+        let got = compute_hover_info_raw(&source, &input, *product, prefs);
         assert_eq!(got, expected, "{label}");
     }
 }

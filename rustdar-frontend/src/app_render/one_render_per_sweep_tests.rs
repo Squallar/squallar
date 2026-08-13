@@ -300,7 +300,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
             rendered: Some(crate::channels::RenderedImage {
                 image: Arc::clone(&image),
                 max_range_km: 230.0,
-                value_data: Arc::new(Vec::new()),
+                hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
                 melting_layer_source: None,
             }),

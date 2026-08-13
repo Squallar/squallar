@@ -129,7 +129,7 @@ fn post_result(
     // this function can leave a field absent — an absent field and a null one
     // read the same on the page, but only one of them is true by construction.
     proto::set_field(&message, proto::IMAGE, &JsValue::NULL);
-    proto::set_field(&message, proto::VALUES, &JsValue::NULL);
+    proto::set_field(&message, proto::POLAR, &JsValue::NULL);
     proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(0.0));
     proto::set_field(&message, proto::NYQUIST, &JsValue::NULL);
     proto::set_field(&message, proto::MELTING_LAYER, &JsValue::NULL);
@@ -141,16 +141,16 @@ fn post_result(
         Some(JobOutput::Frame(RenderedFrame {
             image,
             max_range_km,
-            values,
+            polar,
             nyquist_ms,
             melting_layer_source,
         })) => {
             let image = js_sys::Uint8Array::from(image.as_slice());
-            let values = js_sys::Float32Array::from(values.as_slice());
+            let polar = js_sys::Uint8Array::from(polar.to_bytes().as_slice());
             transfer.push(&image.buffer());
-            transfer.push(&values.buffer());
+            transfer.push(&polar.buffer());
             proto::set_field(&message, proto::IMAGE, &image);
-            proto::set_field(&message, proto::VALUES, &values);
+            proto::set_field(&message, proto::POLAR, &polar);
             proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(max_range_km));
             // The one field on this arm that a frame may honestly not have; it
             // stays null for a Level III or volume product, which is what the

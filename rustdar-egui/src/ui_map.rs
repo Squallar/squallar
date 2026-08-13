@@ -2,6 +2,7 @@ use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::beam;
+use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::types::{RadarProduct, RenderView};
 use rustdar_units::UserPreferences;
 
@@ -3578,36 +3579,40 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -
     }
 }
 
-/// The side of a square value grid of `len` entries, or `None` if it has none.
+/// What a hover needs to know about where it is, in the world rather than on
+/// the glass.
 ///
-/// The grid is square by construction — it is one `f32` per pixel of a square
-/// raster — but its side is no longer a constant: a sweep reaching past the
-/// 230 km is rendered wider, and this crate has no way to know which
-/// ceiling the frontend passed for it. Reading the side back off the length is
-/// therefore the only honest answer, and an exact integer square root is what
-/// makes it safe: a length that is not a perfect square cannot produce an index
-/// inside a grid that is not there.
-///
-/// **A zero length is the routine case, not the pathological one.** Loop frames
-/// ship an empty grid on purpose — a hover readout goes quiet under a loop —
-/// and every `poll_loop_render_results` frame stores `Vec::new()`. `None` here
-/// is what keeps that from becoming a divide by a zero side.
-pub(super) fn value_grid_side(len: usize) -> Option<usize> {
-    let side = len.isqrt();
-    (side > 0 && side * side == len).then_some(side)
-}
-
-/// Context for computing hover info from radar value data.
+/// It used to carry the pointer's screen position and the rectangle the raster
+/// was drawn into as well, so that the readout could divide one by the other
+/// and index a pixel. It reads a gate now, and a gate is found by where a point
+/// *is* — so those two fields went with the grid, and with them the class of
+/// bug where the readout picked its pixel out of a rectangle that had been
+/// computed from a different extent from the one the picture was drawn at.
 pub(super) struct HoverInput {
     pub site_lat: f64,
     pub site_lon: f64,
     pub hover_lat: f64,
     pub hover_lon: f64,
-    pub hover_pos: egui::Pos2,
-    pub rect: egui::Rect,
 }
 
-/// Compute hover info string from raw value data and site coordinates.
+/// What the readout says where the picture has numbers behind it that this
+/// process is not holding.
+///
+/// A loop frame keeps no values of its own — 5.03 MiB apiece against a loop of
+/// up to 36 — and reads them back out of the volume it was rendered from
+/// instead. That works for the six products the RDA puts on the wire and cannot
+/// work for the eleven computed from them, so a looping pane showing normalized
+/// rotation has a picture and no numbers.
+///
+/// **It says so rather than going blank.** A blank readout already means
+/// something — the radar looked here and found nothing — and letting a missing
+/// buffer wear that meaning shows the reader a hole in the weather that is
+/// really a hole in the application. This is the whole of
+/// [`rustdar_radar::hover::Reading::NotResident`]'s reason for existing as a
+/// third state.
+const NOT_RESIDENT: &str = "| no value held for this frame";
+
+/// Compute hover info string from the picture's own gates and site coordinates.
 ///
 /// The radar-relative half of the readout comes from
 /// [`beam::site_bearing_range_km`], the crate's one spelling of "where is this
@@ -3616,8 +3621,16 @@ pub(super) struct HoverInput {
 /// [`rustdar_radar::types::EARTH_RADIUS_KM`], and
 /// `the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
 /// pins that the readout's digits did not move.
+///
+/// That same pair is now the *whole* input to the value half too. An azimuth
+/// and a ground range is exactly a polar lookup key, so
+/// [`rustdar_radar::hover::HoverSource::read`] takes it directly and answers
+/// with the gate `render_gate` painted the point from — the same gate the
+/// colour under the cursor came from, by construction rather than by agreement.
+/// `the_hover_readouts_digits_do_not_move` pins that this replaced a `side²`
+/// raster grid of the same numbers without moving one of them.
 pub(super) fn compute_hover_info_raw(
-    value_data: &[f32],
+    hover: &HoverSource,
     input: &HoverInput,
     product: RadarProduct,
     prefs: &UserPreferences,
@@ -3629,23 +3642,11 @@ pub(super) fn compute_hover_info_raw(
         input.hover_lon,
     );
 
-    let mut value_str = String::new();
-    if let Some(side) = value_grid_side(value_data.len()) {
-        let frac_x = (input.hover_pos.x - input.rect.left()) / input.rect.width();
-        let frac_y = (input.hover_pos.y - input.rect.top()) / input.rect.height();
-        let px = (frac_x * side as f32) as i32;
-        let py = (frac_y * side as f32) as i32;
-
-        if px >= 0 && px < side as i32 && py >= 0 && py < side as i32 {
-            let pixel_idx = py as usize * side + px as usize;
-            if pixel_idx < value_data.len() {
-                let value = value_data[pixel_idx];
-                if !value.is_nan() {
-                    value_str = format!("| {}", product.format_value(value, prefs));
-                }
-            }
-        }
-    }
+    let value_str = match hover.read(azimuth, distance_km) {
+        Reading::Value(value) => format!("| {}", product.format_value(value, prefs)),
+        Reading::Unpainted => String::new(),
+        Reading::NotResident => NOT_RESIDENT.to_string(),
+    };
 
     let distance = prefs.distance.convert_from_km(distance_km);
 

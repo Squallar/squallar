@@ -205,3 +205,57 @@ fn the_geometry_is_a_thousandth_of_the_values_it_indexes() {
         f.geometry().resident_bytes(),
     );
 }
+
+#[test]
+fn a_field_survives_the_round_trip_the_browsers_worker_port_makes() {
+    // The page↔worker port transfers buffers, so a field's byte form is the
+    // only shape it crosses in. Every field has to come back the same picture,
+    // including a loop frame's — geometry with no numbers behind it.
+    for mut f in [ring(37, 9.7, 23), ring(1, 180.0, 1), PolarField::default()] {
+        let back = PolarField::from_bytes(&f.to_bytes()).expect("this build wrote it");
+        assert_eq!(back.geometry().wedges(), f.geometry().wedges());
+        assert_eq!(back.geometry().gates(), f.geometry().gates());
+        assert_eq!(back.geometry().reach_gates(), f.geometry().reach_gates());
+        assert_eq!(
+            back.geometry().first_gate_km(),
+            f.geometry().first_gate_km()
+        );
+        assert_eq!(
+            back.geometry().gate_interval_km(),
+            f.geometry().gate_interval_km()
+        );
+        assert_eq!(back.resident_bytes(), f.resident_bytes());
+        for r in 0..f.geometry().radials() {
+            for g in 0..f.geometry().gates() {
+                let at = GateAt { radial: r, gate: g };
+                assert_eq!(back.at(at), f.at(at), "({r}, {g})");
+            }
+        }
+
+        f.strip_values();
+        let stripped = PolarField::from_bytes(&f.to_bytes()).expect("this build wrote it");
+        assert!(!stripped.has_values());
+        assert_eq!(stripped.geometry().wedges(), f.geometry().wedges());
+    }
+}
+
+#[test]
+fn a_message_this_build_did_not_write_is_declined_rather_than_indexed_into() {
+    let good = ring(5, 60.0, 4).to_bytes();
+    assert!(PolarField::from_bytes(&good).is_some());
+    // Truncated at every length short of the whole.
+    for n in 0..good.len() {
+        assert!(
+            PolarField::from_bytes(&good[..n]).is_none(),
+            "a {n}-byte prefix was accepted"
+        );
+    }
+    // One byte too many is not this build's message either.
+    let mut long = good.clone();
+    long.push(0);
+    assert!(PolarField::from_bytes(&long).is_none());
+    // A header claiming a values buffer that is not radials × gates.
+    let mut lying = good.clone();
+    lying[12..16].copy_from_slice(&3u32.to_le_bytes());
+    assert!(PolarField::from_bytes(&lying).is_none());
+}

@@ -602,7 +602,7 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         // still satisfied this loop, which is exactly how that mutation
         // survived this test's first draft.
         "proto::IMAGE,",
-        "proto::VALUES,",
+        "proto::POLAR,",
         "proto::MAX_RANGE,",
         "proto::NYQUIST,",
         "proto::OUT,",
@@ -617,8 +617,16 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
     }
 }
 
-/// The `Frame` arm still writes the three fields it always wrote, and still
+/// The `Frame` arm still writes the four fields it always wrote, and still
 /// transfers both buffers.
+///
+/// The second buffer changed shape without changing role: it carried the
+/// `side²` `f32` raster value grid as a `Float32Array` and now carries the
+/// gates behind those pixels as bytes — 16 MiB against about 5 MiB for the
+/// widest sweep, and a few kilobytes for a loop frame, which sends geometry and
+/// no values at all. What this test is about is unchanged, and is why the field
+/// is still checked by name: it must be *written* and it must be
+/// **transferred**, or the browser copies it per frame instead of moving it.
 ///
 /// Widening the reply to carry sections and grids was supposed to leave the
 /// working path untouched, and that claim is otherwise verified only by
@@ -645,11 +653,11 @@ fn the_frame_arm_of_the_worker_reply_is_unchanged() {
         .0;
     for needle in [
         "proto::IMAGE, &image",
-        "proto::VALUES, &values",
+        "proto::POLAR, &polar",
         "proto::MAX_RANGE,",
         "proto::NYQUIST,",
         "transfer.push(&image.buffer());",
-        "transfer.push(&values.buffer());",
+        "transfer.push(&polar.buffer());",
     ] {
         assert!(
             arm.contains(needle),
@@ -660,7 +668,7 @@ fn the_frame_arm_of_the_worker_reply_is_unchanged() {
     assert!(
         !arm.contains("proto::OUT"),
         "the Frame arm writes an out-of-band field; a frame travels in \
-         IMAGE/VALUES/MAX_RANGE/NYQUIST and nothing else, and a reply carrying \
+         IMAGE/POLAR/MAX_RANGE/NYQUIST and nothing else, and a reply carrying \
          both leaves the page arbitrating between two outputs for one job"
     );
 }

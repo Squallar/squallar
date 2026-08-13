@@ -1,6 +1,7 @@
 use crate::overlay_cache::OverlayTextureCache;
 use chrono::NaiveDateTime;
 use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_radar::hover::HoverSource;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
 use std::collections::HashMap;
@@ -39,7 +40,18 @@ pub struct RadarImageData {
     /// [`rustdar_radar::types::ImageBounds::from_radar_site`] builds from it,
     /// the range ring is drawn on it, and the hover picks a pixel out of it.
     pub max_range_km: f64,
-    pub value_data: Arc<Vec<f32>>,
+    /// The gates behind these pixels, and whatever is holding their numbers.
+    ///
+    /// A still pane's carries the render's own values. A loop frame's carries
+    /// the geometry and an `Arc` on the volume it was rendered from, because
+    /// 5.03 MiB of numbers per frame is 70 MiB across a browser's loop and the
+    /// volume is resident anyway — see [`rustdar_radar::hover::HoverSource`].
+    ///
+    /// It replaced a `side²` `f32` raster grid: 206.75 MiB for a surveillance
+    /// cut at the ceiling this display now reaches, held here, in the render
+    /// cache and in the suspend copy, so that a hover could read one number out
+    /// of it.
+    pub hover: Arc<HoverSource>,
     /// Where the cut this frame was drawn from declared its velocity folds,
     /// m/s, or `None` for a frame no single cut is behind.
     ///

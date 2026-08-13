@@ -32,7 +32,10 @@ pub struct CachedPaneRender {
     /// see `restore_cached_renders`, which rebuilds the bounds from this and
     /// from nothing else.
     pub max_range_km: f64,
-    pub value_data: Arc<Vec<f32>>,
+    /// The gates behind these pixels, for the readout — see
+    /// [`rustdar_radar::hover::HoverSource`]. Kept beside them because a
+    /// restore has to be able to answer the same questions the render did.
+    pub hover: Arc<rustdar_radar::hover::HoverSource>,
     pub product: RadarProduct,
     pub elevation: f32,
     /// Where the cached sweep's cut declared its velocity folds, m/s. Kept for
@@ -206,7 +209,10 @@ impl PaneRenderState {
 pub struct CachedRenderOutput {
     pub image: Arc<egui::ColorImage>,
     pub max_range_km: f64,
-    pub value_data: Arc<Vec<f32>>,
+    /// The gates behind this shared raster — shared with it for the reason the
+    /// extent is: two panes on one `(site, product, view, elevation)` are
+    /// looking at one buffer of one cut, so they read one set of gates.
+    pub hover: Arc<rustdar_radar::hover::HoverSource>,
     /// Where the drawn sweep's cut declared its velocity folds, m/s — shared
     /// with the buffer for the reason the extent is, and it is the same
     /// argument: two panes on one `(site, product, view, elevation)` are
@@ -298,7 +304,7 @@ impl RenderCache {
     /// against a number describing nothing in it.
     fn entry_bytes(value: &CachedRenderOutput) -> usize {
         value.image.pixels.len() * std::mem::size_of::<egui::Color32>()
-            + value.value_data.len() * std::mem::size_of::<f32>()
+            + value.hover.resident_bytes()
     }
 
     /// Move `key` to the most-recently-used end. No-op if absent.
@@ -1945,19 +1951,23 @@ impl RenderDispatcher {
                         // so that a texture the display layer rejects gives its
                         // buffer up too.
                         //
-                        // The value grid does *not* go back here. It leaves in
-                        // the `Arc` below and is held by the pane, the render
-                        // cache and every hover that samples it, so this thread
-                        // is not its last owner and there is no moment on this
-                        // path at which it is nobody's. See
-                        // `rustdar_radar::render::POOLED_VALUES`, which records
-                        // what that costs.
+                        // The raster value grid is already back in the
+                        // renderer's slot — `From<SweepRender> for
+                        // RenderedFrame` is where it dies, on every path — and
+                        // what leaves here in its place is the gates, at the
+                        // resolution the radar measured them. That is the whole
+                        // of the residency change: this `Arc` is held by the
+                        // pane, the render cache and the suspend copy for as
+                        // long as the picture is on screen, and it used to be
+                        // 206.75 MiB of it.
                         let picture = plan_view_image(&frame.image);
                         rustdar_radar::render::recycle_image(frame.image);
                         Some(crate::channels::RenderedImage {
                             image: Arc::new(picture?),
                             max_range_km: frame.max_range_km,
-                            value_data: Arc::new(frame.values),
+                            hover: Arc::new(rustdar_radar::hover::HoverSource::resident(
+                                frame.polar,
+                            )),
                             nyquist_ms: frame.nyquist_ms,
                             melting_layer_source: frame.melting_layer_source,
                         })
