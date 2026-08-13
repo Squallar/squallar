@@ -652,28 +652,39 @@ fn dolly_for_step(step: f64) -> f32 {
 ///
 /// # The measurement
 ///
-/// A sweep of every strip from 8 to 1400 points on each axis, every latitude
-/// from 0° to 84°, and six boxes — the whole ring square, 300 km square, the
-/// 10 km floor, the 664 × 10 km rectangle a config can carry, its transpose, and
-/// an ordinary 120 × 75 — settling against [`COVERAGE_MARGIN`], worst case per
-/// band:
+/// A sweep of every strip from 8 to 1256 points on each axis, every latitude
+/// from 0° to 84°, and eight boxes — the whole ring square, the **470 km cap a
+/// maximal drag commits**, 300 km square, the 10 km floor, the 664 × 10 km
+/// rectangle the corner bound allows, its transpose, an ordinary 120 × 75 and a
+/// 235 × 470 — settling against [`COVERAGE_MARGIN`], worst case per band:
 ///
 /// | centre latitude | passes to settle |
 /// |---|---|
-/// | 0–49° | 4 |
-/// | 50–59° | 5 |
-/// | 60–69° | 6 |
-/// | 70–79° | 7 |
-/// | 80°+ | does not settle |
+/// | 0–29° | 3 |
+/// | 30–61° | 4 |
+/// | 62–72° | 5 |
+/// | 73–76° | 6 |
+/// | 77–79° | 7 |
+/// | 80–84° | 8 |
 ///
-/// Eight is the 70–79° figure with one pass in hand. It is not chosen to cover
-/// the last row, because nothing covers the last row: past about 80° the
-/// single-logarithm step stops converging — 40 passes leaves the worst shapes no
-/// closer than 8 does — so a bigger budget there buys arithmetic and no
-/// coverage. Those latitudes are 15° past the northernmost radar the US network
-/// has and are reachable only by panning a map to the Arctic and picking a
-/// region there; the loop's answer is documented on [`viewport_for_region`] and
-/// is still a strip framed on the box.
+/// **Eight is the last row, not a row with a pass in hand**, and it is a row a
+/// user can reach: a 470 km square — the exact box the selector commits at its
+/// cap — in a 96 × 96 strip at 83.5°N settles on the eighth pass and delivers
+/// its margin there. The table peaked at seven until that box joined the sweep,
+/// which is a constant asserting nothing;
+/// [`the_budgets_last_pass_is_one_a_maximal_drag_really_needs`] is what holds it
+/// from both sides now.
+///
+/// Past about 80° the single-logarithm step is close to not converging at all —
+/// the north lane's ground is sublinear in the zoom it is bought with, and the
+/// elasticity goes to zero at the pole, so a bigger budget there buys arithmetic
+/// and very little coverage. What the loop answers when it runs out is bounded
+/// and measured on [`solve_viewport`], and by
+/// [`a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`]: it is
+/// short only for a box whose poleward edge is within 2.53° of the pole, and
+/// never for one a drag can commit. Those latitudes are 15° past the
+/// northernmost radar the US network has and are reachable only by panning a map
+/// to the Arctic and picking a region there.
 ///
 /// # Why this was four, and dead
 ///
@@ -695,6 +706,10 @@ fn dolly_for_step(step: f64) -> f32 {
 ///     tests::the_solve_stops_as_soon_as_the_strip_covers_the_box
 /// [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`]:
 ///     tests::the_framing_budget_covers_every_latitude_a_region_can_sit_at
+/// [`the_budgets_last_pass_is_one_a_maximal_drag_really_needs`]:
+///     tests::the_budgets_last_pass_is_one_a_maximal_drag_really_needs
+/// [`a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`]:
+///     tests::a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole
 const MAX_FRAMING_PASSES: usize = 8;
 
 /// How much more than the box the framing deliberately covers, as a fraction of
@@ -711,15 +726,65 @@ const MAX_FRAMING_PASSES: usize = 8;
 /// nothing, right where the box's edge is.
 ///
 /// The sequence above is what the arithmetic *would* run to; the loop stops on
-/// the first of those terms, because this constant is also its settle bar. The
-/// solve is aimed at the box plus this and stops when it has cleared the box
-/// itself — [`MAX_FRAMING_PASSES`] for how that check is written and for why it
-/// used to be one nothing could satisfy.
+/// the first term that clears this bar. **This is the floor of the band the
+/// solve settles in, and [`COVERAGE_TARGET`] is its ceiling** — the two are
+/// different numbers on purpose, and
+/// [`the_framing_delivers_the_margin_it_promises`] is what holds the floor.
 ///
-/// So the target is the box plus this, and the loop converges onto a viewport
-/// that covers it. 0.1% of a 920 km box is 920 m — under a third of one cell at
-/// the shipped grid's 3.6 km — which is the price of never being short.
+/// 0.1% of a 920 km box is 920 m — under a third of one cell at the shipped
+/// grid's 3.6 km — which is the price of never being short. It also has to clear
+/// `f32::EPSILON`, 1.19e-7, by a wide margin and does: the mirror registers
+/// through walkers' **f32** `Projector::project`, so a margin at or under one
+/// part in 8.4 million is a margin that does not survive being drawn.
+///
+/// [`the_framing_delivers_the_margin_it_promises`]:
+///     tests::the_framing_delivers_the_margin_it_promises
 const COVERAGE_MARGIN: f64 = 0.001;
+
+/// What the solve **aims** at, as a fraction of the box — the ceiling of the
+/// band whose floor is [`COVERAGE_MARGIN`].
+///
+/// The solve must aim past what it must deliver, and this is the whole reason:
+/// **the east–west lane is exact**. Walkers' points per degree of longitude is
+/// exactly `tile_size · 2^zoom / 360`, so one logarithm lands the strip on the
+/// target *to rounding* — which means a solve that aims at the box plus the
+/// margin and settles for the box plus nothing hands back a strip that covers
+/// the box and no more. Measured over 865 280 framings against the aim and the
+/// bar set to the same number, the worst delivered margin was **3.28e-8** — a
+/// twentieth of `f32::EPSILON`, against a promised 1e-3 — and 2.09% of framings
+/// delivered under a tenth of it. The exact lane spending the whole margin is
+/// not an edge case; it is what an exact lane does.
+///
+/// Twice the margin, so that the exact lane lands on the band's ceiling and the
+/// asymptotic lane is stopped at its floor, and the answer is somewhere between
+/// the two either way. The settle test is written as [`SETTLE_SHORTFALL`].
+///
+/// The cost is bounded and small: the widest a binding axis can be left is this,
+/// 0.2%, which on the 470 km cap a maximal drag commits is 940 m of mirror
+/// outside the box on each side. [`the_framing_spends_no_more_of_the_mirror_than_the_box_needs`]
+/// holds it to that.
+///
+/// [`the_framing_spends_no_more_of_the_mirror_than_the_box_needs`]:
+///     tests::the_framing_spends_no_more_of_the_mirror_than_the_box_needs
+const COVERAGE_TARGET: f64 = 2.0 * COVERAGE_MARGIN;
+
+/// The loop's settle test, in the units it has to hand.
+///
+/// `shortfall` is measured against the box scaled by `1 + `[`COVERAGE_TARGET`],
+/// so "the strip covers the box plus [`COVERAGE_MARGIN`]" is
+/// `shortfall ≤ (1 + COVERAGE_TARGET) / (1 + COVERAGE_MARGIN)`, and that is this
+/// with the division done once at compile time rather than every pass.
+///
+/// It comes out at 1.000999000999001, which is worth reading against the bar it
+/// replaces: the old test was `shortfall ≤ 1 + COVERAGE_MARGIN`, 1.001, and the
+/// difference between the two is the entire delivered margin. A residual bar of
+/// 9.99e-4 against 1e-3 is the same order, so the pass budget does not move —
+/// [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`] re-measures
+/// it.
+///
+/// [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`]:
+///     tests::the_framing_budget_covers_every_latitude_a_region_can_sit_at
+const SETTLE_SHORTFALL: f64 = (1.0 + COVERAGE_TARGET) / (1.0 + COVERAGE_MARGIN);
 
 /// The widest zoom `walkers::MapMemory::set_zoom` will accept: the whole world
 /// in one 256-point tile.
@@ -883,12 +948,13 @@ fn solve_viewport(
         return None;
     }
 
-    // The box plus the margin: what the strip is actually solved onto. See
-    // `COVERAGE_MARGIN` — the solve approaches from above, so aiming at the box
-    // itself lands short of it every time.
+    // The box plus `COVERAGE_TARGET`: what the strip is actually solved onto.
+    // The solve approaches from above, so aiming at the box itself lands short
+    // of it every time — and aiming at exactly what has to be delivered lands
+    // *on* it, which for the exact east–west lane means delivering none of it.
     let want = rustdar_radar::voxel::HalfExtentKm {
-        east_km: half.east_km * (1.0 + COVERAGE_MARGIN),
-        north_km: half.north_km * (1.0 + COVERAGE_MARGIN),
+        east_km: half.east_km * (1.0 + COVERAGE_TARGET),
+        north_km: half.north_km * (1.0 + COVERAGE_TARGET),
     };
 
     let mut memory = walkers::MapMemory::default();
@@ -900,13 +966,12 @@ fn solve_viewport(
         if !shortfall.is_finite() || shortfall <= 0.0 {
             return None;
         }
-        // Settled once the strip covers the **box** — the margin is what is
-        // being converged *through*, not what has to be reached exactly, so the
-        // bar is the margin and not 1.0. `shortfall` is measured against `want`,
-        // which is the box scaled by `1 + COVERAGE_MARGIN`, so "covers the box"
-        // is `shortfall / (1 + COVERAGE_MARGIN) <= 1` and this is that with the
-        // division folded into the constant.
-        if shortfall <= 1.0 + COVERAGE_MARGIN {
+        // Settled once the strip covers the box **plus the margin the constant
+        // promises** — not merely the box, which is a bar an exact lane clears
+        // with nothing left over. See `SETTLE_SHORTFALL` for the arithmetic and
+        // `COVERAGE_TARGET` for what aiming and settling at the same number
+        // measured out at.
+        if shortfall <= SETTLE_SHORTFALL {
             return Some((memory, pass));
         }
         // Ground per point halves with every zoom level, so the zoom that
@@ -932,12 +997,24 @@ fn solve_viewport(
         }
     }
     // Out of passes without the strip ever measuring as covering. Reachable
-    // only past about 80° of latitude, where the single-logarithm step stops
-    // converging at all — see `MAX_FRAMING_PASSES`. The answer is still framed
-    // on the box and still biased outward: the loop's last act was a step, so
+    // only past 80° of latitude, and then only for a box whose poleward edge
+    // reaches within 2.53° of the pole — see `MAX_FRAMING_PASSES`.
+    //
+    // **The answer here can be short of the box, and this used to claim it
+    // could not.** The old reasoning was that the loop's last act is a step, so
     // this memory is one whole measured shortfall wider than the last thing
-    // measured short. Answered rather than refused, because the alternative is
-    // the pane's own map memory, which is not framed on the box at all.
+    // measured short, and therefore biased outward. The step is real; the
+    // conclusion is not, because the step is sized by a model — ground halves
+    // with every zoom level — that the north lane stops obeying next to the
+    // pole. There the ground bought by a zoom level goes to nothing, so a step
+    // sized to close the whole gap closes a fraction of it.
+    //
+    // What it really answers, measured over 865 280 framings: a box inside the
+    // selector's cap is never left short, and past the cap the worst answer
+    // covers 95.9% of its box.
+    // `a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole` holds both.
+    // Answered rather than refused because the alternative is the pane's own map
+    // memory, which is not framed on the box at all.
     Some((memory, MAX_FRAMING_PASSES))
 }
 
@@ -954,6 +1031,36 @@ fn solve_viewport(
 /// approximation, because it is the codebase's real geodesy and the same
 /// function the resampler places the box's own corners with.
 ///
+/// # A strip can be wider than the world
+///
+/// walkers' `unproject` is the plain inverse Mercator and does **not** wrap:
+/// a point a world to the left of the centre reads back as `centre − 360°`,
+/// literally, and the geodesy between two longitudes 360° apart is the distance
+/// between one point and itself. So the raw difference *folds*: measured at
+/// zoom 0, a 512-point strip about 35.33°N reads its two edges at −457.28° and
+/// +262.72° and answers **2.47e-12 km** of east–west ground for a viewport
+/// showing two entire worlds. Every width around it is wrong in the same
+/// direction and by an arbitrary amount — 1.17 worlds reads 11 529 km where one
+/// world reads 12 158 — so the measure is not merely inaccurate out there, it is
+/// not monotone in zoom, and the solve above is a loop that assumes it is.
+///
+/// Two things came off that. The near-zero is one guard from `None`, which is
+/// the caller's site-centred fallback and the bug this whole path exists to
+/// remove. And the fold is what put the framing solve past its pass budget: at
+/// 83.5°N in a 536 × 96 strip the east lane read 1413, 965, 672, 538, 480, 456,
+/// 412 km over seven passes — *shrinking* as the strip widened — so a solve
+/// whose north lane had already converged could never settle.
+///
+/// **Half a turn is the whole of the axis**, so the offset is clamped there.
+/// Past it the strip has all the longitude there is and the ground either side
+/// of the centre is the half-circumference at that latitude, which is what the
+/// clamp answers: monotone in zoom, saturating, and never zero.
+///
+/// The north lane needs no such clamp and does not get one: `atan(sinh(y))` is
+/// bounded into ±90° for every pixel there is, so a latitude offset cannot reach
+/// half a turn to begin with and a clamp there would be a branch nothing can
+/// take.
+///
 /// `pub(crate)` for the tests in `ui_map` rather than for any caller: it is the
 /// instrument the coverage property is measured with, and the end-to-end pin —
 /// that a **picked** region's floor is framed on that region rather than on the
@@ -964,15 +1071,18 @@ pub(crate) fn ground_half_extent(
     map_memory: &walkers::MapMemory,
     centre: walkers::Position,
 ) -> Option<rustdar_radar::voxel::HalfExtentKm> {
+    /// Half a turn of longitude: the most ground there is either side of any
+    /// meridian, and so the most an offset can honestly measure.
+    const HALF_TURN_DEG: f64 = 180.0;
+
     let projector = walkers::Projector::new(rect, map_memory, centre);
     let ground_km = |pos: egui::Pos2| {
         let point = projector.unproject(pos.to_vec2());
-        let (_, range_km) = rustdar_radar::beam::site_bearing_range_km(
-            centre.y(),
-            centre.x(),
-            point.y(),
-            point.x(),
-        );
+        // See "A strip can be wider than the world" above: the raw difference
+        // folds back towards zero past a half-turn, and this saturates instead.
+        let lon = centre.x() + (point.x() - centre.x()).clamp(-HALF_TURN_DEG, HALF_TURN_DEG);
+        let (_, range_km) =
+            rustdar_radar::beam::site_bearing_range_km(centre.y(), centre.x(), point.y(), lon);
         (range_km.is_finite() && range_km > 0.0).then_some(range_km)
     };
     Some(rustdar_radar::voxel::HalfExtentKm {
