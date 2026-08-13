@@ -561,7 +561,7 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 /// are the render's, on a box where 30-odd agents are runnable at any moment.
 ///
 /// Both fault columns are the evidence rather than the wall clock, and they are
-/// not the same measurement twice. `value_data` is built serially on the
+/// not the same measurement twice. The value grid is built serially on the
 /// render's own thread and faults there; `image` is written by `par_chunks_mut`
 /// on rayon's workers and faults on *them*, which no per-thread counter on the
 /// render's thread can see. That is why the per-thread figure is roughly half
@@ -631,34 +631,34 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 /// Because the two buffers die in different places and at different times, and
 /// on the path that matters most one of them does not die at all.
 ///
-/// A **loop frame** gives both back, and its two buffers die at two different
-/// moments. The texture is finished with as soon as it has been reinterpreted
-/// for the channel, which is `app_fetch`'s `deliver`. The grid is dead the
-/// moment it is produced, because a loop frame stores no values — and *where*
-/// that is honoured depends on which kind of loop frame it is. A Level II frame
-/// is dispatched `JobRequest::Radar { values_wanted: false }` and
-/// `offload::execute` empties it there, in the instance that rasterized it. A
-/// Level III frame is dispatched `JobRequest::Level3`, which has **no such
-/// field** — there is nothing to strip on a raster whose values the loop never
-/// asked for differently — so its grid rides back to `deliver` intact and is
-/// handed over there, beside the texture. One call at that site covers both:
-/// what a Level II frame carries to it is the capacity-0 husk `execute`'s
-/// `mem::take` left behind, which [`recycle_values`] declines. So the
-/// highest-frequency render in the application — sixty of them per loop
-/// download, of either kind — allocates neither buffer, and gets the whole of
-/// the table above.
+/// **The grid dies at one site, on every path.** `rustdar_frontend::offload`'s
+/// `From<SweepRender> for RenderedFrame` is that site: it is the one conversion
+/// all three rasterizing arms come through, and the grid does not go past it.
+/// Nothing outside this crate reads it any more — a readout reads gates now, at
+/// the resolution the radar measured them (see [`polar`]) — so the moment the
+/// texture has been derived from it, it is nobody's, and it goes back to the
+/// slot instead of to the allocator.
 ///
-/// A **static pane** gives back only the texture. Its grid leaves in an `Arc`
-/// that the pane, the render cache and every hover that samples the field all
-/// hold, so the render's thread is not its last owner and there is no moment on
-/// that path at which it belongs to nobody. That slot therefore misses, which
-/// costs exactly what the "miss" section above says it costs: nothing.
+/// That is a change from what this section used to describe, and it is worth
+/// saying which way. The grid used to leave a *static* pane's render inside an
+/// `Arc` held by the pane, the render cache and every hover that sampled it, so
+/// the render's thread was not its last owner and that slot missed on every
+/// static render — half the pool's value, on the path that takes the largest
+/// raster. Only loop frames fed it. Now every render feeds it.
 ///
-/// A single slot holding both would be empty whenever either was still out,
-/// which on the static path is always — so it would give the static pane
-/// nothing, where two slots give it half.
+/// The **texture** still dies later and elsewhere: it is finished with as soon
+/// as it has been reinterpreted for the channel, which is `render_dispatch`'s
+/// `deliver` for a static pane and `app_fetch`'s for a loop frame. That is why
+/// there are still two slots and not one pair — a single slot holding both
+/// would be empty whenever either was still out, and one of them always is.
 ///
-/// Half is worth having and is also the *smaller* half, which is worth writing
+/// The measurement below was taken while the static pane's grid still escaped,
+/// so its rows describe a loop frame's render. They are kept because what they
+/// separate is still true and is still the reason both slots exist, and because
+/// the "grid only" row is now what *every* render gets rather than what only a
+/// loop frame got.
+///
+/// It is also the *smaller* half, which is worth writing
 /// down because it is the opposite of what the sizes suggest. The two buffers
 /// are the same 16 MiB and remove the same 4,096 pages each, but they are not
 /// paid for on the same thread: the grid is built serially on the render's own
@@ -680,10 +680,10 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 ///
 /// So the texture's slot buys half the faults and about a millisecond, and the
 /// grid's buys the other half and four or five more. Giving the static pane its
-/// grid back would need the `Arc` replaced by a handle that recycles when the
-/// last holder drops it — across `rustdar_frontend::channels`,
-/// `rustdar_egui::pane` and `rustdar_egui::overlay_cache` — and the numbers
-/// above are here so that whoever weighs that has them without re-measuring.
+/// grid back used to need the `Arc` replaced by a handle that recycled when the
+/// last holder dropped it, across three crates; what happened instead is that
+/// the `Arc` stopped carrying a grid at all, so there is no last holder to wait
+/// for and the static pane now gets those four or five milliseconds too.
 ///
 /// # Residency
 ///
@@ -697,21 +697,24 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 ///   `render_dispatch`'s `deliver`, the static pane — is the one render kind
 ///   that may take the long-range raster. So its high-water is the 4096 ceiling:
 ///   **64 MiB** natively, 16 MiB on the web, where the ceiling is 2048.
-/// * The **grid** slot is fed only by loop frames, for the reason the section
-///   above gives — a static pane's grid leaves in an `Arc` and never belongs to
-///   nobody. Every loop frame is dispatched at `LOOP_IMAGE_SIZE`, so this slot
-///   never sees anything larger than `LOOP_IMAGE_SIZE² × 4`: **16 MiB** on
-///   desktop and mobile, 4 MiB on the web, where a loop frame is 1024². A
-///   long-range static render does *take* this slot's buffer and grow it to 64
-///   MiB — but that grown grid leaves in the `Arc` and never comes back, and the
-///   slot it left is empty.
+/// * The **grid** slot is fed by every render now, including the static pane's,
+///   for the reason the section above gives. So its high-water is the same
+///   raster the texture slot's is — the largest a static render takes, which
+///   is `side_ceiling_px² × 4` at whatever ceiling the device reported. It used
+///   to be fed only by loop frames and so capped at `LOOP_IMAGE_SIZE² × 4`.
 ///
-/// So the real ceiling is **80 MiB** natively and 20 MiB on the web, not the
-/// 128 MiB that doubling the long-range texture would suggest. High-water rather
-/// than constant, for [`RenderBuffers::checkout`]'s reason and with its price:
-/// the slot is fitted to the render asking for it rather than reallocated, so an
-/// alternation between two sides re-faults nothing once the larger has been
-/// seen.
+/// So both slots now sit at the same figure, and that figure follows the
+/// device: **206.75 MiB** apiece for the 7362 px a 1832-gate surveillance cut
+/// asks for on a desktop reporting 32768, 16 MiB on the web where the ceiling is
+/// 2048. High-water rather than constant, for [`RenderBuffers::checkout`]'s
+/// reason and with its price: the slot is fitted to the render asking for it
+/// rather than reallocated, so an alternation between two sides re-faults
+/// nothing once the larger has been seen.
+///
+/// That is a real spare and it is the whole of what this change *added* back:
+/// against it, the same 206.75 MiB stopped being held per resident render by
+/// the pane, the render cache and the suspend copy, where a display showing six
+/// distinct rasters held six of them.
 ///
 /// This is a spare rather than an addition to the peak — a render that is alive
 /// is holding its buffers, and the slots are empty while it is — so the ceiling
@@ -723,8 +726,9 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 /// pages to fault. Which of the slots can even be fed there depends on where
 /// the render ran, and the two answers differ. The grid's is returned by
 /// `offload::execute` itself, which is the rasterizing instance whichever it
-/// is, so that slot fills in a worker as readily as on the main thread. The
-/// texture's is returned by the consumers — `render_dispatch`'s `deliver` and
+/// is — `From<SweepRender> for RenderedFrame` runs wherever the render ran — so
+/// that slot fills in a worker as readily as on the main thread. The texture's
+/// is returned by the consumers — `render_dispatch`'s `deliver` and
 /// `app_fetch`'s — which are always the main instance, so with a worker
 /// attached the worker's texture slot never fills and every render there
 /// allocates as it always did. Without one, the inline fallback rasterizes in

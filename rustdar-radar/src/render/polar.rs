@@ -16,6 +16,19 @@
 //! This is the measurements themselves, at the resolution the radar took them,
 //! arranged the way [`super::MercatorProjection::render_gate`] read them.
 //!
+//! Measured on this box, `--release`, holding one render per pane the way a
+//! pane, the render cache and the suspend copy all did — a synthetic 720 × 1832
+//! surveillance cut at a 8192 ceiling, which lands on a 7328 px raster, each
+//! arm in its own process so the renderer's pools cannot confound them:
+//!
+//! | resident host bytes | grid | this |
+//! |---------------------|-----:|-----:|
+//! | marginal, per pane  | 214,806,528 B (204.86 MiB) | 5,288,000 B (5.04 MiB) |
+//! | six panes           | 1034.31 MiB | **35.22 MiB** |
+//!
+//! Forty-one times smaller, and the six-pane figure is what a display showing
+//! six distinct rasters was actually holding.
+//!
 //! # The rule is `render_gate`'s rule, backwards
 //!
 //! A readout that picked its gate by any rule of its own would name a different

@@ -84,9 +84,16 @@ pub struct RadarImageData {
 /// serve the hover readout. Retaining them per frame would cost
 /// `MAX_LOOP_RENDER_BUDGET` × 18 MB (648 MB on desktop) to answer a question
 /// nobody can ask of a moving picture. So a section loop frame drops them, and
-/// the pane's hover readout goes quiet while a loop runs — exactly as a plan-view
-/// loop frame's does, which carries an empty `value_data` for the same reason
-/// (see `App::rendered_image`).
+/// the pane's hover readout goes quiet while a *section* loop runs.
+///
+/// A **plan-view** loop frame no longer goes quiet, and the difference is worth
+/// stating because the arithmetic above is the same. It stopped having to copy
+/// anything: a plan view's numbers are gates of a volume the loop's download
+/// cache is already holding for as long as the loop lives, so the frame keeps
+/// 5.8 KiB of geometry and an `Arc` and reads the numbers back out — see
+/// [`RadarImageData::hover`]. A section's are a resampled vertical plane cut
+/// from a tilt ladder, with no resident source to read back from, so this
+/// paragraph still describes it.
 ///
 /// [`axes`](Self::axes) and [`tilt_elevations_deg`](Self::tilt_elevations_deg)
 /// are kept because they are *labels on this picture*: the height and distance
