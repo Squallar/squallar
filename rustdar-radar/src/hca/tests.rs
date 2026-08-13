@@ -594,6 +594,7 @@ fn beam_ml_intersection_matches_the_hand_computation() {
     let ml = MeltingLayer {
         top_km_arl: [3.0; 360],
         bottom_km_arl: [2.5; 360],
+        source: MeltingLayerSource::Rpg,
     };
     let bins = beam_ml_intersection(0.5, 0, 0.25, &ml);
     assert_eq!(bins.bb, 414);
@@ -1272,7 +1273,13 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
         .map(|&e| wet_snow_ring_sweep(e))
         .collect();
     let sweep_refs: Vec<&[Radial]> = sweeps.iter().map(|s| s.as_slice()).collect();
-    let ml = detect_melting_layer(&sweep_refs, &params(), 2.75, &hsda_far(), None);
+    let ml = detect_melting_layer(
+        &sweep_refs,
+        &params(),
+        &MeltingLayer::flat(2.75),
+        &hsda_far(),
+        None,
+    );
     for az in [0usize, 90, 180, 270] {
         assert!(
             (2.6..=3.3).contains(&ml.top_km_arl[az]),
@@ -1287,7 +1294,7 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
         assert!(ml.top_km_arl[az] > ml.bottom_km_arl[az]);
     }
     // A quiet volume detects nothing and returns the default.
-    let quiet = detect_melting_layer(&[], &params(), 2.75, &hsda_far(), None);
+    let quiet = detect_melting_layer(&[], &params(), &MeltingLayer::flat(2.75), &hsda_far(), None);
     assert_eq!(quiet.top_km_arl[0], 2.75);
     assert_eq!(quiet.bottom_km_arl[0], 2.25);
 }
@@ -1370,7 +1377,15 @@ fn the_pool_classifies_a_volume_the_way_one_thread_does() {
         .map(|&e| wet_snow_ring_sweep(e))
         .collect();
     let refs: Vec<&[Radial]> = sweeps.iter().map(|s| s.as_slice()).collect();
-    let detect = || detect_melting_layer(&refs, &params(), 2.75, &hsda_far(), None);
+    let detect = || {
+        detect_melting_layer(
+            &refs,
+            &params(),
+            &MeltingLayer::flat(2.75),
+            &hsda_far(),
+            None,
+        )
+    };
     let parallel = detect();
     assert!(
         parallel.top_km_arl[0] != 2.75,
@@ -1512,4 +1527,380 @@ fn hsda_regimes_follow_the_wet_bulb_heights() {
     };
     let high = hail_size_radial(&f, &classes, &cold);
     assert_eq!(high, vec![HailSize::Small; 2]);
+}
+
+// ── The RPG's own melting layer, from product 166 ───────────────────────
+
+mod melting_layer_product {
+    use super::*;
+    use nexrad_level3::model::{
+        DataLayer, DataPacket, Level3Message, LinkedContourPacket, MessageHeader,
+        ProductDescriptionBlock, SymbologyBlock,
+    };
+
+    /// A product-166 message drawing `rings` at `elevation_tenths / 10`
+    /// degrees, each ring a closed circle of the given radius in **screen
+    /// units** (1/4 km), preceded by its Set Colour Level packet as the RPG
+    /// writes them.
+    ///
+    /// Circles rather than the real product's slightly wobbly rings because
+    /// a circle's radius is known exactly at every azimuth, which is what
+    /// makes the recovered height checkable against the beam-height model by
+    /// hand.
+    pub(super) fn product_166(elevation_tenths: i16, rings: &[i16]) -> Level3Message {
+        let mut packets = Vec::new();
+        for (level, &radius) in rings.iter().enumerate() {
+            packets.push(DataPacket::ContourColour(level as u16 + 1));
+            let points = (0..=360)
+                .map(|deg| {
+                    let a = f64::from(deg).to_radians();
+                    (
+                        (f64::from(radius) * a.sin()).round() as i16,
+                        (f64::from(radius) * a.cos()).round() as i16,
+                    )
+                })
+                .collect();
+            packets.push(DataPacket::LinkedContour(LinkedContourPacket { points }));
+        }
+        Level3Message {
+            header: MessageHeader {
+                message_code: 166,
+                date_of_message: 20661,
+                time_of_message: 7108,
+                message_length: 0,
+                source_id: 0,
+                destination_id: 0,
+                number_of_blocks: 3,
+            },
+            pdb: ProductDescriptionBlock {
+                block_divider: -1,
+                latitude: 39.786,
+                longitude: -104.545,
+                height: 5610,
+                product_code: 166,
+                operational_mode: 2,
+                vcp: 212,
+                sequence_number: 0,
+                volume_scan_number: 39,
+                volume_scan_date: 20661,
+                volume_scan_time: 7108,
+                generation_date: 20661,
+                generation_time: 7108,
+                product_specific_1: 0,
+                product_specific_2: 0,
+                elevation_number: 1,
+                product_specific_3: elevation_tenths,
+                thresholds: [0u16; 16],
+                product_specific_47_53: [0; 7],
+                version: 0,
+                spot_blank: 0,
+                symbology_offset: 60,
+                graphic_offset: 0,
+                tabular_offset: 0,
+            },
+            symbology: Some(SymbologyBlock {
+                block_id: 1,
+                block_length: 0,
+                num_layers: 1,
+                layers: vec![DataLayer {
+                    layer_length: 0,
+                    packets,
+                }],
+            }),
+        }
+    }
+
+    /// A product-166 message drawing the four rings a layer of `top_km` /
+    /// `bottom_km` ARL really produces at `el_deg`: the top crossed by the
+    /// beam's lower edge and by its centre, and the bottom crossed by its
+    /// centre and its upper edge.
+    ///
+    /// Built through `ml_range_from_height` — `Compute_range_from_height`,
+    /// the RPG's own inverse — so the rings are where the algorithm would
+    /// have drawn them and the test measures the recovery rather than a
+    /// pair of numbers chosen to match it.
+    pub(super) fn layer_at(el_deg: f64, top_km: f64, bottom_km: f64) -> Level3Message {
+        let units = |h: f64, e: f64| (ml_range_from_height(e, h) * 4.0).round() as i16;
+        let half_bw = BEAM_WIDTH_DEG / 2.0;
+        product_166(
+            (el_deg * 10.0).round() as i16,
+            &[
+                units(top_km, el_deg - half_bw),
+                units(top_km, el_deg),
+                units(bottom_km, el_deg),
+                units(bottom_km, el_deg + half_bw),
+            ],
+        )
+    }
+
+    /// The two beam-centre rings invert to the heights that drew them, and
+    /// the two edge rings — which the recovery never reads as input — agree
+    /// with them.
+    ///
+    /// Ring order is by radius, widest first: top-at-lower-edge,
+    /// top-at-centre, bottom-at-centre, bottom-at-upper-edge.
+    #[test]
+    fn the_beam_centre_rings_invert_to_the_layer_that_drew_them() {
+        let recovery = MeltingLayer::from_melting_layer_product(&layer_at(0.5, 2.8, 2.3))
+            .expect("four rings invert");
+
+        for az in 0..360 {
+            // A ring drawn on the product's 1/4 km integer grid is not
+            // exactly round, so a screen unit of slack per azimuth.
+            assert!(
+                (recovery.layer.top_km_arl[az] - 2.8).abs() < 0.02,
+                "az {az}: top {}",
+                recovery.layer.top_km_arl[az],
+            );
+            assert!(
+                (recovery.layer.bottom_km_arl[az] - 2.3).abs() < 0.02,
+                "az {az}: bottom {}",
+                recovery.layer.bottom_km_arl[az],
+            );
+        }
+        assert_eq!(recovery.layer.source, MeltingLayerSource::Rpg);
+        assert!(
+            (recovery.depth_km - 0.5).abs() < 0.02,
+            "depth {}",
+            recovery.depth_km,
+        );
+        // The edge rings are the check, not an input: they were drawn from
+        // the same layer, so the two routes must land together.
+        assert!(
+            recovery.consistency_km < 0.05,
+            "self-consistency {}",
+            recovery.consistency_km,
+        );
+        assert!(recovery.looks_sound());
+    }
+
+    /// The recovery reads the product's own elevation, so the same layer
+    /// drawn from a higher cut — different rings entirely — comes back the
+    /// same. This is what would break first if the elevation were assumed
+    /// rather than read.
+    #[test]
+    fn the_same_layer_recovers_from_a_different_cut() {
+        let low =
+            MeltingLayer::from_melting_layer_product(&layer_at(0.5, 2.8, 2.3)).expect("inverts");
+        let high =
+            MeltingLayer::from_melting_layer_product(&layer_at(1.5, 2.8, 2.3)).expect("inverts");
+        for az in 0..360 {
+            assert!(
+                (low.layer.top_km_arl[az] - high.layer.top_km_arl[az]).abs() < 0.03,
+                "az {az}: {} vs {}",
+                low.layer.top_km_arl[az],
+                high.layer.top_km_arl[az],
+            );
+        }
+    }
+
+    /// The rings arrive in whatever order the product wrote them; the
+    /// recovery ranks them by radius, so shuffling the packets must not
+    /// change the answer.
+    #[test]
+    fn ring_order_in_the_product_does_not_matter() {
+        let straight =
+            MeltingLayer::from_melting_layer_product(&product_166(5, &[831, 604, 531, 388]))
+                .expect("inverts");
+        let shuffled =
+            MeltingLayer::from_melting_layer_product(&product_166(5, &[531, 831, 388, 604]))
+                .expect("inverts");
+        assert_eq!(straight.layer.top_km_arl, shuffled.layer.top_km_arl);
+        assert_eq!(straight.layer.bottom_km_arl, shuffled.layer.bottom_km_arl);
+    }
+
+    /// A layer at or below the radar draws collapsed rings. That is the real
+    /// winter answer — it is what KOKX, KATX and KBUF publish — and it must
+    /// come back as a layer at ground, accepted, not refused for having no
+    /// depth. Refusing it would throw away the whole fix at exactly the three
+    /// sites the fix is for.
+    #[test]
+    fn a_layer_on_the_ground_is_recovered_and_accepted() {
+        let recovery = MeltingLayer::from_melting_layer_product(&product_166(5, &[8, 6, 0, 0]))
+            .expect("inverts");
+        assert!(recovery.layer.bottom_km_arl.iter().all(|&b| b == 0.0));
+        assert!(
+            recovery.layer.top_km_arl.iter().all(|&t| t < 0.05),
+            "a collapsed ring is a layer at ground",
+        );
+        assert!(
+            recovery.depth_km < 0.25,
+            "depth {} is far under the nominal 0.5",
+            recovery.depth_km,
+        );
+        assert!(
+            recovery.looks_sound(),
+            "a ground-truncated layer has no depth to check and is still sound",
+        );
+    }
+
+    /// Fewer than four contours is not a partial layer, it is no layer: a
+    /// classification that is right on some azimuths and kilometres wrong on
+    /// the rest is the failure this path exists to remove.
+    #[test]
+    fn a_product_short_of_four_contours_is_refused() {
+        assert!(MeltingLayer::from_melting_layer_product(&product_166(5, &[604, 531])).is_none());
+        let mut empty = product_166(5, &[]);
+        empty.symbology = None;
+        assert!(MeltingLayer::from_melting_layer_product(&empty).is_none());
+    }
+
+    /// An elevation of zero (or a nonsense one) makes the inversion
+    /// meaningless — the beam-height model degenerates — so it is refused
+    /// rather than quietly producing a layer.
+    #[test]
+    fn an_unusable_elevation_is_refused() {
+        assert!(
+            MeltingLayer::from_melting_layer_product(&product_166(0, &[831, 604, 531, 388]))
+                .is_none()
+        );
+        assert!(
+            MeltingLayer::from_melting_layer_product(&product_166(900, &[831, 604, 531, 388]))
+                .is_none()
+        );
+    }
+
+    /// Rings whose implied layer is nowhere near the algorithm's 0.5 km are
+    /// not silently used. [`MeltingLayerRecovery::looks_sound`] is what
+    /// [`resolve_melting_layer`] consults before accepting a recovery.
+    #[test]
+    fn an_implausible_depth_fails_the_soundness_check() {
+        let recovery =
+            MeltingLayer::from_melting_layer_product(&layer_at(0.5, 4.0, 1.0)).expect("inverts");
+        assert!(recovery.depth_km > 0.75, "depth {}", recovery.depth_km);
+        assert!(!recovery.looks_sound());
+    }
+
+    /// Rings that do not belong to one layer at all — the two routes to the
+    /// top land 2 km apart — fail the consistency check even though their
+    /// depth happens to look ordinary.
+    #[test]
+    fn rings_that_disagree_with_each_other_fail_the_soundness_check() {
+        let mut incoherent = layer_at(0.5, 2.8, 2.3);
+        // Widen the outermost ring far past where the layer's top could put
+        // it, leaving the depth (a centre-ring quantity) untouched.
+        let Some(block) = incoherent.symbology.as_mut() else {
+            panic!("the fixture has a symbology block")
+        };
+        for packet in &mut block.layers[0].packets {
+            if let DataPacket::LinkedContour(c) = packet
+                && c.points.iter().any(|p| p.0 > 800 || p.1 > 800)
+            {
+                for p in &mut c.points {
+                    p.0 = (f64::from(p.0) * 1.6).round() as i16;
+                    p.1 = (f64::from(p.1) * 1.6).round() as i16;
+                }
+            }
+        }
+        let recovery =
+            MeltingLayer::from_melting_layer_product(&incoherent).expect("still inverts");
+        assert!(
+            (recovery.depth_km - 0.5).abs() < 0.05,
+            "the centre rings are untouched, so the depth still reads 0.5: {}",
+            recovery.depth_km,
+        );
+        assert!(recovery.consistency_km > MAX_ML_INCONSISTENCY_KM);
+        assert!(!recovery.looks_sound());
+    }
+}
+
+// ── The fallback chain, and what it says it did ─────────────────────────
+
+/// Every constructor records where its heights came from, because a
+/// consumer that cannot tell a measured layer from an assumed one cannot
+/// tell a 96 % classification from a 16 % one.
+#[test]
+fn every_melting_layer_names_its_own_source() {
+    assert_eq!(
+        MeltingLayer::flat(3.0).source,
+        MeltingLayerSource::FleetDefault,
+        "the bare flat layer is the fleet guess",
+    );
+    assert_eq!(
+        MeltingLayer::from_zero_c_height(4.2, 0.2).source,
+        MeltingLayerSource::Sounding,
+    );
+    assert_eq!(
+        MeltingLayer::flat_from(3.0, MeltingLayerSource::Sounding).source,
+        MeltingLayerSource::Sounding,
+    );
+    // Only the two that observed this volume claim to have measured it.
+    assert!(MeltingLayerSource::Rpg.is_measured());
+    assert!(MeltingLayerSource::RadarDetected.is_measured());
+    assert!(!MeltingLayerSource::Sounding.is_measured());
+    assert!(!MeltingLayerSource::FleetDefault.is_measured());
+    // Ordered best-first, so the chain's preference is the type's own.
+    assert!(MeltingLayerSource::Rpg < MeltingLayerSource::RadarDetected);
+    assert!(MeltingLayerSource::RadarDetected < MeltingLayerSource::Sounding);
+    assert!(MeltingLayerSource::Sounding < MeltingLayerSource::FleetDefault);
+}
+
+/// The chain with no sweeps to detect from: the RPG's layer when there is
+/// one, the sounding's flat layer when there is not, and the fleet default
+/// only when nothing else answered — each saying which it was.
+#[test]
+fn the_chain_falls_through_in_order_and_says_where_it_stopped() {
+    let params = KdpParams {
+        init_fdp_deg: Some(60.0),
+        ..KdpParams::default()
+    };
+    let hsda = hsda_far();
+    let radar_km_msl = 1.71;
+
+    // Nothing at all: the fleet default, and it says so.
+    let bare = resolve_melting_layer(None, &[], &params, None, radar_km_msl, &hsda, None);
+    assert_eq!(bare.source, MeltingLayerSource::FleetDefault);
+    assert!((bare.top_km_arl[0] - (DEFAULT_HEIGHT_0_KM_MSL - radar_km_msl)).abs() < 1e-12);
+
+    // A sounding but no product and no detection: flat at the sounding's
+    // freezing level, named as the sounding's.
+    let sounded = resolve_melting_layer(None, &[], &params, Some(4.2), radar_km_msl, &hsda, None);
+    assert_eq!(sounded.source, MeltingLayerSource::Sounding);
+    assert!((sounded.top_km_arl[0] - (4.2 - radar_km_msl)).abs() < 1e-12);
+
+    // The RPG's own product outranks the sounding, and the layer that comes
+    // back is the product's, not the sounding's.
+    let product = melting_layer_product::layer_at(0.5, 2.8, 2.3);
+    let rpg = resolve_melting_layer(
+        Some(&product),
+        &[],
+        &params,
+        Some(4.2),
+        radar_km_msl,
+        &hsda,
+        None,
+    );
+    assert_eq!(rpg.source, MeltingLayerSource::Rpg);
+    assert!(
+        (rpg.top_km_arl[0] - 2.8).abs() < 0.02,
+        "the product's own 2.8 km layer, not the sounding's {:.3} km: got {}",
+        4.2 - radar_km_msl,
+        rpg.top_km_arl[0],
+    );
+
+    // A product that inverts to nonsense is refused, not used: the chain
+    // falls to the sounding rather than classifying on a bad layer.
+    let bad = melting_layer_product::layer_at(0.5, 4.0, 1.0);
+    let refused = resolve_melting_layer(
+        Some(&bad),
+        &[],
+        &params,
+        Some(4.2),
+        radar_km_msl,
+        &hsda,
+        None,
+    );
+    assert_eq!(refused.source, MeltingLayerSource::Sounding);
+}
+
+/// An inverted layer — bottom above top — is refused, not classified on.
+/// `Hca_beamMLintersection` would hand every gate the wrong zone.
+#[test]
+fn a_melting_layer_recovered_upside_down_is_not_sound() {
+    let mut recovery =
+        MeltingLayer::from_melting_layer_product(&melting_layer_product::layer_at(0.5, 2.8, 2.3))
+            .expect("inverts");
+    assert!(recovery.looks_sound());
+    recovery.layer.bottom_km_arl[17] = recovery.layer.top_km_arl[17] + 0.1;
+    assert!(!recovery.looks_sound(), "one bad azimuth is enough");
 }
