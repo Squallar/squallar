@@ -56,6 +56,45 @@
 //! ms at 3840×2160**, so a burst wider than the lane pays single-digit
 //! milliseconds to wait — against a thread spawn that was never free either.
 //!
+//! # Three lanes, and why teardown is not opaque work
+//!
+//! [`super::discard`]'s frees are a third queue, one thread wide.
+//!
+//! They were briefly put in the opaque lane, and the paragraph above is what
+//! makes that wrong: the opaque lane carries the two overlay rasterizations,
+//! which follow the map and are wanted *now*. A site switch discarding a
+//! session's cached volumes would queue every one of them ahead of the next
+//! overlay render, and a pan straight after a site switch would lag for the
+//! length of the teardown — the lane's own charter, spent on the one kind of
+//! work that has no deadline at all.
+//!
+//! One thread and not `threads`, because frees serialise on the allocator
+//! anyway: a second worker would contend for the same lock rather than halve
+//! the wall clock.
+//!
+//! **That argument cuts both ways, and the other direction is not a reason to
+//! widen the lane but a limit on what narrowing it bought.** This worker holds
+//! the allocator's lock while walking tens of thousands of blocks, and both
+//! other lanes allocate heavily — a rasterization and a volume decode do little
+//! else. Under glibc the volume was allocated on an `rd-job` worker's arena, so
+//! freeing it here is a cross-arena free: it takes a lock the next decode wants
+//! and returns blocks to a tcache the thread that will reuse them is not
+//! looking at. So "nothing waits on a free" is true of *this queue* and false
+//! of the resource underneath it, and the pan this lane was split off to
+//! protect can still be delayed — through the allocator rather than through the
+//! queue. The split removes the queueing delay, which was unbounded in the
+//! length of a teardown; it does not make a free free.
+//!
+//! # What the third lane costs a process that never discards anything
+//!
+//! A thread, eagerly. [`start`] builds all three lanes together, so the free
+//! worker is spawned the first time *anything* is offloaded, and the pool's
+//! thread count is `2 × concurrent_renders + 1` rather than `2 ×`. The
+//! "never pays for the threads" note on [`POOL`] still holds at the level it
+//! was written — a build that offloads nothing starts no pool at all — but a
+//! build that offloads only renders now carries one idle worker parked in
+//! `recv`.
+//!
 //! # In-flight cancellation is not here, on purpose
 //!
 //! `super::execute` has no yield point, and the only place to add one is the
@@ -68,15 +107,23 @@
 use super::{JobRequest, JobResult, JobSink};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
-/// The pool's two queues, started once per process.
+/// The pool's three queues, started once per process.
 struct Pool {
     described: mpsc::Sender<(u64, JobRequest)>,
     opaque: mpsc::Sender<Opaque>,
+    free: mpsc::Sender<Doomed>,
 }
 
 /// An [`super::offload`] closure and the name it was dispatched under, which is
 /// all a panic report has to identify it by.
 type Opaque = (&'static str, Box<dyn FnOnce() + Send>);
+
+/// A payload on its way to the free lane, and the name it was discarded under.
+///
+/// The payload itself travels rather than a closure that drops it: the lane's
+/// whole body is the `drop` at the end of `recv`, so there is nothing for a
+/// closure to carry that the value does not already say.
+type Doomed = (&'static str, Box<dyn std::any::Any + Send>);
 
 /// Started on first use rather than at launch, so a build that never offloads
 /// anything — every test binary in this workspace that does not touch the
@@ -117,8 +164,29 @@ fn start() -> Pool {
         }
     });
 
-    log::debug!("job pool started with {threads} thread(s) per lane");
-    Pool { described, opaque }
+    // One thread, deliberately, and the module doc says why: frees serialise on
+    // the allocator, and nothing waits on one.
+    let (free, free_rx) = mpsc::channel();
+    lane("rd-free", 1, free_rx, |(name, payload): Doomed| {
+        let started = web_time::Instant::now();
+        // A `Drop` that panics must not take the lane's only thread with it, or
+        // every later discard queues behind a receiver nobody is draining and
+        // `run_free` starts answering `Err` for the rest of the session.
+        if guarded(name, move || drop(payload)).is_none() {
+            log::error!("{name}: a payload panicked while being freed");
+        }
+        log::debug!(
+            "{name}: freed in {} µs off the frame",
+            started.elapsed().as_micros()
+        );
+    });
+
+    log::debug!("job pool started with {threads} thread(s) per lane, and one to free");
+    Pool {
+        described,
+        opaque,
+        free,
+    }
 }
 
 /// Start `threads` workers that take `T`s off `rx` and hand each to `run`.
@@ -211,6 +279,21 @@ pub(super) fn run_opaque(
         .opaque
         .send((name, job))
         .map_err(|returned| returned.0.1)
+}
+
+/// Hand `payload` to the free lane. [`super::discard`]'s native arm.
+///
+/// `Err` carries the payload back, for [`run_opaque`]'s reason and with the
+/// same one reachable cause: the queue is unbounded, so a refusal is a lane
+/// with no live worker — every thread spawn failed, or the process is going
+/// away — and never back-pressure. The caller's answer is *not* to free it
+/// where it stands: [`super::discard`] files it in the deferred queue, which
+/// the frame loop drains under a time budget on this target as well.
+pub(super) fn run_free(
+    name: &'static str,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<(), Box<dyn std::any::Any + Send>> {
+    pool().free.send((name, payload)).map_err(|back| back.0.1)
 }
 
 /// This thread's handle to the pool.

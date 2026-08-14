@@ -551,6 +551,71 @@ pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 /// same limit there by another route.
 pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 
+/// How long a frame keeps *starting* frees of what
+/// [`crate::offload::discard`] handed it.
+///
+/// # It paces; it does not bound the frame, and the difference matters here
+///
+/// [`crate::offload::drain_deferred_drops`] checks the clock **after** each
+/// free, because a check before one would let a zero budget — or a clock too
+/// coarse to resolve a free — stop the queue entirely. The cost of that choice
+/// is that a frame's real spend is this budget *plus one whole payload*, and on
+/// wasm32, the only arm that queues in production, one payload can be a 47–69
+/// MiB `DecodedScan`: precisely the free this whole mechanism exists to keep
+/// off a frame. **A single large free is not made smaller by any number here.**
+///
+/// What the web arm buys is therefore *pacing* rather than a bound: sixty
+/// volumes evicted at once are freed a few per frame instead of all on one, and
+/// the map keeps moving between them. The bound proper is the native arm's,
+/// where the free happens on the pool's lane and the frame pays nothing.
+///
+/// # A duration, because the thing being paced is not a countable object
+///
+/// This started as a count of payloads per frame, and the count could not be
+/// justified. A cap of *n* entries is only a cap on frame time if every entry
+/// costs about the same, and these do not: one is whatever a caller discarded,
+/// from a `PolarField` to a whole `DecodedScan` — 47–69 MiB across thousands
+/// of per-radial buffers. Pricing a count needs a per-free millisecond figure
+/// for the browser that nobody has measured, on payloads of no one size, and
+/// the first attempt got it by multiplying a *loop frame* count by a
+/// *decoded volume* cost — two different objects, since a loop caches pictures
+/// at ~4 MiB each (see [`LOOP_POOL_FLOOR_BYTES`]) and volumes live in the scan
+/// caches, not in loop frames.
+///
+/// A duration needs none of that. It is priced against the frame, which is
+/// 16.7 ms on every target and is the quantity actually being protected, and
+/// it self-calibrates: a frame full of cheap payloads retires many and a frame
+/// handed one enormous one retires it and stops.
+///
+/// # Two milliseconds, and what bounds it either way
+///
+/// An eighth of a frame, and `the_teardown_slice_paces_rather_than_stalls`
+/// pins it at that rather than at the looser bound it could have been given.
+/// The lower bound is not a floor on progress — the drain frees at least one
+/// payload per call whatever this says, so the queue empties even at zero — it
+/// is a floor on *rate*: too small a slice makes a large teardown take more
+/// frames than the eviction that caused it, and the memory the app decided it
+/// wanted back stays resident longer. The upper bound is the frame: this is
+/// overhead against drawing, spent on work nothing is waiting for.
+///
+/// The **whole** per-frame cost of a draining queue is larger than this number
+/// twice over, and both are deliberate: the overrun above, and the re-arm, which
+/// asks for another frame while anything is queued — so a teardown is paced at
+/// this budget *plus a rendered frame* apiece, at whatever rate the display
+/// runs. That is the price of draining without waiting for the user, and
+/// `crate::offload::drain_deferred_drops` is where it is argued.
+///
+/// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`]'s ~1.0 ms is the nearest measured figure
+/// in this file, and it is cited as a scale rather than as a precedent: that
+/// millisecond is *foreground* work a pane is waiting on, and this one is not,
+/// which is an argument for staying under it rather than for matching it.
+///
+/// Deliberately not a per-target cascade, for
+/// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`]'s reason: it is chosen against the frame
+/// budget, which is 16.7 ms everywhere, rather than against a device class's
+/// memory.
+pub const DEFERRED_DROP_BUDGET_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// The **whole application's** loop allowance on a device that can tell us
 /// nothing about itself, in bytes.
 ///

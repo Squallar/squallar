@@ -615,6 +615,40 @@ fn the_volume_build_cap_paces_rather_than_stalls() {
     }
 }
 
+/// The teardown slice paces rather than stalls: a real slice of a frame, and a
+/// small one.
+///
+/// The two bounds are not the pair the sibling caps above assert, because the
+/// quantity is not the same kind. There is no count to compare against a render
+/// budget — see [`DEFERRED_DROP_BUDGET_PER_FRAME`] for why a count could not be
+/// justified at all — so what is checked is the budget's relationship to the
+/// frame it is a slice of:
+///
+/// * **Non-zero**, for rate rather than for progress: `drain_deferred_drops`
+///   frees at least one payload per call whatever this says, so zero is not a
+///   no-op the way a zero *count* silently was — it is a teardown that takes
+///   one frame per payload while the memory stays resident.
+/// * **An eighth of a frame**, which is what the constant's own doc claims and
+///   therefore what is pinned. A looser bound here would let the doc and the
+///   check disagree, which is the failure this file exists to prevent.
+///
+/// Neither bound makes this a bound on *frame time*, and the assertion
+/// deliberately does not imply one: the drain checks its budget after each
+/// free, so a frame's real spend is this plus one whole payload — on wasm, up
+/// to a 47–69 MiB volume. See [`DEFERRED_DROP_BUDGET_PER_FRAME`].
+#[test]
+fn the_teardown_slice_paces_rather_than_stalls() {
+    const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
+    const { assert!(DEFERRED_DROP_BUDGET_PER_FRAME.as_micros() > 0) };
+    assert!(
+        DEFERRED_DROP_BUDGET_PER_FRAME * 8 <= FRAME,
+        "the teardown slice ({:?}) is more than the eighth of a 16.7 ms frame \
+         its own doc claims; it is overhead against drawing, spent on work \
+         nothing is waiting for, and it already overruns by one whole payload",
+        DEFERRED_DROP_BUDGET_PER_FRAME,
+    );
+}
+
 /// The pacing cap is a real cap: at least one cut per pass, and fewer than the
 /// concurrent render budget on every arm.
 ///

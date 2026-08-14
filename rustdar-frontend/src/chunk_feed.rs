@@ -464,9 +464,27 @@ impl ChunkFeedManager {
     /// A round in flight for a dropped site is not a leak — the poller travels
     /// on the response and is dropped by [`Self::finish_round`] when it finds no
     /// feed to put it back into.
+    /// # The feed is handed over, not dropped here
+    ///
+    /// A `SiteFeed` owns the poller, which owns the assembler, which owns every
+    /// sealed cut — and that is a **second** full copy of the volume, not the
+    /// one the panes hold: [`crate::chunks::VolumeAssembler::snapshot`] builds
+    /// the published `Arc<Scan>` by cloning each sealed sweep, so a live site
+    /// carries the assembler's cuts *and* the snapshot. `evict_unshown_scans`
+    /// hands the snapshot over one call later; without this the assembler's
+    /// copy — uniquely held, so its free is the real one — was still walked in
+    /// place, on the frame thread, in the same frame.
+    ///
+    /// This runs from `poll_data_channels`, on the frame thread, which is where
+    /// [`crate::offload::discard_each`] requires it to be called from.
     pub fn retain_live(&mut self, live_sites: &[String]) {
-        self.feeds
-            .retain(|site, _| live_sites.iter().any(|s| s == site));
+        let unshown = |site: &String| !live_sites.iter().any(|s| s == site);
+        crate::offload::discard_each(
+            "retired-feed",
+            crate::app::evicted(&mut self.feeds, &unshown),
+        );
+        // Not handed over: an entry is a fingerprint and an elevation, and the
+        // whole map is smaller than one radial of what the feeds above hold.
         self.delivered
             .retain(|(site, _), _| live_sites.iter().any(|s| s == site));
     }

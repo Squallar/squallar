@@ -24,6 +24,14 @@
 //! The second is not a second code path. Both arms of [`offload_job`] call the
 //! same [`execute`] and the same `deliver`, so the fallback is derived from the
 //! worker path rather than written beside it, and there is no pair to drift.
+//!
+//! [`discard`] is the same fork applied to teardown — a job whose whole body is
+//! a `drop`. Natively it goes to a lane of the pool kept for exactly this; on
+//! the web, where [`offload`]'s answer is "inline on this frame", it queues
+//! instead and [`drain_deferred_drops`] frees what a frame can afford, because
+//! a free nobody is waiting on is the one job that never has to run now. What
+//! keeps that queue draining is a term in the frame loop's own wake-up
+//! condition — see [`drain_deferred_drops`], where the invariant is written.
 
 use rustdar_radar::render_input::RenderInput;
 use rustdar_radar::voxel::{VoxelGrid, VoxelRequest, VoxelShape};
@@ -100,6 +108,297 @@ pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
             started.elapsed().as_millis()
         );
     }
+}
+
+/// Free `payload` away from the frame that stopped needing it.
+///
+/// Teardown is CPU-bound work like any other job here, and "it runs rarely" is
+/// not an exception the frame budget recognises: an evicted decoded volume is
+/// 47–69 MiB across thousands of per-radial buffers, its drop is an allocator
+/// walk over every one of them, and the caller handing it over is the frame
+/// thread on every target.
+///
+/// Native hands the payload to the pool's **free lane** — a third queue, one
+/// thread wide, and deliberately not the opaque lane that carries the overlay
+/// rasterizations a pan is waiting on. See [`pool`]'s own doc. The web arm has
+/// no lane to hand it to: [`offload`] runs inline on wasm, so routing through
+/// it would put the free back on the exact frame this function exists to
+/// spare. That arm files the payload in a thread-local queue, and
+/// [`drain_deferred_drops`] retires what a frame can afford.
+///
+/// # Call it from the frame thread
+///
+/// Natively the payload goes to the pool and any thread may hand one over —
+/// except on the one path that does not: a free lane with no live worker falls
+/// back to [`defer_drop`], and that queue is **thread-local**. Filed from a
+/// tokio worker it is filed where no drain will ever look, [`has_deferred_drops`]
+/// on the frame thread reports empty, and the payload is held for the life of
+/// the process. The fallback needs a lane whose every thread failed to spawn,
+/// so it is not a path anything reaches in practice; it is a real leak when it
+/// is reached, and this is the obligation that prevents it.
+///
+/// An obligation rather than an assertion, and `pub(crate)` so the callers that
+/// could break it are one crate rather than everyone. A `debug_assert` against
+/// a thread id the drain stamps looks like the cheaper answer and is not: to
+/// catch a *different* thread filing, the stamp has to be process-global, and
+/// `cargo test` drives this module from many threads at once — each one
+/// legitimately filling and draining its own thread-local queue. A global stamp
+/// would fail those honest tests; a thread-local one cannot see the case it
+/// would exist for.
+///
+/// # Hand over the last reference, and hand over a pointer
+///
+/// Three things a caller has to get right, none of which the signature can
+/// enforce:
+///
+/// * **The last reference.** Deferring a `drop` is not deferring a *free*: a
+///   queued `Arc` whose twin is still held frees nothing when its turn comes,
+///   and the memory stays resident behind the live handle. The budget is
+///   priced per payload and paid per handle, so a caller that keeps a copy has
+///   moved a refcount decrement off the frame and nothing else. The reverse is
+///   observable too — the queued reference keeps `Arc::strong_count` one above
+///   what it was for as long as the entry waits, and this crate does branch on
+///   that count (`render_dispatch::PaneRenderState::want_result`).
+/// * **A pointer, not a large value.** The payload is boxed on the way in, so
+///   an `impl Send` passed by value is memcpy'd once *on the calling thread*.
+///   Hand over a `Box`, an `Arc` or an owning collection's entry — something
+///   whose move is a pointer — rather than a large struct by value.
+/// * **Memory, not a resource whose teardown matters.** A payload's `Drop` may
+///   never run at all. The pool is a `OnceLock` that is never dropped and whose
+///   lane threads are detached, so whatever is queued when the process exits
+///   dies with it — and a payload mid-`drop` is cut off partway. A browser tab
+///   at unload is the same. For plain memory that is exactly right; the process
+///   is releasing everything anyway. For a wgpu resource, an mmap, a file
+///   handle or a temp-file guard it means the teardown is silently skipped, or
+///   runs on a worker after `main` has dropped the device it belonged to. This
+///   takes `impl Send + 'static`, which invites all of those, and none of them
+///   belong here.
+///
+/// Use [`discard_each`] for a collection: a batch handed over whole is one
+/// payload, freed in one turn, and the pacing is lost.
+pub(crate) fn discard(name: &'static str, payload: impl Send + 'static) {
+    let payload: Box<dyn std::any::Any + Send> = Box::new(payload);
+    #[cfg(not(target_arch = "wasm32"))]
+    // `Err` is a free lane with no live worker — see [`pool::run_free`]. The
+    // answer is the queue, not a free where we stand: this is the frame thread,
+    // which is the one place a multi-GiB teardown must not land.
+    if let Err(payload) = pool::run_free(name, payload) {
+        log::warn!("{name}: the free lane has no worker left; deferring the drop instead");
+        defer_drop(name, payload);
+    }
+    #[cfg(target_arch = "wasm32")]
+    defer_drop(name, payload);
+}
+
+/// [`discard`] each item of `payloads` separately.
+///
+/// **This is what a collection teardown wants**, and it exists because the
+/// obvious thing is the wrong one: `discard(name, map.remove(site))` type-checks
+/// — every collection is `Send + 'static` — and hands over a single payload
+/// holding every volume in it, which the drain then frees in one turn on one
+/// frame. That is the stall this module exists to remove, written in a form
+/// that looks like the fix.
+///
+/// Per item, the pacing is real: the drain's budget is spent between whole
+/// payloads, so entries are what a frame can stop between.
+///
+/// **Every obligation on [`discard`] applies to every item**, and the item is
+/// where two of them are easiest to miss: an `IntoIterator<Item = T>` most
+/// naturally yields `T` by value, so a collection of large structs memcpys each
+/// one on the calling thread — iterate `Box`es or `Arc`s — and a collection of
+/// handles frees nothing unless these are the last ones. It must be called from
+/// the frame thread for the reason [`discard`] must.
+pub(crate) fn discard_each<T: Send + 'static>(
+    name: &'static str,
+    payloads: impl IntoIterator<Item = T>,
+) {
+    for payload in payloads {
+        discard(name, payload);
+    }
+}
+
+/// A payload awaiting its frame-paced free, and the name it was discarded
+/// under — which is all the drain's log has to identify it by, the same shape
+/// the pool's lanes carry.
+type DeferredDrop = (&'static str, Box<dyn std::any::Any + Send>);
+
+thread_local! {
+    /// What [`discard`] is holding until a frame can afford to free it.
+    ///
+    /// Thread-local because a browser has one thread, so here a thread-local
+    /// queue is a process-wide queue with a cheaper lock. Natively it holds
+    /// only what the free lane refused — a lane with no worker at all — so an
+    /// entry is always one this thread put here, and the drain that empties it
+    /// runs on this thread too.
+    ///
+    /// **This is the opposite structure to [`PENDING`], deliberately**, and the
+    /// contrast is worth stating because that registry's doc argues at length
+    /// for *not* being thread-local. It has to be global: a job is submitted
+    /// from the frame thread or a tokio worker and answered on a pool thread,
+    /// so the map is reached from threads that are not the submitter's. Nothing
+    /// of the sort happens here — every producer of an entry is the thread that
+    /// consumes it — so the reason that made a registry global is exactly the
+    /// reason absent from this queue.
+    ///
+    /// A `VecDeque`: the drain takes from the front one payload at a time, so
+    /// the entry that has waited longest is always the next to go and no
+    /// teardown can starve behind a later one.
+    static DEFERRED_DROPS: RefCell<std::collections::VecDeque<DeferredDrop>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// File `payload` for [`drain_deferred_drops`] to retire.
+///
+/// Reached on wasm for every discard and natively only for one the free lane
+/// could not take. The `cfg` in [`discard`] is over the *routing*, never over
+/// whether this queue exists, which is what lets a host test drive the queue a
+/// browser will use.
+///
+/// `pub(crate)` for exactly that: `app::tests` reaches it to put a payload on
+/// the queue the way a browser's [`discard`] does, because the native routing
+/// would hand it to the pool and the frame loop is what that test is about.
+pub(crate) fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Send>) {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().push_back((name, payload)));
+}
+
+/// Whether this thread is still holding anything it has promised to free.
+///
+/// Read by `App::handle_redraw` — see [`drain_deferred_drops`] for the
+/// invariant it is read *for*, which is the whole reason this is public.
+pub(crate) fn has_deferred_drops() -> bool {
+    DEFERRED_DROPS.with(|q| !q.borrow().is_empty())
+}
+
+/// Free deferred payloads until `budget` is spent, and answer how many went.
+///
+/// # A non-empty queue must keep the frame loop awake
+///
+/// **This is a contract on the caller, and without it the pacing below is a
+/// statement about frames that says nothing about memory.** The app rests on
+/// `ControlFlow::Wait` and draws only when something asks it to, so a queue
+/// that does not ask is a queue that stops draining: a site switch fills it,
+/// one frame frees what it can, the fetch that woke the loop settles, and the
+/// remainder stays resident until the user next touches the application — at
+/// exactly the moment the application decided it wanted the memory back.
+/// `App::handle_redraw` therefore names [`has_deferred_drops`] among the terms
+/// that request the next frame, beside the renders and loops already there.
+///
+/// The re-arm is necessary and not sufficient, and these are the cases it does
+/// not reach. Four sit between the drain and the re-arm — the drain is early in
+/// `handle_redraw`, on purpose, so each of these still frees its budget's worth
+/// per frame *if a frame happens*, and what they cost is the next frame not
+/// being asked for:
+///
+/// * a **minimized** window returns before the re-arm;
+/// * a **zero-area** window does too, which is the normal state of a browser's
+///   first frame or two rather than an edge case;
+/// * **no window or no renderer** returns earliest of all — which is what
+///   `suspended` leaves behind, so it is every Android background;
+/// * a **backgrounded browser tab** gets no animation frames at all, so nothing
+///   written here reaches it.
+///
+/// All four are bounded by what was queued when the app stopped drawing, and
+/// all four end when it draws again.
+///
+/// # Peak memory goes up, and that is the trade
+///
+/// Deferring a free does not reduce what is held; it moves *when* it is
+/// released. A wasm teardown now has a window in which the maps have let go and
+/// the memory has not come back — as much as the queue is holding, on a target
+/// whose address space is 4 GiB. For a site switch that is the right trade: the
+/// alternative is the same bytes released a few milliseconds sooner and a frame
+/// visibly dropped to do it. It is worth stating plainly because the window is
+/// open-ended in exactly one of the cases above — a backgrounded tab stops
+/// drawing, so it stops draining, while holding everything the switch queued.
+///
+/// # A time budget, not a count
+///
+/// The queue's entries are whatever a caller discarded, and their frees differ
+/// by orders of magnitude — a `PolarField` and a whole `DecodedScan` are both
+/// one entry. A count would have to be priced against a per-entry millisecond
+/// figure nobody has for the browser, on payloads that are not one size; a
+/// duration is priced against the frame, which is 16.7 ms on every target and
+/// is the thing actually being protected.
+///
+/// **At least one payload goes per call, whatever the budget says.** The
+/// elapsed check is made *after* a free rather than before it, so the drain
+/// cannot be turned into a no-op — not by a budget set to zero, and not by a
+/// platform whose clock is too coarse to resolve one.
+///
+/// The price is that this **paces rather than bounds**: a call costs the budget
+/// plus one whole payload, and on wasm one payload can be the 47–69 MiB volume
+/// the mechanism exists to keep off a frame. Firefox's
+/// `privacy.reduceTimerPrecision` is on by default and clamps the clock to
+/// ~100 µs with jitter, which cuts the same way — `elapsed` under-reports, so
+/// the overrun is if anything larger than the numbers here suggest. Sixty
+/// volumes freed a few per frame instead of sixty on one frame is the win;
+/// a frame-time guarantee is not on offer, and
+/// [`crate::constants::DEFERRED_DROP_BUDGET_PER_FRAME`] says so where a reader
+/// looking for the bound will land.
+pub(crate) fn drain_deferred_drops(budget: std::time::Duration) -> usize {
+    // Nothing to do, and nothing measured: this runs on every frame of every
+    // target, and on wasm `Instant::now` is a call across the JS boundary to
+    // `performance.now()`. An empty queue must cost a thread-local read.
+    if !has_deferred_drops() {
+        return 0;
+    }
+    let started = web_time::Instant::now();
+    let mut freed = 0;
+    // The payload whose free cost the most, and **only where that can be
+    // measured**. A per-payload cost needs a clock finer than one free, and
+    // wasm's is not: `performance.now()` is clamped to ~100 µs with jitter
+    // under Firefox's default `privacy.reduceTimerPrecision`, so nearly every
+    // payload would read 0 µs and the "dearest" would be whichever one the
+    // comparison happened to keep — a name presented as a measurement and
+    // arrived at by tie-breaking. Natively the clock resolves it, so the
+    // attribution is native-only and says so rather than being quietly wrong on
+    // the arm that actually pays.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut dearest: (&'static str, u128) = ("nothing", 0);
+    // One at a time, with the borrow released before the payload is dropped:
+    // a `Drop` that discards something of its own then finds the queue
+    // borrowable rather than panicking the frame.
+    while let Some((name, payload)) = DEFERRED_DROPS.with(|q| q.borrow_mut().pop_front()) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let before = started.elapsed();
+        drop(payload);
+        freed += 1;
+        // The one read per payload the loop needs anyway, reused for both the
+        // budget test and the cost above rather than taken twice.
+        let elapsed = started.elapsed();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cost = elapsed.saturating_sub(before).as_micros();
+            if cost > dearest.1 {
+                dearest = (name, cost);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = name;
+        if elapsed >= budget {
+            break;
+        }
+    }
+    // Microseconds, and once per drain rather than once per payload. A free is
+    // routinely sub-millisecond, so `as_millis` printed "0 ms" for the thing
+    // this line exists to measure; and one line per entry is a console write
+    // per payload for the length of a teardown, which on the target that has to
+    // be measured is itself a frame cost.
+    #[cfg(not(target_arch = "wasm32"))]
+    log::debug!(
+        "freed {freed} deferred payload(s) in {} µs; dearest was {} at {} µs; {} left",
+        started.elapsed().as_micros(),
+        dearest.0,
+        dearest.1,
+        DEFERRED_DROPS.with(|q| q.borrow().len()),
+    );
+    #[cfg(target_arch = "wasm32")]
+    log::debug!(
+        "freed {freed} deferred payload(s) in {} µs on the frame thread; {} left",
+        started.elapsed().as_micros(),
+        DEFERRED_DROPS.with(|q| q.borrow().len()),
+    );
+    freed
 }
 
 /// A CPU-bound job described as data, so it can be executed somewhere that does
@@ -1684,3 +1983,8 @@ mod tests;
 /// The premultiply runs at the producer, and no pixel moved when it got there.
 #[cfg(test)]
 mod premultiply_tests;
+
+/// The deferred-drop queue frees at the drain's pace, never at the push, and a
+/// native discard never comes near it.
+#[cfg(test)]
+mod discard_tests;
