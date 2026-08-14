@@ -430,6 +430,82 @@ impl SpcOutlookHandler {
         self.state.record_coverage(coverage);
     }
 
+    /// Every enabled product's features, concatenated in the order they will be
+    /// painted.
+    ///
+    /// Walks the day's own publication order, not `enabled_products`' — the
+    /// same rule [`Self::status_line`] and [`Self::round_verdict`] follow, and
+    /// for a sharper reason here: this vector **is** the paint order
+    /// (`rasterize::rasterize_spc_outlooks` draws in list order) and
+    /// `HashSet`'s iteration order is seeded per process. Walking the set
+    /// directly let one selection paint in a different order after a restart,
+    /// so a reopened session was not the 1:1 image it closed as.
+    ///
+    /// It is also what puts Day 3's significant-severe hatching on top:
+    /// [`ConditionalIntensity`](OutlookProduct::ConditionalIntensity) is last
+    /// in `OutlookDay::Day3.products()`, so its overlay tier lands above the
+    /// probabilistic fills rather than under whichever product the hash
+    /// happened to yield last.
+    fn features_in_paint_order(&self) -> Vec<crate::types::OverlayFeature> {
+        let day = self.selected_day;
+        let mut features = Vec::new();
+        for &product in day.products() {
+            if !self.enabled_products.contains(&product) {
+                continue;
+            }
+            if let Some(outlook) = self.state.data.get(&(day, product)) {
+                features.extend(outlook.features.iter().cloned());
+            }
+        }
+        features
+    }
+
+    /// Bring the products that are not independently selectable into line with
+    /// the ones that are, and drop any that the selected day does not publish.
+    ///
+    /// [`OutlookProduct::implied_by`] names a governing product for each such
+    /// product — today only Day 3's
+    /// [`ConditionalIntensity`](OutlookProduct::ConditionalIntensity), governed
+    /// by [`Probabilistic`](OutlookProduct::Probabilistic). This makes the
+    /// implied product's membership of `enabled_products` mirror its parent's
+    /// exactly, so that it takes part in the fetch scope, the `outstanding`
+    /// count and the `per_product_error` ledger like any other product while
+    /// never appearing as a toggle of its own.
+    ///
+    /// This is the **only** thing that inserts or removes an implied product,
+    /// and three paths need it:
+    ///
+    /// * the day buttons — arriving on Day 3 from a day whose only product is
+    ///   `Probabilistic` retains a parent with no child;
+    /// * the product toggles — ticking `Probabilistic` inserts a parent with no
+    ///   child;
+    /// * [`deserialize_state`](Self::deserialize_state) — a session persisted
+    ///   before Day 3 had a significant-severe product at all restores a parent
+    ///   with no child, and without this would never fetch `_cigprob` again.
+    ///
+    /// The first two both run through
+    /// [`refile_after_selection_change`](Self::refile_after_selection_change),
+    /// which is documented as being called from every path that moves
+    /// `selected_day` or `enabled_products`, so calling it there covers both.
+    /// `set_enabled` cannot break the invariant — it either clears everything
+    /// or inserts the day's first product, which is always a selectable one —
+    /// but it runs this too rather than rely on that staying true.
+    fn sync_implied_products(&mut self) {
+        let published = self.selected_day.products();
+        self.enabled_products
+            .retain(|p| p.is_selectable() || published.contains(p));
+        for &product in published {
+            let Some(parent) = product.implied_by() else {
+                continue;
+            };
+            if self.enabled_products.contains(&parent) {
+                self.enabled_products.insert(product);
+            } else {
+                self.enabled_products.remove(&product);
+            }
+        }
+    }
+
     /// Drop what is no longer asked for, and take the layer back off the ledger
     /// if nothing that is left is failing.
     ///
@@ -450,6 +526,7 @@ impl SpcOutlookHandler {
     /// Defers entirely while a round is in flight: that round files its own
     /// verdict when its last task lands, from the scope as it stands then.
     fn refile_after_selection_change(&mut self) {
+        self.sync_implied_products();
         let day = self.selected_day;
         let enabled = self.enabled_products.clone();
         self.per_product_error
@@ -516,6 +593,7 @@ impl OverlayHandler for SpcOutlookHandler {
                 && let Some(&first) = self.selected_day.products().first()
             {
                 self.enabled_products.insert(first);
+                self.sync_implied_products();
                 self.config_generation = self.config_generation.wrapping_add(1);
             }
         } else if !self.enabled_products.is_empty() {
@@ -531,11 +609,15 @@ impl OverlayHandler for SpcOutlookHandler {
         if !self.is_enabled() {
             return None;
         }
+        // Named the way the toggles are named: an implied product is not
+        // something the user chose, so listing it would describe a selection
+        // that is not on offer. Days 1-2 name no significant-severe product
+        // here either, for the same reason.
         let products: Vec<String> = self
             .selected_day
             .products()
             .iter()
-            .filter(|p| self.enabled_products.contains(p))
+            .filter(|p| p.is_selectable() && self.enabled_products.contains(p))
             .map(|p| p.to_string())
             .collect();
         Some(format!("{} - {}", self.selected_day, products.join(", ")))
@@ -707,13 +789,7 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let day = self.selected_day;
-        let mut features = Vec::new();
-        for &product in &self.enabled_products {
-            if let Some(outlook) = self.state.data.get(&(day, product)) {
-                features.extend(outlook.features.iter().cloned());
-            }
-        }
+        let features = self.features_in_paint_order();
         if features.is_empty() {
             return None;
         }
@@ -745,7 +821,16 @@ impl OverlayHandler for SpcOutlookHandler {
             return Vec::new();
         }
         let day = self.selected_day;
-        let products: Vec<OutlookProduct> = self.enabled_products.iter().copied().collect();
+        // Publication order, not the `HashSet`'s: `sync_implied_products` keeps
+        // `enabled_products` a subset of `day.products()`, so this builds the
+        // same number of tasks `set_fetching` counted while giving the log line
+        // and the task order the same shape on every run.
+        let products: Vec<OutlookProduct> = day
+            .products()
+            .iter()
+            .copied()
+            .filter(|p| self.enabled_products.contains(p))
+            .collect();
         log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
         // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes every one of these fail in the browser. See `spc::fetch`.
@@ -805,14 +890,25 @@ impl OverlayHandler for SpcOutlookHandler {
             .collect();
         items.push(ControlItem::ButtonRow { buttons });
 
-        // Only the products the selected day actually publishes.
-        for &product in self.selected_day.products() {
+        // Only the products the selected day actually publishes, and only the
+        // ones the user picks directly. Day 3's `ConditionalIntensity` is
+        // fetched and accounted for like any other product but has no toggle:
+        // it follows `Probabilistic`, exactly as the same features do on Days
+        // 1-2 where they ride inside the hazard products. See
+        // [`OutlookProduct::implied_by`].
+        for &product in self
+            .selected_day
+            .products()
+            .iter()
+            .filter(|p| p.is_selectable())
+        {
             let id: &'static str = match product {
                 OutlookProduct::Categorical => "cat",
                 OutlookProduct::Tornado => "tor",
                 OutlookProduct::Wind => "wind",
                 OutlookProduct::Hail => "hail",
                 OutlookProduct::Probabilistic => "prob",
+                OutlookProduct::ConditionalIntensity => continue,
             };
             items.push(ControlItem::Toggle {
                 id,
@@ -937,6 +1033,11 @@ impl OverlayHandler for SpcOutlookHandler {
         {
             self.enabled_products = products;
         }
+        // A session persisted before Day 3 had a significant-severe product
+        // restores `Probabilistic` with no `ConditionalIntensity` beside it.
+        // Without this the layer would reopen looking exactly as it did and
+        // quietly never ask for `_cigprob` again.
+        self.sync_implied_products();
     }
 }
 
@@ -969,6 +1070,263 @@ mod tests {
             handler.enabled_products.iter().copied().collect::<Vec<_>>(),
             vec![OutlookProduct::Probabilistic],
             "day 5 publishes only the probabilistic product"
+        );
+    }
+
+    /// A handler on Day 3 with the probabilistic product ticked, through the
+    /// real control path so the implied product is filled in the way the app
+    /// fills it.
+    fn day3_probabilistic() -> SpcOutlookHandler {
+        let mut h = SpcOutlookHandler::new();
+        h.selected_day = OutlookDay::Day3;
+        toggle(&mut h, "prob", true);
+        h
+    }
+
+    fn day3_outlook(product: OutlookProduct) -> SpcOutlook {
+        SpcOutlook {
+            day: OutlookDay::Day3,
+            product,
+            valid: None,
+            expire: None,
+            features: Vec::new(),
+        }
+    }
+
+    fn land_day3(
+        handler: &mut SpcOutlookHandler,
+        product: OutlookProduct,
+        result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
+    ) {
+        handler.apply_fetch_result(Box::new(SpcOutlookFetchResult {
+            day: OutlookDay::Day3,
+            product,
+            result,
+        }));
+    }
+
+    /// Day 3's significant-severe area is a separate endpoint, and until this
+    /// was fixed it was never requested at all: `outlook_url` built only
+    /// `_cat` and `_prob`, and neither carries it.
+    ///
+    /// It must be `_cigprob` and not `_sigprob`. `_sigprob` still answers 200
+    /// with a real `SIGN` polygon but has not been re-issued since 2026-03-03,
+    /// so asking for it would paint a months-old hazard area as current.
+    #[test]
+    fn day_3_asks_for_the_conditional_intensity_endpoint_not_the_frozen_one() {
+        let sources = rustdar_radar::sources::DataSources::default();
+        let url = crate::spc::outlook::outlook_url(
+            &sources,
+            OutlookDay::Day3,
+            OutlookProduct::ConditionalIntensity,
+        );
+        assert!(
+            url.ends_with("/day3otlk_cigprob.lyr.geojson"),
+            "day 3's significant area comes from _cigprob, got {url}"
+        );
+        assert!(
+            !url.contains("sigprob"),
+            "_sigprob is frozen at 2026-03-03 and must never be requested: {url}"
+        );
+    }
+
+    /// The product is fetched and accounted for, but the user never sees a
+    /// toggle for it — Days 1-2 carry the same features inline with no toggle
+    /// of their own, and an extra switch on Day 3 alone would be an asymmetry
+    /// in the one place the user looks.
+    #[test]
+    fn the_significant_area_is_fetched_but_has_no_toggle_of_its_own() {
+        let handler = day3_probabilistic();
+        assert!(
+            handler
+                .enabled_products
+                .contains(&OutlookProduct::ConditionalIntensity),
+            "ticking Probabilistic must bring the significant area into scope"
+        );
+
+        let ids: Vec<&str> = handler
+            .controls(&PaneControlContext {
+                pane_idx: 0,
+                pane_state: None,
+            })
+            .into_iter()
+            .filter_map(|item| match item {
+                ControlItem::Toggle { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["cat", "prob"],
+            "day 3 offers exactly the two products the user picks"
+        );
+
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("Day 3 - Probabilistic"),
+            "the status line names the selection, not the implied product"
+        );
+    }
+
+    /// One product, one URL, one task, one ledger entry. Merging the two
+    /// requests behind the `Probabilistic` key would have put two fetches
+    /// behind one error slot, which is how a partial round comes to read as a
+    /// complete one.
+    #[test]
+    fn the_significant_area_is_its_own_task_and_its_own_ledger_entry() {
+        let mut handler = day3_probabilistic();
+        let ctx = FetchConfig {
+            client: Default::default(),
+            zone_cache_dir: None,
+            sources: rustdar_radar::sources::DataSources::default(),
+            viewport: None,
+        };
+        assert_eq!(
+            handler.create_fetch_tasks(&ctx).len(),
+            2,
+            "Probabilistic and its significant area are two tasks"
+        );
+
+        // The significant area fails; the probabilistic field succeeds.
+        handler.set_fetching(true);
+        land_day3(
+            &mut handler,
+            OutlookProduct::Probabilistic,
+            Ok(day3_outlook(OutlookProduct::Probabilistic)),
+        );
+        land_day3(
+            &mut handler,
+            OutlookProduct::ConditionalIntensity,
+            Err(transient()),
+        );
+
+        assert!(
+            handler
+                .per_product_error
+                .contains_key(&(OutlookDay::Day3, OutlookProduct::ConditionalIntensity)),
+            "the failure is filed against the product that failed"
+        );
+        assert!(
+            handler.state.retry.is_incomplete(),
+            "a round that lost the significant area must not read as complete"
+        );
+    }
+
+    /// The invariant has three ways in, and the persisted one is the quiet
+    /// one: a session saved before this product existed restores
+    /// `Probabilistic` alone and would otherwise never ask for `_cigprob`
+    /// again, looking exactly as it did when it closed.
+    #[test]
+    fn every_path_that_enables_the_parent_brings_the_significant_area() {
+        // 1. the product toggle
+        let handler = day3_probabilistic();
+        assert!(
+            handler
+                .enabled_products
+                .contains(&OutlookProduct::ConditionalIntensity),
+            "toggle path"
+        );
+
+        // 2. the day buttons, arriving from a day whose only product is
+        //    Probabilistic
+        let mut from_day5 = SpcOutlookHandler::new();
+        from_day5.selected_day = OutlookDay::Day5;
+        from_day5.set_enabled(true);
+        assert_eq!(
+            from_day5
+                .enabled_products
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![OutlookProduct::Probabilistic],
+            "premise: day 5 publishes only the probabilistic product"
+        );
+        toggle(&mut from_day5, "day3", true);
+        assert!(
+            from_day5
+                .enabled_products
+                .contains(&OutlookProduct::ConditionalIntensity),
+            "day-button path"
+        );
+
+        // 3. a session persisted before this product existed
+        let mut reopened = SpcOutlookHandler::new();
+        reopened.deserialize_state(serde_json::json!({
+            "selected_day": "Day3",
+            "enabled_products": ["Probabilistic"],
+        }));
+        assert!(
+            reopened
+                .enabled_products
+                .contains(&OutlookProduct::ConditionalIntensity),
+            "reopen path: a pre-change session must start asking for _cigprob"
+        );
+    }
+
+    /// The mirror holds in both directions, and the implied product never
+    /// survives onto a day that does not publish it.
+    #[test]
+    fn the_significant_area_leaves_when_its_parent_or_its_day_does() {
+        let mut handler = day3_probabilistic();
+        toggle(&mut handler, "prob", false);
+        assert!(
+            !handler
+                .enabled_products
+                .contains(&OutlookProduct::ConditionalIntensity),
+            "unticking Probabilistic drops the significant area with it"
+        );
+
+        let mut handler = day3_probabilistic();
+        toggle(&mut handler, "day1", true);
+        assert!(
+            !handler
+                .enabled_products
+                .contains(&OutlookProduct::ConditionalIntensity),
+            "day 1 carries its CIG features inline and publishes no such product"
+        );
+    }
+
+    /// `features` is the paint order, and `HashSet` iteration is seeded per
+    /// process — so walking the set directly repainted the same selection in a
+    /// different order after a restart. The significant-severe hatching is the
+    /// overlay tier and must land on top, which the day's publication order
+    /// gives for free.
+    #[test]
+    fn the_outlooks_paint_in_publication_order_not_hash_order() {
+        let mut handler = day3_probabilistic();
+        toggle(&mut handler, "cat", true);
+
+        let feature = |label: &str| crate::types::OverlayFeature {
+            polygons: Vec::new(),
+            fill_rgba: [0, 0, 0, 0],
+            stroke_rgba: [0, 0, 0, 0],
+            label: label.to_string(),
+            label2: String::new(),
+            hatch: crate::types::HatchPattern::None,
+            geo_bounds: None,
+        };
+        for (product, label) in [
+            (OutlookProduct::Categorical, "cat"),
+            (OutlookProduct::Probabilistic, "prob"),
+            (OutlookProduct::ConditionalIntensity, "cig"),
+        ] {
+            let mut o = day3_outlook(product);
+            o.features.push(feature(label));
+            handler.state.data.insert((OutlookDay::Day3, product), o);
+        }
+
+        // A hash-order walk is stable within one process, so a single run of
+        // this could pass by luck; what it pins is the *rule* — the order is
+        // read off `OutlookDay::Day3.products()` and cannot depend on the set.
+        let order: Vec<String> = handler
+            .features_in_paint_order()
+            .into_iter()
+            .map(|f| f.label)
+            .collect();
+        assert_eq!(
+            order,
+            vec!["cat", "prob", "cig"],
+            "publication order, with the significant-severe overlay last"
         );
     }
 

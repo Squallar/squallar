@@ -50,7 +50,19 @@ impl OutlookDay {
                 OutlookProduct::Wind,
                 OutlookProduct::Hail,
             ],
-            OutlookDay::Day3 => &[OutlookProduct::Categorical, OutlookProduct::Probabilistic],
+            // Day 3's significant-severe area is a *separate endpoint*, unlike
+            // Days 1-2 where the CIG features ride inline in the hazard
+            // products. It is listed here — in the fetch and ledger scope —
+            // rather than folded into `Probabilistic`, so that it keeps its own
+            // fetch task, its own `per_product_error` slot and its own place in
+            // the `outstanding` count. It is hidden from the product toggles by
+            // [`OutlookProduct::implied_by`]; see there for why the two facts
+            // are not in tension.
+            OutlookDay::Day3 => &[
+                OutlookProduct::Categorical,
+                OutlookProduct::Probabilistic,
+                OutlookProduct::ConditionalIntensity,
+            ],
             _ => &[OutlookProduct::Probabilistic],
         }
     }
@@ -92,6 +104,58 @@ pub enum OutlookProduct {
     /// Combined probabilistic product. Day 3 and days 4-8 only; days 1-2 carry
     /// the four hazard-specific products instead.
     Probabilistic,
+    /// Day 3's significant-severe area — the Conditional Intensity Groups,
+    /// `day3otlk_cigprob`. **Day 3 only**, and never user-selectable on its own:
+    /// see [`OutlookProduct::implied_by`].
+    ///
+    /// Days 1-2 need no equivalent. There the CIG features are carried inline
+    /// in the hazard products, confirmed over 1023 archived `.lyr.geojson`
+    /// products and in SPC's own reference bundle. Day 3 has always served its
+    /// significant area separately — a hole that predates SCN 26-11, not a
+    /// regression the notice caused.
+    ///
+    /// # Why not `day3otlk_sigprob`
+    ///
+    /// The obvious sibling, `day3otlk_sigprob`, still answers `200` with a real
+    /// `SIGN` MultiPolygon — and has not been re-issued since **2026-03-03
+    /// 08:30Z**, the day after SCN 26-11 took effect, while `_cat`, `_prob` and
+    /// `_cigprob` all re-issue with the outlook. Fetching it would paint a
+    /// months-old hazard area, with its own stale `VALID`/`EXPIRE` to make it
+    /// read as current. It is a dead file; this is its live successor. Because
+    /// only one of the two is still written, `SIGN` and `CIG*` cannot both
+    /// arrive for the same live Day 3.
+    ConditionalIntensity,
+}
+
+impl OutlookProduct {
+    /// The product whose toggle also governs this one, if this product is not
+    /// independently selectable.
+    ///
+    /// [`ConditionalIntensity`](Self::ConditionalIntensity) is the significant
+    /// -severe overlay on Day 3's probabilistic field, and on Days 1-2 the same
+    /// features arrive inside the hazard product with no toggle of their own.
+    /// Giving Day 3 a toggle the other days do not have would be an asymmetry
+    /// in the one place the user looks; so the fetch layer keeps it as a first
+    /// class product — its own task, its own error slot, its own share of
+    /// `outstanding` — while the control list hides it and its selection
+    /// follows its parent's.
+    ///
+    /// Keeping it a separate *key* is the point. Putting two requests behind
+    /// one product key is how a partial round comes to read as a complete one,
+    /// which this handler has been bitten by twice; see
+    /// `SpcOutlookHandler::round_verdict`.
+    pub fn implied_by(self) -> Option<OutlookProduct> {
+        match self {
+            OutlookProduct::ConditionalIntensity => Some(OutlookProduct::Probabilistic),
+            _ => None,
+        }
+    }
+
+    /// Whether the user picks this product directly. The inverse of
+    /// [`implied_by`](Self::implied_by) being set.
+    pub fn is_selectable(self) -> bool {
+        self.implied_by().is_none()
+    }
 }
 
 impl std::fmt::Display for OutlookProduct {
@@ -102,6 +166,7 @@ impl std::fmt::Display for OutlookProduct {
             OutlookProduct::Wind => write!(f, "Wind"),
             OutlookProduct::Hail => write!(f, "Hail"),
             OutlookProduct::Probabilistic => write!(f, "Probabilistic"),
+            OutlookProduct::ConditionalIntensity => write!(f, "Conditional Intensity"),
         }
     }
 }
@@ -166,6 +231,11 @@ pub fn outlook_url(
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Tornado) => "_torn",
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Wind) => "_wind",
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Hail) => "_hail",
+        // Day 3's significant-severe area, which `_prob` does not carry. Only
+        // `OutlookDay::Day3` lists this product, so no other day reaches here.
+        // `_sigprob` is the dead sibling — see
+        // [`OutlookProduct::ConditionalIntensity`].
+        (_, OutlookProduct::ConditionalIntensity) => "_cigprob",
         // Day 3 serves every hazard from the one combined `_prob` endpoint.
         (_, OutlookProduct::Tornado)
         | (_, OutlookProduct::Wind)
