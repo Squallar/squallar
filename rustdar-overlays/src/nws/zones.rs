@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,12 +177,22 @@ fn needs_zones(alert: &NwsAlert) -> bool {
 ///
 /// First-seen order is part of the contract: it is the order the fetches are
 /// issued in, so a round that is interrupted has fetched a prefix that depends
-/// on nothing but the alert feed.
+/// on nothing but the alert feed. That is why the answer stays a `Vec` and the
+/// set is only the membership test beside it — a bare `HashSet` would return
+/// the same URLs in an order that changes every run.
+///
+/// The set is not an optimisation detail, it is the difference between one
+/// pass and `n²/2` string compares. A measured live round — 361 alerts, 223 of
+/// them geometryless, 1,904 references, 1,690 distinct — spent **22.5 ms in
+/// Firefox and 13.7 ms in Chrome** scanning the list it was building, on the
+/// browser's main thread, once per alert poll. That is a dropped frame at
+/// 60 Hz and three at 144 Hz, in the middle of a pan.
 pub fn distinct_zone_urls(alerts: &[NwsAlert]) -> Vec<String> {
     let mut needed_urls: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for alert in alerts.iter().filter(|alert| needs_zones(alert)) {
         for url in &alert.affected_zones {
-            if !needed_urls.contains(url) {
+            if seen.insert(url.as_str()) {
                 needed_urls.push(url.clone());
             }
         }
@@ -860,6 +870,95 @@ mod tests {
 
         assert_eq!(resolution.failures, vec![(ZoneFailure::NoBoundary, 1)]);
         assert_eq!(resolution.alerts_missing, 1);
+    }
+
+    /// The contract [`distinct_zone_urls`] is allowed to be fast within: each
+    /// URL once, in the order the alerts first name it, and an alert that
+    /// brought its own geometry contributes nothing.
+    #[test]
+    fn the_zone_list_is_first_seen_order_with_no_repeats() {
+        let mut carries_geometry = zone_alert("has-own", vec!["z/never".to_string()]);
+        carries_geometry.features.push(OverlayFeature::new(
+            Vec::new(),
+            [0; 4],
+            [0; 4],
+            String::new(),
+            String::new(),
+            HatchPattern::None,
+        ));
+        let alerts = vec![
+            zone_alert("a", vec!["z/c".to_string(), "z/a".to_string()]),
+            carries_geometry,
+            zone_alert("b", vec!["z/a".to_string(), "z/b".to_string()]),
+            zone_alert("c", vec!["z/b".to_string(), "z/c".to_string()]),
+        ];
+
+        assert_eq!(distinct_zone_urls(&alerts), vec!["z/c", "z/a", "z/b"]);
+    }
+
+    /// A round costs one pass over its zone references, not one scan of
+    /// everything already collected per reference.
+    ///
+    /// Stated as a shape rather than a millisecond budget, because the budget
+    /// would be a statement about this machine: quadrupling the round
+    /// quadruples the work of one pass and multiplies the work of a rescan by
+    /// sixteen, and no machine changes which of those it is. The threshold sits
+    /// halfway between the two in the log, so it takes a 2x mismeasurement in
+    /// either direction to call this wrong.
+    ///
+    /// Reverting the set in [`distinct_zone_urls`] to `needed_urls.contains`
+    /// fails it at roughly 15x. The live round this was written for -- 1,904
+    /// references, 1,690 distinct -- cost 22.5 ms on Firefox's main thread that
+    /// way, per alert poll.
+    #[test]
+    fn the_zone_list_costs_one_pass_not_one_scan_per_url() {
+        /// Zones per alert, as the feed groups them.
+        const PER_ALERT: usize = 8;
+        /// Distinct URLs at the small size; the large size is 4x this.
+        const SMALL: usize = 2_000;
+
+        /// Full-length zone URLs, because the compare being counted here is a
+        /// `String` compare and short strings would flatter it.
+        fn round(distinct: usize) -> Vec<NwsAlert> {
+            (0..distinct.div_ceil(PER_ALERT))
+                .map(|alert| {
+                    zone_alert(
+                        &format!("a{alert}"),
+                        (0..PER_ALERT)
+                            .map(|zone| {
+                                let n = alert * PER_ALERT + zone;
+                                format!("https://api.weather.gov/zones/county/ZZC{n:06}")
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+
+        /// Fastest of three: interference only ever adds time, so the minimum
+        /// is the reading least contaminated by the rest of the machine.
+        fn fastest(alerts: &[NwsAlert]) -> std::time::Duration {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let urls = distinct_zone_urls(alerts);
+                    let taken = start.elapsed();
+                    assert_eq!(urls.len(), alerts.len() * PER_ALERT);
+                    taken
+                })
+                .min()
+                .expect("three runs")
+        }
+
+        let small = fastest(&round(SMALL));
+        let large = fastest(&round(SMALL * 4));
+
+        let growth = large.as_secs_f64() / small.as_secs_f64();
+        assert!(
+            growth < 8.0,
+            "four times the round took {growth:.1}x the time ({small:?} -> {large:?}). \
+             One pass grows 4x and a rescan-per-URL grows 16x, so this is the rescan.",
+        );
     }
 
     /// Nothing to do is not a fault: a round of alerts that all carry geometry
