@@ -46,8 +46,8 @@ rustdar-egui/src/volume_iso.rs	75	60
 rustdar-egui/src/volume_view.rs	266	259
 rustdar-frontend/src/app.rs	1230	883
 rustdar-frontend/src/app_chunks.rs	230	136
-rustdar-frontend/src/app_fetch.rs	1136	637
-rustdar-frontend/src/app_render.rs	2141	1496
+rustdar-frontend/src/app_fetch.rs	1154	715
+rustdar-frontend/src/app_render.rs	2142	1497
 rustdar-frontend/src/app_state.rs	194	108
 rustdar-frontend/src/budget.rs	237	199
 rustdar-frontend/src/channels.rs	61	58
@@ -63,9 +63,9 @@ rustdar-frontend/src/location_permission.rs	159	150
 rustdar-frontend/src/loop_downloads.rs	685	678
 rustdar-frontend/src/loop_pool.rs	174	173
 rustdar-frontend/src/mobile_cfg.rs	19	19
-rustdar-frontend/src/offload.rs	633	563
-rustdar-frontend/src/offload/pool.rs	87	83
-rustdar-frontend/src/platform.rs	288	231
+rustdar-frontend/src/offload.rs	742	671
+rustdar-frontend/src/offload/pool.rs	105	95
+rustdar-frontend/src/platform.rs	288	234
 rustdar-frontend/src/platform_double.rs	238	226
 rustdar-frontend/src/render_dispatch.rs	804	721
 rustdar-frontend/src/site_catalogue.rs	36	29
@@ -116,7 +116,7 @@ rustdar-overlays/src/render/handlers/sites.rs	63	36
 rustdar-overlays/src/render/hatch.rs	272	262
 rustdar-overlays/src/render/layers.rs	61	19
 rustdar-overlays/src/render/overlay_state.rs	879	751
-rustdar-overlays/src/render/rasterize.rs	855	742
+rustdar-overlays/src/render/rasterize.rs	858	747
 rustdar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
 rustdar-overlays/src/render/station_model.rs	646	397
 rustdar-overlays/src/spc/colors.rs	44	42
