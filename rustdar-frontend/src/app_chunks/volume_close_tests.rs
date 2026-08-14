@@ -462,6 +462,48 @@ fn the_completed_branch_refetches_level_three_and_owns_the_loop_append() {
     );
 }
 
+/// The round the coverage pattern arrives on invalidates the site's panes,
+/// even though it seals nothing.
+///
+/// Until the start chunk lands the live snapshot carries
+/// `placeholder_coverage_pattern`, whose cut table is empty, and
+/// `current::resolve` refuses a volume that cannot key its own sweeps — so
+/// every plan pane on the site drew without the live volume in it. The start
+/// chunk carries no radials, so the round it arrives on seals nothing and the
+/// early return above would take it, leaving those images in `render_cache`
+/// with nothing to drop them: `reset_panes_for_tilts` matches this round's
+/// angles, and there are none. Per-frame consumers re-resolve on their own;
+/// the drawn picture does not.
+///
+/// Probed against the source for the same reason as the test above: reaching
+/// this branch for real needs an `App`, a `Gui` and a bucket.
+#[test]
+fn a_learned_coverage_pattern_resets_the_sites_panes() {
+    let source = include_str!("../app_chunks.rs");
+    let start = source
+        .find("fn apply_chunk_outcome(")
+        .expect("apply_chunk_outcome is gone");
+    let body = &source[start..];
+    let guard = body
+        .find("if outcome.sealed_elevations.is_empty() {")
+        .expect("the seal-less early return is gone");
+    let ret = guard
+        + body[guard..]
+            .find("return;")
+            .expect("the early return no longer returns");
+    assert!(
+        body[guard..ret].contains("if outcome.learned_coverage_pattern {"),
+        "a round that only learned the coverage pattern takes the seal-less \
+             early return, so the panes drawn while the pattern was the \
+             placeholder are never invalidated"
+    );
+    assert!(
+        body[guard..ret].contains("self.render.reset_panes_for_site("),
+        "the learned-pattern arm does not drop the site's cached images, which \
+             is the only thing that makes the corrected volume reach the screen"
+    );
+}
+
 /// A volume that ended *without* completing is not applied as one.
 ///
 /// The gate is `progress.volume_complete`, not merely `closed.is_some()`. A
