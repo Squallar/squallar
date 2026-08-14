@@ -414,6 +414,33 @@ pub(crate) fn fnv1a64(grid: &VolumetricGrid) -> u64 {
 /// The two RPG twins are **not** re-pinned, and that is the load-bearing half:
 /// `eet` and `vil` stayed on [`RangeBinning::Slant`], and their suites are
 /// byte-unchanged.
+///
+/// # Re-pinned again when the ground range became the arc
+///
+/// [`crate::beam::ground_range_km`] and its inverse stopped being the
+/// tangent-plane `r·cos e` and became the spherical arc, so
+/// [`crate::beam::height_at_ground_km`] — which this grid's heights come
+/// through — is now `height_km` composed with the *arc's* inverse. The height
+/// model itself did not change; what changed is which slant range a cell's
+/// ground range names.
+///
+/// * digest `0x5385ddeb1814353b` → `0x7718c8e4c1f550ef`;
+/// * **defined cells 4689 → 4689.** Unchanged, and that is the load-bearing
+///   figure: no cell gained or lost coverage, so the grid's shape is identical
+///   and only the heights inside it moved. A change that had disturbed the
+///   binning would show here first.
+/// * every spot height rose, all four by ~0.004 kft (1.2 m): 10.309390 →
+///   10.313282 kft, 10.572002 → 10.576097, 12.872785 → 12.879181, 7.560002 →
+///   7.562729. Rising is the direction the change predicts and it is the same
+///   direction as the re-pin above, for the same reason carried one step
+///   further — reaching a given distance *over the ground* takes a longer beam
+///   when that distance is measured as an arc than when it is measured on the
+///   tangent plane, and a longer beam stands higher. The interpolated cell
+///   (150, 80) rises with the rest this time rather than falling, because both
+///   tilts of its bracketing pair moved the same way by nearly the same amount.
+///
+/// The twins are again untouched: `eet` and `vil` are on
+/// [`RangeBinning::Slant`], which never sees a ground range.
 #[test]
 fn golden_echo_tops_grid_is_pinned() {
     let grid = compute_echo_tops(&golden_scan());
@@ -422,14 +449,17 @@ fn golden_echo_tops_grid_is_pinned() {
 
     let defined: usize = grid.values.iter().flatten().filter(|v| !v.is_nan()).count();
     assert_eq!(defined, 4689, "defined-cell count moved");
-    assert_eq!(fnv1a64(&grid), 0x5385ddeb1814353b, "grid digest moved");
+    assert_eq!(fnv1a64(&grid), 0x7718c8e4c1f550ef, "grid digest moved");
 
     // Spot pins, exact to the bit, each hand-checked against the beam
     // height formula. Chosen to cover every code path:
     //
     // * (45, 40): core A crosses at the top tilt, so its top is *clamped*
-    //   to that tilt's centre height over the cell — 40.5·tan 4.3° +
-    //   40.5²/(2·8494.7·cos² 4.3°) = 3.143 km = 10.309 kft.
+    //   to that tilt's centre height over the cell. 40.5 km of ground arc
+    //   at 4.3° is 40.62920 km of slant range (`slant_range_for_ground_km`),
+    //   and 40.62920·sin 4.3° + 40.62920²/(2·8494.667) = 3.14349 km =
+    //   10.31328 kft. Under the tangent plane the same cell was 40.50378 km
+    //   of slant range and 3.14230 km = 10.30939 kft.
     // * (45, 41): one cell further out, the same clamp moves with range.
     // * (150, 80): core B is topmost at 2.4° (18.9 dBZ at 3.75 km) and
     //   interpolates toward 3.4° (14.0 dBZ at 5.16 km) — ~3.95 km.
@@ -440,10 +470,10 @@ fn golden_echo_tops_grid_is_pinned() {
     //   reason. A first-of-volume dedup defines this cell and empties the
     //   one above, so these two pin newest-wins, not merely "some sweep".
     let spots = [
-        (45usize, 40usize, 0x4124f343u32), // core A: 10.30939 kft
-        (45, 41, 0x412926ec),              // core A, next cell: 10.572002
-        (150, 80, 0x414df6ed),             // core B interpolated: 12.872785
-        (308, 120, 0x40f1eb89),            // core C via SAILS repeat: 7.560002
+        (45usize, 40usize, 0x41250334u32), // core A: 10.313282 kft
+        (45, 41, 0x412937b2),              // core A, next cell: 10.576097
+        (150, 80, 0x414e1120),             // core B interpolated: 12.879181
+        (308, 120, 0x40f201e0),            // core C via SAILS repeat: 7.562729
     ];
     for (az, r, bits) in spots {
         let got = grid.values[az][r];
@@ -539,30 +569,41 @@ fn beam_heights_match_the_hand_computed_four_thirds_model() {
 /// which is a **different point in the air** from the slant arm's — and the
 /// gap grows with the tilt, which is exactly why the two cannot be mixed.
 ///
-/// Cell 100 (centre 100.5 km of ground) on a 0.5° tilt, `s·tan e +
-/// s²/(2·Re′·cos²e)`:
-///   centre = 100.5·tan 0.500° + 100.5²/(2·8494.667·cos² 0.500°)
-///          = 1.4716008654 km
-///   bottom = 100.5·tan 0.025° + 100.5²/(2·8494.667·cos² 0.025°)
-///          = 0.6383568893 km
-///   top    = 100.5·tan 0.975° + 100.5²/(2·8494.667·cos² 0.975°)
-///          = 2.3050471627 km
+/// Cell 100 (centre 100.5 km of ground) on a 0.5° tilt. The arm is
+/// `height_km(slant_range_for_ground_km(s, e), e)`, and standing over 100.5 km
+/// of *arc* takes 100.5189 km of beam where the tangent plane asked for
+/// 100.5038:
+///   centre (0.500°) = 1.4719106511 km
+///   bottom (0.025°) = 0.6384207809 km
+///   top    (0.975°) = 2.3057665207 km
 ///
-/// At 0.5° the two arms are 7.9 cm apart at 100 km — nothing. At 19.5° over
-/// 69.5 km of ground they are **1.447 km** apart, because the slant arm is
-/// answering about a beam 69.5 km long, which stands over only 65.5 km of
+/// # Re-pinned when the ground range became the arc
+///
+/// The three were 1.4716008654, 0.6383568893 and 2.3050471627 km, the folded
+/// `s·tan e + s²/(2·Re′·cos²e)` this stopped being. All three rose — by 0.31 m,
+/// 0.06 m and 0.72 m — and rising is the direction the change predicts, for the
+/// same reason the move to [`RangeBinning::Ground`] raised them before: the arc
+/// is shorter than the tangent-plane projection of the same beam, so reaching a
+/// *given* ground distance takes a longer beam than it used to, and a longer
+/// beam stands higher.
+///
+/// At 0.5° the two arms are 38.8 cm apart at 100 km, where they were 7.9 cm —
+/// still nothing, and the tolerance below moves 1e-4 → 1e-3 km to keep saying
+/// so with a figure rather than by being wide. At 19.5° over 69.5 km of ground
+/// they are **1.521 km** apart, where they were 1.447, because the slant arm is
+/// answering about a beam 69.5 km long, which stands over only 65.3 km of
 /// ground. A hail layer or an echo top taking the wrong one would be
 /// integrating a column that is not the column it was asked about.
 #[test]
 fn the_ground_arm_answers_over_the_ground_and_the_two_diverge_with_tilt() {
     let g = BeamHeights::at_elevation(0.5, RangeBinning::Ground);
-    assert!((g.centre_km[100] - 1.4716008653654709).abs() < 1e-9);
-    assert!((g.bottom_km[100] - 0.6383568893468486).abs() < 1e-9);
-    assert!((g.top_km[100] - 2.3050471627204763).abs() < 1e-9);
+    assert!((g.centre_km[100] - 1.471910651079749).abs() < 1e-9);
+    assert!((g.bottom_km[100] - 0.6384207809488871).abs() < 1e-9);
+    assert!((g.top_km[100] - 2.3057665206657405).abs() < 1e-9);
 
     let slant = BeamHeights::at_elevation(0.5, RangeBinning::Slant);
     assert!(
-        (g.centre_km[100] - slant.centre_km[100]).abs() < 1e-4,
+        (g.centre_km[100] - slant.centre_km[100]).abs() < 1e-3,
         "at 0.5° the two arms must be within a metre of each other",
     );
 
@@ -570,8 +611,8 @@ fn the_ground_arm_answers_over_the_ground_and_the_two_diverge_with_tilt() {
     let steep_s = BeamHeights::at_elevation(19.5, RangeBinning::Slant);
     let gap = steep_g.centre_km[69] - steep_s.centre_km[69];
     assert!(
-        (gap - 1.447316631030965).abs() < 1e-9,
-        "at 19.5° over 69.5 km the arms must stand 1.447 km apart; they are \
+        (gap - 1.5212578179714455).abs() < 1e-9,
+        "at 19.5° over 69.5 km the arms must stand 1.521 km apart; they are \
          {gap:.6} km",
     );
     assert_eq!(g.centre_km.len(), RANGE_BINS);

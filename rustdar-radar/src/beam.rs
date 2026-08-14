@@ -46,10 +46,17 @@
 //! h = √(r² + Rₑ² + 2·r·Rₑ·sin e) − Rₑ
 //! ```
 //!
-//! The quadratic is kept for two reasons: it is what the shipped products
-//! already compute (so lifting it here is a refactor and not a change of
-//! answer), and it has the closed-form inverse [`slant_range_for_height_km`],
-//! which a cross-section needs once per output row.
+//! The quadratic is kept for **one** reason: it is what the shipped products
+//! already compute, so lifting it here is a refactor and not a change of
+//! answer, which five bit-exact digest assertions hold it to.
+//!
+//! It is *not* kept for being the invertible one, and a previous version of
+//! this note said it was. The spherical form inverts in closed form too —
+//! `r = √((Rₑ + h)² − Rₑ²·cos²e) − Rₑ·sin e`, one root and two trig calls,
+//! the same shape of work as [`slant_range_for_height_km`]. "A cross-section
+//! needs a closed form once per output row" is true and argues for nothing,
+//! because both forms have one. Anyone weighing the two should weigh the pins
+//! and the 23.49 m bound below, which are the real terms.
 //!
 //! **The residual, measured.** ~1.54 m at 230 km / 0.5°, ~32.84 m at
 //! 70 km / 19.5° — both far under one 250 m gate.
@@ -119,33 +126,72 @@
 //! including keeping [`RE_EFF_KM`] below out of its reach, since that is
 //! refraction and not geodesy.
 //!
-//! [`ground_range_km`] is the tangent-plane projection `r·cos e`, and not the
-//! spherical arc `Rₑ·asin(r·cos e/(Rₑ + h))` that `polar_to_geo` returns. Those
-//! differ by ~110 m at 230 km / 0.5° and ~182 m at 70 km / 19.5° — the same
-//! order as the beam-height residual, and in the same direction for every
-//! consumer, which is what makes it a consistency choice rather than an
-//! accuracy claim. It is *not* the same order as the equirectangular placement
-//! that used to sit downstream of it, which was a hundred times larger; that
-//! one is gone and this one is deliberate.
+//! [`ground_range_km`] is the spherical arc on that same effective sphere,
 //!
-//! Say what that costs against an outside implementation, because it will turn
-//! up in every one of them: Py-ART's `antenna_to_cartesian` and the `+proj=aeqd`
-//! regrids take the spherical arc, so a bin-for-bin comparison against Py-ART,
-//! wradlib or pyproj shows an offset of the order above at **every** gate,
-//! coherently, with no scatter. That offset is this paragraph's choice becoming
-//! visible, not a defect on either side, and it is not something to fit away —
-//! the family both belong to is standard, and picking one member of it was the
-//! decision. Nothing in this crate is verified against the other member.
+//! ```text
+//! s = Rₑ·asin(r·cos e/(Rₑ + h)),   h = √(r² + Rₑ² + 2·r·Rₑ·sin e) − Rₑ
+//! ```
 //!
-//! Every drawn product in this crate now shares that choice. The plan view's
-//! four per-tilt rasterizers hoist `cos e` of their sweep's median elevation
-//! and paint at the ground range, the sampler converts a ground range back to
-//! a slant one before reading a gate, and a section drawn from the sampler
-//! therefore registers against the map above it at any tilt. What is left
-//! between them is this paragraph's own subject — tangent plane against
-//! spherical arc, and the 6371-vs-6378 inconsistency [`crate::types::
-//! ImageBounds`] carries — which is a tenth of a pixel, not the 18 px that
-//! `cos e` was worth at 19.5°.
+//! which is the exact form and the one
+//! [`nexrad_model::geo::RadarCoordinateSystem::polar_to_geo`] computes, over a
+//! radius written `6_371_000.0 * 4.0 / 3.0` metres that is [`RE_EFF_KM`] to the
+//! bit. Note the `h` here is the *spherical* height and not [`height_km`]'s
+//! quadratic: that is what makes this and [`slant_range_for_ground_km`] an
+//! exactly invertible pair rather than merely a close one.
+//!
+//! It was the tangent-plane projection `r·cos e` until this commit — the
+//! small-angle limit of that arc, with the curvature term dropped. The tangent
+//! plane erred **outward**, placing every echo further from the radar than the
+//! ground it fell on. Measured at each tilt's own reach rather than at an
+//! arithmetic ceiling, in metres and in cells of the 4.4512 px/km plan view
+//! (224.66 m to a cell):
+//!
+//! | tilt | reach | outward error | cells |
+//! |---|---:|---:|---:|
+//! | 0.5°  | 460.125 km | 666 m  | 2.96 |
+//! | 1.8°  | 460.125 km | 1227 m | 5.46 |
+//! | 19.5° | 70 km      | 182 m  | 0.81 |
+//!
+//! It passed one whole cell at 304 km on the 0.5° cut and at 219 km on the
+//! 1.8°, so the outer third of one surveillance sweep and the outer half of the
+//! other were drawn a visible pixel or more from the ground they sat over.
+//!
+//! A previous version of this paragraph called that a consistency choice, on
+//! the grounds that it was "the same order as the beam-height residual" and ran
+//! one way for every consumer. Both halves were wrong. The first quoted 110 m
+//! at 230 km / 0.5°, which is arithmetic evaluated half way along a cut that
+//! reaches twice as far — at the reach it is six times that. The second holds
+//! only while every consumer shares the spelling, which they do not (below).
+//!
+//! Against outside implementations this now **agrees** rather than costing
+//! anything. Py-ART's `antenna_to_cartesian` computes this same arc over this
+//! same 4/3 sphere, and the `+proj=aeqd` regrids and wradlib take it too, so
+//! the coherent scatter-free per-gate offset a bin-for-bin comparison used to
+//! show is gone. What is left between us and Py-ART is that it reads its `s` off
+//! as planar azimuthal-equidistant coordinates where this crate walks it as a
+//! true arc on [`crate::types::EARTH_RADIUS_KM`] — the split described above,
+//! and the one `polar_to_geo` makes as well.
+//!
+//! # What still spells the tangent plane
+//!
+//! **This pair is not what the plan view paints with.** `render`'s
+//! `sweep_ground_factor` and [`crate::volumetric::RangeBinning`]'s
+//! `range_scale` each hoist `cos e` of their sweep's median elevation once and
+//! multiply it through the gate loop. That is not an oversight to sweep up in
+//! passing: a scalar can be hoisted out of a third of a million iterations and
+//! an arc cannot, because the arc is not linear in `r` and so does not survive
+//! being folded into the uniform gate spacing a raster's `first_gate_km` +
+//! `j·sample_km` walk assumes. Those two are the tangent plane's remaining
+//! spellings, and the table above is still the error in what a viewer sees.
+//!
+//! So [`ground_range_km`] has, as of this commit, **no caller outside tests**.
+//! It is the reference those two hoists are to be replaced by, and until they
+//! are, a section sampled through [`slant_range_for_ground_km`] sits up to that
+//! table's distance from the plan view drawn above it. Recording that here is
+//! the point: it used to be invisible because both sides were wrong together,
+//! which is the failure this module was created to end, and it is now a stated
+//! difference with a measured size. The 6371-vs-6378 inconsistency
+//! [`crate::types::ImageBounds`] used to carry is a tenth of a pixel beside it.
 
 use crate::types::EARTH_RADIUS_KM;
 
@@ -225,8 +271,10 @@ pub fn height_km(slant_range_km: f64, elev_deg: f64) -> f64 {
 ///
 /// `Rₑ·(√(sin²e + 2h/Rₑ) − sin e)`, the 4/3-model counterpart of
 /// `hca::ml_range_from_height`'s 1.21-model `Compute_range_from_height`. A
-/// cross-section needs one of these per output row, which is why the quadratic
-/// height form is worth keeping over the spherical one.
+/// cross-section needs one of these per output row. That is a cost this form
+/// meets, not a reason to prefer it: the spherical height inverts in closed
+/// form as well (module doc), so what keeps the quadratic is the bit-exact
+/// digest pins on [`height_km`], not invertibility.
 ///
 /// Returns `NaN` where `sin²e + 2h/Rₑ` goes negative, i.e. below
 /// `h = −Rₑ·sin²e/2`: no ascending beam reaches those heights at any range.
@@ -240,45 +288,107 @@ pub fn slant_range_for_height_km(height_km: f64, elev_deg: f64) -> f64 {
     RE_EFF_KM * ((s * s + 2.0 * height_km / RE_EFF_KM).sqrt() - s)
 }
 
-/// Ground range, km: the horizontal distance from the site to the point under
-/// a gate at `slant_range_km` on a tilt of `elev_deg`.
+/// Beam-centre height above the radar, km, on the **exact** spherical model —
+/// `√(r² + Rₑ² + 2·r·Rₑ·sin e) − Rₑ`, taking the elevation in radians.
 ///
-/// Tangent-plane `r·cos e`, per the module doc. The factor is 0.09 % at 2.4°
-/// and 5.7 % at 19.5° — 0.2 km and 4.0 km at those tilts' plotted extents —
-/// and **50 % at the 60° a TDWR's VCP 80 climbs to**, which is why the plan
-/// view applies it rather than treating it as small.
+/// Private, and used only by [`ground_range_km`], which needs the height under
+/// the arc. It is deliberately not [`height_km`]: the arc and its inverse
+/// [`slant_range_for_ground_km`] are an algebraic pair derived from the same
+/// triangle, and feeding the arc a quadratic height would leave the round trip
+/// short by the quadratic's own residual instead of by rounding.
+///
+/// So this crate carries two height models on purpose. [`height_km`] is the
+/// public, quadratic, digest-pinned one every drawn product shares; this is an
+/// internal detail of a horizontal conversion. The module doc measures the gap
+/// between them (23.49 m below 20 km of altitude) — it is not a disagreement
+/// about where a beam is, because nothing reads this one's output as a height.
 #[inline]
-pub fn ground_range_km(slant_range_km: f64, elev_deg: f64) -> f64 {
-    slant_range_km * elev_deg.to_radians().cos()
+fn spherical_height_km(slant_range_km: f64, elev_rad: f64) -> f64 {
+    let r = slant_range_km;
+    (r * r + RE_EFF_KM * RE_EFF_KM + 2.0 * r * RE_EFF_KM * elev_rad.sin()).sqrt() - RE_EFF_KM
 }
 
-/// The slant range whose gate sits over `ground_range_km` — the inverse of
-/// [`ground_range_km`].
+/// Ground range, km: the arc along the earth from the site to the point under
+/// a gate at `slant_range_km` on a tilt of `elev_deg`.
 ///
-/// Diverges at 90°, where a vertically pointing beam covers no ground; the
-/// WSR-88D's highest cut is 19.5°, so no production caller is near it.
+/// `Rₑ·asin(r·cos e/(Rₑ + h))` with `h` from [`spherical_height_km`] — the
+/// exact great-circle arc on the effective sphere, derived in the module doc
+/// along with the table of what the tangent-plane `r·cos e` this replaced was
+/// worth (666 m outward at the 0.5° cut's reach, ~3 plan-view cells).
+///
+/// The shortening against the slant range is 0.5178 km at 230 km / 2.4° and
+/// 4.1974 km at 70 km / 19.5°; at the 60° a TDWR's VCP 80 climbs to, an 88.8 km
+/// Doppler gate sits over 44.00 km of ground, a shortening of 44.80 km. Those
+/// are ranges at a named tilt *and* range, not the pure `cos e` percentages an
+/// earlier version of this doc quoted, because the arc is not a per-tilt scale
+/// factor — which is the whole reason `render` cannot hoist it.
+///
+/// The `asin` argument is `sin` of the arc's central angle by construction and
+/// cannot round past 1: it is bounded by `r/√(r² + Rₑ²)`, which is 0.054 at the
+/// 460 km a WSR-88D reaches and would need `r` of Rₑ's order to approach 1. No
+/// clamp, therefore, and no `NaN` from this that was not already in the input.
+#[inline]
+pub fn ground_range_km(slant_range_km: f64, elev_deg: f64) -> f64 {
+    let el = elev_deg.to_radians();
+    let h = spherical_height_km(slant_range_km, el);
+    RE_EFF_KM * (slant_range_km * el.cos() / (RE_EFF_KM + h)).asin()
+}
+
+/// The slant range whose gate sits over `ground_range_km` — the exact inverse
+/// of [`ground_range_km`].
+///
+/// `Rₑ·sin θ/cos(e + θ)` with `θ = s/Rₑ` the arc's central angle. Both come
+/// from the triangle on the earth's centre, the radar and the gate: two sides
+/// `Rₑ` and `Rₑ + h`, the angle `θ` between them, and `90° + e` at the radar.
+/// The law of sines gives this and the arc, the law of cosines gives the
+/// height, and `a_ground_range_round_trip_is_exact_on_both_networks` pins the
+/// pair at 1.71e-13 km over 235 944 points — the WSR-88D's ladder to 460.1 km
+/// and a TDWR's to 88.8, each at its own beam bottom, centre and top.
+///
+/// **It diverges where `cos(e + θ) = 0`, not at 90°.** A vertical beam covering
+/// no ground is the old tangent-plane form's singularity and this one does not
+/// have it: at `e = 90°` this returns `−Rₑ` rather than blowing up, which is
+/// the arc running away over the far side of the sphere. The real condition is
+/// the gate passing the effective sphere's horizon as seen from the radar,
+/// `θ = 90° − e`, which is 10 452 km of ground arc at 19.5° and 4448 km at the
+/// 60° of a TDWR's VCP 80. Both denominators are ground arcs, matching this
+/// function's argument: 4448 km against the 44.00 km of ground a TDWR's 88.8 km
+/// Doppler reach covers at 60° is a margin of 101×, so the tilt that was
+/// supposed to be the worrying one is not close.
 #[inline]
 pub fn slant_range_for_ground_km(ground_range_km: f64, elev_deg: f64) -> f64 {
-    ground_range_km / elev_deg.to_radians().cos()
+    let el = elev_deg.to_radians();
+    let theta = ground_range_km / RE_EFF_KM;
+    RE_EFF_KM * theta.sin() / (el + theta).cos()
 }
 
 /// Beam-centre height above the radar, km, over a point at `ground_range_km`
 /// from the site on a tilt of `elev_deg`.
 ///
-/// `s·tan e + s²/(2·Rₑ·cos²e)`, which is [`height_km`] composed with
-/// [`slant_range_for_ground_km`] with the division folded in. Written closed
-/// form because a cross-section evaluates it per output column. The two
-/// spellings are *not* bit-identical — the folded form divides once where the
-/// composition divides twice — so
-/// `the_ground_range_height_is_the_slant_range_height_over_the_same_point`
-/// measures the gap rather than assuming it away: 2.8e-14 km (28 pm) at worst
-/// over 1..460 km × the VCP 212 ladder.
+/// [`height_km`] composed with [`slant_range_for_ground_km`], written as that
+/// composition. It used to be the folded closed form
+/// `s·tan e + s²/(2·Rₑ·cos²e)`, which is the same composition against the
+/// *tangent-plane* inverse with the division cancelled; once the inverse became
+/// the spherical arc there is no such cancellation to make and the folded form
+/// would be a third, unrelated answer.
+///
+/// Writing it as the composition keeps two properties that the folded form used
+/// to have to be measured for.
+/// `the_ground_range_height_is_the_slant_range_height_over_the_same_point` now
+/// holds **by construction** and to the bit, rather than to the 2.8e-14 km the
+/// two spellings used to differ by. And the height model stays the quadratic
+/// one — this is not a route by which the spherical height reaches a drawn
+/// product.
+///
+/// Still closed form, and still no iteration: one sine and two cosines for the
+/// inverse and a multiply-add for the height. A cross-section evaluating it per
+/// output column pays what it did before, so nothing about that use changes.
 #[inline]
 pub fn height_at_ground_km(ground_range_km: f64, elev_deg: f64) -> f64 {
-    let el = elev_deg.to_radians();
-    let cos_el = el.cos();
-    ground_range_km * el.tan()
-        + ground_range_km * ground_range_km / (2.0 * RE_EFF_KM * cos_el * cos_el)
+    height_km(
+        slant_range_for_ground_km(ground_range_km, elev_deg),
+        elev_deg,
+    )
 }
 
 /// Initial great-circle bearing (degrees clockwise from true north, `0..360`)
@@ -355,7 +465,13 @@ pub fn site_bearing_range_km(site_lat: f64, site_lon: f64, lat: f64, lon: f64) -
 ///
 /// Distance is a **ground** range, matching [`site_bearing_range_km`]'s output
 /// and [`ground_range_km`]'s; a caller holding a slant range applies
-/// [`ground_range_km`] first, as every rasterizer in [`crate::render`] does.
+/// [`ground_range_km`] first.
+///
+/// [`crate::render`]'s rasterizers do not, and this line used to claim they
+/// did. They multiply by a hoisted `cos e` instead, which was the same answer
+/// while [`ground_range_km`] was the tangent plane and is no longer — the
+/// module doc's "What still spells the tangent plane" measures what that is
+/// worth and why the hoist cannot simply be swapped for a call.
 ///
 /// A range past half the circumference wraps over the pole and keeps going,
 /// which is what the spherical formula means and not something to guard: no
