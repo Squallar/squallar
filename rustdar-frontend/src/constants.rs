@@ -1452,37 +1452,6 @@ pub const DESKTOP_APP_TEXTURE_BUDGET_BYTES: usize = 3840 * 1024 * 1024;
 /// `u32::MAX + 1`.
 pub const DESKTOP_APP_TEXTURE_CEILING_BYTES: usize = 4032 * 1024 * 1024;
 
-/// Ceiling on the compressed tile bytes each basemap/label tile source
-/// retains beside its textures: `TILE_CACHE_ENTRIES` PNGs at a generous
-/// 30 KiB each — ~7.5 MiB per source, four sources at most (light and dark,
-/// base and labels), riding the same LRU slot as each tile's texture. A
-/// budget *statement* rather than an enforcement point — the bound is the
-/// cache's own entry count; this names what that bound costs so the next
-/// memory audit does not have to rediscover it.
-///
-/// # FOLLOW-UP: this budget currently has no consumer
-///
-/// The retention was introduced for the 3D floor's CPU map composite, which no
-/// longer exists: the floor is now the 2D pane's own render, copied (see
-/// [`VOLUME_MIRROR_BYTES_MAX`]), and nothing re-decodes a tile. So the ~30 MiB
-/// this names is live and read by nobody.
-///
-/// It is *stated* here rather than removed alongside its consumer because
-/// dropping it is a separate decision from replacing the floor, and because
-/// nothing warns: `rustdar_egui::tile_source::TileSource::raster_bytes_at` and
-/// `rustdar_egui::ui::Gui::map_tiles_mut` are both unreferenced now and both
-/// `pub`, so no dead-code lint fires on either. The work, when it is taken:
-///
-///  1. delete `TileSource::raster_bytes_at` and `Gui::map_tiles_mut`;
-///  2. drop `CachedTile::bytes` (`rustdar-egui/src/tile_source.rs`), which is
-///     what actually retains the compressed PNGs;
-///  3. delete this constant and its test.
-///
-/// Until then, treat this figure as a *debt* rather than a cost: it is the size
-/// of the thing step 2 gives back.
-pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
-    rustdar_egui::tile_source::TILE_CACHE_ENTRIES.get() * 30 * 1024;
-
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.
 ///
 /// The cache exists so panes showing the same site/product/elevation share one
