@@ -212,11 +212,118 @@ pub mod compare {
         }
     }
 
-    /// Score `derived` (360 × 230, azimuth-major, `NaN` undefined) against a
-    /// Level III message, using the message's own codec and gate spacing.
-    /// `None` when the message carries no radial packet.
+    /// Why a derived grid was refused: the comparison lattice is exactly 360
+    /// azimuth rows of [`RANGE_BINS`] range cells, and this names the first
+    /// dimension that was not.
+    ///
+    /// Returned by [`PolarGrid::new`] rather than asserted, so the caller
+    /// learns *which* dimension is wrong and what it actually had. The two
+    /// variants are the two directions the old `take(360)` / `take(RANGE_BINS)`
+    /// walk failed silently in: a short grid shrank the denominator and scored
+    /// better, a tall one was truncated and scored against the wrong azimuths.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GridShape {
+        /// The grid does not have 360 azimuth rows.
+        Azimuths { found: usize },
+        /// Row `az` does not have [`RANGE_BINS`] range cells.
+        RangeBins { az: usize, found: usize },
+    }
+
+    impl std::fmt::Display for GridShape {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match *self {
+                Self::Azimuths { found } => write!(
+                    f,
+                    "derived grid has {found} azimuth rows, not {}",
+                    PolarGrid::AZIMUTHS,
+                ),
+                Self::RangeBins { az, found } => write!(
+                    f,
+                    "derived grid row {az} has {found} range cells, not {RANGE_BINS}",
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for GridShape {}
+
+    /// A derived field **on the comparison lattice**: exactly 360 azimuth-major
+    /// rows of exactly [`RANGE_BINS`] cells, `NaN` undefined.
+    ///
+    /// # Why this is a type and not an assertion
+    ///
+    /// The lattice is not a property of any one product — it is the coordinate
+    /// system every twin score is quoted in, and the denominator of every
+    /// `% exact` this crate publishes. Expressing it as a type moves the
+    /// question from *"did this function remember to check?"* to *"where did
+    /// this grid become a comparison grid?"*, which has exactly one answer
+    /// ([`PolarGrid::new`]) and is checked once, at the boundary, instead of
+    /// once per scorer.
+    ///
+    /// It is a **borrow**, not an owned grid: every producer in the tree
+    /// already allocates `vec![vec![f32::NAN; RANGE_BINS]; 360]` and fills it,
+    /// so requiring them to change representation would buy nothing. What the
+    /// borrow buys is that [`tally_packet`] can no longer be *reached* with a
+    /// mis-shape — there is no expressible call that gets past the constructor
+    /// — and that its inner loop needs no bounds cap, so nothing in it can
+    /// silently iterate fewer cells than the domain.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PolarGrid<'a> {
+        rows: &'a [Vec<f32>],
+    }
+
+    impl<'a> PolarGrid<'a> {
+        /// Azimuth rows in the comparison domain: one per whole degree.
+        pub const AZIMUTHS: usize = 360;
+
+        /// Borrow `rows` as a comparison grid, or say why it is not one.
+        ///
+        /// Every row is checked, not just the first: a ragged grid is as
+        /// unscoreable as a short one, and costs the same walk to rule out
+        /// as the tally itself does to index.
+        pub fn new(rows: &'a [Vec<f32>]) -> Result<Self, GridShape> {
+            if rows.len() != Self::AZIMUTHS {
+                return Err(GridShape::Azimuths { found: rows.len() });
+            }
+            if let Some((az, row)) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, row)| row.len() != RANGE_BINS)
+            {
+                return Err(GridShape::RangeBins {
+                    az,
+                    found: row.len(),
+                });
+            }
+            Ok(Self { rows })
+        }
+
+        /// Row `az`, [`RANGE_BINS`] cells wide — guaranteed by construction.
+        ///
+        /// # Panics
+        /// If `az >= 360`, like any slice index.
+        pub fn row(&self, az: usize) -> &'a [f32] {
+            &self.rows[az]
+        }
+    }
+
+    impl<'a> TryFrom<&'a [Vec<f32>]> for PolarGrid<'a> {
+        type Error = GridShape;
+
+        fn try_from(rows: &'a [Vec<f32>]) -> Result<Self, Self::Error> {
+            Self::new(rows)
+        }
+    }
+
+    /// Score `derived` against a Level III message, using the message's own
+    /// codec and gate spacing. `None` when the message carries no radial
+    /// packet.
+    ///
+    /// The 360 × 230 azimuth-major contract is carried by [`PolarGrid`], which
+    /// is the only way to build the argument — it is no longer a sentence in
+    /// this comment that nothing enforces.
     pub fn tally_against_l3(
-        derived: &[Vec<f32>],
+        derived: PolarGrid<'_>,
         msg: &Level3Message,
         kind: ProductKind,
     ) -> Option<Tally> {
@@ -302,19 +409,42 @@ pub mod compare {
 
     /// The lower-level entry point: explicit packet, gate spacing and codec,
     /// scoring the derived grid against [`resample_packet_levels`].
+    ///
+    /// Both sides are the full 360 × [`RANGE_BINS`] domain and neither walk is
+    /// capped: the derived side because [`PolarGrid`] cannot be built any other
+    /// shape, the reference side because [`resample_packet_levels`] builds its
+    /// own grid from those two constants whatever the packet's radial count and
+    /// gate spacing are (pinned by
+    /// `the_reference_side_is_always_the_full_domain`). So `compared` counts
+    /// over a domain fixed in advance, not over however many cells the caller
+    /// happened to supply.
     pub fn tally_packet(
-        derived: &[Vec<f32>],
+        derived: PolarGrid<'_>,
         packet: &RadialPacket,
         l3_gate_km: f64,
         codec: &ValueCodec,
         kind: ProductKind,
     ) -> Tally {
         let levels = resample_packet_levels(packet, l3_gate_km);
+        // The reference side is the full domain for every packet, by the same
+        // two constants `PolarGrid` holds the derived side to. Asserted rather
+        // than assumed because the walk below reads the two together, and a
+        // short *reference* would shrink `compared` exactly the way a short
+        // derived grid used to — the defect this commit closes, arriving from
+        // the other side.
+        assert_eq!(
+            levels.len(),
+            PolarGrid::AZIMUTHS,
+            "the resampled reference is not the full comparison domain",
+        );
 
         let mut t = Tally::default();
-        for (az, row) in derived.iter().take(360).enumerate() {
-            for (r, &v) in row.iter().take(RANGE_BINS).enumerate() {
-                let l3_level: Option<u16> = levels[az][r];
+        for (az, l3_row) in levels.iter().enumerate() {
+            let row = derived.row(az);
+            for (r, &l3_level) in l3_row.iter().enumerate() {
+                // Both rows are `RANGE_BINS` wide; a mismatch panics here
+                // rather than silently scoring the shorter of the two.
+                let v = row[r];
                 let l3_defined = l3_level.is_some_and(|g| codec.decode(g).is_finite());
                 match (v.is_finite(), l3_defined) {
                     (true, true) => {
@@ -352,6 +482,7 @@ pub mod compare {
 #[cfg(test)]
 mod tests {
     use super::compare::*;
+    use crate::volumetric::RANGE_BINS;
     use nexrad_level3::model::{RadialPacket, RadialRun};
 
     const SCALE: f32 = 2.0;
@@ -396,6 +527,13 @@ mod tests {
         vec![vec![f32::NAN; 230]; 360]
     }
 
+    /// The tests' own way onto the comparison lattice. A fixture that is not
+    /// 360 × 230 is a bug in the test, so it panics here rather than
+    /// producing a score — which is the whole change these tests exercise.
+    fn grid(rows: &[Vec<f32>]) -> PolarGrid<'_> {
+        PolarGrid::new(rows).expect("test fixture is a 360 × 230 grid")
+    }
+
     /// A derived grid decoding exactly what the packet encodes scores 100%
     /// exact with no presence disagreement.
     #[test]
@@ -407,7 +545,7 @@ mod tests {
                 *v = (((az + r) % 200 + 20) as f32 - OFFSET) / SCALE;
             }
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
         assert_eq!(t.compared, 360 * 230);
         assert_eq!(t.exact, t.compared);
         assert_eq!(t.within_one, t.compared);
@@ -427,7 +565,7 @@ mod tests {
                 *v = (101.0 - OFFSET) / SCALE;
             }
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
         assert_eq!(t.exact, 0);
         assert_eq!(t.within_one, t.compared);
         assert_eq!(t.within_two, t.compared);
@@ -435,7 +573,7 @@ mod tests {
         for v in derived.iter_mut().flatten() {
             *v = (103.0 - OFFSET) / SCALE;
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
         assert_eq!(t.within_one, 0);
         assert_eq!(t.within_two, 0, "three levels is outside every band");
     }
@@ -454,7 +592,7 @@ mod tests {
                 *v = (100.0 - OFFSET) / SCALE;
             }
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
         // az 0: derived-only (230 cells). az 1: both. az 2..: L3-only.
         assert_eq!(t.compared, 230);
         assert_eq!(t.exact, 230);
@@ -482,7 +620,7 @@ mod tests {
                 *v = (110.0 - OFFSET) / SCALE; // the odd run's value
             }
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
         assert_eq!(
             t.exact, t.compared,
             "a cell centre read the radial left of it",
@@ -505,7 +643,7 @@ mod tests {
                 }
             }
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
         assert_eq!(t.compared, 360 * 10);
         assert_eq!(t.exact, t.compared, "the offset shifted the gate mapping");
         assert_eq!(t.presence_disagreements, 0);
@@ -525,7 +663,7 @@ mod tests {
                 *v = ((20 + r) as f32 - OFFSET) / SCALE;
             }
         }
-        let t = tally_packet(&derived, &p, 0.25, &codec(), ProductKind::Numeric);
+        let t = tally_packet(grid(&derived), &p, 0.25, &codec(), ProductKind::Numeric);
         assert_eq!(t.compared, 360 * 230, "the domain is 230 km, not 250");
         assert_eq!(t.exact, t.compared);
     }
@@ -543,88 +681,164 @@ mod tests {
                 *v = (class - OFFSET) / SCALE;
             }
         }
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Class);
+        let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Class);
         assert_eq!(t.confusion.get(&(60, 60)), Some(&(180 * 230)));
         assert_eq!(t.confusion.get(&(80, 60)), Some(&(180 * 230)));
         assert_eq!(t.confusion.values().sum::<usize>(), t.compared);
         assert_eq!(t.exact, 180 * 230);
     }
 
-    // ---- AUDIT DEMONSTRATIONS (campaign/oracle-round2) ----------------
-    // These document present behaviour of `tally_packet`; they are NOT a
-    // statement that the behaviour is correct. See the audit report.
+    // ---- AUDIT DEMONSTRATIONS (campaign/oracle-round2), REFUTED ---------
+    //
+    // These arrived as *demonstrations*: each built a mis-shaped grid and
+    // asserted the flattering number the old walk produced for it. Their
+    // premises — the grids — are preserved below cell for cell, and each
+    // one's original assertions are quoted verbatim in its doc comment.
+    //
+    // They cannot pass as written under a correct scorer, and they never
+    // failed: on `main` before this commit both PASSED, because what they
+    // assert *is* the old behaviour. A grid that scores 100% while missing
+    // 359 of its 360 rows is the defect; a fix that keeps that assertion
+    // true is not a fix. So each has been turned into its own refutation —
+    // same fixture, same name, the expectation inverted from "this is what
+    // it scores" to "this is refused, and here is which dimension was
+    // wrong". The unchanged demonstration remains in this branch's parent
+    // commit as the record of the old behaviour.
 
-    /// AUDIT: a grid that is *physically short* scores a perfect 100% exact
-    /// and 0% presence disagreement, because `derived.iter().take(360)`
-    /// iterates only the rows that exist and nothing checks `derived.len()`.
+    /// AUDIT, REFUTED: a grid that is *physically short* is now refused by
+    /// [`PolarGrid::new`] naming the dimension, instead of scoring a perfect
+    /// 100% exact and 0% presence disagreement off a shrunken denominator.
     ///
-    /// Contrast `presence_disagreements_count_cells_defined_on_exactly_one_side`:
-    /// a full-height grid whose rows are `NaN` is correctly penalised. The
-    /// difference between "360 rows, 359 of them NaN" (scores 0.28% of the
-    /// union) and "1 row" (scores 100%) is invisible to every caller.
+    /// The demonstration this replaces asserted, on the same three fixtures:
+    ///
+    /// ```text
+    /// assert_eq!(t.compared, 230, "only the row that exists was compared");
+    /// assert_eq!(t.exact_pct(), 100.0, "a 1/360-height grid scores perfect");
+    /// assert_eq!(t.presence_disagreement_pct(), 0.0, …);
+    /// assert_eq!(t.l3_defined, 230, "the reference's other 359 rows vanished");
+    /// assert_eq!(t.exact_pct(), 100.0, "a 1-bin-wide grid scores perfect");
+    /// assert_eq!(t.exact_pct(), 0.0, "0/max(1) reads 0%, not 100%");
+    /// ```
+    ///
+    /// Every one of those was true, and none of them can be reached now:
+    /// there is no `Tally` to interrogate, because there is no scoring call
+    /// to make. Contrast
+    /// `presence_disagreements_count_cells_defined_on_exactly_one_side`: a
+    /// full-height grid whose rows are `NaN` is still correctly penalised.
+    /// The difference between "360 rows, 359 of them NaN" (0.28% of the
+    /// union) and "1 row" is no longer invisible — it is the difference
+    /// between a score and a refusal.
     #[test]
     fn audit_a_short_grid_scores_perfect() {
-        let p = packet(360, 230, 0, 1.0, |az, r| ((az + r) % 200 + 20) as u16);
-
         // One single row, agreeing exactly. 359 rows simply absent.
         let derived: Vec<Vec<f32>> = vec![
             (0..230)
-                .map(|r| (((0 + r) % 200 + 20) as f32 - OFFSET) / SCALE)
+                .map(|r| ((r % 200 + 20) as f32 - OFFSET) / SCALE)
                 .collect(),
         ];
         assert_eq!(derived.len(), 1, "premise: the grid is 1/360 of a grid");
-
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
-        assert_eq!(t.compared, 230, "only the row that exists was compared");
-        assert_eq!(t.exact_pct(), 100.0, "a 1/360-height grid scores perfect");
         assert_eq!(
-            t.presence_disagreement_pct(),
-            0.0,
-            "the 359 missing rows are not even counted as disagreements"
+            PolarGrid::new(&derived).unwrap_err(),
+            GridShape::Azimuths { found: 1 },
+            "a 1/360-height grid is refused, not scored perfect",
         );
-        assert_eq!(t.l3_defined, 230, "the reference's other 359 rows vanished");
 
         // The same holds for a short *row*: 1 bin of 230.
         let narrow: Vec<Vec<f32>> = (0..360)
-            .map(|az| vec![(((az + 0) % 200 + 20) as f32 - OFFSET) / SCALE])
+            .map(|az| vec![((az % 200 + 20) as f32 - OFFSET) / SCALE])
             .collect();
-        let t = tally_packet(&narrow, &p, 1.0, &codec(), ProductKind::Numeric);
-        assert_eq!(t.compared, 360, "one bin per row");
-        assert_eq!(t.exact_pct(), 100.0, "a 1-bin-wide grid scores perfect");
-        assert_eq!(t.presence_disagreement_pct(), 0.0);
+        assert_eq!(
+            PolarGrid::new(&narrow).unwrap_err(),
+            GridShape::RangeBins { az: 0, found: 1 },
+            "a 1-bin-wide grid is refused, and the row is named",
+        );
 
-        // And the degenerate case: an empty grid is not perfect, it is 0/0.
-        let t = tally_packet(&[], &p, 1.0, &codec(), ProductKind::Numeric);
-        assert_eq!(t.compared, 0);
-        assert_eq!(t.exact_pct(), 0.0, "0/max(1) reads 0%, not 100%");
+        // A ragged grid — full height, one short row at 200 — is refused
+        // too. Nothing about the old walk would have noticed this one.
+        let mut ragged = vec![vec![f32::NAN; 230]; 360];
+        ragged[200].truncate(229);
+        assert_eq!(
+            PolarGrid::new(&ragged).unwrap_err(),
+            GridShape::RangeBins {
+                az: 200,
+                found: 229
+            },
+            "one short row of 360 is refused, and it is named",
+        );
+
+        // And the degenerate case: an empty grid was 0/0 and read as 0%.
+        // It is now refused for what it is — no rows at all.
+        assert_eq!(
+            PolarGrid::new(&[]).unwrap_err(),
+            GridShape::Azimuths { found: 0 },
+            "an empty grid is refused, not scored 0/0",
+        );
     }
 
-    /// AUDIT: a *tall* grid is truncated to its first 360 rows. On a
-    /// half-degree (720-row) grid that means rows 0..359 — azimuths
-    /// 0.0°..179.5° — are scored against Level III whole degrees 0..359.
-    /// Every cell is compared against the wrong azimuth and nothing says so.
+    /// AUDIT, REFUTED: a *tall* grid is no longer truncated to its first 360
+    /// rows and scored against azimuths it does not correspond to — it is
+    /// refused, naming 720.
+    ///
+    /// The demonstration this replaces built the same *correct* 720-row
+    /// half-degree derivation and asserted:
+    ///
+    /// ```text
+    /// assert_eq!(t.compared, 360 * 230, "only half the grid was even read");
+    /// assert_eq!(t.exact, 230, "1 of 360 scored rows landed on its own azimuth");
+    /// assert!(t.exact_pct() < 1.0, "a *correct* 720-row derivation scores {:.2}%", …);
+    /// ```
+    ///
+    /// This is the case that defeats the obvious defence: `compared` came
+    /// back at 82,800 — the full domain, exactly what a healthy score looks
+    /// like — while every cell was mis-registered by a factor of two in
+    /// azimuth, so the 0.28% would have been read as a catastrophic
+    /// *algorithm* failure with nothing to distinguish it from one.
     #[test]
     fn audit_a_720_row_grid_is_scored_against_the_wrong_azimuths() {
-        // L3 level encodes the whole-degree azimuth: level = az + 20.
-        let p = packet(360, 230, 0, 1.0, |az, _| (az + 20) as u16);
-
         // A 720-row half-degree grid that is *correct*: row i is azimuth
         // i * 0.5, and it carries the level of the degree it sits in.
         let derived: Vec<Vec<f32>> = (0..720)
             .map(|i| vec![((i / 2 + 20) as f32 - OFFSET) / SCALE; 230])
             .collect();
 
-        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
-        assert_eq!(t.compared, 360 * 230, "only half the grid was even read");
-        // Row i is compared against L3 degree i, but carries degree i/2.
-        // Only rows 0 and 1 (both degree 0, compared against degrees 0 and 1)
-        // put row 0 on the right answer.
-        assert_eq!(t.exact, 230, "1 of 360 scored rows landed on its own azimuth");
-        assert!(
-            t.exact_pct() < 1.0,
-            "a *correct* 720-row derivation scores {:.2}%",
-            t.exact_pct()
+        assert_eq!(
+            PolarGrid::new(&derived).unwrap_err(),
+            GridShape::Azimuths { found: 720 },
+            "super-resolution height is refused, not silently halved",
         );
+    }
+
+    /// The refusals say which dimension was wrong and what it actually was —
+    /// the whole point of returning [`GridShape`] rather than asserting.
+    #[test]
+    fn a_refusal_names_the_dimension_and_the_count() {
+        assert_eq!(
+            GridShape::Azimuths { found: 720 }.to_string(),
+            "derived grid has 720 azimuth rows, not 360",
+        );
+        assert_eq!(
+            GridShape::RangeBins { az: 200, found: 1 }.to_string(),
+            "derived grid row 200 has 1 range cells, not 230",
+        );
+    }
+
+    /// The reference side needs no such view: [`resample_packet_levels`]
+    /// builds the full domain from the two constants whatever the packet
+    /// carries, so `tally_packet`'s uncapped walk cannot index past it.
+    ///
+    /// Not circular — the packets here are deliberately *unlike* the domain:
+    /// 720 radials, and 1832 gates at a quarter of the grid's spacing.
+    #[test]
+    fn the_reference_side_is_always_the_full_domain() {
+        for (radials, gates, gate_km) in [(720, 1832, 0.25), (360, 230, 1.0), (1, 4, 4.0)] {
+            let p = packet(radials, gates, 0, 1.0, |_, _| 20);
+            let levels = resample_packet_levels(&p, gate_km);
+            assert_eq!(levels.len(), 360, "{radials} radials");
+            assert!(
+                levels.iter().all(|row| row.len() == RANGE_BINS),
+                "{gates} gates at {gate_km} km",
+            );
+        }
     }
 
     /// The codec round trip and its undefined levels, through the public
