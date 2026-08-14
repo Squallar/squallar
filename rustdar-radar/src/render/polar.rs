@@ -40,10 +40,14 @@
 //!     `[range_km − gate_interval/2, range_km + gate_interval/2)` — half-open,
 //!     because its `t` runs over `[0, 1)`, so the `+2` on the sample counts
 //!     raises sample density and never extent — with `range_km` the gate's
-//!     centre, `first_gate_km + gate · gate_interval_km`. So the gate holding a
-//!     ground range is `floor((ground_km − first_gate_km) / gate_interval_km +
-//!     ½)`, and a range outside `[first − ½gi, first + (gates − ½)gi)` is in no
-//!     gate at all.
+//!     centre. Those centres are uniform **along the beam** and not on the
+//!     ground: [`crate::beam::ground_range_km`] is an arc, not a scale factor,
+//!     so the inverse converts first and indexes second. The gate holding a
+//!     ground range is `floor((slant(ground_km) - first_slant) /
+//!     interval_slant + 0.5)`, and a slant range outside the swept span is in
+//!     no gate at all. The conversion is exact both ways — the pair round-trips
+//!     to 1.7e-13 km — so this stays the inverse of the paint rather than an
+//!     approximation of it.
 //!   * **Azimuth.** A radial is painted over `[centre − half, centre + half)`,
 //!     half-open for the same reason, at the half-width
 //!     [`super::l2_wedge_half_widths_deg`] (or
@@ -212,8 +216,26 @@ pub(crate) fn take_gate_reads() -> u64 {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolarGeometry {
     wedges: Vec<Wedge>,
-    first_gate_km: f64,
-    gate_interval_km: f64,
+    /// Gate 0's centre **along the beam**, km.
+    first_gate_slant_km: f64,
+    /// One gate's depth **along the beam**, km.
+    gate_interval_slant_km: f64,
+    /// The elevation the sweep was flown at, degrees, or `None` where the two
+    /// ranges above are **already ground ranges** and must not be converted at
+    /// all.
+    ///
+    /// Here because the slant geometry above is uniform and the *ground*
+    /// geometry it projects to is not, so a ground range cannot be turned back
+    /// into a gate index without it.
+    ///
+    /// `None` and not `Some(0.0)`: at zero elevation the arc is not the
+    /// identity — a horizontal beam still climbs away from a curving earth, and
+    /// the gap is 4.6 m at 100 km, 56 m at 230 and **449 m at 460**. The paths
+    /// that need this are the ones whose grids are ground grids already: the
+    /// 1 km volumetric cube, interpolated echo tops, and Level III radial
+    /// packets, which arrive binned on the ground by the RPG. Converting those
+    /// would invent a foreshortening nobody applied.
+    elevation_deg: Option<f64>,
     gates: usize,
     reach_gates: usize,
 }
@@ -227,8 +249,8 @@ impl PolarGeometry {
     /// crate's one spelling of "where is this point, from the radar" — so a
     /// caller does not have to know that a gate is measured along a slanted
     /// beam and drawn on the ground beneath it. The foreshortening is already
-    /// in [`Self::first_gate_km`] and [`Self::gate_interval_km`], because it
-    /// was already in the numbers `render_gate` was called with.
+    /// undone here rather than assumed away: this holds the sweep's *slant*
+    /// grid and its elevation, and inverts the arc to reach it.
     ///
     /// **This is the module's whole subject; see the module docs for why each
     /// term is what it is.** `None` here means "no gate", not "no value" — a
@@ -249,11 +271,32 @@ impl PolarGeometry {
 
     /// The gate whose footprint holds `ground_km`, or `None` past either end of
     /// a radial.
+    ///
+    /// # The inverse is taken in slant, where the grid is uniform
+    ///
+    /// The forward paint lays gate `j` over the ground interval
+    /// `[ground(s_j − ½Δ), ground(s_j + ½Δ))`, and `ground` — the spherical arc
+    /// — is strictly increasing. So a ground range is inside that interval
+    /// exactly when its **slant** range is inside `[s_j − ½Δ, s_j + ½Δ)`, and
+    /// that grid *is* uniform. Converting once and indexing uniformly is
+    /// therefore the exact inverse of the paint, not an approximation of it:
+    /// [`crate::beam::slant_range_for_ground_km`] and
+    /// [`crate::beam::ground_range_km`] round-trip to 1.7e-13 km over the whole
+    /// fleet domain, which is fourteen orders below a gate.
+    ///
+    /// Searching the ground edges directly would have been the alternative, and
+    /// it is both slower and less exact — a binary search over numbers that
+    /// were themselves rounded, instead of one closed-form step.
     fn gate_at(&self, ground_km: f64) -> Option<usize> {
-        if self.gate_interval_km <= 0.0 || self.reach_gates == 0 {
+        if self.gate_interval_slant_km <= 0.0 || self.reach_gates == 0 {
             return None;
         }
-        let g = ((ground_km - self.first_gate_km) / self.gate_interval_km + 0.5).floor();
+        let along_beam_km = match self.elevation_deg {
+            Some(e) => crate::beam::slant_range_for_ground_km(ground_km, e),
+            None => ground_km,
+        };
+        let g = ((along_beam_km - self.first_gate_slant_km) / self.gate_interval_slant_km + 0.5)
+            .floor();
         (g >= 0.0 && g < self.reach_gates as f64).then_some(g as usize)
     }
 
@@ -291,14 +334,42 @@ impl PolarGeometry {
         self.reach_gates
     }
 
-    /// The ground range of gate 0's centre, km.
-    pub fn first_gate_km(&self) -> f64 {
-        self.first_gate_km
+    /// Gate 0's centre **along the beam**, km.
+    ///
+    /// Renamed from `first_gate_km`, which answered a *ground* range. The
+    /// ground grid stopped being uniform when the conversion became the
+    /// spherical arc, so there is no single ground interval to report and a
+    /// caller that wants one has to name the gate it means. Keeping the old
+    /// name over the new meaning would have handed the next reader a wrong
+    /// belief in a correct-looking call.
+    pub fn first_gate_slant_km(&self) -> f64 {
+        self.first_gate_slant_km
     }
 
-    /// One gate's ground depth, km.
-    pub fn gate_interval_km(&self) -> f64 {
-        self.gate_interval_km
+    /// One gate's depth **along the beam**, km. See
+    /// [`Self::first_gate_slant_km`] for why this is no longer a ground figure.
+    pub fn gate_interval_slant_km(&self) -> f64 {
+        self.gate_interval_slant_km
+    }
+
+    /// The elevation the sweep was flown at, degrees.
+    pub fn elevation_deg(&self) -> Option<f64> {
+        self.elevation_deg
+    }
+
+    /// The ground range of gate `gate`'s centre, km — the projection of
+    /// [`Self::first_gate_slant_km`] + `gate` × [`Self::gate_interval_slant_km`].
+    ///
+    /// The replacement for arithmetic callers used to do themselves on
+    /// `first_gate_km() + gate × gate_interval_km()`. That spelling is a
+    /// straight line and the ground grid is not one, so it now lives here where
+    /// it can be the same conversion the paint used.
+    pub fn gate_ground_km(&self, gate: usize) -> f64 {
+        let along_beam_km = self.first_gate_slant_km + gate as f64 * self.gate_interval_slant_km;
+        match self.elevation_deg {
+            Some(e) => crate::beam::ground_range_km(along_beam_km, e),
+            None => along_beam_km,
+        }
     }
 
     /// Whether this describes no gates at all, which is what a render that
@@ -316,14 +387,16 @@ impl PolarGeometry {
     /// not going through a render.
     pub fn from_parts(
         wedges: Vec<Wedge>,
-        first_gate_km: f64,
-        gate_interval_km: f64,
+        first_gate_slant_km: f64,
+        gate_interval_slant_km: f64,
+        elevation_deg: Option<f64>,
         gates: usize,
     ) -> Self {
         Self {
             wedges,
-            first_gate_km,
-            gate_interval_km,
+            first_gate_slant_km,
+            gate_interval_slant_km,
+            elevation_deg,
             gates,
             reach_gates: gates,
         }
@@ -409,7 +482,7 @@ impl PolarField {
 impl PolarField {
     /// The header this field's byte form opens with: three counts and two
     /// ranges.
-    const HEADER: usize = 4 * 4 + 8 * 2;
+    const HEADER: usize = 4 * 4 + 8 * 3;
 
     /// This field as bytes, little-endian, for the one boundary that can only
     /// carry buffers.
@@ -425,6 +498,20 @@ impl PolarField {
     /// writes it and the only thing that reads it ship in the same binary, and
     /// `rustdar_web`'s protocol token already refuses a worker built from
     /// different source.
+    ///
+    /// **That token is the only thing standing behind this layout, and the
+    /// guard beside it does not cover this function.**
+    /// `rustdar_web`'s `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
+    /// scrapes the *field names* of the worker's reply object, so it fires when
+    /// a reply grows or loses a field. These bytes travel **inside** one of
+    /// those fields, so changing this encoding leaves the field set identical
+    /// and the guard silent. Whoever edits this function must bump
+    /// `PROTOCOL_VERSION` by hand; the mismatch it prevents is a page and a
+    /// worker on opposite sides of a deploy exchanging a buffer they lay out
+    /// differently. `from_bytes` length-checks would turn most such pairs into
+    /// `None` and a quiet readout rather than a wrong one, but "degrades
+    /// quietly" is the exact failure the version number exists to convert into
+    /// a clean termination.
     pub fn to_bytes(&self) -> Vec<u8> {
         let g = &self.geometry;
         let mut out = Vec::with_capacity(Self::HEADER + g.wedges.len() * 8 + self.values.len() * 4);
@@ -432,8 +519,10 @@ impl PolarField {
         out.extend_from_slice(&(g.gates as u32).to_le_bytes());
         out.extend_from_slice(&(g.reach_gates as u32).to_le_bytes());
         out.extend_from_slice(&(self.values.len() as u32).to_le_bytes());
-        out.extend_from_slice(&g.first_gate_km.to_le_bytes());
-        out.extend_from_slice(&g.gate_interval_km.to_le_bytes());
+        out.extend_from_slice(&g.first_gate_slant_km.to_le_bytes());
+        out.extend_from_slice(&g.gate_interval_slant_km.to_le_bytes());
+        // NaN is the wire spelling of `None` — see `PolarGeometry::elevation_deg`.
+        out.extend_from_slice(&g.elevation_deg.unwrap_or(f64::NAN).to_le_bytes());
         for w in &g.wedges {
             out.extend_from_slice(&w.azimuth_deg.to_le_bytes());
             out.extend_from_slice(&w.half_width_deg.to_le_bytes());
@@ -466,8 +555,9 @@ impl PolarField {
         let gates = u32_at(4);
         let reach_gates = u32_at(8);
         let n_values = u32_at(12);
-        let first_gate_km = f64_at(16);
-        let gate_interval_km = f64_at(24);
+        let first_gate_slant_km = f64_at(16);
+        let gate_interval_slant_km = f64_at(24);
+        let elevation_deg = Some(f64_at(32)).filter(|e| !e.is_nan());
 
         let wedge_bytes = radials.checked_mul(8)?;
         let value_bytes = n_values.checked_mul(4)?;
@@ -504,8 +594,9 @@ impl PolarField {
         Some(Self {
             geometry: PolarGeometry {
                 wedges,
-                first_gate_km,
-                gate_interval_km,
+                first_gate_slant_km,
+                gate_interval_slant_km,
+                elevation_deg,
                 gates,
                 reach_gates,
             },
@@ -527,9 +618,20 @@ pub(super) struct PolarShape {
     pub radials: usize,
     /// The most gates any one of them carries.
     pub gates: usize,
-    /// Gate 0's ground range, km — foreshortened exactly as the fill will
-    /// foreshorten it.
-    pub first_gate_km: f64,
+    /// Gate 0's centre **along the beam**, km.
+    ///
+    /// Slant and not ground since the conversion became the spherical arc: the
+    /// ground grid a fill paints is no longer uniform, so it cannot be named by
+    /// a first value and a step, and the readout inverts the arc instead. A
+    /// path whose gates are already in ground kilometres passes its own spacing
+    /// with `elevation_deg` `None`.
+    pub first_gate_slant_km: f64,
+    /// One gate's depth **along the beam**, km.
+    pub gate_interval_slant_km: f64,
+    /// The elevation the sweep was flown at, degrees, or `None` for a path
+    /// whose ranges are ground ranges already. See
+    /// [`PolarGeometry::elevation_deg`] for why `None` rather than zero.
+    pub elevation_deg: Option<f64>,
 }
 
 /// The field under construction, written by
@@ -562,8 +664,9 @@ pub(super) struct PolarBuffers {
     azimuth: Vec<AtomicU32>,
     half_width: Vec<AtomicU32>,
     gates: usize,
-    first_gate_km: f64,
-    gate_interval_km: f64,
+    first_gate_slant_km: f64,
+    gate_interval_slant_km: f64,
+    elevation_deg: Option<f64>,
 }
 
 /// The bits [`PolarBuffers`] leaves where nothing was painted — `f32::NAN`.
@@ -578,7 +681,7 @@ impl PolarBuffers {
     /// [`PolarShape`], because a field whose gate depth disagreed with the
     /// spacing the raster was *sized* from would be describing a different
     /// sweep from the one on the glass.
-    pub(super) fn new(shape: PolarShape, gate_interval_km: f64) -> Self {
+    pub(super) fn new(shape: PolarShape) -> Self {
         let cells = shape.radials.saturating_mul(shape.gates);
         Self {
             values: (0..cells).map(|_| AtomicU32::new(UNPAINTED_BITS)).collect(),
@@ -589,8 +692,9 @@ impl PolarBuffers {
                 .map(|_| AtomicU32::new(UNPAINTED_BITS))
                 .collect(),
             gates: shape.gates,
-            first_gate_km: shape.first_gate_km,
-            gate_interval_km,
+            first_gate_slant_km: shape.first_gate_slant_km,
+            elevation_deg: shape.elevation_deg,
+            gate_interval_slant_km: shape.gate_interval_slant_km,
         }
     }
 
@@ -669,8 +773,9 @@ impl PolarBuffers {
         PolarField {
             geometry: PolarGeometry {
                 wedges,
-                first_gate_km: self.first_gate_km,
-                gate_interval_km: self.gate_interval_km,
+                first_gate_slant_km: self.first_gate_slant_km,
+                gate_interval_slant_km: self.gate_interval_slant_km,
+                elevation_deg: self.elevation_deg,
                 gates,
                 reach_gates,
             },

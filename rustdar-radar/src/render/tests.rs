@@ -399,7 +399,7 @@ const L2_GATE_KM: f64 = 0.25;
 /// a 150 km fixture really was drawn on a 230 km frame — and that is exactly
 /// the substitution this file now has none of.
 fn l2_ground_reach_km() -> f64 {
-    L2_GATES as f64 * L2_GATE_KM * f64::from(L2_ELEVATION).to_radians().cos()
+    crate::beam::ground_range_km(L2_GATES as f64 * L2_GATE_KM, f64::from(L2_ELEVATION))
 }
 
 /// The raw gate codes Level II reserves below the data range. Every other
@@ -1116,7 +1116,7 @@ const TDWR_GATE_KM: f64 = 0.3;
 /// pin the ground figure rather than the round one so that a future change
 /// putting slant ranges back on the glass fails here instead of only at 60°.
 fn tdwr_ground_reach_km() -> f64 {
-    417.0 * f64::from(L2_ELEVATION).to_radians().cos()
+    crate::beam::ground_range_km(417.0, f64::from(L2_ELEVATION))
 }
 
 /// Gates either side of the beacon's own, so the ring is five gates thick —
@@ -1416,8 +1416,10 @@ fn tdwr_doppler_volume() -> Scan {
 /// "the extent is the data's" from "the extent happens to be right at one site".
 #[test]
 fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
-    let cos_e = f64::from(L2_ELEVATION).to_radians().cos();
-    let doppler_ground_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
+    let doppler_ground_km = crate::beam::ground_range_km(
+        TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM,
+        f64::from(L2_ELEVATION),
+    );
 
     // The four measured sites, with the coordinates the site table holds.
     for (name, lat, lon) in [
@@ -1542,8 +1544,10 @@ fn a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_
     let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
         .expect("359 radials carry the moment and the sweep must still be found");
 
-    let cos_e = f64::from(L2_ELEVATION).to_radians().cos();
-    let doppler_ground_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
+    let doppler_ground_km = crate::beam::ground_range_km(
+        TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM,
+        f64::from(L2_ELEVATION),
+    );
     assert!(
         (vel.max_range_km - doppler_ground_km).abs() < 1e-9,
         "one blank leading radial reframed the pane at {} km instead of \
@@ -1700,7 +1704,7 @@ fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
     const SLANT_KM: f64 = 20.0;
     const GATE_KM: f64 = 0.25;
     // 20 · cos 45° — the ground under the gate, and what both must agree on.
-    let ground_km = SLANT_KM * f64::from(ELEV).to_radians().cos();
+    let ground_km = crate::beam::ground_range_km(SLANT_KM, f64::from(ELEV));
 
     let scan = tilted_beacon_sweep(ELEV, GATE_KM, 600, SLANT_KM, 2);
 
@@ -1824,7 +1828,7 @@ fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
         ..
     } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
 
-    let expected = 417.0 * f64::from(ELEV).to_radians().cos();
+    let expected = crate::beam::ground_range_km(417.0, f64::from(ELEV));
     assert!(
         (extent_km - expected).abs() < 1e-9,
         "1390 gates of 0.3 km on a {ELEV}° cut cover {expected:.4} km of \
@@ -2978,7 +2982,7 @@ fn doppler_ground_reach_km() -> f64 {
     let slant_km = (f64::from(DOPPLER_FIRST_GATE_M)
         + f64::from(DOPPLER_GATES) * f64::from(DOPPLER_GATE_M))
         / 1000.0;
-    slant_km * f64::from(L2_ELEVATION).to_radians().cos()
+    crate::beam::ground_range_km(slant_km, f64::from(L2_ELEVATION))
 }
 
 /// A filled Doppler cut: every gate of every radial carries a velocity.
@@ -3056,7 +3060,7 @@ fn wsr88d_doppler_sweep() -> Scan {
 /// takes a leaner ceiling on purpose — would crop the still frame it replaces
 /// rather than merely softening it.
 ///
-/// **What it costs**: 3.412 px/km against the long-range arm's 6.824, which is
+/// **What it costs**: 3.4145 px/km against the long-range arm's 6.829, which is
 /// 23.4% under the floor's 4.4522, and 0.853 pixels across a 250 m gate where
 /// the floor gives 1.113.
 ///
@@ -3118,8 +3122,13 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
     let floor = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
     let px_per_km = |side: usize| side as f64 / (2.0 * extent_km);
     for (side, expected, what) in [
-        (types::IMAGE_SIZE, 3.412, "a base-size ceiling"),
-        (LONG_RANGE_SIDE, 6.824, "a long-range ceiling"),
+        // 3.412 and 6.824 before the ground range became the spherical arc:
+        // the extent these divide is the sweep's ground reach, and the arc is
+        // shorter than the tangent plane's `r·cos e`, so the same pixels cover
+        // slightly less ground and the scale rises. Both moved by the same
+        // 0.07 %, because both divide the one extent.
+        (types::IMAGE_SIZE, 3.4145, "a base-size ceiling"),
+        (LONG_RANGE_SIDE, 6.8290, "a long-range ceiling"),
     ] {
         assert!(
             (px_per_km(side) - expected).abs() < 1e-3,
@@ -3152,7 +3161,7 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
     // handed: the widest sweep a radar flies, and the arithmetic guard past it.
     const RESOLUTION_LINE: f64 = 2.0;
     for (extent, expected, why) in [
-        (extent_km, 3.412, "this Doppler cut"),
+        (extent_km, 3.4145, "this Doppler cut"),
         (460.125, 2.2255, "a WSR-88D surveillance cut"),
         (types::MAX_EXTENT_KM, 2.1787, "the arithmetic cap"),
     ] {
@@ -3760,8 +3769,8 @@ fn split_volume_with_stray_velocity(stray: Option<usize>) -> Scan {
 /// would have been fooled, and in the middle, where an `any` test is.
 #[test]
 fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
-    let cos_e = f64::from(L2_ELEVATION).to_radians().cos();
-    let long_range_km = TDWR_GATES as f64 * TDWR_GATE_KM * cos_e;
+    let long_range_km =
+        crate::beam::ground_range_km(TDWR_GATES as f64 * TDWR_GATE_KM, f64::from(L2_ELEVATION));
 
     for stray in [None, Some(0usize), Some(200)] {
         let scan = split_volume_with_stray_velocity(stray);
@@ -3794,7 +3803,10 @@ fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
     let scan = split_volume_with_stray_velocity(Some(200));
     let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
         .expect("the Doppler half carries velocity");
-    let doppler_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
+    let doppler_km = crate::beam::ground_range_km(
+        TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM,
+        f64::from(L2_ELEVATION),
+    );
     assert!((vel.max_range_km - doppler_km).abs() < 1e-9);
 }
 
@@ -3905,7 +3917,11 @@ fn the_polar_field_answers_what_the_value_grid_holds() {
         // From 50 km out. Inside that a 1° wedge is under four texels wide and
         // the same seam problem returns in the other axis.
         for gate in (50..cgeom.gates()).step_by(11) {
-            let km = cgeom.first_gate_km() + gate as f64 * cgeom.gate_interval_km();
+            // `gate_ground_km`, not `first + gate × interval`: the slant grid
+            // is uniform and the ground grid it projects to is not, so the
+            // straight line this used to be would probe a range the gate does
+            // not cover.
+            let km = cgeom.gate_ground_km(gate);
             if km > coarse.max_range_km {
                 break;
             }

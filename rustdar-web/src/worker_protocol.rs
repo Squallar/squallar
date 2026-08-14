@@ -166,7 +166,20 @@ pub const OUT_KIND: &str = "outkind";
 /// cannot otherwise see. The reverse pairing is no better: a version 6 page
 /// ignores the two fields and shows nothing a version 7 worker took the trouble
 /// to send.
-const PROTOCOL_VERSION: u32 = 7;
+///
+/// Version 8 changed no field at all, and that is why it is worth reading. The
+/// bytes inside [`POLAR`] grew an elevation and restated their two ranges as
+/// slant rather than ground, when `beam::ground_range_km` became the spherical
+/// arc and the ground grid stopped being uniform enough to name with a first
+/// value and a step. The reply's field *set* is identical either side of that
+/// change, so `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
+/// — which scrapes field names out of `worker.rs` — cannot see it and did not
+/// fire. **A change to `PolarField::to_bytes`'s layout has to be bumped here by
+/// hand.** Mismatched halves would mostly fail `from_bytes`'s length checks and
+/// answer `None`, so the readout would go quiet rather than lie; but "degrades
+/// quietly" is the exact failure this number exists to convert into a clean
+/// termination, which is the argument versions 3, 4 and 6 were each landed on.
+const PROTOCOL_VERSION: u32 = 8;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

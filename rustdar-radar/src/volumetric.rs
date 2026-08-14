@@ -166,30 +166,30 @@ pub enum DedupPolicy {
 /// slant range is a cell whose two coordinates describe two different points
 /// in the air.
 ///
-/// # The two coordinates are no longer exactly the same ground range
+/// # The two coordinates are the same ground range again
 ///
-/// [`range_scale`](Self::range_scale) indexes with the tangent-plane `r·cos e`,
-/// while [`crate::beam::height_at_ground_km`] now inverts the spherical arc.
-/// Under [`Ground`](Self::Ground) a cell's height is therefore the height at
-/// the arc-inverse of a tangent-plane pseudo-range, which is not the height of
-/// the gate that landed in it. Measured over this cube's own domain — 230 bins
-/// × the VCP 212 ladder — the gap is at most **50.3 m below 20 km of altitude**
-/// (at 197.5 km / 5.1°), a fifth of a 250 m gate; it reaches 875 m only at
-/// 229.5 km / 19.5°, where the beam is 85 km up and the cut is range-truncated
-/// far short of it.
+/// They briefly were not. When [`crate::beam::ground_range_km`] became the
+/// spherical arc, this cube went on indexing with a per-sweep tangent-plane
+/// `r·cos e` scalar while [`crate::beam::height_at_ground_km`] inverted the
+/// arc — so a [`Ground`](Self::Ground) cell's height was the height at the
+/// arc-inverse of a tangent-plane pseudo-range, which is not the height of the
+/// gate that landed in it. Over this cube's own domain (230 bins × the VCP 212
+/// ladder) that was at most 50.3 m below 20 km of altitude, a fifth of a gate.
 ///
-/// This is `range_scale`'s defect, not the height's: the scale factor is the
-/// last tangent-plane spelling on this path, kept because a per-sweep scalar
-/// hoists out of the gate loop and an arc does not. Closing it means giving
-/// this cube a per-gate arc, which moves `golden_echo_tops_grid_is_pinned` and
-/// four more digests and so is its own change. Until then the bound above is
-/// the honest statement of what "the heights go with the bins" is worth.
+/// [`range_of`](Self::range_of) now files each gate through the same arc, so
+/// the two coordinates describe one point again and the statement above is
+/// exact rather than bounded. The scalar could not simply be replaced by a
+/// factor — an arc is not one — so it became a per-gate call, and the cost of
+/// that was measured before it was accepted: the same substitution in the far
+/// larger raster loop is +3.1 % in Chrome and nothing measurable in Firefox, on
+/// a path that runs once per sweep and never per frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeBinning {
     /// Bin `r` holds the gates whose **slant** range falls in `[r, r+1)` km.
     Slant,
-    /// Bin `r` holds the gates whose **ground** range — slant × `cos e` of the
-    /// sweep's median elevation — falls in `[r, r+1)` km.
+    /// Bin `r` holds the gates whose **ground** range — the spherical arc
+    /// beneath the beam, at the sweep's median elevation — falls in
+    /// `[r, r+1)` km.
     Ground,
 }
 
@@ -202,16 +202,37 @@ impl RangeBinning {
     /// settling first radial would rebin a whole sweep by a fifth of a degree.
     /// An empty or non-finite sweep falls back to 1, which bins it where it
     /// was measured rather than collapsing it onto the site.
-    fn range_scale(self, radials: &[Radial]) -> f64 {
+    fn binning_elevation_deg(self, radials: &[Radial]) -> Option<f64> {
         match (self, sweep_elevation_deg(radials)) {
-            (Self::Ground, Some(e)) if e.is_finite() => e.to_radians().cos().clamp(0.0, 1.0),
-            _ => 1.0,
+            (Self::Ground, Some(e)) if e.is_finite() => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The range this binning files a gate measured at `slant_km` under.
+    ///
+    /// [`Slant`](Self::Slant) files it where it was measured.
+    /// [`Ground`](Self::Ground) files it under the ground arc beneath it,
+    /// through [`crate::beam::ground_range_km`] — the same conversion
+    /// [`crate::beam::height_at_ground_km`] inverts, so a cell's range and its
+    /// height finally describe the same point in the air.
+    ///
+    /// This was a per-sweep `cos e` scalar hoisted out of the gate loop. It had
+    /// to become a per-gate call because the arc is not a scale factor, and the
+    /// cost of that was measured before it was accepted rather than assumed:
+    /// see the branch's render measurements, where the same substitution in the
+    /// far larger raster loop cost +3.1 % in Chrome and nothing measurable in
+    /// Firefox, on a path that runs once per sweep and never per frame.
+    fn range_of(elevation_deg: Option<f64>, slant_km: f64) -> f64 {
+        match elevation_deg {
+            Some(e) => crate::beam::ground_range_km(slant_km, e),
+            None => slant_km,
         }
     }
 
     /// Beam-centre height, km, over a cell of this binning at `range_km`.
     ///
-    /// The pair to [`range_scale`](Self::range_scale), and the reason both
+    /// The pair to [`range_of`](Self::range_of), and the reason both
     /// live on the enum: a cube whose bins moved but whose heights did not
     /// would put a gate's reflectivity at one point and its altitude at
     /// another, which is a silent error in every column scan above it.
@@ -709,7 +730,7 @@ fn tilt_at(
                         radials,
                         moment,
                         stat,
-                        binning.range_scale(radials),
+                        binning.binning_elevation_deg(radials),
                         binning.gate_filing(radials, moment),
                     );
                     MomentGrid {
@@ -848,10 +869,13 @@ impl LinearZMemo {
 /// over the gates falling in it. `NaN` where no gate carried data; gate values
 /// ≥ 999 are the decoder's sentinels and are dropped.
 ///
-/// `range_scale` is [`RangeBinning::range_scale`] — 1 to file a gate under the
-/// range it was measured at, `cos e` to file it under the ground it sits over.
-/// A parameter rather than a re-derivation from `radials` because it is one
-/// number per sweep and this runs once per moment per tilt.
+/// `binning_elevation_deg` is [`RangeBinning::binning_elevation_deg`] — `None`
+/// to file a gate under the range it was measured at, the sweep's median
+/// elevation to file it under the ground arc it sits over, through
+/// [`RangeBinning::range_of`]. A parameter rather than a re-derivation from
+/// `radials` because it is one number per sweep and this runs once per moment
+/// per tilt; the *conversion* it feeds is per gate, because an arc is not a
+/// scale factor.
 ///
 /// `filing` is [`RangeBinning::gate_filing`], a parameter for the same reason
 /// and answering a different question: whether a declared gate *is* a sample,
@@ -902,7 +926,7 @@ fn sweep_to_grid(
     radials: &[Radial],
     moment: RadarProduct,
     stat: CellStat,
-    range_scale: f64,
+    binning_elevation_deg: Option<f64>,
     filing: GateFiling,
 ) -> (Vec<Vec<f32>>, Vec<Vec<crate::types::GateReport>>) {
     use crate::types::GateReport;
@@ -955,7 +979,8 @@ fn sweep_to_grid(
             // The bin is the gate's, whatever the gate said: a below-threshold
             // or range-folded gate is still a gate *here*, and filing it is
             // the whole point of the status plane.
-            let r = ((fg + j as f64 * gi + centre_shift) * range_scale) as usize;
+            let r = RangeBinning::range_of(binning_elevation_deg, fg + j as f64 * gi + centre_shift)
+                as usize;
             if r >= RANGE_BINS {
                 continue;
             }

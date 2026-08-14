@@ -178,7 +178,7 @@ fn the_hover_reads_the_gate_the_point_falls_in() {
     // One radial over the whole compass, 200 gates of 1 km from 0.5 km out.
     // Gate g therefore spans [g, g + 1) km and carries `g` dBZ.
     const GATES: usize = 200;
-    let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, GATES);
+    let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, None, GATES);
     let values: Vec<f32> = (0..GATES).map(|g| g as f32).collect();
     let source = HoverSource::resident(PolarField::from_parts(geometry, values));
 
@@ -234,7 +234,7 @@ fn a_loop_frame_with_no_values_says_so_rather_than_reading_as_no_data() {
     let (site_lat, site_lon) = (35.3333, -97.2778);
     let prefs = UserPreferences::default();
 
-    let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, 200);
+    let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, None, 200);
     let mut field = PolarField::from_parts(geometry, vec![7.5; 200]);
     // What a loop frame carries: the geometry, and no numbers.
     field.strip_values();
@@ -431,7 +431,7 @@ fn the_hover_readouts_digits_do_not_move() {
         // The value goes in the gate the point actually falls in, found through
         // the same `pick` the readout will use — so a row with a value is a row
         // where the readout has one to find, whatever the geometry.
-        let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, GATES);
+        let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, None, GATES);
         let mut values = vec![f32::NAN; GATES];
         if let Some(v) = value {
             let (azimuth, ground_km) = rustdar_radar::beam::site_bearing_range_km(
