@@ -3883,8 +3883,11 @@ impl RegionKnobs {
     /// equally a real shear line and a folded uniform field — which the
     /// reference refuses to resolve. Off costs 0.05 pp of recall and 0.01 pp of
     /// interior, and takes precision from 94.07% to 96.49% and the KHNX floor
-    /// from 3.26% to 2.15%. And the edge predicate carries the
-    /// `CENSOR_VNY_FRAC` clause below.
+    /// from 3.26% to 2.15%. It is also, on measurement, the *only* thing
+    /// standing between this arm and the inverted-sign shear a `CENSOR_VNY_FRAC`
+    /// clause in the edge predicate was once credited with refusing; that clause
+    /// is gone and this is what replaced it, which is to say what was doing the
+    /// work all along.
     ///
     /// Precision **rises** because the arm withdraws as well as adds: of the
     /// claims the pre-region dealiaser made, it drops 27 458 that were only
@@ -4176,33 +4179,37 @@ fn region_assign(
 
     // ── the acceptance test the published algorithm does not have ────────
     //
-    // The last clause is the censor's own boundary, reused rather than
-    // reinvented. Integrality alone cannot separate a fold from shear: at
-    // `int_tol` 0.20 a boundary of 1.70·Vny reads as `round(0.85) == 1` and is
-    // merged as one fold, and on a two-region field there is no cycle to
-    // contradict it and a uniform boundary passes `agree_frac` trivially. That
-    // unfolds a real shear line by 2·Vny — a −0.85·Vny half comes back
-    // +1.15·Vny — and it does it in the posture named for not doing it.
+    // An edge is accepted on three things: enough gate pairs to mean anything,
+    // a mean displacement close enough to a whole number of intervals to be a
+    // fold at all, and enough of its own pairs agreeing on that number.
     //
-    // [`CENSOR_VNY_FRAC`] is already this module's *measured* boundary between
-    // shear the reference paints and a fold displacement: it keeps a 1.70·Vny
-    // jump and drops a 2.00·Vny one. A boundary below it is shear by this
-    // module's own standing measurement, so it may not be called a fold here
-    // either. In these units the mean is `m` intervals, an interval is 2·Vny,
-    // so the boundary in units of Vny is `2·|m|`.
+    // This test used to carry a fourth clause requiring a boundary claiming a
+    // fold to measure at least [`CENSOR_VNY_FRAC`]·Vny across, on the reasoning
+    // that a 1.70·Vny boundary reads as `round(0.85) == 1` and would unfold a
+    // real shear line by 2·Vny. **It was measured and removed.** Against the
+    // RPG's own dealiased field on 2 991 boundaries it refused — 14 scored
+    // volumes, 54 rungs, 12 sites — 93.46% of the 2 952 the reference answers
+    // carry a fold displacement and only 4.74% are shear, against a null of
+    // 4.75% and a 99th percentile of 7.50%; and 2 758 of the 2 759 confirmed
+    // folds carry the exact branch the refused edge claimed. It was discarding
+    // correct work.
     //
-    // Edges claiming branch **zero** are exempt, and that is not a softening:
-    // such an edge asserts the two regions are continuous, which is a claim
-    // about *no* fold, needs no fold-sized evidence, and is what keeps
-    // neighbouring unfolded regions in one component for the anchor vote.
-    // Guarding those instead would fragment the graph for nothing.
+    // The shear line it was written to protect is protected by `anchor_largest`
+    // being off, not by this. The two landed in one commit and had never been
+    // separated. With the clause gone and the anchor strict,
+    // [`a_declaration_below_the_floor_falls_back_to_the_estimate`],
+    // [`a_declared_limit_keeps_a_shear_line_the_estimate_censors_as_a_fold`] and
+    // [`the_censor_keeps_the_shear_the_reference_paints_and_drops_a_fold_displacement`]
+    // all pass, and a −9.911 m/s half returns −9.911. Restore `anchor_largest`
+    // with the clause still gone and those same three fail, returning +13.409 —
+    // the inverted sign this clause was credited with preventing. The anchor is
+    // the defence, and it always was.
     let mut accepted: Vec<usize> = (0..ea.len())
         .filter(|&e| {
             let m = sum[e] / cnt[e] as f64 / interval;
             cnt[e] as usize >= k.min_pairs
                 && (m - branch_of[e] as f64).abs() <= k.int_tol
                 && agree[e] as f64 >= k.agree_frac * cnt[e] as f64
-                && (branch_of[e] == 0 || 2.0 * m.abs() >= CENSOR_VNY_FRAC)
         })
         .collect();
     stats.accepted = accepted.len();
@@ -5371,10 +5378,24 @@ mod tests {
     /// Opening the acceptance test *alone* is not that ablation, and finding
     /// out why was worth the test: with every edge merged the sweep becomes one
     /// component whose constraints contradict each other, the component check
-    /// then refuses the whole thing, and **nothing** moves. Two refusals in
-    /// series each mask the other's absence. Only with both off does the field
-    /// acquire the invented branch structure `dealias_region_based` reads on
-    /// KHNX, which is what this asserts.
+    /// then refuses the whole thing, and **nothing** moves. Refusals in series
+    /// each mask the others' absence.
+    ///
+    /// There are **three**, not two, and the third was hidden until the
+    /// `CENSOR_VNY_FRAC` edge clause was removed. While that clause stood it
+    /// kept the graph fragmented even in the loosened arm, so opening the
+    /// acceptance test and the component check moved 5 018 gates and the
+    /// ablation looked complete. Without it those two alone move **0** — one
+    /// component again — and it is `anchor_largest` that still refuses. Measured
+    /// on this fixture: acceptance + component loose, 0 gates; `anchor_largest`
+    /// alone, 66; all three loosened, **9 734 of 14 400**. Only with all three
+    /// off does the field acquire the invented branch structure
+    /// `dealias_region_based` reads on KHNX, which is what this asserts.
+    ///
+    /// The second assertion is therefore not `admitted > refused * 4` alone: with
+    /// `refused` at 0 that passes on a single moved gate, which is how a
+    /// half-dead ablation went unnoticed. It must also move a quarter of the
+    /// field.
     #[test]
     fn a_field_with_no_structure_gets_no_branch_and_the_refusal_is_why() {
         let (ny, n, gc) = (20.0, 72usize, 200usize);
@@ -5412,6 +5433,7 @@ mod tests {
             int_tol: 1.0,
             agree_frac: 0.0,
             contra_frac: 1.01,
+            anchor_largest: true,
             ..RegionKnobs::SHIPPED
         })));
         let total = n * gc;
@@ -5425,6 +5447,13 @@ mod tests {
             "the published posture moved {admitted} gates against this arm's \
              {refused}; if those are comparable then the refusal is not what \
              holds this field and the ablation proves nothing",
+        );
+        assert!(
+            admitted * 4 > total,
+            "the ablation moved only {admitted} of {total} gates, so it is not \
+             ablating: with `refused` at {refused} the comparison above passes on \
+             a single gate, and a refusal that has quietly stopped refusing would \
+             read as a pass",
         );
     }
 
