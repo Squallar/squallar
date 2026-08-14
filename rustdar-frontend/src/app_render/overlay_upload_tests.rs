@@ -91,7 +91,7 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usi
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
-            image,
+            image: Some(image),
             geo_bounds: bounds(),
             overlay_kind: OverlayKind::NwsAlerts,
             generation: 7,

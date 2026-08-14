@@ -190,7 +190,23 @@ pub const OUT_KIND: &str = "outkind";
 /// lie; but "degrades quietly" is the exact failure this number exists to
 /// convert into a clean termination, which is the argument versions 3, 4 and 6
 /// were each landed on.
-const PROTOCOL_VERSION: u32 = 8;
+///
+/// Version 9 added the overlay job (`JobRequest::Overlay`, tag 8 in the
+/// page→worker framing) and its reply, `OUT` code 5 — the first rasterization
+/// of an *overlay* to cross this port, so the site markers stop being drawn
+/// inline on the page's one thread. Like version 8 it changes **no field
+/// name**: the job direction is a byte codec under [`REQUEST`] and the reply
+/// rides the existing [`OUT`]/[`OUT_KIND`] pair, so the reply-shape scrape
+/// below cannot see either half and did not fire. What pins them instead is
+/// `rustdar_frontend`'s `offload::tests` — the framing digest gained an
+/// `overlay/sites` row and the tag table an eighth entry — and code 5's
+/// payload is deliberately unframed raw RGBA whose acceptance is the
+/// dispatcher's own length check, so there is no third codec to digest. A
+/// version 8 worker answers the new tag with a failed job (its `from_bytes`
+/// refuses tag 8) and a version 8 page would drop `OUT` code 5 as unknown:
+/// both halves degrade quietly, which is exactly the mismatch the token turns
+/// into a clean termination and a respawn.
+const PROTOCOL_VERSION: u32 = 9;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

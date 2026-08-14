@@ -1172,7 +1172,7 @@ impl super::App {
                     let image =
                         std::sync::Arc::new(Self::overlay_color_image(&output, width, height));
                     let _ = sender.send(OverlayRenderResponse {
-                        image,
+                        image: Some(image),
                         geo_bounds: render_bounds,
                         overlay_kind: kind,
                         generation: data_generation,
@@ -1205,34 +1205,73 @@ impl super::App {
                         is_loading: target_loading.as_deref() == Some(s.name),
                     })
                     .collect();
-                crate::offload::offload("sites-render", move || {
-                    let output = rasterize::rasterize_radar_sites(
-                        &sites,
-                        &render_bounds,
-                        width,
-                        height,
-                        actual_zoom,
+                // Described, not closed over: the first overlay kind whose
+                // dispatch is a `JobRequest`, which is what lets it run in the
+                // web worker instead of inline on the browser's one thread
+                // (`offload`'s wasm arm, where the handler kinds above still
+                // run). On native it rides the pool's interactive lane — the
+                // same lane the closure rode — so nothing about where it runs
+                // changed there; see `offload::pool::Interactive`.
+                let request = crate::offload::JobRequest::Overlay {
+                    width,
+                    height,
+                    bounds: render_bounds,
+                    input: crate::offload::OverlayJobInput::Sites(rasterize::SitesInput {
+                        sites,
+                        zoom: actual_zoom,
                         is_dark,
                         device_scale,
-                    );
-                    // Same conversion, same place, same reason — see
-                    // `OverlayRenderResponse::image`. This one is not the
-                    // cheaper case for being a simpler picture: the site markers
-                    // cover the whole viewport too, so the buffer is the same
-                    // size as any other overlay's.
-                    let image =
-                        std::sync::Arc::new(Self::overlay_color_image(&output, width, height));
-                    let _ = sender.send(OverlayRenderResponse {
-                        image,
-                        geo_bounds: render_bounds,
-                        overlay_kind: kind,
-                        generation: data_generation,
-                        pane_indices,
-                        zoom,
-                        hit_map: None,
-                    });
-                    super::notify_redraw(&window);
-                });
+                    }),
+                };
+                crate::offload::offload_job(
+                    "sites-render",
+                    crate::offload::Job::Described(request),
+                    move |result| {
+                        // The dispatch's own dimensions are the only statement
+                        // of the raster's shape — the reply's buffer carries
+                        // none (`JobOutput::OverlayRaster`) — so the length
+                        // check here is what stands between a payload from
+                        // another build and a texture of the wrong shape.
+                        //
+                        // The pixels arrive premultiplied by `execute`'s
+                        // contract, so the constructor below is the straight
+                        // copy `Self::overlay_color_image` performs for every
+                        // tiny-skia rasterizer.
+                        let expected = (width as usize) * (height as usize) * 4;
+                        let image = result
+                            .and_then(crate::offload::JobOutput::overlay_raster)
+                            .and_then(|rgba| {
+                                if rgba.len() == expected {
+                                    Some(std::sync::Arc::new(
+                                        egui::ColorImage::from_rgba_premultiplied(
+                                            [width as usize, height as usize],
+                                            &rgba,
+                                        ),
+                                    ))
+                                } else {
+                                    log::error!(
+                                        "sites-render answered {} bytes where {width}x{height} \
+                                         needs {expected}; treating it as a failed render",
+                                        rgba.len(),
+                                    );
+                                    None
+                                }
+                            });
+                        // Sent on every arm, `None` included: this message is
+                        // what clears the named panes' in-flight marks — see
+                        // `OverlayRenderResponse::image`.
+                        let _ = sender.send(OverlayRenderResponse {
+                            image,
+                            geo_bounds: render_bounds,
+                            overlay_kind: kind,
+                            generation: data_generation,
+                            pane_indices,
+                            zoom,
+                            hit_map: None,
+                        });
+                        super::notify_redraw(&window);
+                    },
+                );
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
             OverlayKind::Radar
@@ -2511,6 +2550,12 @@ mod loop_pane_tests;
 #[path = "app_fetch/melting_layer_dispatch_tests.rs"]
 #[cfg(test)]
 mod melting_layer_dispatch_tests;
+
+/// The sites overlay dispatch is a described job that reaches the installed
+/// sink, and a job the worker never answers still un-wedges the pane.
+#[cfg(test)]
+#[path = "app_fetch/sites_wire_tests.rs"]
+mod sites_wire_tests;
 
 #[path = "app_fetch/site_switch_tests.rs"]
 #[cfg(test)]

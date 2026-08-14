@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 8;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 8. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 9;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 9. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -582,7 +582,11 @@ fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
          stopped apologising for its storm motion and started reporting it: \
          the legend draws the numbers, and the two derived rungs are fitted \
          from a wind profile the page never sees, so a reply that omits them \
-         is one whose storm-relative field shows no vector at all. Changing \
+         is one whose storm-relative field shows no vector at all. Version 9 \
+         added the overlay job (page->worker tag 8) and its reply, `outkind` \
+         code 5 — a version 8 pair mismatched with a 9 exchanges jobs one half \
+         refuses and payloads the other drops, which is a site-marker layer \
+         that silently never draws. Changing \
          the message shapes without changing this number is the whole failure \
          it prevents.",
     );
@@ -818,8 +822,8 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///
 /// # What was blind, exactly
 ///
-/// `the_worker_protocol_version_is_the_one_these_shapes_ship` asserts that
-/// `PROTOCOL_VERSION` is 7. It fires for someone who bumps the number and
+/// `the_worker_protocol_version_is_the_one_these_shapes_ship` asserts the
+/// `PROTOCOL_VERSION` literal. It fires for someone who bumps the number and
 /// forgets this file — the harmless direction. The direction that ships a
 /// defect is the inverse: change what a reply carries, leave the number alone,
 /// and a page from one side of a deploy and a worker from the other exchange a
@@ -851,6 +855,14 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///     crates);
 ///   * `rustdar_frontend::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
 ///     for the page->worker direction named below.
+///
+/// The overlay raster `OUT` carries under code 5 (protocol version 9) has no
+/// digest **because it has no layout**: the payload is raw premultiplied RGBA,
+/// accepted only by the dispatching page's own `width × height × 4` length
+/// check. What that leaves under this test's floor is the code byte itself and
+/// the job framing's new row, both pinned by the `offload::tests` digest and
+/// tag table named above — this test sees code 5 not at all, since neither
+/// half of version 9 touched a field name.
 ///
 /// Each was measured against an uncooperative regressor: a same-width field
 /// reorder made to encoder and decoder in step left every other test in its
@@ -929,7 +941,7 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     assert_eq!(
         shape,
         [
-            "PROTOCOL_VERSION = 8",
+            "PROTOCOL_VERSION = 9",
             "frame | IMAGE | image",
             "frame | MAX_RANGE | range",
             "frame | MELTING_LAYER | mls",

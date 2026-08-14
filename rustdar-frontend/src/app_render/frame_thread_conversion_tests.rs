@@ -6,13 +6,17 @@
 //! the rasterizer's — both produce the same pixels, which is the whole point.
 //!
 //! There are now two ways a full-size buffer can be kept off the frame thread,
-//! and the distinction is what this module is about. The **overlay** rasters
-//! convert in the `offload` closure that drew them, because their producer is
-//! opaque to the job funnel. The **radar** rasters — plan view and section
-//! alike — do not convert on arrival at all: `offload::execute` premultiplies
-//! them inside the job, so what every consumer holds is already egui's own
-//! bytes. That is why the assertions below look for a *missing* unmultiply in
-//! `app_render` and a *present* conversion in `app_fetch`'s overlay spawn.
+//! and the distinction is what this module is about. The **opaque** overlay
+//! rasters convert in the `offload` closure that drew them, because their
+//! producer is opaque to the job funnel. Everything **described** — the radar
+//! rasters, plan view and section alike, and now the sites overlay
+//! (`JobRequest::Overlay`) — does not convert on arrival at all:
+//! `offload::execute` premultiplies inside the job, so what every consumer
+//! holds is already egui's own bytes and reading them through
+//! `from_rgba_premultiplied` computes nothing. That is why the assertions
+//! below look for a *missing* unmultiply in `app_render`, a *present*
+//! conversion in `app_fetch`'s one remaining opaque overlay arm, and a
+//! *compute-nothing read* in its described one.
 
 const APP_RENDER: &str = include_str!("../app_render.rs");
 const APP_FETCH: &str = include_str!("../app_fetch.rs");
@@ -110,33 +114,53 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
 ///
 /// Both overlay producers, because they are two sends of one response type and
 /// a conversion added back to only one of them would be invisible — the
-/// `RadarSites` raster covers the same viewport as any other overlay's.
+/// `RadarSites` raster covers the same viewport as any other overlay's. They
+/// are no longer two of one shape, though, and each is pinned to its own:
 ///
-/// Counted on `overlay_color_image` rather than on either egui constructor
-/// because there is no longer one right constructor to look for: the polygon
-/// rasterizers hand over premultiplied pixels and `rasterize_model_data` hands
-/// over straight ones, so the arm is chosen from `RasterizeOutput::alpha` inside
-/// that one function. A call site that picked a constructor itself would be the
-/// regression — hence the second assertion.
+/// * The **handler** arm is still an opaque closure, and its rasterizer's
+///   alpha convention varies by kind — tiny-skia writes premultiplied,
+///   `rasterize_model_data` writes straight, and both arrive through the same
+///   `prepare_rasterize` arm. So its conversion must be `overlay_color_image`,
+///   the one function that reads `RasterizeOutput::alpha`, and a call site
+///   that picked an egui constructor itself would be the regression.
+/// * The **sites** arm is a described job now, and its reply's convention
+///   does not vary: `offload::execute` converts inside the job at the
+///   rasterizer's own declaration, the contract on
+///   `offload::JobOutput::OverlayRaster` is premultiplied-always, and
+///   `offload::tests::the_sites_render_is_byte_identical_direct_and_via_the_wire`
+///   pins the bytes. Its deliver therefore reads the buffer through
+///   `from_rgba_premultiplied`, which computes nothing — the same
+///   read-a-converted-raster shape `upload_section_raster` is *required* to
+///   have below — and exactly one such read may exist.
 #[test]
 fn both_overlay_rasterizers_convert_before_they_send() {
     let body = body_of(APP_FETCH, "pub(super) fn spawn_overlay_render(");
     let conversions = body.matches(OVERLAY_CONVERT_CALL).count();
     assert_eq!(
-        conversions, 2,
-        "`spawn_overlay_render` converts {conversions} of its two rasters \
-         before sending. Each `offload` arm has to do it: an unconverted \
-         `OverlayRenderResponse` has nowhere to be converted but \
-         `poll_overlay_render_results`, on the frame thread.",
+        conversions, 1,
+        "`spawn_overlay_render` has {conversions} `overlay_color_image` calls \
+         where its one remaining opaque arm needs exactly one. Zero means the \
+         handler raster arrives unconverted, with nowhere to be converted but \
+         `poll_overlay_render_results` on the frame thread; two means a \
+         described arm has gone back to converting what `offload::execute` \
+         already converted inside the job.",
     );
     assert!(
-        !body.contains(UNMULTIPLY) && !body.contains("from_rgba_premultiplied"),
-        "`spawn_overlay_render` names an egui alpha constructor directly. \
-         Which one is right depends on the overlay kind — tiny-skia writes \
-         premultiplied, `rasterize_model_data` writes straight, and both \
-         arrive through the same `prepare_rasterize` arm — so the choice has \
-         to be read off `RasterizeOutput::alpha` in `overlay_color_image`, not \
-         written out here.",
+        !body.contains(UNMULTIPLY),
+        "`spawn_overlay_render` unmultiplies somewhere. No arm may: the \
+         opaque one reads `RasterizeOutput::alpha` through \
+         `overlay_color_image`, and the described one receives pixels \
+         `offload::execute` already premultiplied inside the job.",
+    );
+    assert_eq!(
+        body.matches("from_rgba_premultiplied").count(),
+        1,
+        "`spawn_overlay_render` must read exactly one described reply through \
+         `from_rgba_premultiplied` — the compute-nothing read of the wire's \
+         premultiplied-always contract, in the sites deliver. More is an arm \
+         guessing a convention the kind's rasterizer did not declare; fewer \
+         means the described reply is being converted somewhere else, which \
+         can only be the frame thread.",
     );
 }
 

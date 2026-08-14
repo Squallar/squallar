@@ -238,7 +238,21 @@ pub struct OverlayRenderResponse {
     ///
     /// The renderer's `Vec<u8>` is dropped in the same closure that converts it,
     /// so the RGBA buffer and its `Color32` copy never coexist in the channel.
-    pub image: Arc<egui::ColorImage>,
+    ///
+    /// # `None` is a render that failed, and it must still be sent
+    ///
+    /// The described overlay path (`offload::JobRequest::Overlay`) can answer
+    /// nothing — a worker died mid-job, a wait for one lapsed, a reply's
+    /// buffer failed the dispatch's own length check — where the opaque
+    /// closures always produced pixels. The empty response travels anyway,
+    /// because this message is the **only** thing that clears the named panes'
+    /// `render_in_flight` marks: `ui_map_pane` dispatches on
+    /// `stale && !render_in_flight`, so a failure that went unreported would
+    /// leave every named pane believing a rasterization it will never hear
+    /// about is still running, and that layer could never be dispatched again
+    /// for the life of the session. The poller clears the marks for a `None`
+    /// exactly as for a kept result, and places nothing.
+    pub image: Option<Arc<egui::ColorImage>>,
     pub geo_bounds: GeoBounds,
     pub overlay_kind: OverlayKind,
     pub generation: u64,

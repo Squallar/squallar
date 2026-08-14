@@ -218,8 +218,13 @@ fn post_result(
                 // below, so the page adopts the buffer instead of being sent a
                 // second copy of it.
                 JobOutput::Volume(volume) => volume.to_bytes(),
+                // Already bytes: the raster **is** the payload, raw
+                // premultiplied RGBA with no framing of its own — the page
+                // side's guard is the dispatch's length check, see
+                // `offload::OUT_KIND_OVERLAY`.
+                JobOutput::OverlayRaster(rgba) => rgba,
                 // Answered above; naming it keeps the match exhaustive by value
-                // so a fifth output kind stops the build here rather than
+                // so a sixth output kind stops the build here rather than
                 // falling into a catch-all that posts an empty payload.
                 JobOutput::Frame(_) => unreachable!("the frame arm is above"),
             };

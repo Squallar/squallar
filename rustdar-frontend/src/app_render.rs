@@ -1236,6 +1236,18 @@ impl super::App {
                 continue;
             }
 
+            // **The un-wedge.** `None` is a described render that failed — a
+            // worker lost mid-job, a lapsed wait for one, a reply refused by
+            // the dispatch's length check — and the whole reason it was sent
+            // is the retain above: the in-flight marks are cleared for every
+            // named pane, which is what lets the layer be dispatched again,
+            // and there is nothing to upload or place. The panes keep whatever
+            // picture they have, which is what a failed radar render has
+            // always meant too.
+            let Some(image) = resp.image else {
+                continue;
+            };
+
             // Load texture once, then clone handle to all target panes.
             //
             // The pixels arrive already converted — see
@@ -1247,14 +1259,11 @@ impl super::App {
             // the rasterizer was handed a width and a height and answered with
             // exactly that many pixels, and a second copy of the numbers is a
             // second thing that can disagree with the texture being placed.
-            let [width, height] = resp.image.size;
+            let [width, height] = image.size;
             let (width, height) = (width as u32, height as u32);
             let tex_name = format!("overlay_{}", self.texture_counter);
-            let texture = ctx.load_texture(
-                tex_name,
-                Arc::clone(&resp.image),
-                egui::TextureOptions::LINEAR,
-            );
+            let texture =
+                ctx.load_texture(tex_name, Arc::clone(&image), egui::TextureOptions::LINEAR);
 
             // Every pane still named here wants the picture: the retain above is
             // what decided that, and it also cleared every in-flight mark.

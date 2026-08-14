@@ -102,10 +102,10 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context) {
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
-            image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            image: Some(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
                 [W as usize, H as usize],
                 &vec![255u8; (W * H) as usize * 4],
-            )),
+            ))),
             geo_bounds: bounds(),
             overlay_kind: KIND,
             generation: 9,
@@ -225,5 +225,59 @@ fn a_result_for_an_enabled_layer_still_lands() {
         !in_flight(&mut app),
         "a stored result must clear its own in-flight mark, exactly as it did \
          before the guard existed",
+    );
+}
+
+/// **The un-wedge.** A described render (`offload::JobRequest::Overlay`) can
+/// fail — a worker lost mid-job, a lapsed wait for one, a reply the dispatch's
+/// length check refused — and the failure arrives as a response carrying no
+/// image at all. It must clear the in-flight mark for every named pane exactly
+/// as a kept result does, and place nothing: `ui_map_pane` dispatches on
+/// `stale && !render_in_flight`, so a failure that skipped the clear would
+/// leave the layer un-dispatchable for the life of the session — wedged blank,
+/// with no error anywhere.
+///
+/// Off the same fixture as its two siblings, and the parked texture is the
+/// same instrument: whether the pane's picture survived is visible in the same
+/// field as whether something replaced it.
+#[test]
+fn a_failed_render_clears_the_in_flight_mark_and_touches_nothing() {
+    let ctx = egui::Context::default();
+    let (mut app, parked) = app_awaiting_a_render(&ctx);
+    assert!(
+        in_flight(&mut app),
+        "premise: the render must really be marked in flight, or the mark \
+         being clear afterwards says nothing",
+    );
+
+    app.channels
+        .overlay_render_sender
+        .send(crate::channels::OverlayRenderResponse {
+            image: None,
+            geo_bounds: bounds(),
+            overlay_kind: KIND,
+            generation: 9,
+            pane_indices: vec![0],
+            zoom: 32,
+            hit_map: None,
+        })
+        .expect("the receiver lives on the App");
+    app.poll_overlay_render_results(&ctx);
+
+    assert!(
+        !in_flight(&mut app),
+        "a failed render left its in-flight mark standing: the layer can \
+         never be dispatched again — the exact wedge the empty response \
+         exists to prevent",
+    );
+    assert_eq!(
+        current_id(&mut app),
+        Some(parked),
+        "a failed render must leave the picture on screen alone",
+    );
+    assert!(
+        !app.gui.pane(0).expect("pane 0").is_holding_raster(),
+        "a failed render staged a hold, so an empty upload would swap in over \
+         the picture the pane is rightly keeping",
     );
 }
