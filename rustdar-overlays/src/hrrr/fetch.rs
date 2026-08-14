@@ -214,6 +214,85 @@ fn exactly_one_submessage(count: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// The longitude envelope `rasterize_model_data`'s frame handling has actually
+/// been shown correct for.
+///
+/// HRRR CONUS measures -134.0955..-60.9172, corner-verified against real GRIB2
+/// section 3 in `hrrr::lambert::tests`. This is that with margin either side,
+/// and the margin matters in one direction only: the near edge is 40° from the
+/// antimeridian, far enough that no viewport containing this domain can also
+/// be written in a second longitude frame.
+const VALIDATED_DOMAIN_LON: std::ops::RangeInclusive<f64> = -140.0..=-50.0;
+
+/// Refuse a model domain whose longitude the renderer has never been shown to
+/// place correctly — and say what decision the refusal is asking for.
+///
+/// This is a guard against a state that decays *silently*. Today
+/// `DataSources::hrrr_url` hardcodes `/conus/`, so the only domain that can
+/// reach here is inside [`VALIDATED_DOMAIN_LON`] by 40°, and this never fires.
+/// The day a non-CONUS domain is added it fires immediately, at the moment and
+/// in front of the person who can choose correctly — rather than shipping a
+/// layer that silently paints nothing.
+///
+/// It is deliberately a refusal and not a log line: a warning nobody can act
+/// on is a defect, and this one has exactly one reader, who is mid-change.
+fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
+    // `min > max` and not just `!is_finite`: the bounds walk above seeds
+    // `min_lon` at `f64::MAX` and `max_lon` at `f64::MIN`, and both of those
+    // *are* finite, so a grid whose coordinates could not be walked arrives
+    // here as an inverted extent rather than a NaN one. Reported as itself,
+    // because it is a decode problem and the message below is not about
+    // decoding.
+    if !bounds.min_lon.is_finite() || !bounds.max_lon.is_finite() || bounds.min_lon > bounds.max_lon
+    {
+        return Err(format!(
+            "Model grid reported a non-finite or inverted longitude extent \
+             ({}..{}); its coordinates could not be walked",
+            bounds.min_lon, bounds.max_lon
+        ));
+    }
+    if VALIDATED_DOMAIN_LON.contains(&bounds.min_lon)
+        && VALIDATED_DOMAIN_LON.contains(&bounds.max_lon)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Model domain spans longitude {:.4}..{:.4}, outside the {:.1}..{:.1} \
+         envelope the renderer's longitude handling has been validated for \
+         (HRRR CONUS is -134.0955..-60.9172).\n\
+         \n\
+         This is not a decode failure — the grid decoded fine. The parse side \
+         folds longitude into [-180,180] (`lambert::normalize_longitude_degrees`) \
+         while the viewport is deliberately left unfolded \
+         (`OverlayTexturePlan::coverage`). For a domain near or across the \
+         antimeridian the two disagree by a whole turn: measured on a grid \
+         parked at the seam, identical ground paints 3294 pixels written one \
+         way and 0 written the other. A layer added without resolving this \
+         renders blank, with nothing to say why.\n\
+         \n\
+         The repair was left unbuilt on purpose, because three candidates are \
+         each correct for a different domain shape and nothing in the tree \
+         said which this domain needs:\n\
+         \x20 * a rigid whole-grid shift — exact only if the domain does not \
+         straddle the antimeridian;\n\
+         \x20 * a per-point shift — tears cells, because `rasterize_model_data` \
+         sizes every cell from its neighbours' pixel spacing, so two adjacent \
+         points shifted differently stretch one cell across the texture;\n\
+         \x20 * `GridCoords::wraps_longitude` — guards the index window, not \
+         this, and measures `false` for a seam-parked grid.\n\
+         \n\
+         Whoever added this domain is the person who can choose between them. \
+         The measurement, the instrument (`seam_probe.rs`) and the reasoning \
+         are in `campaigns/overlays/t17/` on the `campaign-harness` branch. \
+         Widen VALIDATED_DOMAIN_LON only together with the repair the new \
+         domain's shape calls for.",
+        bounds.min_lon,
+        bounds.max_lon,
+        VALIDATED_DOMAIN_LON.start(),
+        VALIDATED_DOMAIN_LON.end(),
+    ))
+}
+
 /// Parse GRIB2 bytes into `HrrrGridData`.
 ///
 /// The bytes must be exactly one record with exactly one submessage, and that is
@@ -310,6 +389,9 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         min_lon,
         max_lon,
     };
+    // Here, not in the rasterizer: this is where a *domain* first states its
+    // extent, and the person who changed the domain is standing here.
+    check_domain_longitude(&bounds)?;
 
     let (visible_points, value_range) = super::summarize_values(&values, param);
 
