@@ -854,7 +854,10 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     let vocabulary = worker_protocol_vocabulary();
     let arms = post_result_arms();
 
-    let mut shape = vec![format!("PROTOCOL_VERSION = {}", declared_protocol_version())];
+    let mut shape = vec![format!(
+        "PROTOCOL_VERSION = {}",
+        declared_protocol_version()
+    )];
     let mut written = Vec::new();
     for (arm, slice) in &arms {
         for ident in message_field_idents(slice) {
