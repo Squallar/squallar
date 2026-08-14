@@ -11,6 +11,8 @@ mod cf;
 pub mod fetch;
 mod h5;
 #[cfg(test)]
+mod measure_tmp;
+#[cfg(test)]
 mod tests;
 
 /// Which GOES orbital slot to fetch GLM data from.
