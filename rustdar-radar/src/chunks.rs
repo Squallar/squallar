@@ -1452,10 +1452,18 @@ impl std::fmt::Debug for ClosedVolume {
 
 /// What one round changed.
 ///
-/// A round that rolls describes **two** volumes: the one that closed, in
-/// [`Self::closed`], and the one now being assembled, in every other field. They
-/// are deliberately not merged — a caller reading a whole volume wants the first
-/// and a caller reading one tilt wants the second.
+/// An outcome carrying a [`Self::closed`] describes **two** volumes: the one
+/// that closed, there, and the one now being assembled, in every other field.
+/// They are deliberately not merged — a caller reading a whole volume wants the
+/// first and a caller reading one tilt wants the second.
+///
+/// **`closed` is not necessarily this round's roll.** A round that rolls and
+/// then fails parks its closed volume and a later round delivers it, so
+/// `closed.is_some()` does not imply `rolled_to.is_some()`, nor that
+/// `closed.progress.volume` is the volume before the one now being assembled.
+/// Read everything about the closed volume from the [`ClosedVolume`] itself,
+/// never by pairing it with the rest of this struct — see
+/// `ChunkPoller::park_for_next_round`.
 #[derive(Debug, Clone, Default)]
 pub struct PollOutcome {
     pub ingested: usize,
@@ -1466,10 +1474,14 @@ pub struct PollOutcome {
     pub sealed_angles: Vec<f32>,
     /// The volume rolled this round; `snapshot` now describes a new volume.
     pub rolled_to: Option<VolumeIndex>,
-    /// The volume that just closed, **with the scan it closed as**. Where
+    /// A volume that closed, **with the scan it closed as**. Where
     /// `volume_complete` for a finished volume is reported, and the only way to
-    /// reach that volume: the roll that produced this replaced the assembler
+    /// reach that volume: the roll that produced it replaced the assembler
     /// `snapshot` reads. See [`ClosedVolume`].
+    ///
+    /// Usually this round's roll, but not always — a roll whose round then
+    /// failed is delivered by a later one. See this struct's own doc before
+    /// pairing this with any other field.
     pub closed: Option<ClosedVolume>,
     pub progress: Option<VolumeProgress>,
     /// Keys that would not parse or bytes that would not decode. Skipped, not
@@ -1494,6 +1506,9 @@ pub struct ChunkPoller {
     /// roll — the caller sets it from what is on screen, which does not change
     /// just because the radar started a new volume.
     selection: CutSelection,
+    /// Volumes that closed in rounds that then failed, oldest first, waiting for
+    /// outcomes that reach the caller. See [`Self::park_for_next_round`].
+    pending_closed: std::collections::VecDeque<ClosedVolume>,
 }
 
 impl ChunkPoller {
@@ -1504,6 +1519,7 @@ impl ChunkPoller {
             consecutive_failures: 0,
             last_round_was_quiet: false,
             selection: CutSelection::All,
+            pending_closed: std::collections::VecDeque::new(),
         }
     }
 
@@ -1516,6 +1532,7 @@ impl ChunkPoller {
             consecutive_failures: 0,
             last_round_was_quiet: false,
             selection: CutSelection::All,
+            pending_closed: std::collections::VecDeque::new(),
         }
     }
 
@@ -1709,7 +1726,12 @@ impl ChunkPoller {
         // Before the first `.await`, for the same reason as in `poll`.
         let _ = crate::archive::shared_client();
 
-        let mut outcome = PollOutcome::default();
+        // As in `poll`: a volume closed by a round that then failed leaves on a
+        // later outcome, whichever way that one leaves. Oldest first.
+        let mut outcome = PollOutcome {
+            closed: self.pending_closed.pop_front(),
+            ..Default::default()
+        };
         if id.site() != self.site {
             return Ok(outcome);
         }
@@ -1718,7 +1740,8 @@ impl ChunkPoller {
             return Ok(outcome);
         }
         if self.should_roll_to(id) {
-            outcome.closed = self.roll(id.volume());
+            let closed = self.roll(id.volume());
+            self.deliver_or_queue(&mut outcome, closed);
             outcome.rolled_to = Some(id.volume());
         } else if self.current.is_none() {
             let mut next = VolumeAssembler::new(self.site.clone(), id.volume());
@@ -1744,6 +1767,7 @@ impl ChunkPoller {
             }
             Err(e) => {
                 self.consecutive_failures += 1;
+                self.park_for_next_round(&mut outcome);
                 return Err(e);
             }
         };
@@ -1850,6 +1874,87 @@ impl ChunkPoller {
         }
     }
 
+    /// Hold a closed volume back when the round it closed in ends in an error,
+    /// so a later outcome carries it.
+    ///
+    /// **What this guarantees: no `ClosedVolume` this poller has built is ever
+    /// dropped *by the poller*.** [`Self::roll`] is the only thing that closes a
+    /// volume, and it closes one by *replacing* the assembler
+    /// [`Self::snapshot`] reads — so the report is the only way back to that
+    /// volume, and an `Err` return drops the outcome carrying it. The volume
+    /// then never appears anywhere: no error names it, the next round describes
+    /// the volume after it, and a volume that finished assembling goes missing
+    /// while the caller sees what looks like an ordinary transient fetch
+    /// failure.
+    ///
+    /// Both round paths roll *before* they fetch — `poll` rolls on the probe
+    /// listing and then lists the new directory, `fetch_notified` rolls on the
+    /// chunk's own name and then downloads it — so in both, a failure lands
+    /// after the assembler has already moved. One remedy covers both, because
+    /// both build their report in a `PollOutcome` and both leave through an
+    /// `Err` that discards it.
+    ///
+    /// # How far the guarantee actually reaches
+    ///
+    /// Only to the poller's own edge, and the distance is worth stating plainly:
+    /// this survives **one or two consecutive failures**, which is the common
+    /// case and the whole point, not an arbitrary number of them. A parked
+    /// volume still dies with the poller or the round, at four places the poller
+    /// cannot see — `rustdar_frontend::chunk_feed` rebuilding a retired feed
+    /// after `RETRY_AFTER`, `retain_live` dropping a site, `finish_round`
+    /// finding no feed to return the poller to, and `app_chunks` discarding a
+    /// round whose fetch generation went stale. Feed retirement at three
+    /// consecutive errors is what bounds the queue below, and it is also what
+    /// ends the guarantee.
+    ///
+    /// # Why a queue and not a slot
+    ///
+    /// A slot has to overwrite, and overwriting is the very bug this exists to
+    /// stop. An earlier version argued a slot could never be occupied at roll
+    /// time, on the grounds that rolling again needs the current assembler to
+    /// have a volume time, that a fresh one has none until a chunk is ingested,
+    /// and that a round which ingests returns `Ok` and drains on the way. That
+    /// last clause is false: `poll`'s mid-round failure path ingests a chunk and
+    /// *then* leaves through `Err`, re-parking as it goes, so one round reaches
+    /// "parked volume, assembler with a volume time" — from which the next
+    /// notification rolls. Two volumes then want the slot, and the older is the
+    /// one that would have been thrown away.
+    ///
+    /// So the order is explicit instead: oldest out first, and nothing is ever
+    /// overwritten. Growth needs a round that both rolls and fails, every one of
+    /// which counts toward the retirement that ends the feed at three.
+    fn park_for_next_round(&mut self, outcome: &mut PollOutcome) {
+        if let Some(closed) = outcome.closed.take() {
+            log::debug!(
+                "{}: volume {} closed in a round that failed; holding its report \
+                 for a later one ({} now waiting)",
+                self.site,
+                closed.progress.volume.get(),
+                self.pending_closed.len() + 1
+            );
+            // Front, not back: this one was drained before the ones already
+            // queued were added, so it is the oldest of them.
+            self.pending_closed.push_front(closed);
+        }
+    }
+
+    /// Give a freshly closed volume to this round if it is not already carrying
+    /// one, and queue it behind the others otherwise.
+    ///
+    /// The one place a `ClosedVolume` may be assigned, so that "never
+    /// overwritten" is a property of the code rather than of an argument about
+    /// which states are reachable. See [`Self::park_for_next_round`].
+    fn deliver_or_queue(&mut self, outcome: &mut PollOutcome, closed: Option<ClosedVolume>) {
+        let Some(closed) = closed else {
+            return;
+        };
+        if outcome.closed.is_none() {
+            outcome.closed = Some(closed);
+        } else {
+            self.pending_closed.push_back(closed);
+        }
+    }
+
     /// One round: no sleeping, no looping, no self-scheduling.
     pub async fn poll(&mut self, sources: &crate::sources::DataSources) -> Result<PollOutcome> {
         // Before the first `.await`, so merely polling this future installs the
@@ -1857,7 +1962,12 @@ impl ChunkPoller {
         let _ = crate::archive::shared_client();
 
         let now = chrono::Utc::now().naive_utc();
-        let mut outcome = PollOutcome::default();
+        // A volume closed by an earlier round that then failed rides out on this
+        // one, whichever way it leaves. Oldest first. See `park_for_next_round`.
+        let mut outcome = PollOutcome {
+            closed: self.pending_closed.pop_front(),
+            ..Default::default()
+        };
 
         let volume = match self.plan(now) {
             PollPlan::Discover => {
@@ -1865,6 +1975,7 @@ impl ChunkPoller {
                     Ok(volume) => volume,
                     Err(e) => {
                         self.consecutive_failures += 1;
+                        self.park_for_next_round(&mut outcome);
                         return Err(e);
                     }
                 };
@@ -1884,6 +1995,7 @@ impl ChunkPoller {
                     Ok(listed) => listed,
                     Err(e) => {
                         self.consecutive_failures += 1;
+                        self.park_for_next_round(&mut outcome);
                         return Err(e);
                     }
                 };
@@ -1892,7 +2004,8 @@ impl ChunkPoller {
                     .first()
                     .is_some_and(|c| current_time.is_none_or(|t| c.volume_time() > t));
                 if started {
-                    outcome.closed = self.roll(next);
+                    let closed = self.roll(next);
+                    self.deliver_or_queue(&mut outcome, closed);
                     outcome.rolled_to = Some(next);
                     next
                 } else {
@@ -1909,6 +2022,7 @@ impl ChunkPoller {
             Ok(listed) => listed,
             Err(e) => {
                 self.consecutive_failures += 1;
+                self.park_for_next_round(&mut outcome);
                 return Err(e);
             }
         };
@@ -1965,7 +2079,22 @@ impl ChunkPoller {
             // the cache the seals invalidated is state on the assembler and
             // outlives the round. `consecutive_failures` was already counted at
             // the break.
+            //
+            // **Known loss, not yet repaired: `sealed_elevations`.** A cut that
+            // sealed earlier in this round is dropped here with the outcome, and
+            // it does not come back. The frontend invalidates panes through
+            // `render_dispatch::reset_panes_for_tilts`, which matches a pane's
+            // elevation against *this round's* angles within
+            // `ELEVATION_TOLERANCE` — so a lost 2.4° seal is not repaired by the
+            // next round sealing 0.5°. That pane waits for another seal at its
+            // own tilt, a volume period away, or for the volume to close. It is
+            // left alone deliberately: parking these the way the closed volume
+            // above is parked would have `fill_sealed_angles` resolve them
+            // against whatever volume is current at delivery, which is the
+            // cross-volume attribution the frontend's `apply_chunk_outcome`
+            // documents at length — a wrong angle rather than a late one.
             self.warm_snapshot(&outcome);
+            self.park_for_next_round(&mut outcome);
             return Err(e);
         }
 
