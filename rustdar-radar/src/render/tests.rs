@@ -4001,3 +4001,82 @@ fn neighbours(
     }
     out
 }
+
+/// **Consecutive gates tile: the boundary between one gate and the next is a
+/// single number, so no seam and no overlap can open between them whatever the
+/// slant-to-ground conversion does to their spacing.**
+///
+/// This is the property [`gate_ground_edges`] exists for, and it is a property
+/// of *how* the edges are produced rather than of the conversion inside them.
+/// A caller that asked for a centre and split a constant depth either side
+/// would satisfy it only while the conversion is linear — which the tangent
+/// plane is and [`crate::beam::ground_range_km`]'s arc is not.
+///
+/// # What the second half measures, and why it is not alarming
+///
+/// The discriminating half rebuilds what a centre-plus-constant-depth painter
+/// would produce over the same gates and measures the worst mismatch: **1.90 m**
+/// at 19.5° over 400 gates. At the plan view's 4.4522 px/km that is 0.0085 of a
+/// cell, and the worst case anywhere on the tilt ladder is 0.026 of a cell. So
+/// this is not a seam anyone has been looking at — it is a guard that keeps one
+/// from opening, and the number is here so the next reader can see the size of
+/// what is being prevented rather than assume it was a visible artifact.
+///
+/// The reason to build it out rather than accept a sub-pixel mismatch is that
+/// exactness here is free: sharing the boundary costs one fewer evaluation per
+/// gate than computing both ends of every span.
+#[test]
+fn consecutive_gates_tile_with_no_seam() {
+    // The steepest cut the fleet flies, where the conversion is least linear
+    // and a per-gate spelling would drift fastest.
+    const ELEV_DEG: f64 = 19.5;
+    const FIRST_KM: f64 = 2.125;
+    const INTERVAL_KM: f64 = 0.25;
+    const GATES: usize = 400;
+
+    let spans: Vec<GateSpan> = gate_ground_edges(FIRST_KM, INTERVAL_KM, GATES, |slant_km| {
+        crate::beam::ground_range_km(slant_km, ELEV_DEG)
+    })
+    .collect();
+    assert_eq!(spans.len(), GATES);
+
+    // The property: bit-for-bit, not nearly. A sub-ulp gap is still a gap, and
+    // one along every gate boundary of every radial is a systematic artifact.
+    for (j, pair) in spans.windows(2).enumerate() {
+        assert_eq!(
+            pair[0].far_km.to_bits(),
+            pair[1].near_km.to_bits(),
+            "gate {j} ends at {} but gate {} starts at {} — the shared boundary \
+             was evaluated twice instead of once",
+            pair[0].far_km,
+            j + 1,
+            pair[1].near_km,
+        );
+    }
+    // Monotone and non-empty, so "tiles" means tiles outward and not that every
+    // span collapsed to a point.
+    for (j, span) in spans.iter().enumerate() {
+        assert!(
+            span.far_km > span.near_km,
+            "gate {j} has no depth: {span:?}",
+        );
+    }
+
+    // The discriminating half. Rebuild the centre-plus-constant-depth form the
+    // old signature invited and show it does *not* tile under this conversion,
+    // so the assertion above is not true of any spelling.
+    let ground = |slant_km: f64| crate::beam::ground_range_km(slant_km, ELEV_DEG);
+    let flat_depth = INTERVAL_KM * ELEV_DEG.to_radians().cos();
+    let worst = (0..GATES - 1)
+        .map(|j| {
+            let centre = ground(FIRST_KM + j as f64 * INTERVAL_KM);
+            let next = ground(FIRST_KM + (j + 1) as f64 * INTERVAL_KM);
+            ((centre + flat_depth / 2.0) - (next - flat_depth / 2.0)).abs()
+        })
+        .fold(0.0f64, f64::max);
+    assert!(
+        (worst - 0.001_903).abs() < 1e-5,
+        "the centre-plus-depth seam moved: {:.4} m, documented as 1.903 m",
+        worst * 1000.0,
+    );
+}
