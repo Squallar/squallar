@@ -10,15 +10,15 @@ rustdar-egui/src/actions.rs	60	26
 rustdar-egui/src/config_store.rs	14	14
 rustdar-egui/src/input_harness.rs	1244	1234
 rustdar-egui/src/overlay_cache.rs	208	200
-rustdar-egui/src/pane.rs	770	745
+rustdar-egui/src/pane.rs	786	761
 rustdar-egui/src/pane_content.rs	205	192
 rustdar-egui/src/parity_walk.rs	308	267
 rustdar-egui/src/point_painter.rs	55	0
 rustdar-egui/src/tile_source.rs	210	193
 rustdar-egui/src/tiles.rs	131	120
-rustdar-egui/src/ui.rs	1910	1685
+rustdar-egui/src/ui.rs	1912	1687
 rustdar-egui/src/ui_catalog.rs	481	471
-rustdar-egui/src/ui_config.rs	576	552
+rustdar-egui/src/ui_config.rs	579	555
 rustdar-egui/src/ui_fade.rs	98	94
 rustdar-egui/src/ui_glyphs.rs	220	208
 rustdar-egui/src/ui_input.rs	342	342
@@ -46,8 +46,8 @@ rustdar-egui/src/volume_iso.rs	75	60
 rustdar-egui/src/volume_view.rs	266	259
 rustdar-frontend/src/app.rs	1226	879
 rustdar-frontend/src/app_chunks.rs	230	145
-rustdar-frontend/src/app_fetch.rs	1136	627
-rustdar-frontend/src/app_render.rs	2125	1480
+rustdar-frontend/src/app_fetch.rs	1136	637
+rustdar-frontend/src/app_render.rs	2136	1490
 rustdar-frontend/src/app_state.rs	194	108
 rustdar-frontend/src/budget.rs	237	199
 rustdar-frontend/src/channels.rs	61	58
@@ -135,7 +135,7 @@ rustdar-platform/src/os_location/unsupported.rs	11	0
 rustdar-platform/src/os_location/windows.rs	233	233
 rustdar-platform/src/platform.rs	236	122
 rustdar-platform/src/run.rs	31	0
-rustdar-radar/src/archive.rs	249	222
+rustdar-radar/src/archive.rs	249	225
 rustdar-radar/src/azimuth.rs	191	191
 rustdar-radar/src/beam.rs	80	80
 rustdar-radar/src/catalogue.rs	137	122
@@ -150,7 +150,7 @@ rustdar-radar/src/hhc.rs	411	380
 rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	118
+rustdar-radar/src/level3.rs	188	140
 rustdar-radar/src/nrot.rs	3228	3169
 rustdar-radar/src/nyquist.rs	126	107
 rustdar-radar/src/palette.rs	400	390
