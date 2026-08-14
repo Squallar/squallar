@@ -4,6 +4,36 @@ use super::lambert_fixture::{
 };
 use super::*;
 
+/// The rasterizer over a grid by reference. Every comparison in this module is
+/// between *whole* grids — the window under test is the internal one — so the
+/// described input's `Whole` carry is built at the call; shadows the crate
+/// function so fourteen call sites stay written against the grid.
+fn rasterize_model_data(
+    grid: &HrrrGridData,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+) -> RasterizeOutput {
+    super::rasterize_model_data(
+        &ModelDataInput::Whole(std::sync::Arc::new(grid.clone())),
+        bounds,
+        width,
+        height,
+    )
+}
+
+/// [`projection_window`] over a grid's own fields, as the whole-grid arm
+/// resolves it — the shim that keeps this module's window probes written
+/// against the grid.
+fn projection_window(
+    grid: &HrrrGridData,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+) -> IndexWindow {
+    super::projection_window(&grid.coords, grid.ni, grid.nj, bounds, width, height)
+}
+
 /// Texture sides chosen to straddle the interesting regime change: at 1-8 px
 /// a grid cell is far smaller than a pixel, at 256 px far larger.
 const SIDES: &[u32] = &[1, 2, 7, 64, 256];

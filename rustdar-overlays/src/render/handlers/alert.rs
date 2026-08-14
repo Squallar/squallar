@@ -11,10 +11,9 @@ use crate::render::controls::{
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
     OverlayItem, OverlayKind, OverlayState, PopupAction, PopupActionKind, PopupContent,
-    PopupSection, RasterizeContext, RasterizeFn, RenderMode,
+    PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
-use crate::types::GeoBounds;
 
 /// `pub`, not `pub(crate)`: `rustdar-frontend`'s described-job dispatch tests
 /// seed a live registry with alerts through `apply_fetch_result`, which takes
@@ -217,9 +216,9 @@ impl NwsAlertHandler {
             .count()
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder both
-    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
-    /// and the described job cannot come to capture different state.
+    /// What the rasterizer reads, captured once — the **one** builder
+    /// `prepare_job` answers from, kept a private helper so a second dispatch
+    /// path could not quietly capture different state.
     ///
     /// The rows are [`rasterize::AlertPaint`], not whole [`NwsAlert`]s: the
     /// id, the category and the geometry are everything the raster reads, and
@@ -484,16 +483,7 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
-    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let input = self.paint_input(ctx)?;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_nws_alerts(&input, bounds, width, height)
-        }))
-    }
-
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        // The same helper `prepare_rasterize` captures from, so the described
-        // job and the closure cannot come to read different state.
         self.paint_input(ctx).map(HandlerJobInput::Alerts)
     }
 

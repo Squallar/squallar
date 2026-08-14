@@ -146,8 +146,11 @@ impl HitMap {
 /// copy, `from_rgba_unmultiplied` is a copy through a 64 KiB lookup table — and
 /// picking the wrong one does not fail, it shifts every translucent colour. So
 /// the convention is carried on [`RasterizeOutput`] rather than known by the
-/// consumer: `app_fetch::overlay_color_image` reads it off the value it was
-/// handed and cannot be written to assume one.
+/// consumer: `rustdar_frontend::offload::execute`'s output stage reads it off
+/// the value it was handed, converts the straight case inside the job, and
+/// answers premultiplied-always — so the one page-side read is a
+/// compute-nothing `from_rgba_premultiplied` that cannot be written to assume
+/// the wrong thing.
 ///
 /// It has to be per-rasterizer, not per-crate, because this module genuinely
 /// produces both. Everything drawn through tiny-skia is [`Self::Premultiplied`]
@@ -1578,17 +1581,43 @@ fn merc_y_to_lat(merc_y: f64) -> f64 {
 // ── Model data (HRRR) rasterization ──────────────────────────────────────
 
 /// Half-open `(i, j)` ranges of the grid the rasterizer touches.
+///
+/// Public because it is on the wire: [`ModelWindow`] carries the window its
+/// values were cut to, computed once at the dispatch and never recomputed on
+/// the far side — the window math runs through libm (`index_bounds` projects),
+/// and a worker that re-derived it could land one index off at an exact
+/// boundary and read outside the values it was sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexWindow {
-    i0: usize,
-    i1: usize,
-    j0: usize,
-    j1: usize,
+pub struct IndexWindow {
+    pub i0: usize,
+    pub i1: usize,
+    pub j0: usize,
+    pub j1: usize,
 }
 
 impl IndexWindow {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.i0 >= self.i1 || self.j0 >= self.j1
+    }
+
+    /// Points inside the window.
+    pub fn area(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else {
+            (self.i1 - self.i0) * (self.j1 - self.j0)
+        }
+    }
+
+    /// This window cut down to the grid it indexes, so a window off a message
+    /// port can never name a point past the grid that arrived beside it.
+    fn clamped(&self, ni: usize, nj: usize) -> Self {
+        Self {
+            i0: self.i0.min(ni),
+            i1: self.i1.min(ni),
+            j0: self.j0.min(nj),
+            j1: self.j1.min(nj),
+        }
     }
 
     /// The cells this window can *draw*: one ring in from the edge, because
@@ -1650,16 +1679,18 @@ fn grow_bounds(bounds: &GeoBounds, lon_pad: f64, merc_pad: f64) -> GeoBounds {
 ///    to the box instead blanks the overlay below ~0.3 cells per texture, i.e.
 ///    from about map zoom 19 up, where a single cell covers the whole texture.
 fn projection_window(
-    grid: &HrrrGridData,
+    coords: &crate::hrrr::GridCoords,
+    ni: usize,
+    nj: usize,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
 ) -> IndexWindow {
     let full = IndexWindow {
         i0: 0,
-        i1: grid.ni,
+        i1: ni,
         j0: 0,
-        j1: grid.nj,
+        j1: nj,
     };
 
     // A grid with a longitude discontinuity in it — across the anti-meridian or
@@ -1668,7 +1699,7 @@ fn projection_window(
     // reach this window is built on stops describing it. The *box* crossing the
     // seam is handled inside `index_bounds`; this is the same hazard from the
     // grid's side, which nothing there can see.
-    if grid.coords.wraps_longitude() {
+    if coords.wraps_longitude() {
         return full;
     }
 
@@ -1676,7 +1707,7 @@ fn projection_window(
     // reach the texture sit within a cell of the box, where the spacing is the
     // same to well inside the headroom in `CELL_REACH`.
     let edge_lat = bounds.min_lat.abs().max(bounds.max_lat.abs());
-    let Some(cell_deg) = grid.coords.cell_span_degrees(edge_lat) else {
+    let Some(cell_deg) = coords.cell_span_degrees(edge_lat) else {
         return full;
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1686,7 +1717,7 @@ fn projection_window(
         + PIXEL_REACH * (mb.merc_y_max - mb.merc_y_min) / height.max(1) as f64;
 
     let grown = grow_bounds(bounds, lon_pad, merc_pad);
-    let Some((fi0, fi1, fj0, fj1)) = grid.coords.index_bounds(&grown, grid.ni, grid.nj) else {
+    let Some((fi0, fi1, fj0, fj1)) = coords.index_bounds(&grown, ni, nj) else {
         return full;
     };
 
@@ -1696,25 +1727,187 @@ fn projection_window(
     let high = |f: f64, n: usize| (f.ceil() + 1.0).max(0.0).min(n as f64) as usize;
 
     IndexWindow {
-        i0: low(fi0, grid.ni),
-        i1: high(fi1, grid.ni),
-        j0: low(fj0, grid.nj),
-        j1: high(fj1, grid.nj),
+        i0: low(fi0, ni),
+        i1: high(fi1, ni),
+        j0: low(fj0, nj),
+        j1: high(fj1, nj),
+    }
+}
+
+/// What [`rasterize_model_data`] reads — the model-grid overlay's input, in
+/// the two carries its size forces where every other kind needs one.
+///
+/// The HRRR values vector is 1,905,141 `f32` — **7.62 MB** — and the raster
+/// only ever reads the points inside its own [`projection_window`]. So the
+/// input is an enum over *how much of the grid is in hand*:
+///
+///  * [`Self::Whole`] is the dispatch's carry: the grid as fetched, by
+///    `Arc`, so the native path (which moves this enum by value through the
+///    pool and serialises nothing) pays a refcount where every other carry
+///    would pay a memcpy.
+///  * [`Self::Window`] is the wire's carry: the window and exactly its
+///    values. `rustdar_frontend::offload`'s encoder cuts a `Whole` down to
+///    this at `to_bytes` time — the one place that knows the texture's
+///    bounds — and its decoder only ever produces this form.
+///
+/// Both arms run the one rasterizer, and the byte parity between them is
+/// pinned twice: `render::rasterize::model_window_tests` proves a proper
+/// subset window paints identically to the whole grid, and
+/// `rustdar_frontend::offload::tests` proves it again through the codec.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelDataInput {
+    /// The grid as fetched, whole, by reference.
+    Whole(std::sync::Arc<HrrrGridData>),
+    /// The projection window and exactly its values — what travels.
+    Window(ModelWindow),
+}
+
+/// The wire form of a model-grid raster: the grid's shape and coordinates,
+/// the [`IndexWindow`] its values were cut to, and those values alone.
+///
+/// `coords` travels whole on either arm because its cost is nothing like the
+/// values': the Lambert case — every real HRRR fetch — is a 104-byte constant
+/// struct ([`crate::hrrr::lambert::LambertGridParts`]), and the explicit case
+/// (materialised coordinate arrays; no production source produces one) never
+/// has a proper-subset window to cut to, since [`projection_window`] can only
+/// narrow a Lambert grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelWindow {
+    pub parameter: crate::hrrr::ModelParameter,
+    /// The **full grid's** shape — indices in `win` and `coords` are stated
+    /// against it, exactly as they are against a whole grid.
+    pub ni: usize,
+    pub nj: usize,
+    pub coords: crate::hrrr::GridCoords,
+    /// The window `values` covers, computed at the dispatch and carried —
+    /// see [`IndexWindow`] for why it is never recomputed here.
+    pub win: IndexWindow,
+    /// Row-major within `win`: point `(i, j)` of the grid is
+    /// `values[(j - win.j0) * (win.i1 - win.i0) + (i - win.i0)]`.
+    pub values: Vec<f32>,
+}
+
+impl ModelDataInput {
+    pub fn parameter(&self) -> crate::hrrr::ModelParameter {
+        match self {
+            Self::Whole(grid) => grid.parameter,
+            Self::Window(window) => window.parameter,
+        }
+    }
+
+    /// The full grid's `(ni, nj)`.
+    pub fn shape(&self) -> (usize, usize) {
+        match self {
+            Self::Whole(grid) => (grid.ni, grid.nj),
+            Self::Window(window) => (window.ni, window.nj),
+        }
+    }
+
+    pub fn coords(&self) -> &crate::hrrr::GridCoords {
+        match self {
+            Self::Whole(grid) => &grid.coords,
+            Self::Window(window) => &window.coords,
+        }
+    }
+
+    /// The index window a raster of `bounds` at `width` × `height` may draw
+    /// from: computed for a whole grid, **carried** for a window — the
+    /// window's values are all it has, so the window it was cut to is the
+    /// only honest answer whatever bounds are asked about.
+    pub fn window_for(&self, bounds: &GeoBounds, width: u32, height: u32) -> IndexWindow {
+        let (ni, nj) = self.shape();
+        match self {
+            Self::Whole(grid) => projection_window(&grid.coords, ni, nj, bounds, width, height),
+            Self::Window(window) => window.win.clamped(ni, nj),
+        }
+    }
+
+    /// The value at grid point `(i, j)`, or `None` where there is none to
+    /// read — past a short values vector on the whole arm (the same skip the
+    /// rasterizer has always made there), or outside the carried window.
+    fn value_at(&self, i: usize, j: usize) -> Option<f32> {
+        match self {
+            Self::Whole(grid) => grid.values.get(j * grid.ni + i).copied(),
+            Self::Window(window) => {
+                let win = &window.win;
+                if i < win.i0 || i >= win.i1 || j < win.j0 || j >= win.j1 {
+                    return None;
+                }
+                window
+                    .values
+                    .get((j - win.j0) * (win.i1 - win.i0) + (i - win.i0))
+                    .copied()
+            }
+        }
+    }
+
+    /// One row of `win`'s values, exactly as the wire writes them: the whole
+    /// arm slices its values vector (padding with NaN where the vector runs
+    /// short of `ni × nj`, which paints nothing — `color_for_value(NAN)` is
+    /// transparent, pinned by `model_nan_tests`), the window arm hands back
+    /// the row it carries.
+    ///
+    /// A callback per row rather than a returned `Vec` so the encoder writes
+    /// straight from the grid's own storage — one pass, no intermediate
+    /// buffer of up to 7.62 MB.
+    pub fn for_each_window_row(&self, win: &IndexWindow, mut f: impl FnMut(&[f32])) {
+        if win.is_empty() {
+            return;
+        }
+        match self {
+            Self::Whole(grid) => {
+                let mut padded: Vec<f32> = Vec::new();
+                for j in win.j0..win.j1 {
+                    let start = j * grid.ni + win.i0;
+                    let end = j * grid.ni + win.i1;
+                    if end <= grid.values.len() {
+                        f(&grid.values[start..end]);
+                    } else {
+                        padded.clear();
+                        padded.extend(
+                            (start..end).map(|k| grid.values.get(k).copied().unwrap_or(f32::NAN)),
+                        );
+                        f(&padded);
+                    }
+                }
+            }
+            Self::Window(window) => {
+                // `win` is this input's own window (what `window_for` answers),
+                // stated relative to the carried one so a caller asking for a
+                // clamped sub-window still gets rows of the width it asked for.
+                let carried = &window.win;
+                let row_w = carried.i1 - carried.i0;
+                for j in win.j0..win.j1 {
+                    let row = (j - carried.j0) * row_w;
+                    f(&window.values[row + (win.i0 - carried.i0)..row + (win.i1 - carried.i0)]);
+                }
+            }
+        }
     }
 }
 
 /// Writes pixels directly rather than going through tiny-skia: one filled
 /// rectangle per grid point, sized from its neighbour spacing.
+///
+/// Takes the wire-form input the described job decodes back into
+/// ([`ModelDataInput`]), the way [`SitesInput`] and its siblings are taken:
+/// "over a port" and "on this thread" run the same function, and byte
+/// identity between the whole grid and its window is a pinned property
+/// rather than a hope.
 pub fn rasterize_model_data(
-    grid: &HrrrGridData,
+    input: &ModelDataInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
     let size = (width * height * 4) as usize;
     let mut rgba = vec![0u8; size];
+    let (ni, nj) = input.shape();
+    let parameter = input.parameter();
+    let coords = input.coords();
 
-    if grid.values.is_empty() || width == 0 || height == 0 || grid.ni == 0 || grid.nj == 0 {
+    let empty = matches!(input, ModelDataInput::Whole(grid) if grid.values.is_empty());
+    if empty || width == 0 || height == 0 || ni == 0 || nj == 0 {
         return RasterizeOutput {
             rgba,
             hit_cells: None,
@@ -1725,15 +1918,14 @@ pub fn rasterize_model_data(
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
-    let ni = grid.ni;
-    let nj = grid.nj;
 
     // `coords.at` is the Lambert inverse for HRRR, and this loop used to run it
     // over all 1.9 M points — two thirds of this function's cost, on the
     // background render thread, re-paid on every zoom step and every third of a
     // viewport of pan (`OverlayTextureCache::needs_rerender`). Only points that
-    // can influence a pixel of *this* texture are projected now.
-    let win = projection_window(grid, bounds, width, height);
+    // can influence a pixel of *this* texture are projected now — and for a
+    // windowed input, only those points' values ever travelled at all.
+    let win = input.window_for(bounds, width, height);
     if win.is_empty() {
         return RasterizeOutput {
             rgba,
@@ -1747,7 +1939,7 @@ pub fn rasterize_model_data(
     let mut px_coords: Vec<(f32, f32)> = Vec::with_capacity(win_w * (win.j1 - win.j0));
     for j in win.j0..win.j1 {
         for i in win.i0..win.i1 {
-            match grid.coords.at(j * ni + i) {
+            match coords.at(j * ni + i) {
                 Some((lat, lon)) => px_coords.push(mb.project(lat, lon, w, h)),
                 None => px_coords.push((f32::NAN, f32::NAN)),
             }
@@ -1759,12 +1951,10 @@ pub fn rasterize_model_data(
     let draw = win.interior(ni, nj);
     for j in draw.j0..draw.j1 {
         for i in draw.i0..draw.i1 {
-            let idx = j * ni + i;
-            if idx >= grid.values.len() {
+            let Some(value) = input.value_at(i, j) else {
                 continue;
-            }
-            let value = grid.values[idx];
-            let color = grid.parameter.color_for_value(value);
+            };
+            let color = parameter.color_for_value(value);
             if color[3] == 0 {
                 continue;
             }
@@ -1850,6 +2040,9 @@ pub(crate) mod lambert_fixture;
 
 #[cfg(test)]
 mod model_nan_tests;
+
+#[cfg(test)]
+mod model_window_tests;
 
 #[cfg(test)]
 mod projection_window_tests;

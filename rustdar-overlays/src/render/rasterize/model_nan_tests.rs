@@ -32,7 +32,8 @@ fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
 }
 
 fn painted_pixels(grid: &HrrrGridData) -> usize {
-    let out = rasterize_model_data(grid, &BOUNDS, 64, 64);
+    let input = ModelDataInput::Whole(std::sync::Arc::new(grid.clone()));
+    let out = rasterize_model_data(&input, &BOUNDS, 64, 64);
     out.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
 }
 
@@ -126,7 +127,12 @@ fn a_grid_shape_mismatch_does_not_paint_padded_points() {
     // Claim 4x4 while supplying only 4 coordinates and 4 values.
     g.ni = 4;
     g.nj = 4;
-    let out = rasterize_model_data(&g, &BOUNDS, 64, 64);
+    let out = rasterize_model_data(
+        &ModelDataInput::Whole(std::sync::Arc::new(g)),
+        &BOUNDS,
+        64,
+        64,
+    );
     assert_eq!(out.rgba.len(), 64 * 64 * 4, "must not overrun the buffer");
 
     let bottom_row = &out.rgba[(63 * 64 * 4)..];

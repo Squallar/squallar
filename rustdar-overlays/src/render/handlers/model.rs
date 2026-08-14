@@ -9,11 +9,10 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
-    RasterizeContext, RenderMode,
+    FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler, OverlayKind,
+    OverlayLegend, OverlayState, RasterizeContext, RenderMode,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
-use crate::types::GeoBounds;
+use crate::render::rasterize;
 
 /// How many parameters' grids stay resident at once.
 ///
@@ -27,7 +26,7 @@ use crate::types::GeoBounds;
 /// cache for the parameter that pane selected.
 ///
 /// Below the pane count, a miss does not cost a refetch — it costs a **picture**.
-/// `prepare_rasterize` answers `None`, `app_fetch` clears the render marks and
+/// `prepare_job` answers `None`, `app_fetch` clears the render marks and
 /// returns, and the pane goes on drawing its last texture at its old bounds with
 /// nothing in the code that will re-ask: [`OverlayHandler::auto_fetch_delay`]
 /// reads the handler-global `fetch_time` that *any* parameter's successful fetch
@@ -84,7 +83,7 @@ const _: () = assert!(MODEL_GRID_CACHE_ENTRIES >= 2);
 ///
 /// The recency list is behind a `RefCell` because every *reader* of a grid
 /// reaches it through an `&self` method of [`OverlayHandler`] —
-/// `hover_value_at`, `prepare_rasterize`, `controls`, `has_data`. `RenderCache`
+/// `hover_value_at`, `prepare_job`, `controls`, `has_data`. `RenderCache`
 /// takes `&mut self` in `get` for exactly this reason, "a lookup that did not
 /// count as a use would let the pane currently on screen age out while an
 /// unwatched one survived"; here the trait forbids `&mut self`, so the
@@ -381,14 +380,17 @@ impl OverlayHandler for ModelDataHandler {
         })
     }
 
-    fn prepare_rasterize(
-        &self,
-        _ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    /// The [`Whole`](rasterize::ModelDataInput::Whole) carry: an `Arc` clone
+    /// of the selected parameter's resident grid, so describing the job costs
+    /// a refcount here and the values memcpy — the window cut — happens only
+    /// where bytes must be built anyway, in the web encoder that knows the
+    /// texture's bounds. The `Arc` never crosses a port; see
+    /// [`rasterize::ModelDataInput`].
+    fn prepare_job(&self, _ctx: &RasterizeContext) -> Option<HandlerJobInput> {
         let grid = self.cached_grids.get(self.selected_param)?.clone();
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_model_data(&grid, bounds, width, height)
-        }))
+        Some(HandlerJobInput::ModelData(
+            rasterize::ModelDataInput::Whole(grid),
+        ))
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
@@ -902,7 +904,7 @@ mod tests {
     /// its own config. Every one of them must find its grid here.
     ///
     /// This is the case a cap below the pane count breaks, and it breaks
-    /// *silently*: `prepare_rasterize` answers `None`, `app_fetch` clears the
+    /// *silently*: `prepare_job` answers `None`, `app_fetch` clears the
     /// render marks and returns, and the starved pane goes on drawing its last
     /// texture at its old bounds. Nothing re-asks — `auto_fetch_delay` reads the
     /// handler-global `fetch_time` that any parameter's fetch stamps, and
@@ -927,7 +929,7 @@ mod tests {
             h.selected_param = p;
             assert!(h.has_data(), "the pane showing {p:?} has no grid");
             assert!(
-                h.prepare_rasterize(&rasterize_ctx()).is_some(),
+                h.prepare_job(&rasterize_ctx()).is_some(),
                 "the pane showing {p:?} would be skipped by app_fetch and left \
                  drawing a stale texture",
             );
@@ -1042,10 +1044,10 @@ mod tests {
         let p = h.cached_grids.recency_order()[0];
         h.selected_param = p;
         assert!(
-            h.prepare_rasterize(&rasterize_ctx()).is_some(),
+            h.prepare_job(&rasterize_ctx()).is_some(),
             "the fixture must answer a rasterize",
         );
-        counted_as_a_use(&h, p, "prepare_rasterize");
+        counted_as_a_use(&h, p, "prepare_job");
 
         let p = h.cached_grids.recency_order()[0];
         h.selected_param = p;

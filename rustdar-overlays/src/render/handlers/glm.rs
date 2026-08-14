@@ -16,10 +16,9 @@ use crate::render::controls::{
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
     OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RasterizeFn, RenderMode,
+    RenderMode,
 };
 use crate::render::rasterize;
-use crate::types::GeoBounds;
 
 /// What a poll's listings covered, in the layer-agnostic terms the UI renders.
 ///
@@ -436,9 +435,9 @@ impl GlmHandler {
         }
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder both
-    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
-    /// and the described job cannot come to capture different state.
+    /// What the rasterizer reads, captured once — the **one** builder
+    /// `prepare_job` answers from, kept a private helper so a second dispatch
+    /// path could not quietly capture different state.
     ///
     /// The rows are [`rasterize::FlashPaint`], not whole [`GlmFlash`]es: the
     /// coordinates, the timestamp and the energy are everything the raster
@@ -882,18 +881,9 @@ impl OverlayHandler for GlmHandler {
         });
     }
 
-    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let input = self.paint_input(ctx)?;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_glm_strikes(&input, bounds, width, height)
-        }))
-    }
-
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        // The same helper `prepare_rasterize` captures from, so the described
-        // job and the closure cannot come to capture different state — the
-        // dispatch's own `ctx.now` included, which is what keeps the flash
-        // ages a worker renders the ages this page computed.
+        // Captures the dispatch's own `ctx.now`, which is what keeps the
+        // flash ages a worker renders the ages this page computed.
         Some(HandlerJobInput::Glm(self.paint_input(ctx)?))
     }
 

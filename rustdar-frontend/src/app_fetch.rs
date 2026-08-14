@@ -1042,43 +1042,12 @@ impl super::App {
         }
     }
 
-    /// The rasterizer's bytes as an egui image, in whichever alpha convention
-    /// the rasterizer says it wrote them.
-    ///
-    /// The whole reason this is one function taking a [`RasterizeOutput`],
-    /// rather than a constructor picked at each `offload` arm: the two egui
-    /// constructors accept the same bytes and neither can fail, so choosing the
-    /// wrong one is invisible until somebody notices that every translucent
-    /// polygon is the wrong colour. Nearly every rasterizer here draws through
-    /// tiny-skia and hands over premultiplied pixels — but `rasterize_model_data`
-    /// writes straight alpha, and it reaches this function through exactly the
-    /// same `prepare_rasterize` arm as the others. Reading
-    /// [`RasterizeOutput::alpha`] is what keeps the HRRR overlay correct while
-    /// the polygon overlays skip a conversion that used to cost 22 ms a render.
-    ///
-    /// Called from inside the `offload` closures and nowhere else — see
-    /// `app_render::frame_thread_conversion_tests`.
-    fn overlay_color_image(
-        output: &rustdar_overlays::render::rasterize::RasterizeOutput,
-        width: u32,
-        height: u32,
-    ) -> egui::ColorImage {
-        use rustdar_overlays::render::rasterize::AlphaMode;
-        let size = [width as usize, height as usize];
-        match output.alpha {
-            // A straight copy: `Color32` *is* premultiplied sRGBA, and so is a
-            // `tiny_skia::Pixmap`.
-            AlphaMode::Premultiplied => {
-                egui::ColorImage::from_rgba_premultiplied(size, &output.rgba)
-            }
-            // Three lookups per pixel through `ecolor`'s 64 KiB table.
-            AlphaMode::Straight => egui::ColorImage::from_rgba_unmultiplied(size, &output.rgba),
-        }
-    }
-
-    /// The deliver every **described** overlay job shares — sites, the three
-    /// polygon kinds and the two hit-map kinds — built once so the dispatches
-    /// cannot drift.
+    /// The deliver every overlay job shares — sites and the six handler-backed
+    /// kinds, which is every texture overlay — built once so the dispatches
+    /// cannot drift. (The per-kind alpha convention never reaches this
+    /// deliver: `offload::execute` converts the one straight-alpha rasterizer
+    /// — the model grid's — inside the job, so the read below is
+    /// compute-nothing on every kind alike.)
     ///
     /// `response` arrives **image-less**, which is the failure shape: the
     /// dispatch site fills in every field the poller reads, and this deliver
@@ -1103,15 +1072,15 @@ impl super::App {
     /// report — worse than no picture, so the whole render is failed rather
     /// than shown without its clicks.
     ///
-    /// The two halves are allowed to be absent together — the four kinds with
-    /// no hit map dispatch `id_map: None` and their replies say `None` — and
-    /// a mixed pairing is refused for the mismatch it is.
+    /// The two halves are allowed to be absent together — the kinds with no
+    /// hit map dispatch `id_map: None` and their replies say `None` — and a
+    /// mixed pairing is refused for the mismatch it is.
     ///
-    /// The pixels arrive premultiplied by `offload::execute`'s contract, so
-    /// the constructor below is the straight copy
-    /// [`Self::overlay_color_image`] performs for every tiny-skia rasterizer
-    /// — the one compute-nothing `from_rgba_premultiplied` read the
-    /// frame-thread conversion tests permit `app_fetch`.
+    /// The pixels arrive premultiplied by `offload::execute`'s contract —
+    /// converted inside the job for the one rasterizer that declares straight
+    /// alpha — so the constructor below is a straight copy: the one
+    /// compute-nothing `from_rgba_premultiplied` read the frame-thread
+    /// conversion tests permit `app_fetch`.
     fn overlay_job_deliver(
         label: &'static str,
         width: u32,
@@ -1248,29 +1217,34 @@ impl super::App {
         let sender = self.channels.overlay_render_sender.clone();
         let window = self.window.clone();
 
-        // Clone the data needed for the render closure.
+        // Clone the data needed for the render job.
         //
         // **The split below is a decision per kind, spelled as a match and
-        // not as a capability probe**: a kind is on the described path
+        // not as a capability probe**: a kind is on the handler-backed path
         // because this list says so, and a kind added to `OverlayKind` does
         // not silently pick a path by whether its handler happens to answer
         // `prepare_job`. The described list and the handlers that implement
-        // `prepare_job` must be the same three kinds —
+        // `prepare_job` must be the same six kinds —
         // `rustdar-overlays`' texture tests pin that set, and
-        // `app_fetch::polygon_wire_tests` pins this routing.
+        // `app_fetch::polygon_wire_tests` / `model_wire_tests` pin this
+        // routing.
         match kind {
-            // The handler-backed described kinds — the three polygon kinds
-            // and the two hit-map kinds — are **described jobs**
+            // The handler-backed kinds — the three polygon kinds, the two
+            // hit-map kinds and the model grid, which is every texture kind
+            // a handler renders — are **described jobs**
             // (`JobRequest::Overlay`). On the web the job posts to the worker
             // instead of running inline on the browser's one thread, which is
             // where the frame-thread audit measured 224 ms of gesture-end
             // stall for the polygon layer set alone; on native it rides the
-            // pool's interactive lane, the same lane the closures rode.
+            // pool's interactive lane, the same lane the closures rode. There
+            // is no other path: the opaque closure arm this match used to
+            // have is deleted, with the trait method that fed it.
             OverlayKind::SpcOutlook
             | OverlayKind::SpcDiscussions
             | OverlayKind::NwsAlerts
             | OverlayKind::StormReports
-            | OverlayKind::Lightning => {
+            | OverlayKind::Lightning
+            | OverlayKind::ModelData => {
                 use rustdar_overlays::render::overlay_state::HandlerJobInput;
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
@@ -1288,10 +1262,11 @@ impl super::App {
                     now: chrono::Utc::now().naive_utc(),
                 };
                 let Some(input) = self.gui.overlays.prepare_job(kind, &rctx) else {
-                    // Nothing to render — clear in-flight. `prepare_job` and
-                    // `prepare_rasterize` answer `None` in exactly the same
-                    // states (both are built from one per-handler helper), so
-                    // this arm declines exactly where the closure arm did.
+                    // Nothing to render — clear in-flight. `has_data()` and
+                    // `prepare_job` agree in every reachable state
+                    // (`texture_tests`' permanent-wakeup guard), so this
+                    // decline is the no-data case and not a kind that lost
+                    // its input.
                     self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
@@ -1321,6 +1296,10 @@ impl super::App {
                     HandlerJobInput::Glm(input) => {
                         ("glm-render", crate::offload::OverlayJobInput::Glm(input))
                     }
+                    HandlerJobInput::ModelData(input) => (
+                        "model-render",
+                        crate::offload::OverlayJobInput::ModelData(Box::new(input)),
+                    ),
                 };
                 let request = crate::offload::JobRequest::Overlay {
                     width,
@@ -1349,50 +1328,6 @@ impl super::App {
                         window,
                     ),
                 );
-            }
-            // The model grid: the one kind still an opaque closure through
-            // `prepare_rasterize`, because its gridded input has no wire form
-            // yet — see `offload::offload`'s own note. On the web it still
-            // rasterizes inline on the frame.
-            OverlayKind::ModelData => {
-                let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
-                    is_dark: self.cached_dark_theme.unwrap_or(false),
-                    zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
-                    // See the described arm's note on this field.
-                    device_scale: texture.pixels_per_point,
-                    // Unread on this arm — nothing in the model grid's raster
-                    // reads a clock — and captured at the dispatch anyway,
-                    // because that is what the field means everywhere.
-                    now: chrono::Utc::now().naive_utc(),
-                };
-                let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
-                    // Nothing to render — clear in-flight
-                    self.clear_overlay_render_marks(&pane_indices, kind);
-                    return;
-                };
-                crate::offload::offload("overlay-render", move || {
-                    let output = rasterize_fn(&render_bounds, width, height);
-                    // Converted here rather than on arrival, and the RGBA
-                    // buffer dropped at the end of this statement — see
-                    // `OverlayRenderResponse::image`. In whichever alpha
-                    // convention this kind's rasterizer wrote: see
-                    // `Self::overlay_color_image`.
-                    let image =
-                        std::sync::Arc::new(Self::overlay_color_image(&output, width, height));
-                    let _ = sender.send(OverlayRenderResponse {
-                        image: Some(image),
-                        geo_bounds: render_bounds,
-                        overlay_kind: kind,
-                        generation: data_generation,
-                        pane_indices,
-                        zoom,
-                        // The model grid builds no hit cells, and a kind that
-                        // does belongs on the described path, where the
-                        // id_map zip lives.
-                        hit_map: None,
-                    });
-                    super::notify_redraw(&window);
-                });
             }
             OverlayKind::RadarSites => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else {
@@ -2753,6 +2688,14 @@ mod polygon_wire_tests;
 #[cfg(test)]
 #[path = "app_fetch/hitmap_wire_tests.rs"]
 mod hitmap_wire_tests;
+
+/// The model-grid dispatch is a described job carrying the grid by `Arc`,
+/// whose wire form is the projection window — the last kind through the
+/// wire, and the routing pin that closes the opaque path's door from the
+/// dispatch side.
+#[cfg(test)]
+#[path = "app_fetch/model_wire_tests.rs"]
+mod model_wire_tests;
 
 #[path = "app_fetch/site_switch_tests.rs"]
 #[cfg(test)]

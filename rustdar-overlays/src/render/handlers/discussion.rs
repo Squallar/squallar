@@ -8,12 +8,12 @@ use crate::render::controls::{
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
     OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RasterizeFn, RenderMode,
+    RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::colors::md_stroke_color;
 use crate::spc::discussion::SpcDiscussion;
-use crate::types::{GeoBounds, OverlayLabel};
+use crate::types::OverlayLabel;
 
 /// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
 /// dispatch tests seed a live registry through `apply_fetch_result`, whose
@@ -113,9 +113,9 @@ impl SpcDiscussionHandler {
         }
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder both
-    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
-    /// and the described job cannot come to capture different state.
+    /// What the rasterizer reads, captured once — the **one** builder
+    /// `prepare_job` answers from, kept a private helper so a second dispatch
+    /// path could not quietly capture different state.
     ///
     /// [`rasterize::DiscussionPaint`] rows, not whole [`SpcDiscussion`]s: the
     /// type and the rings are everything the raster reads, and the described
@@ -310,16 +310,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         });
     }
 
-    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let input = self.paint_input(ctx)?;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_spc_discussions(&input, bounds, width, height)
-        }))
-    }
-
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        // The same helper `prepare_rasterize` captures from, so the described
-        // job and the closure cannot come to read different state.
         self.paint_input(ctx).map(HandlerJobInput::Discussions)
     }
 

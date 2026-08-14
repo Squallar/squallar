@@ -3,18 +3,19 @@
 //!
 //! `rasterize/alpha_tests` checks two rasterizers by calling them directly.
 //! That is a check on the *function*, and the thing that reaches the uploader
-//! is the [`RasterizeOutput`] a **handler** hands over — so a handler could
+//! is the [`RasterizeOutput`] a **handler** describes — so a handler could
 //! attach the wrong [`AlphaMode`] to a correct buffer and nothing there would
 //! notice. `the_polygon_rasterizers_hand_over_premultiplied_pixels` calls
 //! `rasterize_nws_alerts`, which returns a bare `Vec<u8>`; the mode is attached
-//! one layer up, in `NwsAlertHandler::prepare_rasterize`, and that layer was
+//! one layer up, in the handler's described input, and that layer was
 //! unpinned. Flipping it to `Straight` — which double-multiplies every
 //! translucent pixel of the alert layer on screen — failed nothing.
 //!
-//! So the walk below goes through `prepare_rasterize`, and it covers every one
-//! of the twelve places an `AlphaMode` is written down: three in the handlers
-//! and nine in `render::rasterize`, counting each rasterizer's degenerate early
-//! returns as well as its drawing path.
+//! So the walk below goes through `prepare_job` — the **only** dispatch a
+//! handler has, now that the closure twin (`prepare_rasterize`) is deleted —
+//! runs each described input through its own rasterizer exactly as
+//! `offload::execute`'s overlay arm does, and covers every place an
+//! `AlphaMode` is written down.
 
 use std::collections::HashSet;
 
@@ -23,9 +24,9 @@ use crate::render::overlay_state::{
     FetchPayload, HandlerJobInput, OverlayHandler, OverlayKind, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize::{
-    self, AlphaMode, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes, rasterize_model_data,
-    rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions, rasterize_spc_outlooks,
-    rasterize_storm_reports,
+    self, AlphaMode, ModelDataInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
+    rasterize_model_data, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
+    rasterize_spc_outlooks, rasterize_storm_reports,
 };
 use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
 
@@ -53,6 +54,44 @@ fn rctx() -> RasterizeContext {
         is_dark: false,
         zoom: 7.0,
         now: chrono::Utc::now().naive_utc(),
+    }
+}
+
+/// Run a described input through the rasterizer its variant names — the same
+/// match `offload::execute`'s overlay arm makes — answering the kind the
+/// variant belongs to beside the raster, so a handler that described another
+/// kind's input is caught by name rather than by a wrong picture.
+fn run_described(
+    input: HandlerJobInput,
+    bounds: &GeoBounds,
+    w: u32,
+    h: u32,
+) -> (OverlayKind, RasterizeOutput) {
+    match input {
+        HandlerJobInput::Alerts(input) => (
+            OverlayKind::NwsAlerts,
+            rasterize_nws_alerts(&input, bounds, w, h),
+        ),
+        HandlerJobInput::Outlooks(input) => (
+            OverlayKind::SpcOutlook,
+            rasterize_spc_outlooks(&input, bounds, w, h),
+        ),
+        HandlerJobInput::Discussions(input) => (
+            OverlayKind::SpcDiscussions,
+            rasterize_spc_discussions(&input, bounds, w, h),
+        ),
+        HandlerJobInput::Reports(input) => (
+            OverlayKind::StormReports,
+            rasterize_storm_reports(&input, bounds, w, h),
+        ),
+        HandlerJobInput::Glm(input) => (
+            OverlayKind::Lightning,
+            rasterize_glm_strikes(&input, bounds, w, h),
+        ),
+        HandlerJobInput::ModelData(input) => (
+            OverlayKind::ModelData,
+            rasterize_model_data(&input, bounds, w, h),
+        ),
     }
 }
 
@@ -201,6 +240,11 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
     }
 }
 
+/// [`cin_grid`] as the input the rasterizer takes — the dispatch's own carry.
+fn whole(grid: crate::hrrr::HrrrGridData) -> ModelDataInput {
+    ModelDataInput::Whole(std::sync::Arc::new(grid))
+}
+
 fn site_fixtures() -> rasterize::SitesInput {
     rasterize::SitesInput {
         sites: vec![RadarSiteInfo {
@@ -219,10 +263,9 @@ fn site_fixtures() -> rasterize::SitesInput {
 /// Give `handler` the smallest data it will actually draw, and turn it on.
 ///
 /// `false` for a texture kind that never takes a fetch and never answers
-/// `prepare_rasterize`: `RadarSites`, whose raster `app_fetch` dispatches by
-/// calling [`rasterize_radar_sites`] directly, and `Radar`, which `ui_map_pane`
-/// skips outright because its renders are driven by product and elevation
-/// rather than by the viewport.
+/// `prepare_job`: `RadarSites`, whose raster `app_fetch` describes itself from
+/// the site catalogue, and `Radar`, which `ui_map_pane` skips outright because
+/// its renders are driven by product and elevation rather than by the viewport.
 pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     use crate::glm::{GlmFetchOutcome, GlmFetchResult};
     use crate::hrrr::HrrrFetchResult;
@@ -362,15 +405,14 @@ fn assert_alpha_matches_bytes(what: &str, out: &RasterizeOutput) {
     }
 }
 
-/// **The unpinned nine.** Twelve places write an `AlphaMode` down; before this,
-/// flipping nine of them failed nothing at all.
+/// **The unpinned declarations.** The `AlphaMode` a handler's described input
+/// rasterizes to, checked against the bytes for every texture handler at once.
 ///
-/// Written over `prepare_rasterize` because that is the seam the uploader
-/// reads: `App::overlay_color_image` picks its egui constructor from
-/// `RasterizeOutput::alpha` and cannot tell the two apart by looking, so a
-/// wrong declaration is silent all the way to the screen — where it shows up as
-/// every translucent pixel of one layer being the wrong colour, which is a
-/// thing nobody diffs.
+/// Written over `prepare_job` because that is the only seam a handler has:
+/// `offload::execute`'s overlay arm reads `RasterizeOutput::alpha` off exactly
+/// this output to decide whether a premultiply is owed inside the job, so a
+/// wrong declaration is every translucent pixel of one layer at the wrong
+/// brightness — which is a thing nobody diffs.
 #[test]
 fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     let ctx = rctx();
@@ -383,22 +425,47 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
             continue;
         }
         let kind = handler.kind();
-        let rasterize = handler.prepare_rasterize(&ctx).unwrap_or_else(|| {
+        let input = handler.prepare_job(&ctx).unwrap_or_else(|| {
             panic!("{kind:?} was seeded with data it should draw and answered None")
         });
-        assert_alpha_matches_bytes(&format!("{kind:?}"), &rasterize(&BOUNDS, W, H));
+        let (named, out) = run_described(input, &BOUNDS, W, H);
+        assert_eq!(
+            named, kind,
+            "{kind:?}'s `prepare_job` answered another kind's input variant, \
+             so a worker would rasterize the wrong layer under its panes",
+        );
+        assert_alpha_matches_bytes(&format!("{kind:?}"), &out);
+        // The painted floor the deleted closure-parity walk used to hold,
+        // kept now that the closure it compared against is gone: a described
+        // fixture that paints almost nothing makes every downstream byte
+        // comparison near-vacuous.
+        assert!(
+            drawn(&out.rgba).len() > 100,
+            "{kind:?}'s fixture painted almost nothing",
+        );
+        if matches!(kind, OverlayKind::StormReports | OverlayKind::Lightning) {
+            let cells = out
+                .hit_cells
+                .as_ref()
+                .expect("a hit-map kind answers cells on its drawing path");
+            assert!(
+                !cells.cells.is_empty(),
+                "{kind:?}'s fixture recorded no hit cells, so nothing about \
+                 the id space is being exercised",
+            );
+        }
         checked += 1;
     }
     assert_eq!(
         checked, 6,
-        "the six texture handlers that rasterize through `prepare_rasterize` \
+        "the six texture handlers that rasterize through `prepare_job` \
          must all be covered; a new one is not exempt, and a removed one \
          should be removed from this count deliberately",
     );
 
     // The seventh raster, and the one with no handler to speak for it:
-    // `app_fetch` calls this directly, which is why it returns a
-    // `RasterizeOutput` rather than a bare buffer.
+    // `app_fetch` builds its input from the site catalogue itself, which is
+    // why it returns a `RasterizeOutput` rather than a bare buffer.
     assert_alpha_matches_bytes(
         "rasterize_radar_sites",
         &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H),
@@ -457,7 +524,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     let mut empty = cin_grid();
     empty.values.clear();
     assert_eq!(
-        rasterize_model_data(&empty, &BOUNDS, W, H).alpha,
+        rasterize_model_data(&whole(empty), &BOUNDS, W, H).alpha,
         AlphaMode::Straight,
     );
 
@@ -473,7 +540,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
         max_lon: -34.0,
     };
     assert_eq!(
-        rasterize_model_data(&lambert, &atlantic, W, H).alpha,
+        rasterize_model_data(&whole(lambert), &atlantic, W, H).alpha,
         AlphaMode::Straight,
     );
 }
@@ -490,10 +557,10 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
             continue;
         }
         let kind = handler.kind();
-        let rasterize = handler
-            .prepare_rasterize(&ctx)
+        let input = handler
+            .prepare_job(&ctx)
             .expect("seeded above, and the walk next door asserts this");
-        let out = rasterize(&BOUNDS, W, H);
+        let (_, out) = run_described(input, &BOUNDS, W, H);
         // A pixel tells the conventions apart when it is translucent: at
         // `a == 255` the premultiply is the identity and both readings agree.
         let translucent: HashSet<u8> = drawn(&out.rgba)
@@ -516,26 +583,26 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
 // ── `has_data` against the handler's own rasterizer ──────────────────────
 
 /// **The permanent-wakeup guard.** For every texture handler,
-/// `has_data() == prepare_rasterize().is_some()`.
+/// `has_data() == prepare_job().is_some()`.
 ///
 /// `ui_map_pane` reads `has_data` for two decisions: whether to dispatch a
 /// `RenderOverlay`, and whether a *settle* render is still owed — and the
 /// second asks egui for a repaint 100 ms out for as long as the answer is yes.
-/// A handler that says it has data and then declines to rasterize is therefore
-/// not merely wasteful: the render is dispatched, `spawn_overlay_render` finds
-/// no rasterizer and abandons it, the texture stays at the old zoom, and the
-/// pane asks for another frame in 100 ms. For ever, on an idle app, with
-/// nothing on screen to say why.
+/// A handler that says it has data and then declines to describe a job is
+/// therefore not merely wasteful: the render is dispatched,
+/// `spawn_overlay_render` finds no input and abandons it, the texture stays at
+/// the old zoom, and the pane asks for another frame in 100 ms. For ever, on
+/// an idle app, with nothing on screen to say why.
 ///
 /// `SpcOutlookHandler` was exactly that. `has_data` was `!state.data.is_empty()`
-/// while `prepare_rasterize` needs the *selected day* crossed with the *ticked
-/// products* to yield a feature — so untick every SPC product, or move to a day
-/// whose products are not ticked, and the two disagreed for ever.
+/// while the rasterize dispatch needs the *selected day* crossed with the
+/// *ticked products* to yield a feature — so untick every SPC product, or move
+/// to a day whose products are not ticked, and the two disagreed for ever.
 ///
 /// The states below are the ones the layer stack can actually reach, and the
 /// master toggle is the reachable route to the divergence: for a handler whose
 /// "enabled" *is* its product set, switching it off empties the very set
-/// `prepare_rasterize` looks the data up by.
+/// `prepare_job` looks the data up by.
 #[test]
 fn every_texture_handler_agrees_with_its_own_rasterizer() {
     let ctx = rctx();
@@ -546,15 +613,16 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         }
         let kind = handler.kind();
         if matches!(kind, OverlayKind::RadarSites | OverlayKind::Radar) {
-            // The two exempt kinds: there is no `prepare_rasterize` for their
+            // The two exempt kinds: there is no `prepare_job` for their
             // `has_data` to agree *with*. Their `has_data` is an unconditional
-            // `true` and their pixels come from elsewhere — `app_fetch` calls
-            // `rasterize_radar_sites` directly and it always produces a buffer,
-            // and `ui_map_pane` skips `Radar` outright. Neither dispatch can
-            // decline, so neither can strand a settle.
+            // `true` and their pixels come from elsewhere — `app_fetch`
+            // describes the sites job from the site catalogue itself and it
+            // always produces a buffer, and `ui_map_pane` skips `Radar`
+            // outright. Neither dispatch can decline, so neither can strand a
+            // settle.
             assert!(
-                handler.prepare_rasterize(&ctx).is_none(),
-                "{kind:?} grew a `prepare_rasterize`; it now has this invariant \
+                handler.prepare_job(&ctx).is_none(),
+                "{kind:?} grew a `prepare_job`; it now has this invariant \
                  to keep, so seed it in `seed` and drop it from this exemption",
             );
             continue;
@@ -563,7 +631,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         let agree = |h: &dyn OverlayHandler, state: &str| {
             assert_eq!(
                 h.has_data(),
-                h.prepare_rasterize(&ctx).is_some(),
+                h.prepare_job(&ctx).is_some(),
                 "{kind:?} disagrees with its own rasterizer while {state}. \
                  `ui_map_pane` gates both the render dispatch and the settle \
                  repaint on `has_data`, so `true` here with `None` there is a \
@@ -599,7 +667,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
     }
     assert_eq!(
         checked, 6,
-        "the six texture handlers that rasterize through `prepare_rasterize` \
+        "the six texture handlers that rasterize through `prepare_job` \
          must all be covered",
     );
 }
@@ -619,7 +687,7 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     let mut handler = super::outlook::SpcOutlookHandler::new();
     assert!(seed(&mut handler), "the outlook handler takes a fetch");
     assert!(
-        handler.has_data() && handler.prepare_rasterize(&ctx).is_some(),
+        handler.has_data() && handler.prepare_job(&ctx).is_some(),
         "fixture: Day 1 Categorical is both ticked and fetched",
     );
 
@@ -637,7 +705,7 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     );
 
     assert!(
-        handler.prepare_rasterize(&ctx).is_none(),
+        handler.prepare_job(&ctx).is_none(),
         "fixture: there is nothing on Day 5 to rasterize",
     );
     assert!(
@@ -649,20 +717,6 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
 
 // ── The described-job set ────────────────────────────────────────────────
 
-/// Whether `kind` is one the dispatch routes as a described job: the three
-/// polygon kinds and the two hit-map kinds. Only the model grid still runs
-/// opaque.
-fn is_described(kind: OverlayKind) -> bool {
-    matches!(
-        kind,
-        OverlayKind::NwsAlerts
-            | OverlayKind::SpcOutlook
-            | OverlayKind::SpcDiscussions
-            | OverlayKind::StormReports
-            | OverlayKind::Lightning
-    )
-}
-
 /// Whether `kind` resolves clicks through a hit map, and therefore must
 /// answer [`OverlayHandler::hit_items`] exactly when it answers
 /// `prepare_job` — an input with rows and no items is a layer whose every
@@ -671,10 +725,10 @@ fn has_hit_map(kind: OverlayKind) -> bool {
     matches!(kind, OverlayKind::StormReports | OverlayKind::Lightning)
 }
 
-/// **The set of kinds with a wire form is every texture kind but the model
-/// grid**, and on each of them `prepare_job` agrees with `prepare_rasterize`
-/// about whether there is anything to draw — and, for the hit-map kinds,
-/// `hit_items` agrees with both — in every state the layer stack can reach.
+/// **Every texture kind that renders through a handler has a described job**
+/// — the model grid included, since the opaque closure path it was the last
+/// rider of is deleted — and, for the hit-map kinds, `hit_items` agrees with
+/// `prepare_job` in every state the layer stack can reach.
 ///
 /// `rustdar-frontend`'s `spawn_overlay_render` routes by an explicit match on
 /// kind, not by probing `prepare_job` — so the match there and the
@@ -682,33 +736,25 @@ fn has_hit_map(kind: OverlayKind) -> bool {
 /// keeps a kind from joining one and not the other. A kind routed described
 /// without an implementation would answer `None` with data on hand, and its
 /// layer would silently never draw: precisely the disagreement the
-/// permanent-wakeup guard above exists to catch on the closure path.
+/// permanent-wakeup guard above exists to catch.
 #[test]
-fn the_kinds_with_a_described_job_are_all_but_the_model_grid() {
+fn every_texture_kind_rasterizes_as_a_described_job() {
     let ctx = rctx();
     let mut described = 0;
     for handler in create_handlers().iter_mut() {
         let kind = handler.kind();
+        let handler_backed = handler.render_mode() == RenderMode::Texture
+            && !matches!(kind, OverlayKind::RadarSites | OverlayKind::Radar);
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
-            if is_described(kind) {
-                assert_eq!(
-                    h.prepare_job(&ctx).is_some(),
-                    h.prepare_rasterize(&ctx).is_some(),
-                    "{kind:?}'s described job disagrees with its closure about \
-                     whether there is anything to draw while {state}. The \
-                     dispatch declines on `prepare_job` where the closure arm \
-                     declined on `prepare_rasterize`, so a disagreement is a \
-                     layer that renders on one path and never on the other.",
-                );
-            } else {
+            if !handler_backed {
                 assert!(
                     h.prepare_job(&ctx).is_none(),
                     "{kind:?} grew a `prepare_job` while {state}. The \
                      described set is stated twice — here and in \
                      `spawn_overlay_render`'s match — so add the kind to the \
-                     dispatch's described arm, to `is_described` above, and \
-                     to the wire (`offload::OverlayJobInput`) together.",
+                     dispatch's described arm and to the wire \
+                     (`offload::OverlayJobInput`) together.",
                 );
             }
             if has_hit_map(kind) {
@@ -747,20 +793,24 @@ fn the_kinds_with_a_described_job_are_all_but_the_model_grid() {
         if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
             continue;
         }
+        assert!(
+            handler.prepare_job(&ctx).is_some(),
+            "{kind:?} is a seeded texture kind with no described job — the \
+             closure path it would have ridden is deleted, so this layer \
+             cannot render at all",
+        );
         agree(handler.as_ref(), "seeded and enabled");
         handler.set_enabled(false);
         agree(handler.as_ref(), "seeded, then switched off");
         handler.set_enabled(true);
         agree(handler.as_ref(), "seeded, switched off, switched back on");
-        if is_described(kind) {
-            described += 1;
-        }
+        described += 1;
     }
     assert_eq!(
-        described, 5,
-        "the three polygon kinds and the two hit-map kinds must all have \
-         been walked seeded; a kind that stopped seeding is a kind whose \
-         agreement was never tested",
+        described, 6,
+        "the three polygon kinds, the two hit-map kinds and the model grid \
+         must all have been walked seeded; a kind that stopped seeding is a \
+         kind whose described job was never tested",
     );
 }
 
@@ -834,92 +884,4 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
         checked += 1;
     }
     assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
-}
-
-/// The described job and the closure paint **the same bytes** on the same
-/// handler state — the handler-level half of the parity story, whose
-/// wire-level half is `rustdar-frontend`'s per-kind
-/// `..._is_byte_identical_direct_and_via_the_wire`.
-///
-/// Both answers are built by one private helper per handler, so this cannot
-/// drift today; the test is for the refactor that splits them, which would
-/// compile.
-#[test]
-fn a_described_job_and_the_closure_paint_the_same_bytes() {
-    let ctx = rctx();
-    let mut checked = 0;
-    for handler in create_handlers().iter_mut() {
-        let kind = handler.kind();
-        if !is_described(kind) || !seed(handler.as_mut()) {
-            continue;
-        }
-        let closure = handler
-            .prepare_rasterize(&ctx)
-            .expect("seeded, and the agreement test next door pins this")(
-            &BOUNDS, W, H
-        );
-        let input = handler
-            .prepare_job(&ctx)
-            .expect("seeded, and the agreement test next door pins this");
-        let (named, job) = match input {
-            HandlerJobInput::Alerts(input) => (
-                OverlayKind::NwsAlerts,
-                rasterize_nws_alerts(&input, &BOUNDS, W, H),
-            ),
-            HandlerJobInput::Outlooks(input) => (
-                OverlayKind::SpcOutlook,
-                rasterize_spc_outlooks(&input, &BOUNDS, W, H),
-            ),
-            HandlerJobInput::Discussions(input) => (
-                OverlayKind::SpcDiscussions,
-                rasterize_spc_discussions(&input, &BOUNDS, W, H),
-            ),
-            HandlerJobInput::Reports(input) => (
-                OverlayKind::StormReports,
-                rasterize_storm_reports(&input, &BOUNDS, W, H),
-            ),
-            HandlerJobInput::Glm(input) => (
-                OverlayKind::Lightning,
-                rasterize_glm_strikes(&input, &BOUNDS, W, H),
-            ),
-        };
-        assert_eq!(
-            named, kind,
-            "{kind:?}'s `prepare_job` answered another kind's input variant, \
-             so a worker would rasterize the wrong layer under its panes",
-        );
-        assert!(
-            drawn(&closure.rgba).len() > 100,
-            "{kind:?}'s fixture painted almost nothing, so the byte equality \
-             below would be near-vacuous",
-        );
-        assert_eq!(
-            closure.rgba, job.rgba,
-            "{kind:?}'s described job paints differently from its closure on \
-             the same state: the two answers have stopped being built from \
-             one captured input",
-        );
-        // The hit-map kinds must also answer the same **cells** on both
-        // paths: a described job that painted the same pixels but recorded
-        // different indices is a hover that names the wrong item, which no
-        // pixel comparison can see.
-        assert_eq!(
-            closure.hit_cells, job.hit_cells,
-            "{kind:?}'s described job records different hit cells from its \
-             closure on the same state",
-        );
-        if has_hit_map(kind) {
-            let cells = job
-                .hit_cells
-                .as_ref()
-                .expect("a hit-map kind answers cells on its drawing path");
-            assert!(
-                !cells.cells.is_empty(),
-                "{kind:?}'s fixture recorded no hit cells, so the cell \
-                 equality above is vacuous for the one thing it is about",
-            );
-        }
-        checked += 1;
-    }
-    assert_eq!(checked, 5, "all five described kinds must be compared");
 }

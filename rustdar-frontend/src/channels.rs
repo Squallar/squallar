@@ -209,8 +209,9 @@ pub struct OverlayRenderResponse {
     /// on.
     ///
     /// The fraction is a quarter now, so the same pane plans 2880×1620 and
-    /// 17.8 MiB, and the polygon path has no unmultiply left in it at all —
-    /// `App::overlay_color_image` copies premultiplied pixels straight through.
+    /// 17.8 MiB, and no overlay path has an unmultiply left in it at all —
+    /// `offload::execute` converts inside the job and the one shared deliver
+    /// copies premultiplied pixels straight through.
     /// Neither change makes this the smaller of the two cases: this buffer still
     /// scales with the window rather than being fixed, and it is still the one
     /// that must not be walked on the frame thread.

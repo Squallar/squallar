@@ -44,7 +44,12 @@ const MAX_LATITUDE_ITERATIONS: usize = 32;
 
 /// Constructed from the same six parameters PROJ's `+proj=lcc` takes, so it can
 /// be checked against PROJ directly.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` is field-for-field over the *derived* constants, which is what
+/// the wire round-trip compares: [`LambertGrid::from_parts`] restores stored
+/// bits rather than re-running this constructor, so two equal parts are two
+/// equal projections with no libm in between.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LambertConformalConic {
     /// Semi-major axis, metres.
     a: f64,
@@ -290,7 +295,7 @@ fn normalize_longitude_degrees(lon: f64) -> f64 {
 /// vector and the split arrays are alive together). Nothing downstream reads
 /// them in bulk: the rasterizer walks the grid in index order and the tooltip
 /// wants one point, both of which this answers arithmetically.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LambertGrid {
     projection: LambertConformalConic,
     /// Projection-plane metres of grid point (0, 0).
@@ -308,6 +313,45 @@ pub struct LambertGrid {
     /// Whether adjacent grid points can jump in longitude — see
     /// [`Self::wraps_longitude`]. Measured once here, not per use.
     wraps_longitude: bool,
+}
+
+/// A [`LambertGrid`]'s stored constants as one plain struct of public fields —
+/// its wire form, produced by [`LambertGrid::to_parts`] and consumed by
+/// [`LambertGrid::from_parts`].
+///
+/// It exists because the grid's fields are private and the codec that carries
+/// a model-grid overlay job (`rustdar_frontend::offload`) lives in another
+/// crate. The fields are the *stored* values — derived constants and the
+/// measured `wraps_longitude` included — precisely so the far side restores
+/// bits instead of re-deriving anything: a re-derivation would put libm's last
+/// ulp between two builds of one grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LambertGridParts {
+    /// Semi-major axis, metres.
+    pub a: f64,
+    /// First eccentricity; exactly 0 for a sphere.
+    pub e: f64,
+    /// Cone constant.
+    pub n: f64,
+    /// Scale factor (Snyder eq. 15-2).
+    pub big_f: f64,
+    /// Polar radius to the latitude of origin.
+    pub rho0: f64,
+    /// Central meridian, radians.
+    pub lon0: f64,
+    /// Projection-plane metres of grid point (0, 0).
+    pub x0: f64,
+    pub y0: f64,
+    /// Signed step per index.
+    pub dx: f64,
+    pub dy: f64,
+    pub ni: usize,
+    pub nj: usize,
+    /// Scanning-mode bits that decide the flat index order.
+    pub i_consecutive: bool,
+    pub alternating: bool,
+    /// Measured at construction; carried, never recomputed.
+    pub wraps_longitude: bool,
 }
 
 impl LambertGrid {
@@ -470,6 +514,85 @@ impl LambertGrid {
     /// coincide.
     pub fn wraps_longitude(&self) -> bool {
         self.wraps_longitude
+    }
+
+    /// This grid's stored constants, whole, for the one boundary that can only
+    /// carry numbers: `rustdar_frontend::offload`'s described-overlay codec.
+    ///
+    /// Every field is the **stored** value — the derived projection constants
+    /// included — so [`Self::from_parts`] restores bits rather than re-running
+    /// [`LambertConformalConic::new`] or [`Self::detect_longitude_wrap`]. That
+    /// is what makes the round trip exact: nothing on the decode side consults
+    /// libm, whose last ulp is the one thing two platforms do not share.
+    pub fn to_parts(&self) -> LambertGridParts {
+        LambertGridParts {
+            a: self.projection.a,
+            e: self.projection.e,
+            n: self.projection.n,
+            big_f: self.projection.big_f,
+            rho0: self.projection.rho0,
+            lon0: self.projection.lon0,
+            x0: self.x0,
+            y0: self.y0,
+            dx: self.dx,
+            dy: self.dy,
+            ni: self.ni,
+            nj: self.nj,
+            i_consecutive: self.i_consecutive,
+            alternating: self.alternating,
+            wraps_longitude: self.wraps_longitude,
+        }
+    }
+
+    /// The inverse of [`Self::to_parts`]: a grid from stored constants, or
+    /// `None` for constants no [`Self::from_template`] construction ever
+    /// produces — a non-finite number anywhere, a non-positive semi-major
+    /// axis, an eccentricity outside `[0, 1)`, or a zero cone constant, each
+    /// of which would make the projection arithmetic answer NaN for every
+    /// point rather than fail. The parts arrive off a message port, so this is
+    /// a refusal at the boundary, not an assertion about a caller.
+    pub fn from_parts(parts: LambertGridParts) -> Option<Self> {
+        let finite = [
+            parts.a,
+            parts.e,
+            parts.n,
+            parts.big_f,
+            parts.rho0,
+            parts.lon0,
+            parts.x0,
+            parts.y0,
+            parts.dx,
+            parts.dy,
+        ]
+        .iter()
+        .all(|v| v.is_finite());
+        if !finite
+            || parts.a <= 0.0
+            || !(0.0..1.0).contains(&parts.e)
+            || parts.n == 0.0
+            || parts.big_f == 0.0
+        {
+            return None;
+        }
+        Some(Self {
+            projection: LambertConformalConic {
+                a: parts.a,
+                e: parts.e,
+                n: parts.n,
+                big_f: parts.big_f,
+                rho0: parts.rho0,
+                lon0: parts.lon0,
+            },
+            x0: parts.x0,
+            y0: parts.y0,
+            dx: parts.dx,
+            dy: parts.dy,
+            ni: parts.ni,
+            nj: parts.nj,
+            i_consecutive: parts.i_consecutive,
+            alternating: parts.alternating,
+            wraps_longitude: parts.wraps_longitude,
+        })
     }
 
     /// Number of grid points.

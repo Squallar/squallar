@@ -62,8 +62,8 @@ fn an_ample_budget_takes_the_whole_queue_at_once() {
 }
 
 /// The push holds the payload and the drain is where it dies. A push that
-/// freed anything would be [`offload`]'s inline arm under another name — the
-/// frame-thread free the queue exists to remove.
+/// freed anything would be an inline frame-thread free under another name —
+/// the exact cost the queue exists to remove.
 #[test]
 fn a_payload_is_freed_by_the_drain_and_never_by_the_push() {
     empty_the_queue();

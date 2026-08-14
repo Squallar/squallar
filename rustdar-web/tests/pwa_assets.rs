@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 11;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 11. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 12;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 12. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -596,7 +596,12 @@ fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
          input carries the page's clock so a worker never ages a flash \
          against its own. A version 10 pairing exchanges inner codes one \
          half refuses and reply payloads whose length check the other half \
-         fails — a storm-reports layer that silently never draws. Changing \
+         fails — a storm-reports layer that silently never draws. Version 12 \
+         completed that inner code space with the HRRR model grid (input code \
+         7, the grid's Lambert constants plus its projection window's \
+         values), the last overlay kind that still rasterized inline on the \
+         page: a version 11 worker refuses code 7 and answers a failed job, \
+         which is a model layer that silently never draws. Changing \
          the message shapes without changing this number is the whole failure \
          it prevents.",
     );
@@ -955,7 +960,7 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     assert_eq!(
         shape,
         [
-            "PROTOCOL_VERSION = 11",
+            "PROTOCOL_VERSION = 12",
             "frame | IMAGE | image",
             "frame | MAX_RANGE | range",
             "frame | MELTING_LAYER | mls",

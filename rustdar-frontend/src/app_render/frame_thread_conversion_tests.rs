@@ -1,22 +1,20 @@
-//! The unmultiply stays off the frame thread.
+//! The unmultiply stays off the frame thread — and the opaque overlay path
+//! stays deleted.
 //!
 //! Read off the source, for the reason `frame_build_order_tests` gives: what is
 //! being asserted is *where a statement is written*, and no runtime observation
 //! distinguishes a conversion that ran on the frame thread from one that ran on
 //! the rasterizer's — both produce the same pixels, which is the whole point.
 //!
-//! There are now two ways a full-size buffer can be kept off the frame thread,
-//! and the distinction is what this module is about. The **opaque** overlay
-//! rasters convert in the `offload` closure that drew them, because their
-//! producer is opaque to the job funnel. Everything **described** — the radar
-//! rasters, plan view and section alike, and now the sites overlay
-//! (`JobRequest::Overlay`) — does not convert on arrival at all:
-//! `offload::execute` premultiplies inside the job, so what every consumer
-//! holds is already egui's own bytes and reading them through
-//! `from_rgba_premultiplied` computes nothing. That is why the assertions
-//! below look for a *missing* unmultiply in `app_render`, a *present*
-//! conversion in `app_fetch`'s one remaining opaque overlay arm, and a
-//! *compute-nothing read* in its described one.
+//! Every overlay raster is a **described job** now. Nothing converts on
+//! arrival: `offload::execute` premultiplies inside the job (the model grid's
+//! straight-alpha palette included), so what every consumer holds is already
+//! egui's own bytes and reading them through `from_rgba_premultiplied`
+//! computes nothing. The assertions below look for a *missing* unmultiply in
+//! `app_render`, exactly one compute-nothing read in the one shared overlay
+//! deliver — and, since S5d, for the **absence of the opaque path itself**:
+//! no `offload(name, closure)` funnel, no closure arm in the overlay
+//! dispatch, and an `Opaque` job variant that does not exist on wasm at all.
 
 const APP_RENDER: &str = include_str!("../app_render.rs");
 const APP_FETCH: &str = include_str!("../app_fetch.rs");
@@ -51,13 +49,12 @@ fn free_body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 /// The per-pixel unmultiply, by the only name it is ever called by.
 const UNMULTIPLY: &str = "from_rgba_unmultiplied";
 
-/// The overlay path's one converter: the function that reads
-/// `RasterizeOutput::alpha` and picks the egui constructor from it.
+/// The deleted overlay converter, by the name it had: the function that read
+/// `RasterizeOutput::alpha` on the frame side and picked an egui constructor
+/// from it. It died with the opaque closure arm — the convention is resolved
+/// inside the job now — and its name coming back anywhere in `app_fetch` is
+/// the page-side conversion coming back with it.
 const OVERLAY_CONVERT: &str = "overlay_color_image";
-
-/// The same, as a *call* — so the comment sitting above each one does not get
-/// counted as a second conversion.
-const OVERLAY_CONVERT_CALL: &str = "Self::overlay_color_image(";
 
 /// Every function `setup_egui_frame` reaches that used to walk a full-size
 /// buffer, and no longer may.
@@ -109,24 +106,12 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
     }
 }
 
-/// The other half of the same claim: the conversion did not merely leave the
-/// frame thread, it landed where the rasterization is.
+/// The overlay dispatch converts nothing and closes over nothing: every arm
+/// is a described job handed to the one shared deliver.
 ///
-/// Both overlay producers, because they are two sends of one response type and
-/// a conversion added back to only one of them would be invisible — the
-/// `RadarSites` raster covers the same viewport as any other overlay's. They
-/// are no longer two of one shape, though, and each is pinned to its own:
-///
-/// * The **opaque** arm — the model grid, the one closure kind left — has
-///   the rasterizer that writes straight alpha (`rasterize_model_data`), so
-///   its conversion must be `overlay_color_image`, the one function that
-///   reads `RasterizeOutput::alpha`, and a call site that picked an egui
-///   constructor itself would be the regression.
-/// * The **described** arms — sites, and the handler kinds (the three
-///   polygon kinds and the two hit-map kinds) — share one deliver,
-///   `overlay_job_deliver`, and their replies' convention does not vary:
-///   `offload::execute` converts inside the job at the rasterizer's own
-///   declaration, the contract on `offload::JobOutput::OverlayRaster` is
+/// * No arm may convert. `offload::execute` converts inside the job at the
+///   rasterizer's own declaration — the model grid's straight alpha included
+///   — the contract on `offload::JobOutput::OverlayRaster` is
 ///   premultiplied-always, and the per-kind
 ///   `..._is_byte_identical_direct_and_via_the_wire` parity tests in
 ///   `offload::tests` pin the bytes. The deliver therefore reads the buffer
@@ -134,33 +119,34 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
 ///   read-a-converted-raster shape `upload_section_raster` is *required* to
 ///   have below — and exactly one such read may exist, in the one shared
 ///   deliver rather than once per dispatch.
+/// * Both dispatch sites — the handler-kind arm (all six handler-backed
+///   kinds, the model grid among them) and the sites arm — must hand their
+///   reply to that one `overlay_job_deliver`, or a drifting copy grows.
 #[test]
-fn both_overlay_rasterizers_convert_before_they_send() {
+fn every_overlay_dispatch_is_described_and_converts_nothing() {
     let body = body_of(APP_FETCH, "pub(super) fn spawn_overlay_render(");
-    let conversions = body.matches(OVERLAY_CONVERT_CALL).count();
-    assert_eq!(
-        conversions, 1,
-        "`spawn_overlay_render` has {conversions} `overlay_color_image` calls \
-         where its one remaining opaque arm needs exactly one. Zero means the \
-         handler raster arrives unconverted, with nowhere to be converted but \
-         `poll_overlay_render_results` on the frame thread; two means a \
-         described arm has gone back to converting what `offload::execute` \
-         already converted inside the job.",
+    assert!(
+        !APP_FETCH.contains(OVERLAY_CONVERT),
+        "`overlay_color_image` is back in app_fetch. The page-side alpha \
+         conversion died with the opaque overlay arm; `offload::execute` \
+         converts inside the job, and a frame-side converter is that cost \
+         landing back on the browser's one thread.",
     );
     assert!(
         !body.contains(UNMULTIPLY),
-        "`spawn_overlay_render` unmultiplies somewhere. No arm may: the \
-         opaque one reads `RasterizeOutput::alpha` through \
-         `overlay_color_image`, and the described ones receive pixels \
-         `offload::execute` already premultiplied inside the job.",
+        "`spawn_overlay_render` unmultiplies somewhere. No arm may: every \
+         arm receives pixels `offload::execute` already premultiplied inside \
+         the job.",
     );
     assert_eq!(
         body.matches("Self::overlay_job_deliver(").count(),
         2,
-        "`spawn_overlay_render`'s described arms — the sites dispatch and the \
-         handler-kind dispatch — must both hand their reply to the one shared \
-         `overlay_job_deliver`. Fewer means a described arm grew a deliver of \
-         its own, which is the drift the shared builder exists to prevent.",
+        "`spawn_overlay_render`'s two dispatch sites — the handler-kind arm \
+         and the sites arm — must both hand their reply to the one shared \
+         `overlay_job_deliver`. Fewer means an arm grew a deliver of its \
+         own, which is the drift the shared builder exists to prevent; more \
+         means a third dispatch site exists that this module has never heard \
+         of.",
     );
     assert!(
         !body.contains("from_rgba_premultiplied"),
@@ -188,6 +174,67 @@ fn both_overlay_rasterizers_convert_before_they_send() {
         "`overlay_job_deliver` converts. The wire's contract is \
          premultiplied-always (`offload::execute` converted inside the job), \
          so any conversion here is a double conversion.",
+    );
+}
+
+/// **The opaque overlay path stays deleted** — S5d's guard, stated as
+/// properties of the source so it cannot come back silently.
+///
+/// Three doors are pinned shut, each beside a presence control on the same
+/// haystack so an absence cannot pass vacuously on a moved or renamed file
+/// (a scrape that greps an empty string finds nothing and means nothing):
+///
+/// 1. The dispatch: `spawn_overlay_render` names no `Job::Opaque`, no bare
+///    `offload(` funnel and no `prepare_rasterize` — the trait method is
+///    deleted, so this is a tripwire for it being re-grown.
+/// 2. The funnel: `offload.rs` has no `pub fn offload(` — the function whose
+///    wasm arm ran any closure inline on the browser's one thread. The only
+///    inline execution left there is `run_here`, the lost-worker fallback
+///    every described job shares.
+/// 3. The type: `Job::Opaque` is declared under
+///    `#[cfg(not(target_arch = "wasm32"))]`, so on wasm the variant does not
+///    exist and a dispatch that routed an overlay through a closure would
+///    not compile — the compile-level half of the guarantee, witnessed here
+///    so the cfg cannot be quietly dropped.
+#[test]
+fn the_opaque_overlay_path_stays_deleted() {
+    let body = body_of(APP_FETCH, "pub(super) fn spawn_overlay_render(");
+    // Presence control: the scrape is reading the real dispatch.
+    assert!(
+        body.contains("offload_job("),
+        "control: `spawn_overlay_render` no longer calls `offload_job`, so \
+         the absence checks below are reading the wrong function",
+    );
+    for door in ["Job::Opaque", "prepare_rasterize", "offload::offload("] {
+        assert!(
+            !body.contains(door),
+            "`spawn_overlay_render` names `{door}` again. The opaque overlay \
+             path was deleted in S5d — on wasm it was an inline gesture-end \
+             rasterization on the browser's one thread — and every overlay \
+             kind has a wire form, so there is nothing left that needs it.",
+        );
+    }
+
+    // Presence control for the funnel scrape.
+    assert!(
+        OFFLOAD.contains("pub fn offload_job("),
+        "control: offload.rs no longer declares `offload_job`, so the \
+         absence check below is reading the wrong file",
+    );
+    assert!(
+        !OFFLOAD.contains("pub fn offload("),
+        "offload.rs declares `pub fn offload(` again — the funnel whose wasm \
+         arm ran closures inline on the browser's one thread. Its deletion \
+         is what makes \"no overlay can rasterize inline\" a property of the \
+         API; the lost-worker fallback (`run_here`) is the only inline \
+         execution wasm is meant to have.",
+    );
+    assert!(
+        OFFLOAD.contains("#[cfg(not(target_arch = \"wasm32\"))]\n    Opaque("),
+        "`Job::Opaque` is no longer declared native-only. The cfg is the \
+         compile-level guarantee that no wasm dispatch can construct an \
+         opaque job at all; without it, the guarantee is back to being every \
+         dispatch site staying careful.",
     );
 }
 

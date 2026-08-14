@@ -45,14 +45,16 @@
 //! hundreds of milliseconds, and the render admission check in
 //! `render_dispatch` already bounds how many can be outstanding at
 //! `Budgets::concurrent_renders`. The `rd-opaque` lane carries the overlay
-//! rasterizations, which follow the map and are wanted *now* — the opaque
-//! closures that gave it its name, and the described overlay jobs that are
-//! replacing them one kind at a time (see [`Interactive`]). One lane would let
-//! a full slate of radar renders put an overlay behind a second of work that a
-//! thread-per-job never made it wait for. Two lanes, each sized at the render
-//! bound, is the shape that keeps the bound and does not invent that stall.
+//! rasterizations, which follow the map and are wanted *now*. The name is the
+//! one the opaque closures gave it; the closures are gone — every overlay
+//! kind is a described [`JobRequest::Overlay`] now — and the lane keeps its
+//! name and its charter, carrying exactly those described overlay jobs. One
+//! lane would let a full slate of radar renders put an overlay behind a
+//! second of work that a thread-per-job never made it wait for. Two lanes,
+//! each sized at the render bound, is the shape that keeps the bound and does
+//! not invent that stall.
 //!
-//! What the opaque lane's own bound costs was measured rather than assumed:
+//! What the overlay lane's own bound costs was measured rather than assumed:
 //! `rasterize_radar_sites` over 200 markers is **3.16 ms at 1920×1080 and 3.70
 //! ms at 3840×2160**, so a burst wider than the lane pays single-digit
 //! milliseconds to wait — against a thread spawn that was never free either.
@@ -61,13 +63,13 @@
 //!
 //! [`super::discard`]'s frees are a third queue, one thread wide.
 //!
-//! They were briefly put in the opaque lane, and the paragraph above is what
-//! makes that wrong: the opaque lane carries the two overlay rasterizations,
-//! which follow the map and are wanted *now*. A site switch discarding a
-//! session's cached volumes would queue every one of them ahead of the next
-//! overlay render, and a pan straight after a site switch would lag for the
-//! length of the teardown — the lane's own charter, spent on the one kind of
-//! work that has no deadline at all.
+//! They were briefly put in the overlay lane, and the paragraph above is what
+//! makes that wrong: that lane carries the overlay rasterizations, which
+//! follow the map and are wanted *now*. A site switch discarding a session's
+//! cached volumes would queue every one of them ahead of the next overlay
+//! render, and a pan straight after a site switch would lag for the length of
+//! the teardown — the lane's own charter, spent on the one kind of work that
+//! has no deadline at all.
 //!
 //! One thread and not `threads`, because frees serialise on the allocator
 //! anyway: a second worker would contend for the same lock rather than halve
@@ -109,41 +111,19 @@ use super::{JobRequest, JobResult, JobSink};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 /// The pool's three queues, started once per process.
+///
+/// The `interactive` lane's item is the same `(id, request)` pair the
+/// described lane's is — only the queue differs, which is the whole point:
+/// which lane a job rides is a question about its **deadline**, not about
+/// its shape. It carried an enum of closure-or-job while the opaque overlay
+/// path was being dismantled kind by kind; the last kind (the model grid)
+/// left, the `Closure` variant went with it, and the lane became the overlay
+/// lane outright — keeping the `rd-opaque` thread name the closures gave it,
+/// so a profile reads continuously across the change.
 struct Pool {
     described: mpsc::Sender<(u64, JobRequest)>,
-    opaque: mpsc::Sender<Interactive>,
+    interactive: mpsc::Sender<(u64, JobRequest)>,
     free: mpsc::Sender<Doomed>,
-}
-
-/// What rides the `rd-opaque` lane: the work that follows the map.
-///
-/// Widened from the bare `(name, closure)` pair when the sites raster became a
-/// described job
-/// ([`JobRequest::Overlay`]). Which lane a job rides is a question about its
-/// **deadline**, not about its encoding: the two-lane split above exists so an
-/// overlay never queues behind a slate of radar renders, and a sites job that
-/// moved to the described lane on the day it gained a wire form would have
-/// re-invented exactly the stall the split removes — behind up to
-/// `concurrent_renders` radar rasterizations at tens to hundreds of
-/// milliseconds each, against its own measured 3.16–3.70 ms. So a described
-/// overlay job rides the lane the overlay rasterizations have always ridden,
-/// beside the opaque closures it is progressively replacing; when the last
-/// opaque overlay kind gains a wire form, the `Closure` variant goes with it
-/// and this lane becomes the overlay lane outright.
-///
-/// An enum rather than boxing the described job into a closure because
-/// [`JobSink::send`]'s refusal contract returns the *request*: a lane with no
-/// live worker hands the value back inside `SendError`, and a request
-/// swallowed by a `FnOnce` could not be given back to the funnel to run
-/// inline.
-enum Interactive {
-    /// [`super::offload`]'s escape hatch, unchanged: the closure and the name
-    /// it was dispatched under, which is all a panic report has to identify
-    /// it by.
-    Closure(&'static str, Box<dyn FnOnce() + Send>),
-    /// A described job with an interactive deadline, delivered through the
-    /// same registry as the described lane's — only the queue differs.
-    Job(u64, JobRequest),
 }
 
 /// A payload on its way to the free lane, and the name it was discarded under.
@@ -183,23 +163,12 @@ fn start() -> Pool {
         super::deliver_job_reply(id, run(super::JobRequest::kind(&request), &request));
     });
 
-    let (opaque, opaque_rx) = mpsc::channel();
-    lane("rd-opaque", threads, opaque_rx, |task: Interactive| {
-        match task {
-            // No registry entry and no id: an opaque job is a closure that owns
-            // its own delivery, which is exactly why it could not be described.
-            Interactive::Closure(name, job) => {
-                if guarded(name, job).is_none() {
-                    log::error!("{name} panicked; its result will never arrive");
-                }
-            }
-            // The same body as the described lane's, on the queue with the
-            // interactive deadline. One `run`, one `deliver_job_reply` — the
-            // lane a job rides must never change what running it means.
-            Interactive::Job(id, request) => {
-                super::deliver_job_reply(id, run(super::JobRequest::kind(&request), &request));
-            }
-        }
+    // The same body as the described lane's, on the queue with the
+    // interactive deadline. One `run`, one `deliver_job_reply` — the lane a
+    // job rides must never change what running it means.
+    let (interactive, interactive_rx) = mpsc::channel();
+    lane("rd-opaque", threads, interactive_rx, |(id, request)| {
+        super::deliver_job_reply(id, run(super::JobRequest::kind(&request), &request));
     });
 
     // One thread, deliberately, and the module doc says why: frees serialise on
@@ -222,7 +191,7 @@ fn start() -> Pool {
     log::debug!("job pool started with {threads} thread(s) per lane, and one to free");
     Pool {
         described,
-        opaque,
+        interactive,
         free,
     }
 }
@@ -302,36 +271,14 @@ fn guarded<T>(kind: &'static str, f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
-/// Hand `job` to the opaque lane. [`super::offload`]'s native arm.
-///
-/// `Err` carries the closure back, for [`JobSink::send`]'s reason: the only way
-/// to refuse is a lane with no worker left, and the caller's answer is to run
-/// the closure where it stands. Slow, and the honest alternative to dropping a
-/// job whose `deliver` is the only thing that will ever release the caller's
-/// render slot.
-pub(super) fn run_opaque(
-    name: &'static str,
-    job: Box<dyn FnOnce() + Send>,
-) -> Result<(), Box<dyn FnOnce() + Send>> {
-    pool()
-        .opaque
-        .send(Interactive::Closure(name, job))
-        .map_err(|returned| match returned.0 {
-            Interactive::Closure(_, job) => job,
-            // This arm sent a `Closure`; a `SendError` hands back the value
-            // that was sent.
-            Interactive::Job(..) => unreachable!("a refused send returns what was sent"),
-        })
-}
-
 /// Hand `payload` to the free lane. [`super::discard`]'s native arm.
 ///
-/// `Err` carries the payload back, for [`run_opaque`]'s reason and with the
-/// same one reachable cause: the queue is unbounded, so a refusal is a lane
-/// with no live worker — every thread spawn failed, or the process is going
-/// away — and never back-pressure. The caller's answer is *not* to free it
-/// where it stands: [`super::discard`] files it in the deferred queue, which
-/// the frame loop drains under a time budget on this target as well.
+/// `Err` carries the payload back, for [`JobSink::send`]'s reason and with
+/// the same one reachable cause: the queue is unbounded, so a refusal is a
+/// lane with no live worker — every thread spawn failed, or the process is
+/// going away — and never back-pressure. The caller's answer is *not* to free
+/// it where it stands: [`super::discard`] files it in the deferred queue,
+/// which the frame loop drains under a time budget on this target as well.
 pub(super) fn run_free(
     name: &'static str,
     payload: Box<dyn std::any::Any + Send>,
@@ -347,15 +294,15 @@ pub(super) fn run_free(
 pub(super) fn sink() -> Box<dyn JobSink> {
     Box::new(Handle {
         described: pool().described.clone(),
-        interactive: pool().opaque.clone(),
+        interactive: pool().interactive.clone(),
     })
 }
 
 struct Handle {
     described: mpsc::Sender<(u64, JobRequest)>,
-    /// The `rd-opaque` lane's sender, for the described jobs whose deadline is
-    /// the map's. See [`Interactive`] for why the routing is by deadline.
-    interactive: mpsc::Sender<Interactive>,
+    /// The `rd-opaque` lane's sender, for the described overlay jobs whose
+    /// deadline is the map's. See [`Pool`] for why the routing is by deadline.
+    interactive: mpsc::Sender<(u64, JobRequest)>,
 }
 
 impl JobSink for Handle {
@@ -375,21 +322,13 @@ impl JobSink for Handle {
         // The one routing decision this transport makes, and it is over the
         // job's deadline rather than its kind list: an overlay follows the
         // map and must not queue behind a slate of radar renders. See
-        // [`Interactive`].
-        if matches!(request, JobRequest::Overlay { .. }) {
-            return self
-                .interactive
-                .send(Interactive::Job(id, request))
-                .map_err(|returned| match returned.0 {
-                    Interactive::Job(_, request) => request,
-                    Interactive::Closure(..) => {
-                        unreachable!("a refused send returns what was sent")
-                    }
-                });
-        }
-        self.described
-            .send((id, request))
-            .map_err(|returned| returned.0.1)
+        // [`Pool`].
+        let lane = if matches!(request, JobRequest::Overlay { .. }) {
+            &self.interactive
+        } else {
+            &self.described
+        };
+        lane.send((id, request)).map_err(|returned| returned.0.1)
     }
 }
 

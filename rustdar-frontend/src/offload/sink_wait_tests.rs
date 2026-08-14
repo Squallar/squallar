@@ -8,10 +8,10 @@
 //! Two things shape every fixture below. [`SINK_WAIT`] and [`WORKER`] are
 //! **thread-locals** and the harness reuses its threads, so each test takes a
 //! [`Fixture`] guard that puts both back on the way out, including on an
-//! unwind. And "runs here" is asynchronous on this target — [`offload`] hands
-//! the job to the pool's opaque lane natively, and only runs it on the frame in
-//! a browser — so a job that ran is asserted through a channel with a timeout,
-//! while a job that is *held* is asserted synchronously, because nothing ran.
+//! unwind. And "runs here" is asynchronous on this target — `run_here` spawns
+//! a thread for the job natively, and only runs it on the frame in a browser
+//! — so a job that ran is asserted through a channel with a timeout, while a
+//! job that is *held* is asserted synchronously, because nothing ran.
 
 use super::*;
 use std::sync::Arc;
