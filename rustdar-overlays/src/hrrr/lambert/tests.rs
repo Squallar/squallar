@@ -232,6 +232,24 @@ fn the_flat_index_mapping_reproduces_gribs_scan_order() {
     }
 }
 
+/// The size in [`LambertGrid`]'s own doc, **measured** rather than counted.
+///
+/// That figure read 88 for as long as two fields had existed without it being
+/// updated. It is the whole reason to believe "constants, not arrays", and the
+/// number is what a caller costing a cache entry reaches for — so it is pinned
+/// here rather than left to be re-derived by whoever next doubts it.
+///
+/// 64-bit only: `usize` is four bytes on wasm32, where the same layout is 96.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn the_documented_size_is_the_measured_one() {
+    assert_eq!(
+        std::mem::size_of::<LambertGrid>(),
+        104,
+        "LambertGrid's doc comment states this figure; update both together",
+    );
+}
+
 /// The lazy form must be **bit-identical** to the eager one it replaced, at
 /// every one of the 1,905,141 points — not close, identical: it is the same
 /// arithmetic, and every PROJ-anchored assertion above is stated in terms of

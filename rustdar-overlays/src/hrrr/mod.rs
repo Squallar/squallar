@@ -910,11 +910,16 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 /// Where a grid point's coordinates come from.
 ///
 /// HRRR is 1,905,141 points, so a materialised `lats`/`lons` pair is 30.5 MB
-/// *per cached parameter* — and [`crate::render::handlers`] caches one grid per
-/// parameter with no eviction, on targets with a 4 GiB address space (wasm32)
-/// or a hard per-app cap (Android). The Lambert case rebuilds any point from
-/// the projection constants instead, which is every point HRRR has ever
-/// returned; see [`lambert::LambertGrid`].
+/// *per cached parameter*, on targets with a 4 GiB address space (wasm32) or a
+/// hard per-app cap (Android). The Lambert case rebuilds any point from the
+/// projection constants instead, which is every point HRRR has ever returned;
+/// see [`lambert::LambertGrid`].
+///
+/// [`crate::render::handlers`] used to cache one grid per parameter with **no
+/// eviction**, which made that 30.5 MB a per-parameter leak; it is bounded now
+/// by `MODEL_GRID_CACHE_ENTRIES`, sized to the pane count. The figure above is
+/// still what one resident grid costs on this arm — it is the multiplier that
+/// stopped being unbounded, not the cost.
 #[derive(Debug, Clone)]
 pub enum GridCoords {
     /// GRIB2 template 3.30 — computed on demand from section 3.
