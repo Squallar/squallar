@@ -3878,6 +3878,117 @@ fn the_format_version_is_the_one_this_layout_ships() {
     );
 }
 
+/// A grid assembled by hand, for
+/// [`the_wire_layout_is_the_one_this_version_ships`].
+///
+/// Every number here is a literal and exactly representable, so the encoding
+/// is the same bytes on every target: nothing in this fixture is computed, so
+/// nothing in it can move with a libm. [`wire_fixture`] cannot serve — it goes
+/// through beam geometry, so its box-tightened axis ranges and its whole index
+/// plane are whatever the platform's `sin`/`cos`/`atan2` said, and a digest of
+/// it would be a digest of the libm that ran it.
+///
+/// The colour table is a synthetic ramp rather than [`colormap_lut`]'s, on
+/// purpose. A palette edit is not a wire-layout change, and a digest taken
+/// over the real table would turn every palette edit into a spurious demand to
+/// bump [`FORMAT_VERSION`] — a guard that cries wolf is one people delete. The
+/// table's *length prefix and position* are still covered, which is the part
+/// of it that is layout.
+///
+/// Written as a struct literal with no `..`, also on purpose, though the
+/// credit for that is small and worth stating exactly. A new field on
+/// [`VoxelGrid`] makes this fail to compile — measured: adding a
+/// `coverage_fraction: f32` to the struct produced four `E0063`s, of which
+/// this fixture was one. The other three are the literals `build_voxels` and
+/// the derivation path already use, so today the type is *already* closed
+/// against a silently-added field and this line adds nothing to that. What it
+/// adds is that the property cannot be lost: if production ever moves to a
+/// builder or a `..Default::default()`, the other three stop failing and this
+/// one does not.
+fn layout_fixture() -> VoxelGrid {
+    VoxelGrid {
+        indices: vec![0, 1, 128, NO_DATA_INDEX, 255, 7],
+        values: Some(vec![0.0, -1.5, 2.25, f32::NAN, 0.5, -0.75]),
+        lut: (0..LUT_LEN).map(|i| (i % 251) as u8).collect(),
+        shape: VoxelShape {
+            nx: 3,
+            ny: 2,
+            nz: 1,
+        },
+        x_range_km: (-1.5, 2.5),
+        y_range_km: (-3.25, 4.75),
+        z_range_km_msl: (0.5, 8.5),
+        site: (35.25, -97.5),
+        value_range: (-32.0, 96.0),
+        product: RadarProduct::Reflectivity,
+        tilt_count: 5,
+        widest_tilt_gap_deg: 1.25,
+    }
+}
+
+/// The bytes this version ships are **these** bytes.
+///
+/// [`the_format_version_is_the_one_this_layout_ships`] asserts
+/// `FORMAT_VERSION == 1` and that a `1` is written at byte 4. Both are our
+/// value compared against our value, so both fail for exactly one person: the
+/// one who *raises* the number. They are silent for the one who changes the
+/// layout and does not — and that is the person the number exists to catch,
+/// because raising it is the safe act and forgetting to is what ships a page
+/// and a worker that misread each other.
+///
+/// Measured rather than argued. With `FORMAT_VERSION` left at `1`, against
+/// this module's 68 pre-existing tests:
+///
+/// * swapping `x_range_km` and `y_range_km` on the wire, encoder and decoder
+///   in step — the same-width reorder the version test's own doc names as the
+///   danger — left `the_format_version_is_the_one_this_layout_ships` green,
+///   and 67 of those 68 with it. The one that failed was
+///   `a_grid_header_that_cannot_describe_its_own_product_is_refused`, which
+///   caught it only incidentally, by asserting that offset 20 is `x_range.0`,
+///   and reported it as "the finiteness assertions above are corrupting some
+///   other field" — a message that reads as a broken test rather than as a
+///   missing bump;
+/// * appending an `f64` with `from_bytes` and `encoded_len` updated in step
+///   left the version test green again, 66 of 68 passing;
+/// * and the same swap done to `render_input` — `radar_lat` against
+///   `radar_lon`, which draws every site at the wrong coordinates — left
+///   **all 890** of `rustdar-radar`'s library tests passing (864 run, 26
+///   ignored, 0 failed), its own version test included.
+///
+/// This one fails on all three, because it is not a claim about the constant.
+/// It is the encoder's own output, over a fixture nothing computes, compared
+/// with the bytes recorded when the version was last set. Any change to what
+/// `to_bytes` writes — a field added, removed, reordered, retyped, or written
+/// in a different width or endianness — moves the length or the digest, and
+/// the only way past it is to write the new numbers down, which is where the
+/// bump obligation is met.
+///
+/// A digest is opaque about *what* moved, deliberately: the three assertions
+/// are one tuple so the failure names the version alongside them, and what to
+/// do about it does not depend on which field it was.
+#[test]
+fn the_wire_layout_is_the_one_this_version_ships() {
+    let bytes = layout_fixture().to_bytes();
+    assert_eq!(
+        (
+            FORMAT_VERSION,
+            bytes.len(),
+            crate::wire::layout_digest(&bytes)
+        ),
+        (1, 1170, 0x794c_df89_7bd1_0a4d),
+        "the bytes `to_bytes` writes are not the bytes version 1 shipped. \
+         Something about this payload's layout moved — a field added, \
+         removed, reordered, retyped, or written at a different width. That \
+         is the change `FORMAT_VERSION` exists to announce, and a stale \
+         worker that shares a build token with a fresh page (locally it \
+         always does: `GITHUB_SHA` is absent outside CI, so the token \
+         degrades to `…/dev`) will decode the new bytes into the old field \
+         order and raymarch a volume with its axes swapped, with no error \
+         anywhere. Bump `FORMAT_VERSION`, then write the new length and \
+         digest here — in that order, and never the numbers alone.",
+    );
+}
+
 /// A real grid survives the wire, for every product — derivations
 /// included — with and without the value plane.
 ///

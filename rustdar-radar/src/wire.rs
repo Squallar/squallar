@@ -71,3 +71,38 @@ impl<'a> Reader<'a> {
         self.at == self.bytes.len()
     }
 }
+
+/// A digest of an encoded payload, for the
+/// `the_wire_layout_is_the_one_this_version_ships` tests.
+///
+/// FNV-1a 64, six lines and no dependency, because nothing here needs a
+/// cryptographic hash — the adversary is a developer who moved a field, not
+/// one searching for a collision.
+///
+/// **What this is for.** Each of the three codecs pins its version with
+/// `assert_eq!(FORMAT_VERSION, N)`, which is our value compared against our
+/// value: it fails for exactly one person, the one who *raises* the number,
+/// and is silent for the one who changes a shape and does not. That is the
+/// wrong way round — raising it is the safe act, and forgetting to is what
+/// ships a page and a worker that misread each other. A digest over the bytes
+/// an encoder actually produced fails for the second developer, which is the
+/// one the number exists to catch.
+///
+/// **Why the fixtures it is used on are built from literals.** A digest is
+/// only a guard if it never fires for a reason other than the layout. Every
+/// grid, section and tilt this crate builds for its other tests goes through
+/// beam geometry, and `sin`/`cos`/`atan2` are the platform's libm rather than
+/// anything IEEE 754 pins — so a digest of one of those would be a digest of
+/// whichever libm ran it, and would go red on a target nobody changed. The
+/// `layout_fixture` beside each of these tests is therefore assembled by hand
+/// from exactly-representable numbers, and carries no value that anything
+/// computes.
+#[cfg(test)]
+pub(crate) fn layout_digest(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
