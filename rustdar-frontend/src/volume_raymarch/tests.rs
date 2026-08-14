@@ -1101,8 +1101,11 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
         grid_bytes_with_mips([256, 256, 128]),
         Some(38_354_944),
         "the desktop grid is 32 MiB of premultiplied cells and then the whole \
-         mip pyramid a second level buys, which the device reserved \
-         38,350,848 B for before the page of slack",
+         mip pyramid a second level buys. 38,350,848 B of that is the tile \
+         model and 4,096 the page; the two devices this has been read on \
+         reserved 38,351,360 B (RTX 3090, which lays the pyramid out and adds \
+         512 B to every D3 image) and 37,748,736 B (lavapipe, which lays out \
+         only the two levels named), so the charge is over on both",
     );
     assert_eq!(grid_bytes([128, 128, 64]), Some(4 * 1024 * 1024));
     assert_eq!(grid_bytes_with_mips([128, 128, 64]), Some(4_800_512));
@@ -1130,11 +1133,24 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
 /// 256×256×128 grid is identical at `mip_level_count` 2 through 9 — see
 /// [`grid_bytes_at`]'s doc for the readings.
 ///
+/// **On the device it was swept on.** lavapipe reserves each named level and
+/// nothing under it, so the pyramid is not what *it* lays out; the charge counts
+/// it anyway because it is the larger of the two layouts and this figure may
+/// only err upwards. Which layout a given backend uses is read off the device by
+/// `the_charged_grid_bytes_are_never_under_what_the_device_reserved`, which is
+/// `#[ignore]`d behind a real adapter — `cargo test -p rustdar-frontend --test
+/// volume_gpu -- --ignored` — while this test needs none and asserts the
+/// arithmetic alone.
+///
 /// An inequality against the packed two-level sum rather than a literal, so it
 /// holds for every shape: whatever the tiling does, the count may never be
 /// those two levels alone again. The upper bound is the other half — a full 3D
 /// pyramid is 8/7 of its base, so a count that had started charging for
 /// something else entirely would show here rather than passing for being big.
+/// **It is also where a growing over-charge is caught**: the GPU test above can
+/// only pin the surplus against whatever the device in front of it reserves, and
+/// on a backend that does not tile there is nothing there to bound the tile
+/// model with. This one runs on every target, with no adapter.
 #[test]
 fn a_second_mip_level_is_charged_as_the_whole_pyramid() {
     for cells in [
