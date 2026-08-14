@@ -249,6 +249,8 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             level_failures: Vec::new(),
             evaluated_levels: Vec::new(),
             listing_failures: Vec::new(),
+            window_gaps: Vec::new(),
+            record_drops: crate::glm::RecordDrops::default(),
         }))),
         OverlayKind::ModelData => Box::new(HrrrFetchResult(Ok(cin_grid()))),
         OverlayKind::RadarSites | OverlayKind::Radar => return false,

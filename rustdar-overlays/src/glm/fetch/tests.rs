@@ -37,6 +37,14 @@ struct Fixture<'a> {
     /// Variable to write against a deliberately shorter dimension,
     /// simulating a corrupt or restructured file.
     short: Option<&'a str>,
+    /// Replacement `flash_lat` column, for the record-drop tests. Kept two
+    /// elements long so every other column still matches and a *drop* is the
+    /// only gate that can fire.
+    flash_lats: Option<&'a [f32]>,
+    /// `_FillValue` to declare on `flash_lat`, so a value in `flash_lats` can
+    /// be **marked missing** rather than merely out of range. The two land in
+    /// different buckets and the tests below turn on telling them apart.
+    flash_lat_fill: Option<f32>,
 }
 
 /// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
@@ -76,9 +84,14 @@ fn synthetic_glm_file(spec: Fixture<'_>) -> Vec<u8> {
             if let Some(u) = units {
                 var.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
             }
+            if name == "flash_lat"
+                && let Some(fill) = spec.flash_lat_fill
+            {
+                var.set_attr("_FillValue", hdf5_pure::AttrValue::F64(fill as f64));
+            }
         };
 
-        put("flash_lat", &[35.0, 36.0]);
+        put("flash_lat", spec.flash_lats.unwrap_or(&[35.0, 36.0]));
         put("flash_lon", &[-97.0, -98.0]);
         put("flash_energy", &[1.0e-14, 2.0e-14]);
         put("flash_area", &[128.0, 256.0]);
@@ -203,6 +216,103 @@ fn a_short_required_column_is_rejected() {
     }
 }
 
+/// The drop counts must leave the parser. They used to be two `usize` locals
+/// consumed by a `log::warn!` and nothing else, so a granule that handed over
+/// records and had them thrown away was indistinguishable, everywhere above
+/// this function, from a granule that had none to give.
+///
+/// Fails if either counter is dropped on the floor again, and — because the
+/// two buckets are asserted separately — if a `_FillValue` is ever counted as
+/// a coordinate problem, which would send the reader looking at unpacking when
+/// the product simply declined to place the record.
+#[test]
+fn a_dropped_record_reaches_the_caller_and_says_which_kind() {
+    // -999 is off-globe *and* the declared fill value, so the two gates both
+    // match the same element and only the bucket tells them apart.
+    let filled = synthetic_glm_file(Fixture {
+        flash_lats: Some(&[35.0, -999.0]),
+        flash_lat_fill: Some(-999.0),
+        ..Default::default()
+    });
+    let parsed = parse_glm_netcdf(&filled, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+        .expect("one bad record must not fail the granule");
+    assert_eq!(parsed.records.len(), 1, "the good record still draws");
+    assert_eq!(
+        (
+            parsed.drops.considered,
+            parsed.drops.fill_values,
+            parsed.drops.off_globe
+        ),
+        (2, 1, 0),
+        "a value the file marked missing is a fill-value drop, not a coordinate one",
+    );
+
+    // Same shape, no `_FillValue` declared: now the range check is the only
+    // gate that can fire, and it must land in the other bucket.
+    let off_globe = synthetic_glm_file(Fixture {
+        flash_lats: Some(&[35.0, -999.0]),
+        ..Default::default()
+    });
+    let parsed = parse_glm_netcdf(&off_globe, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+        .expect("one bad record must not fail the granule");
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(
+        (
+            parsed.drops.considered,
+            parsed.drops.fill_values,
+            parsed.drops.off_globe
+        ),
+        (2, 0, 1),
+        "an unmarked coordinate off the globe is this reader and the product \
+         disagreeing, and is counted as such",
+    );
+}
+
+/// **The quiet-sky guard, at the finest grain.** A granule whose records all
+/// place cleanly reports nothing dropped, so a poll that draws every record it
+/// was given can never be marked incomplete on this axis. Without it the fix
+/// for the test above could be "report a drop always", which is the false
+/// alarm that teaches people to ignore the mark.
+#[test]
+fn a_granule_that_keeps_every_record_reports_no_drops() {
+    let bytes = synthetic_glm_file(Fixture::default());
+    let parsed = parse_glm_netcdf(
+        &bytes,
+        GlmSatellite::GoesEast,
+        &[GlmDataLevel::Flash, GlmDataLevel::Event],
+    )
+    .expect("the fixture parses");
+    assert_eq!(parsed.drops.dropped(), 0);
+    assert_eq!(
+        parsed.drops.considered, 4,
+        "two flashes and two events were looked at, and the denominator counts \
+         every level that parsed rather than only the first",
+    );
+}
+
+/// The denominator counts what was **examined**, not what the file contains: a
+/// level that failed outright never reached the drop predicates, and folding
+/// its rows in would inflate `considered` with records nothing ever read —
+/// making the drop *rate* look smaller than it is.
+#[test]
+fn a_level_that_failed_contributes_no_denominator() {
+    let bytes = synthetic_glm_file(Fixture {
+        omit: &["event_lat"],
+        ..Default::default()
+    });
+    let parsed = parse_glm_netcdf(
+        &bytes,
+        GlmSatellite::GoesEast,
+        &[GlmDataLevel::Flash, GlmDataLevel::Event],
+    )
+    .expect("one level failing must not fail the granule");
+    assert_eq!(parsed.level_failures.len(), 1, "the event level failed");
+    assert_eq!(
+        parsed.drops.considered, 2,
+        "only the flash level was examined, so only its two records count",
+    );
+}
+
 /// Every per-file error must survive the batch partition, in the right
 /// bucket. Fails if errors are discarded into a log line, which is what
 /// made a total parse failure read as "Updated 0s ago".
@@ -214,6 +324,7 @@ fn batch_partition_keeps_every_error_and_separates_the_kinds() {
             GranuleParse {
                 records: Vec::new(),
                 level_failures: Vec::new(),
+                drops: RecordDrops::default(),
             },
         )),
         Err(FileError::Parse("b.nc: bad variable".into())),
@@ -249,6 +360,7 @@ fn batch_partition_dedups_level_failures_per_level_not_per_file() {
             GranuleParse {
                 records: Vec::new(),
                 level_failures: both_broken(),
+                drops: RecordDrops::default(),
             },
         )),
         Ok((
@@ -256,6 +368,7 @@ fn batch_partition_dedups_level_failures_per_level_not_per_file() {
             GranuleParse {
                 records: Vec::new(),
                 level_failures: both_broken(),
+                drops: RecordDrops::default(),
             },
         )),
         Ok((
@@ -263,6 +376,7 @@ fn batch_partition_dedups_level_failures_per_level_not_per_file() {
             GranuleParse {
                 records: Vec::new(),
                 level_failures: both_broken(),
+                drops: RecordDrops::default(),
             },
         )),
     ]);
@@ -282,6 +396,57 @@ fn batch_partition_dedups_level_failures_per_level_not_per_file() {
     }
 }
 
+/// Drops **sum** across granules where level failures **dedup**, and the two
+/// must not be given the same treatment. A level failure is a fact about the
+/// product and repeats identically in every file; a drop count is a quantity,
+/// and the same mismatch across twenty granules costs twenty granules' worth
+/// of records. Deduplicating it would report one granule's loss for the whole
+/// window and understate it by the batch size.
+#[test]
+fn batch_partition_sums_record_drops_rather_than_deduping_them() {
+    let with_drops = |considered, fill_values, off_globe| {
+        Ok((
+            "x.nc".to_string(),
+            GranuleParse {
+                records: Vec::new(),
+                level_failures: Vec::new(),
+                drops: RecordDrops {
+                    considered,
+                    fill_values,
+                    off_globe,
+                },
+            },
+        ))
+    };
+    let outcome = BatchOutcome::from_results(vec![
+        with_drops(100, 3, 1),
+        with_drops(100, 3, 1),
+        with_drops(50, 0, 2),
+    ]);
+
+    assert_eq!(
+        (
+            outcome.drops.considered,
+            outcome.drops.fill_values,
+            outcome.drops.off_globe
+        ),
+        (250, 6, 4),
+        "three granules' drops add up; identical counts are not one report",
+    );
+}
+
+/// A granule that never parsed contributes neither drops nor denominator: its
+/// records were never examined, and charging them to `considered` would let a
+/// download outage dilute the drop rate towards zero.
+#[test]
+fn a_granule_that_failed_contributes_no_drops_and_no_denominator() {
+    let outcome = BatchOutcome::from_results(vec![
+        Err(FileError::Transport("a.nc: HTTP status error: 503".into())),
+        Err(FileError::Parse("b.nc: bad variable".into())),
+    ]);
+    assert_eq!(outcome.drops, RecordDrops::default());
+}
+
 /// Fails if the accumulator drops any bucket — invisible from the async
 /// fetch that calls it.
 #[test]
@@ -295,10 +460,25 @@ fn the_accumulator_forwards_every_bucket() {
             parse_errors: vec!["p".into()],
             transport_errors: vec!["t".into()],
             level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+            drops: RecordDrops {
+                considered: 40,
+                fill_values: 2,
+                off_globe: 1,
+            },
         },
     );
 
     assert_eq!(acc.entries.len(), 1);
+    assert_eq!(
+        (
+            acc.drops.considered,
+            acc.drops.fill_values,
+            acc.drops.off_globe
+        ),
+        (40, 2, 1),
+        "the record bucket must not be dropped either - it is the one that \
+         reached only a log line",
+    );
     assert_eq!(acc.parse_errors, vec!["p"]);
     assert_eq!(acc.transport_errors, vec!["t"]);
     assert_eq!(
@@ -329,6 +509,7 @@ fn a_batch_that_parsed_nothing_is_not_evidence() {
             parse_errors: vec!["every file failed".into()],
             transport_errors: Vec::new(),
             level_failures: Vec::new(),
+            drops: RecordDrops::default(),
         },
     );
     assert!(
@@ -887,6 +1068,7 @@ fn build_outcome_binds_each_bucket_to_its_own_field() {
     let outcome = build_outcome(
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         vec![GlmSatellite::GoesEast],
         Vec::new(),
         &tally,
@@ -932,7 +1114,15 @@ fn build_outcome_keeps_level_failures_out_of_the_file_counts() {
         level_failures: vec![level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group)],
         ..Default::default()
     };
-    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+    let outcome = build_outcome(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &tally,
+        acc,
+    );
 
     assert!(outcome.parse_failures.is_none(), "no *file* failed");
     assert!(outcome.transport_failures.is_none());
@@ -948,7 +1138,15 @@ fn build_outcome_leaves_an_empty_bucket_unreported() {
         parse_errors: vec!["a.nc: boom".into()],
         ..Default::default()
     };
-    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+    let outcome = build_outcome(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &tally,
+        acc,
+    );
 
     assert_eq!(
         outcome.parse_failures.expect("parse failures").in_window,
@@ -1321,6 +1519,120 @@ fn one_dead_satellite_does_not_blank_the_others_flashes() {
         "the survivor's flashes were dropped with the failed satellite's — and \
          so were the failed satellite's own earlier granules, which are still \
          real flashes inside the window",
+    );
+}
+
+/// A listing key dated inside the window, so a round can reach the download
+/// step. Built against the caller's `now` because the window is wall-clock.
+fn fresh_granule_key(now: NaiveDateTime) -> String {
+    let start = now - TimeDelta::seconds(20);
+    format!(
+        "GLM-L2-LCFA/{}/{}/OR_GLM-L2-LCFA_G18_s{}0_e1_c2.nc",
+        start.format("%Y/%j"),
+        start.format("%H"),
+        start.format("%Y%j%H%M%S"),
+    )
+}
+
+/// **A full bucket with nothing in the window is reported, and is not a dead
+/// feed.**
+///
+/// The second silent path: the listing answers `200`, `objects_seen` is
+/// non-zero so the dead-feed check stays quiet, every object is rejected by the
+/// window filter, and the round returns `Ok` on a fresh clock with that
+/// satellite contributing nothing. Three real causes reach it — a `.nc` suffix
+/// that stopped matching, an `_s` timestamp that stopped parsing, publishing
+/// stalled longer than the window — and all three looked exactly like a calm
+/// night.
+///
+/// Both fixtures below serve `STALE_GRANULE`, dated 2020: counted, never in
+/// window.
+#[test]
+fn a_listing_with_no_in_window_granule_is_a_window_gap_not_a_dead_feed() {
+    let sources = s3_serving(vec![
+        ("east", http_response("200 OK", &listing_xml(STALE_GRANULE))),
+        ("west", http_response("200 OK", &listing_xml(STALE_GRANULE))),
+    ]);
+    let mut cache = GlmCache::default();
+
+    let outcome = poll(&sources, &mut cache).expect("both listings answered");
+
+    let gapped: Vec<GlmSatellite> = outcome.window_gaps.iter().map(|g| g.satellite).collect();
+    assert_eq!(
+        gapped,
+        vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        "a listing that placed no granule in the window must say so; this is the \
+         round that returned Ok with an empty layer and a fresh clock",
+    );
+    assert!(
+        outcome.window_gaps.iter().all(|g| g.objects_seen > 0),
+        "the count is what separates this from a dead feed, and the report is \
+         useless without it",
+    );
+    assert!(
+        outcome.dead_feeds.is_empty(),
+        "the bucket is not empty, and telling the operator it is sends them to \
+         check the one thing that is fine",
+    );
+}
+
+/// ...and the opposite listing keeps its own name: an empty bucket is a dead
+/// feed and **not** also a window gap. They are mutually exclusive by
+/// construction — zero objects can only yield zero keys — and reporting both
+/// would put two contradictory sentences on one layer.
+#[test]
+fn an_empty_bucket_is_a_dead_feed_and_not_also_a_window_gap() {
+    let empty = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>bucket</Name><IsTruncated>false</IsTruncated>\
+                 </ListBucketResult>";
+    let sources = s3_serving(vec![
+        ("east", http_response("200 OK", empty)),
+        ("west", http_response("200 OK", empty)),
+    ]);
+    let mut cache = GlmCache::default();
+
+    let outcome = poll(&sources, &mut cache).expect("both listings answered");
+
+    assert_eq!(outcome.dead_feeds.len(), 2);
+    assert!(
+        outcome.window_gaps.is_empty(),
+        "an empty bucket is already reported as dead; saying its listing was \
+         healthy in the same breath is a contradiction",
+    );
+}
+
+/// **The quiet-sky guard for the round.** A listing that places a granule in
+/// the window reports no gap, even though the granule then fails to download
+/// and the layer draws nothing.
+///
+/// This is the distinction the whole report rests on. GLM publishes a granule
+/// every 20 s whether or not anything flashed, so *keys present* means the feed
+/// is delivering and any emptiness downstream is somebody else's report to
+/// make — here, the transport failure. Fails if the gap check is ever widened
+/// from "no keys" to "no flashes", which would mark every calm night
+/// incomplete and train people to ignore the mark.
+#[test]
+fn a_granule_in_the_window_is_never_a_window_gap() {
+    let key = fresh_granule_key(Utc::now().naive_utc());
+    let sources = s3_serving(vec![
+        ("east", http_response("200 OK", &listing_xml(&key))),
+        ("west", http_response("200 OK", &listing_xml(&key))),
+    ]);
+    let mut cache = GlmCache::default();
+
+    let outcome = poll(&sources, &mut cache).expect("both listings answered");
+
+    assert!(
+        outcome.window_gaps.is_empty(),
+        "the window holds a granule, so the feed is publishing; that the granule \
+         then failed is a different report and has one",
+    );
+    assert!(outcome.dead_feeds.is_empty());
+    assert!(
+        outcome.flashes.is_empty(),
+        "the mock serves XML for the object body, so nothing parses - the point \
+         is that an empty layer is still not a window gap",
     );
 }
 
