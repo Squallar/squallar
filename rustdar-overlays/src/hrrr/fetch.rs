@@ -289,7 +289,7 @@ fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
          {:.1}..{:.1} envelope the renderer's longitude handling has been \
          validated for (HRRR CONUS is -134.0955..-60.9172).\n\
          \n\
-         This is not a decode failure — the grid decoded fine. The parse side \
+         This is not a decode failure - the grid decoded fine. The parse side \
          folds longitude into [-180,180] (`lambert::normalize_longitude_degrees`) \
          while the viewport is deliberately left unfolded \
          (`OverlayTexturePlan::coverage`). For a domain near or across the \
@@ -301,12 +301,12 @@ fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
          The repair was left unbuilt on purpose, because three candidates are \
          each correct for a different domain shape and nothing in the tree \
          said which this domain needs:\n\
-         \x20 * a rigid whole-grid shift — exact only if the domain does not \
+         \x20 * a rigid whole-grid shift - exact only if the domain does not \
          straddle the antimeridian;\n\
-         \x20 * a per-point shift — tears cells, because `rasterize_model_data` \
+         \x20 * a per-point shift - tears cells, because `rasterize_model_data` \
          sizes every cell from its neighbours' pixel spacing, so two adjacent \
          points shifted differently stretch one cell across the texture;\n\
-         \x20 * `GridCoords::wraps_longitude` — guards the index window, not \
+         \x20 * `GridCoords::wraps_longitude` - guards the index window, not \
          this, and measures `false` for a seam-parked grid.\n\
          \n\
          Whoever added this domain is the person who can choose between them. \
