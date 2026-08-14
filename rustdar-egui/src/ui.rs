@@ -4246,17 +4246,6 @@ impl Gui {
         self.map_tiles.label_tiles_light.is_some() || self.map_tiles.label_tiles_dark.is_some()
     }
 
-    /// The shared tile sources, for a consumer outside the pane draw loop.
-    ///
-    /// The 3D floor's map composite reads tile *bytes* through this
-    /// (`HttpsTiles::raster_bytes_at`) so the box's ground carries the same
-    /// basemap and city-label tiles the 2D panes draw — the sources are the
-    /// panes' own, so there is one cache, one fetch queue and one attribution
-    /// story however many consumers stand on them.
-    pub fn map_tiles_mut(&mut self) -> &mut MapTileState {
-        &mut self.map_tiles
-    }
-
     /// Record that the arm for `kind` drew pane `pane_idx` into `rect`.
     ///
     /// Called from inside each arm of `render_panes`' render branch, with the
