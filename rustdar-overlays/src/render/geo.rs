@@ -3,6 +3,43 @@
 
 use crate::types::{GeoBounds, GeoPolygon, GeoPolygonRing, ScreenPoint};
 
+/// The whole multiple of 360° that carries the datum spanning
+/// `[datum_min, datum_max]` to its representation nearest the target spanning
+/// `[target_min, target_max]`.
+///
+/// One spelling, because the two callers have to agree or the map draws a
+/// shape where it cannot be clicked. The rasterizer moves a *polygon* toward
+/// the *viewport* (`MercatorBounds::lon_shift`); the hit test moves a *click*
+/// toward a *ring* (`geo_point_in_feature`). Same question, opposite ends.
+///
+/// A datum wider than a half-turn has no unambiguous nearest representation —
+/// translating it would be a guess about which side of the seam it meant — so
+/// it gets no shift. A single point always has a span of zero and so is always
+/// answerable, which is why moving the point is the safe end to move.
+pub fn lon_shift(datum_min: f64, datum_max: f64, target_min: f64, target_max: f64) -> f64 {
+    let span = datum_max - datum_min;
+    if !span.is_finite() || !(0.0..180.0).contains(&span) {
+        return 0.0;
+    }
+    let datum_centre = (datum_min + datum_max) / 2.0;
+    let target_centre = (target_min + target_max) / 2.0;
+    if !target_centre.is_finite() {
+        return 0.0;
+    }
+    360.0 * ((target_centre - datum_centre) / 360.0).round()
+}
+
+/// `ring`'s longitude extent, or `None` for a ring with no finite vertex.
+pub fn ring_lon_extent(ring: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    for &(_, lon) in ring {
+        min_lon = min_lon.min(lon);
+        max_lon = max_lon.max(lon);
+    }
+    (min_lon.is_finite() && max_lon.is_finite()).then_some((min_lon, max_lon))
+}
+
 /// Ray casting, even-odd rule. Behaviour on the boundary is unspecified.
 pub fn point_in_polygon(point: ScreenPoint, vertices: &[ScreenPoint]) -> bool {
     let n = vertices.len();

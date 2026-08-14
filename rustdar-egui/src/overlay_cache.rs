@@ -953,8 +953,7 @@ fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
 /// consistent with the rendered projection.
 pub fn geo_point_in_feature(lat: f64, lon: f64, feature: &OverlayFeature) -> bool {
     let merc_y = lat_rad_to_mercator_y(lat.to_radians());
-    let point = ScreenPoint::new(lon as f32, merc_y as f32);
-    let ring_contains = |ring: &[(f64, f64)]| {
+    let ring_contains = |point: ScreenPoint, ring: &[(f64, f64)]| {
         if ring.len() < 3 {
             return false;
         }
@@ -970,13 +969,30 @@ pub fn geo_point_in_feature(lat: f64, lon: f64, feature: &OverlayFeature) -> boo
         let Some(exterior) = polygon.first() else {
             continue;
         };
-        if !ring_contains(exterior) {
+        // `lon` arrives from `Projector::unproject`, which is linear in pixel
+        // x and folds nothing, so a click east of the dateline reads e.g. 185
+        // while the ring it lands in is stored at -175. The point is moved
+        // into the ring's frame rather than the ring into the point's: a point
+        // has no shape to deform, and this has to reach the same verdict the
+        // rasterizer reached when it shifted the polygon the other way, or a
+        // Pacific zone draws where it cannot be clicked.
+        let point = match overlay_geo::ring_lon_extent(exterior) {
+            Some((rmin, rmax)) => ScreenPoint::new(
+                (lon + overlay_geo::lon_shift(lon, lon, rmin, rmax)) as f32,
+                merc_y as f32,
+            ),
+            None => ScreenPoint::new(lon as f32, merc_y as f32),
+        };
+        if !ring_contains(point, exterior) {
             continue;
         }
         // Inside the exterior — but inside any interior ring means this
         // polygon has a hole here, and the point is outside it. Another
         // polygon of the same feature may still contain the point.
-        if !polygon[1..].iter().any(|hole| ring_contains(hole)) {
+        // The holes take the exterior's shifted point, not their own: a hole
+        // shifted by a different turn than the ring it cuts is no longer in
+        // that ring.
+        if !polygon[1..].iter().any(|hole| ring_contains(point, hole)) {
             return true;
         }
     }
