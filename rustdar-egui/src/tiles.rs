@@ -81,19 +81,18 @@ impl TileSource for CartoDb {
 
 // Slippy-map tile coordinate helpers (standard OSM / Web Mercator formulas)
 
-/// The latitude Web Mercator ends at: the one whose projected `y` is exactly
-/// `π`, so the world is the square the tile grid needs it to be.
+/// The latitude Web Mercator ends at — [`rustdar_radar::types`]' constant, not
+/// a second copy of it.
 ///
-/// `2·atan(e^π) − π/2` in degrees. Quoted to the digits EPSG:3857 and the OSM
-/// slippy-map note carry rather than to the `85.05` two other constants in this
-/// workspace were transcribed as — that truncation is 0.0011287798° short,
-/// **125.51 m** of meridian, and while it is only ever a clamp bound the point
-/// of a named limit is that it is the limit.
+/// Re-exported under this path because that is where it was defined when the
+/// tile helpers, `overlay_cache` and `rustdar-overlays`'s rasterizer were each
+/// given their own spelling of it; it now lives one crate down, which is the
+/// lowest point all three can reach. The constant's own doc carries the
+/// projection's reasoning and what the truncated copies cost.
 ///
 /// Not applied as a clamp by [`lat_to_tile_y`], which needs no branch: the
 /// index clamp below already carries every latitude past this to the edge row.
-/// It is here because the tile grid's domain should be nameable.
-pub const MERCATOR_LAT_LIMIT_DEG: f64 = 85.051_128_779_806_6;
+pub use rustdar_radar::types::MERCATOR_LAT_LIMIT_DEG;
 
 /// Carry a fractional tile coordinate to an index on `0..2^zoom`.
 ///

@@ -47,6 +47,21 @@
 //! *Refraction.* `beam::RE_EFF_KM` and the `1.21 · Re` Level III models are in
 //! [`ALLOWED`] rather than excluded, because they are exactly the sites a
 //! careless unification would "fix". Their entries say why they must not be.
+//!
+//! # The Web Mercator latitude limit rides along
+//!
+//! `types::MERCATOR_LAT_LIMIT_DEG` — 85.051128779806°, the latitude whose
+//! projected `y` is exactly `π` — went the same way and for the same reason.
+//! Three modules each spelled it `85.05`: the tile helpers, `overlay_cache`
+//! and `rustdar-overlays`'s `render::rasterize`. Two were repaired one at a
+//! time, and the third was *missed by the commit that repaired the second* —
+//! which is the whole argument for a scan. That truncation is 0.0011287798°
+//! short, 125.51 m of meridian, and in the rasterizer's case it desynchronised
+//! the Y-range a texture was drawn for from the Y-range it was placed
+//! between.
+//!
+//! Its band is deliberately narrow — see [`BANDS`] — and it is the one band
+//! test files are exempt from, see [`is_test_file`].
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::path::{Path, PathBuf};
@@ -57,15 +72,29 @@ use std::path::{Path, PathBuf};
 /// real spread of a degree of latitude — 110.57 km at the equator to 111.69 at
 /// the poles — and no further; `112.0` in the wild is a pixel or a colour
 /// channel, never a geodesy figure.
+///
+/// The Mercator band starts at 85.04 rather than at 85.0 for the same kind of
+/// reason, measured the same way. The limit is 85.051128779806°, so every
+/// spelling of it anybody actually writes — `85.05`, `85.0511`,
+/// `85.05112878` — is at or above 85.05, while a figure rounded as far as
+/// `85.0` is 5.7 km short and is nobody's statement of a projection limit.
+/// Bare `85.0` *is* four things in this workspace, none of them a latitude:
+/// `palette.rs`'s 85 dBZ colour stop, `nrot.rs`'s rot-divisor table row and
+/// its assertion, and a green channel in `rasterize.rs`. Starting the band
+/// above them is what keeps this guard from crying wolf at a colour table.
 const BANDS: &[(&str, f64, f64)] = &[
     ("earth radius, km", 6300.0, 6400.0),
     ("km per degree", 110.5, 111.9),
+    ("mercator latitude limit", 85.04, 85.06),
 ];
 
 /// Only integers are exempt in the degree band: kilometres per degree is a
 /// fractional quantity and every real spelling of it has a decimal point,
 /// while bare `111` is a slice bound and bare `112` is a tower height.
 const DEGREE_BAND: &str = "km per degree";
+
+/// The band [`is_test_file`] exempts, and the only one with an exemption.
+const MERCATOR_BAND: &str = "mercator latitude limit";
 
 /// Every site in the workspace permitted to name one of [`BANDS`]' numbers,
 /// with the reason it is not `EARTH_RADIUS_KM` or `KM_PER_DEGREE_LAT`.
@@ -81,6 +110,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "pub const EARTH_RADIUS_KM: f64 = 6371.0;",
         "THE definition. Everything horizontal is this sphere or an \
          expression over it.",
+    ),
+    (
+        "rustdar-radar/src/types.rs",
+        "pub const MERCATOR_LAT_LIMIT_DEG: f64 = 85.051_128_779_806_6;",
+        "THE definition of the Web Mercator latitude limit, for the same \
+         reason and after the same three-copy history. `rustdar-egui`'s \
+         `tiles` re-exports this rather than restating it, and \
+         `render::rasterize` reads it through `rustdar_radar::types`, so this \
+         is the only literal spelling in non-test code.",
     ),
     // ── Atmospheric refraction: a different physical quantity ───────────
     (
@@ -306,6 +344,28 @@ fn sources(dir: &Path, into: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether a workspace-relative path is a test file by name.
+///
+/// Only [`MERCATOR_BAND`] consults this, and only because the projection's own
+/// tests have to be able to *quote* latitudes at the limit to check what
+/// happens there. `tiles/tests.rs` carries fourteen of them — the limit to
+/// every digit, one ulp either side of it, and `85.05` itself, whose whole job
+/// is to be shown measurably short. Those are reference vectors checked
+/// against `mercantile`, deliberately written as literals so the table cannot
+/// validate the constant against itself, and making each one ask [`ALLOWED`]
+/// for permission would turn the guard into a form to fill in.
+///
+/// The two geodesy bands get no such exemption, because their duplicates
+/// *were* in test code as often as not and every one of them is in [`ALLOWED`]
+/// by name.
+///
+/// This is by filename, so a `#[cfg(test)] mod tests` inside an ordinary
+/// source file is still scanned — `nrot.rs`'s inline tests are, and should be.
+fn is_test_file(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    relative.contains("/tests/") || name == "tests.rs" || name.ends_with("_tests.rs")
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -352,6 +412,9 @@ fn scan() -> Vec<Hit> {
                         continue;
                     }
                     if *band == DEGREE_BAND && !cleaned.contains('.') {
+                        continue;
+                    }
+                    if *band == MERCATOR_BAND && is_test_file(&relative) {
                         continue;
                     }
                     hits.push(Hit {
@@ -411,8 +474,9 @@ fn numeric_literals(line: &str) -> Vec<(usize, &str)> {
     out
 }
 
-/// No file in the workspace names an earth radius or a kilometres-per-degree
-/// figure in code, unless [`ALLOWED`] says why.
+/// No file in the workspace names an earth radius, a kilometres-per-degree
+/// figure or the Web Mercator latitude limit in code, unless [`ALLOWED`] says
+/// why.
 ///
 /// The failure message is the whole point: it prints the offending line and
 /// tells the author the two things they can do about it, so the guard reads as
@@ -438,15 +502,19 @@ fn horizontal_geodesy_has_exactly_one_definition() {
 
     assert!(
         unexplained.is_empty(),
-        "{} site(s) name an earth radius or a kilometres-per-degree figure \
-         without saying why:\n\n{}\n\nIf this is horizontal geodesy — turning \
-         degrees into ground kilometres or back — use \
-         `rustdar_radar::types::KM_PER_DEGREE_LAT` (or `EARTH_RADIUS_KM` for a \
-         great circle) instead; that is the whole reason it exists, and a \
-         second spelling puts the data and the map under it on different \
-         planets. If it is something else — a refraction model, a Level III \
-         twin's own constant, a projection's parameter — add it to `ALLOWED` \
-         in {}, with the reason. There is no wildcard on purpose.",
+        "{} site(s) name an earth radius, a kilometres-per-degree figure or \
+         the Web Mercator latitude limit without saying why:\n\n{}\n\nIf this \
+         is horizontal geodesy — turning degrees into ground kilometres or \
+         back — use `rustdar_radar::types::KM_PER_DEGREE_LAT` (or \
+         `EARTH_RADIUS_KM` for a great circle) instead; that is the whole \
+         reason it exists, and a second spelling puts the data and the map \
+         under it on different planets. If it is the latitude Web Mercator \
+         ends at, use `rustdar_radar::types::MERCATOR_LAT_LIMIT_DEG`: `85.05` \
+         is 125.51 m short of it, and a clamp at one figure feeding a texture \
+         placed at the other is the defect this band exists for. If it is \
+         something else — a refraction model, a Level III twin's own \
+         constant, a projection's parameter — add it to `ALLOWED` in {}, with \
+         the reason. There is no wildcard on purpose.",
         unexplained.len(),
         unexplained.join("\n"),
         file!(),
@@ -517,6 +585,11 @@ fn a_fresh_duplicate_would_be_caught() {
         "let d = x / 111.319_49;",
         "const R: f64 = 6371.0;",
         "let r = 6378.137f64;",
+        // The three spellings the Mercator limit was actually found in, plus
+        // the rounding a fourth would most likely arrive as.
+        "const MAX_MERCATOR_LAT: f64 = 85.05;",
+        "let lat = lat.clamp(-85.05112878, 85.05112878);",
+        "min_lat: 85.0511_f64,",
     ];
     for line in offenders {
         let stripped = strip_comments_and_strings(line);
@@ -535,8 +608,17 @@ fn a_fresh_duplicate_would_be_caught() {
     }
 
     // And the exclusions really do exclude: a CONUS longitude and a tower
-    // height are not conversion factors.
-    for benign in ["min_lon: -111.1424,", "tower_ft: 112,", "&alphas[111..],"] {
+    // height are not conversion factors, and a bare `85.0` is a dBZ stop, a
+    // table row or a colour channel — every one of those is real code in this
+    // workspace, quoted from `palette.rs`, `nrot.rs` and `rasterize.rs`.
+    for benign in [
+        "min_lon: -111.1424,",
+        "tower_ft: 112,",
+        "&alphas[111..],",
+        "(85.0, (255, 140, 0)),",
+        "(85.0, 8.23),",
+        "((255.0 - f * 55.0) as u8, (135.0 - f * 85.0) as u8, 0)",
+    ] {
         let stripped = strip_comments_and_strings(benign);
         let flagged = numeric_literals(&stripped).iter().any(|(_, literal)| {
             let cleaned = literal.trim_end_matches('.').replace('_', "");
@@ -548,4 +630,55 @@ fn a_fresh_duplicate_would_be_caught() {
         });
         assert!(!flagged, "`{benign}` is not a geodesy constant");
     }
+}
+
+/// The one exemption in this file recognises test files and nothing else.
+///
+/// It is spelled by filename, so it is exactly as wide as its name suggests —
+/// which is worth pinning, because a looser rule (any path containing `test`)
+/// would quietly exempt real source and the guard would still pass.
+#[test]
+fn only_files_named_as_tests_are_exempt() {
+    for path in [
+        "rustdar-egui/src/tiles/tests.rs",
+        "rustdar-egui/src/overlay_cache/texture_budget_tests.rs",
+        "rustdar-radar/tests/geodesy_one_definition.rs",
+    ] {
+        assert!(is_test_file(path), "`{path}` is a test file");
+    }
+    for path in [
+        "rustdar-overlays/src/render/rasterize.rs",
+        "rustdar-egui/src/tiles.rs",
+        "rustdar-radar/src/types.rs",
+        // Not a test file: `tests` is a path component of neither, and the
+        // exemption must not spread by substring.
+        "rustdar-radar/src/latest.rs",
+        "rustdar-frontend/src/app_fetch.rs",
+    ] {
+        assert!(!is_test_file(path), "`{path}` is source, not a test");
+    }
+}
+
+/// The exemption applies to the Mercator band only — the geodesy bands still
+/// scan test files, which is where several of their duplicates lived.
+#[test]
+fn the_exemption_does_not_reach_the_geodesy_bands() {
+    let scanned_bands: Vec<_> = BANDS
+        .iter()
+        .filter(|(band, ..)| *band != MERCATOR_BAND)
+        .map(|(band, ..)| *band)
+        .collect();
+    assert_eq!(
+        scanned_bands,
+        vec!["earth radius, km", DEGREE_BAND],
+        "a band was added or renamed without deciding whether test files see it",
+    );
+    // The geodesy allowances that live in test files are still matched, which
+    // can only be true if test files are still scanned for those bands.
+    let hits = scan();
+    assert!(
+        hits.iter()
+            .any(|h| h.path.ends_with("rustdar-radar/src/beam/tests.rs")),
+        "test files stopped being scanned for the geodesy bands",
+    );
 }

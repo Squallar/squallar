@@ -426,6 +426,39 @@ pub const KM_PER_DEGREE_LAT: f64 = EARTH_RADIUS_KM * PI / 180.0;
 /// m/s to mph conversion factor.
 pub const MS_TO_MPH: f32 = 2.23694;
 
+/// The latitude Web Mercator ends at: the one whose projected `y` is exactly
+/// `π`, so the world is the square the tile grid needs it to be.
+///
+/// `2·atan(e^π) − π/2` in degrees. Quoted to the digits EPSG:3857 and the OSM
+/// slippy-map note carry rather than to the `85.05` that copies of it in this
+/// workspace were transcribed as — that truncation is 0.0011287798° short,
+/// **125.51 m** of meridian, and while it is only ever a clamp bound the point
+/// of a named limit is that it is the limit.
+///
+/// # Why the radar crate holds a map-projection constant
+///
+/// Because this is already where the workspace's Web Mercator lives:
+/// `lat_rad_to_mercator_y` and `mercator_y_from_sin_lat` are below it and
+/// [`ImageBounds`] is documented in terms of it. It is also the lowest crate
+/// both callers can reach — `rustdar-egui`'s tile grid and
+/// `rustdar-overlays`'s rasterizer share only this crate and `rustdar-units`,
+/// and `rustdar-units` is unit conversion with no geodesy in it. Two of the
+/// three copies this replaced existed *because* there was no such place.
+///
+/// # It is a domain bound, not a clamp every caller must apply
+///
+/// `tiles::lat_to_tile_y` needs no branch on it — its index clamp already
+/// carries every latitude past this to the edge row — and
+/// `render::rasterize`'s `MercatorBounds::from_geo` needs none either, because
+/// `overlay_cache::OverlayTexturePlan::coverage` has already clamped the same
+/// bounds to this value before the rasterizer is handed them. It is here
+/// because the projection's domain should be nameable, and because a caller
+/// that does clamp must clamp to the same edge the tiles under it end at.
+///
+/// `rustdar-radar/tests/geodesy_one_definition.rs` is the guard that stops a
+/// fourth copy appearing.
+pub const MERCATOR_LAT_LIMIT_DEG: f64 = 85.051_128_779_806_6;
+
 #[inline]
 pub(crate) fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
     (PI / 4.0 + lat_rad / 2.0).tan().ln()

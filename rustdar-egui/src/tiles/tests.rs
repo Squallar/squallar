@@ -106,7 +106,7 @@ const MERCANTILE_TILE: &[(f64, f64, u8, u32, u32)] = &[
     (-85.05112878080661, 0.0, 14, 8192, 16383),
     (85.0511287788066, 0.0, 5, 16, 0), // just inside
     (85.0511287788066, 0.0, 14, 8192, 0),
-    (85.05, 0.0, 5, 16, 0), // the truncated figure two other modules carry
+    (85.05, 0.0, 5, 16, 0), // the truncated figure three modules used to carry
     (85.05, 0.0, 14, 8192, 0),
     (-85.05, 0.0, 5, 16, 31),
     (-85.05, 0.0, 14, 8192, 16383),
@@ -497,9 +497,13 @@ fn a_tile_corner_projects_where_walkers_draws_it() {
 
 /// The named clamp latitude is the one whose Mercator `y` is exactly `π`.
 ///
-/// Two other modules in this workspace carry `85.05` for the same quantity.
-/// That is 0.0011287798° short — **125.51 m** of meridian — and this pins the
-/// digits so a third copy cannot be made from a rounded one.
+/// Three modules in this workspace each carried `85.05` for this quantity —
+/// the tile helpers, `overlay_cache` and `rustdar-overlays`'s rasterizer. All
+/// three now read the one constant in `rustdar_radar::types`, and
+/// `rustdar-radar/tests/geodesy_one_definition.rs` is what stops a fourth
+/// appearing. This pins the digits themselves, so the constant cannot be
+/// re-derived from a rounded one: `85.05` is 0.0011287798° short, **125.51 m**
+/// of meridian.
 #[test]
 fn the_clamp_latitude_is_the_one_whose_mercator_y_is_pi() {
     let y = MERCATOR_LAT_LIMIT_DEG.to_radians().tan().asinh();
