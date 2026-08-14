@@ -1585,6 +1585,28 @@ impl RenderDispatcher {
     /// other product anyway, so this gate buys no correctness — it buys not
     /// cloning an `Arc` and not describing a render as classification-shaped
     /// when it is a reflectivity sweep.
+    ///
+    /// # "The same volume" is a question, not an `==`
+    ///
+    /// The two sides are written by different code. `cached.volume_start` is
+    /// the pane's `ScanInfo::timestamp`, taken from the volume's **first
+    /// radial** with its milliseconds; `volume_start` is whatever the caller
+    /// is drawing, which for a *loop frame* is the S3 archive key parsed with
+    /// `%H%M%S` and so truncated to the whole second. Measured over 108
+    /// archive volumes the two differ by 1–993 ms and are **never** equal, so
+    /// the `==` this used to make answered `None` for every frame of every
+    /// loop — including the newest, the one volume an object had actually been
+    /// fetched for. The classification silently dropped a rung and the same
+    /// volume classified differently still versus looped.
+    ///
+    /// `rustdar_radar::scan::names_same_volume` is the pairing, and it carries
+    /// the whole argument: the tolerance is exactly the archive key's own
+    /// truncation, and the nearest volume it could confuse for its neighbour
+    /// is 198× further away than the widest pair it admits.
+    /// `a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer`
+    /// pins the pairing and
+    /// `a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion`
+    /// pins the bound.
     pub(crate) fn melting_layer_product_for(
         &self,
         product: RadarProduct,
@@ -1595,13 +1617,31 @@ impl RenderDispatcher {
             return None;
         }
         let cached = self.melting_layer.get(site)?;
-        (cached.volume_start == volume_start).then(|| Arc::clone(&cached.bytes))
+        rustdar_radar::scan::names_same_volume(cached.volume_start, volume_start)
+            .then(|| Arc::clone(&cached.bytes))
     }
 
     /// The volume the site's cached `N0M` object names, if there is one.
     ///
     /// The fetch gate's read: a poll that would ask for an object already in
     /// hand for this volume asks for nothing instead.
+    ///
+    /// # Why this one is compared with `==` and its reader is not
+    ///
+    /// Because both sides of *this* comparison come from one place. The
+    /// gate in `spawn_level3_fetches` weighs this against
+    /// `latest_scan_time_for_site`, and the cached `volume_start` is the value
+    /// that same call produced when the fetch was dispatched — one quantity
+    /// stated twice, both times off `ScanInfo::timestamp`, both times with the
+    /// first radial's milliseconds. There is no archive key on either side, so
+    /// there is nothing for `scan::names_same_volume` to absorb.
+    ///
+    /// It would also be the wrong thing to widen for its own sake: the failure
+    /// this gate can produce is a **redundant fetch**, not a mispaired volume,
+    /// and a `!=` that answered "different" too eagerly costs one ~6 kB object.
+    /// The reader, by contrast, decides which volume's measured melting layer
+    /// a classification stands on. Same-looking comparison, different
+    /// consequence — which is why they are allowed to differ.
     pub(crate) fn melting_layer_volume(&self, site: &str) -> Option<chrono::NaiveDateTime> {
         self.melting_layer.get(site).map(|held| held.volume_start)
     }
@@ -1634,6 +1674,22 @@ impl RenderDispatcher {
     /// cells and the RPG painted an unshifted field; that is the vector the
     /// reference product was built with, and withholding it here would fall to
     /// a derived vector for a storm the RPG did not think was moving.
+    ///
+    /// # "The same volume" is a question, not an `==`
+    ///
+    /// Paired by `rustdar_radar::scan::names_same_volume` for exactly the
+    /// reason its sibling above is, and it carried exactly the same defect: a
+    /// loop frame's start comes off the archive key truncated to the second
+    /// while the cached vector's comes off the volume's first radial with its
+    /// milliseconds, so under `==` **every** frame of every SRV loop —
+    /// including the newest, the one volume an `N0S` had really been fetched
+    /// for — silently shifted on a derived rung instead. This is the sharper
+    /// of the two failures, because a storm motion off by a volume is a
+    /// solid-body shift of every gate in the field.
+    /// `a_loop_frame_keyed_by_the_archive_reaches_this_volumes_storm_motion`
+    /// pins the pairing and
+    /// `a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion`
+    /// pins the bound.
     pub(crate) fn rpg_storm_motion_for(
         &self,
         product: RadarProduct,
@@ -1644,7 +1700,8 @@ impl RenderDispatcher {
             return None;
         }
         let cached = self.storm_motion.get(site)?;
-        (cached.volume_start == volume_start).then_some(cached.motion)
+        rustdar_radar::scan::names_same_volume(cached.volume_start, volume_start)
+            .then_some(cached.motion)
     }
 
     /// The volume the site's cached `N0S` vector names, if there is one.
@@ -1652,7 +1709,9 @@ impl RenderDispatcher {
     /// The fetch gate's read, exactly as
     /// [`melting_layer_volume`](Self::melting_layer_volume) is: a poll that
     /// would ask for a vector already in hand for this volume asks for
-    /// nothing instead.
+    /// nothing instead — and compared with `==` for the reason recorded there,
+    /// which applies here unchanged. Both sides are `latest_scan_time_for_site`
+    /// and the worst a mismatch buys is one redundant object.
     pub(crate) fn storm_motion_volume(&self, site: &str) -> Option<chrono::NaiveDateTime> {
         self.storm_motion.get(site).map(|held| held.volume_start)
     }

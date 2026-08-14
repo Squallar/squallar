@@ -1694,12 +1694,30 @@ impl super::App {
                 // # A known limitation, scoped and captioned rather than hidden
                 //
                 // Only one volume per site has an `N0M` object fetched for it —
-                // the one the pane is on — so in practice **every other frame
-                // of a classification loop classifies on the fallback**. Those
-                // frames are not wrong about themselves: they carry
+                // the one the pane is on — so **every frame of a classification
+                // loop but that one classifies on the fallback**. Those frames
+                // are not wrong about themselves: they carry
                 // `MeltingLayerSource::Sounding` or `FleetDefault` and the pane
                 // says so as they play, which is the difference between a
                 // limitation and a defect.
+                //
+                // That one frame is the one on the pane's own volume — the
+                // newest while the pane follows live, and whichever frame was
+                // scrubbed to otherwise, since `spawn_level3_fetches` pairs
+                // against `latest_scan_time_for_site` either way. It reaches
+                // the object only because `timestamp` and the cached
+                // `volume_start` are paired
+                // by `rustdar_radar::scan::names_same_volume` rather than by
+                // `==`. They are two statements of one volume start written by
+                // different code — the cache holds the first radial's time with
+                // its milliseconds, a loop frame holds the archive key's time
+                // truncated to the second — and measured over 108 archive
+                // volumes they differ by 1–993 ms and are *never* equal. Under
+                // the exact comparison this used to make, the sentence above
+                // read "every other frame" and was wrong in the way that
+                // mattered: the newest frame fell to the fallback too, so the
+                // same volume classified one way still and another way looped,
+                // with nothing on screen to say which had happened.
                 //
                 // Closing it is a per-frame pairing, and the machinery is
                 // already here: [`Self::spawn_loop_l3_listing`] lists a code's
@@ -1717,13 +1735,20 @@ impl super::App {
                 // The RPG's storm motion is asked per frame for exactly the
                 // reason the melting layer is, and the limitation is the same
                 // one, scoped the same way: only the volume the pane is on has
-                // an `N0S` fetched for it, so **every other frame of an SRV
-                // loop shifts on a derived rung**. Those frames are not wrong
-                // about themselves — they carry
+                // an `N0S` fetched for it, so **every frame of an SRV loop but
+                // the one on the pane's own volume shifts on a derived rung**.
+                // Those frames are not wrong about themselves — they carry
                 // `StormMotionSource::BunkersRightMover` or `MeanWind` and the
                 // pane says so as they play — and closing it is the same
                 // per-frame pairing (`spawn_loop_l3_listing` +
                 // `spawn_loop_l3_pairing`) pointed at `N0S`.
+                //
+                // That frame reaches the vector on the same pairing the melting
+                // layer above uses, and for the same reason it used to miss it
+                // entirely. This is the sharper of the two failures: a melting
+                // layer off by one rung shifts a classification boundary, while
+                // a storm motion off by a volume is a solid-body shift of every
+                // gate in the field, still captioned as the RPG's own.
                 //
                 // Handing every frame the still frame's vector would be worse
                 // than the fallback rather than better: a solid-body shift of
