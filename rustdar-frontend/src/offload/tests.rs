@@ -1144,8 +1144,8 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
 /// many words — "What this does not cover: the page->worker `job` direction".
 /// This is that direction.
 ///
-/// [`a_job_kind_that_moved_on_the_wire_is_a_job_another_build_misreads`] pins
-/// the six tag bytes, which is the first byte of each of these. Everything
+/// [`every_job_tag_is_the_literal_byte_it_ships_as`] pins the six tag bytes,
+/// which is the first byte of each of these. Everything
 /// after it — the two `f64` coordinates, the `u32` ceiling, the section's four
 /// corners and its optional top, the voxel request's tagged half-extent and its
 /// three axes — was unpinned, and every round-trip test in this file is written
