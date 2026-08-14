@@ -5,10 +5,10 @@
 //! render, the overlay rasterization and the radar-sites rasterization. All
 //! four have the same shape — a `FnOnce` that ends by sending its result on an
 //! `mpsc::Sender` and calling `notify_redraw` — and all four had the same
-//! `std::thread::Builder` call written out inline. Three of the four are
-//! described jobs now, the sites raster most recently
-//! ([`JobRequest::Overlay`]); the handler-backed overlay rasterization is the
-//! closure that remains.
+//! `std::thread::Builder` call written out inline. Nearly all of it is
+//! described jobs now ([`JobRequest::Overlay`] carries the sites raster and
+//! the three polygon overlay kinds); what remains on the closure is the
+//! hit-map overlay kinds and the model grid.
 //!
 //! They are funnelled through here so the wasm arm exists once.
 //!
@@ -42,7 +42,7 @@ use rustdar_radar::render_input::RenderInput;
 use rustdar_radar::voxel::{VoxelGrid, VoxelRequest, VoxelShape};
 use rustdar_radar::xsect::{CrossSection, SectionRequest};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The storm motion vector [`RenderedFrame::storm_motion`] carries,
 /// re-exported for the reason [`crate::tls`] is: a platform adapter that has to
@@ -76,10 +76,11 @@ pub use rustdar_radar::srv::SrvMotion;
 ///   means returning a `u32` id image and rebuilding the map on this side, a
 ///   refactor of `rustdar-overlays` against a rasterizer that draws vector
 ///   shapes rather than the 28 M projections the radar one does. It is being
-///   dismantled kind by kind: `sites-render` was the first to leave — it is
-///   [`JobRequest::Overlay`] now — and the polygon kinds, the hit-map kinds
-///   and the model grid follow, at which point this arm's remaining caller
-///   count reaches zero and the inline path is deleted.
+///   dismantled kind by kind: `sites-render` left first, and the polygon
+///   kinds — NWS alerts, SPC outlooks, SPC discussions, none of which build a
+///   hit map — followed; all four are [`JobRequest::Overlay`] now. The
+///   hit-map kinds and the model grid remain, and when they leave this arm's
+///   caller count reaches zero and the inline path is deleted.
 ///
 /// Inline execution preserves the contract the callers actually depend on. Each
 /// `job` delivers through a channel that is drained on a later frame, so a send
@@ -504,10 +505,11 @@ pub enum JobRequest {
     /// statement of one fact, which is the disagreement
     /// [`agree_on_product`] exists to refuse elsewhere.
     ///
-    /// Only the sites render is described so far. The handler-backed kinds
-    /// still capture a `RasterizeFn` trait object and stay on [`offload`]'s
-    /// opaque arm — see that function's own note — until each gains a wire
-    /// form of its own.
+    /// The sites render and the three polygon kinds (NWS alerts, SPC
+    /// outlooks, SPC discussions) are described. The hit-map kinds and the
+    /// model grid still capture a `RasterizeFn` trait object and stay on
+    /// [`offload`]'s opaque arm — see that function's own note — until each
+    /// gains a wire form of its own.
     Overlay {
         /// Texture width in physical texels, from the pane's
         /// `OverlayTexturePlan` — never re-derived on the far side.
@@ -560,14 +562,34 @@ pub enum JobRequest {
 /// `rustdar_overlays::render::rasterize::SitesInput`, whose doc states the
 /// contract from the rasterizer's side.
 ///
-/// One variant so far. The polygon kinds, the hit-map kinds and the model grid
-/// are next, in that order of difficulty; each lands here as a variant plus an
-/// [`OVERLAY_INPUT_SITES`]-style code, and until then those kinds stay on
-/// [`offload`]'s opaque arm.
+/// Four variants: the sites render and the three polygon-fill kinds without
+/// hit maps, whose handlers describe them through
+/// `rustdar_overlays::render::overlay_state::HandlerJobInput`. The hit-map
+/// kinds (storm reports, lightning) and the model grid are next; each lands
+/// here as a variant plus an [`OVERLAY_INPUT_SITES`]-style code, and until
+/// then those kinds stay on [`offload`]'s opaque arm.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayJobInput {
     /// The radar-site markers: catalogue rows plus the appearance inputs.
     Sites(rustdar_overlays::render::rasterize::SitesInput),
+    /// NWS alerts: the paint rows, the category and hidden-id filters, and
+    /// the texel density. The gesture-end stall the frame-thread audit
+    /// measured at 224 ms on the web was exactly this kind's raster running
+    /// inline; describing it is what moved that off the browser's one thread.
+    ///
+    /// Boxed for [`JobRequest::Radar`]'s reason at this enum's scale: the
+    /// input's inline size (three owned collections) is what pushed
+    /// `JobRequest` past what a `Result<(), JobRequest>` should carry, and a
+    /// request is moved through queues and sinks by value.
+    Alerts(Box<rustdar_overlays::render::rasterize::AlertsInput>),
+    /// SPC outlooks: the features in paint order — hatch patterns riding on
+    /// each feature — plus the theme-resolved hatch colour and the texel
+    /// density. The hatch colour is a page-side fact captured at dispatch;
+    /// the worker never re-derives it.
+    Outlooks(rustdar_overlays::render::rasterize::OutlooksInput),
+    /// SPC mesoscale discussions: per-MD type and rings, plus the texel
+    /// density.
+    Discussions(rustdar_overlays::render::rasterize::DiscussionsInput),
 }
 
 /// What a job produces.
@@ -1124,9 +1146,10 @@ impl JobRequest {
                     max_lon: r.f64()?,
                 };
                 let input = decode_overlay_input(&mut r)?;
-                // The site list is length-counted rather than "the rest", so
-                // unlike the archive arms nothing may follow it: trailing
-                // bytes mean the two builds' layouts disagree.
+                // Every overlay input's lists are length-counted rather than
+                // "the rest", so unlike the archive arms nothing may follow
+                // the payload: trailing bytes mean the two builds' layouts
+                // disagree.
                 r.rest().is_empty().then_some(())?;
                 Some(Self::Overlay {
                     width,
@@ -1203,6 +1226,9 @@ impl JobRequest {
             Self::Decode { .. } => "decode",
             Self::Overlay { input, .. } => match input {
                 OverlayJobInput::Sites(_) => "overlay/sites",
+                OverlayJobInput::Alerts(_) => "overlay/alerts",
+                OverlayJobInput::Outlooks(_) => "overlay/outlooks",
+                OverlayJobInput::Discussions(_) => "overlay/discussions",
             },
         }
     }
@@ -1382,9 +1408,18 @@ const TAG_OVERLAY: u8 = 8;
 /// Starts at 1, leaving 0 unallocated on this inner wire exactly as the outer
 /// tag space leaves it: a zeroed buffer must never decode.
 const OVERLAY_INPUT_SITES: u8 = 1;
+/// [`OverlayJobInput::Alerts`]'s code. The next free number after the sites
+/// code, and — like every code on this wire — a contract between two builds:
+/// pinned as a literal in `offload::tests`, never renumbered.
+const OVERLAY_INPUT_ALERTS: u8 = 2;
+/// [`OverlayJobInput::Outlooks`]'s code.
+const OVERLAY_INPUT_OUTLOOKS: u8 = 3;
+/// [`OverlayJobInput::Discussions`]'s code.
+const OVERLAY_INPUT_DISCUSSIONS: u8 = 4;
 
 /// The variant's own bytes after [`JobRequest::Overlay`]'s fixed header:
-/// one input-kind byte, then the kind's fields.
+/// one input-kind byte, then the kind's fields — scalars first, then the
+/// count-prefixed lists, on every kind alike.
 fn encode_overlay_input(out: &mut Vec<u8>, input: &OverlayJobInput) {
     match input {
         OverlayJobInput::Sites(sites) => {
@@ -1404,22 +1439,65 @@ fn encode_overlay_input(out: &mut Vec<u8>, input: &OverlayJobInput) {
                 out.extend_from_slice(&site.lon.to_le_bytes());
                 out.push(u8::from(site.is_current));
                 out.push(u8::from(site.is_loading));
-                let name = &site.name.as_bytes()[..site.name.len().min(usize::from(u16::MAX))];
-                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                out.extend_from_slice(name);
+                encode_str(out, &site.name);
+            }
+        }
+        OverlayJobInput::Alerts(alerts) => {
+            out.push(OVERLAY_INPUT_ALERTS);
+            out.extend_from_slice(&alerts.device_scale.to_le_bytes());
+            out.extend_from_slice(&(alerts.enabled_categories.len() as u32).to_le_bytes());
+            for category in &alerts.enabled_categories {
+                out.push(AlertCategoryWire(*category).wire_code());
+            }
+            // Sorted, because a `HashSet`'s iteration order is seeded per
+            // process: the *set* round-trips either way, but the bytes have
+            // to be a function of the value for the framing digest to pin
+            // them and for two encodes of one input to agree.
+            let mut hidden: Vec<&String> = alerts.hidden_ids.iter().collect();
+            hidden.sort();
+            out.extend_from_slice(&(hidden.len() as u32).to_le_bytes());
+            for id in hidden {
+                encode_str(out, id);
+            }
+            out.extend_from_slice(&(alerts.alerts.len() as u32).to_le_bytes());
+            for alert in &alerts.alerts {
+                encode_str(out, &alert.id);
+                out.push(AlertCategoryWire(alert.category).wire_code());
+                out.extend_from_slice(&(alert.features.len() as u32).to_le_bytes());
+                for feature in &alert.features {
+                    encode_feature(out, feature);
+                }
+            }
+        }
+        OverlayJobInput::Outlooks(outlooks) => {
+            out.push(OVERLAY_INPUT_OUTLOOKS);
+            out.extend_from_slice(&outlooks.device_scale.to_le_bytes());
+            out.extend_from_slice(&outlooks.hatch_color);
+            out.extend_from_slice(&(outlooks.features.len() as u32).to_le_bytes());
+            for feature in &outlooks.features {
+                encode_feature(out, feature);
+            }
+        }
+        OverlayJobInput::Discussions(discussions) => {
+            out.push(OVERLAY_INPUT_DISCUSSIONS);
+            out.extend_from_slice(&discussions.device_scale.to_le_bytes());
+            out.extend_from_slice(&(discussions.discussions.len() as u32).to_le_bytes());
+            for md in &discussions.discussions {
+                out.push(MdTypeWire(md.md_type).wire_code());
+                encode_polygon(out, &md.polygon);
             }
         }
     }
 }
 
 /// The inverse of [`encode_overlay_input`]. `None` for an input kind this
-/// build does not have, a flag byte outside `{0, 1}`, a name that is not
-/// UTF-8, or a buffer shorter than its own count claims.
+/// build does not have, a flag or enum byte outside its build's values, a
+/// string that is not UTF-8, or a buffer shorter than its own counts claim.
 ///
-/// The count is read but never trusted with an allocation: the rows are
-/// pushed as they decode, so a count claiming four billion sites fails on
-/// [`Reader::take`]'s first short read instead of reserving for a list the
-/// buffer cannot hold.
+/// The counts are read but never trusted with an allocation: rows, features,
+/// rings and points are pushed as they decode, so a count claiming four
+/// billion of anything fails on [`Reader::take`]'s first short read instead
+/// of reserving for a list the buffer cannot hold.
 fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
     match r.u8()? {
         OVERLAY_INPUT_SITES => {
@@ -1433,8 +1511,7 @@ fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
                 let lon = r.f64()?;
                 let is_current = flag(r.u8()?)?;
                 let is_loading = flag(r.u8()?)?;
-                let name_len = usize::from(r.u16()?);
-                let name = std::str::from_utf8(r.take(name_len)?).ok()?.to_owned();
+                let name = decode_str(r)?;
                 sites.push(rustdar_overlays::render::rasterize::RadarSiteInfo {
                     name,
                     lat,
@@ -1452,7 +1529,288 @@ fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
                 },
             ))
         }
+        OVERLAY_INPUT_ALERTS => {
+            let device_scale = r.f32()?;
+            let category_count = r.u32()? as usize;
+            let mut enabled_categories = Vec::new();
+            for _ in 0..category_count {
+                enabled_categories.push(AlertCategoryWire::from_wire_code(r.u8()?)?.0);
+            }
+            let hidden_count = r.u32()? as usize;
+            let mut hidden_ids = HashSet::new();
+            for _ in 0..hidden_count {
+                hidden_ids.insert(decode_str(r)?);
+            }
+            let alert_count = r.u32()? as usize;
+            let mut alerts = Vec::new();
+            for _ in 0..alert_count {
+                let id = decode_str(r)?;
+                let category = AlertCategoryWire::from_wire_code(r.u8()?)?.0;
+                let feature_count = r.u32()? as usize;
+                let mut features = Vec::new();
+                for _ in 0..feature_count {
+                    features.push(decode_feature(r)?);
+                }
+                alerts.push(rustdar_overlays::render::rasterize::AlertPaint {
+                    id,
+                    category,
+                    features,
+                });
+            }
+            Some(OverlayJobInput::Alerts(Box::new(
+                rustdar_overlays::render::rasterize::AlertsInput {
+                    alerts,
+                    enabled_categories,
+                    hidden_ids,
+                    device_scale,
+                },
+            )))
+        }
+        OVERLAY_INPUT_OUTLOOKS => {
+            let device_scale = r.f32()?;
+            let hatch_color: [u8; 4] = r.take(4)?.try_into().ok()?;
+            let feature_count = r.u32()? as usize;
+            let mut features = Vec::new();
+            for _ in 0..feature_count {
+                features.push(decode_feature(r)?);
+            }
+            Some(OverlayJobInput::Outlooks(
+                rustdar_overlays::render::rasterize::OutlooksInput {
+                    features,
+                    hatch_color,
+                    device_scale,
+                },
+            ))
+        }
+        OVERLAY_INPUT_DISCUSSIONS => {
+            let device_scale = r.f32()?;
+            let md_count = r.u32()? as usize;
+            let mut discussions = Vec::new();
+            for _ in 0..md_count {
+                let md_type = MdTypeWire::from_wire_code(r.u8()?)?.0;
+                let polygon = decode_polygon(r)?;
+                discussions.push(rustdar_overlays::render::rasterize::DiscussionPaint {
+                    md_type,
+                    polygon,
+                });
+            }
+            Some(OverlayJobInput::Discussions(
+                rustdar_overlays::render::rasterize::DiscussionsInput {
+                    discussions,
+                    device_scale,
+                },
+            ))
+        }
         _ => None,
+    }
+}
+
+/// A `u16` length prefix and then the bytes, truncated to what the prefix can
+/// carry — the sites-name convention, spelled once for every string on this
+/// wire. Every string here is an identifier or a short label, so the
+/// truncation is over input it will never see; a cut that split a multi-byte
+/// character is refused by [`decode_str`]'s UTF-8 check rather than misread.
+fn encode_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = &s.as_bytes()[..s.len().min(usize::from(u16::MAX))];
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The inverse of [`encode_str`]: `None` for a short buffer or bytes that are
+/// not UTF-8.
+fn decode_str(r: &mut Reader) -> Option<String> {
+    let len = usize::from(r.u16()?);
+    Some(std::str::from_utf8(r.take(len)?).ok()?.to_owned())
+}
+
+/// One overlay feature: the two labels, the two colours, the hatch, the
+/// optional geo-AABB, and last the multi-polygon — every ring of every
+/// polygon, holes included, since a hole dropped here is a hole filled on
+/// the far side and the parity tests are what would catch it.
+///
+/// The AABB is **carried, not recomputed**: it is stored state of the value
+/// (`OverlayFeature::geo_bounds`), the round trip compares whole requests,
+/// and a decode that re-derived it would make a request with a hand-built
+/// bounds come back a different request instead of itself.
+fn encode_feature(out: &mut Vec<u8>, feature: &rustdar_overlays::types::OverlayFeature) {
+    encode_str(out, &feature.label);
+    encode_str(out, &feature.label2);
+    out.extend_from_slice(&feature.fill_rgba);
+    out.extend_from_slice(&feature.stroke_rgba);
+    out.push(HatchWire(feature.hatch).wire_code());
+    match &feature.geo_bounds {
+        None => out.push(0),
+        Some(b) => {
+            out.push(1);
+            out.extend_from_slice(&b.min_lat.to_le_bytes());
+            out.extend_from_slice(&b.max_lat.to_le_bytes());
+            out.extend_from_slice(&b.min_lon.to_le_bytes());
+            out.extend_from_slice(&b.max_lon.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&(feature.polygons.len() as u32).to_le_bytes());
+    for polygon in &feature.polygons {
+        encode_polygon(out, polygon);
+    }
+}
+
+/// The inverse of [`encode_feature`], with every refusal [`decode_overlay_input`]
+/// promises: `None` on a hatch byte or an option tag this build does not
+/// have, a label that is not UTF-8, or counts the buffer cannot honour.
+fn decode_feature(r: &mut Reader) -> Option<rustdar_overlays::types::OverlayFeature> {
+    let label = decode_str(r)?;
+    let label2 = decode_str(r)?;
+    let fill_rgba: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let stroke_rgba: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let hatch = HatchWire::from_wire_code(r.u8()?)?.0;
+    let geo_bounds = match r.u8()? {
+        0 => None,
+        1 => Some(rustdar_overlays::types::GeoBounds {
+            min_lat: r.f64()?,
+            max_lat: r.f64()?,
+            min_lon: r.f64()?,
+            max_lon: r.f64()?,
+        }),
+        _ => return None,
+    };
+    let polygon_count = r.u32()? as usize;
+    let mut polygons = Vec::new();
+    for _ in 0..polygon_count {
+        polygons.push(decode_polygon(r)?);
+    }
+    Some(rustdar_overlays::types::OverlayFeature {
+        polygons,
+        fill_rgba,
+        stroke_rgba,
+        label,
+        label2,
+        hatch,
+        geo_bounds,
+    })
+}
+
+/// One polygon: a ring count, then each ring's point count and its
+/// `(lat, lon)` pairs in that order — the crate's own `(f64, f64)`
+/// convention, stated here and in [`decode_polygon`] and nowhere else. The
+/// first ring is the exterior and the rest are holes, an ordering the codec
+/// preserves by never reordering anything.
+fn encode_polygon(out: &mut Vec<u8>, polygon: &rustdar_overlays::types::GeoPolygon) {
+    out.extend_from_slice(&(polygon.len() as u32).to_le_bytes());
+    for ring in polygon {
+        out.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+        for &(lat, lon) in ring {
+            out.extend_from_slice(&lat.to_le_bytes());
+            out.extend_from_slice(&lon.to_le_bytes());
+        }
+    }
+}
+
+/// The inverse of [`encode_polygon`].
+fn decode_polygon(r: &mut Reader) -> Option<rustdar_overlays::types::GeoPolygon> {
+    let ring_count = r.u32()? as usize;
+    let mut polygon = Vec::new();
+    for _ in 0..ring_count {
+        let point_count = r.u32()? as usize;
+        let mut ring = Vec::new();
+        for _ in 0..point_count {
+            ring.push((r.f64()?, r.f64()?));
+        }
+        polygon.push(ring);
+    }
+    Some(polygon)
+}
+
+/// An [`AlertCategory`](rustdar_overlays::nws::alert::AlertCategory) as a
+/// number, in the newtype-pair shape [`MeltingLayerWire`] set: both directions
+/// are exhaustive over the same arms, so a variant added upstream fails this
+/// build rather than silently encoding as something else. The numbering is
+/// the enum's own declaration order, most severe first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlertCategoryWire(rustdar_overlays::nws::alert::AlertCategory);
+
+impl AlertCategoryWire {
+    fn wire_code(self) -> u8 {
+        use rustdar_overlays::nws::alert::AlertCategory as C;
+        match self.0 {
+            C::Warning => 0,
+            C::Watch => 1,
+            C::Advisory => 2,
+            C::Other => 3,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use rustdar_overlays::nws::alert::AlertCategory as C;
+        let category = match code {
+            0 => C::Warning,
+            1 => C::Watch,
+            2 => C::Advisory,
+            3 => C::Other,
+            _ => return None,
+        };
+        Some(Self(category))
+    }
+}
+
+/// An [`MdType`](rustdar_overlays::spc::discussion::MdType) as a number. See
+/// [`AlertCategoryWire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MdTypeWire(rustdar_overlays::spc::discussion::MdType);
+
+impl MdTypeWire {
+    fn wire_code(self) -> u8 {
+        use rustdar_overlays::spc::discussion::MdType as M;
+        match self.0 {
+            M::Convective => 0,
+            M::WinterWeather => 1,
+            M::Other => 2,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use rustdar_overlays::spc::discussion::MdType as M;
+        let md_type = match code {
+            0 => M::Convective,
+            1 => M::WinterWeather,
+            2 => M::Other,
+            _ => return None,
+        };
+        Some(Self(md_type))
+    }
+}
+
+/// A [`HatchPattern`](rustdar_overlays::types::HatchPattern) as a number. See
+/// [`AlertCategoryWire`]. `None` maps to 0 — the quiet value for the quiet
+/// variant — and the three Conditional Intensity Groups take their own
+/// numbers, because a CIG3 read as a CIG1 is a cross-hatch silently demoted
+/// to dots on the layer that qualifies SPC's strongest areas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HatchWire(rustdar_overlays::types::HatchPattern);
+
+impl HatchWire {
+    fn wire_code(self) -> u8 {
+        use rustdar_overlays::types::HatchPattern as H;
+        match self.0 {
+            H::None => 0,
+            H::Cig1 => 1,
+            H::Cig2 => 2,
+            H::Cig3 => 3,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use rustdar_overlays::types::HatchPattern as H;
+        let hatch = match code {
+            0 => H::None,
+            1 => H::Cig1,
+            2 => H::Cig2,
+            3 => H::Cig3,
+            _ => return None,
+        };
+        Some(Self(hatch))
     }
 }
 
@@ -1759,15 +2117,34 @@ pub fn execute(request: &JobRequest) -> JobResult {
                         sites, bounds, *width, *height,
                     )
                 }
+                OverlayJobInput::Alerts(alerts) => {
+                    rustdar_overlays::render::rasterize::rasterize_nws_alerts(
+                        alerts, bounds, *width, *height,
+                    )
+                }
+                OverlayJobInput::Outlooks(outlooks) => {
+                    rustdar_overlays::render::rasterize::rasterize_spc_outlooks(
+                        outlooks, bounds, *width, *height,
+                    )
+                }
+                OverlayJobInput::Discussions(discussions) => {
+                    rustdar_overlays::render::rasterize::rasterize_spc_discussions(
+                        discussions,
+                        bounds,
+                        *width,
+                        *height,
+                    )
+                }
             };
             // The output contract is **premultiplied, always** — stated on
             // [`JobOutput::OverlayRaster`] — where each rasterizer's own
-            // convention is whatever it declares. The sites rasterizer
-            // declares premultiplied on every path (tiny-skia's pixmap *is*
-            // premultiplied), so the arm below is dead for it today; it is
-            // written now because the model-grid rasterizer declares straight
-            // alpha and reaches this seam in a later slice, and a seam that
-            // silently dropped the declaration would ship it double-bright.
+            // convention is whatever it declares. All four described
+            // rasterizers declare premultiplied on every path (tiny-skia's
+            // pixmap *is* premultiplied), so the arm below is dead for them
+            // today; it is written now because the model-grid rasterizer
+            // declares straight alpha and reaches this seam in a later slice,
+            // and a seam that silently dropped the declaration would ship it
+            // double-bright.
             //
             // The conversion is [`premultiply_raster`] — egui's own
             // constructor per pixel, the exact call the frame-thread consumer
@@ -1780,10 +2157,10 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 }
             }
             // `output.hit_map` is dropped, correctly *for the kinds described
-            // so far*: the sites rasterizer answers `None` on every path. The
-            // hit-map kinds cannot take this arm until the id-image reply
-            // exists — that is the next-but-one slice, and their inputs are
-            // not describable here yet either.
+            // so far*: the sites, alert, outlook and discussion rasterizers
+            // all answer `None` on every path. The hit-map kinds cannot take
+            // this arm until the id-image reply exists — that is a later
+            // slice, and their inputs are not describable here yet either.
             Some(JobOutput::OverlayRaster(rgba))
         }
     };

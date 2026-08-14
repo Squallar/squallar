@@ -433,13 +433,16 @@ mod tests {
         // yellows and pinks, so any blue pixel came from the hatch pass.
         let hatch_color = [0u8, 0, 255, 255];
         let rgba = crate::render::rasterize::rasterize_spc_outlooks(
-            &outlook.features,
+            &crate::render::rasterize::OutlooksInput {
+                features: outlook.features.clone(),
+                hatch_color,
+                device_scale: 1.0,
+            },
             &bounds,
             512,
             512,
-            hatch_color,
-            1.0,
-        );
+        )
+        .rgba;
         let hatch_pixels = rgba
             .chunks_exact(4)
             .filter(|p| p[2] > 200 && p[0] < 60 && p[1] < 60)

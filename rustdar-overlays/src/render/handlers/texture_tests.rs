@@ -20,11 +20,12 @@ use std::collections::HashSet;
 
 use super::create_handlers;
 use crate::render::overlay_state::{
-    FetchPayload, OverlayHandler, OverlayKind, RasterizeContext, RenderMode,
+    FetchPayload, HandlerJobInput, OverlayHandler, OverlayKind, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize::{
     self, AlphaMode, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes, rasterize_model_data,
-    rasterize_radar_sites, rasterize_storm_reports,
+    rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions, rasterize_spc_outlooks,
+    rasterize_storm_reports,
 };
 use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
 
@@ -600,4 +601,139 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
         "the pane would dispatch a render `spawn_overlay_render` abandons, and \
          ask for another frame 100 ms later, for as long as the app is open",
     );
+}
+
+// ── The described-job set ────────────────────────────────────────────────
+
+/// Whether `kind` is one of the three the dispatch routes as described jobs.
+fn is_described(kind: OverlayKind) -> bool {
+    matches!(
+        kind,
+        OverlayKind::NwsAlerts | OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions
+    )
+}
+
+/// **The set of kinds with a wire form is exactly the polygon kinds**, and on
+/// each of them `prepare_job` agrees with `prepare_rasterize` about whether
+/// there is anything to draw, in every state the layer stack can reach.
+///
+/// `rustdar-frontend`'s `spawn_overlay_render` routes by an explicit match on
+/// kind, not by probing `prepare_job` — so the match there and the
+/// implementations here are two statements of one set, and this test is what
+/// keeps a kind from joining one and not the other. A kind routed described
+/// without an implementation would answer `None` with data on hand, and its
+/// layer would silently never draw: precisely the disagreement the
+/// permanent-wakeup guard above exists to catch on the closure path.
+#[test]
+fn the_kinds_with_a_described_job_are_exactly_the_polygon_kinds() {
+    let ctx = rctx();
+    let mut described = 0;
+    for handler in create_handlers().iter_mut() {
+        let kind = handler.kind();
+
+        let agree = |h: &dyn OverlayHandler, state: &str| {
+            if is_described(kind) {
+                assert_eq!(
+                    h.prepare_job(&ctx).is_some(),
+                    h.prepare_rasterize(&ctx).is_some(),
+                    "{kind:?}'s described job disagrees with its closure about \
+                     whether there is anything to draw while {state}. The \
+                     dispatch declines on `prepare_job` where the closure arm \
+                     declined on `prepare_rasterize`, so a disagreement is a \
+                     layer that renders on one path and never on the other.",
+                );
+            } else {
+                assert!(
+                    h.prepare_job(&ctx).is_none(),
+                    "{kind:?} grew a `prepare_job` while {state}. The \
+                     described set is stated twice — here and in \
+                     `spawn_overlay_render`'s match — so add the kind to the \
+                     dispatch's described arm, to `is_described` above, and \
+                     to the wire (`offload::OverlayJobInput`) together.",
+                );
+            }
+        };
+
+        agree(handler.as_ref(), "empty");
+        // Only the texture kinds can be seeded (the `seed` fixture panics on
+        // the others by design); a non-texture kind has had its `prepare_job`
+        // pinned `None` by the empty-state walk above, which is the whole
+        // claim for it.
+        if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
+            continue;
+        }
+        agree(handler.as_ref(), "seeded and enabled");
+        handler.set_enabled(false);
+        agree(handler.as_ref(), "seeded, then switched off");
+        handler.set_enabled(true);
+        agree(handler.as_ref(), "seeded, switched off, switched back on");
+        if is_described(kind) {
+            described += 1;
+        }
+    }
+    assert_eq!(
+        described, 3,
+        "the three polygon kinds must all have been walked seeded; a kind \
+         that stopped seeding is a kind whose agreement was never tested",
+    );
+}
+
+/// The described job and the closure paint **the same bytes** on the same
+/// handler state — the handler-level half of the parity story, whose
+/// wire-level half is `rustdar-frontend`'s per-kind
+/// `..._is_byte_identical_direct_and_via_the_wire`.
+///
+/// Both answers are built by one private helper per handler, so this cannot
+/// drift today; the test is for the refactor that splits them, which would
+/// compile.
+#[test]
+fn a_described_job_and_the_closure_paint_the_same_bytes() {
+    let ctx = rctx();
+    let mut checked = 0;
+    for handler in create_handlers().iter_mut() {
+        let kind = handler.kind();
+        if !is_described(kind) || !seed(handler.as_mut()) {
+            continue;
+        }
+        let closure = handler
+            .prepare_rasterize(&ctx)
+            .expect("seeded, and the agreement test next door pins this")(
+            &BOUNDS, W, H
+        );
+        let input = handler
+            .prepare_job(&ctx)
+            .expect("seeded, and the agreement test next door pins this");
+        let (named, job) = match input {
+            HandlerJobInput::Alerts(input) => (
+                OverlayKind::NwsAlerts,
+                rasterize_nws_alerts(&input, &BOUNDS, W, H),
+            ),
+            HandlerJobInput::Outlooks(input) => (
+                OverlayKind::SpcOutlook,
+                rasterize_spc_outlooks(&input, &BOUNDS, W, H),
+            ),
+            HandlerJobInput::Discussions(input) => (
+                OverlayKind::SpcDiscussions,
+                rasterize_spc_discussions(&input, &BOUNDS, W, H),
+            ),
+        };
+        assert_eq!(
+            named, kind,
+            "{kind:?}'s `prepare_job` answered another kind's input variant, \
+             so a worker would rasterize the wrong layer under its panes",
+        );
+        assert!(
+            drawn(&closure.rgba).len() > 100,
+            "{kind:?}'s fixture painted almost nothing, so the byte equality \
+             below would be near-vacuous",
+        );
+        assert_eq!(
+            closure.rgba, job.rgba,
+            "{kind:?}'s described job paints differently from its closure on \
+             the same state: the two answers have stopped being built from \
+             one captured input",
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "all three described kinds must be compared");
 }

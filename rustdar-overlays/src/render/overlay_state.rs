@@ -20,6 +20,36 @@ use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 
 pub type RasterizeFn = Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>;
 
+/// A handler's raster **described as data** — what
+/// [`OverlayHandler::prepare_job`] answers where [`prepare_rasterize`] answers
+/// a closure.
+///
+/// Each variant carries the kind's own rasterizer input struct
+/// ([`crate::render::rasterize::AlertsInput`] and its siblings), captured at
+/// the same moment and from the same state the closure would have captured —
+/// both are built by one per-handler helper, so the two cannot drift. The
+/// frontend maps each variant onto its `offload::OverlayJobInput` twin and
+/// posts it as a `JobRequest::Overlay`, which is what lets these kinds
+/// rasterize in the web worker instead of inline on the browser's one thread.
+///
+/// Only the polygon-fill kinds without hit maps are here. The hit-map kinds
+/// (storm reports, lightning) answer clicks through an
+/// `Arc<dyn OverlayItem>` map that cannot cross a message port, and the model
+/// grid's input has no wire form yet — they stay on [`prepare_rasterize`]'s
+/// closure until each gains a variant of its own.
+///
+/// [`prepare_rasterize`]: OverlayHandler::prepare_rasterize
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandlerJobInput {
+    /// NWS alerts — [`crate::render::rasterize::rasterize_nws_alerts`].
+    Alerts(crate::render::rasterize::AlertsInput),
+    /// SPC outlooks — [`crate::render::rasterize::rasterize_spc_outlooks`].
+    Outlooks(crate::render::rasterize::OutlooksInput),
+    /// SPC mesoscale discussions —
+    /// [`crate::render::rasterize::rasterize_spc_discussions`].
+    Discussions(crate::render::rasterize::DiscussionsInput),
+}
+
 /// What opens a layer-stack status line that is reporting a fault rather than a
 /// count — see [`OverlayRegistry::status_line`].
 ///
@@ -586,6 +616,27 @@ pub trait OverlayHandler: Send {
         None
     }
 
+    /// This handler's raster as a described job, or `None` — either because
+    /// there is nothing to render (exactly when [`prepare_rasterize`] answers
+    /// `None`) or because this kind has no wire form yet, which is the
+    /// default.
+    ///
+    /// A handler that implements this must keep it in agreement with
+    /// [`prepare_rasterize`]: same `Some`-ness in every reachable state, and
+    /// the same captured input — the shipped three build both answers from one
+    /// private helper, and
+    /// `handlers::texture_tests::the_kinds_with_a_described_job_are_exactly_the_polygon_kinds`
+    /// is the pin. The dispatch site (`rustdar_frontend`'s
+    /// `spawn_overlay_render`) routes by an explicit match on kind, not by
+    /// probing this method, so a kind moved between the two paths is a
+    /// decision made there and tested here.
+    ///
+    /// [`prepare_rasterize`]: OverlayHandler::prepare_rasterize
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+        let _ = ctx;
+        None
+    }
+
     // ── Click & selection ─────────────────────────────────────────────
 
     /// The features a click is tested against, borrowed from this handler.
@@ -1128,6 +1179,16 @@ impl OverlayRegistry {
         ctx: &RasterizeContext,
     ) -> Option<RasterizeFn> {
         self.handler(kind).and_then(|h| h.prepare_rasterize(ctx))
+    }
+
+    /// [`OverlayHandler::prepare_job`] through the registry, the way
+    /// [`prepare_rasterize`](Self::prepare_rasterize) is reached.
+    pub fn prepare_job(
+        &self,
+        kind: OverlayKind,
+        ctx: &RasterizeContext,
+    ) -> Option<HandlerJobInput> {
+        self.handler(kind).and_then(|h| h.prepare_job(ctx))
     }
 
     pub fn create_fetch_tasks(&self, kind: OverlayKind, ctx: &FetchConfig) -> Vec<FetchTask> {

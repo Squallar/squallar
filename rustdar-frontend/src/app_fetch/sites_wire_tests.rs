@@ -98,7 +98,9 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
             panic!("the sites dispatch posted a job of another kind, not JobRequest::Overlay");
         };
         assert_eq!((*width, *height), (64, 48), "the plan's own dimensions");
-        let crate::offload::OverlayJobInput::Sites(sites) = input;
+        let crate::offload::OverlayJobInput::Sites(sites) = input else {
+            panic!("the sites dispatch posted an overlay job of another kind");
+        };
         assert!(
             !sites.sites.is_empty(),
             "the described job carries no sites at all, so the worker would \

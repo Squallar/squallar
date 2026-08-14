@@ -16,9 +16,9 @@
 
 use std::collections::HashSet;
 
-use super::{AlphaMode, rasterize_model_data, rasterize_nws_alerts};
+use super::{AlertPaint, AlertsInput, AlphaMode, rasterize_model_data, rasterize_nws_alerts};
 use crate::hrrr::{HrrrGridData, ModelParameter};
-use crate::nws::alert::{AlertCategory, AlertCertainty, AlertSeverity, AlertUrgency, NwsAlert};
+use crate::nws::alert::AlertCategory;
 use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
 
 const W: u32 = 96;
@@ -41,7 +41,7 @@ fn drawn(rgba: &[u8]) -> Vec<[u8; 4]> {
 
 /// A square covering most of the texture, in a saturated translucent colour, so
 /// the two conventions are far apart on every channel.
-fn alert_fixture() -> NwsAlert {
+fn alert_fixture() -> AlertPaint {
     let ring = vec![
         (34.2, -98.8),
         (34.2, -97.2),
@@ -49,23 +49,9 @@ fn alert_fixture() -> NwsAlert {
         (35.8, -98.8),
         (34.2, -98.8),
     ];
-    NwsAlert {
+    AlertPaint {
         id: "urn:test".into(),
-        event: "Tornado Warning".into(),
         category: AlertCategory::Warning,
-        severity: AlertSeverity::Severe,
-        urgency: AlertUrgency::Immediate,
-        certainty: AlertCertainty::Observed,
-        headline: None,
-        description: String::new(),
-        instruction: None,
-        area_desc: String::new(),
-        sender_name: String::new(),
-        effective: String::new(),
-        expires: String::new(),
-        onset: None,
-        ends: None,
-        affected_zones: Vec::new(),
         features: vec![OverlayFeature::new(
             vec![vec![ring]],
             [255, 0, 0, 128],
@@ -87,18 +73,24 @@ fn alert_fixture() -> NwsAlert {
 /// "as drawn".
 #[test]
 fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
-    let alerts = vec![alert_fixture()];
-    let rgba = rasterize_nws_alerts(
-        &alerts,
-        &[AlertCategory::Warning],
-        &HashSet::new(),
+    let out = rasterize_nws_alerts(
+        &AlertsInput {
+            alerts: vec![alert_fixture()],
+            enabled_categories: vec![AlertCategory::Warning],
+            hidden_ids: HashSet::new(),
+            device_scale: 1.0,
+        },
         &BOUNDS,
         W,
         H,
-        1.0,
+    );
+    assert_eq!(
+        out.alpha,
+        AlphaMode::Premultiplied,
+        "the alert rasterizer stopped declaring tiny-skia's own convention",
     );
 
-    let pixels = drawn(&rgba);
+    let pixels = drawn(&out.rgba);
     assert!(
         pixels.len() > 1000,
         "fixture drew {} pixels; the invariant below says nothing about an \

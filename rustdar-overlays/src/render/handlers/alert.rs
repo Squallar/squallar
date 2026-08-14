@@ -9,14 +9,18 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
-    RasterizeFn, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
+    OverlayItem, OverlayKind, OverlayState, PopupAction, PopupActionKind, PopupContent,
+    PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
+use crate::render::rasterize;
 use crate::types::GeoBounds;
 
-pub(crate) struct NwsAlertFetchResult(
+/// `pub`, not `pub(crate)`: `rustdar-frontend`'s described-job dispatch tests
+/// seed a live registry with alerts through `apply_fetch_result`, which takes
+/// a type-erased payload the handler downcasts to exactly this — so the type
+/// has to be nameable where the test constructs it.
+pub struct NwsAlertFetchResult(
     pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
 );
 
@@ -211,6 +215,35 @@ impl NwsAlertHandler {
             .iter()
             .filter(|item| self.is_drawn(item) && !item.alert.features.is_empty())
             .count()
+    }
+
+    /// What the rasterizer reads, captured once — the **one** builder both
+    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
+    /// and the described job cannot come to capture different state.
+    ///
+    /// The rows are [`rasterize::AlertPaint`], not whole [`NwsAlert`]s: the
+    /// id, the category and the geometry are everything the raster reads, and
+    /// the described job serialises this struct onto a message port — prose
+    /// fields the raster never draws would be bytes on the wire per raster.
+    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::AlertsInput> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(rasterize::AlertsInput {
+            alerts: self
+                .state
+                .data
+                .iter()
+                .map(|i| rasterize::AlertPaint {
+                    id: i.alert.id.clone(),
+                    category: i.alert.category,
+                    features: i.alert.features.clone(),
+                })
+                .collect(),
+            enabled_categories: self.enabled_categories.iter().copied().collect(),
+            hidden_ids: self.hidden_alerts.clone(),
+            device_scale: ctx.device_scale,
+        })
     }
 }
 
@@ -452,30 +485,16 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let device_scale = ctx.device_scale;
-        if self.state.data.is_empty() {
-            return None;
-        }
-        let alerts: Vec<NwsAlert> = self.state.data.iter().map(|i| i.alert.clone()).collect();
-        let enabled_categories: Vec<AlertCategory> =
-            self.enabled_categories.iter().copied().collect();
-        let hidden_alerts = self.hidden_alerts.clone();
+        let input = self.paint_input(ctx)?;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            let rgba = rasterize::rasterize_nws_alerts(
-                &alerts,
-                &enabled_categories,
-                &hidden_alerts,
-                bounds,
-                width,
-                height,
-                device_scale,
-            );
-            RasterizeOutput {
-                rgba,
-                hit_map: None,
-                alpha: rasterize::AlphaMode::Premultiplied,
-            }
+            rasterize::rasterize_nws_alerts(&input, bounds, width, height)
         }))
+    }
+
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+        // The same helper `prepare_rasterize` captures from, so the described
+        // job and the closure cannot come to read different state.
+        self.paint_input(ctx).map(HandlerJobInput::Alerts)
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

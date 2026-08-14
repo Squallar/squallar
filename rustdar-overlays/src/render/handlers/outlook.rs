@@ -8,14 +8,18 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
+    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
+    RasterizeFn, RenderMode,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
+use crate::render::rasterize;
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use crate::types::GeoBounds;
 
-pub(crate) struct SpcOutlookFetchResult {
+/// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
+/// dispatch tests seed a live registry through `apply_fetch_result`, whose
+/// payload the handler downcasts to exactly this.
+pub struct SpcOutlookFetchResult {
     pub day: OutlookDay,
     pub product: OutlookProduct,
     pub result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
@@ -460,6 +464,32 @@ impl SpcOutlookHandler {
         features
     }
 
+    /// What the rasterizer reads, captured once — the **one** builder both
+    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
+    /// and the described job cannot come to capture different state.
+    ///
+    /// The hatch colour is a page-side fact (the theme) resolved **here**, at
+    /// capture time, and carried as the resolved value: the worker a described
+    /// job may run in has no theme to consult, and everything the hatch pass
+    /// reads beyond it — each feature's own `HatchPattern` and rings — is on
+    /// the feature list itself.
+    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::OutlooksInput> {
+        let features = self.features_in_paint_order();
+        if features.is_empty() {
+            return None;
+        }
+        let hatch_color = if ctx.is_dark {
+            [200, 200, 200, 180]
+        } else {
+            [60, 60, 60, 180]
+        };
+        Some(rasterize::OutlooksInput {
+            features,
+            hatch_color,
+            device_scale: ctx.device_scale,
+        })
+    }
+
     /// Bring the products that are not independently selectable into line with
     /// the ones that are, and drop any that the selected day does not publish.
     ///
@@ -789,31 +819,16 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let features = self.features_in_paint_order();
-        if features.is_empty() {
-            return None;
-        }
-        let device_scale = ctx.device_scale;
-        let hatch_color = if ctx.is_dark {
-            [200, 200, 200, 180]
-        } else {
-            [60, 60, 60, 180]
-        };
+        let input = self.paint_input(ctx)?;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            let rgba = rasterize::rasterize_spc_outlooks(
-                &features,
-                bounds,
-                width,
-                height,
-                hatch_color,
-                device_scale,
-            );
-            RasterizeOutput {
-                rgba,
-                hit_map: None,
-                alpha: rasterize::AlphaMode::Premultiplied,
-            }
+            rasterize::rasterize_spc_outlooks(&input, bounds, width, height)
         }))
+    }
+
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+        // The same helper `prepare_rasterize` captures from, so the described
+        // job and the closure cannot come to read different state.
+        self.paint_input(ctx).map(HandlerJobInput::Outlooks)
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

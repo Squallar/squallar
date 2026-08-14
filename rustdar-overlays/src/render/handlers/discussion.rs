@@ -6,15 +6,19 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
+    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
+    RasterizeFn, RenderMode,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
+use crate::render::rasterize;
 use crate::spc::colors::md_stroke_color;
 use crate::spc::discussion::SpcDiscussion;
 use crate::types::{GeoBounds, OverlayLabel};
 
-pub(crate) struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, FetchError>);
+/// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
+/// dispatch tests seed a live registry through `apply_fetch_result`, whose
+/// payload the handler downcasts to exactly this.
+pub struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, FetchError>);
 /// [`Whole`]: one GET of the SPC mesoscale-discussion RSS feed, parsed in one
 /// pass. Every discussion the layer draws came out of that single document, so
 /// there is no second request to lose and nothing a coverage report could hold
@@ -107,6 +111,32 @@ impl SpcDiscussionHandler {
             enabled: true,
             labels: Vec::new(),
         }
+    }
+
+    /// What the rasterizer reads, captured once — the **one** builder both
+    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
+    /// and the described job cannot come to capture different state.
+    ///
+    /// [`rasterize::DiscussionPaint`] rows, not whole [`SpcDiscussion`]s: the
+    /// type and the rings are everything the raster reads, and the described
+    /// job serialises this struct onto a message port — the discussion text is
+    /// popup prose it never draws.
+    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::DiscussionsInput> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(rasterize::DiscussionsInput {
+            discussions: self
+                .state
+                .data
+                .iter()
+                .map(|i| rasterize::DiscussionPaint {
+                    md_type: i.md.md_type,
+                    polygon: i.md.polygon.clone(),
+                })
+                .collect(),
+            device_scale: ctx.device_scale,
+        })
     }
 }
 
@@ -281,26 +311,16 @@ impl OverlayHandler for SpcDiscussionHandler {
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let device_scale = ctx.device_scale;
-        if self.state.data.is_empty() {
-            return None;
-        }
-        let discussions: Vec<SpcDiscussion> =
-            self.state.data.iter().map(|i| i.md.clone()).collect();
+        let input = self.paint_input(ctx)?;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            let rgba = rasterize::rasterize_spc_discussions(
-                &discussions,
-                bounds,
-                width,
-                height,
-                device_scale,
-            );
-            RasterizeOutput {
-                rgba,
-                hit_map: None,
-                alpha: rasterize::AlphaMode::Premultiplied,
-            }
+            rasterize::rasterize_spc_discussions(&input, bounds, width, height)
         }))
+    }
+
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+        // The same helper `prepare_rasterize` captures from, so the described
+        // job and the closure cannot come to read different state.
+        self.paint_input(ctx).map(HandlerJobInput::Discussions)
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

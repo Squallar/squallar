@@ -11,10 +11,9 @@ use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Tr
 use std::sync::Arc;
 
 use crate::glm::GlmFlash;
-use crate::nws::alert::{AlertCategory, NwsAlert};
+use crate::nws::alert::AlertCategory;
 use crate::render::overlay_state::OverlayItem;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
-use crate::spc::discussion::SpcDiscussion;
 use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::{GeoBounds, GeoPolygonRing, OverlayFeature};
 
@@ -267,25 +266,56 @@ impl MercatorBounds {
 // tiny-skia and never called the conversion: it writes palette bytes with
 // straight alpha, and says so.
 
-/// `hatch_color` is theme-dependent, so it cannot live in the feature.
+/// Everything [`rasterize_spc_outlooks`] reads besides the raster's own
+/// geometry, as one struct — the **wire form** of the outlook render, shaped
+/// the way [`SitesInput`] is and for its reason: the described job decodes
+/// back into the struct the direct call takes, so byte-identity between "over
+/// a port" and "on this thread" is a property of the type.
 ///
-/// Premultiplied RGBA — see the module note above.
+/// `hatch_color` is resolved from the theme at *prepare* time and travels as
+/// the resolved colour: the worker has no theme to consult, and re-deriving it
+/// there would be a second statement of a page-side fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlooksInput {
+    /// In paint order, hatched features included — see
+    /// `SpcOutlookHandler::features_in_paint_order`. The hatch pass reads each
+    /// feature's own [`HatchPattern`](crate::types::HatchPattern) off this
+    /// list, so nothing beyond the list and `hatch_color` travels for it.
+    pub features: Vec<OverlayFeature>,
+    /// Theme-dependent, so it cannot live in the feature.
+    pub hatch_color: [u8; 4],
+    /// See the `device_scale` note on
+    /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
+    pub device_scale: f32,
+}
+
+/// [`RasterizeOutput`] for the reason [`rasterize_radar_sites`] answers one:
+/// with the outlook render a described job, `rustdar_frontend::offload`'s
+/// `execute` calls this directly and needs the alpha convention stated by the
+/// value rather than known by the caller. Premultiplied on every path.
 pub fn rasterize_spc_outlooks(
-    features: &[OverlayFeature],
+    input: &OutlooksInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    hatch_color: [u8; 4],
-    device_scale: f32,
-) -> Vec<u8> {
-    let scale = sane_device_scale(device_scale);
+) -> RasterizeOutput {
+    let OutlooksInput {
+        features,
+        hatch_color,
+        device_scale,
+    } = input;
+    let scale = sane_device_scale(*device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_spc_outlooks ({}×{})",
             width,
             height
         );
-        return vec![0u8; (width * height * 4) as usize];
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+            alpha: AlphaMode::Premultiplied,
+        };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
@@ -296,27 +326,63 @@ pub fn rasterize_spc_outlooks(
     for feature in features {
         draw_feature(&mut pixmap, feature, &mb, w, h, scale);
     }
-    crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, hatch_color);
+    crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, *hatch_color);
 
-    pixmap.take()
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: None,
+        alpha: AlphaMode::Premultiplied,
+    }
 }
 
-/// Premultiplied RGBA — see the module note above.
+/// The paint-relevant slice of one mesoscale discussion: what
+/// [`rasterize_spc_discussions`] reads of an
+/// [`SpcDiscussion`](crate::spc::discussion::SpcDiscussion), and nothing else.
+/// The title, text and link stay page-side — they are popup content, and a
+/// raster described over a message port should not carry prose it never draws.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscussionPaint {
+    /// Chooses the fill and stroke colours (`crate::spc::colors`).
+    pub md_type: crate::spc::discussion::MdType,
+    /// Every ring drawn as its own filled polygon — MDs carry no holes.
+    pub polygon: crate::types::GeoPolygon,
+}
+
+/// Everything [`rasterize_spc_discussions`] reads besides the raster's own
+/// geometry — the **wire form** of the discussion render. See
+/// [`OutlooksInput`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscussionsInput {
+    pub discussions: Vec<DiscussionPaint>,
+    /// See the `device_scale` note on
+    /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
+    pub device_scale: f32,
+}
+
+/// [`RasterizeOutput`] for [`rasterize_spc_outlooks`]'s reason. Premultiplied
+/// on every path.
 pub fn rasterize_spc_discussions(
-    discussions: &[SpcDiscussion],
+    input: &DiscussionsInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    device_scale: f32,
-) -> Vec<u8> {
-    let scale = sane_device_scale(device_scale);
+) -> RasterizeOutput {
+    let DiscussionsInput {
+        discussions,
+        device_scale,
+    } = input;
+    let scale = sane_device_scale(*device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_spc_discussions ({}×{})",
             width,
             height
         );
-        return vec![0u8; (width * height * 4) as usize];
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+            alpha: AlphaMode::Premultiplied,
+        };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
@@ -352,29 +418,73 @@ pub fn rasterize_spc_discussions(
         }
     }
 
-    pixmap.take()
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: None,
+        alpha: AlphaMode::Premultiplied,
+    }
+}
+
+/// The paint-relevant slice of one alert: what [`rasterize_nws_alerts`] reads
+/// of an [`NwsAlert`](crate::nws::alert::NwsAlert), and nothing else. The
+/// headline, description, instruction and the rest stay page-side — popup
+/// content, never drawn by this rasterizer, and not worth a codec on the
+/// message port the described job crosses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertPaint {
+    /// Tested against [`AlertsInput::hidden_ids`].
+    pub id: String,
+    /// Tested against [`AlertsInput::enabled_categories`].
+    pub category: AlertCategory,
+    /// The geometry, colours and (unused here) hatch of the alert's area.
+    pub features: Vec<OverlayFeature>,
+}
+
+/// Everything [`rasterize_nws_alerts`] reads besides the raster's own
+/// geometry — the **wire form** of the alert render. See [`OutlooksInput`].
+///
+/// The category and hidden-id filters travel *with* the rows rather than
+/// being applied before them, exactly as the argument list always took them:
+/// which alerts paint stays this function's own decision, made identically on
+/// the direct path and in a worker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertsInput {
+    pub alerts: Vec<AlertPaint>,
+    pub enabled_categories: Vec<AlertCategory>,
+    pub hidden_ids: HashSet<String>,
+    /// See the `device_scale` note on
+    /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
+    pub device_scale: f32,
 }
 
 /// Renders only alerts in `enabled_categories` and not in `hidden_ids`.
 ///
-/// Premultiplied RGBA — see the module note above.
+/// [`RasterizeOutput`] for [`rasterize_spc_outlooks`]'s reason. Premultiplied
+/// on every path.
 pub fn rasterize_nws_alerts(
-    alerts: &[NwsAlert],
-    enabled_categories: &[AlertCategory],
-    hidden_ids: &HashSet<String>,
+    input: &AlertsInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    device_scale: f32,
-) -> Vec<u8> {
-    let scale = sane_device_scale(device_scale);
+) -> RasterizeOutput {
+    let AlertsInput {
+        alerts,
+        enabled_categories,
+        hidden_ids,
+        device_scale,
+    } = input;
+    let scale = sane_device_scale(*device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_nws_alerts ({}×{})",
             width,
             height
         );
-        return vec![0u8; (width * height * 4) as usize];
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+            alpha: AlphaMode::Premultiplied,
+        };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
@@ -389,7 +499,11 @@ pub fn rasterize_nws_alerts(
         }
     }
 
-    pixmap.take()
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: None,
+        alpha: AlphaMode::Premultiplied,
+    }
 }
 
 /// Deliberately not `rustdar_radar`'s site type: keeps this crate decoupled.

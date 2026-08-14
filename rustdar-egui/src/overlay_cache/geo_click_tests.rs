@@ -103,20 +103,23 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
     // Opaque fill, no stroke: a painted pixel is then unambiguous, and no
     // outline can bleed a hole's rim into the count.
     let rendered = rustdar_overlays::render::rasterize::rasterize_spc_outlooks(
-        &[OverlayFeature::new(
-            f.polygons.clone(),
-            [255, 0, 0, 255],
-            [0, 0, 0, 0],
-            String::new(),
-            String::new(),
-            HatchPattern::None,
-        )],
+        &rustdar_overlays::render::rasterize::OutlooksInput {
+            features: vec![OverlayFeature::new(
+                f.polygons.clone(),
+                [255, 0, 0, 255],
+                [0, 0, 0, 0],
+                String::new(),
+                String::new(),
+                HatchPattern::None,
+            )],
+            hatch_color: [0, 0, 0, 0],
+            device_scale: 1.0,
+        },
         &bounds,
         W,
         H,
-        [0, 0, 0, 0],
-        1.0,
-    );
+    )
+    .rgba;
 
     // The projection `MercatorBounds` applies, restated: lon is linear, lat is
     // linear in Mercator Y, and the texture's y axis runs north to south.
