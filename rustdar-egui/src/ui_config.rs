@@ -1200,6 +1200,22 @@ impl super::Gui {
         // Fill in any overlay kinds not yet in per-pane enabled maps
         // (e.g. newly added overlays or first load after migration).
         self.initialize_pane_enabled();
+        // The third wholesale writer of a pane's enabled map, and the one it is
+        // easiest to assume is startup-only. It is not: on web and Android the
+        // config store is not readable when `App::new` runs, so
+        // `App::apply_config_store` reaches here **mid-session**, after frames
+        // have been drawn and overlay textures cached. A restored config that
+        // turns a layer off has to release it exactly as the toggle would — and
+        // `ui_map_pane`'s per-frame clear is no backstop here, because the same
+        // restore can convert the pane to a cross-section, which is a pane that
+        // loop never runs for again.
+        //
+        // After `initialize_pane_enabled` rather than beside the assignment in
+        // the loop above, so that a kind the stored map simply omits is judged
+        // by the default that pass fills in rather than by its absence.
+        for pane in &mut self.panes {
+            pane.release_disabled_overlay_textures();
+        }
         true
     }
 

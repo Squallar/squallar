@@ -2251,6 +2251,123 @@ impl PaneState {
         self.overlay_textures.entry(kind).or_default()
     }
 
+    /// Whether `kind`'s texture may be let go, judged against the enabled map
+    /// that decides it — **the single definition of that question**, and the
+    /// only place the rule is written.
+    ///
+    /// An associated function over the map rather than a method on the pane so
+    /// that both askers can reach it *literally* rather than each re-deriving
+    /// it. [`Self::release_disabled_overlay_textures`] holds
+    /// `&mut self.overlay_textures` while it asks, which rules out a `&self`
+    /// method — and an inline `kind == Radar || enabled.get(..)` there would be
+    /// a second copy of the rule that agrees with this one only by inspection.
+    /// The exclusion below has to hold at every point or it holds at none of
+    /// them: enforced when a layer is switched off but not when a late render
+    /// lands, it is a rule with a window in it, and the window is exactly the
+    /// frames in which the two spellings disagree.
+    ///
+    /// # The radar raster is not a layer texture, and this is where that is said
+    ///
+    /// [`OverlayKind::Radar`]'s cache is the only one this application does not
+    /// re-render on demand, and it is the only one carrying state nothing else
+    /// can rebuild:
+    ///
+    /// * **Nothing would put it back.** Every other texture cache is refilled by
+    ///   the viewport loop in `ui_map_pane`, which asks
+    ///   [`OverlayTextureCache::needs_rerender`] every frame and gets `true` from
+    ///   an empty cache outright. That loop `continue`s past `Radar` — the radar
+    ///   picture is dispatched by `App::dispatch_pane_renders` on a
+    ///   product/tilt/scan key, never on the cache being empty — so a cleared
+    ///   radar cache stays cleared until the next volume arrives. On a parked
+    ///   time or a site that has stopped scanning, that is *never*, and switching
+    ///   the layer back on shows empty map.
+    /// * **It is half of a two-step swap.** The cache holds a
+    ///   [`HeldOverlayTexture`](crate::overlay_cache::HeldOverlayTexture) whose
+    ///   pixels are still crossing PCIe, promoted by
+    ///   [`Self::promote_held_raster`] with the `data_time` that captions it.
+    ///   Only the dedicated paths end a hold — that promotion, and
+    ///   [`Self::release_held_raster`] for a context that died.
+    /// * **It carries facts no other copy has.**
+    ///   [`RadarTextureMeta`](crate::overlay_cache::RadarTextureMeta) is what
+    ///   `stale_image_on_screen`, the range ring, the hover readout and the
+    ///   storm-motion legend read, and it exists only here.
+    ///
+    /// So the radar raster is released by its own paths and by
+    /// `Gui::clear_graphics_state`, and a layer-stack toggle is not one of them.
+    /// The cost of the exclusion is one pane-sized texture per pane held across a
+    /// Radar-off period, which is the same texture the pane had before the click
+    /// and will draw again after it.
+    pub fn overlay_texture_releasable(
+        enabled: &HashMap<OverlayKind, bool>,
+        kind: OverlayKind,
+    ) -> bool {
+        // The same fallback [`Self::is_overlay_enabled`] applies: a kind with no
+        // entry is not drawn, so its texture is releasable.
+        kind != OverlayKind::Radar && !enabled.get(&kind).copied().unwrap_or(false)
+    }
+
+    /// [`Self::overlay_texture_releasable`] against this pane's own map, for
+    /// callers that hold the whole pane.
+    pub fn overlay_texture_is_releasable(&self, kind: OverlayKind) -> bool {
+        Self::overlay_texture_releasable(&self.enabled_overlays, kind)
+    }
+
+    /// Let go of the GPU texture of every overlay this pane no longer draws.
+    ///
+    /// Called wherever [`Self::enabled_overlays`] is written wholesale — the
+    /// toggle path (`Gui::write_pane_overlay`, which every eye, Show switch,
+    /// catalog tile and preset routes through), the fan-out that copies one
+    /// pane's map onto its linked siblings (`Gui::propagate_layer_sync`), and the
+    /// config restore (`Gui::load_ui_config`, which is *not* startup-only — on
+    /// web and Android the store can land mid-session, after frames have been
+    /// drawn). A reconciliation rather than a per-kind clear because two of those
+    /// three have a new map and no list of what changed.
+    ///
+    /// # What this recovers, and what it does not
+    ///
+    /// Only the kinds **switched off**. A pane with five layers still on keeps
+    /// five textures whether or not anything can see it, and that is untouched
+    /// here: releasing a hidden pane's live layers is a different rule, with a
+    /// different trigger and a re-render to pay on every re-split.
+    ///
+    /// # `render_in_flight` is deliberately left alone
+    ///
+    /// It is not a GPU resource, and the mark's whole lifecycle already belongs
+    /// to the dispatcher: `App::spawn_overlay_render` sets it, every path out of
+    /// that function that does not reach an `offload` undoes it with
+    /// `clear_overlay_render_marks`, and the `offload` arm's result clears it in
+    /// `poll_overlay_render_results` for every pane it names — kept or dropped.
+    /// There is no exit that strands one, so clearing it here would protect
+    /// against nothing.
+    ///
+    /// It would also cost. The dispatch gate is
+    /// `stale && !cache.render_in_flight`, so a mark cleared on the way off
+    /// **opens** it: switch a layer off and back on before its render lands and
+    /// the pane dispatches a second render of the same content, and both upload.
+    /// Left standing, the gate stays shut, the render already in flight arrives,
+    /// and the poller stores it because the layer is on again — which is the
+    /// picture the user asked for, at no extra cost.
+    ///
+    /// Idempotent: one pass over the kinds, clearing what is already clear for
+    /// all but the kinds just switched off. Cheap, but not free of callers — the
+    /// sync fan-out runs it on every linked pane on **every frame**, not only on
+    /// toggles, so what makes it affordable is that a cleared cache clears again
+    /// in two `Option` writes rather than that it runs rarely.
+    ///
+    /// Textures only — the handlers' *data* (alert polygons, GLM flashes, METAR
+    /// points) is untouched, because that costs a refetch to get back and this
+    /// costs a re-render.
+    pub fn release_disabled_overlay_textures(&mut self) {
+        // Two fields of one struct, borrowed disjointly, which is the whole
+        // reason the predicate above is an associated function over the map.
+        let enabled = &self.enabled_overlays;
+        for (&kind, cache) in &mut self.overlay_textures {
+            if Self::overlay_texture_releasable(enabled, kind) {
+                cache.clear();
+            }
+        }
+    }
+
     /// Whether this pane is waiting on a raster's pixels to finish arriving.
     ///
     /// The frame loop's own term: the app runs on `ControlFlow::Wait`, so a pane

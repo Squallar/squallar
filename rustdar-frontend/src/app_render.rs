@@ -1189,7 +1189,53 @@ impl super::App {
     fn poll_overlay_render_results(&mut self, ctx: &egui::Context) {
         use rustdar_egui::overlay_cache::OverlayTextureData;
 
-        while let Ok(resp) = self.channels.overlay_render_receiver.try_recv() {
+        while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv() {
+            let kind = resp.overlay_kind;
+
+            // Narrow the result to the panes that still draw this kind, and do
+            // it **before the upload**.
+            //
+            // A render is dispatched a frame or more before it lands, and it
+            // cannot be recalled: switch the layer off in between and the
+            // finished raster arrives for a pane that no longer wants it. It
+            // used to be stored anyway, which undid the release
+            // `Gui::write_pane_overlay` had just performed — and permanently on
+            // a pane the viewport loop in `ui_map_pane` never repaints, which
+            // is any pane hidden past the split's visible count or converted to
+            // a cross-section.
+            //
+            // Ahead of `load_texture` rather than inside the placement loop
+            // because the upload *is* the cost being avoided. Allocating the
+            // full-size texture and dropping the handle a few lines later would
+            // still have spent it: the drop only queues an egui free.
+            //
+            // The in-flight mark clears for every named pane either way, kept
+            // or dropped. This is the `offload` arm's half of the mark's
+            // lifecycle — `spawn_overlay_render` sets it and undoes it on every
+            // exit that never reaches an `offload` — and it is the *only* half
+            // that clears it. `release_disabled_overlay_textures` deliberately
+            // leaves the mark alone, so a result dropped here is what lets that
+            // kind be dispatched again.
+            //
+            // The radar raster never reaches this poller — `ui_map_pane`'s loop
+            // skips `Radar` and the picture comes from `apply_render_to_pane` —
+            // but the predicate excludes it regardless, so that "a layer toggle
+            // never touches the radar cache" is one rule with one spelling
+            // (`PaneState::overlay_texture_releasable`) rather than one
+            // re-derived at each site.
+            let gui = &mut self.gui;
+            resp.pane_indices.retain(|&pane_idx| {
+                let Some(pane) = gui.pane_mut(pane_idx) else {
+                    return false;
+                };
+                let wanted = !pane.overlay_texture_is_releasable(kind);
+                pane.overlay_cache_mut(kind).render_in_flight = false;
+                wanted
+            });
+            if resp.pane_indices.is_empty() {
+                continue;
+            }
+
             // Load texture once, then clone handle to all target panes.
             //
             // The pixels arrive already converted — see
@@ -1210,16 +1256,16 @@ impl super::App {
                 egui::TextureOptions::LINEAR,
             );
 
+            // Every pane still named here wants the picture: the retain above is
+            // what decided that, and it also cleared every in-flight mark.
             for &pane_idx in &resp.pane_indices {
                 let Some(pane) = self.gui.pane_mut(pane_idx) else {
                     continue;
                 };
 
-                let cache = pane.overlay_cache_mut(resp.overlay_kind);
+                let cache = pane.overlay_cache_mut(kind);
 
-                cache.render_in_flight = false;
-
-                // Every result is stored, and the staleness question is asked
+                // Every surviving result is stored, and the staleness question is asked
                 // next frame instead. `resp.generation` is a content token, not
                 // a sequence number (`ui_map_pane::overlay_cache_token`), so
                 // there is no order to compare it in — and none is needed:
@@ -4988,3 +5034,10 @@ mod stamping_tests;
 #[path = "app_render/one_render_per_sweep_tests.rs"]
 #[cfg(test)]
 mod one_render_per_sweep_tests;
+
+/// The frames between a dispatched overlay render and the layer being switched
+/// off — where a result that cannot be recalled lands on a pane that no longer
+/// wants it.
+#[path = "app_render/overlay_disable_race_tests.rs"]
+#[cfg(test)]
+mod overlay_disable_race_tests;
