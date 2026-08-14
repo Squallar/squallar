@@ -550,6 +550,83 @@ mod tests {
         assert_eq!(t.exact, 180 * 230);
     }
 
+    // ---- AUDIT DEMONSTRATIONS (campaign/oracle-round2) ----------------
+    // These document present behaviour of `tally_packet`; they are NOT a
+    // statement that the behaviour is correct. See the audit report.
+
+    /// AUDIT: a grid that is *physically short* scores a perfect 100% exact
+    /// and 0% presence disagreement, because `derived.iter().take(360)`
+    /// iterates only the rows that exist and nothing checks `derived.len()`.
+    ///
+    /// Contrast `presence_disagreements_count_cells_defined_on_exactly_one_side`:
+    /// a full-height grid whose rows are `NaN` is correctly penalised. The
+    /// difference between "360 rows, 359 of them NaN" (scores 0.28% of the
+    /// union) and "1 row" (scores 100%) is invisible to every caller.
+    #[test]
+    fn audit_a_short_grid_scores_perfect() {
+        let p = packet(360, 230, 0, 1.0, |az, r| ((az + r) % 200 + 20) as u16);
+
+        // One single row, agreeing exactly. 359 rows simply absent.
+        let derived: Vec<Vec<f32>> = vec![
+            (0..230)
+                .map(|r| (((0 + r) % 200 + 20) as f32 - OFFSET) / SCALE)
+                .collect(),
+        ];
+        assert_eq!(derived.len(), 1, "premise: the grid is 1/360 of a grid");
+
+        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        assert_eq!(t.compared, 230, "only the row that exists was compared");
+        assert_eq!(t.exact_pct(), 100.0, "a 1/360-height grid scores perfect");
+        assert_eq!(
+            t.presence_disagreement_pct(),
+            0.0,
+            "the 359 missing rows are not even counted as disagreements"
+        );
+        assert_eq!(t.l3_defined, 230, "the reference's other 359 rows vanished");
+
+        // The same holds for a short *row*: 1 bin of 230.
+        let narrow: Vec<Vec<f32>> = (0..360)
+            .map(|az| vec![(((az + 0) % 200 + 20) as f32 - OFFSET) / SCALE])
+            .collect();
+        let t = tally_packet(&narrow, &p, 1.0, &codec(), ProductKind::Numeric);
+        assert_eq!(t.compared, 360, "one bin per row");
+        assert_eq!(t.exact_pct(), 100.0, "a 1-bin-wide grid scores perfect");
+        assert_eq!(t.presence_disagreement_pct(), 0.0);
+
+        // And the degenerate case: an empty grid is not perfect, it is 0/0.
+        let t = tally_packet(&[], &p, 1.0, &codec(), ProductKind::Numeric);
+        assert_eq!(t.compared, 0);
+        assert_eq!(t.exact_pct(), 0.0, "0/max(1) reads 0%, not 100%");
+    }
+
+    /// AUDIT: a *tall* grid is truncated to its first 360 rows. On a
+    /// half-degree (720-row) grid that means rows 0..359 — azimuths
+    /// 0.0°..179.5° — are scored against Level III whole degrees 0..359.
+    /// Every cell is compared against the wrong azimuth and nothing says so.
+    #[test]
+    fn audit_a_720_row_grid_is_scored_against_the_wrong_azimuths() {
+        // L3 level encodes the whole-degree azimuth: level = az + 20.
+        let p = packet(360, 230, 0, 1.0, |az, _| (az + 20) as u16);
+
+        // A 720-row half-degree grid that is *correct*: row i is azimuth
+        // i * 0.5, and it carries the level of the degree it sits in.
+        let derived: Vec<Vec<f32>> = (0..720)
+            .map(|i| vec![((i / 2 + 20) as f32 - OFFSET) / SCALE; 230])
+            .collect();
+
+        let t = tally_packet(&derived, &p, 1.0, &codec(), ProductKind::Numeric);
+        assert_eq!(t.compared, 360 * 230, "only half the grid was even read");
+        // Row i is compared against L3 degree i, but carries degree i/2.
+        // Only rows 0 and 1 (both degree 0, compared against degrees 0 and 1)
+        // put row 0 on the right answer.
+        assert_eq!(t.exact, 230, "1 of 360 scored rows landed on its own azimuth");
+        assert!(
+            t.exact_pct() < 1.0,
+            "a *correct* 720-row derivation scores {:.2}%",
+            t.exact_pct()
+        );
+    }
+
     /// The codec round trip and its undefined levels, through the public
     /// surface the example uses.
     #[test]
