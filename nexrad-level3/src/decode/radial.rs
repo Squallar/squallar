@@ -315,8 +315,9 @@ fn skip_xdr_bytes(data: &[u8], offset: usize, n: usize) -> Result<usize> {
 /// caller's bounds check then waves the string through as if it were
 /// empty. Same hazard, and the same remedy, as `checked_end`.
 fn xdr_string_extent(len: u32) -> Option<usize> {
-    let padded = len.checked_next_multiple_of(4)?;
-    Some(padded.checked_add(4)? as usize)
+    let len = len as usize;
+    let padded = len.div_ceil(4) * 4;
+    Some(padded + 4)
 }
 
 /// Bounds of the XDR string at `offset`: its declared content length, and
