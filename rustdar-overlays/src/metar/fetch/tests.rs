@@ -54,6 +54,52 @@ fn an_inhg_altimeter_is_converted_to_hectopascals() {
     assert!(hpa > 900.0, "{hpa} looks like a raw inHg value");
 }
 
+/// `mslp` is already hectopascals and must not be run through the inHg
+/// conversion the altimeter needs. KOKC's fixture row carries both, and they
+/// are different quantities: 1015.3 hPa reduced with the station's own
+/// temperature, against a 30.04 inHg cockpit setting that is 1017.27 hPa.
+#[test]
+fn sea_level_pressure_is_read_in_hectopascals_and_is_not_the_altimeter() {
+    let okc = station("KOKC");
+    let mslp = okc.mslp_hpa.expect("KOKC reports an MSLP");
+    assert!((mslp - 1015.3).abs() < 0.01, "got {mslp} hPa");
+    let alt = okc.altimeter_hpa.expect("KOKC reports an altimeter");
+    assert!(
+        (alt - mslp).abs() > 1.0,
+        "the two pressures collapsed to one value ({alt} vs {mslp}); a \
+         conversion has been applied to the wrong one"
+    );
+    // Read through the altimeter's conversion it would be ~34x high.
+    assert!(mslp < 1100.0, "{mslp} looks like it went through to_hpa()");
+}
+
+/// Most of the network publishes no MSLP — 572 of 1324 records carried one
+/// across 20 state ASOS networks — and that must reach the plot as `None`,
+/// never as a zero and never as a substituted altimeter.
+#[test]
+fn a_station_publishing_no_sea_level_pressure_yields_none() {
+    let obs = sample();
+    assert!(
+        obs.iter().any(|o| o.mslp_hpa.is_some()),
+        "the fixture must exercise both arms"
+    );
+    for o in &obs {
+        if let Some(m) = o.mslp_hpa {
+            assert!(
+                m > 800.0,
+                "{}: {m} hPa is not a sea level pressure",
+                o.station_id
+            );
+            assert_ne!(
+                Some(m),
+                o.altimeter_hpa,
+                "{}: MSLP is the altimeter",
+                o.station_id
+            );
+        }
+    }
+}
+
 /// Fails if `sknt` is integer-parsed: `u16::from_str("14.0")` blanks every
 /// wind speed in the feed.
 #[test]
@@ -406,6 +452,9 @@ async fn live_metar_fetch_carries_every_mapped_field() {
         ("wind_speed_kt", has(&|o| o.wind_speed_kt.is_some())),
         ("visibility", has(&|o| o.visibility.is_some())),
         ("altimeter_hpa", has(&|o| o.altimeter_hpa.is_some())),
+        // Sparse by nature — 43.2% of 1324 records across 20 state networks —
+        // so this asserts the column is not *empty*, not that it is full.
+        ("mslp_hpa", has(&|o| o.mslp_hpa.is_some())),
         ("flight_category", has(&|o| o.flight_category.is_some())),
         ("raw_ob", has(&|o| !o.raw_ob.is_empty())),
         ("obs_time", has(&|o| !o.obs_time.is_empty())),

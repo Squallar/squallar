@@ -102,6 +102,13 @@ impl OverlayItem for MetarItem {
             ));
         }
 
+        // Its own row rather than folded into the altimeter's: the two are
+        // different reductions of the same air and differ by a median 0.49 hPa,
+        // up to 11.6 across 20 state networks.
+        if let Some(mslp) = ob.mslp_hpa {
+            kv.push(("Sea level".into(), format!("{mslp:.1} hPa")));
+        }
+
         if let Some(fc) = ob.flight_category {
             kv.push(("Flight Cat.".into(), fc.label().to_string()));
         }
@@ -519,6 +526,7 @@ mod tests {
             wind_gust_kt: None,
             visibility: vis,
             altimeter_hpa: None,
+            mslp_hpa: None,
             flight_category: None,
             raw_ob: String::new(),
             clouds: Vec::new(),
