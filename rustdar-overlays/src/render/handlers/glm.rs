@@ -557,9 +557,22 @@ impl OverlayHandler for GlmHandler {
         self.enabled = enabled;
     }
 
-    /// E.g. `"312 flashes · 10 min"`: what is in the window, and how wide the
-    /// window is. The count is whatever the window holds right now — it is
-    /// the number the map is drawing, not a promise about the feed.
+    /// E.g. `"312 flashes · 10 min"`: what the layer is holding, and how wide
+    /// its window is.
+    ///
+    /// It is **not** the number of bolts on screen, and this comment used to
+    /// say it was. Three culls run after this count is taken, inside
+    /// `rasterize_glm_strikes`: the viewport bounding box, a second age test
+    /// against a clock sampled later than the fetch's, and a pixel-window test
+    /// after projection. For a full-disk product on a regional view the first
+    /// of those alone removes most of what this number counts, so reading it
+    /// as a drawn count let an under-drawing map read as a complete one.
+    ///
+    /// Kept as the held count rather than swapped for a drawn one: the held
+    /// count is a property of the data and answers "is the feed alive", which
+    /// is what a status line is for, while a drawn count changes on every pan
+    /// and would need a `RasterizeOutput` field every other overlay would then
+    /// have to carry. The claim was wrong, not the number.
     fn status_line(&self) -> Option<String> {
         if !self.enabled {
             return None;
