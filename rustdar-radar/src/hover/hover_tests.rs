@@ -400,8 +400,9 @@ fn the_hover_lookup_does_not_walk_the_gates() {
         let wedges = geom.wedges().to_vec();
         let g = crate::render::polar::PolarGeometry::from_parts(
             wedges,
-            geom.first_gate_km(),
-            geom.gate_interval_km(),
+            geom.first_gate_slant_km(),
+            geom.gate_interval_slant_km(),
+            geom.elevation_deg(),
             gates,
         );
         let values = (0..720 * gates).map(|i| (i % 97) as f32).collect();

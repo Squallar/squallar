@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 7;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 7. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 8;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 8. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -828,6 +828,20 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 /// three enumerations above are no help: each is a list of names it expects to
 /// *find*, so a reply that grows a field passes all of them.
 ///
+/// # What this still cannot see
+///
+/// It watches the reply's **field set**, so it catches a field added, removed
+/// or renamed. It cannot catch a change to the *bytes inside* a field, because
+/// the field set is identical either side of one. `POLAR` carries
+/// `rustdar_radar::render::polar::PolarField::to_bytes`, a hand-rolled layout
+/// whose header grew an `f64` at protocol version 8 without a single name here
+/// changing — this test passed, unmodified, across that change, and the bump
+/// was made by hand. That is a real gap and it is recorded here rather than in
+/// a commit message because this is where someone looks when they wonder what
+/// the guard covers. Closing it would mean scraping or pinning that encoding
+/// too; until then, a buffer-valued field is a place the author is on their
+/// own.
+///
 /// # Why a list and not a digest
 ///
 /// A hash of the shape would be exactly as binding and would say nothing. This
@@ -893,7 +907,7 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     assert_eq!(
         shape,
         [
-            "PROTOCOL_VERSION = 7",
+            "PROTOCOL_VERSION = 8",
             "frame | IMAGE | image",
             "frame | MAX_RANGE | range",
             "frame | MELTING_LAYER | mls",

@@ -22,7 +22,10 @@ fn ring(n: usize, width: f64, gates: usize) -> PolarField {
     let values = (0..n)
         .flat_map(|r| (0..gates).map(move |g| (r * 1000 + g) as f32))
         .collect();
-    PolarField::from_parts(PolarGeometry::from_parts(wedges, 0.5, 1.0, gates), values)
+    PolarField::from_parts(
+        PolarGeometry::from_parts(wedges, 0.5, 1.0, None, gates),
+        values,
+    )
 }
 
 /// Which gate a point resolves to, as `radial * 1000 + gate`.
@@ -93,7 +96,7 @@ fn where_two_wedges_overlap_the_later_radial_wins() {
     let values = (0..4)
         .flat_map(|r| (0..2).map(move |g| (r * 1000 + g) as f32))
         .collect();
-    let f = PolarField::from_parts(PolarGeometry::from_parts(wedges, 0.5, 1.0, 2), values);
+    let f = PolarField::from_parts(PolarGeometry::from_parts(wedges, 0.5, 1.0, None, 2), values);
 
     // 1.0° is inside radial 1 ([0.0, 1.0)? no — [0.0,1.0) excludes 1.0),
     // radial 2 ([0.5, 1.5)) and radial 3 ([1.0, 2.0)). The greatest wins.
@@ -117,7 +120,7 @@ fn a_radial_that_painted_nothing_does_not_answer_for_its_neighbours() {
     let values = (0..4)
         .flat_map(|r| (0..2).map(move |g| (r * 1000 + g) as f32))
         .collect();
-    let f = PolarField::from_parts(PolarGeometry::from_parts(wedges, 0.5, 1.0, 2), values);
+    let f = PolarField::from_parts(PolarGeometry::from_parts(wedges, 0.5, 1.0, None, 2), values);
 
     assert_eq!(read(&f, 270.0, 0.5), None, "the silenced radial's own sky");
     assert_eq!(
@@ -134,7 +137,7 @@ fn an_unpainted_gate_reads_as_no_value_rather_than_as_a_nan() {
         half_width_deg: 180.0,
     }];
     let f = PolarField::from_parts(
-        PolarGeometry::from_parts(wedges, 0.5, 1.0, 3),
+        PolarGeometry::from_parts(wedges, 0.5, 1.0, None, 3),
         vec![1.0, f32::NAN, 3.0],
     );
     assert_eq!(read(&f, 0.0, 0.5), Some(1.0));
@@ -159,6 +162,7 @@ fn a_field_with_no_gates_answers_nothing_rather_than_dividing_by_zero() {
             }],
             0.0,
             0.0,
+            None,
             1,
         ),
         vec![7.0],
@@ -217,12 +221,12 @@ fn a_field_survives_the_round_trip_the_browsers_worker_port_makes() {
         assert_eq!(back.geometry().gates(), f.geometry().gates());
         assert_eq!(back.geometry().reach_gates(), f.geometry().reach_gates());
         assert_eq!(
-            back.geometry().first_gate_km(),
-            f.geometry().first_gate_km()
+            back.geometry().first_gate_slant_km(),
+            f.geometry().first_gate_slant_km()
         );
         assert_eq!(
-            back.geometry().gate_interval_km(),
-            f.geometry().gate_interval_km()
+            back.geometry().gate_interval_slant_km(),
+            f.geometry().gate_interval_slant_km()
         );
         assert_eq!(back.resident_bytes(), f.resident_bytes());
         for r in 0..f.geometry().radials() {

@@ -1258,7 +1258,7 @@ fn a_cells_status_names_which_of_the_decoders_answers_its_gates_gave() {
         &radials_vec(radial),
         RadarProduct::Reflectivity,
         CellStat::Max,
-        1.0,
+        None,
         GateFiling::AsDeclared,
     );
 
@@ -1840,7 +1840,7 @@ fn ground_grid(sweep: &Sweep) -> Vec<Vec<f32>> {
         radials,
         RadarProduct::Reflectivity,
         CellStat::LinearZMean,
-        binning.range_scale(radials),
+        binning.binning_elevation_deg(radials),
         binning.gate_filing(radials, RadarProduct::Reflectivity),
     )
     .0
@@ -1938,7 +1938,7 @@ fn slant_bins_hold_whole_pairs_so_replication_costs_them_nothing() {
             radials,
             RadarProduct::Reflectivity,
             CellStat::Max,
-            RangeBinning::Slant.range_scale(radials),
+            RangeBinning::Slant.binning_elevation_deg(radials),
             RangeBinning::Slant.gate_filing(radials, RadarProduct::Reflectivity),
         )
         .0
@@ -2062,4 +2062,94 @@ fn only_ground_binning_of_replicated_content_ever_decimates() {
             "{what} was filed the wrong way"
         );
     }
+}
+
+/// **A [`RangeBinning::Ground`] cell is the arc's, not the tangent plane's** —
+/// pinned on a gate the two disagree about, because almost every gate they
+/// agree about and a fixture made of those proves nothing.
+///
+/// # Why this test exists rather than the golden digest
+///
+/// `golden_echo_tops_grid_is_pinned` did **not** move when the cube's binning
+/// changed from `slant × cos e` to [`crate::beam::ground_range_km`]'s arc, and
+/// the reason is a property of that fixture rather than of the change. Over the
+/// golden scan the two spellings put **0 of the 109 304** gates echo tops can
+/// read into different 1 km bins, though they disagree about 6.6 % of all
+/// 2 880 000 gates present. The two differ by only tens of metres out to
+/// 200 km, so a gate changes bin only when it lies within that much of a
+/// kilometre boundary, and the golden cores sit where none of them do.
+///
+/// That is worth saying plainly: an unchanged digest there is evidence about
+/// the fixture's ranges, **not** evidence the cube is unaffected. Real volumes
+/// put gates everywhere, so roughly one gate in fifteen files a bin lower than
+/// it used to. Nothing in the suite covered that, so it is covered here.
+///
+/// # The gate
+///
+/// A 0.5° tilt, one gate centred 200.06 km along the beam:
+///   * `200.06 × cos 0.5° = 200.0524` → bin **200**
+///   * `ground_range_km(200.06, 0.5) = 199.9743` → bin **199**
+///
+/// One kilometre is the whole cell, so this is not a rounding argument: the
+/// reflectivity lands in a different column of the cube, under a different
+/// height, and every product that scans that column reads it there.
+#[test]
+fn a_ground_binned_cell_is_the_arc_not_the_tangent_plane() {
+    const ELEV: f32 = 0.5;
+    const SLANT_KM: f64 = 200.06;
+
+    // 250 m gates from 60 m, so gate 800 is centred at exactly
+    // 0.06 + 800 × 0.25 = 200.06 km. Only that one carries a number.
+    const FIRST_GATE_M: u16 = 60;
+    const GATE_M: u16 = 250;
+    const TARGET: usize = 800;
+    let mut bytes = vec![0u8; TARGET + 1];
+    bytes[TARGET] = (50.0f32 * SCALE + OFFSET) as u8;
+    let md = MomentData::from_fixed_point(
+        bytes.len() as u16,
+        FIRST_GATE_M,
+        GATE_M,
+        8,
+        SCALE,
+        OFFSET,
+        bytes,
+    );
+    assert!(
+        (f64::from(FIRST_GATE_M) / 1000.0 + TARGET as f64 * f64::from(GATE_M) / 1000.0 - SLANT_KM)
+            .abs()
+            < 1e-9,
+        "the target gate is not at {SLANT_KM} km",
+    );
+    let scan = Scan::new(
+        vcp(),
+        vec![one_radial_sweep(1, ELEV, 0.0, Some(md), None, None)],
+    );
+
+    let ground = crate::beam::ground_range_km(SLANT_KM, f64::from(ELEV));
+    let flat = SLANT_KM * f64::from(ELEV).to_radians().cos();
+    assert_eq!(ground as usize, 199, "the arc's bin moved: {ground}");
+    assert_eq!(flat as usize, 200, "the tangent plane's bin moved: {flat}");
+
+    let cube = VolumeCube::build(
+        &scan,
+        &[RadarProduct::Reflectivity],
+        DedupPolicy::NewestWins,
+        RangeBinning::Ground,
+    );
+    let values = &cube
+        .grid(0, RadarProduct::Reflectivity)
+        .expect("the cube kept the one reflectivity sweep")
+        .values;
+    let filed: Vec<usize> = (0..RANGE_BINS)
+        .filter(|&r| !values[0][r].is_nan())
+        .collect();
+    assert_eq!(
+        filed,
+        vec![199],
+        "the one gate should file in the arc's bin 199 and nowhere else",
+    );
+    assert!(
+        values[0][200].is_nan(),
+        "the gate filed under the tangent plane's bin 200",
+    );
 }

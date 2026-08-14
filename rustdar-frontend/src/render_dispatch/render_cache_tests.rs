@@ -45,7 +45,7 @@ fn hover_field(side: usize) -> rustdar_radar::render::polar::PolarField {
         })
         .collect();
     PolarField::from_parts(
-        PolarGeometry::from_parts(wedges, 0.125, 0.25, gates),
+        PolarGeometry::from_parts(wedges, 0.125, 0.25, None, gates),
         vec![0.0; RADIALS * gates],
     )
 }

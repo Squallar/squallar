@@ -1040,15 +1040,10 @@ impl RenderBuffers {
     /// [`RenderBuffers::into_output`] reads the lengths back off `cells` rather
     /// than being told them again — so nothing downstream can be handed a
     /// picture whose dimensions disagree with its bytes.
-    fn new(
-        product: types::RadarProduct,
-        side_px: usize,
-        shape: polar::PolarShape,
-        gate_interval_km: f64,
-    ) -> Self {
+    fn new(product: types::RadarProduct, side_px: usize, shape: polar::PolarShape) -> Self {
         Self {
             cells: Self::checkout(side_px * side_px),
-            polar: polar::PolarBuffers::new(shape, gate_interval_km),
+            polar: polar::PolarBuffers::new(shape),
             product,
         }
     }
@@ -2119,7 +2114,9 @@ fn volume_grid_shape(rows: usize, range_bins: usize) -> polar::PolarShape {
     polar::PolarShape {
         radials: rows,
         gates: range_bins,
-        first_gate_km: crate::volumetric::RANGE_BIN_KM / 2.0,
+        first_gate_slant_km: crate::volumetric::RANGE_BIN_KM / 2.0,
+        gate_interval_slant_km: crate::volumetric::RANGE_BIN_KM,
+        elevation_deg: None,
     }
 }
 
@@ -2162,11 +2159,38 @@ fn volume_grid_shape(rows: usize, range_bins: usize) -> polar::PolarShape {
 /// nothing whichever factor it is handed. A non-finite median is a corrupt
 /// angle, and 1.0 draws that sweep where the RDA said it was measured, which
 /// is a better failure than `cos NaN` collapsing all of it onto the site.
-fn sweep_ground_factor(radials: &[Radial]) -> f64 {
+fn sweep_elevation_deg_or_flat(radials: &[Radial]) -> f64 {
     match crate::volumetric::sweep_elevation_deg(radials) {
-        Some(e) if e.is_finite() => e.to_radians().cos().clamp(0.0, 1.0),
-        _ => 1.0,
+        Some(e) if e.is_finite() => e,
+        // A sweep that will not say where it pointed is drawn where it was
+        // measured rather than collapsed onto the site, which is what a zero
+        // elevation gives: the arc is the identity to within 8 nm at 460 km.
+        _ => 0.0,
     }
+}
+
+/// The **mean** foreshortening over a radial that reaches `slant_reach_km`: the
+/// ground arc it ends at, divided by the slant range it took to get there.
+///
+/// # This sizes the raster; it does not place a gate
+///
+/// `cos e` was this number back when the slant-to-ground conversion *was* a
+/// scale factor. [`crate::beam::ground_range_km`]'s arc is not one — it
+/// compresses with range — so no single factor is right for every gate, and the
+/// one worth having is the one that reproduces the **reach**, because the reach
+/// is what [`types::plan_view_extent_km`] and [`types::data_limited_side_px`]
+/// size the picture against.
+///
+/// Gate positions do not come through here. They come from
+/// [`gate_ground_edges`], which evaluates the arc per boundary. Keeping the two
+/// apart is the point: a frame sized by a mean and filled by the real thing is
+/// correct, where a frame and a fill that each rounded their own way would not
+/// be.
+fn sweep_ground_factor(slant_reach_km: f64, elevation_deg: f64) -> f64 {
+    if slant_reach_km <= 0.0 {
+        return 1.0;
+    }
+    (crate::beam::ground_range_km(slant_reach_km, elevation_deg) / slant_reach_km).clamp(0.0, 1.0)
 }
 
 /// How far a field's samples go along a radial and how far apart they are, both
@@ -2263,7 +2287,7 @@ fn render_with_projection(
     // the fill states separately: it is the same spacing the raster was sized
     // from, so a readout cannot come to disagree with the picture about how
     // deep a gate is.
-    let bufs = RenderBuffers::new(product, side_px, shape, sample_km);
+    let bufs = RenderBuffers::new(product, side_px, shape);
 
     fill(&proj, &bufs);
 
@@ -2506,8 +2530,10 @@ pub fn render_radar_to_image_full_sized(
     // the *data* goes is a property of the sweep, how wide the *picture* is
     // has to be the ground it covers, and the four sweep paths in this module
     // are where the one becomes the other.
-    let cos_e = sweep_ground_factor(radials);
-    let ground_reach_km = compute_max_range(radials, product) * cos_e;
+    let sweep_elevation = sweep_elevation_deg_or_flat(radials);
+    let slant_reach_km = compute_max_range(radials, product);
+    let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
+    let ground_reach_km = slant_reach_km * cos_e;
     let ground_sample_km = compute_gate_interval_km(radials, product) * cos_e;
     let (first_gate_slant_km, gate_count) = compute_gate_span(radials, product);
 
@@ -2531,7 +2557,9 @@ pub fn render_radar_to_image_full_sized(
             shape: polar::PolarShape {
                 radials: radials.len(),
                 gates: gate_count,
-                first_gate_km: first_gate_slant_km * cos_e,
+                first_gate_slant_km,
+                gate_interval_slant_km: compute_gate_interval_km(radials, product),
+                elevation_deg: Some(sweep_elevation),
             },
         },
         product,
@@ -2559,7 +2587,7 @@ pub fn render_radar_to_image_full_sized(
                             first_gate_range,
                             gate_size,
                             moment.gate_count() as usize,
-                            |slant_km| slant_km * cos_e,
+                            |slant_km| crate::beam::ground_range_km(slant_km, sweep_elevation),
                         );
                         // `iter`, not `values`: the latter is `iter().collect()`
                         // and this walk is strictly sequential, so the `Vec`
@@ -2620,9 +2648,10 @@ fn render_nrot_to_image(
 
     let vg = crate::velocity::grid(radials)?;
 
-    let cos_e = sweep_ground_factor(radials);
-    let ground_reach_km =
-        (vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km) * cos_e;
+    let sweep_elevation = sweep_elevation_deg_or_flat(radials);
+    let slant_reach_km = vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km;
+    let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
+    let ground_reach_km = slant_reach_km * cos_e;
     let half_widths = derived_grid_half_widths_deg(&vg.azimuths_deg);
 
     // The physics keeps the first radial's angle. It is the same number the
@@ -2653,7 +2682,9 @@ fn render_nrot_to_image(
             shape: polar::PolarShape {
                 radials: nrot_grid.len(),
                 gates: nrot_grid.iter().map(Vec::len).max().unwrap_or(0),
-                first_gate_km: vg.first_gate_range_km * cos_e,
+                first_gate_slant_km: vg.first_gate_range_km,
+                gate_interval_slant_km: vg.gate_interval_km,
+                elevation_deg: Some(sweep_elevation),
             },
         },
         types::RadarProduct::NormalizedRotation,
@@ -2667,7 +2698,7 @@ fn render_nrot_to_image(
                     vg.first_gate_range_km,
                     vg.gate_interval_km,
                     nrot_row.len(),
-                    |slant_km| slant_km * cos_e,
+                    |slant_km| crate::beam::ground_range_km(slant_km, sweep_elevation),
                 );
                 for ((j, &nrot_val), span) in nrot_row.iter().enumerate().zip(edges) {
                     if nrot_val.is_nan() {
@@ -2750,9 +2781,10 @@ fn render_srv_to_image(
 
     // As in NROT: the dealiaser above keeps the first radial's angle, this is
     // where the finished field is *placed*.
-    let cos_e = sweep_ground_factor(radials);
-    let ground_reach_km =
-        (grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km) * cos_e;
+    let sweep_elevation = sweep_elevation_deg_or_flat(radials);
+    let slant_reach_km = grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km;
+    let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
+    let ground_reach_km = slant_reach_km * cos_e;
     let half_widths = derived_grid_half_widths_deg(&grid.azimuths_deg);
     let output = render_with_projection(
         radar_lat,
@@ -2763,7 +2795,9 @@ fn render_srv_to_image(
             shape: polar::PolarShape {
                 radials: grid.values.len(),
                 gates: grid.values.iter().map(Vec::len).max().unwrap_or(0),
-                first_gate_km: grid.first_gate_range_km * cos_e,
+                first_gate_slant_km: grid.first_gate_range_km,
+                gate_interval_slant_km: grid.gate_interval_km,
+                elevation_deg: Some(sweep_elevation),
             },
         },
         types::RadarProduct::StormRelativeVelocity,
@@ -2776,7 +2810,7 @@ fn render_srv_to_image(
                     grid.first_gate_range_km,
                     grid.gate_interval_km,
                     row.len(),
-                    |slant_km| slant_km * cos_e,
+                    |slant_km| crate::beam::ground_range_km(slant_km, sweep_elevation),
                 );
                 for ((j, &value), span) in row.iter().enumerate().zip(edges) {
                     if value.is_nan() {
@@ -3153,7 +3187,9 @@ pub fn render_hhc_to_image(
             shape: polar::PolarShape {
                 radials: grid.values.len(),
                 gates: max_gates,
-                first_gate_km: grid.first_gate_km,
+                first_gate_slant_km: grid.first_gate_km,
+                gate_interval_slant_km: grid.gate_interval_km,
+                elevation_deg: None,
             },
         },
         types::RadarProduct::HydrometeorClassification,
@@ -3217,9 +3253,10 @@ pub fn render_derived_kdp_to_image(
     // KDP is a range derivative of ΦDP, so its grid keeps the differential
     // phase sweep's own gate spacing and reaches where that sweep reached —
     // and is placed on the ground the same way that sweep's moments are.
-    let cos_e = sweep_ground_factor(radials);
-    let ground_reach_km =
-        (derived.first_gate_km + max_gates as f64 * derived.gate_interval_km) * cos_e;
+    let sweep_elevation = sweep_elevation_deg_or_flat(radials);
+    let slant_reach_km = derived.first_gate_km + max_gates as f64 * derived.gate_interval_km;
+    let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
+    let ground_reach_km = slant_reach_km * cos_e;
     let half_widths = derived_grid_half_widths_deg(&derived.azimuths_deg);
 
     let output = render_with_projection(
@@ -3231,7 +3268,9 @@ pub fn render_derived_kdp_to_image(
             shape: polar::PolarShape {
                 radials: n_radials,
                 gates: max_gates,
-                first_gate_km: derived.first_gate_km * cos_e,
+                first_gate_slant_km: derived.first_gate_km,
+                gate_interval_slant_km: derived.gate_interval_km,
+                elevation_deg: Some(sweep_elevation),
             },
         },
         types::RadarProduct::SpecificDifferentialPhase,
@@ -3244,7 +3283,7 @@ pub fn render_derived_kdp_to_image(
                     derived.first_gate_km,
                     derived.gate_interval_km,
                     row.len(),
-                    |slant_km| slant_km * cos_e,
+                    |slant_km| crate::beam::ground_range_km(slant_km, sweep_elevation),
                 );
                 for ((j, &v), span) in row.iter().enumerate().zip(edges) {
                     if v.is_nan() {
@@ -3367,7 +3406,9 @@ fn render_level3_radial_with_gate_km(
                 gates: num_bins,
                 // The same centre the gate loop below paints gate 0 at, which
                 // is what this field has to agree with.
-                first_gate_km: radial_packet.gate_range_km(0, gate_interval),
+                first_gate_slant_km: radial_packet.gate_range_km(0, gate_interval),
+                gate_interval_slant_km: gate_interval,
+                elevation_deg: None,
             },
         },
         product,
