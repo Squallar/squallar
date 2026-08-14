@@ -959,6 +959,19 @@ impl VolumeAssembler {
             let vcp = self.coverage_pattern.insert(vcp);
             self.chunk_map = ElevationChunkMap::from_coverage_pattern(vcp);
             outcome.learned_coverage_pattern = true;
+            // Same reasoning as the reported site below, and the same one line.
+            // A snapshot handed out before this carries
+            // `placeholder_coverage_pattern`, whose cut table is empty, and a
+            // `Scan` that cannot key its own sweeps must not go on being served
+            // once the real pattern is known.
+            //
+            // Reachable, not theoretical: the start chunk is the only carrier of
+            // message 5, and a listed-then-missing key is ordinary enough that
+            // `fetch_disposition` calls it `Skip` — so a round can seal a cut
+            // with the pattern still absent. `current::resolve` drops an overlay
+            // whose pattern has no cuts, by design, which left the live volume
+            // discarded until the *next* seal happened to rebuild the cache.
+            self.cached = None;
         }
 
         // Accumulated whatever else this chunk turns out to be. A cut arrives

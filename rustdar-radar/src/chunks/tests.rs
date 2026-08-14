@@ -1144,6 +1144,96 @@ fn the_snapshot_is_shared_until_a_cut_seals() {
     );
 }
 
+/// The start chunk arriving late must reach the served volume, not just the
+/// assembler's field.
+///
+/// The start chunk is the only carrier of message 5, and a listed-then-missing
+/// key is ordinary — S3 is eventually consistent, and `fetch_disposition`
+/// answers `Skip` — so a cut can seal while the coverage pattern is still
+/// absent. The snapshot then carries `placeholder_coverage_pattern`, whose cut
+/// table is empty, and `current::resolve` drops an overlay that cannot key its
+/// own sweeps. That is deliberate *while the pattern is unknown*; what was not
+/// deliberate is that learning the pattern did not invalidate the cache, so
+/// every reader kept getting the placeholder `Scan` and the live volume stayed
+/// discarded until the next seal — one cut later — happened to rebuild it.
+///
+/// Asserted on the volume actually served, and through `resolve`, because the
+/// failure is the silent kind: `coverage_pattern` is set, the round reports a
+/// sealed cut, nothing errors, and the map under-draws.
+#[test]
+fn a_late_start_chunk_reaches_the_snapshot_rather_than_the_next_seal() {
+    let mut a = VolumeAssembler::new("KTLX", vol(42));
+    let chunks = golden_chunks();
+    let seal_at = *sealing_positions(&chunks)
+        .first()
+        .expect("some chunk seals a cut");
+    assert_eq!(
+        chunks[0].1,
+        ChunkKind::Start,
+        "the fixture's start chunk is sequence 1, and it is the one held back"
+    );
+    // Carrying a pattern with a real cut table, unlike `volumetric::tests::vcp`,
+    // whose table is empty: an empty one is what the *placeholder* looks like,
+    // so the two would be indistinguishable exactly where this test looks.
+    let start = (
+        chunks[0].0,
+        ChunkKind::Start,
+        ChunkContents {
+            radials: Vec::new(),
+            coverage_pattern: Some(vcp_with(&[(0.5, true), (0.9, true), (1.3, false)])),
+            ..Default::default()
+        },
+    );
+
+    // The round the start chunk 404'd in: radials only, through the first seal.
+    for (sequence, kind, contents) in chunks.iter().skip(1).take(seal_at).cloned() {
+        a.ingest_contents(sequence, kind, volume_time(), contents);
+    }
+    let before = a.snapshot();
+    assert!(
+        !before.sweeps().is_empty(),
+        "the fixture must seal a cut with the start chunk still missing"
+    );
+    assert!(
+        before.coverage_pattern().elevation_cuts().is_empty(),
+        "without the start chunk the snapshot carries the placeholder pattern"
+    );
+    let nyquist = crate::nyquist::DeclaredNyquist::default();
+    assert!(
+        crate::current::resolve(None, Some(crate::nyquist::Volume::new(&before, &nyquist)))
+            .is_none(),
+        "an overlay with no cut table is dropped, which is what makes the \
+             stale cache invisible rather than merely wasteful"
+    );
+
+    // The next round brings it, and seals nothing.
+    let (sequence, kind, contents) = start;
+    let outcome = a.ingest_contents(sequence, kind, volume_time(), contents);
+    assert!(outcome.learned_coverage_pattern);
+    assert!(
+        outcome.sealed.is_empty(),
+        "the start chunk carries no radials, so nothing else can invalidate \
+             the cache on its behalf"
+    );
+
+    let after = a.snapshot();
+    assert!(
+        !after.coverage_pattern().elevation_cuts().is_empty(),
+        "the served volume still carries the placeholder pattern, so learning \
+             the VCP reached the assembler and not the reader"
+    );
+    assert_eq!(
+        after.sweeps().len(),
+        before.sweeps().len(),
+        "the rebuild must add the pattern without changing the cuts"
+    );
+    assert!(
+        crate::current::resolve(None, Some(crate::nyquist::Volume::new(&after, &nyquist)))
+            .is_some(),
+        "the live volume is still being thrown away after its pattern arrived"
+    );
+}
+
 /// A leftover from the previous pass through this rotating index carries
 /// elevation numbers that would collide with the volume being assembled, so
 /// it must be refused outright rather than merged.
