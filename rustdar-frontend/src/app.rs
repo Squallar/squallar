@@ -2776,6 +2776,12 @@ impl App {
     /// is a subtraction, and after it a serialization and a string compare. Only
     /// a genuine change reaches the store.
     ///
+    /// The serialization stays here on purpose — the string compare against
+    /// `last_written` is what decides whether to write at all, so the value has
+    /// to exist on this thread. Only the bytes leave: the filesystem backend
+    /// queues them for its writer thread, so what a frame pays is the
+    /// serialization and the compare, never `create_dir_all` and `write`.
+    ///
     /// See [`AutosaveState`] for why the config is written on a timer rather
     /// than at shutdown.
     fn autosave_config(&mut self, force: bool) {
@@ -2801,6 +2807,10 @@ impl App {
             return;
         };
         match store.store(rustdar_egui::config_store::UI_CONFIG_KEY, &json) {
+            // For a backend that queues, this says "accepted", not "written" —
+            // a write that then fails is reported where it failed. The cost is
+            // that a failing disk waits for the next genuine change rather than
+            // the next tick, which is the trade the backend documents.
             Ok(()) => self.autosave.last_written = Some(json),
             // Not fatal and not retried on a shorter timer: the next tick tries
             // again anyway, and a full `localStorage` would otherwise log once
@@ -3157,8 +3167,16 @@ impl App {
     /// an event loop.
     ///
     /// Split out so the deferred replay in `window_event` can take exactly this
-    /// half and no more — the config save happened when the flag was set, and
-    /// running it again on the way out would write the file twice.
+    /// half and no more.
+    ///
+    /// The config save runs here as well as where the exit was requested, and
+    /// the second one is not redundant on the deferred route: `handle_redraw`
+    /// runs between the two, and its `autosave_config` *queues* a write that
+    /// the `process::exit` below discards without the writer thread ever
+    /// getting a turn. So the last change a user makes — in the very redraw
+    /// that processed the menu's Exit — would be the one lost. Writing the file
+    /// twice on the way out is much the cheaper mistake, and
+    /// [`ConfigStore::store_now`] is what makes this one the last word.
     ///
     /// `process::exit` is not redundant beside `event_loop.exit()`. On Android
     /// the loop never unwinds, so nothing after `exit()` ever runs and the
@@ -3168,6 +3186,11 @@ impl App {
     /// must not lose this.
     fn exit_now(&self, event_loop: &ActiveEventLoop) {
         log::info!("Exiting application");
+        // Last, and synchronously: see the note above. Anything the writer
+        // thread still holds dies with the process a few lines down.
+        if let Some(store) = self.platform.config_store() {
+            self.gui.save_ui_config(store.as_ref());
+        }
         event_loop.exit();
         if self.platform.needs_process_exit() {
             std::process::exit(0);
@@ -3619,8 +3642,9 @@ impl ApplicationHandler for App {
                 self.handle_redraw();
                 // Spend a deferred exit (set during redraw, where there was no
                 // event loop to hand out) through the same door an immediate one
-                // uses — `process::exit` included. Taken rather than read: the
-                // config save already ran when the flag was set.
+                // uses — `process::exit` and the final synchronous config save
+                // included. The redraw just above may have queued a save of its
+                // own, which is exactly what `exit_now` cannot rely on.
                 if std::mem::take(&mut self.exit_requested) {
                     self.exit_now(event_loop);
                 }

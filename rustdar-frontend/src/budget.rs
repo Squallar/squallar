@@ -116,11 +116,19 @@ pub fn remembered_steps(store: Option<&dyn ConfigStore>) -> Option<u32> {
 }
 
 /// Write what this session settled on, synchronously. See [`BUDGET_MEMO_KEY`].
+///
+/// [`ConfigStore::store_now`] is what makes "synchronously" true. The ordinary
+/// `store` hands the bytes to a writer thread that a dying process never gets
+/// back to, and this is called off a lost rendering surface — the moment the
+/// process is most likely to be killed. A dropped memo means the next session
+/// opens at the top rung and loses the same surface again: the ladder would
+/// never descend, which is the entire guarantee this key exists to provide. One
+/// integer costs nothing to wait for.
 pub fn remember_steps(store: Option<&dyn ConfigStore>, steps: u32) {
     let Some(store) = store else {
         return;
     };
-    if let Err(e) = store.store(BUDGET_MEMO_KEY, &steps.to_string()) {
+    if let Err(e) = store.store_now(BUDGET_MEMO_KEY, &steps.to_string()) {
         log::warn!("could not persist the budget ladder position: {e}");
     }
 }

@@ -3,10 +3,17 @@
 //! `rustdar_radar::types::ScanInfo::from_scan` prefers a volume's own stated
 //! position over the compiled-in table, which makes every site the user opens
 //! self-correcting *for as long as that volume is in memory*. This is what
-//! makes it survive the process: the position learned from a volume is written
-//! here the moment it is learned, and handed back to `from_scan` on the next
-//! run, so a site stays corrected and the map centres correctly on a radar the
-//! user opened last week and has not re-downloaded yet.
+//! makes it survive the process: the position learned from a volume is handed
+//! to the config store the moment it is learned, and handed back to `from_scan`
+//! on the next run, so a site stays corrected and the map centres correctly on
+//! a radar the user opened last week and has not re-downloaded yet.
+//!
+//! Handed to, not written by. This is reached from applying a volume, which is
+//! a frame, so it takes the store's ordinary deferred `store` and a process
+//! that dies within milliseconds of learning a position can still lose it. That
+//! is the right trade here and not at the two device memos: those are written
+//! off a lost rendering surface, where the process dying next is the expected
+//! case rather than a coincidence.
 //!
 //! # Why this is not a field on `UiConfig`
 //!

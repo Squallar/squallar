@@ -36,7 +36,27 @@ pub trait ConfigStore {
     /// The `Err` string is for logging, which is why it is not a typed error:
     /// no caller branches on the reason, and the backends have nothing in
     /// common to enumerate.
+    ///
+    /// A backend may return before the bytes are anywhere durable — see
+    /// [`store_now`](Self::store_now) for the callers that cannot accept that.
+    /// `Ok` from those backends means "accepted", not "written", so a failure
+    /// discovered afterwards is logged by the backend and never reaches here.
     fn store(&self, key: &str, value: &str) -> Result<(), String>;
+
+    /// Persist `value` under `key`, and do not return until it is written.
+    ///
+    /// For the two moments where the process may not exist a moment later: an
+    /// exit, and an Android suspend where the system may kill the app without
+    /// another turn of the event loop. A deferred write has no chance to run
+    /// after either, so those callers pay the latency deliberately.
+    ///
+    /// The default is [`store`](Self::store), which is already correct for
+    /// every backend that writes inline — the in-memory one, and the
+    /// `localStorage` one, which has no thread to defer to. Only a backend
+    /// that defers has anything to override here.
+    fn store_now(&self, key: &str, value: &str) -> Result<(), String> {
+        self.store(key, value)
+    }
 }
 
 /// A [`ConfigStore`] held entirely in memory.

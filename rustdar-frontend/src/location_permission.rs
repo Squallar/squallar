@@ -490,6 +490,11 @@ impl LocationGate {
 
     /// Write the memo now, not on the autosave timer.
     ///
+    /// [`ConfigStore::store_now`], because "now" is the claim: the ordinary
+    /// `store` hands the bytes to a writer thread, and a session that ends
+    /// before that thread runs loses the memo exactly as if it had waited for
+    /// the timer this deliberately does not use.
+    ///
     /// Failure is logged and dropped, like every other config write in this
     /// app: a full `localStorage` must not stop the map from working. The cost
     /// of losing it is one extra prompt on the next run.
@@ -504,7 +509,7 @@ impl LocationGate {
                 return;
             }
         };
-        if let Err(e) = store.store(LOCATION_MEMO_KEY, &json) {
+        if let Err(e) = store.store_now(LOCATION_MEMO_KEY, &json) {
             log::warn!("could not persist the location memo: {e}");
         }
     }

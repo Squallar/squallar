@@ -786,12 +786,19 @@ impl Default for UiConfig {
 }
 
 impl super::Gui {
-    /// Save UI layout configuration to `store`.
+    /// Save UI layout configuration to `store`, waiting for the write.
+    ///
+    /// [`ConfigStore::store_now`] rather than `store`, because both callers are
+    /// save points where the process may be gone a moment later — the exit
+    /// path, and the Android suspend that the system is free to follow with a
+    /// kill. A backend that defers writes to another thread would never get to
+    /// run this one. The periodic autosave, which is on the frame thread and
+    /// has a next tick to fall back on, deliberately uses `store` instead.
     pub fn save_ui_config(&self, store: &dyn ConfigStore) {
         let Some(json) = self.ui_config_json() else {
             return;
         };
-        if let Err(e) = store.store(UI_CONFIG_KEY, &json) {
+        if let Err(e) = store.store_now(UI_CONFIG_KEY, &json) {
             log::error!("Failed to write config: {}", e);
         }
     }

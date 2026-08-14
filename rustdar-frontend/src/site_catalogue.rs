@@ -35,7 +35,7 @@
 //! the first catalogue can only *add* rows. Nothing a user is looking at
 //! moves. Every catalogue after it takes the next-launch path.
 //!
-//! # Its own key, written synchronously
+//! # Its own key, written when the fetch lands
 //!
 //! Not `ui.json`. `App::autosave_config` writes that on a 3 s timer behind a
 //! string compare, and everything the user has configured rides in the one
@@ -99,17 +99,22 @@ pub fn load(store: Option<&dyn ConfigStore>) -> SiteCatalogue {
     }
 }
 
-/// Write `catalogue` out **now**, replacing whatever was there.
+/// Hand `catalogue` to the store **when it lands**, replacing whatever is there.
 ///
 /// Returns whether a write was attempted, which is also whether anything
 /// changed: a fetch that comes back with the catalogue already cached is the
 /// ordinary case, and rewriting the same ~15 KB blob into `localStorage` on
 /// every launch for a value that has not moved is a cost with no benefit.
 ///
-/// Synchronous rather than deferred to the autosave tick, for the reason in the
-/// module note. A failed write is logged and dropped — a full `localStorage`
-/// must not stop the map from working, and the cost of losing it is one more
-/// launch that starts without the network.
+/// Handed over when the fetch lands rather than deferred to the autosave tick,
+/// for the reason in the module note — which is about *this key* not riding the
+/// 3 s `UiConfig` blob, and is unaffected by the store queuing the bytes. This
+/// is reached from a frame, so it takes the deferred `store` and a process that
+/// dies moments later loses the catalogue. That costs one more launch on the
+/// seed, which is why this is not one of the callers that pays for `store_now`.
+///
+/// A failed write is logged and dropped — a full `localStorage` must not stop
+/// the map from working.
 ///
 /// The return value says nothing about whether the caller should *use* the
 /// catalogue: it did once, and a store that could not be written then discarded
@@ -141,8 +146,14 @@ pub fn store_if_changed(
     }
     // Says only what this function did. It used to add "applied on the next
     // launch", which the launch that adopts its first catalogue contradicts on
-    // the very next line of the log.
-    log::info!("site catalogue cached: {} radars", fetched.len());
+    // the very next line of the log. "Queued" is the same discipline one step
+    // further: `store` hands the bytes to a writer thread and returns before
+    // any of them are on disk, so "cached" would now be claiming an outcome
+    // this function has not observed and will never be told about.
+    log::info!(
+        "site catalogue queued for caching: {} radars",
+        fetched.len()
+    );
     true
 }
 
