@@ -304,32 +304,40 @@ fn skip_xdr_bytes(data: &[u8], offset: usize, n: usize) -> Result<usize> {
     Ok(offset + n)
 }
 
+/// The on-wire extent of an XDR counted string: its 4-byte length prefix
+/// plus `len` content bytes padded up to a 4-byte boundary.
+fn xdr_string_extent(len: u32) -> Option<usize> {
+    let padded = len.div_ceil(4) * 4;
+    Some((padded + 4) as usize)
+}
+
+/// Bounds of the XDR string at `offset`: its declared content length, and
+/// the offset one past its padding. Both are proven to sit inside `data`.
+fn xdr_string_bounds(data: &[u8], offset: usize) -> Result<(usize, usize)> {
+    let len = read_u32(data, offset)?;
+    let eof = |expected: usize| Error::UnexpectedEof {
+        offset,
+        expected,
+        available: data.len().saturating_sub(offset),
+    };
+    let extent =
+        xdr_string_extent(len).ok_or_else(|| eof((len as usize).saturating_add(4)))?;
+    let end = checked_end(data, offset, extent)?;
+    if end > data.len() {
+        return Err(eof(extent));
+    }
+    Ok((len as usize, end))
+}
+
 /// Skip an XDR string (4-byte length prefix + padded-to-4 content).
 fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
-    let len = read_u32(data, offset)? as usize;
-    let padded = len.div_ceil(4) * 4;
-    let end = offset + 4 + padded;
-    if end > data.len() {
-        return Err(Error::UnexpectedEof {
-            offset,
-            expected: 4 + padded,
-            available: data.len().saturating_sub(offset),
-        });
-    }
-    Ok(end)
+    Ok(xdr_string_bounds(data, offset)?.1)
 }
 
 fn read_xdr_string(data: &[u8], offset: usize) -> Result<(String, usize)> {
-    let len = read_u32(data, offset)? as usize;
-    let padded = len.div_ceil(4) * 4;
-    let end = offset + 4 + padded;
-    if end > data.len() {
-        return Err(Error::UnexpectedEof {
-            offset,
-            expected: 4 + padded,
-            available: data.len().saturating_sub(offset),
-        });
-    }
+    let (len, end) = xdr_string_bounds(data, offset)?;
+    // `len` is at most the padded extent, so the content ends at or before
+    // `end`, which `xdr_string_bounds` proved is within `data`.
     let s = std::str::from_utf8(&data[offset + 4..offset + 4 + len])
         .unwrap_or("")
         .to_owned();
@@ -652,6 +660,80 @@ mod tests {
         let mut d = finish(d);
         d[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(decode_generic_radial_packet(&d, 0).is_err());
+    }
+
+    /// An XDR string's padded extent is rounded at `u32` width, so this
+    /// bites on a 64-bit host even though the defect only ever fired on
+    /// wasm32. Rounding in `usize` instead — what this code used to do —
+    /// makes the hostile lengths harmless on 64-bit and catastrophic on
+    /// 32-bit, which is precisely the shape CI cannot see.
+    ///
+    /// Two separate overflows live in this range. `u32::MAX - 3` is already
+    /// a multiple of 4, so the rounding leaves it alone and the `+ 4` for
+    /// the length prefix is what carries; the three above it overflow in
+    /// the rounding itself. Both must be refused.
+    #[test]
+    fn a_hostile_xdr_string_length_has_no_extent() {
+        for len in [u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3] {
+            assert_eq!(
+                xdr_string_extent(len),
+                None,
+                "declared length {len} must have no representable extent",
+            );
+        }
+    }
+
+    /// The refusal must not cost the lengths a real product uses: the
+    /// prefix plus the content rounded up to the next 4-byte boundary.
+    #[test]
+    fn an_ordinary_xdr_string_length_keeps_its_padded_extent() {
+        for (len, want) in [
+            (0u32, 4usize),
+            (1, 8),
+            (3, 8),
+            (4, 8),
+            (5, 12),
+            (64, 68),
+            // The largest length that still has an extent: rounds to
+            // itself, and the prefix is the last 4 bytes that fit.
+            (u32::MAX - 7, (u32::MAX - 7) as usize + 4),
+        ] {
+            assert_eq!(xdr_string_extent(len), Some(want), "declared length {len}");
+        }
+    }
+
+    /// End to end: a hostile length prefix on the radial attribute string
+    /// must come back as an error. On wasm32 the padded extent wrapped to
+    /// 0 and the bounds check waved it through, leaving the decoder to
+    /// read the following fields from the middle of the string.
+    #[test]
+    fn a_hostile_xdr_string_length_is_an_error_not_a_misframed_read() {
+        let mut d = xdr_radial_component_prelude();
+        push_i32(&mut d, 1); // one radial
+        push_f32(&mut d, 0.0); // azimuth
+        push_f32(&mut d, 0.0); // elevation
+        push_f32(&mut d, 1.0); // width
+        push_i32(&mut d, 1); // number of bins
+        d.extend_from_slice(&u32::MAX.to_be_bytes()); // attribute string length
+        push_i32(&mut d, 1); // data array length
+        push_i32(&mut d, 7); // one gate
+        assert!(decode_generic_radial_packet(&finish(d), 0).is_err());
+    }
+
+    /// The same length on a *skipped* string, reached through the radial
+    /// parameter list rather than the attribute read. `skip_xdr_string`
+    /// carried its own copy of the arithmetic.
+    #[test]
+    fn a_hostile_xdr_string_length_is_an_error_when_skipped() {
+        let mut d = xdr_radial_component_prelude();
+        // Rewrite the radial parameter count from 0 to 1 so the list is
+        // walked; the prelude's last eight bytes are that count and its
+        // pointer.
+        let n = d.len();
+        d[n - 8..n - 4].copy_from_slice(&1i32.to_be_bytes());
+        d.extend_from_slice(&u32::MAX.to_be_bytes()); // parameter id length
+        push_empty_string(&mut d); // parameter attributes
+        assert!(decode_generic_radial_packet(&finish(d), 0).is_err());
     }
 
     /// The guardrails must not reject a well-formed packet: one radial,
