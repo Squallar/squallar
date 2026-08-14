@@ -1800,6 +1800,24 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
             "8-bit, gate_count overruns the bytes",
             MomentData::from_fixed_point(400, FIRST_GATE_M, GATE_M, 8, 2.0, 66.0, short_bytes),
         ),
+        // Appended rather than grouped with the other zero-scale moment, because
+        // the assertions after the loop reach `cases[3]` by index. Both word
+        // sizes at a zero scale, not just the 8-bit one: this now guards a
+        // function derived from `render::moment_value_at` rather than a copy of
+        // the model, and a primitive taking the wrong branch for wide words
+        // would otherwise be caught only from the readout's side.
+        (
+            "16-bit, scale 0 (status codes disabled)",
+            MomentData::from_fixed_point(
+                600,
+                FIRST_GATE_M,
+                GATE_M,
+                16,
+                0.0,
+                0.0,
+                (0..600u16).flat_map(u16::to_be_bytes).collect(),
+            ),
+        ),
     ];
 
     let mut checked = 0usize;
@@ -1854,8 +1872,8 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
     // preconditions: the sweep actually reached each of the three decode
     // paths, so an implementation that got one of them wrong could not
     // have passed by never being asked.
-    // 256 + 256 + 600 + 50 gates, plus three past the end of each.
-    assert_eq!(checked, 1174, "the comparison grid changed size");
+    // 256 + 256 + 600 + 50 + 600 gates, plus three past the end of each.
+    assert_eq!(checked, 1777, "the comparison grid changed size");
     assert!(saw_below, "no below-threshold gate was exercised");
     assert!(saw_folded, "no range-folded gate was exercised");
     assert!(
