@@ -1262,7 +1262,9 @@ impl VolumeAssembler {
     /// every sealed sweep so far. The same `Arc` comes back until a cut seals;
     /// build one per *rendered* completion, not one per poll, and use
     /// [`IngestOutcome::sealed`] to tell whether the seal was even for a tilt
-    /// anything is showing.
+    /// anything is showing. [`ChunkPoller`] refills this cache at the end of
+    /// any round that sealed — see `ChunkPoller::warm_snapshot` — so the first
+    /// frame-thread call after a seal is already the `Arc` clone.
     ///
     /// **Carries the site** whenever a chunk stated one, which every Message 31
     /// chunk does. That is what makes a chunk-fed pane place itself the way an
@@ -1293,6 +1295,14 @@ impl VolumeAssembler {
         });
         self.cached = Some(std::sync::Arc::clone(&scan));
         scan
+    }
+
+    /// Whether [`Self::snapshot`] would return without building. The question
+    /// the warming tests have to ask *before* calling `snapshot()`, which
+    /// would itself warm a cold cache and erase the difference being tested.
+    #[cfg(test)]
+    pub(crate) fn snapshot_is_warm(&self) -> bool {
+        self.cached.is_some()
     }
 
     /// Every cut's declared Nyquist velocity, as far as the chunks so far have
@@ -1630,12 +1640,14 @@ impl ChunkPoller {
     /// landed precisely on the volumes every consumer discards.
     ///
     /// Warm is not automatic, and the reason is a cross-layer one worth naming: a
-    /// **seal** also clears that cache, so the cache is warm at roll time only
-    /// because the caller asked for a snapshot in the round the volume's last cut
-    /// sealed. That does hold — [`Self::plan`] runs before any ingestion, so it
-    /// cannot see `saw_scan_end` until a *later* round, and the final seal and the
-    /// roll are therefore never the same round. A caller that stops reading
-    /// snapshots would pay one cold copy per volume here instead.
+    /// **seal** also clears that cache, so what makes it warm at roll time is that
+    /// something rebuilt it in the round the volume's last cut sealed. That is now
+    /// [`Self::warm_snapshot`]'s job — every sealing round ends by refilling the
+    /// cache — so it no longer depends on the caller having asked for a snapshot,
+    /// which is a guarantee this path used to rest on and no longer has to. It held
+    /// either way: [`Self::plan`] runs before any ingestion, so it cannot see
+    /// `saw_scan_end` until a *later* round, and the final seal and the roll are
+    /// therefore never the same round.
     pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<ClosedVolume> {
         let closed = self.current.as_mut().map(|current| {
             // `close`, not `progress`: it is what resolves a still-open cut to
@@ -1740,6 +1752,7 @@ impl ChunkPoller {
 
         self.consecutive_failures = 0;
         self.fill_sealed_angles(&mut outcome);
+        self.warm_snapshot(&outcome);
         Ok(outcome)
     }
 
@@ -1785,6 +1798,43 @@ impl ChunkPoller {
                 .collect();
         }
         outcome.progress = progress;
+    }
+
+    /// Rebuild [`VolumeAssembler::snapshot`]'s cache inside the round that
+    /// sealed, so the frame thread does not pay the copy.
+    ///
+    /// A seal is exactly what clears that cache, and the first `snapshot()`
+    /// after the round returns is the frame thread's — the frontend reads one
+    /// when it applies the outcome and one per frame when it publishes base
+    /// volumes. Left cold, what lands on the paint path is a deep copy of
+    /// every sweep sealed so far, once per sealed cut, on whatever cadence the
+    /// coverage pattern sets. Built here, that copy runs inside the async
+    /// round and the frame thread's call is an `Arc` clone. The same move
+    /// [`Self::roll`] documents for a completed volume, extended to every
+    /// sealing round. The size and the cadence are both the volume's, and
+    /// neither has been measured on this path.
+    ///
+    /// Keyed on [`PollOutcome::sealed_elevations`] rather than run every
+    /// round, because a seal is the invalidation the frame thread would
+    /// otherwise pay for. It is not the only one — the first chunk to report
+    /// the site or the coverage pattern clears the cache too, and so does
+    /// [`VolumeAssembler::close`] abandoning a short cut — so this warms the
+    /// common case rather than guaranteeing a warm cache. Warming on every
+    /// round instead would build volumes for rounds nothing will render.
+    ///
+    /// On wasm the copy still runs on the page thread — the round is a
+    /// `spawn_local` future — so there this moves it out of the paint
+    /// callback, not off the thread. What would remove the copy rather than
+    /// move it is gate bytes that can be shared instead of cloned:
+    /// `nexrad_model::BinaryData` wraps a `Vec<u8>` rather than an
+    /// `Arc<[u8]>`, which is what makes `Sweep: Clone` a byte copy.
+    fn warm_snapshot(&mut self, outcome: &PollOutcome) {
+        if outcome.sealed_elevations.is_empty() {
+            return;
+        }
+        if let Some(current) = self.current.as_mut() {
+            let _ = current.snapshot();
+        }
     }
 
     /// One round: no sleeping, no looping, no self-scheduling.
@@ -1850,6 +1900,13 @@ impl ChunkPoller {
             }
         };
 
+        // Held rather than returned from inside the loop: a chunk earlier in
+        // the round may already have sealed a cut, and a seal is what clears
+        // the snapshot cache. Returning straight out left that rebuild to
+        // whoever asked next — the frame thread — so the round leaves by one
+        // exit that warms it, and a flaky network keeps the stall the happy
+        // path no longer has.
+        let mut failure: Option<ChunkError> = None;
         for id in self.select(&listed) {
             let bytes = match download_chunk(sources, &id).await {
                 Ok(bytes) => bytes,
@@ -1860,12 +1917,14 @@ impl ChunkPoller {
                     }
                     FetchDisposition::Abort => {
                         self.consecutive_failures += 1;
-                        return Err(ChunkError::Bucket(e));
+                        failure = Some(ChunkError::Bucket(e));
+                        break;
                     }
                 },
                 Err(e) => {
                     self.consecutive_failures += 1;
-                    return Err(e);
+                    failure = Some(e);
+                    break;
                 }
             };
             let Some(current) = self.current.as_mut() else {
@@ -1887,9 +1946,20 @@ impl ChunkPoller {
             }
         }
 
+        if let Some(e) = failure {
+            // Only the warm, not `fill_sealed_angles`: the outcome is dropped
+            // with the `Err`, so its angles and progress are unreachable, while
+            // the cache the seals invalidated is state on the assembler and
+            // outlives the round. `consecutive_failures` was already counted at
+            // the break.
+            self.warm_snapshot(&outcome);
+            return Err(e);
+        }
+
         self.consecutive_failures = 0;
         self.last_round_was_quiet = outcome.ingested == 0;
         self.fill_sealed_angles(&mut outcome);
+        self.warm_snapshot(&outcome);
         Ok(outcome)
     }
 }
