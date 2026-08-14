@@ -2882,17 +2882,42 @@ const DA_THRESH_SCALE: f64 = 1.4;
 ///   components `rawmin_bins` size-gates and some fall under it.
 /// - **Values**: 2449 gates, and **every one differs by a whole 2·Vny** — when
 ///   truncation moves a value it moves it by a fold, never by a little. 2431 of
-///   those are one VCP 31 long-pulse volume, 2269 of them on a single tilt
-///   where they are 2.17% of its painted bins; 38 of the 41 volumes change no
-///   value at all.
+///   those are one volume, `KLWX20250219_070024`, 2269 of them on a single tilt
+///   where they are 2.17% of its painted bins; **38 of the 41 volumes change no
+///   value at all**.
 /// - **Censoring**: 869 gates, including 16 whose own value is identical and
 ///   which the censor withdrew only because a neighbour moved.
 ///
-/// Raising it was measured and **refused**: the storm corpus pays +110% pass
-/// work to reach the fixed point, and the volume that would benefit is a
-/// clear-air VCP the corpus barely covers (`vcp31/` is empty). The single-site
-/// result wants replication before this constant moves. See
-/// `campaigns/nrot/dacap/` on branch `harness/nrot-dealias-cap`.
+/// **It is not the volume scan pattern.** The corpus swept here carries **10
+/// VCP 31 volumes across 8 sites and 51 tilts**; seven of those tilts truncate
+/// and **nine of the ten volumes change nothing**. KFTG and KLOT truncate at
+/// the same pattern and the same Nyquist and produce zero. The three volumes
+/// that do change anything sit in three *different* VCPs — 31, 215 and 212 —
+/// each one of many in its own (1 of 10, 1 of 4, 1 of 7).
+///
+/// **It is a site-day.** A control pair either side of the implicated volume —
+/// same site, same day, same 11.34 m/s — shows the regime, not the volume:
+///
+/// | KLWX 2025-02-19 | trunc | max passes | changed |
+/// | --- | --: | --: | --: |
+/// | `062130` (−39 min) | 3/5 | 16 | 0.020% |
+/// | `070024` | 3/5 | 69 | 0.582% |
+/// | `085715` (+2h57m) | 5/5 | **98** | 0.574% |
+///
+/// All three change; the two later ones at the same rate. So this is a
+/// condition that persists across a site-day and intensifies through it, not a
+/// property of one file and not of the pattern. **What that condition is, is
+/// unknown** — until it is named, nothing pattern-specific or site-specific
+/// should be designed against it.
+///
+/// Beware selecting by Nyquist alone: the `vny < 15` band of this corpus is 10
+/// VCP 31 volumes **plus one VCP 34**, a newer clear-air long-pulse pattern
+/// sharing the band. Low Nyquist does not identify a pattern.
+///
+/// Raising the cap was measured and **refused**: the storm corpus pays +110%
+/// pass work to reach the fixed point, and the volumes that would benefit are
+/// one unexplained site-day. See `campaigns/nrot/dacap/` on branch
+/// `harness/nrot-dealias-cap`.
 const DA_PASSES: i32 = 10;
 
 /// Raw-continuity flood-fill threshold as a Vny fraction. The aliased flood
