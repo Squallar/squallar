@@ -146,7 +146,46 @@ impl MercatorBounds {
         }
     }
 
+    /// Bring a longitude into this box's own 360° frame.
+    ///
+    /// The two sides of this comparison are written in different conventions
+    /// and always have been. Point data is folded into [-180, 180] on the way
+    /// in — GLM does it in `normalize_longitude`, because GOES-West's own
+    /// coordinate offsets run past the antimeridian. The viewport is
+    /// deliberately *not* folded: `OverlayCache::coverage` says so in as many
+    /// words, "longitude is not [clamped], because the map wraps and a texture
+    /// may legitimately straddle the antimeridian", so a view over the
+    /// dateline arrives as e.g. `-195..-165`.
+    ///
+    /// Compared raw, a flash the fold placed at +172 fails `lon > max_lon`
+    /// against a max of -165 and is dropped, and if it survived it would
+    /// project 12 texture-widths off the side. Measured on real granules: of
+    /// the 86 development-set flashes lying inside a 30° dateline viewport,
+    /// 76 (88.4%) were dropped; 1 of 3 on the holdout. Only GOES-West can see
+    /// this, so the GOES-East cases score a structural zero and say nothing.
+    ///
+    /// Returns a longitude in `[min_lon, min_lon + 360)`, so a caller that has
+    /// shifted no longer needs the `< min_lon` half of a range test.
+    #[inline]
+    pub(crate) fn wrap_lon(&self, lon: f64) -> f64 {
+        self.min_lon + (lon - self.min_lon).rem_euclid(360.0)
+    }
+
     /// To texture pixel coordinates.
+    ///
+    /// Longitude is mapped linearly, so a `lon` outside this box's own 360°
+    /// frame lands proportionally outside the texture and is culled by the
+    /// caller's pixel-window test. That is why callers whose data is folded
+    /// into [-180, 180] — currently only the GLM strike path — must put it
+    /// through [`Self::wrap_lon`] first, and why the other callers, which pass
+    /// longitudes in the same convention as the bounds, need not.
+    ///
+    /// The wrap is deliberately not applied here. It is identity only for
+    /// longitudes already inside `[min_lon, min_lon + 360)`; applying it to a
+    /// point west of `min_lon` moves that point to the far side of the frame,
+    /// which for a *polygon* vertex would redraw the shape rather than move it
+    /// off-screen. `project_polygon` and the point overlays are untested
+    /// against the dateline either way — see the T17 record.
     #[inline]
     pub(crate) fn project(&self, lat: f64, lon: f64, w: f32, h: f32) -> (f32, f32) {
         let lon_frac = (lon - self.min_lon) / (self.max_lon - self.min_lon);
@@ -752,11 +791,10 @@ pub fn rasterize_glm_strikes(
     let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(params.device_scale);
 
     for (i, flash) in flashes.iter().enumerate() {
-        if flash.lat < bounds.min_lat
-            || flash.lat > bounds.max_lat
-            || flash.lon < bounds.min_lon
-            || flash.lon > bounds.max_lon
-        {
+        // Into the viewport's frame before either test: the flash carries a
+        // folded longitude and `bounds` carries an unfolded one.
+        let lon = mb.wrap_lon(flash.lon);
+        if flash.lat < bounds.min_lat || flash.lat > bounds.max_lat || lon > bounds.max_lon {
             continue;
         }
 
@@ -765,7 +803,7 @@ pub fn rasterize_glm_strikes(
             continue;
         }
 
-        let (px, py) = mb.project(flash.lat, flash.lon, w, h);
+        let (px, py) = mb.project(flash.lat, lon, w, h);
         if px < -base_size || px > w + base_size || py < -base_size || py > h + base_size {
             continue;
         }
