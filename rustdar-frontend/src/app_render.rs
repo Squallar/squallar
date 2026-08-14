@@ -4938,9 +4938,10 @@ mod loop_interval_tests;
 #[cfg(test)]
 mod loop_level3_tests;
 
-/// What bounds the loop's cache of decoded volumes — the fourth holder of whole
-/// `Arc<Scan>`s, and the one nothing removed an entry from until
-/// `App::evict_unneeded_loop_scans`.
+/// What bounds the loop's two data caches: the decoded volumes — the fourth
+/// holder of whole `Arc<Scan>`s — and the paired Level III objects beside them.
+/// Neither had an entry removed from it by anything but a site switch until
+/// `App::evict_unneeded_loop_scans`, and one predicate now bounds both.
 #[path = "app_render/loop_scan_cache_tests.rs"]
 #[cfg(test)]
 mod loop_scan_cache_tests;

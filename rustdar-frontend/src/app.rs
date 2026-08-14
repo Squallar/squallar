@@ -2586,7 +2586,8 @@ impl App {
         self.evict_unneeded_loop_scans();
     }
 
-    /// Drop the loop cache's decoded volumes no live loop frame names.
+    /// Drop the loop caches' data no live loop frame names — the decoded Level
+    /// II volumes and the paired Level III objects alike.
     ///
     /// # The fourth holder of whole volumes, and the one nothing bounded
     ///
@@ -2600,6 +2601,19 @@ impl App {
     /// accumulated 0.4–1 GB an hour, unbounded — fatal inside wasm32's 4 GiB
     /// address space, and an OOM rather than a leak on a handheld.
     ///
+    /// # And the sibling that had the same shape
+    ///
+    /// `LoopDownloadManager::l3_cache` is the same defect on the other
+    /// datasource: one `Level3Product` per `(site, AWIPS code, volume start)`,
+    /// written by `cache_l3_product` for every frame of every Level III loop,
+    /// and taken out by nothing but the same `clear_all`. Each carries the
+    /// decoded message *and* the bytes it was decoded from, a few hundred
+    /// kilobytes rather than a volume's ~10 MB — smaller per entry, unbounded on
+    /// the same axis, and it grows on every re-listing: a product switch, a time
+    /// navigation, `reinit_active_loops`. It is swept here with the *same*
+    /// predicate object, so the two caches cannot come to disagree about which
+    /// frames still matter.
+    ///
     /// # Needs-based retention, not a window and not an LRU
     ///
     /// The retention set is the union of `(ls.site, frame.timestamp)` over every
@@ -2608,6 +2622,15 @@ impl App {
     /// [`Self::extract_loop_volume`] and a sibling's `own_sweep` — resolves
     /// through a loop frame's timestamp against the loop's own site. An entry
     /// no frame names is an entry nothing can ask for.
+    ///
+    /// The Level III readers are the same claim with a shorter list:
+    /// `l3_frame_state` and `l3_frame_products` are reached only through
+    /// `frame_data`, `frame_data_settled` and `frame_data_in_flight`, each of
+    /// which is asked with a loop frame's timestamp and `RenderTarget::site`,
+    /// which is `ls.site`. Nothing outside the loop path reads that cache at
+    /// all — the still image's Level III objects live in
+    /// `render_dispatch`'s own `level3_data`, keyed `(site, code)` with no
+    /// volume in it — so it needs no counterpart to the exception below.
     ///
     /// One reader does **not** resolve through a loop frame, and it is the one
     /// an enumeration of the loop path misses: `prepare_volume`'s third arm
@@ -2768,6 +2791,21 @@ impl App {
         // out to hold the last handle pays the deep free, and it is paid
         // off-frame only if every holder hands its own over.
         crate::offload::discard_each("evicted-loop-volume", self.loop_mgr.retain_scans(keep));
+        // **The other datasource's cache, by the same rule and the same
+        // predicate.** `l3_cache` had exactly the shape `scan_cache` had — one
+        // entry per frame per AWIPS code, written by `cache_l3_product` and
+        // removed by nothing but `clear_all` — and each entry carries a decoded
+        // `Level3Message` *and* the bytes it was decoded from. Smaller per entry
+        // than a volume and unbounded on the same axis, so a Level III loop that
+        // re-lists leaves its whole previous window behind, per code, for the
+        // life of the process.
+        //
+        // The predicate is passed unchanged, which is what makes the two caches
+        // answer one question. It judges `(site, volume start)` and never the
+        // code — see `LoopDownloadManager::retain_l3` for why that is the rule
+        // rather than a shortcut, and note that the frames a loop names do not
+        // move when its product does.
+        crate::offload::discard_each("evicted-loop-object", self.loop_mgr.retain_l3(keep));
     }
 
     /// Persist the config if it has changed and the interval has elapsed.
