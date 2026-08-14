@@ -31,7 +31,11 @@ fn the_native_transport_moves_a_request_rather_than_copying_it() {
     let bytes_at = archive.as_ptr();
 
     let (tx, rx) = mpsc::channel();
-    let handle = Handle { described: tx };
+    let (interactive, _keep_alive) = mpsc::channel();
+    let handle = Handle {
+        described: tx,
+        interactive,
+    };
     handle
         .send(
             17,
@@ -70,7 +74,11 @@ fn a_refusal_hands_the_request_back_whole() {
 
     let (tx, rx) = mpsc::channel::<(u64, JobRequest)>();
     drop(rx);
-    let handle = Handle { described: tx };
+    let (interactive, _keep_alive) = mpsc::channel();
+    let handle = Handle {
+        described: tx,
+        interactive,
+    };
 
     let refused = handle.send(
         1,

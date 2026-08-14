@@ -1,11 +1,14 @@
 //! Where a long-running, CPU-bound job runs.
 //!
-//! Four places in this crate hand a closure somewhere it will not stall the
-//! frame that created it: the static radar render, the loop-frame render, the
-//! overlay rasterization and the radar-sites rasterization. All four have the
-//! same shape — a `FnOnce` that ends by sending its result on an
+//! Four places in this crate used to hand a closure somewhere it would not
+//! stall the frame that created it: the static radar render, the loop-frame
+//! render, the overlay rasterization and the radar-sites rasterization. All
+//! four have the same shape — a `FnOnce` that ends by sending its result on an
 //! `mpsc::Sender` and calling `notify_redraw` — and all four had the same
-//! `std::thread::Builder` call written out inline.
+//! `std::thread::Builder` call written out inline. Three of the four are
+//! described jobs now, the sites raster most recently
+//! ([`JobRequest::Overlay`]); the handler-backed overlay rasterization is the
+//! closure that remains.
 //!
 //! They are funnelled through here so the wasm arm exists once.
 //!
@@ -64,7 +67,7 @@ pub use rustdar_radar::srv::SrvMotion;
 ///
 /// Running inline blocks the frame. For rasterization that is a visible stall,
 /// and [`offload_job`] is the answer for the paths that can describe their
-/// input. The two that cannot stay here:
+/// input. The one that cannot stays here:
 ///
 /// * `overlay-render` captures a `RasterizeFn` — a `Box<dyn FnOnce(..) -> ..>`
 ///   holding overlay handler state — and answers with a `HitMap` whose
@@ -72,9 +75,11 @@ pub use rustdar_radar::srv::SrvMotion;
 ///   closure nor a trait-object map crosses a message port. Making it portable
 ///   means returning a `u32` id image and rebuilding the map on this side, a
 ///   refactor of `rustdar-overlays` against a rasterizer that draws vector
-///   shapes rather than the 28 M projections the radar one does.
-/// * `sites-render` is portable — a `Vec<RadarSiteInfo>` in, a `Vec<u8>` out —
-///   and simply is not expensive enough yet to be worth a second job kind.
+///   shapes rather than the 28 M projections the radar one does. It is being
+///   dismantled kind by kind: `sites-render` was the first to leave — it is
+///   [`JobRequest::Overlay`] now — and the polygon kinds, the hit-map kinds
+///   and the model grid follow, at which point this arm's remaining caller
+///   count reaches zero and the inline path is deleted.
 ///
 /// Inline execution preserves the contract the callers actually depend on. Each
 /// `job` delivers through a channel that is drained on a later frame, so a send
@@ -487,6 +492,34 @@ pub enum JobRequest {
         input: Box<RenderInput>,
         request: VoxelRequest,
     },
+    /// Rasterize an overlay layer — the first kind of frame-following work to
+    /// leave [`offload`]'s opaque arm, which on the web runs closures **inline
+    /// on the browser's one thread** (a measured 224 ms against a 290 ms p50
+    /// gesture frame for the layer set that prompted this).
+    ///
+    /// The raster's geometry travels on this variant — one statement of the
+    /// texture's size and ground for every overlay kind — and everything a
+    /// particular kind's rasterizer reads beyond that travels in `input`,
+    /// whose variant *is* the kind. A separate kind field would be a second
+    /// statement of one fact, which is the disagreement
+    /// [`agree_on_product`] exists to refuse elsewhere.
+    ///
+    /// Only the sites render is described so far. The handler-backed kinds
+    /// still capture a `RasterizeFn` trait object and stay on [`offload`]'s
+    /// opaque arm — see that function's own note — until each gains a wire
+    /// form of its own.
+    Overlay {
+        /// Texture width in physical texels, from the pane's
+        /// `OverlayTexturePlan` — never re-derived on the far side.
+        width: u32,
+        /// Texture height. See `width`.
+        height: u32,
+        /// The ground the texture covers: the viewport plus overdraw, exactly
+        /// as `OverlayTexturePlan::coverage` answered it at the dispatch site.
+        bounds: rustdar_overlays::types::GeoBounds,
+        /// What the kind's rasterizer reads. See [`OverlayJobInput`].
+        input: OverlayJobInput,
+    },
     /// **Decode a downloaded Level II archive volume.**
     ///
     /// The one job here that does not rasterize anything, and the one whose
@@ -515,6 +548,26 @@ pub enum JobRequest {
     /// does not have to hand over its only copy, and so the enum's `Clone`
     /// costs a refcount rather than 16 MB.
     Decode { archive: std::sync::Arc<Vec<u8>> },
+}
+
+/// What one overlay kind's rasterizer reads, per kind — the payload of
+/// [`JobRequest::Overlay`].
+///
+/// Each variant carries **the rasterizer's own input type**, not a copy of its
+/// fields: the wire decodes back into the struct the direct call takes, so
+/// "described over a port" and "called on this thread" run the same function
+/// on the same value and byte-identity is a property of the type. See
+/// `rustdar_overlays::render::rasterize::SitesInput`, whose doc states the
+/// contract from the rasterizer's side.
+///
+/// One variant so far. The polygon kinds, the hit-map kinds and the model grid
+/// are next, in that order of difficulty; each lands here as a variant plus an
+/// [`OVERLAY_INPUT_SITES`]-style code, and until then those kinds stay on
+/// [`offload`]'s opaque arm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverlayJobInput {
+    /// The radar-site markers: catalogue rows plus the appearance inputs.
+    Sites(rustdar_overlays::render::rasterize::SitesInput),
 }
 
 /// What a job produces.
@@ -546,6 +599,18 @@ pub enum JobOutput {
     /// across the volumes this was measured on, which is an order of magnitude
     /// past the largest thing that had been in this enum.
     Volume(Box<rustdar_radar::scan::DecodedScan>),
+    /// An overlay raster — the answer to [`JobRequest::Overlay`]: the RGBA
+    /// texture, **always premultiplied** ([`execute`]'s overlay arm converts
+    /// any rasterizer that declares straight alpha), and nothing else.
+    ///
+    /// Deliberately a bare buffer with no width, height or framing, for the
+    /// reason [`RenderedFrame`] has no width: nothing on this port describes
+    /// its own shape. The dispatch site captured the texture's dimensions and
+    /// its `deliver` believes the buffer only if its length is exactly
+    /// `width × height × 4` of *those* values — a payload from another build,
+    /// or one tagged with the wrong kind, fails that arithmetic and reads as
+    /// "nothing to draw" rather than as a picture of the wrong shape.
+    OverlayRaster(Vec<u8>),
 }
 
 impl JobOutput {
@@ -558,7 +623,7 @@ impl JobOutput {
     pub fn frame(self) -> Option<RenderedFrame> {
         match self {
             Self::Frame(frame) => Some(frame),
-            Self::Section(_) | Self::Voxels(_) | Self::Volume(_) => None,
+            Self::Section(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster(_) => None,
         }
     }
 
@@ -566,7 +631,7 @@ impl JobOutput {
     pub fn section(self) -> Option<Box<CrossSection>> {
         match self {
             Self::Section(section) => Some(section),
-            Self::Frame(_) | Self::Voxels(_) | Self::Volume(_) => None,
+            Self::Frame(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster(_) => None,
         }
     }
 
@@ -574,7 +639,7 @@ impl JobOutput {
     pub fn voxels(self) -> Option<Box<VoxelGrid>> {
         match self {
             Self::Voxels(grid) => Some(grid),
-            Self::Frame(_) | Self::Section(_) | Self::Volume(_) => None,
+            Self::Frame(_) | Self::Section(_) | Self::Volume(_) | Self::OverlayRaster(_) => None,
         }
     }
 
@@ -587,7 +652,19 @@ impl JobOutput {
     pub fn volume(self) -> Option<Box<rustdar_radar::scan::DecodedScan>> {
         match self {
             Self::Volume(volume) => Some(volume),
-            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) => None,
+            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::OverlayRaster(_) => None,
+        }
+    }
+
+    /// The overlay raster, or `None` for an output of another kind.
+    ///
+    /// The narrow accessor the four above are, for the same reason — and the
+    /// buffer it answers is believed nowhere until its length is checked
+    /// against the dispatch's own dimensions; see [`JobOutput::OverlayRaster`].
+    pub fn overlay_raster(self) -> Option<Vec<u8>> {
+        match self {
+            Self::OverlayRaster(rgba) => Some(rgba),
+            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::Volume(_) => None,
         }
     }
 
@@ -618,6 +695,7 @@ impl JobOutput {
             Self::Section(_) => Some(OUT_KIND_SECTION),
             Self::Voxels(_) => Some(OUT_KIND_VOXELS),
             Self::Volume(_) => Some(OUT_KIND_VOLUME),
+            Self::OverlayRaster(_) => Some(OUT_KIND_OVERLAY),
         }
     }
 }
@@ -629,6 +707,17 @@ pub const OUT_KIND_SECTION: u8 = 2;
 pub const OUT_KIND_VOXELS: u8 = 3;
 /// A decoded Level II volume. The first code that never was a `RenderView`.
 pub const OUT_KIND_VOLUME: u8 = 4;
+/// An overlay raster: raw premultiplied RGBA, no framing of its own.
+///
+/// The one `OUT` payload without a magic to refuse the wrong bytes — raw
+/// pixels have no header to carry one. What stands in for the magic is the
+/// length check at the consumer ([`JobOutput::OverlayRaster`]): another kind's
+/// payload arriving under this code is believed only if it happens to be
+/// exactly `width × height × 4` bytes of the raster the dispatch asked for,
+/// and anything else is "nothing to draw". The protocol version beside the
+/// code (`rustdar-web`'s `PROTOCOL_VERSION`, bumped to 9 with it) is what
+/// keeps a worker that predates the fifth code from being attached at all.
+pub const OUT_KIND_OVERLAY: u8 = 5;
 
 /// What a rasterizing job produces: the RGBA texture, the half-width it was
 /// projected at, and the per-pixel value grid (`NAN` where no gate landed).
@@ -914,6 +1003,24 @@ impl JobRequest {
                 out.extend_from_slice(&input.to_bytes());
                 out
             }
+            Self::Overlay {
+                width,
+                height,
+                bounds,
+                input,
+            } => {
+                let mut out = vec![TAG_OVERLAY];
+                out.extend_from_slice(&width.to_le_bytes());
+                out.extend_from_slice(&height.to_le_bytes());
+                // The box in its declaration order, spelled here and in the
+                // decoder and nowhere else.
+                out.extend_from_slice(&bounds.min_lat.to_le_bytes());
+                out.extend_from_slice(&bounds.max_lat.to_le_bytes());
+                out.extend_from_slice(&bounds.min_lon.to_le_bytes());
+                out.extend_from_slice(&bounds.max_lon.to_le_bytes());
+                encode_overlay_input(&mut out, input);
+                out
+            }
             // The tag and then the archive, which takes the rest: an archive
             // volume has no framing this needs to know about, and a length
             // prefix would be a second statement of a length the buffer
@@ -989,6 +1096,45 @@ impl JobRequest {
             TAG_DECODE => Some(Self::Decode {
                 archive: std::sync::Arc::new(rest.to_vec()),
             }),
+            TAG_OVERLAY => {
+                let mut r = Reader::new(rest);
+                let width = r.u32()?;
+                let height = r.u32()?;
+                // Refused at the boundary for `decode_voxel_request`'s reason:
+                // these bytes arrive on a message port and the two numbers are
+                // what [`execute`]'s overlay arm allocates a `width × height`
+                // pixmap from, so without a ceiling a malformed job is a
+                // multi-gigabyte allocation rather than a refusal. The ceiling
+                // is the largest raster *any* target of this workspace
+                // affords — the desktop plan-view side, squared — which every
+                // real overlay plan sits under (a plan never exceeds the
+                // adapter's texture limit, and its pixel count is the viewport
+                // plus a quarter overdraw). A zero side is refused with it:
+                // the rasterizer would answer a zero-length buffer whose
+                // "success" no consumer could tell from a failure.
+                let ceiling = crate::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
+                let pixels = u64::from(width) * u64::from(height);
+                if width == 0 || height == 0 || pixels > ceiling * ceiling {
+                    return None;
+                }
+                let bounds = rustdar_overlays::types::GeoBounds {
+                    min_lat: r.f64()?,
+                    max_lat: r.f64()?,
+                    min_lon: r.f64()?,
+                    max_lon: r.f64()?,
+                };
+                let input = decode_overlay_input(&mut r)?;
+                // The site list is length-counted rather than "the rest", so
+                // unlike the archive arms nothing may follow it: trailing
+                // bytes mean the two builds' layouts disagree.
+                r.rest().is_empty().then_some(())?;
+                Some(Self::Overlay {
+                    width,
+                    height,
+                    bounds,
+                    input,
+                })
+            }
             _ => None,
         }
     }
@@ -1033,7 +1179,12 @@ impl JobRequest {
             | Self::Level3Pair {
                 side_ceiling_px, ..
             } => *side_ceiling_px as usize,
-            Self::Section { .. } | Self::Voxels { .. } | Self::Decode { .. } => 0,
+            // An overlay's raster is not ceiling-sized at all: the texture's
+            // exact dimensions are the request's own `width` and `height`.
+            Self::Section { .. }
+            | Self::Voxels { .. }
+            | Self::Decode { .. }
+            | Self::Overlay { .. } => 0,
         }
     }
 
@@ -1050,6 +1201,9 @@ impl JobRequest {
             Self::Section { .. } => "section",
             Self::Voxels { .. } => "voxels",
             Self::Decode { .. } => "decode",
+            Self::Overlay { input, .. } => match input {
+                OverlayJobInput::Sites(_) => "overlay/sites",
+            },
         }
     }
 }
@@ -1218,6 +1372,89 @@ const TAG_SECTION: u8 = 5;
 const TAG_VOXELS: u8 = 6;
 /// A Level II archive volume to decode. The one job that is not a render.
 const TAG_DECODE: u8 = 7;
+/// An overlay rasterization. The kind *within* the overlay is a second byte —
+/// [`OVERLAY_INPUT_SITES`] — inside the payload, so overlay kinds can be added
+/// without spending a job tag each.
+const TAG_OVERLAY: u8 = 8;
+
+/// [`OverlayJobInput::Sites`]'s code inside a [`TAG_OVERLAY`] payload.
+///
+/// Starts at 1, leaving 0 unallocated on this inner wire exactly as the outer
+/// tag space leaves it: a zeroed buffer must never decode.
+const OVERLAY_INPUT_SITES: u8 = 1;
+
+/// The variant's own bytes after [`JobRequest::Overlay`]'s fixed header:
+/// one input-kind byte, then the kind's fields.
+fn encode_overlay_input(out: &mut Vec<u8>, input: &OverlayJobInput) {
+    match input {
+        OverlayJobInput::Sites(sites) => {
+            out.push(OVERLAY_INPUT_SITES);
+            out.extend_from_slice(&sites.zoom.to_le_bytes());
+            out.push(u8::from(sites.is_dark));
+            out.extend_from_slice(&sites.device_scale.to_le_bytes());
+            // Count-prefixed, then each row; the name last per row, length-
+            // prefixed. A name is a catalogue identifier — four bytes for
+            // every WSR-88D — so the `u16` is generous; the truncation keeps
+            // the encoder total on input it will never see, and a cut that
+            // split a multi-byte character is refused by the decoder's UTF-8
+            // check rather than misread.
+            out.extend_from_slice(&(sites.sites.len() as u32).to_le_bytes());
+            for site in &sites.sites {
+                out.extend_from_slice(&site.lat.to_le_bytes());
+                out.extend_from_slice(&site.lon.to_le_bytes());
+                out.push(u8::from(site.is_current));
+                out.push(u8::from(site.is_loading));
+                let name = &site.name.as_bytes()[..site.name.len().min(usize::from(u16::MAX))];
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(name);
+            }
+        }
+    }
+}
+
+/// The inverse of [`encode_overlay_input`]. `None` for an input kind this
+/// build does not have, a flag byte outside `{0, 1}`, a name that is not
+/// UTF-8, or a buffer shorter than its own count claims.
+///
+/// The count is read but never trusted with an allocation: the rows are
+/// pushed as they decode, so a count claiming four billion sites fails on
+/// [`Reader::take`]'s first short read instead of reserving for a list the
+/// buffer cannot hold.
+fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
+    match r.u8()? {
+        OVERLAY_INPUT_SITES => {
+            let zoom = r.f64()?;
+            let is_dark = flag(r.u8()?)?;
+            let device_scale = r.f32()?;
+            let count = r.u32()? as usize;
+            let mut sites = Vec::new();
+            for _ in 0..count {
+                let lat = r.f64()?;
+                let lon = r.f64()?;
+                let is_current = flag(r.u8()?)?;
+                let is_loading = flag(r.u8()?)?;
+                let name_len = usize::from(r.u16()?);
+                let name = std::str::from_utf8(r.take(name_len)?).ok()?.to_owned();
+                sites.push(rustdar_overlays::render::rasterize::RadarSiteInfo {
+                    name,
+                    lat,
+                    lon,
+                    is_current,
+                    is_loading,
+                });
+            }
+            Some(OverlayJobInput::Sites(
+                rustdar_overlays::render::rasterize::SitesInput {
+                    sites,
+                    zoom,
+                    is_dark,
+                    device_scale,
+                },
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// A bounds-checked cursor over a job's fixed-width header.
 ///
@@ -1255,6 +1492,10 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -1328,6 +1569,11 @@ fn premultiplied(output: JobOutput) -> JobOutput {
         JobOutput::Voxels(grid) => JobOutput::Voxels(grid),
         // A decoded volume carries gate codes, not pixels.
         JobOutput::Volume(volume) => JobOutput::Volume(volume),
+        // Already premultiplied: [`execute`]'s overlay arm converted at the
+        // rasterizer's own declaration, which is the one place the declared
+        // `AlphaMode` is still in hand. Running the table again here would
+        // double-multiply every translucent pixel.
+        JobOutput::OverlayRaster(rgba) => JobOutput::OverlayRaster(rgba),
     }
 }
 
@@ -1501,6 +1747,45 @@ pub fn execute(request: &JobRequest) -> JobResult {
             )
             .map(|grid| JobOutput::Voxels(Box::new(grid)))
         }
+        JobRequest::Overlay {
+            width,
+            height,
+            bounds,
+            input,
+        } => {
+            let output = match input {
+                OverlayJobInput::Sites(sites) => {
+                    rustdar_overlays::render::rasterize::rasterize_radar_sites(
+                        sites, bounds, *width, *height,
+                    )
+                }
+            };
+            // The output contract is **premultiplied, always** — stated on
+            // [`JobOutput::OverlayRaster`] — where each rasterizer's own
+            // convention is whatever it declares. The sites rasterizer
+            // declares premultiplied on every path (tiny-skia's pixmap *is*
+            // premultiplied), so the arm below is dead for it today; it is
+            // written now because the model-grid rasterizer declares straight
+            // alpha and reaches this seam in a later slice, and a seam that
+            // silently dropped the declaration would ship it double-bright.
+            //
+            // The conversion is [`premultiply_raster`] — egui's own
+            // constructor per pixel, the exact call the frame-thread consumer
+            // used to make — so via-wire and direct bytes stay identical.
+            let mut rgba = output.rgba;
+            match output.alpha {
+                rustdar_overlays::render::rasterize::AlphaMode::Premultiplied => {}
+                rustdar_overlays::render::rasterize::AlphaMode::Straight => {
+                    premultiply_raster(&mut rgba)
+                }
+            }
+            // `output.hit_map` is dropped, correctly *for the kinds described
+            // so far*: the sites rasterizer answers `None` on every path. The
+            // hit-map kinds cannot take this arm until the id-image reply
+            // exists — that is the next-but-one slice, and their inputs are
+            // not describable here yet either.
+            Some(JobOutput::OverlayRaster(rgba))
+        }
     };
     // One place, after every arm, so no rasterizing arm can be added that
     // forgets it — the alternative is five call sites and a sixth that does not
@@ -1551,6 +1836,10 @@ pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
         }
         OUT_KIND_VOLUME => rustdar_radar::scan::DecodedScan::from_bytes(bytes)
             .map(|volume| JobOutput::Volume(Box::new(volume))),
+        // Raw RGBA: no codec to refuse it here, so acceptance is deferred to
+        // the dispatch's own length check — see [`OUT_KIND_OVERLAY`] for why
+        // that is the guard rather than a magic.
+        OUT_KIND_OVERLAY => Some(JobOutput::OverlayRaster(bytes.to_vec())),
         _ => {
             log::error!(
                 "a worker sent an out-of-band payload tagged {kind}, which this build has no decoder for"

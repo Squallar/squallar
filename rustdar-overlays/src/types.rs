@@ -87,7 +87,12 @@ pub enum HatchPattern {
 }
 
 /// Geographic bounding box for viewport culling.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` because the box rides inside
+/// `rustdar_frontend::offload::JobRequest`, whose wire round-trip tests compare
+/// whole requests; it is derived — four `f64` comparisons — and carries the
+/// usual `f64` caveat that `NaN != NaN`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeoBounds {
     pub min_lat: f64,
     pub max_lat: f64,

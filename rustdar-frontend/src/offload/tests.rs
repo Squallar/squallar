@@ -266,6 +266,43 @@ fn a_sourceless_voxel_job() -> JobRequest {
     }
 }
 
+/// The sites overlay job, on a fixture with real content: two markers inside
+/// the box — one of them current, so both fill colours draw — and one far
+/// outside it, so the cull path runs too. The dimensions are distinct and the
+/// box asymmetric, so a decoder that transposed width with height or a lat
+/// with a lon cannot round-trip.
+pub(super) fn an_overlay_sites_job() -> JobRequest {
+    let site = |name: &str, lat: f64, lon: f64, is_current: bool| {
+        rustdar_overlays::render::rasterize::RadarSiteInfo {
+            name: name.to_owned(),
+            lat,
+            lon,
+            is_current,
+            is_loading: false,
+        }
+    };
+    JobRequest::Overlay {
+        width: 96,
+        height: 64,
+        bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        input: OverlayJobInput::Sites(rustdar_overlays::render::rasterize::SitesInput {
+            sites: vec![
+                site("KTLX", 35.33, -97.28, true),
+                site("KVNX", 36.74, -98.13, false),
+                site("PGUA", 13.46, 144.81, false),
+            ],
+            zoom: 6.5,
+            is_dark: false,
+            device_scale: 1.0,
+        }),
+    }
+}
+
 /// The voxel job a pane whose viewport is **not square** posts.
 ///
 /// The two axes are two `f64`s on the wire, adjacent and same-typed, so an
@@ -299,6 +336,7 @@ fn every_job_kind_survives_the_wire_format() {
         a_voxel_job(),
         a_sourceless_voxel_job(),
         a_rectangular_voxel_job(),
+        an_overlay_sites_job(),
     ] {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),
@@ -336,7 +374,7 @@ fn the_retired_srm_tag_is_refused() {
 #[test]
 fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(&str, u8, u8); 7] = [
+    let table: [(&str, u8, u8); 8] = [
         ("TAG_RADAR", TAG_RADAR, 1),
         ("TAG_LEVEL3", TAG_LEVEL3, 2),
         ("TAG_SRM_RETIRED", TAG_SRM_RETIRED, 3),
@@ -344,6 +382,7 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
         ("TAG_SECTION", TAG_SECTION, 5),
         ("TAG_VOXELS", TAG_VOXELS, 6),
         ("TAG_DECODE", TAG_DECODE, 7),
+        ("TAG_OVERLAY", TAG_OVERLAY, 8),
     ];
     for (name, actual, expected) in table {
         assert_eq!(
@@ -355,13 +394,14 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // And the encoder really posts those bytes — the constant could be
     // right while the arm that writes it is not. Every constructible kind,
     // framed against its literal rather than against its own constant.
-    let framing: [(JobRequest, u8); 6] = [
+    let framing: [(JobRequest, u8); 7] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 4),
         (a_section_job(), 5),
         (a_voxel_job(), 6),
         (a_decode_job(), 7),
+        (an_overlay_sites_job(), 8),
     ];
     for (job, tag) in framing {
         let bytes = job.to_bytes();
@@ -383,12 +423,13 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     }
 
     // The unallocated bytes on either end of the table stay unallocated.
-    // An eighth kind added without a line in the table above makes 8
+    // A ninth kind added without a line in the table above makes 9
     // decode, and this is what says so. **7 left this list when the decode
-    // job took it**, which is the whole point of the list: a new kind cannot
-    // be added without coming here and saying so.
+    // job took it, and 8 when the overlay job did**, which is the whole point
+    // of the list: a new kind cannot be added without coming here and saying
+    // so.
     let mut bytes = a_voxel_job().to_bytes();
-    for unallocated in [0u8, 8] {
+    for unallocated in [0u8, 9] {
         bytes[0] = unallocated;
         assert_eq!(
             JobRequest::from_bytes(&bytes),
@@ -1127,6 +1168,11 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
         // separately, so the whole buffer is framing as far as this is
         // concerned.
         JobRequest::Level3 { .. } | JobRequest::Level3Pair { .. } | JobRequest::Decode { .. } => 0,
+        // Every byte is this codec's own: the geometry header and the sites
+        // rows are both written by `encode_overlay_input`'s file, with no
+        // nested payload carrying a pin of its own. The whole buffer is
+        // framing.
+        JobRequest::Overlay { .. } => 0,
     };
     bytes[..bytes.len() - nested].to_vec()
 }
@@ -1175,6 +1221,7 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         a_voxel_job(),
         a_sourceless_voxel_job(),
         a_decode_job(),
+        an_overlay_sites_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1199,10 +1246,11 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
             "voxels | 59 | 0x625ac8a3330ec11f",
             "voxels | 43 | 0xdbe9f7d560c79fd4",
             "decode | 30 | 0x2aad0634cde46e59",
+            "overlay/sites | 131 | 0xf24942f4dd119e16",
         ]
         .map(str::to_string),
         "the framing `JobRequest::to_bytes` writes is not the framing protocol \
-         version 8 shipped. Left is what this build posts; right is what this \
+         version 9 shipped. Left is what this build posts; right is what this \
          list was last told. Something about a request's layout moved — a \
          field added, removed, reordered, retyped, or written at a different \
          width, or a tag renumbered. This encoding carries no version of its \
@@ -1215,5 +1263,260 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
          worker will read the new bytes in the old order: a job framed one way \
          and read another renders the wrong region, or the wrong product, or \
          fails to decode and strands the pane that posted it."
+    );
+}
+
+// ── The overlay job ─────────────────────────────────────────────────────────
+
+/// **The parity gate for the sites render: direct call and via-wire execution
+/// are byte-identical.** This is what makes describing the job a move of the
+/// same work rather than a second implementation of it — the wire decodes back
+/// into the very struct the direct call takes
+/// (`rustdar_overlays::render::rasterize::SitesInput`), and both paths run the
+/// one rasterizer.
+///
+/// The fixture has real content and the test refuses to pass on an empty
+/// raster: two identical all-zero buffers would satisfy `assert_eq!` while
+/// proving only that nothing was drawn anywhere, so a positive painted-pixel
+/// floor comes first. Perturbing the encoder — a byte order swapped, a field
+/// dropped — fails this by name: the decoded input differs, the markers land
+/// elsewhere or not at all, and the byte comparison reports it.
+#[test]
+fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_sites_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Sites(sites) = input;
+
+    let direct =
+        rustdar_overlays::render::rasterize::rasterize_radar_sites(&sites, &bounds, width, height);
+    // The premise the via-wire contract ("always premultiplied") rides on for
+    // this kind: the direct path already answers premultiplied bytes, so the
+    // wire's conversion arm is a no-op and identity is exact.
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the sites rasterizer changed its alpha convention; the parity claim \
+         below is now comparing across a conversion",
+    );
+
+    let painted = direct.rgba.chunks_exact(4).filter(|px| px[3] != 0).count();
+    assert!(
+        painted > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+
+    let via_wire = execute_bytes(
+        &JobRequest::Overlay {
+            width,
+            height,
+            bounds,
+            input: OverlayJobInput::Sites(sites),
+        }
+        .to_bytes(),
+    )
+    .and_then(JobOutput::overlay_raster)
+    .expect("the described sites job rasterizes");
+
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the sites raster differs between the direct call and the wire — the \
+         two paths have stopped being one renderer",
+    );
+}
+
+/// The overlay reply's kind code and its raw round trip — plus the accessor
+/// narrowness every other output kind already pins.
+#[test]
+fn an_overlay_reply_travels_as_its_own_out_kind() {
+    let output = execute(&an_overlay_sites_job()).expect("the sites job draws");
+    assert_eq!(output.out_kind(), Some(OUT_KIND_OVERLAY));
+
+    // A frame consumer, a section consumer and a voxel consumer all see
+    // "nothing to draw" — never a wrong-shaped buffer.
+    assert!(
+        execute(&an_overlay_sites_job())
+            .and_then(JobOutput::frame)
+            .is_none()
+    );
+    assert!(
+        execute(&an_overlay_sites_job())
+            .and_then(JobOutput::section)
+            .is_none()
+    );
+    assert!(
+        execute(&an_overlay_sites_job())
+            .and_then(JobOutput::voxels)
+            .is_none()
+    );
+
+    // The raw payload round-trips through `decode_output` unchanged: there is
+    // no codec under code 5, deliberately — see `OUT_KIND_OVERLAY` — so what
+    // goes in is exactly what comes out, and acceptance is the dispatcher's
+    // length check rather than a magic.
+    let rgba = output.overlay_raster().expect("an overlay raster");
+    assert_eq!(
+        decode_output(OUT_KIND_OVERLAY, &rgba),
+        Some(JobOutput::OverlayRaster(rgba.clone())),
+    );
+    // And the accessor is as narrow as its four siblings.
+    assert!(
+        execute(&a_job())
+            .and_then(JobOutput::overlay_raster)
+            .is_none()
+    );
+}
+
+/// The overlay job's malformed shapes: every truncation, a trailing byte, a
+/// zero or absurd raster size, a flag outside `{0, 1}`, an input kind this
+/// build does not have, and a site name that is not UTF-8 — each a clean
+/// refusal, with a paired positive control proving the mutation landed where
+/// this test believes it did.
+#[test]
+fn a_malformed_overlay_job_is_refused_rather_than_misread() {
+    let job = an_overlay_sites_job();
+    let bytes = job.to_bytes();
+
+    // Control first: untouched bytes decode to the job itself, so every
+    // refusal below is the mutation's doing.
+    assert_eq!(JobRequest::from_bytes(&bytes), Some(job.clone()));
+
+    // The site list is count-prefixed and nothing follows it, so a cut
+    // anywhere is a refusal — including cuts that leave whole site rows.
+    for cut in 1..bytes.len() {
+        assert_eq!(
+            JobRequest::from_bytes(&bytes[..cut]),
+            None,
+            "the overlay job truncated to {cut} bytes was accepted",
+        );
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(
+        JobRequest::from_bytes(&trailing),
+        None,
+        "trailing bytes mean the two builds' layouts disagree",
+    );
+
+    // A zero side, and a size the raster ceiling refuses: without the bound,
+    // `execute` would allocate `width x height` pixels off a message port's
+    // say-so. `u32::MAX` squared also proves the pixel arithmetic is checked
+    // in a width that cannot wrap.
+    for (w, h, what) in [
+        (0u32, 64u32, "a zero width"),
+        (96, 0, "a zero height"),
+        (u32::MAX, u32::MAX, "an absurd raster"),
+        (
+            65_536,
+            65_536,
+            "one pixel past any ceiling this workspace affords",
+        ),
+    ] {
+        let mut sized = bytes.clone();
+        sized[1..5].copy_from_slice(&w.to_le_bytes());
+        sized[5..9].copy_from_slice(&h.to_le_bytes());
+        assert_eq!(JobRequest::from_bytes(&sized), None, "{what} was accepted");
+    }
+
+    // Offsets, stated once: tag(1) + width(4) + height(4) + bounds(32) = 41
+    // is the input kind byte; + 1 + zoom(8) = 50 is `is_dark`.
+    let mut bad_kind = bytes.clone();
+    bad_kind[41] = 0;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_kind),
+        None,
+        "input kind 0 must stay unallocated",
+    );
+    bad_kind[41] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_kind),
+        None,
+        "input kind 2 is a build this one is not",
+    );
+
+    let mut bad_flag = bytes.clone();
+    bad_flag[50] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_flag),
+        None,
+        "is_dark is a bool, not a byte",
+    );
+
+    // The first site's name: 50 + 1 + count(4) + lat(8) + lon(8) + two flags
+    // + name_len(2) = 79. Positive control first — a *different ASCII byte*
+    // still decodes, proving 79 really is inside the name — then a byte no
+    // UTF-8 string contains.
+    let mut renamed = bytes.clone();
+    renamed[79] = b'Q';
+    match JobRequest::from_bytes(&renamed) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Sites(sites),
+            ..
+        }) => assert_eq!(
+            sites.sites[0].name, "QTLX",
+            "byte 79 is not the first name byte; the refusal below would be \
+             about some other field",
+        ),
+        other => panic!("the renamed control failed to decode: {other:?}"),
+    }
+    let mut bad_name = bytes;
+    bad_name[79] = 0xFF;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_name),
+        None,
+        "a site name that is not UTF-8 was accepted",
+    );
+}
+
+/// On native, a described overlay job rides the pool's **interactive** lane —
+/// the one the overlay closures have always ridden — and a radar job rides the
+/// described lane, so an overlay can never queue behind a slate of radar
+/// renders. The two halves are one test because either alone proves nothing:
+/// every job on `rd-opaque` would pass the first, and every job on `rd-job`
+/// the second.
+///
+/// Asserted by the name of the thread `deliver` runs on, which is the pool's
+/// own statement of which lane executed the job.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_described_overlay_job_rides_the_interactive_lane() {
+    let _guard = install_test_worker(pool::sink());
+
+    let lane_of = |job: JobRequest| {
+        let (tx, rx) = mpsc::channel();
+        offload_job("test", Job::Described(job), move |_| {
+            let _ = tx.send(
+                std::thread::current()
+                    .name()
+                    .unwrap_or("<unnamed>")
+                    .to_owned(),
+            );
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the job delivers")
+    };
+
+    let overlay_lane = lane_of(an_overlay_sites_job());
+    assert!(
+        overlay_lane.starts_with("rd-opaque"),
+        "the sites job delivered on {overlay_lane}: it is queueing behind \
+         radar renders, which is the stall the lane split exists to prevent",
+    );
+    let radar_lane = lane_of(a_job());
+    assert!(
+        radar_lane.starts_with("rd-job"),
+        "the radar control delivered on {radar_lane}, so the routing is not \
+         by deadline and the assertion above proves nothing",
     );
 }

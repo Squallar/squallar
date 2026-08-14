@@ -393,12 +393,41 @@ pub fn rasterize_nws_alerts(
 }
 
 /// Deliberately not `rustdar_radar`'s site type: keeps this crate decoupled.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RadarSiteInfo {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
     pub is_current: bool,
     pub is_loading: bool,
+}
+
+/// Everything [`rasterize_radar_sites`] reads besides the raster's own
+/// geometry, as one struct: the site rows and the three appearance inputs.
+///
+/// This is the **wire form** of the sites render. The struct exists so that a
+/// job described over a message port and a direct call cannot come to take
+/// different inputs: `rustdar_frontend::offload` carries exactly this type in
+/// its `OverlayJobInput::Sites` variant, decodes back into it, and calls the
+/// same function the direct path calls — byte-identity between the two paths
+/// is a property of the type rather than of two argument lists kept in step.
+///
+/// The raster's own geometry — bounds, width, height — deliberately stays
+/// outside: those are shared by every overlay kind and travel once on the
+/// enclosing job, where one statement of them cannot disagree with another.
+///
+/// Derives what the job enum derives, for the reason [`GeoBounds`]'s
+/// `PartialEq` states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SitesInput {
+    pub sites: Vec<RadarSiteInfo>,
+    /// The *actual* zoom — the quantized cache key divided back out — because
+    /// the marker radius is a function of it.
+    pub zoom: f64,
+    pub is_dark: bool,
+    /// Physical texels per point, as the texture plan counted them. See the
+    /// `device_scale` note on [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
+    pub device_scale: f32,
 }
 
 /// [`RasterizeOutput`] and not a bare buffer, unlike its neighbours, because
@@ -408,14 +437,18 @@ pub struct RadarSiteInfo {
 /// convention on its behalf. Returning the mode with the bytes is what keeps
 /// that call site from having to know it.
 pub fn rasterize_radar_sites(
-    sites: &[RadarSiteInfo],
+    input: &SitesInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    zoom: f64,
-    is_dark: bool,
-    device_scale: f32,
 ) -> RasterizeOutput {
+    let SitesInput {
+        sites,
+        zoom,
+        is_dark,
+        device_scale,
+    } = input;
+    let (zoom, is_dark, device_scale) = (*zoom, *is_dark, *device_scale);
     let scale = sane_device_scale(device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(

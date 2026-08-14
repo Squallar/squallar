@@ -194,14 +194,19 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
     }
 }
 
-fn site_fixtures() -> Vec<RadarSiteInfo> {
-    vec![RadarSiteInfo {
-        name: "KTLX".into(),
-        lat: 35.0,
-        lon: -98.0,
-        is_current: false,
-        is_loading: false,
-    }]
+fn site_fixtures() -> rasterize::SitesInput {
+    rasterize::SitesInput {
+        sites: vec![RadarSiteInfo {
+            name: "KTLX".into(),
+            lat: 35.0,
+            lon: -98.0,
+            is_current: false,
+            is_loading: false,
+        }],
+        zoom: 7.0,
+        is_dark: false,
+        device_scale: 1.0,
+    }
 }
 
 /// Give `handler` the smallest data it will actually draw, and turn it on.
@@ -357,7 +362,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     // `RasterizeOutput` rather than a bare buffer.
     assert_alpha_matches_bytes(
         "rasterize_radar_sites",
-        &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H, 7.0, false, 1.0),
+        &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H),
     );
 }
 
@@ -380,7 +385,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     };
 
     assert_eq!(
-        rasterize_radar_sites(&site_fixtures(), &BOUNDS, 0, 0, 7.0, false, 1.0).alpha,
+        rasterize_radar_sites(&site_fixtures(), &BOUNDS, 0, 0).alpha,
         AlphaMode::Premultiplied,
     );
     assert_eq!(

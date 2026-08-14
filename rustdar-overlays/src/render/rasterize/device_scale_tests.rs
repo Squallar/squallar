@@ -13,7 +13,7 @@
 //! asserted against the bytes here, on a fixture where the *only* thing that
 //! differs between the two runs is the scale.
 
-use super::{RadarSiteInfo, rasterize_radar_sites};
+use super::{RadarSiteInfo, SitesInput, rasterize_radar_sites};
 use crate::types::GeoBounds;
 
 const BOUNDS: GeoBounds = GeoBounds {
@@ -23,14 +23,19 @@ const BOUNDS: GeoBounds = GeoBounds {
     max_lon: -97.0,
 };
 
-fn one_site() -> Vec<RadarSiteInfo> {
-    vec![RadarSiteInfo {
-        name: "KTLX".to_string(),
-        lat: 35.0,
-        lon: -98.0,
-        is_current: false,
-        is_loading: false,
-    }]
+fn one_site(device_scale: f32) -> SitesInput {
+    SitesInput {
+        sites: vec![RadarSiteInfo {
+            name: "KTLX".to_string(),
+            lat: 35.0,
+            lon: -98.0,
+            is_current: false,
+            is_loading: false,
+        }],
+        zoom: 8.0,
+        is_dark: false,
+        device_scale,
+    }
 }
 
 /// How many pixels the rasterizer actually painted.
@@ -59,8 +64,8 @@ fn a_denser_texture_draws_its_markers_at_the_same_size_on_screen() {
     const W: u32 = 256;
     const H: u32 = 256;
 
-    let at_1x = rasterize_radar_sites(&one_site(), &BOUNDS, W, H, 8.0, false, 1.0);
-    let at_2x = rasterize_radar_sites(&one_site(), &BOUNDS, W * 2, H * 2, 8.0, false, 2.0);
+    let at_1x = rasterize_radar_sites(&one_site(1.0), &BOUNDS, W, H);
+    let at_2x = rasterize_radar_sites(&one_site(2.0), &BOUNDS, W * 2, H * 2);
 
     let (one, two) = (painted(&at_1x.rgba), painted(&at_2x.rgba));
     assert!(one > 0, "the fixture must actually paint a marker");
@@ -86,7 +91,7 @@ fn an_unscaled_display_rasterizes_exactly_as_it_did_before() {
     const W: u32 = 256;
     const H: u32 = 256;
 
-    let plain = rasterize_radar_sites(&one_site(), &BOUNDS, W, H, 8.0, false, 1.0);
+    let plain = rasterize_radar_sites(&one_site(1.0), &BOUNDS, W, H);
     // Every value that is not a description of a display reads as unscaled,
     // rather than reaching a `Rect::from_xywh` that returns `None` or a radius
     // of zero — either of which is an overlay that silently stops painting.
@@ -96,7 +101,7 @@ fn an_unscaled_display_rasterizes_exactly_as_it_did_before() {
         (0.5, "a scale under one texel per point"),
         (f32::NAN, "a scale that is not a number"),
     ] {
-        let got = rasterize_radar_sites(&one_site(), &BOUNDS, W, H, 8.0, false, scale);
+        let got = rasterize_radar_sites(&one_site(scale), &BOUNDS, W, H);
         assert_eq!(got.rgba, plain.rgba, "{why} must rasterize as unscaled");
     }
 }

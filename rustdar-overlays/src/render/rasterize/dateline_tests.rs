@@ -260,7 +260,13 @@ fn stations_either_side_of_the_seam_all_draw() {
         is_loading: false,
     };
     let one = |s: RadarSiteInfo| {
-        painted(&rasterize_radar_sites(&[s], &view, TEX, TEX, 6.0, true, 1.0).rgba)
+        let input = super::SitesInput {
+            sites: vec![s],
+            zoom: 6.0,
+            is_dark: true,
+            device_scale: 1.0,
+        };
+        painted(&rasterize_radar_sites(&input, &view, TEX, TEX).rgba)
     };
 
     let guam = one(site("PGUA", 13.4558, 144.8111));
@@ -297,7 +303,20 @@ fn a_station_just_west_of_the_texture_keeps_its_slack() {
         is_current: false,
         is_loading: false,
     };
-    let n = painted(&rasterize_radar_sites(&[just_west], &view, TEX, TEX, 6.0, true, 1.0).rgba);
+    let n = painted(
+        &rasterize_radar_sites(
+            &super::SitesInput {
+                sites: vec![just_west],
+                zoom: 6.0,
+                is_dark: true,
+                device_scale: 1.0,
+            },
+            &view,
+            TEX,
+            TEX,
+        )
+        .rgba,
+    );
     assert!(
         n > 0,
         "a station 0.5 deg west of a 30 deg viewport is inside the 50-point slack \
