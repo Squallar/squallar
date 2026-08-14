@@ -936,6 +936,8 @@ fn outcome(
         level_failures: Vec::new(),
         evaluated_levels: Vec::new(),
         listing_failures: Vec::new(),
+        window_gaps: Vec::new(),
+        record_drops: crate::glm::RecordDrops::default(),
     })))
 }
 
@@ -955,6 +957,8 @@ fn level_outcome(
         level_failures,
         evaluated_levels,
         listing_failures: Vec::new(),
+        window_gaps: Vec::new(),
+        record_drops: crate::glm::RecordDrops::default(),
     })))
 }
 
@@ -1082,6 +1086,8 @@ fn half_listed_round() -> FetchPayload {
             GlmSatellite::GoesEast,
             crate::fetch_policy::FetchError::transient("GLM listing HTTP 503"),
         )],
+        window_gaps: Vec::new(),
+        record_drops: crate::glm::RecordDrops::default(),
     })))
 }
 
@@ -1197,6 +1203,8 @@ fn round(
         level_failures,
         evaluated_levels: Vec::new(),
         listing_failures: Vec::new(),
+        window_gaps: Vec::new(),
+        record_drops: crate::glm::RecordDrops::default(),
     })))
 }
 

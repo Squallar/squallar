@@ -11,7 +11,7 @@ use rustdar_radar::sources::DataSources;
 use super::cf;
 use super::{
     DeadFeed, FetchFailures, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel, GlmFetchOutcome, GlmFlash,
-    GlmSatellite, LevelFailure,
+    GlmSatellite, LevelFailure, RecordDrops, WindowGap,
 };
 use crate::fetch_policy::{FetchError, NotFound};
 
@@ -142,6 +142,7 @@ pub async fn fetch_glm_flashes(
     // List & download new files for each satellite
     let mut acc = PollAccumulator::default();
     let mut dead_feeds = Vec::new();
+    let mut window_gaps = Vec::new();
     let mut tally = PollTally::default();
 
     // One satellite's failure must not take the other's flashes with it. This
@@ -176,12 +177,27 @@ pub async fn fetch_glm_flashes(
         // Zero objects means the feed is gone (dead bucket, renamed path,
         // satellite rotated out of the slot), not a quiet sky: GOES-East
         // rendered nothing for over a year once `noaa-goes16` went dead.
-        // Objects present but no in-window flashes is normal and stays silent.
+        // Objects present but no in-window *flashes* is normal and stays silent.
+        //
+        // Objects present but no in-window *keys* is neither, and is the branch
+        // that had nowhere to go: the prefix is full, every object in it was
+        // rejected by the `.nc` suffix or the `_s` timestamp window, and this
+        // satellite contributes no granule at all while the round still returns
+        // `Ok` on a fresh clock. `else if` because the two are exclusive by
+        // construction — zero objects can only produce zero keys, and reporting
+        // an empty bucket twice would say the listing was healthy when it was
+        // the opposite. See [`WindowGap`] for the cadence measurement that says
+        // a healthy feed cannot reach this.
         if listing.objects_seen == 0 {
             dead_feeds.push(DeadFeed {
                 satellite: sat,
                 bucket: bucket.to_string(),
                 prefixes: listing.prefixes.clone(),
+            });
+        } else if listing.keys.is_empty() {
+            window_gaps.push(WindowGap {
+                satellite: sat,
+                objects_seen: listing.objects_seen,
             });
         }
 
@@ -237,6 +253,7 @@ pub async fn fetch_glm_flashes(
     Ok(build_outcome(
         filtered,
         dead_feeds,
+        window_gaps,
         queried,
         listing_failures,
         &tally,
@@ -284,6 +301,7 @@ fn flashes_in_window(
 fn build_outcome(
     flashes: Vec<GlmFlash>,
     dead_feeds: Vec<DeadFeed>,
+    window_gaps: Vec<WindowGap>,
     queried: Vec<GlmSatellite>,
     listing_failures: Vec<(GlmSatellite, FetchError)>,
     tally: &PollTally,
@@ -292,6 +310,8 @@ fn build_outcome(
     GlmFetchOutcome {
         flashes,
         dead_feeds,
+        window_gaps,
+        record_drops: acc.drops,
         queried,
         listing_failures,
         parse_failures: summarize_failures(tally.in_window, acc.parse_errors),
@@ -318,6 +338,10 @@ struct PollAccumulator {
     /// ~20 s granule cadence. Without this, "healthy again" and "did not look"
     /// are indistinguishable to the caller.
     evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
+    /// Summed across both satellites: the drop counts share one denominator
+    /// (records) and neither bird's is meaningful without the other's, because
+    /// the same product change reaches both.
+    drops: RecordDrops,
 }
 
 impl PollAccumulator {
@@ -326,6 +350,7 @@ impl PollAccumulator {
         self.parse_errors.extend(batch.parse_errors);
         self.transport_errors.extend(batch.transport_errors);
         self.level_failures.extend(batch.level_failures);
+        self.drops.absorb(batch.drops);
 
         // Evidence requires a granule that actually parsed: a batch where every
         // file failed says nothing about the levels inside them.
@@ -561,6 +586,10 @@ struct BatchOutcome {
     /// Levels that failed inside files that otherwise parsed, deduplicated per
     /// (satellite, level).
     level_failures: Vec<LevelFailure>,
+    /// Summed over every granule in the batch that parsed. **Not** deduplicated
+    /// like `level_failures`: a drop count is a quantity, and the same product
+    /// mismatch hitting twenty granules costs twenty granules' worth of records.
+    drops: RecordDrops,
 }
 
 /// Download and parse a batch of GLM NetCDF files concurrently. `bucket` is
@@ -620,10 +649,12 @@ impl BatchOutcome {
             parse_errors: Vec::new(),
             transport_errors: Vec::new(),
             level_failures: Vec::new(),
+            drops: RecordDrops::default(),
         };
         for result in results {
             match result {
                 Ok((key, parsed)) => {
+                    outcome.drops.absorb(parsed.drops);
                     // One batch is one satellite, but the satellite is compared
                     // anyway: it is part of `LevelFailure`'s identity and the
                     // accumulator merges across satellites.
@@ -812,6 +843,7 @@ fn parse_with_source<S: VarSource>(
 
     let mut all_records = Vec::new();
     let mut failures: Vec<LevelFailure> = Vec::new();
+    let mut drops = RecordDrops::default();
 
     for level in levels {
         let vars = match level {
@@ -822,7 +854,14 @@ fn parse_with_source<S: VarSource>(
         // One level failing must not take the others with it: the three are
         // independent variable sets, selected independently.
         match parse_level_records(file, vars, &time_origin, satellite) {
-            Ok(records) => all_records.extend(records),
+            Ok((records, level_drops)) => {
+                all_records.extend(records);
+                // Only levels that *parsed* contribute a denominator: a level
+                // that failed is a `LevelFailure` and its records were never
+                // looked at, so counting them here would inflate `considered`
+                // with rows nothing ever examined.
+                drops.absorb(level_drops);
+            }
             Err(e) => {
                 warn_once(
                     level_parse_key(satellite, vars.lat),
@@ -856,6 +895,7 @@ fn parse_with_source<S: VarSource>(
     Ok(GranuleParse {
         records: all_records,
         level_failures: failures,
+        drops,
     })
 }
 
@@ -866,6 +906,9 @@ pub(crate) struct GranuleParse {
     /// Empty in the overwhelmingly common case. Non-empty means some levels
     /// parsed and others did not — see [`LevelFailure`].
     pub level_failures: Vec<LevelFailure>,
+    /// Records the levels that *did* parse handed over and the parser refused
+    /// to place. Zero on every granule measured; see [`RecordDrops`].
+    pub drops: RecordDrops,
 }
 
 /// Unit spellings accepted for `*_area`, mapped to the multiplier that turns
@@ -897,12 +940,17 @@ const ENERGY_UNITS: &[(&str, f64)] = &[("j", 1.0), ("joule", 1.0), ("joules", 1.
 /// Every variable goes through CF unpacking (see [`super::cf`]): most GLM
 /// variables are `_Unsigned` packed shorts and reading them raw yields
 /// meaningless numbers.
+/// Returns the records that survived *and* what it threw away getting there:
+/// the two drop predicates below are the only place a record the product
+/// delivered leaves the pipeline, and until this returned [`RecordDrops`] the
+/// count reached a `log::warn!` and stopped. See [`RecordDrops`] for why a log
+/// line is not enough.
 fn parse_level_records<S: VarSource>(
     file: &S,
     vars: &LevelVars,
     time_origin: &chrono::NaiveDateTime,
     satellite: GlmSatellite,
-) -> Result<Vec<GlmFlash>, String> {
+) -> Result<(Vec<GlmFlash>, RecordDrops), String> {
     // Required *columns*: absence is a schema change and fails the level. An
     // absent *value* is a different condition and arrives quietly as `None`
     // inside `UnpackedVar::values`.
@@ -987,8 +1035,10 @@ fn parse_level_records<S: VarSource>(
     );
 
     let mut records = Vec::with_capacity(count);
-    let mut missing = 0usize;
-    let mut off_globe = 0usize;
+    let mut drops = RecordDrops {
+        considered: count,
+        ..RecordDrops::default()
+    };
 
     for i in 0..count {
         // A `_FillValue` in any field that places a strike in space and time
@@ -996,7 +1046,7 @@ fn parse_level_records<S: VarSource>(
         let (Some(lat), Some(lon), Some(offset)) =
             (lats.values[i], lons.values[i], times.values[i])
         else {
-            missing += 1;
+            drops.fill_values += 1;
             continue;
         };
 
@@ -1006,7 +1056,7 @@ fn parse_level_records<S: VarSource>(
         // guards latitude only: the wrap above can carry a mis-unpacked
         // longitude back into the valid interval.
         if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-            off_globe += 1;
+            drops.off_globe += 1;
             continue;
         }
 
@@ -1041,16 +1091,18 @@ fn parse_level_records<S: VarSource>(
         });
     }
 
-    if missing > 0 || off_globe > 0 {
+    if drops.dropped() > 0 {
         log::warn!(
-            "GLM {} {}: dropped {missing} record(s) with fill values and {off_globe} with \
+            "GLM {} {}: dropped {} record(s) with fill values and {} with \
              out-of-range coordinates (of {count})",
             satellite.display_name(),
             vars.level.display_name(),
+            drops.fill_values,
+            drops.off_globe,
         );
     }
 
-    Ok(records)
+    Ok((records, drops))
 }
 
 /// Report a variable the product was expected to have but does not, once per

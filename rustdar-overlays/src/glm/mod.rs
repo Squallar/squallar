@@ -121,6 +121,91 @@ pub struct DeadFeed {
     pub prefixes: Vec<String>,
 }
 
+/// A satellite whose listing answered with objects, none of which is a granule
+/// covering the requested window.
+///
+/// The fourth listing shape, and the one that had nowhere to go. [`DeadFeed`] is
+/// "the prefix is empty"; this is "the prefix is full and none of it is ours" —
+/// a `.nc` suffix that stopped matching, an `_s` timestamp that stopped parsing,
+/// or publishing that stopped for longer than the window. All three end the poll
+/// with `Ok`, a fresh clock, and this feed contributing nothing.
+///
+/// # Why this is never a quiet sky
+///
+/// GLM publishes a granule every 20 s whether or not anything flashed — an empty
+/// granule is still a granule, which is why [`fetch::GlmCache`] stores a
+/// granule's own start time rather than deriving it from its records. So a quiet
+/// sky is *keys present, granules parsed, zero flashes*, and it stays silent.
+/// Zero **keys** is a different claim: it says nothing covering the window was
+/// published, so the layer is empty for want of data rather than for want of
+/// lightning, and the two are not interchangeable to anyone reading the map.
+///
+/// Measured over 24 hour-prefixes on both live buckets, spanning two years, four
+/// seasons, all times of day and a 3.4x range of flash activity: 4313 granules,
+/// inter-granule gap 20.0 s in 4285 of 4289 cases and 40.0 s in the other four,
+/// **never above 40.0 s**. [`GLM_MIN_TIME_WINDOW_SECS`] is 60 s, so on a healthy
+/// feed the window always covers at least one granule and this condition cannot
+/// arise. That margin is what makes the report actionable rather than noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowGap {
+    pub satellite: GlmSatellite,
+    /// Objects the queried prefixes did hold, none of them an in-window granule.
+    /// Carried so the report can say the listing itself was healthy.
+    pub objects_seen: usize,
+}
+
+/// Records a granule delivered that the parser refused to place, against the
+/// number it looked at.
+///
+/// # Its own denominator
+///
+/// `considered` is **records**, and it is carried rather than inferred because
+/// every other count in a GLM round is granules or satellite feeds. Pooling a
+/// record count into `parts_resolved` would divide records by granules and read
+/// as a coverage figure. See [`DataCompleteness`](crate::fetch_policy::DataCompleteness).
+///
+/// # Why this is reported at all, at a measured rate of zero
+///
+/// Measured over 105 granules from 7 cases across both satellites, two years and
+/// a 3.4x activity range: **0 drops in 1584507 records** (315 level-instances),
+/// and 0 in 76003 on a held-out eighth case. Both counters were proven able to
+/// fire on that same corpus before the zero was believed.
+///
+/// It is reported because of what a non-zero means. The drops are not a property
+/// of the weather - they are a disagreement between the product and this reader,
+/// and when one appears it applies to every granule at once. `normalize_longitude`
+/// is the worked example: GOES-West stores longitude unwrapped past the
+/// antimeridian, the range check below rejected it, and that quietly deleted 60
+/// of 3228 events per granule until somebody read the code. Nothing on screen
+/// moved. At a zero baseline this costs nothing on healthy data and turns the
+/// next such mismatch into a number the user can see.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecordDrops {
+    /// Records the drop predicates were applied to - every entry in the level
+    /// dimensions of the granules this poll parsed.
+    pub considered: usize,
+    /// Dropped for a `_FillValue` in latitude, longitude or time: the product
+    /// declined to place the record, so there is nothing to draw.
+    pub fill_values: usize,
+    /// Dropped for a coordinate that is not on the globe after unwrapping. A
+    /// product change or an unpacking mismatch, never a weather condition.
+    pub off_globe: usize,
+}
+
+impl RecordDrops {
+    /// Records looked at and thrown away.
+    pub fn dropped(&self) -> usize {
+        self.fill_values + self.off_globe
+    }
+
+    /// Fold another level's or granule's tally in.
+    pub(crate) fn absorb(&mut self, other: RecordDrops) {
+        self.considered += other.considered;
+        self.fill_values += other.fill_values;
+        self.off_globe += other.off_globe;
+    }
+}
+
 /// Shortest lightning aggregation window the UI allows, in seconds.
 ///
 /// Must stay above the S3 publish latency of the hour's first granule (27–30 s
@@ -183,6 +268,14 @@ pub struct LevelFailure {
 /// What one GLM fetch produced.
 pub struct GlmFetchOutcome {
     pub flashes: Vec<GlmFlash>,
+    /// Enabled satellites whose listing answered with objects but placed no
+    /// granule in the window. See [`WindowGap`] for why this is never a quiet
+    /// sky, and why it needs a report of its own rather than sharing
+    /// `dead_feeds`: the two have opposite listings and opposite causes.
+    pub window_gaps: Vec<WindowGap>,
+    /// Records the granules this poll parsed handed over and the parser refused
+    /// to place. See [`RecordDrops`].
+    pub record_drops: RecordDrops,
     /// Enabled satellites whose listing returned zero objects this poll.
     ///
     /// Reported rather than logged here so the handler can edge-trigger the
