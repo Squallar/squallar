@@ -1075,3 +1075,145 @@ fn every_storm_motion_rung_has_a_stable_distinct_wire_code() {
     assert_eq!(StormMotionWire::from_wire_code(4), None);
     assert_eq!(StormMotionWire::from_wire_code(u8::MAX), None);
 }
+
+// ── The job framing's layout ────────────────────────────────────────────────
+
+/// FNV-1a 64 over a payload, for [`the_job_framing_is_the_one_this_protocol_ships`].
+///
+/// A copy of `rustdar_radar::wire::layout_digest` rather than a call to it: that
+/// one is `#[cfg(test)] pub(crate)`, so it does not exist outside its own crate,
+/// and making it public would ship test-only code in the library to save six
+/// lines. Copying a *hash* costs nothing — the thing that must not be duplicated
+/// is an encoder, because a second encoder has to be kept in step; a second
+/// FNV-1a either agrees with the first or is obviously broken.
+fn layout_digest(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The part of a request's bytes this file owns: everything before the nested
+/// [`RenderInput`], which has a pin of its own.
+///
+/// Three of the six variants put a `RenderInput` last, and its bytes are
+/// already pinned by `rustdar_radar`'s
+/// `render_input::tests::the_wire_layout_is_the_one_this_version_ships`.
+/// Digesting them again here would say nothing new and would make this test
+/// fail for a `RenderInput` change that the other pin has already reported —
+/// two red tests for one edit, one of which names the wrong file. Worse, the
+/// `RenderInput` these fixtures carry comes out of `RenderInput::extract`,
+/// which walks the beam geometry, so its bytes are whatever the platform's
+/// libm said and a digest over them would go red on a target nobody changed.
+///
+/// **The denominator, stated:** what follows is a pin on the *framing* — the
+/// tag byte and the request's own fields — and on nothing else. The nested
+/// payload's length still moves this test's `len` column if the framing's own
+/// size changes, because the framing is measured as a prefix of the whole.
+///
+/// The match is exhaustive on purpose: a seventh job kind cannot reach the wire
+/// without someone deciding here whether it nests a payload with a pin of its
+/// own.
+fn framing_of(request: &JobRequest) -> Vec<u8> {
+    let bytes = request.to_bytes();
+    let nested = match request {
+        JobRequest::Radar { input, .. }
+        | JobRequest::Section { input, .. }
+        | JobRequest::Voxels { input, .. } => input.to_bytes().len(),
+        // Opaque payloads: an archive or a Level III object, which this codec
+        // frames and never interprets. There is nothing under them to pin
+        // separately, so the whole buffer is framing as far as this is
+        // concerned.
+        JobRequest::Level3 { .. } | JobRequest::Level3Pair { .. } | JobRequest::Decode { .. } => 0,
+    };
+    bytes[..bytes.len() - nested].to_vec()
+}
+
+/// The framing this protocol version ships is **this** framing.
+///
+/// # What was blind, exactly
+///
+/// This encoding has no version and no magic — one tag byte and then the
+/// variant's own fields. The number that governs it is `rustdar_web`'s
+/// `PROTOCOL_VERSION`, through `build_token`, and the two guards standing over
+/// that number both watch the *reply* direction: one asserts the literal in the
+/// source (which fires only for the person who raises it), the other scrapes
+/// the field names of a `done` message. `pwa_assets.rs` says so itself, in as
+/// many words — "What this does not cover: the page->worker `job` direction".
+/// This is that direction.
+///
+/// [`a_job_kind_that_moved_on_the_wire_is_a_job_another_build_misreads`] pins
+/// the six tag bytes, which is the first byte of each of these. Everything
+/// after it — the two `f64` coordinates, the `u32` ceiling, the section's four
+/// corners and its optional top, the voxel request's tagged half-extent and its
+/// three axes — was unpinned, and every round-trip test in this file is written
+/// against `to_bytes` and `from_bytes` together, so a same-width reorder made to
+/// both in step passes all of them.
+///
+/// # A list and not one digest
+///
+/// Six rows rather than one hash of all of them, so the failure names the
+/// variant. The diff then reads `- "voxels | 47 | 0x..."` beside the row that
+/// moved, which is the sentence the author needs; a single number would say
+/// only that something, somewhere, is different.
+///
+/// # What this cannot check
+///
+/// That `PROTOCOL_VERSION` was bumped. It is `#[cfg(target_arch = "wasm32")]`
+/// in `rustdar-web`, which depends on this crate, so nothing here can name it.
+/// What this can do is fail for the person who changes the framing, and say
+/// what they owe.
+#[test]
+fn the_job_framing_is_the_one_this_protocol_ships() {
+    let requests = [
+        a_job(),
+        a_level3_job(),
+        a_level3_pair_job(),
+        a_section_job(),
+        a_voxel_job(),
+        a_sourceless_voxel_job(),
+        a_decode_job(),
+    ];
+    let rows: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            let framing = framing_of(request);
+            format!(
+                "{} | {} | {:#018x}",
+                request.kind(),
+                framing.len(),
+                layout_digest(&framing),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        [
+            "radar | 6 | 0x7d65cbf16a7b2ab7",
+            "level3 | 28 | 0xff9d9dbb7736ea4e",
+            "level3/vild | 34 | 0x4f9fb6a0901a3704",
+            "section | 44 | 0x4fe286e53034800e",
+            "voxels | 59 | 0x625ac8a3330ec11f",
+            "voxels | 43 | 0xdbe9f7d560c79fd4",
+            "decode | 30 | 0x2aad0634cde46e59",
+        ]
+        .map(str::to_string),
+        "the framing `JobRequest::to_bytes` writes is not the framing protocol \
+         version 8 shipped. Left is what this build posts; right is what this \
+         list was last told. Something about a request's layout moved — a \
+         field added, removed, reordered, retyped, or written at a different \
+         width, or a tag renumbered. This encoding carries no version of its \
+         own: the number that governs it is `PROTOCOL_VERSION` in \
+         `rustdar-web/src/worker_protocol.rs`, folded into `build_token`. If \
+         the change was deliberate, bump it there FIRST and then re-pin the \
+         row here, in that order and never the numbers alone. A page and a \
+         worker on opposite sides of a deploy share a build token whenever \
+         `GITHUB_SHA` is absent (which it always is outside CI), and the \
+         worker will read the new bytes in the old order: a job framed one way \
+         and read another renders the wrong region, or the wrong product, or \
+         fails to decode and strands the pane that posted it."
+    );
+}

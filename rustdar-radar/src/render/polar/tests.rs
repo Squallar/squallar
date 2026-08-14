@@ -263,3 +263,144 @@ fn a_message_this_build_did_not_write_is_declined_rather_than_indexed_into() {
     lying[12..16].copy_from_slice(&3u32.to_le_bytes());
     assert!(PolarField::from_bytes(&lying).is_none());
 }
+
+/// A field assembled by hand, for
+/// [`the_polar_wire_layout_is_the_one_this_protocol_ships`].
+///
+/// Every number here is a literal and exactly representable, so the encoding is
+/// the same bytes on every target: nothing in this fixture is computed, so
+/// nothing in it can move with a libm. [`ring`] cannot serve — its azimuths
+/// come out of a division and its values out of an arithmetic walk, and while
+/// both happen to be exact today, a fixture whose numbers are *derived* is one
+/// whose digest is a claim about the derivation as well as about the layout.
+///
+/// Written as a struct literal with no `..`, and reaching past
+/// [`PolarGeometry::from_parts`] to the private fields, for two reasons that
+/// are both about what the pin can see:
+///
+///   * **`from_parts` sets `reach_gates` equal to `gates`.** Those are two
+///     separate `u32`s side by side in the header, and a fixture where they
+///     hold the same number cannot tell a swap of the two apart from no change
+///     at all — the pin would pass for the wrong reason, which is the failure
+///     mode a digest is easiest to build wrong into. Here `gates` is 4 and
+///     `reach_gates` is 2.
+///   * **A new field on either struct makes this fail to compile**, so a field
+///     that joins the type and is then written by `to_bytes` cannot reach the
+///     wire without someone having already been stopped once.
+///
+/// All four header counts are distinct (3, 4, 2, 12) and all three header
+/// `f64`s are distinct (0.125, 0.25, 0.5), so any reorder within either width
+/// class moves the bytes. The six wedge `f32`s are likewise pairwise distinct,
+/// so a swap of a wedge's azimuth and half-width is visible too.
+fn layout_fixture() -> PolarField {
+    PolarField {
+        geometry: PolarGeometry {
+            wedges: vec![
+                Wedge {
+                    azimuth_deg: 1.5,
+                    half_width_deg: 0.25,
+                },
+                Wedge {
+                    azimuth_deg: 90.25,
+                    half_width_deg: 0.75,
+                },
+                Wedge {
+                    azimuth_deg: 180.5,
+                    half_width_deg: 1.125,
+                },
+            ],
+            first_gate_slant_km: 0.125,
+            gate_interval_slant_km: 0.25,
+            elevation_deg: Some(0.5),
+            gates: 4,
+            reach_gates: 2,
+        },
+        // `radials * gates`, which is what `from_bytes` insists on, carrying
+        // both of the two states the renderer puts on this wire beside ordinary
+        // numbers: `NaN` for a gate it painted nothing at, and the range-folded
+        // sentinel for one it painted the folded colour at.
+        values: vec![
+            0.0,
+            -1.5,
+            2.25,
+            f32::NAN,
+            0.5,
+            -0.75,
+            super::super::RANGE_FOLDED_SENTINEL,
+            3.125,
+            -16.0,
+            32.5,
+            64.75,
+            -128.25,
+        ],
+    }
+}
+
+/// The bytes this protocol version ships are **these** bytes.
+///
+/// # What was blind, exactly
+///
+/// This encoding has no version of its own. The number that governs it is
+/// `rustdar_web`'s `PROTOCOL_VERSION`, which rides in `build_token` and is what
+/// a page and a worker from opposite sides of a deploy actually compare — and
+/// the two guards standing over that number are both blind here:
+///
+///   * `the_worker_protocol_version_is_the_one_these_shapes_ship` asserts the
+///     literal `PROTOCOL_VERSION` in the source. It is our value compared
+///     against our value, so it fires for exactly one person: the one who
+///     *raises* the number. Raising it is the safe act.
+///   * `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
+///     scrapes the reply's **field names**. These bytes travel inside one of
+///     those fields (`polar`), so the field set is identical either side of a
+///     change here and that guard cannot see one.
+///
+/// Measured, not argued: `PROTOCOL_VERSION` went 7 -> 8 when this header grew
+/// an `f64` (the elevation) and restated its two ranges as slant rather than
+/// ground, and **neither guard fired**. The bump was made by hand, and the
+/// second guard's own doc records the gap. A buffer-valued field was where the
+/// author was entirely on their own; this is the instrument that ends that.
+///
+/// # What this fails for
+///
+/// The encoder's own output, over a fixture nothing computes, compared with the
+/// bytes recorded when the protocol version was last set. Any change to what
+/// `to_bytes` writes — a field added, removed, reordered, retyped, or written
+/// at a different width or endianness — moves the length or the digest, and the
+/// only way past it is to write the new numbers down. That is where the bump
+/// obligation is met.
+///
+/// # What it still cannot do
+///
+/// It cannot check that `PROTOCOL_VERSION` *was* bumped: that constant is
+/// `#[cfg(target_arch = "wasm32")]` in a crate that depends on this one, so
+/// nothing here can name it and a dependency the other way would be an
+/// inversion. What it can do is fail for the person who changes the layout, and
+/// say in the message what they owe. That is the direction that was missing.
+///
+/// A digest is opaque about *what* moved, deliberately: the two assertions are
+/// one tuple so the failure reads as one fact, and what to do about it does not
+/// depend on which field it was.
+#[test]
+fn the_polar_wire_layout_is_the_one_this_protocol_ships() {
+    let bytes = layout_fixture().to_bytes();
+    assert_eq!(
+        (bytes.len(), crate::wire::layout_digest(&bytes)),
+        (112, 0x986a_92ef_b56e_c209),
+        "the bytes `PolarField::to_bytes` writes are not the bytes protocol \
+         version 8 shipped. Something about this payload's layout moved — a \
+         field added, removed, reordered, retyped, or written at a different \
+         width. This encoding carries no version of its own: the number that \
+         governs it is `PROTOCOL_VERSION` in \
+         `rustdar-web/src/worker_protocol.rs`, and nothing else in the \
+         workspace can see a change to these bytes — the reply-shape guard \
+         watches field names and these travel inside one of them. If the \
+         change was deliberate, bump `PROTOCOL_VERSION` there FIRST and then \
+         re-pin the length and digest here, in that order and never the \
+         numbers alone. A page and a worker on opposite sides of a deploy \
+         share a build token whenever `GITHUB_SHA` is absent (which it always \
+         is outside CI), and they will hand each other a buffer they lay out \
+         differently: `from_bytes`'s length checks turn most such pairs into \
+         `None` and a readout that goes quiet, which is the silent degradation \
+         the version number exists to convert into a clean termination.",
+    );
+}
