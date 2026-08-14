@@ -144,6 +144,63 @@ pub struct GateAt {
     pub gate: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Gate values read out of a picture on this thread since
+    /// [`take_gate_reads`] last took the tally.
+    ///
+    /// `#[cfg(test)]` and nothing else, so no build that ships pays a `Cell`
+    /// bump for a readout. It exists so that [`crate::hover`]'s
+    /// `the_hover_lookup_does_not_walk_the_gates` can state its property as a
+    /// count of gates read — the same integer on every machine under every
+    /// load — rather than as a ratio of two `Instant`s, which on a contended
+    /// box is a reading of the rest of the machine.
+    ///
+    /// Thread-local rather than a `static`: the suite runs its tests in
+    /// parallel threads of one process, and a readout runs start to finish on
+    /// the thread that asked for it.
+    static GATE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Note the gates an access actually read.
+///
+/// **`n` is computed from the span the caller took. It is never written as a
+/// literal.** A literal is a claim about the code rather than a measurement of
+/// it, and the first version of this counter was exactly that: it said `1` at a
+/// call site that decoded every gate up to the one asked for, so the guard read
+/// 64 while the readout read 6,477, and the test went green over the defect it
+/// was written to catch. The `.len()` at each site is the whole difference
+/// between a count and an assertion.
+///
+/// The two accessors the **readout** reaches a gate through are the callers:
+/// [`PolarField::at`] for a render that kept its numbers, and
+/// [`crate::render::moment_value_at`] for one reading back out of the volume.
+/// This is not every gate access in the crate — the fills walk whole radials on
+/// purpose and are no business of this counter.
+///
+/// `moment_value_at` is also the sampler's primitive, so this tallies
+/// `gate_sample` too, and in a test build the sampler pays a `Cell` bump per
+/// gate. That does not reach the hover test: the tally is thread-local, the
+/// suite gives each test its own thread, and the readout runs start to finish
+/// on the thread that drained it. A future test that sampled and hovered on one
+/// thread would have to drain between the two.
+///
+/// A reader that bypasses both accessors counts nothing, and the hover test's
+/// equality fails on the shortfall rather than passing on a zero. What no
+/// counter can catch is an accessor that walks the row and then reports one
+/// gate anyway; the guard against that one is that these two are the only gate
+/// accessors a readout has, and both are short enough to read.
+#[cfg(test)]
+pub(crate) fn note_gate_reads(n: u64) {
+    GATE_READS.with(|reads| reads.set(reads.get() + n));
+}
+
+/// The gate reads since this was last called, and the tally back to zero.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn take_gate_reads() -> u64 {
+    GATE_READS.with(|reads| reads.replace(0))
+}
+
 /// Where a render's gates are — everything needed to turn a point into a
 /// `(radial, gate)`, and nothing else.
 ///
@@ -320,7 +377,15 @@ impl PolarField {
         if at.gate >= self.geometry.gates {
             return None;
         }
-        let v = *self.values.get(at.radial * self.geometry.gates + at.gate)?;
+        let index = at.radial * self.geometry.gates + at.gate;
+        // Taken as the span it is so that the count below is produced by the
+        // access rather than declared about it: a reader that walked the row to
+        // reach the gate would hand over the length of its walk. See
+        // [`note_gate_reads`].
+        let taken = self.values.get(index..=index)?;
+        #[cfg(test)]
+        note_gate_reads(taken.len() as u64);
+        let v = *taken.last()?;
         (!v.is_nan()).then_some(v)
     }
 

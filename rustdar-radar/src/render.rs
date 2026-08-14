@@ -1389,6 +1389,110 @@ pub fn painted_moment_value(value: nexrad_model::data::MomentValue) -> Option<f3
     }
 }
 
+/// One gate of `moment`, decoded, reached by indexing rather than by walking
+/// every gate before it.
+///
+/// Feeds [`painted_moment_value`] and does not duplicate a line of it: this
+/// answers in the model's `MomentValue`, which is what that function consumes,
+/// so the rule deciding what a gate *shows* is still spelt exactly once.
+///
+/// # Why this exists rather than `MomentData::iter().nth(gate)`
+///
+/// **Because `nth` on that iterator is a walk.** `iter()` is
+/// `chunks_exact(word).map(..).map(..)`, and `Map` overrides `next`,
+/// `size_hint`, `try_fold` and `fold` — not `nth`, and not `advance_by`. So
+/// `nth(n)` falls through to the default, which is `next()` called `n + 1`
+/// times, and *both* decode closures run on every gate skipped. `ChunksExact`
+/// does specialise `nth` to a pointer add, and that specialisation is
+/// unreachable underneath the two `Map`s stacked on it.
+///
+/// [`crate::hover::SweepGates::at`] read its gate that way on every hover of a
+/// loop frame, which at the ranges a pointer actually sits at is ~100 decodes
+/// to print one number. Measured by `the_hover_lookup_does_not_walk_the_gates`
+/// over 64 probes spanning gates 12 to 188: **6,477 gate decodes, where the
+/// gates asked for are 64**.
+///
+/// **Nothing a user could see was wrong, and that is the point.** At
+/// `-O -C lto` the closures inline and LLVM erases the walk — the readout cost
+/// 0.69 ns flat at every gate index — so this is not a repair of a slow
+/// picture. It is the removal of a shape that was one refactor away from being
+/// quadratic per radial *with every test still green*, which is the failure
+/// [`crate::sampler`]'s `gate_sample` doc predicted in as many words before it
+/// happened in this file.
+///
+/// # The seam this had to cross, spelt out
+///
+/// `nexrad_model` offers the gate bytes **by index** (`raw_values`) and the
+/// decoded values **by iterator** (`iter`), and nothing that is both. There is
+/// no public route from a raw word to a `MomentValue`. So the eight lines below
+/// are the model's own fixed-point rule spelt a second time, and that is a real
+/// cost rather than a tidy one.
+///
+/// **A second time, and not a third.** `sampler::gate_sample` carried this
+/// arithmetic first, for the same reason and with the same guard, and it is now
+/// expressed through this function instead — `Sample` from `MomentValue`, a
+/// mapping that loses nothing. Two readers of one spelling; before this change
+/// the crate was about to have two spellings guarded separately, which is the
+/// drift `gate_sample`'s own doc warned about.
+///
+/// Guarded rather than trusted, from both ends:
+/// `the_indexed_gate_decode_is_the_models_own_element_for_element` runs this
+/// against `iter()` over every gate of both word sizes at four scales including
+/// `scale == 0.0` — the case a reimplementation gets wrong, because it disables
+/// the 0-and-1 status codes entirely — and
+/// `sampler::tests::raw_gate_decoding_matches_the_model_element_for_element`
+/// runs the derived `gate_sample` against the model over the same ground.
+/// Perturbing this function fails both, which is what makes the derived path
+/// tested rather than merely downstream.
+///
+/// The fix that would delete this is upstream: an indexed decoded accessor on
+/// `MomentData`. `nexrad-model` is a registry dependency and not vendored
+/// here, so that is a change to ask for, not one to make in this tree.
+///
+/// `#[inline]` because `gate_sample` is a hot caller — one bilinear sample is
+/// four of these, and a cross-section is a grid of those.
+#[inline]
+pub fn moment_value_at(
+    moment: &nexrad_model::data::MomentData,
+    gate: usize,
+) -> Option<nexrad_model::data::MomentValue> {
+    use nexrad_model::data::MomentValue;
+
+    let bytes = moment.raw_values();
+    // Anything other than 16 is one byte per gate, which is how the model's own
+    // `raw_gate_values` reads it. `raw_values().len()` is authoritative for how
+    // many gates there are, not `gate_count()`, for the same reason.
+    let step = if moment.data_word_size() == 16 { 2 } else { 1 };
+    let start = gate.checked_mul(step)?;
+    let word = bytes.get(start..start.checked_add(step)?)?;
+
+    // The gates this access read, taken from the span it actually took rather
+    // than written as a literal — see [`polar::note_gate_reads`], and see the
+    // header above for what a literal here cost the last time.
+    #[cfg(test)]
+    polar::note_gate_reads((word.len() / step) as u64);
+
+    let raw = if step == 2 {
+        u16::from_be_bytes([word[0], word[1]])
+    } else {
+        u16::from(word[0])
+    };
+
+    // The model's decode, from `MomentData::iter`, including the exact
+    // `scale == 0.0` comparison: the value comes from a binary format where
+    // IEEE 754 zero is stored literally, and a zero scale means the raw words
+    // *are* the values, so 0 and 1 are ordinary numbers and not status codes.
+    let scale = moment.scale();
+    if scale == 0.0 {
+        return Some(MomentValue::Value(raw as f32));
+    }
+    Some(match raw {
+        0 => MomentValue::BelowThreshold,
+        1 => MomentValue::RangeFolded,
+        _ => MomentValue::Value((raw as f32 - moment.offset()) / scale),
+    })
+}
+
 /// Which of `scan`'s sweeps a plan-view render of `product` at
 /// `elevation_angle` would draw, by index.
 ///

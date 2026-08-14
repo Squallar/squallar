@@ -39,16 +39,28 @@
 //! is over a pane. It is a linear scan of the wedges — 720 float comparisons
 //! for a full ring, walked from the far end so a point inside exactly one wedge
 //! stops at the first hit — one division for the gate, and one indexed read.
-//! No allocation, and no decode of anything but the gate asked for:
-//! `MomentData::iter().nth` is `chunks_exact().map()`, and `nth` on either is a
-//! pointer add rather than a walk.
+//! No allocation, and no decode of anything but the gate asked for — the gate
+//! comes out of the volume through [`crate::render::moment_value_at`], which
+//! indexes into the moment's bytes.
 //!
-//! `the_hover_lookup_does_not_walk_the_gates` asserts the shape — nine times
-//! the gates must not cost nine times the time — because that is the property,
-//! and an absolute bound tight enough to mean anything fails for reasons that
-//! have nothing to do with the code. It prints the figures. Measured on a full
-//! ring of 720 wedges over 12,800 calls at spread positions with nothing else
-//! on the box:
+//! That sentence used to read "`MomentData::iter().nth` is
+//! `chunks_exact().map()`, and `nth` on either is a pointer add rather than a
+//! walk", and it was **false in its second half**: `Map` does not forward
+//! `nth`, so the readout decoded every gate up to the one asked for. It is
+//! recorded here rather than quietly deleted because the sentence is what made
+//! the walk invisible for as long as it lasted — it read like a citation and
+//! was a guess.
+//!
+//! `the_hover_lookup_does_not_walk_the_gates` asserts that shape as a **count**
+//! — one gate read per hover, on a 200-gate field, on an 1832-gate one, and
+//! reading back out of the volume — because the property is a traversal count
+//! and a count is the same integer on every machine under every load, where a
+//! ratio of two `Instant`s taken on a contended box is a reading of the rest of
+//! the machine. The figures below are a record rather than a bound, for the
+//! same reason: an absolute bound tight enough to mean anything fails for
+//! reasons that have nothing to do with the code. Measured on a full ring of
+//! 720 wedges over 12,800 calls at spread positions with nothing else on the
+//! box:
 //! **832 ns** at 200 gates, **832 ns** at 1832, and **851 ns** reading out of
 //! the volume, `--release`; 3.03 / 3.03 / 5.33 µs unoptimized. Flat in the gate
 //! count in both builds, which is the claim, and the volume-backed path costs
@@ -144,12 +156,20 @@ impl SweepGates {
     /// there, because it is the same function that decides —
     /// [`crate::render::painted_moment_value`]. A second reading of
     /// `MomentValue` here would be the second spelling of the rule this module
-    /// exists to have only one of.
+    /// exists to have only one of, so the gate arrives *as* a `MomentValue` and
+    /// that call is what turns it into a number.
+    ///
+    /// The gate is reached by [`crate::render::moment_value_at`], which
+    /// indexes. This was `moment.iter().nth(at.gate)`, which reads as O(1) and
+    /// is not: `Map` does not forward `nth`, so it decoded every gate up to the
+    /// one asked for — 6,477 of them across the 64 probes the hover test makes.
+    /// See that function's header for the measurement and for the seam it had
+    /// to cross to avoid re-spelling anything.
     fn at(&self, at: GateAt) -> Option<f32> {
         let sweep = self.scan.sweeps().get(self.sweep)?;
         let radial = sweep.radials().get(at.radial)?;
         let moment = self.product.get_moment(radial)?;
-        let raw = moment.iter().nth(at.gate)?;
+        let raw = crate::render::moment_value_at(moment, at.gate)?;
         // A range-folded gate paints a colour and carries no number, and its
         // sentinel is a NaN — so this is the same test `PolarField::at` makes,
         // and the two sources answer a folded gate alike.

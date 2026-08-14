@@ -6,7 +6,7 @@
 //! from — and a reader must not be able to tell which one answered.
 
 use super::*;
-use crate::render::polar::GateAt;
+use crate::render::polar::{GateAt, take_gate_reads};
 use crate::types::RadarProduct;
 use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
@@ -276,6 +276,61 @@ fn every_product_is_its_own_moment_or_is_derived() {
     }
 }
 
+/// **The indexed decode is the model's own, word for word.**
+///
+/// [`crate::render::moment_value_at`] exists because `nexrad_model` exposes the
+/// gate bytes by index and the decoded values by iterator and nothing that is
+/// both, so it spells the model's fixed-point rule a second time. That is the
+/// cost of not walking the radial, and this is what keeps it honest: every gate
+/// of the moment, both word sizes, against `MomentData::iter()` itself.
+///
+/// `scale == 0.0` is in the list because it is the case a reimplementation gets
+/// wrong — a zero scale disables the 0-and-1 status codes entirely, so the raw
+/// words are ordinary numbers, and a copy that keeps the `match` outside the
+/// `if` turns two real values into "below threshold" and "range folded".
+///
+/// The moments declare **twice the gates their bytes hold**, and the walk runs
+/// past the end of them, because `raw_values().len()` is what bounds a moment
+/// and not the `gate_count` it declares: the model's `chunks_exact` stops at
+/// the bytes, so an indexed copy trusting the declared count would answer for
+/// gates that are not there.
+///
+/// This holds the primitive against the model from the readout's side.
+/// `sampler::tests`' `raw_gate_decoding_matches_the_model_element_for_element`
+/// holds `gate_sample` — now *derived* from the primitive rather than a second
+/// copy of it — against the model from the sampler's, so a perturbation of the
+/// arithmetic fails both and neither consumer is merely downstream of an
+/// untested one. That test also records why an odd-length 16-bit moment cannot
+/// be in either list: `from_fixed_point` carries a `debug_assert!` refusing it.
+#[test]
+fn the_indexed_gate_decode_is_the_models_own_element_for_element() {
+    for word_size in [8u8, 16] {
+        for scale in [SCALE, 0.0, 0.5, -1.5] {
+            let step = usize::from(word_size / 8);
+            let bytes: Vec<u8> = (0..=255u8).chain(0..=255u8).collect();
+            let gates = bytes.len() / step;
+            let moment = MomentData::from_fixed_point(
+                // Twice the gates the bytes hold, deliberately.
+                (gates * 2) as u16,
+                0,
+                (GATE_KM * 1000.0) as u16,
+                word_size,
+                scale,
+                OFFSET,
+                bytes,
+            );
+            // Two past the end, so the bound is checked and not merely reached.
+            for gate in 0..gates + 2 {
+                assert_eq!(
+                    crate::render::moment_value_at(&moment, gate),
+                    moment.iter().nth(gate),
+                    "word size {word_size}, scale {scale}, gate {gate}",
+                );
+            }
+        }
+    }
+}
+
 /// **The readout does not walk the gates, which is what would make it too
 /// expensive to run on pointer motion.**
 ///
@@ -286,25 +341,55 @@ fn every_product_is_its_own_moment_or_is_derived() {
 /// gate up to the one asked for — because that is a real temptation on the
 /// volume-backed path, where the gate has to come out of a `MomentData`.
 ///
-/// So this measures the **shape** rather than the clock: two fields with the
-/// same 720 radials and gate counts nine times apart, timed against each other.
-/// A lookup that is flat in the gate count answers both alike; one that walks
-/// them is nine times slower on the wider field. The arms are interleaved and
-/// the *minimum* per-call time is taken, which is what makes the comparison
-/// survive a 32-core box that is compiling this workspace while it runs — the
-/// same method `POOLED_CELLS` uses for the same reason.
+/// **So this counts the gates read rather than timing the reading**, through
+/// [`crate::render::polar::note_gate_reads`], which both readout accessors
+/// call with the length of the span they took. A count is deterministic — the
+/// same integer on every machine under every load — where the pair of
+/// `Instant`s it replaces was a ratio whose numerator and denominator sample
+/// different slices of a contended machine, leaving it a 14% margin on a quiet
+/// box and nothing at all on a busy one.
+///
+/// The assertion is **one gate read per hover**, on a 200-gate field, on an
+/// 1832-gate one, and reading back out of the volume, for probes spread from
+/// gate 12 to gate 188. An equality rather than a bound on growth, so that it
+/// is both halves of the claim at once: a counter that had gone dead reads zero
+/// at every width, and zero is perfectly invariant under anything, so a test
+/// asserting only that the count does not grow would pass while protecting
+/// nothing. `64 == 64 == 64` says the reads happened, says how many, and says
+/// the number is the same nine times wider.
+///
+/// # What this does and does not catch, having been wrong about it once
+///
+/// **This test passed green over a live defect**, and the reason is worth
+/// keeping. The count is only a count where the number handed to
+/// `note_gate_reads` is computed from the access; the first version passed the
+/// literal `1` from `SweepGates::at`, justified by a comment asserting that
+/// `MomentData::iter().nth` indexes. It does not — `Map` does not forward
+/// `nth` — so the readout decoded 6,477 gates for these same 64 hovers while
+/// this test reported 64 and went green. The literal was the whole defect: it
+/// made the guard report what the author believed instead of what the code did.
+///
+/// So the honest statement of the blindness, replacing the "strictly stronger
+/// than the timing test" this used to claim, which was false in the dimension
+/// that decides it. **Different blindness, not less.** The old ratio could not
+/// see a walk *to* the gate asked for, because the probes ask the same ground
+/// range of both fields and such a walk costs the same on each. This count sees
+/// that one — it is the case the negative controls exercise. What it cannot see
+/// is an accessor that walks the row and then reports one gate anyway. Nothing
+/// counted from inside a liar catches the liar; what catches it is that the two
+/// accessors are the only ones a readout has, and both are short enough to
+/// read in full.
 ///
 /// The absolute figures, measured on this box with nothing else running:
 /// **832 ns** per hover at 200 gates, **832 ns** at 1832 and **851 ns** reading
 /// out of the volume, `--release`; 3.03 / 3.03 / 5.33 µs unoptimized. They are
-/// printed rather than asserted, because a bound tight enough to mean anything
-/// is a bound that fails for reasons that have nothing to do with the code —
-/// this one did, at 25 µs, on a box compiling the workspace beside it.
+/// a record here rather than an assertion, because a bound tight enough to mean
+/// anything is a bound that fails for reasons that have nothing to do with the
+/// code — one did, at 25 µs, on a box compiling the workspace beside it.
 #[test]
 fn the_hover_lookup_does_not_walk_the_gates() {
     const NARROW: usize = 200;
     const WIDE: usize = 1832;
-    const ROUNDS: u32 = 60;
 
     let scan = std::sync::Arc::new(volume(720, false));
     let sources = |gates: usize| {
@@ -341,49 +426,62 @@ fn the_hover_lookup_does_not_walk_the_gates() {
     let probes: Vec<(f64, f64)> = (0..64)
         .map(|i| (i as f64 * 5.6 + 0.3, 3.0 + i as f64 * 0.7))
         .collect();
-    let time = |src: &HoverSource| {
+
+    // Every probe has to land on a gate, or an arm below is counting hovers
+    // that asked nothing. Spread along the radial as well as around the ring,
+    // so that a walk stopping at the gate asked for is as visible as one
+    // running to the end of the row.
+    let picked: Vec<GateAt> = probes
+        .iter()
+        .filter_map(|&(az, km)| narrow.geometry().pick(az, km))
+        .collect();
+    assert_eq!(picked.len(), probes.len(), "a probe landed off the picture");
+    let deepest = picked.iter().map(|at| at.gate).max().expect("64 probes");
+    assert!(
+        deepest > NARROW / 2,
+        "the probes reach only gate {deepest} of {NARROW}, which a walk to the \
+         gate would answer nearly as cheaply as an index",
+    );
+
+    // The gates one pass of the probes reads out of `src`, with the tally taken
+    // fresh first so that nothing the fixture did is counted in it, and the
+    // values summed so that nothing here is a call the optimiser can drop.
+    let hover_over = |src: &HoverSource| {
+        let _ = take_gate_reads();
         let mut sink = 0u32;
-        let start = std::time::Instant::now();
         for &(az, km) in &probes {
             if let Reading::Value(v) = src.read(az, km) {
                 sink = sink.wrapping_add(v.to_bits());
             }
         }
-        (start.elapsed(), sink)
+        (take_gate_reads(), sink)
     };
 
-    let mut best = [std::time::Duration::MAX; 3];
-    let mut sink = 0u32;
-    for round in 0..ROUNDS {
-        // Alternating order, so neither arm always runs into a cold cache.
-        let order: [usize; 3] = if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
-        for i in order {
-            let (d, s) = time([&narrow, &wide, &volume_backed][i]);
-            best[i] = best[i].min(d);
-            sink = sink.wrapping_add(s);
-        }
-    }
-    assert!(sink != 0, "the loop was optimised away");
-
-    let each = |d: std::time::Duration| d / probes.len() as u32;
-    eprintln!(
-        "per hover over 720 wedges: {NARROW} gates {:?}, {WIDE} gates {:?}, \
-         from the volume {:?}",
-        each(best[0]),
-        each(best[1]),
-        each(best[2]),
-    );
-
-    // Nine times the gates must not cost anything like nine times the time.
-    // Two is generous against a flat lookup and far under a walking one.
-    for (i, name) in [(1usize, "resident"), (2, "from the volume")] {
+    for (src, name) in [
+        (&narrow, "resident, 200 gates"),
+        (&wide, "resident, 1832 gates"),
+        (&volume_backed, "from the volume"),
+    ] {
+        let (read, sink) = hover_over(src);
+        assert!(sink != 0, "{name}: no probe read a value at all");
+        let hovers = probes.len() as u64;
+        // The two directions are different faults and get different sentences.
+        // An over-count is a walk; an under-count is a readout that reached its
+        // gate without going through a counted accessor, and calling that
+        // "walking the radial" would send the reader looking for a loop that is
+        // not there.
         assert!(
-            best[i] < best[0] * 2,
-            "{name}: {:?} against {:?} for {}x fewer gates — the lookup is \
-             walking the radial rather than indexing into it",
-            each(best[i]),
-            each(best[0]),
-            WIDE / NARROW,
+            read <= hovers,
+            "{name}: {read} gates read for {hovers} hovers — the lookup is \
+             walking the radial rather than indexing into it (the deepest probe \
+             is at gate {deepest}, and a walk to it reads that many)",
+        );
+        assert_eq!(
+            read, hovers,
+            "{name}: {read} gates read for {hovers} hovers — the readout \
+             reached its gate without passing through a counted accessor, so \
+             this test is no longer measuring anything. Check what \
+             `note_gate_reads` is still called from.",
         );
     }
 }

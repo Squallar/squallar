@@ -147,7 +147,7 @@
 //! That is beam geometry, not a defect in the ladder, and it surfaces as
 //! [`SampleStatus::BeyondRange`] on that rung rather than as an error.
 
-use nexrad_model::data::{DataMoment, ElevationCut, MomentData, Radial, Sweep};
+use nexrad_model::data::{DataMoment, ElevationCut, MomentData, MomentValue, Radial, Sweep};
 
 use crate::azimuth::{MAX_ADJACENT_GAP_STEPS, median_azimuth_step_deg};
 use crate::beam;
@@ -1580,51 +1580,43 @@ fn gate_bracket(moment: &MomentData, slant_km: f64) -> (Sample, Sample, f64) {
 }
 
 /// Decode one gate, by index, without allocating and without walking the
-/// radial.
+/// radial — this module's `Sample`, from
+/// [`crate::render::moment_value_at`]'s `MomentValue`.
 ///
-/// **The reason this duplicates `MomentData::iter`'s six lines is O(1) random
-/// access, not allocation.** `iter()` is already allocation-free, so a doc
-/// blaming allocation would invite someone to "fix" this back to
-/// `iter().nth(j)` — quadratic per radial — with every test still green. One
-/// bilinear sample touches four radials at arbitrary gate indices, which an
-/// iterator cannot serve at any price.
-/// `raw_gate_decoding_matches_the_model_element_for_element` is the guard on
-/// the duplication, and it includes a `scale == 0.0` moment because that case
-/// disables the 0/1 status codes entirely and is the one a reimplementation
-/// gets wrong.
+/// **The decode used to live here, and now it does not.** These six lines were
+/// the model's `MomentData::iter` spelt a second time, deliberately, for O(1)
+/// random access rather than for allocation — `iter()` is already
+/// allocation-free, and one bilinear sample touches four radials at arbitrary
+/// gate indices, which an iterator cannot serve at any price. That reasoning
+/// was right and still is; what changed is that the readout came to need the
+/// same primitive, and a *third* spelling was the one thing worse than the
+/// second. So the arithmetic moved to `render::moment_value_at` and this is the
+/// translation onto this module's vocabulary.
 ///
-/// `raw_values().len()` is authoritative for how many gates there are, not
-/// `gate_count()`: the model's own `raw_gate_values` iterates
-/// `chunks_exact(word)` over the bytes, so a moment whose declared count
-/// overruns its bytes has the gates its bytes have.
+/// The mapping is total and loses nothing, which is why it is safe to express
+/// one through the other: `None` is a gate the bytes do not reach and so
+/// [`SampleStatus::BeyondRange`], `Value` is [`Sample::found`], and the two
+/// status variants are their namesakes. In particular a `scale == 0.0` moment —
+/// where the raw words *are* the values and the 0-and-1 status codes are
+/// disabled entirely — arrives as `MomentValue::Value` carrying the raw number,
+/// which is exactly the `Sample::found(raw as f32)` this used to produce.
+///
+/// `raw_gate_decoding_matches_the_model_element_for_element` still guards this,
+/// now over a derived function rather than a duplicate one, and still against
+/// the model's own iterator.
 fn gate_sample(moment: &MomentData, gate: usize) -> Sample {
-    let bytes = moment.raw_values();
-    // Anything other than 16 is one byte per gate, which is how the model's
-    // own `raw_gate_values` reads it.
-    let raw = if moment.data_word_size() == 16 {
-        let Some(pair) = gate.checked_mul(2).and_then(|k| bytes.get(k..k + 2)) else {
-            return Sample::missing(SampleStatus::BeyondRange);
-        };
-        u16::from_be_bytes([pair[0], pair[1]])
-    } else {
-        let Some(&b) = bytes.get(gate) else {
-            return Sample::missing(SampleStatus::BeyondRange);
-        };
-        u16::from(b)
+    let Some(value) = crate::render::moment_value_at(moment, gate) else {
+        // `raw_values().len()` is authoritative for how many gates there are,
+        // not `gate_count()`: the model's own `raw_gate_values` iterates
+        // `chunks_exact(word)` over the bytes, so a moment whose declared count
+        // overruns its bytes has the gates its bytes have, and the primitive
+        // bounds itself the same way.
+        return Sample::missing(SampleStatus::BeyondRange);
     };
-
-    let scale = moment.scale();
-    // An exact comparison, as in the model: the value comes from a binary
-    // format where IEEE 754 zero is stored literally. A zero scale means the
-    // raw words *are* the values, so 0 and 1 are ordinary numbers rather than
-    // status codes.
-    if scale == 0.0 {
-        return Sample::found(raw as f32);
-    }
-    match raw {
-        0 => Sample::missing(SampleStatus::BelowThreshold),
-        1 => Sample::missing(SampleStatus::RangeFolded),
-        _ => Sample::found((raw as f32 - moment.offset()) / scale),
+    match value {
+        MomentValue::Value(v) => Sample::found(v),
+        MomentValue::BelowThreshold => Sample::missing(SampleStatus::BelowThreshold),
+        MomentValue::RangeFolded => Sample::missing(SampleStatus::RangeFolded),
     }
 }
 
