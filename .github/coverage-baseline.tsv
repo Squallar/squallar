@@ -45,7 +45,7 @@ rustdar-egui/src/volume_alpha.rs	166	164
 rustdar-egui/src/volume_iso.rs	75	60
 rustdar-egui/src/volume_view.rs	266	259
 rustdar-frontend/src/app.rs	1133	809
-rustdar-frontend/src/app_chunks.rs	227	134
+rustdar-frontend/src/app_chunks.rs	227	143
 rustdar-frontend/src/app_fetch.rs	1130	611
 rustdar-frontend/src/app_render.rs	2092	1438
 rustdar-frontend/src/app_state.rs	194	108
@@ -97,8 +97,8 @@ rustdar-overlays/src/metar/types.rs	42	16
 rustdar-overlays/src/nws/alert.rs	177	71
 rustdar-overlays/src/nws/colors.rs	170	154
 rustdar-overlays/src/nws/fetch.rs	52	21
-rustdar-overlays/src/nws/zones.rs	445	380
-rustdar-overlays/src/render/geo.rs	111	107
+rustdar-overlays/src/nws/zones.rs	501	436
+rustdar-overlays/src/render/geo.rs	111	108
 rustdar-overlays/src/render/handlers/alert.rs	701	630
 rustdar-overlays/src/render/handlers/colorscale.rs	63	36
 rustdar-overlays/src/render/handlers/discussion.rs	356	250
@@ -138,7 +138,7 @@ rustdar-radar/src/archive.rs	249	222
 rustdar-radar/src/azimuth.rs	191	191
 rustdar-radar/src/beam.rs	73	73
 rustdar-radar/src/catalogue.rs	137	122
-rustdar-radar/src/chunks.rs	916	666
+rustdar-radar/src/chunks.rs	916	672
 rustdar-radar/src/current.rs	120	119
 rustdar-radar/src/derive.rs	221	205
 rustdar-radar/src/dpprep.rs	1022	956
@@ -158,7 +158,7 @@ rustdar-radar/src/render/polar.rs	235	232
 rustdar-radar/src/render_input.rs	639	609
 rustdar-radar/src/sampler.rs	584	564
 rustdar-radar/src/sampler/seam_fixture.rs	178	167
-rustdar-radar/src/scan.rs	365	211
+rustdar-radar/src/scan.rs	365	212
 rustdar-radar/src/site_position.rs	81	81
 rustdar-radar/src/sites.rs	581	581
 rustdar-radar/src/sounding.rs	234	207
