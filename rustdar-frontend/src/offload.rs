@@ -19,7 +19,9 @@
 //!   inputs cannot be described — see [`offload`]'s own note on which those are.
 //! * [`offload_job`] takes a [`JobRequest`], which *is* a description. Given a
 //!   worker it posts; without one it runs [`execute`] in exactly the place
-//!   [`offload`] would have run the closure.
+//!   [`offload`] would have run the closure — unless this thread has said it is
+//!   [`expect_sink`]ing one shortly, in which case the job waits for it rather
+//!   than paying a browser's whole frame for a transport that is on its way.
 //!
 //! The second is not a second code path. Both arms of [`offload_job`] call the
 //! same [`execute`] and the same `deliver`, so the fallback is derived from the
@@ -1728,18 +1730,25 @@ fn installed(port: Option<Box<dyn JobSink>>) -> Option<(u64, Box<dyn JobSink>)> 
 
 /// Route [`offload_job`] through `port` from now on.
 ///
-/// Called once, from `rustdar-web`'s entry point, after the worker has proved
-/// itself with a build-token handshake. Until then — and forever, on a browser
-/// where the worker could not start — [`offload_job`] runs jobs inline, which
-/// is the behaviour the web build had before any of this existed.
+/// Called from `rustdar-web`'s `worker_port` every time a worker proves itself
+/// with a build-token handshake — once at startup and once per respawn after a
+/// loss. Until the first one lands, [`offload_job`] holds jobs for the window
+/// [`expect_sink`] was armed with and then runs them inline, which is the
+/// behaviour the web build had before any of this existed.
 ///
 /// A port already installed here is **abandoned**, not dropped: it may be
 /// carrying jobs, and a job whose sink is replaced out from under it would
 /// otherwise sit in the registry forever holding a render slot that nothing
 /// can ever release.
+///
+/// Whatever [`expect_sink`] was holding for this moment is handed over here,
+/// oldest first. The hand-over runs whether or not anything was armed, so a
+/// port installed by a path that never expects one — the native pool, a test's
+/// port — costs one empty-queue check.
 pub fn set_worker(port: Box<dyn JobSink>) {
     abandon_worker("replaced by a new port");
     WORKER.with(|w| *w.borrow_mut() = installed(Some(port)));
+    hand_waiting_jobs_to_the_sink();
 }
 
 /// Give up on the worker: it died, or answered the handshake with a build that
@@ -1753,6 +1762,12 @@ pub fn set_worker(port: Box<dyn JobSink>) {
 /// Scoped to the retired sink's own jobs. The registry holds every job in the
 /// process, and a browser worker dying says nothing about a job some other
 /// sink is carrying.
+///
+/// **What [`expect_sink`] is holding is left alone.** Losing a worker is the
+/// moment a replacement is started, not the moment waiting stops, and a queue
+/// emptied here would run on the frame thread the jobs that the respawn is
+/// about to have somewhere to put. The wait's own deadline is what ends it —
+/// see [`expect_sink`].
 pub fn abandon_worker(reason: &str) {
     let Some((sink, _port)) = WORKER.with(|w| w.borrow_mut().take()) else {
         return;
@@ -1778,6 +1793,292 @@ pub fn abandon_worker(reason: &str) {
 /// Whether jobs are currently going to a worker. For diagnostics and tests.
 pub fn worker_attached() -> bool {
     WORKER.with(|w| w.borrow().is_some())
+}
+
+// ── The wait for a sink ──────────────────────────────────────────────────────
+
+/// How many jobs a thread will hold while it waits for the sink it is
+/// expecting, before the oldest is given up on.
+///
+/// A count and not a byte budget, which is worth saying plainly because the job
+/// kinds here are not one size: a full queue of `Radar` requests is ~1.3 MB
+/// apiece, and a full queue of [`JobRequest::Decode`]s is 16.9 MB apiece — 541
+/// MB, on a target whose address space is 4 GiB. A byte budget would be the
+/// honest bound and it is not available: a `JobRequest`'s cost is its payload's
+/// length on two arms, a `RenderInput`'s owned gates on three more, and nothing
+/// here can price the last without walking it.
+///
+/// What makes the count safe anyway is that this queue only fills while there
+/// is **no sink at all** — a handshake in flight, or a worker being replaced —
+/// and the window it fills for is the caller's own deadline, seconds rather
+/// than minutes. Thirty-two is well past what the application dispatches into
+/// such a window: renders are capped by `render_dispatch`'s concurrency limit,
+/// and a decode is one per pane per fetch.
+pub const SINK_WAIT_LIMIT: usize = 32;
+
+/// A job held for the sink its thread is expecting: the name it was dispatched
+/// under — which is all a log line has to identify it by, the same shape
+/// [`DeferredDrop`] carries — the request, and the delivery that has to run on
+/// every path out.
+type WaitingJob = (&'static str, JobRequest, Box<dyn FnOnce(JobResult) + Send>);
+
+/// A job that is **not** being held: the request and the delivery that still
+/// owes its caller an answer, without the name a [`WaitingJob`] carries.
+///
+/// The name is dropped because the one consumer already has it — [`run_here`]
+/// is called from the arm whose `name` this is — and carrying a second copy
+/// would let the two disagree about which job a log line is describing.
+type UnheldJob = (JobRequest, Box<dyn FnOnce(JobResult) + Send>);
+
+/// What [`expect_sink`] armed, and what has arrived since.
+struct SinkWait {
+    /// When to stop waiting, or `None` for a thread expecting nothing — in
+    /// which case a job that finds no sink runs where it stands, exactly as it
+    /// did before any of this existed.
+    until: Option<web_time::Instant>,
+    /// A `VecDeque` for [`DEFERRED_DROPS`]' reason turned around: the hand-over
+    /// takes from the front, so the job that has waited longest is the first to
+    /// reach the sink — and the eviction takes from the front too, so the job
+    /// given up on is the one whose caller has been waiting longest and is
+    /// likeliest to have re-asked already.
+    jobs: std::collections::VecDeque<WaitingJob>,
+}
+
+thread_local! {
+    /// This thread's wait. Thread-local because [`WORKER`] is: what is being
+    /// waited for is *that* handle, and a browser has one thread anyway.
+    ///
+    /// It exists on every target for the reason [`DEFERRED_DROPS`] does — the
+    /// `cfg` in this module is over routing, never over whether a queue exists
+    /// — which is what lets a host test drive the queue a browser will use.
+    /// Nothing native arms it; see [`expect_sink`].
+    static SINK_WAIT: RefCell<SinkWait> = const {
+        RefCell::new(SinkWait {
+            until: None,
+            jobs: std::collections::VecDeque::new(),
+        })
+    };
+}
+
+/// Hold jobs for up to `within` instead of running them here, because a sink is
+/// genuinely about to be installed.
+///
+/// # The state this exists for
+///
+/// A browser has no sink until its worker answers a build-token handshake, and
+/// none again from the moment that worker is lost until a replacement answers
+/// one. In both windows [`offload_job`] falls through to running the job on the
+/// browser's **one** thread, and the audit's figure for the largest of them —
+/// an existing in-code measurement, quoted from
+/// [`JobRequest::Decode`] rather than re-taken here — is 1021.9 ms in Firefox
+/// and 911.4 ms in Chrome for a 16.9 MB volume. Waiting a moment for the
+/// transport that is on its way costs less than that, and costs it once.
+///
+/// # It arms nothing that already has somewhere to send
+///
+/// **A thread with a sink installed is expecting nothing, and this returns
+/// without arming.** That is what keeps the native build out of the queue by
+/// construction rather than by convention: `default_sink` is the job pool, so a
+/// native thread has a sink from its first job and can never reach the arm at
+/// all. The browser's adapter is the only caller either way — `rustdar-web`'s
+/// `worker_port`, which is compiled for wasm32 alone.
+///
+/// # `within` is a window on one attempt, not on the whole recovery
+///
+/// The deadline should cover the handshake a caller has just started and no
+/// more. A caller that is waiting out a backoff before it can even try again
+/// must not arm across the wait: a job held for a minute is a pane blank for a
+/// minute, which is worse than the stall this exists to remove. When the
+/// deadline passes, everything held runs where it would have run anyway — see
+/// [`flush_expired_sink_wait`], which is what a caller with no further jobs
+/// coming needs so that "expired" does not mean "hung".
+pub fn expect_sink(within: std::time::Duration) {
+    if worker_attached() {
+        return;
+    }
+    SINK_WAIT.with(|q| q.borrow_mut().until = Some(web_time::Instant::now() + within));
+}
+
+/// Whether this thread is holding jobs for a sink it expects. For diagnostics
+/// and tests.
+pub fn expecting_sink() -> bool {
+    SINK_WAIT.with(|q| q.borrow().until.is_some())
+}
+
+/// How many jobs this thread is holding for a sink. For diagnostics and tests.
+pub fn jobs_waiting_for_sink() -> usize {
+    SINK_WAIT.with(|q| q.borrow().jobs.len())
+}
+
+/// Empty this thread's wait without running or delivering anything, for a test
+/// whose queue is fixture rather than subject.
+///
+/// Deliberately not a production path: a `deliver` dropped rather than run is
+/// the leaked render slot [`Pending::deliver`] warns about, and every path a
+/// browser takes out of this queue ends in one running. What this exists for is
+/// the **unwind**, which is [`InstalledTestWorker`]'s reason: a failed assertion
+/// leaves this thread's wait armed and full, [`SINK_WAIT`] is a thread-local,
+/// and the harness's next test on this thread would file its jobs into a queue
+/// nobody is coming for — then fail for reasons that have nothing to do with it.
+#[cfg(test)]
+pub(crate) fn clear_sink_wait() {
+    SINK_WAIT.with(|q| {
+        let mut q = q.borrow_mut();
+        q.until = None;
+        q.jobs.clear();
+    });
+}
+
+/// Run `request` where the caller stands, which is [`offload`]'s answer for
+/// this target: a pool lane natively, this frame in a browser.
+///
+/// One function because three arms reach it — no sink and nothing expected, a
+/// sink that refused, and a wait that ran out — and the three must not come to
+/// disagree about where "here" is.
+fn run_here(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(JobResult) + Send>) {
+    offload(name, move || deliver(execute(&request)));
+}
+
+/// Hold `request` for the sink this thread expects, or hand it back for
+/// [`run_here`].
+///
+/// Returns `Some` in exactly the two cases that are today's behaviour: nothing
+/// is expected, or the wait has run out. In the second the jobs already held go
+/// with it — they run here too, which is where they would have run had the
+/// queue never existed.
+///
+/// Nothing a caller wrote runs while the queue is borrowed. An evicted job's
+/// `deliver` may dispatch another job, and that job would find this queue
+/// borrowed and panic the frame; the borrow is released before any of it.
+fn wait_for_sink(
+    name: &'static str,
+    request: JobRequest,
+    deliver: Box<dyn FnOnce(JobResult) + Send>,
+) -> Option<UnheldJob> {
+    enum Outcome {
+        /// Held. Carries whatever was evicted to make room.
+        Held(Option<WaitingJob>),
+        /// Not held, and everything that was held comes back with it.
+        RunHere(Vec<WaitingJob>, WaitingJob),
+    }
+
+    let now = web_time::Instant::now();
+    let outcome = SINK_WAIT.with(|q| {
+        let mut q = q.borrow_mut();
+        match q.until {
+            None => Outcome::RunHere(Vec::new(), (name, request, deliver)),
+            Some(until) if now >= until => {
+                q.until = None;
+                Outcome::RunHere(q.jobs.drain(..).collect(), (name, request, deliver))
+            }
+            Some(_) => {
+                q.jobs.push_back((name, request, deliver));
+                // Push then evict, so the bound is on what is *held*: the
+                // 33rd arrival leaves 32 behind it, and the one given up on is
+                // the oldest rather than the newest.
+                Outcome::Held(if q.jobs.len() > SINK_WAIT_LIMIT {
+                    q.jobs.pop_front()
+                } else {
+                    None
+                })
+            }
+        }
+    });
+
+    match outcome {
+        Outcome::Held(evicted) => {
+            if let Some((evicted_name, _request, deliver)) = evicted {
+                // `None` is "the job produced nothing", which every consumer
+                // already handles and which is exactly what `abandon_worker`
+                // hands a job whose worker died. **What it costs is not the
+                // same at every call site**, and the three differ enough to be
+                // worth writing down rather than summarised as "the callers
+                // re-ask":
+                //
+                //  * `radar-render` is level-triggered and costs a frame.
+                //    `App::dispatch_pane_renders` re-dispatches any pane whose
+                //    `last_rendered` does not match its selection, and a `None`
+                //    clears `render_in_flight` without setting `last_rendered`.
+                //  * `loop-render` and `loop-section` cost the *frame of the
+                //    loop*. `accept_render_result` marks a reply with no image
+                //    `render_failed`, and the planner skips a failed frame — so
+                //    that one frame stays blank until something invalidates the
+                //    flags, which a product or elevation change does.
+                //  * `level2-decode` costs the request. `app_fetch` turns
+                //    `None` into a "could not decode the volume" the user sees,
+                //    and nothing re-asks for a scrub.
+                //
+                // That is the trade at the bound — 32 jobs deep with no sink at
+                // all — against a queue that grows without one. It is reached
+                // only while nothing is installed, and the deadline is what
+                // keeps that window short.
+                log::warn!(
+                    "{evicted_name}: {SINK_WAIT_LIMIT} jobs are already waiting for a sink; \
+                     giving up on the oldest"
+                );
+                deliver(None);
+            }
+            None
+        }
+        Outcome::RunHere(held, (_, request, deliver)) => {
+            for (held_name, held_request, held_deliver) in held {
+                log::warn!("{held_name}: the sink never arrived; running the job here");
+                run_here(held_name, held_request, held_deliver);
+            }
+            Some((request, deliver))
+        }
+    }
+}
+
+/// Run everything a lapsed [`expect_sink`] is still holding, here.
+///
+/// **This is what makes "the wait expires" different from "the wait hangs".**
+/// [`wait_for_sink`] notices a lapsed deadline only when another job arrives,
+/// and the case this exists for is precisely the one where no other job is
+/// coming: a browser whose worker never answers, holding the volume decode the
+/// first paint is waiting on. The caller that armed the wait is the caller that
+/// has to come back for it — `rustdar-web`'s `worker_port` schedules a timer
+/// for the deadline it asked for.
+///
+/// A no-op for a deadline that has not passed, and for one that was re-armed
+/// past this call's timer, so a caller may schedule as many as it starts.
+pub fn flush_expired_sink_wait() {
+    let held: Vec<WaitingJob> = SINK_WAIT.with(|q| {
+        let mut q = q.borrow_mut();
+        match q.until {
+            Some(until) if web_time::Instant::now() >= until => {
+                q.until = None;
+                q.jobs.drain(..).collect()
+            }
+            _ => Vec::new(),
+        }
+    });
+    for (name, request, deliver) in held {
+        log::warn!("{name}: the sink never arrived; running the job here");
+        run_here(name, request, deliver);
+    }
+}
+
+/// Give the sink just installed everything that was being held for it, oldest
+/// first, and stop waiting.
+///
+/// Each job goes back through [`dispatch`] rather than to the sink directly, so
+/// a port that refuses one still falls through to [`run_here`] — the queue
+/// hands jobs to the funnel, not around it. It cannot recurse: the queue is
+/// emptied before the first re-dispatch, and a sink is installed by the time
+/// any of them runs.
+fn hand_waiting_jobs_to_the_sink() {
+    let held: Vec<WaitingJob> = SINK_WAIT.with(|q| {
+        let mut q = q.borrow_mut();
+        q.until = None;
+        q.jobs.drain(..).collect()
+    });
+    if !held.is_empty() {
+        log::info!("handing {} waiting job(s) to the new sink", held.len());
+    }
+    for (name, request, deliver) in held {
+        dispatch(name, request, deliver);
+    }
 }
 
 /// A [`JobSink`] installed for the length of a test, retired when this drops.
@@ -1835,10 +2136,19 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
         // directly, reached through the funnel rather than around it.
         Job::Opaque(run) => return offload(name, move || deliver(run())),
     };
-    let kind = request.kind();
     // Boxed here rather than at the one place that stores it, because every arm
     // below either files it or runs it and the two must be the same closure.
-    let deliver: Box<dyn FnOnce(JobResult) + Send> = Box::new(deliver);
+    dispatch(name, request, Box::new(deliver));
+}
+
+/// [`offload_job`]'s described half, over an already-boxed delivery.
+///
+/// Split out for one caller: [`hand_waiting_jobs_to_the_sink`] holds boxed
+/// deliveries and has to put them back through the same lifecycle — the same
+/// registry, the same id space, the same fallthrough — rather than reach for
+/// the sink itself. A generic `offload_job` cannot take one back.
+fn dispatch(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(JobResult) + Send>) {
+    let kind = request.kind();
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Try the sink on every target: one implementation of the lifecycle, and
@@ -1878,7 +2188,15 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
 
     match handoff {
         Handoff::Taken => {}
-        Handoff::NoSink(request, deliver) => offload(name, move || deliver(execute(&request))),
+        // Held for the sink this thread is expecting, if it is expecting one;
+        // run here if it is not, which is what this arm has always done and
+        // what it still does on every target that installs a sink up front.
+        // See [`expect_sink`].
+        Handoff::NoSink(request, deliver) => {
+            if let Some((request, deliver)) = wait_for_sink(name, request, deliver) {
+                run_here(name, request, deliver);
+            }
+        }
         Handoff::Refused(request) => {
             // The sink exists but would not take the job. Falling through runs
             // it here, which is slow but correct; a sink that keeps refusing is
@@ -1888,7 +2206,7 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
             // refusal, in which case `abandon_worker` has already failed this
             // job and running it again would answer one render twice.
             if let Some(job) = pending().remove(&id) {
-                offload(name, move || (job.deliver)(execute(&request)));
+                run_here(name, request, job.deliver);
             }
         }
     }
@@ -1904,7 +2222,9 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
 enum Handoff {
     /// The sink took it; the reply will come through [`deliver_job_reply`].
     Taken,
-    /// No sink is installed on this thread. Carries the job back untouched.
+    /// No sink is installed on this thread. Carries the job back untouched, so
+    /// it can be held for one this thread is expecting ([`expect_sink`]) or run
+    /// here if it is expecting none.
     NoSink(JobRequest, Box<dyn FnOnce(JobResult) + Send>),
     /// A sink is installed and refused. The `deliver` is in the registry under
     /// this job's id.
@@ -1988,3 +2308,8 @@ mod premultiply_tests;
 /// native discard never comes near it.
 #[cfg(test)]
 mod discard_tests;
+
+/// A job dispatched while a sink is on its way waits for it, within a bound and
+/// within a deadline — and a native thread never waits at all.
+#[cfg(test)]
+mod sink_wait_tests;
