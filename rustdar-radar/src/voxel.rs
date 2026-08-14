@@ -789,7 +789,13 @@ pub fn box_half_width_km(data_reach_km: f64) -> f64 {
 /// It is a **ground** range, `cos e` of the sweep's median elevation folded
 /// in, because that is the coordinate the box's axes are in
 /// ([`crate::sampler::VolumeSampler::column_into`] is asked for a ground
-/// range). The correction is 0.004% at 0.5° and would be nothing at all if
+/// range). That `cos e` is `render::sweep_ground_factor`'s tangent-plane
+/// approximation of the arc [`crate::beam::ground_range_km`] returns, and it
+/// sizes the box a touch large — by the 666 m the two differ by at a 0.5°
+/// cut's 460 km reach, on a box already sized to a maximum over cuts. Erring
+/// large is the safe direction for a bound, which is why it is recorded here
+/// rather than corrected here. The correction is 0.004% at 0.5° and would be
+/// nothing at all if
 /// only the lowest cut could ever be the longest — but the reach is a maximum
 /// over cuts, and a sweep whose gates were shortened by the projection while
 /// its reach was not is exactly the disagreement the plan view had to fix.
