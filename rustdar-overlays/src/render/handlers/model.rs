@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,12 +15,191 @@ use crate::render::overlay_state::{
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
 
+/// How many parameters' grids stay resident at once.
+///
+/// # Sized by the pane count, not by a memory target
+///
+/// Panes configure this overlay independently: `PaneState::overlay_configs`
+/// holds a serialized handler snapshot per pane and is swapped into the registry
+/// around each access, and `deduplicate_overlay_renders` hands every unlinked
+/// pane its own render request. So six panes can sit on six different
+/// parameters, and each one's render loads that pane's config and then asks this
+/// cache for the parameter that pane selected.
+///
+/// Below the pane count, a miss does not cost a refetch — it costs a **picture**.
+/// `prepare_rasterize` answers `None`, `app_fetch` clears the render marks and
+/// returns, and the pane goes on drawing its last texture at its old bounds with
+/// nothing in the code that will re-ask: [`OverlayHandler::auto_fetch_delay`]
+/// reads the handler-global `fetch_time` that *any* parameter's successful fetch
+/// stamps, [`OverlayHandler::create_fetch_tasks`] only ever fetches
+/// `selected_param`, and the enable-fetch rule fires on a toggle. Re-picking the
+/// starved pane's parameter just evicts another pane's.
+///
+/// So the cap is `rustdar_egui::pane::MAX_PANES_DESKTOP`, which is **6**
+/// (`MAX_PANES_MOBILE` is 4, under it). It is spelled rather than imported
+/// because the dependency runs rustdar-egui → rustdar-overlays and cannot run
+/// back; if the pane maximum ever rises, this has to rise with it.
+///
+/// # What that costs
+///
+/// One object at a time, each figure naming the object it describes:
+///
+/// - **The values vector.** `HrrrGridData::values` is a `Vec<f32>` over HRRR
+///   CONUS's 1,905,141 points: **7.62 MB** per resident grid. This is the whole
+///   per-grid cost whenever the coordinates are [`GridCoords::Lambert`], which
+///   is every HRRR fetch this crate makes — HRRR is GRIB2 template 3.30 for
+///   every field, and `LambertGrid` is a fixed-size `Copy` struct of projection
+///   constants rather than anything that scales with the point count.
+/// - **The coordinate arrays.** A second cost only on the
+///   [`GridCoords::Explicit`] arm, where two materialised `Vec<f64>` over those
+///   same 1,905,141 points add **30.5 MB**, for a worst-case resident grid of
+///   **38.1 MB**. No HRRR fetch reaches that arm; it is what a non-3.30 source
+///   would decode to, and what these tests build.
+///
+/// [`ModelParameter::all`] has 16 members and the Parameter dropdown walks
+/// them, so with no eviction the map held one grid per parameter: **122 MB** of
+/// values on the arm this app actually takes, **610 MB** if every entry carried
+/// explicit coordinates — on wasm32's 4 GiB address space, or Android's hard
+/// per-app cap. Six entries bound those at **45.7 MB** and **228.6 MB**, i.e.
+/// 2.7× under the unbounded figure on either arm. A tighter cap would save more
+/// and is not available: the pane count is a floor, not a preference.
+///
+/// [`GridCoords::Lambert`]: crate::hrrr::GridCoords::Lambert
+/// [`GridCoords::Explicit`]: crate::hrrr::GridCoords::Explicit
+const MODEL_GRID_CACHE_ENTRIES: usize = 6;
+
+// At a cap of 1, an insert of a parameter that is not the selected one protects
+// both the arrival and the pin, the `else { break }` in `insert` fires, and the
+// cache settles at two entries for ever — a bound that silently does not hold.
+// Two is where the eviction loop is guaranteed a victim.
+const _: () = assert!(MODEL_GRID_CACHE_ENTRIES >= 2);
+
+/// The resident grids, bounded by [`MODEL_GRID_CACHE_ENTRIES`], evicted
+/// least-recently-touched first.
+///
+/// Shaped after `rustdar_frontend::render_dispatch::RenderCache`: an entries
+/// map plus a recency list holding exactly the keys of `entries`, each exactly
+/// once, oldest use first. Every method that touches one touches the other, and
+/// both fields are private so no caller can desynchronise them.
+///
+/// The recency list is behind a `RefCell` because every *reader* of a grid
+/// reaches it through an `&self` method of [`OverlayHandler`] —
+/// `hover_value_at`, `prepare_rasterize`, `controls`, `has_data`. `RenderCache`
+/// takes `&mut self` in `get` for exactly this reason, "a lookup that did not
+/// count as a use would let the pane currently on screen age out while an
+/// unwatched one survived"; here the trait forbids `&mut self`, so the
+/// mutability moves inside rather than the rule being dropped. There are at
+/// most 16 parameters, so a linear scan of a `Vec` is the whole cost and an
+/// `lru` dependency would be heavier than the thing it replaced.
+struct ModelGridCache {
+    entries: HashMap<ModelParameter, Arc<HrrrGridData>>,
+    recency: RefCell<Vec<ModelParameter>>,
+}
+
+impl ModelGridCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Move `param` to the most-recently-used end. No-op if absent.
+    fn touch(&self, param: ModelParameter) {
+        let mut recency = self.recency.borrow_mut();
+        if let Some(pos) = recency.iter().position(|p| *p == param) {
+            recency.remove(pos);
+            recency.push(param);
+        }
+    }
+
+    /// Look up a grid, marking it most-recently-used.
+    fn get(&self, param: ModelParameter) -> Option<&Arc<HrrrGridData>> {
+        let grid = self.entries.get(&param)?;
+        self.touch(param);
+        Some(grid)
+    }
+
+    /// Whether `param`'s grid is resident, marking it most-recently-used.
+    ///
+    /// Every read counts as a use, including the bare predicate: which accessor
+    /// a caller happened to reach for is not a fact about what the user is
+    /// looking at, and making eviction depend on it is how the grid on screen
+    /// ends up the oldest thing in the list.
+    fn contains(&self, param: ModelParameter) -> bool {
+        self.get(param).is_some()
+    }
+
+    /// Install `param`'s grid, evicting least-recently-touched entries until
+    /// the map is within [`MODEL_GRID_CACHE_ENTRIES`].
+    ///
+    /// Neither the entry going in nor `pinned` is ever the one evicted:
+    /// evicting the arrival would make the fetch that just landed pointless,
+    /// and evicting what is on screen would blank a layer the user is looking
+    /// at.
+    ///
+    /// `pinned` is the registry's `selected_param` **at the moment the payload
+    /// arrives**, which with several panes is whichever pane's config
+    /// `load_pane_configs` swapped in last — not necessarily the pane that
+    /// asked for this fetch. So it protects *a* visible parameter rather than
+    /// every visible one; the guarantee that all of them stay resident comes
+    /// from the cap being at least the pane count, not from this argument.
+    ///
+    /// With at most two protected keys and a cap of at least two, there is
+    /// always a victim, so the `break` is structural insurance rather than a
+    /// case that runs.
+    fn insert(&mut self, param: ModelParameter, grid: Arc<HrrrGridData>, pinned: ModelParameter) {
+        if self.entries.insert(param, grid).is_some() {
+            // A re-fetch of a parameter already resident replaces its own key,
+            // so a superseded run's grid is dropped here rather than aging out
+            // later beside its own replacement. Nothing in this cache is keyed
+            // by run: a stale-run grid of an *unselected* parameter is an
+            // ordinary entry, and being unselected is exactly what walks it to
+            // the evictable end of the list.
+            self.touch(param);
+        } else {
+            self.recency.borrow_mut().push(param);
+        }
+        while self.entries.len() > MODEL_GRID_CACHE_ENTRIES {
+            let victim = {
+                let mut recency = self.recency.borrow_mut();
+                let Some(pos) = recency.iter().position(|p| *p != param && *p != pinned) else {
+                    break;
+                };
+                recency.remove(pos)
+            };
+            self.entries.remove(&victim);
+        }
+    }
+
+    /// Resident grid count.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Residency **without** counting as a use, so an assertion cannot change
+    /// the order it is about to assert on.
+    #[cfg(test)]
+    fn is_resident(&self, param: ModelParameter) -> bool {
+        self.entries.contains_key(&param)
+    }
+
+    /// Oldest use first.
+    #[cfg(test)]
+    fn recency_order(&self) -> Vec<ModelParameter> {
+        self.recency.borrow().clone()
+    }
+}
+
 pub(crate) struct ModelDataHandler {
     pub state: OverlayState<Option<Arc<HrrrGridData>>, Whole>,
     pub enabled: bool,
     pub selected_param: ModelParameter,
-    /// Keyed per parameter so different panes can show different ones.
-    pub cached_grids: HashMap<ModelParameter, Arc<HrrrGridData>>,
+    /// Keyed per parameter so different panes can show different ones, and
+    /// bounded so cycling the dropdown cannot walk off the end of a phone's
+    /// memory; see [`ModelGridCache`].
+    cached_grids: ModelGridCache,
     /// Surfaced in the controls; otherwise a failed fetch appears only in the
     /// log. Cleared by the next success.
     pub last_error: Option<String>,
@@ -31,7 +211,7 @@ impl ModelDataHandler {
             state: OverlayState::new(),
             enabled: false,
             selected_param: ModelParameter::SurfaceBasedCin,
-            cached_grids: HashMap::new(),
+            cached_grids: ModelGridCache::new(),
             last_error: None,
         }
     }
@@ -72,7 +252,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn has_data(&self) -> bool {
-        self.cached_grids.contains_key(&self.selected_param)
+        self.cached_grids.contains(self.selected_param)
     }
 
     fn is_fetching(&self) -> bool {
@@ -130,7 +310,10 @@ impl OverlayHandler for ModelDataHandler {
                 }
                 let param = grid.parameter;
                 let arc = Arc::new(grid);
-                self.cached_grids.insert(param, arc.clone());
+                // The pin is the parameter the pane is showing, which is what
+                // every read path below keys on; an arrival must never blank it.
+                let selected = self.selected_param;
+                self.cached_grids.insert(param, arc.clone(), selected);
                 self.state.set_data(Some(arc));
                 self.last_error = None;
             }
@@ -159,7 +342,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn hover_value_at(&self, lat: f64, lon: f64) -> Option<String> {
-        let grid = self.cached_grids.get(&self.selected_param)?;
+        let grid = self.cached_grids.get(self.selected_param)?;
         if lat < grid.bounds.min_lat
             || lat > grid.bounds.max_lat
             || lon < grid.bounds.min_lon
@@ -202,7 +385,7 @@ impl OverlayHandler for ModelDataHandler {
         &self,
         _ctx: &RasterizeContext,
     ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
-        let grid = self.cached_grids.get(&self.selected_param)?.clone();
+        let grid = self.cached_grids.get(self.selected_param)?.clone();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             rasterize::rasterize_model_data(&grid, bounds, width, height)
         }))
@@ -226,7 +409,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        let grid = self.cached_grids.get(&self.selected_param);
+        let grid = self.cached_grids.get(self.selected_param);
 
         // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
         // with the run time alone reads as an analysis valid now.
@@ -293,7 +476,7 @@ impl OverlayHandler for ModelDataHandler {
             });
         }
 
-        if let Some(grid) = self.cached_grids.get(&self.selected_param) {
+        if let Some(grid) = self.cached_grids.get(self.selected_param) {
             // Windowed fields are maxima over a period, not instantaneous
             // readings; "UH2-5 at 04:00z" alone reads as a snapshot.
             if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
@@ -337,7 +520,7 @@ impl OverlayHandler for ModelDataHandler {
                         self.selected_param = new_param;
                         // Cached parameters re-render on a generation bump
                         // alone; no refetch.
-                        if self.cached_grids.contains_key(&new_param) {
+                        if self.cached_grids.contains(new_param) {
                             self.state.data_generation = self.state.data_generation.wrapping_add(1);
                             return ControlEffect::None;
                         }
@@ -622,5 +805,407 @@ mod tests {
 
         let lines = info_lines(&h);
         assert!(!lines.iter().any(|l| l.contains("HTTP 500")), "{lines:?}");
+    }
+
+    // ── Cache bound ───────────────────────────────────────────────────────
+
+    /// The parameters these tests fill the cache with, in fetch order: exactly
+    /// enough to fill it, plus one more to overflow it.
+    ///
+    /// Taken from [`ModelParameter::all`] so the set follows
+    /// [`MODEL_GRID_CACHE_ENTRIES`], rather than a hand-written list that would
+    /// silently stop overflowing anything the day the cap rose.
+    fn fill_order() -> &'static [ModelParameter] {
+        let need = MODEL_GRID_CACHE_ENTRIES + 1;
+        let all = ModelParameter::all();
+        assert!(
+            all.len() >= need,
+            "these tests need {need} distinct parameters to overflow a cache of \
+             {MODEL_GRID_CACHE_ENTRIES}, and there are {}",
+            all.len(),
+        );
+        &all[..need]
+    }
+
+    /// The keys a full cache holds, oldest use first.
+    fn resident_order() -> &'static [ModelParameter] {
+        &fill_order()[..MODEL_GRID_CACHE_ENTRIES]
+    }
+
+    /// The least recently touched entry of a freshly filled cache — what an
+    /// overflowing insert must take.
+    fn oldest() -> ModelParameter {
+        fill_order()[0]
+    }
+
+    /// The one behind it, which an overflow must take instead when `oldest` is
+    /// spared.
+    fn next_oldest() -> ModelParameter {
+        fill_order()[1]
+    }
+
+    /// One parameter past the cap, so fetching it overflows a full cache.
+    fn overflow() -> ModelParameter {
+        fill_order()[MODEL_GRID_CACHE_ENTRIES]
+    }
+
+    /// A fetch for `parameter` landing, exactly as the fetch path delivers one.
+    fn deliver(h: &mut ModelDataHandler, parameter: ModelParameter) {
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(parameter, vec![300.0])))));
+    }
+
+    fn rasterize_ctx() -> RasterizeContext {
+        RasterizeContext {
+            is_dark: false,
+            zoom: 5.0,
+            device_scale: 1.0,
+        }
+    }
+
+    fn control_ctx<'a>() -> PaneControlContextMut<'a> {
+        PaneControlContextMut {
+            pane_idx: 0,
+            pane_state: None,
+        }
+    }
+
+    /// A cache filled exactly to the cap, each parameter selected and then
+    /// fetched, so the recency list is [`resident_order`], oldest use first.
+    fn full_cache() -> ModelDataHandler {
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        for &p in resident_order() {
+            h.selected_param = p;
+            deliver(&mut h, p);
+        }
+        assert_eq!(
+            h.cached_grids.len(),
+            MODEL_GRID_CACHE_ENTRIES,
+            "the fixture must be full before a test evicts from it",
+        );
+        assert_eq!(
+            h.cached_grids.recency_order(),
+            resident_order().to_vec(),
+            "fixture recency, oldest first",
+        );
+        h
+    }
+
+    /// A full desktop layout is `rustdar_egui::pane::MAX_PANES_DESKTOP` = 6
+    /// unlinked panes, each free to select its own parameter, each rendered from
+    /// its own config. Every one of them must find its grid here.
+    ///
+    /// This is the case a cap below the pane count breaks, and it breaks
+    /// *silently*: `prepare_rasterize` answers `None`, `app_fetch` clears the
+    /// render marks and returns, and the starved pane goes on drawing its last
+    /// texture at its old bounds. Nothing re-asks — `auto_fetch_delay` reads the
+    /// handler-global `fetch_time` that any parameter's fetch stamps, and
+    /// `create_fetch_tasks` only ever fetches `selected_param` — so unlike an
+    /// ordinary eviction this costs no refetch and no gesture, just a wrong
+    /// picture that persists.
+    #[test]
+    fn every_pane_of_a_full_desktop_layout_keeps_a_drawable_grid() {
+        // Spelled, not imported: rustdar-overlays cannot depend on rustdar-egui.
+        const MAX_PANES_DESKTOP: usize = 6;
+        let panes = &ModelParameter::all()[..MAX_PANES_DESKTOP];
+
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        for &p in panes {
+            h.selected_param = p;
+            deliver(&mut h, p);
+        }
+
+        // Each pane's render swaps that pane's config in, then rasterizes.
+        for &p in panes {
+            h.selected_param = p;
+            assert!(h.has_data(), "the pane showing {p:?} has no grid");
+            assert!(
+                h.prepare_rasterize(&rasterize_ctx()).is_some(),
+                "the pane showing {p:?} would be skipped by app_fetch and left \
+                 drawing a stale texture",
+            );
+        }
+        assert_eq!(
+            h.cached_grids.len(),
+            MAX_PANES_DESKTOP,
+            "every pane's grid must be resident at once",
+        );
+    }
+
+    /// Fails if the map grows past the cap, and names which grid should have
+    /// gone: unbounded, this held one 7.62 MB values vector per parameter — plus
+    /// 30.5 MB of coordinates apiece on the `Explicit` arm these fixtures use.
+    #[test]
+    fn an_overflowing_parameter_evicts_the_least_recently_touched() {
+        let mut h = full_cache();
+        h.selected_param = overflow();
+        deliver(&mut h, overflow());
+
+        assert!(
+            !h.cached_grids.is_resident(oldest()),
+            "the least recently touched grid survived an overflowing insert",
+        );
+        for &p in &fill_order()[1..] {
+            assert!(
+                h.cached_grids.is_resident(p),
+                "{p:?} must still be resident"
+            );
+        }
+        assert_eq!(h.cached_grids.len(), MODEL_GRID_CACHE_ENTRIES);
+        assert_eq!(h.cached_grids.recency_order(), fill_order()[1..].to_vec());
+    }
+
+    /// Cycling the whole Parameter dropdown is the gesture that grew this map to
+    /// sixteen grids. The count is asserted to be *exactly* what is resident at
+    /// every step, not merely under the cap: "never exceeds the cap" is
+    /// satisfied by a cache that never holds anything at all.
+    #[test]
+    fn cycling_every_parameter_leaves_exactly_the_cap_resident() {
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        for (i, p) in ModelParameter::all().iter().enumerate() {
+            h.selected_param = *p;
+            deliver(&mut h, *p);
+            let expected = (i + 1).min(MODEL_GRID_CACHE_ENTRIES);
+            assert_eq!(
+                h.cached_grids.len(),
+                expected,
+                "after {} of {} parameters",
+                i + 1,
+                ModelParameter::all().len(),
+            );
+            assert!(
+                h.cached_grids.is_resident(*p),
+                "the parameter just fetched is the one on screen: {p:?}",
+            );
+            assert_eq!(
+                h.cached_grids.recency_order().len(),
+                expected,
+                "the recency list must hold exactly the keys of the map",
+            );
+        }
+        let tail = &ModelParameter::all()[ModelParameter::all().len() - MODEL_GRID_CACHE_ENTRIES..];
+        assert_eq!(h.cached_grids.recency_order(), tail.to_vec());
+    }
+
+    /// Every `&self` reader of a grid must count as a use. If one does not, the
+    /// parameter on screen ages out while one nobody has looked at survives.
+    ///
+    /// Each step reads the parameter that is currently *oldest* and requires
+    /// that read to have moved it to the most-recent end, so no step can pass by
+    /// touching nothing. Each step also asserts the read actually answered, so a
+    /// reader that silently returned `None` could not pass either.
+    #[test]
+    fn every_read_path_counts_as_a_use() {
+        assert!(
+            MODEL_GRID_CACHE_ENTRIES >= 3,
+            "this test walks three distinct parameters through the cache",
+        );
+        let mut h = full_cache();
+
+        // A read has counted as a use when the key it read is now the most
+        // recent, i.e. last. Each step reads the key that was first, so this is
+        // a move across the whole list and not a coincidence of position.
+        fn counted_as_a_use(h: &ModelDataHandler, read: ModelParameter, path: &str) {
+            let order = h.cached_grids.recency_order();
+            assert_eq!(
+                order.len(),
+                MODEL_GRID_CACHE_ENTRIES,
+                "{path}: the recency list must still hold every key, got {order:?}",
+            );
+            assert_eq!(
+                order.last(),
+                Some(&read),
+                "{path}: the read did not count as a use, order is {order:?}",
+            );
+        }
+
+        let p = h.cached_grids.recency_order()[0];
+        h.selected_param = p;
+        assert!(
+            h.hover_value_at(35.0, -97.0).is_some(),
+            "the fixture must answer a hover, or this step proves nothing",
+        );
+        counted_as_a_use(&h, p, "hover_value_at");
+
+        let p = h.cached_grids.recency_order()[0];
+        h.selected_param = p;
+        assert!(
+            h.prepare_rasterize(&rasterize_ctx()).is_some(),
+            "the fixture must answer a rasterize",
+        );
+        counted_as_a_use(&h, p, "prepare_rasterize");
+
+        let p = h.cached_grids.recency_order()[0];
+        h.selected_param = p;
+        assert_ne!(
+            toggle_label(&h),
+            "Model Data",
+            "the label must be the one built from a resident grid — only the \
+             `Some(grid)` arm of `controls` can produce a time in it",
+        );
+        counted_as_a_use(&h, p, "controls");
+
+        let p = h.cached_grids.recency_order()[0];
+        h.selected_param = p;
+        assert!(h.has_data(), "{p:?} is resident");
+        counted_as_a_use(&h, p, "has_data");
+
+        // Picking a cached parameter out of the dropdown: no refetch, but it is
+        // the strongest signal there is that the user wants it kept.
+        let p = h.cached_grids.recency_order()[0];
+        assert_ne!(
+            p, h.selected_param,
+            "the dropdown branch runs only on a change"
+        );
+        let effect = h.apply_control(
+            &ControlUpdate {
+                id: "parameter",
+                value: ControlValue::String(p.as_str().into()),
+            },
+            &mut control_ctx(),
+        );
+        assert_eq!(
+            effect,
+            ControlEffect::None,
+            "a resident parameter must re-render, not refetch",
+        );
+        counted_as_a_use(&h, p, "apply_control(parameter)");
+    }
+
+    /// The grid the user hovered must outlive one that was only ever fetched.
+    /// Without the hover counting as a use, `oldest` is still the oldest entry
+    /// and is exactly what the overflowing insert takes.
+    #[test]
+    fn a_hovered_parameter_outlives_one_that_was_only_fetched() {
+        let mut h = full_cache();
+        h.selected_param = oldest();
+        assert!(
+            h.hover_value_at(35.0, -97.0).is_some(),
+            "the fixture must answer a hover",
+        );
+
+        h.selected_param = overflow();
+        deliver(&mut h, overflow());
+
+        assert!(
+            h.cached_grids.is_resident(oldest()),
+            "the hovered grid was evicted anyway",
+        );
+        assert!(
+            !h.cached_grids.is_resident(next_oldest()),
+            "the oldest use is what must go",
+        );
+        assert_eq!(h.cached_grids.len(), MODEL_GRID_CACHE_ENTRIES);
+    }
+
+    /// The parameter the pane is showing is pinned, even when it is the oldest
+    /// thing in the list: a bare assignment to `selected_param` is what
+    /// `deserialize_state` does when `load_pane_configs` swaps a pane in, so a
+    /// pane can sit on a grid nothing has touched since. Evicting it would blank
+    /// the layer under the user.
+    #[test]
+    fn the_selected_parameter_survives_an_insert_that_would_evict_it() {
+        let mut h = full_cache();
+        h.selected_param = oldest();
+        assert_eq!(
+            h.cached_grids.recency_order(),
+            resident_order().to_vec(),
+            "a bare assignment must not count as a use",
+        );
+
+        // Another parameter's fetch lands while `oldest` is still on screen.
+        deliver(&mut h, overflow());
+
+        assert!(
+            h.cached_grids.is_resident(oldest()),
+            "the parameter on screen was evicted under the user",
+        );
+        assert!(
+            !h.cached_grids.is_resident(next_oldest()),
+            "the eviction must still happen, one entry along",
+        );
+        assert!(h.cached_grids.is_resident(overflow()));
+        assert_eq!(h.cached_grids.len(), MODEL_GRID_CACHE_ENTRIES);
+    }
+
+    /// A re-fetch replaces its own key rather than adding one, so a superseded
+    /// run costs nothing and evicts nobody — the cache carries no run identity,
+    /// and a stale-run grid of an unselected parameter is just an ordinary entry
+    /// aging towards the evictable end.
+    #[test]
+    fn a_refetch_of_a_resident_parameter_replaces_its_own_key() {
+        let mut h = full_cache();
+        h.selected_param = oldest();
+        deliver(&mut h, oldest());
+
+        assert_eq!(
+            h.cached_grids.len(),
+            MODEL_GRID_CACHE_ENTRIES,
+            "a re-fetch must not grow the map",
+        );
+        for &p in resident_order() {
+            assert!(
+                h.cached_grids.is_resident(p),
+                "{p:?} must still be resident"
+            );
+        }
+        let order = h.cached_grids.recency_order();
+        assert_eq!(
+            order.last(),
+            Some(&oldest()),
+            "the replaced key is the most recent use, order is {order:?}",
+        );
+        assert_eq!(
+            order.first(),
+            Some(&next_oldest()),
+            "and the one behind it becomes the oldest, order is {order:?}",
+        );
+    }
+
+    /// Eviction costs one refetch when the user returns, and the toggle is where
+    /// that has to happen: an evicted parameter has no data, so re-enabling the
+    /// layer must re-ask rather than draw nothing. The counterpart is asserted
+    /// too, or the test would pass for a handler that refetches on every toggle.
+    #[test]
+    fn an_evicted_parameter_refetches_when_the_layer_is_toggled_back_on() {
+        let mut h = full_cache();
+        h.selected_param = overflow();
+        deliver(&mut h, overflow()); // evicts `oldest`
+
+        h.selected_param = oldest();
+        assert!(
+            !h.has_data(),
+            "{:?} must be gone, or this is not the eviction case",
+            oldest(),
+        );
+        h.enabled = false;
+        assert_eq!(
+            h.apply_control(
+                &ControlUpdate {
+                    id: "enabled",
+                    value: ControlValue::Bool(true),
+                },
+                &mut control_ctx(),
+            ),
+            ControlEffect::Fetch,
+            "an evicted parameter must refetch on the toggle, not leave the layer blank",
+        );
+
+        h.selected_param = overflow();
+        assert!(h.has_data(), "{:?} is resident", overflow());
+        h.enabled = false;
+        assert_eq!(
+            h.apply_control(
+                &ControlUpdate {
+                    id: "enabled",
+                    value: ControlValue::Bool(true),
+                },
+                &mut control_ctx(),
+            ),
+            ControlEffect::None,
+            "a resident grid must not be refetched on the toggle",
+        );
     }
 }

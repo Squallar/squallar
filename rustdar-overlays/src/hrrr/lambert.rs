@@ -279,7 +279,11 @@ fn normalize_longitude_degrees(lon: f64) -> f64 {
 }
 
 /// A template 3.30 grid reduced to the constants any point's lat/lon can be
-/// rebuilt from — 88 bytes standing in for two 15 MB `Vec<f64>`.
+/// rebuilt from — 104 bytes standing in for two 15 MB `Vec<f64>`.
+///
+/// (104, not the 88 this said before: the six `f64` of the projection, four more
+/// here, two `usize`, and three `bool` padded to the 8-byte alignment. The
+/// figure predated `alternating` and `wraps_longitude`.)
 ///
 /// HRRR CONUS is 1,905,141 points, so materialising the coordinates costs
 /// 30.5 MB per cached parameter and 61 MB at the peak of a parse (the pair
