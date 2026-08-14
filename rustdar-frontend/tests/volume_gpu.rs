@@ -60,8 +60,8 @@
 use egui_wgpu::wgpu;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::volume::raymarch::{
-    CoarseLevel, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
-    mirror_is_gamma_encoded,
+    CoarseLevel, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, GRID_BYTES_PER_CELL, GRID_MIP_LEVELS,
+    OffscreenTarget, VolumePipelines, mirror_is_gamma_encoded,
 };
 use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
 
@@ -2683,13 +2683,53 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 /// on a seventh, while every rung this test drives was in fact 512 B under. The
 /// margin was never checked, so nothing noticed.
 ///
-/// So the surplus is pinned exactly. It is
-/// `TEXTURE_ALLOCATION_SLACK_BYTES - 512`, one page of slack less the constant
-/// the driver adds to every `D3` image, and it is the same on every rung and
-/// both arms because that constant does not vary with the shape. Pinning it
-/// rather than bounding it is what makes this a measurement: a driver that
-/// started rounding differently, or a model that started naming the 512 B, moves
-/// this number and has to say so here.
+/// So the surplus is asserted too. **It is not one number**, and asserting that
+/// it was is what took this test red on CI: it was pinned at
+/// `TEXTURE_ALLOCATION_SLACK_BYTES - 512` — one page of slack less the constant
+/// an NVIDIA driver adds to every `D3` image — which is a property of *that
+/// vendor's layout* dressed up as a property of the charge. lavapipe runs
+/// 606,208 B over on the same rung and is not wrong to.
+///
+/// # Two layouts exist in the wild, so the layout is measured first
+///
+/// [`MipLayout`] is read off the device before any rung is charged, by naming a
+/// third mip level on a descriptor that already named two and seeing whether
+/// the reservation moves. Both readings below are from this campaign, same
+/// shape, `mip_level_count` swept 1 to 5:
+///
+/// | backend | 1 level | 2 | 3 | 4 | 5 |
+/// |---|---:|---:|---:|---:|---:|
+/// | RTX 3090, Vulkan 610.57.04 | 33,555,168 | 38,351,584 | 38,351,584 | 38,351,584 | 38,351,584 |
+/// | lavapipe, Mesa 26.1.6 | 33,554,480 | 37,748,776 | 38,273,064 | 38,338,600 | 38,346,792 |
+///
+/// So the charge's central assumption — a second level buys the whole pyramid,
+/// and past one the count stops mattering — is **NVIDIA's layout and not
+/// lavapipe's**. It is still the right thing to charge, because it is the
+/// larger of the two and this figure may only ever err upwards; what is wrong
+/// is asserting the *difference* as though it were fixed.
+///
+/// The surplus is therefore still pinned exactly, once per layout, which is
+/// what keeps this a measurement rather than a tolerance:
+///
+/// * [`MipLayout::WholePyramid`] — the model's arithmetic **is** the device's,
+///   so all that is left over is [`GRID_CHARGE_SURPLUS_BYTES`]. Uniform across
+///   shape, byte count and arm: twelve readings on the rungs below and twelve
+///   more on six further shapes swept down to 1×1×1, all 3,584.
+/// * [`MipLayout::NamedLevelsOnly`] — the device reserves the **payload of the
+///   levels the descriptor named**, exactly: no tiles, no per-image constant,
+///   nothing below them. That is asserted instead, and it pins the surplus just
+///   as tightly, at whatever the shape makes it: 4,096 B on a one-level
+///   descriptor and 81,920 B to 606,208 B on a two-level one.
+///
+/// What this arm deliberately does *not* do is bound `charged` against a
+/// tolerance. On a backend that does not tile, nothing about the device can
+/// bound the tile model — a 34-layer depth laid out as 48 is 41% of mip 0 that
+/// lavapipe simply does not reserve, and a bound loose enough to admit it would
+/// admit anything. The guard on the charge growing lives where it can run
+/// without an adapter: `volume::raymarch::tests::a_second_mip_level_is_charged_
+/// as_the_whole_pyramid` bounds it at 11/10 of the packed two levels and
+/// `a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip` pins the
+/// shipped shapes to the byte, on every target.
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_gpu \
@@ -2702,13 +2742,6 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
     use rustdar_frontend::volume::raymarch::grid_bytes_at;
     use rustdar_frontend::volume::raymarch::staging::VolumeStaging;
 
-    /// What every grid's charge runs over the driver's own figure: the 4,096 B
-    /// page `volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES` adds, less the
-    /// 512 B the driver adds to every `D3` image and the tile model does not
-    /// name. Constant across shape, byte count and mip level count — swept from
-    /// 1×1×1 to 256×256×128 — because neither term varies with any of them.
-    const GRID_CHARGE_SURPLUS_BYTES: u64 = 4096 - 512;
-
     let _serialised = gpu_lock();
     let (device, queue) = device();
     let Some(_) = device.generate_allocator_report() else {
@@ -2718,6 +2751,8 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
         );
         return;
     };
+    let layout = probe_mip_layout(&device, &queue);
+    eprintln!("mip layout on this device: {layout:?}");
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
 
     let reserved = |device: &wgpu::Device| -> u64 {
@@ -2771,18 +2806,35 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
             );
             eprintln!(
                 "{cells:?} {coarse:?}: reserved {actual}, charged {charged} \
-                 (+{} B)",
+                 (+{} B, {:.2}%)",
                 charged - actual,
+                100.0 * (charged - actual) as f64 / actual as f64,
             );
-            assert_eq!(
-                charged - actual,
-                GRID_CHARGE_SURPLUS_BYTES,
-                "{cells:?} {coarse:?}: the charge ran {} B over the device's \
-                 figure, not the {GRID_CHARGE_SURPLUS_BYTES} B every other rung \
-                 runs over — see `TEXTURE_ALLOCATION_SLACK_BYTES` for what that \
-                 surplus is made of",
-                charged - actual,
-            );
+            match layout {
+                MipLayout::WholePyramid => assert_eq!(
+                    charged - actual,
+                    GRID_CHARGE_SURPLUS_BYTES,
+                    "{cells:?} {coarse:?}: this device lays the whole pyramid \
+                     out, so the tile model and the device are counting the \
+                     same levels and the only thing between them is the page \
+                     and the per-image constant. The charge ran {} B over \
+                     instead — see `TEXTURE_ALLOCATION_SLACK_BYTES` for what \
+                     that surplus is made of",
+                    charged - actual,
+                ),
+                MipLayout::NamedLevelsOnly => assert_eq!(
+                    actual,
+                    named_level_payload(cells, coarse),
+                    "{cells:?} {coarse:?}: this device lays out only the levels \
+                     the descriptor names, and every such backend measured so \
+                     far reserves exactly their payload — no tiles, no \
+                     per-image constant. This one reserved {actual} B for a \
+                     payload of {} B, which is a third layout and means the \
+                     surplus has to be re-measured here. The charge is \
+                     {charged} B, still over, so nothing is unsafe",
+                    named_level_payload(cells, coarse),
+                ),
+            }
             checked += 1;
 
             // The drop is not the free: wgpu holds the texture until a
@@ -2794,6 +2846,152 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
         }
     }
     assert_eq!(checked, 12, "every rung and both coarse arms were measured");
+}
+
+/// What a grid's charge runs over the device's own figure on a
+/// [`MipLayout::WholePyramid`] backend: the 4,096 B page
+/// `volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES` adds, less the 512 B the
+/// driver adds to every `D3` image and the tile model does not name.
+///
+/// Constant across shape, byte count and mip level count — swept from 1×1×1 to
+/// 256×256×128 on an RTX 3090 — because neither term varies with any of them.
+///
+/// **Only on that layout.** Both halves are that vendor's: lavapipe adds no
+/// per-image constant, so its one-level descriptors run the full 4,096 B over,
+/// and its two-level ones run the uncounted pyramid over on top. See
+/// [`MipLayout`].
+const GRID_CHARGE_SURPLUS_BYTES: u64 = 4096 - 512;
+
+/// How a backend lays a mip-mapped `D3` image out — **two layouts exist in the
+/// wild**, and `volume::raymarch::grid_bytes_at` charges for the larger.
+///
+/// Which one a device uses is not knowable from the descriptor, so it is read
+/// off the device by [`probe_mip_layout`] rather than assumed. That is the
+/// difference between this test measuring the charge and it re-asserting one
+/// vendor's memory layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MipLayout {
+    /// Naming a second level reserves the **whole pyramid** down to 1×1×1,
+    /// whether or not anything ever writes to it — so past one level the count
+    /// stops mattering. Measured on an NVIDIA RTX 3090, Vulkan, driver
+    /// 610.57.04: identical reservations at `mip_level_count` 2 through 9.
+    ///
+    /// This is what the charge models, and it is the right one to model because
+    /// it is the larger.
+    WholePyramid,
+    /// Naming a second level reserves **those levels and nothing below them**,
+    /// so every further level named costs its own bytes. Measured on Mesa's
+    /// lavapipe (Mesa 26.1.6, LLVM 22.1.8) — which is the backend CI's `gpu`
+    /// job runs on, so this arm is the one every PR exercises.
+    ///
+    /// The charge over-states here, by 1.6% to 2.3% of a shipped grid. Safe,
+    /// and measured rather than inferred: see the frame-count finding on
+    /// `constants::VOLUME_LOOP_TEXTURE_BUDGET_BYTES`.
+    NamedLevelsOnly,
+}
+
+/// Read [`MipLayout`] off the device, by naming one more level than a
+/// descriptor already names and seeing whether the reservation moves.
+///
+/// The discriminator is a *threshold* rather than an equality because the same
+/// image measured twice on one device differs by up to 736 B according to
+/// whether the allocator gave it a fresh block or sub-allocated it. Level 2 of
+/// the probe shape is 65,536 B, so half of it is forty-four times that noise
+/// and there is nothing to tune. Measured: the two backends read so far come
+/// out at 0 B and 65,536 B of growth, one at each end.
+///
+/// The shape is a shipped rung (`constants::WASM_VOLUME_GRID_CELLS`) so that
+/// the probe cannot be measuring something the rungs below never do; 4 MiB,
+/// created twice and freed, once per process.
+fn probe_mip_layout(device: &wgpu::Device, queue: &wgpu::Queue) -> MipLayout {
+    use rustdar_frontend::volume::VOLUME_TEXTURE_FORMAT;
+
+    const PROBE_CELLS: [u32; 3] = [128, 128, 64];
+    const PROBE_LABEL: &str = "rustdar.volume.grid.miplayout.probe";
+
+    let reserved_at = |levels: u32| -> u64 {
+        let sum = |device: &wgpu::Device| -> u64 {
+            device
+                .generate_allocator_report()
+                .expect("the backend reported an allocator a moment ago")
+                .allocations
+                .iter()
+                .filter(|a| a.name == PROBE_LABEL)
+                .map(|a| a.size)
+                .sum()
+        };
+        let before = sum(device);
+        let probe = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(PROBE_LABEL),
+            size: wgpu::Extent3d {
+                width: PROBE_CELLS[0],
+                height: PROBE_CELLS[1],
+                depth_or_array_layers: PROBE_CELLS[2],
+            },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: VOLUME_TEXTURE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let got = sum(device) - before;
+        // Same as the rungs: the drop is not the free until a submission is
+        // triaged, and the second reading has to start from an empty report.
+        drop(probe);
+        queue.submit(None);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        got
+    };
+
+    let two = reserved_at(2);
+    let three = reserved_at(3);
+    // The payload of the level the third descriptor named and the second did
+    // not. A backend that lays out only what it is told grows by exactly this.
+    let level_two_payload: u64 = PROBE_CELLS
+        .iter()
+        .map(|&n| (n >> 2).max(1) as u64)
+        .product::<u64>()
+        * u64::from(GRID_BYTES_PER_CELL);
+    eprintln!(
+        "mip layout probe {PROBE_CELLS:?}: 2 levels reserved {two} B, 3 levels \
+         reserved {three} B, level 2 is {level_two_payload} B of payload"
+    );
+    if three.saturating_sub(two) < level_two_payload / 2 {
+        MipLayout::WholePyramid
+    } else {
+        MipLayout::NamedLevelsOnly
+    }
+}
+
+/// The payload of the mip levels a grid's descriptor names, packed: no tiles
+/// and no per-image constant.
+///
+/// The floor under any device's reservation — it has to store those texels —
+/// and, on a [`MipLayout::NamedLevelsOnly`] backend, measured to be the whole
+/// of it.
+///
+/// Deliberately its own arithmetic rather than a call into
+/// `volume::raymarch`: a figure the code under test computed would move with it,
+/// and there would be nothing left to compare. Only the *level count* is read
+/// from the crate ([`GRID_MIP_LEVELS`], through the same guard `grid_mip_levels`
+/// applies) — that is the descriptor's own field and asserting a stale copy of
+/// it would be asserting the wrong descriptor.
+fn named_level_payload(cells: [u32; 3], coarse: CoarseLevel) -> u64 {
+    let levels = if coarse == CoarseLevel::Built && cells.iter().copied().max().unwrap_or(0) >= 2 {
+        GRID_MIP_LEVELS
+    } else {
+        1
+    };
+    (0..levels)
+        .map(|level| {
+            cells
+                .iter()
+                .map(|&n| u64::from((n >> level).max(1)))
+                .product::<u64>()
+                * u64::from(GRID_BYTES_PER_CELL)
+        })
+        .sum()
 }
 
 /// **Every pixel of a frame composites the floor on the same arm.**
