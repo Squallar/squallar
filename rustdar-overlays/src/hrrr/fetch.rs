@@ -224,6 +224,28 @@ fn exactly_one_submessage(count: usize) -> Result<(), String> {
 /// be written in a second longitude frame.
 const VALIDATED_DOMAIN_LON: std::ops::RangeInclusive<f64> = -140.0..=-50.0;
 
+/// Marks [`check_domain_longitude`]'s refusal so [`classify_parse_error`] can
+/// tell it apart from a genuine decode failure.
+///
+/// A string rather than a typed error only because `parse_grib2` reports every
+/// other fault as one too; the coupling is pinned by
+/// `the_domain_refusal_is_classified_permanent` rather than left to a reader
+/// noticing both ends.
+const DOMAIN_REFUSAL_MARK: &str = "unsupported model domain";
+
+/// A `parse_grib2` error, classified for the retry ladder.
+///
+/// Everything `parse_grib2` rejects is transient — a truncated or mis-ranged
+/// record is worth another go — *except* a domain the renderer cannot place,
+/// which will be exactly as unplaceable next time.
+fn classify_parse_error(message: String) -> FetchError {
+    if message.contains(DOMAIN_REFUSAL_MARK) {
+        FetchError::permanent(message)
+    } else {
+        FetchError::transient(message)
+    }
+}
+
 /// Refuse a model domain whose longitude the renderer has never been shown to
 /// place correctly — and say what decision the refusal is asking for.
 ///
@@ -236,6 +258,12 @@ const VALIDATED_DOMAIN_LON: std::ops::RangeInclusive<f64> = -140.0..=-50.0;
 ///
 /// It is deliberately a refusal and not a log line: a warning nobody can act
 /// on is a defect, and this one has exactly one reader, who is mid-change.
+///
+/// The refusal carries [`DOMAIN_REFUSAL_MARK`] so the fetch layer can classify
+/// it [`FetchFailure::Permanent`]. A domain does not become placeable by being
+/// asked for again, and the default for a parse error here is `Transient` —
+/// which would retry a configuration mistake on the backoff ladder forever and
+/// present it as though the network were at fault.
 fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
     // `min > max` and not just `!is_finite`: the bounds walk above seeds
     // `min_lon` at `f64::MAX` and `max_lon` at `f64::MIN`, and both of those
@@ -257,9 +285,9 @@ fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "Model domain spans longitude {:.4}..{:.4}, outside the {:.1}..{:.1} \
-         envelope the renderer's longitude handling has been validated for \
-         (HRRR CONUS is -134.0955..-60.9172).\n\
+        "{DOMAIN_REFUSAL_MARK}: spans longitude {:.4}..{:.4}, outside the \
+         {:.1}..{:.1} envelope the renderer's longitude handling has been \
+         validated for (HRRR CONUS is -134.0955..-60.9172).\n\
          \n\
          This is not a decode failure — the grid decoded fine. The parse side \
          folds longitude into [-180,180] (`lambert::normalize_longitude_degrees`) \
@@ -591,7 +619,7 @@ async fn try_fetch(
     .await?;
     // A decode failure is transient by the module's own rule: a truncated body
     // and a changed product encoding are indistinguishable from one sample.
-    parse_grib2(&bytes, *param).map_err(FetchError::transient)
+    parse_grib2(&bytes, *param).map_err(classify_parse_error)
 }
 
 /// Fetch a composite HRRR parameter (e.g. bulk shear) that requires
@@ -654,7 +682,7 @@ async fn try_fetch_composite(
             level,
         )
         .await?;
-        grids.push(parse_grib2(&bytes, *param).map_err(FetchError::transient)?);
+        grids.push(parse_grib2(&bytes, *param).map_err(classify_parse_error)?);
     }
 
     if grids.len() < 2 {
