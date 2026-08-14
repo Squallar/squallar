@@ -342,6 +342,17 @@ fn grib_section(number: u8, body: &[u8]) -> Vec<u8> {
 /// not `ni * nj` — so any value but [`SYNTHETIC_POINTS`] gives a message
 /// well-formed everywhere except the count [`check_point_count`] guards.
 fn synthetic_lambert_grib2(declared_points: u32) -> Vec<u8> {
+    // HRRR's own central meridian, 262.5 = -97.5.
+    synthetic_lambert_grib2_at(declared_points, 262_500_000)
+}
+
+/// [`synthetic_lambert_grib2`] with the domain moved.
+///
+/// `lon0` is written to **both** `Lo1` and `LoV`, in microdegrees, so the grid
+/// always sits on its own central meridian. Moving only the first point would
+/// put the domain outside the cone's principal sector and the message would be
+/// refused for that instead — a different fault wearing the same message.
+fn synthetic_lambert_grib2_at(declared_points: u32, lon0: u32) -> Vec<u8> {
     // Section 1 — identification.
     let mut sect1 = Vec::new();
     sect1.extend_from_slice(&7u16.to_be_bytes()); // centre: NCEP
@@ -372,10 +383,10 @@ fn synthetic_lambert_grib2(declared_points: u32) -> Vec<u8> {
     sect3.extend_from_slice(&SYNTHETIC_NI.to_be_bytes());
     sect3.extend_from_slice(&SYNTHETIC_NJ.to_be_bytes());
     sect3.extend_from_slice(&38_500_000i32.to_be_bytes()); // La1
-    sect3.extend_from_slice(&262_500_000u32.to_be_bytes()); // Lo1
+    sect3.extend_from_slice(&lon0.to_be_bytes()); // Lo1
     sect3.push(0b0000_1000); // resolution and component flags
     sect3.extend_from_slice(&38_500_000i32.to_be_bytes()); // LaD
-    sect3.extend_from_slice(&262_500_000u32.to_be_bytes()); // LoV
+    sect3.extend_from_slice(&lon0.to_be_bytes()); // LoV
     sect3.extend_from_slice(&3_000_000u32.to_be_bytes()); // Dx, mm
     sect3.extend_from_slice(&3_000_000u32.to_be_bytes()); // Dy, mm
     sect3.push(0); // projection centre: north pole, one cone
@@ -927,4 +938,166 @@ fn a_two_run_round_is_refused_only_when_both_runs_were() {
             expected,
         );
     }
+}
+
+// ── The domain envelope guard ────────────────────────────────────────────
+//
+// `check_domain_longitude` exists so that "the renderer assumes a
+// non-straddling domain" stops being a fact only a campaign record knows.
+// These pin both halves of it: that today's domain passes, and that the
+// shapes which would mis-render are refused with the decision attached.
+
+/// The operational domain passes, and passes with room to spare.
+///
+/// Without this the guard could be tightened to nothing and no test would
+/// notice — a refusal that refuses everything is not a guard, it is an outage.
+#[test]
+fn the_conus_domain_the_app_actually_fetches_is_accepted() {
+    // Corner-verified HRRR CONUS, from `hrrr::lambert::tests`.
+    let conus = GeoBounds {
+        min_lat: 21.1,
+        max_lat: 52.7,
+        min_lon: -134.0955,
+        max_lon: -60.9172,
+    };
+    assert!(
+        check_domain_longitude(&conus).is_ok(),
+        "the only domain the app fetches must not be refused"
+    );
+    // And the margin is real, not incidental: CONUS clears the near edge of
+    // the envelope by ~6 deg and the antimeridian by ~46 deg.
+    assert!(conus.min_lon - *VALIDATED_DOMAIN_LON.start() > 5.0);
+    assert!(180.0 - conus.min_lon.abs() > 40.0);
+}
+
+/// A domain east of the antimeridian is refused — the Guam/western-Aleutians
+/// shape, where every longitude is positive and a turn from the viewport.
+#[test]
+fn an_east_hemisphere_domain_is_refused() {
+    let seam_parked = GeoBounds {
+        min_lat: 30.0,
+        max_lat: 33.0,
+        min_lon: 173.4773,
+        max_lon: 176.7655,
+    };
+    let err = check_domain_longitude(&seam_parked).expect_err("must refuse");
+    assert!(
+        err.contains("173.4773"),
+        "the message must name the extent it saw"
+    );
+}
+
+/// A domain straddling the antimeridian is refused. Folded, its extreme
+/// longitudes sit at both ends of the range, so this is also the shape for
+/// which the rigid whole-grid shift would be the *wrong* repair.
+#[test]
+fn a_straddling_domain_is_refused() {
+    let straddling = GeoBounds {
+        min_lat: 50.0,
+        max_lat: 55.0,
+        min_lon: -179.8,
+        max_lon: 179.6,
+    };
+    assert!(check_domain_longitude(&straddling).is_err());
+}
+
+/// The refusal has to carry the decision, not just the fact. This is the
+/// whole point of putting the guard at the fetch and not at the render: the
+/// reader is mid-change and can act, so the message owes them the options and
+/// the evidence.
+#[test]
+fn the_refusal_names_the_decision_and_where_the_evidence_is() {
+    let err = check_domain_longitude(&GeoBounds {
+        min_lat: 50.0,
+        max_lat: 55.0,
+        min_lon: 170.0,
+        max_lon: 178.0,
+    })
+    .expect_err("must refuse");
+
+    for owed in [
+        // that it is not a decode bug
+        "not a decode failure",
+        // the measurement, so the cost is a number and not an adjective
+        "3294",
+        // each of the three candidate repairs
+        "rigid whole-grid shift",
+        "per-point shift",
+        "wraps_longitude",
+        // why the per-point one is not free
+        "neighbours' pixel spacing",
+        // where the evidence lives
+        "campaigns/overlays/t17/",
+        // and what not to do on the way past
+        "VALIDATED_DOMAIN_LON",
+    ] {
+        assert!(
+            err.contains(owed),
+            "the refusal must mention {owed:?}; it said:\n{err}"
+        );
+    }
+}
+
+/// A grid whose coordinates could not be walked reports *that*, rather than
+/// being dressed up as a domain problem it is not.
+///
+/// The sentinel is the one `parse_grib2`'s own bounds walk leaves behind, and
+/// it is the interesting case precisely because `f64::MAX` is finite: an
+/// `is_finite` test alone passes it straight through to the domain message,
+/// which then quotes a 309-digit longitude and blames the wrong thing. This
+/// test caught exactly that.
+#[test]
+fn an_unwalkable_extent_is_refused_as_itself() {
+    let err = check_domain_longitude(&GeoBounds {
+        min_lat: 0.0,
+        max_lat: 0.0,
+        min_lon: f64::MAX,
+        max_lon: f64::MIN,
+    })
+    .expect_err("must refuse");
+    assert!(
+        err.contains("inverted"),
+        "a sentinel extent must not be reported as a straddling domain; it said:\n{err}"
+    );
+    assert!(
+        !err.contains("campaigns/overlays/t17/"),
+        "a decode failure must not send the reader to the domain decision"
+    );
+}
+
+/// The guard is actually *wired into* `parse_grib2`, not merely present.
+///
+/// The tests above call `check_domain_longitude` directly, so deleting its
+/// one call site would leave every one of them green while the guard stopped
+/// running. This drives a whole synthetic GRIB2 message — identical to the
+/// one `a_synthetic_lambert_message_decodes_through_the_real_parse_path`
+/// decodes successfully, moved to 179 E — through the real parse path, and
+/// so fails if the call site goes.
+///
+/// That paired construction is the point: the CONUS spelling of this message
+/// is *known* to decode, so the `Err` here can only be the domain check.
+#[test]
+fn parse_grib2_refuses_a_domain_outside_the_validated_envelope() {
+    // The control: same builder, HRRR's own meridian, decodes fine.
+    let conus = synthetic_lambert_grib2(SYNTHETIC_POINTS);
+    assert!(
+        parse_grib2(&conus, ModelParameter::SurfaceBasedCin).is_ok(),
+        "the CONUS spelling must still decode, or this test proves nothing"
+    );
+
+    // The same message parked at 179 E, a hair east of the antimeridian.
+    let pacific = synthetic_lambert_grib2_at(SYNTHETIC_POINTS, 179_000_000);
+    let err = parse_grib2(&pacific, ModelParameter::SurfaceBasedCin)
+        .expect_err("a domain at 179 E must be refused by parse_grib2 itself");
+
+    assert!(
+        err.contains("outside the -140.0..-50.0 envelope"),
+        "the refusal must be the domain check and not some other decode \
+         failure; it said:\n{err}"
+    );
+    assert!(
+        err.contains("campaigns/overlays/t17/"),
+        "reached through the real parse path, the refusal must still carry \
+         the decision; it said:\n{err}"
+    );
 }
