@@ -57,6 +57,8 @@ fn the_resolver_reproduces_every_shipped_constant() {
     let expected = [
         Budgets {
             name: "wasm32",
+            promotion: Promotion::Floor,
+            steps_back: 0,
             image_side_px: WASM_IMAGE_SIZE,
             long_range_image_side_px: WASM_LONG_RANGE_IMAGE_SIZE,
             loop_image_side_px: WASM_LOOP_IMAGE_SIZE,
@@ -80,6 +82,8 @@ fn the_resolver_reproduces_every_shipped_constant() {
         },
         Budgets {
             name: "mobile",
+            promotion: Promotion::Floor,
+            steps_back: 0,
             image_side_px: NATIVE_IMAGE_SIZE,
             long_range_image_side_px: MOBILE_LONG_RANGE_IMAGE_SIZE,
             loop_image_side_px: MOBILE_LOOP_IMAGE_SIZE,
@@ -103,6 +107,8 @@ fn the_resolver_reproduces_every_shipped_constant() {
         },
         Budgets {
             name: "desktop",
+            promotion: Promotion::Floor,
+            steps_back: 0,
             image_side_px: NATIVE_IMAGE_SIZE,
             long_range_image_side_px: DESKTOP_LONG_RANGE_IMAGE_SIZE,
             loop_image_side_px: DESKTOP_LOOP_IMAGE_SIZE,
@@ -181,8 +187,9 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
 /// The limits an adapter might really report, as `(2D, 3D)` pairs.
 ///
 /// The first four are spec floors and round numbers. The last two are
-/// **measured on real machines** and are recorded here rather than spent: no
-/// bracket is cut against them yet, and doing so is a separate, later decision.
+/// **measured on real machines**, and they are now *spent*: their componentwise
+/// minimum is `DESKTOP_CLASS_REPORT`, the line a browser has to clear to be
+/// promoted off the web floor.
 ///
 /// | row | machine | 2D reported | 2D allocatable | 3D | `EXT_texture_norm16` |
 /// |---|---|---|---|---|---|
@@ -229,7 +236,8 @@ fn synthetic_profiles() -> Vec<DeviceProfile> {
                     for memo in [
                         None,
                         Some(BudgetMemo {
-                            loop_pool_bytes: limits.loop_pool_bytes.floor,
+                            loop_pool_bytes: Some(limits.loop_pool_bytes.floor),
+                            steps_back: 0,
                         }),
                     ] {
                         out.push(DeviceProfile {
@@ -353,7 +361,7 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         );
     }
     assert_eq!(
-        b.quality_ceiling.capped_by(limits.quality_ceiling),
+        b.quality_ceiling.capped_by(limits.quality_ceiling.ceiling),
         b.quality_ceiling,
         "{from} / {}: the resolved quality ceiling is above the bracket's",
         b.name,
@@ -386,6 +394,38 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         b.name,
         b.grid_cells,
         b.volume_texture_bytes,
+    );
+
+    // **One live 3D grid beside a looping one, at every grid size a promotion
+    // can reach.** The never-degrade rule `LoopPool::plan` already subtracts a
+    // grid for, and the one a promotion is most likely to break: a grid that
+    // grew without the store growing under it means `enforce_budget` evicts the
+    // loop's own frame 0, which the dispatcher re-plans at ~89 ms of resample,
+    // for ever. The bound is the store's own floor — `volume_loop_bytes` —
+    // because that is what `App::setup_egui_frame` floors the eviction at
+    // whatever the pool has already promised the raster loops beside it.
+    let live_beside_a_loop = (crate::constants::MIN_LOOP_FRAMES_PER_PANE + 1) * grid;
+    assert!(
+        live_beside_a_loop <= b.volume_loop_bytes(),
+        "{from} / {}: a loop at the {}-frame minimum plus one live grid is {} \
+         MiB of {:?} grids against a {} MiB store floor",
+        b.name,
+        crate::constants::MIN_LOOP_FRAMES_PER_PANE,
+        live_beside_a_loop / (1024 * 1024),
+        b.grid_cells,
+        b.volume_loop_bytes() / (1024 * 1024),
+    );
+
+    // The raster ceiling is a ceiling and never a *regression*: whatever a
+    // promotion or a back-off did to it, a plan view may still reach the size
+    // this build drew before any device was asked.
+    assert!(
+        b.raster_side_ceiling_px >= b.long_range_image_side_px,
+        "{from} / {}: a {} px raster ceiling is below the {} px this build \
+         already draws",
+        b.name,
+        b.raster_side_ceiling_px,
+        b.long_range_image_side_px,
     );
 
     // A device is never asked for an axis it did not say it could hold, and
@@ -597,7 +637,12 @@ fn a_random_sweep_of_profiles_satisfies_every_invariant() {
             memo: match rng.next() % 2 {
                 0 => None,
                 _ => Some(BudgetMemo {
-                    loop_pool_bytes: rng.in_range(0, 8u64 << 30) as usize,
+                    loop_pool_bytes: Some(rng.in_range(0, 8u64 << 30) as usize),
+                    // Every rung of the ladder, including counts far past what
+                    // `volume::degrade` lets a session reach: `demote` has to be
+                    // total, and a memo written by a later build is data this
+                    // one has to survive rather than trust.
+                    steps_back: rng.in_range(0, 12) as u32,
                 }),
             },
             ..shipped_profile(limits)
@@ -707,4 +752,337 @@ fn a_vcp_change_moves_the_frame_count_between_the_two_cadences() {
             );
         }
     }
+}
+
+/// **A desktop browser and a phone browser stop getting the same answer.**
+///
+/// The headline of this stage, stated as the two rows a `cfg` cascade cannot
+/// tell apart at all: same binary, same origin, same WebGL2 backend, same
+/// `DeviceClass::Unknown`, and the *only* thing between them is what the
+/// adapter reports.
+///
+/// The phone row is deliberately not a measurement — this project has no phone
+/// browser reading, and inventing one would be the scaled figure it forbids. It
+/// is the **WebGL2 guarantee**, which is what the web budgets were derived from
+/// in the first place, so what this asserts is the honest claim: a browser that
+/// reports no more than the spec floor keeps every byte it had, and a browser
+/// that reports what a measured desktop machine reported does not.
+#[test]
+fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
+    let web = |two_d: u32, three_d: u32| DeviceProfile {
+        adapter: AdapterCeilings {
+            max_texture_dimension_2d: two_d,
+            max_texture_dimension_3d: three_d,
+        },
+        ..shipped_profile(BudgetLimits::WASM)
+    };
+    let at_the_guarantee = web(
+        AdapterCeilings::WEBGL2_GUARANTEE.max_texture_dimension_2d,
+        AdapterCeilings::WEBGL2_GUARANTEE.max_texture_dimension_3d,
+    );
+    let desktop_class = web(
+        DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
+        DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
+    );
+
+    let floor = resolve(&at_the_guarantee);
+    let promoted = resolve(&desktop_class);
+    assert_eq!(floor.promotion, Promotion::Floor);
+    assert_eq!(promoted.promotion, Promotion::Ceiling);
+    assert_eq!(
+        floor,
+        resolve(&shipped_profile(BudgetLimits::WASM)),
+        "a browser at the guarantee got something other than the shipped \
+         wasm32 configuration",
+    );
+
+    // What the promotion actually buys, named rather than implied.
+    let floor_cells: usize = floor.grid_cells.iter().map(|&n| n as usize).product();
+    let promoted_cells: usize = promoted.grid_cells.iter().map(|&n| n as usize).product();
+    assert!(
+        promoted_cells > floor_cells,
+        "a browser reporting a measured desktop machine's figures was handed \
+         the same {floor_cells} cells as one reporting the spec floor — which \
+         is the complaint this stage exists to answer",
+    );
+    assert_eq!(
+        promoted.grid_cells,
+        crate::constants::MOBILE_VOLUME_GRID_CELLS,
+        "the web ceiling is the mobile tier, which is what bounds the cost of \
+         getting this wrong: a handheld browser that reports desktop-class \
+         figures is handed a budget handheld hardware already runs",
+    );
+    // And the pool it is divided out of moves with it, on the same rung.
+    let pool = |b: &Budgets, p: Promotion| {
+        crate::loop_pool::LoopPool::for_promotion(
+            p,
+            None,
+            crate::loop_pool::LoopPoolLimits::from_budgets(b),
+        )
+        .bytes()
+    };
+    assert!(
+        pool(&promoted, promoted.promotion) > pool(&floor, floor.promotion),
+        "a promoted browser's grids came out of an unpromoted pool, so the \
+         loop pays for the detail in history",
+    );
+
+    // Neither is promoted past the bracket, and both satisfy every invariant.
+    for profile in [&at_the_guarantee, &desktop_class] {
+        check_invariants(profile, "browser separation");
+    }
+}
+
+/// **A software rasteriser is never promoted, whatever it reports.**
+///
+/// The one class where the reported ceilings say nothing worth having: llvmpipe
+/// will advertise 16384 and then take seconds a frame. `quality::select`
+/// already puts it at the bottom of its own ladder, and this is the same
+/// judgement applied to the budgets.
+#[test]
+fn a_software_rasteriser_is_not_promoted_by_what_it_reports() {
+    let profile = DeviceProfile {
+        class: DeviceClass::Software,
+        adapter: AdapterCeilings {
+            max_texture_dimension_2d: 32768,
+            max_texture_dimension_3d: 16384,
+        },
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    assert_eq!(resolve(&profile).promotion, Promotion::Floor);
+    assert_eq!(
+        resolve(&profile),
+        resolve(&shipped_profile(BudgetLimits::DESKTOP)),
+        "a software rasteriser was handed a discrete GPU's budgets",
+    );
+}
+
+/// **The discrete desktop GPU stops eating the compromise it was still eating.**
+///
+/// Named in the one unit that matters to the user: what a maximised 4K pane is
+/// allowed to cost. Before this, 20 MiB paid for the 2560 x 1440 reference pane
+/// at `Native` and nothing larger, so a 3840 x 2160 pane on a card with 24576
+/// MiB of measured VRAM was rendered at half resolution and upscaled by the
+/// blit.
+#[test]
+fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
+    use crate::volume::quality::{ResolutionRung, VolumeQuality};
+
+    const FOUR_K: [u32; 2] = [3840, 2160];
+    let unpromoted = resolve(&shipped_profile(BudgetLimits::DESKTOP));
+    let discrete = resolve(&DeviceProfile {
+        class: DeviceClass::Discrete,
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    });
+    assert_eq!(discrete.promotion, Promotion::Ceiling);
+
+    let before = VolumeQuality::BEST.fit(FOUR_K, unpromoted.offscreen_bytes);
+    let after = VolumeQuality::BEST.fit(FOUR_K, discrete.offscreen_bytes);
+    assert_eq!(
+        before.quality.resolution,
+        ResolutionRung::Half,
+        "precondition: the shipped desktop budget steps a 4K pane down",
+    );
+    assert_eq!(
+        after.quality.resolution,
+        ResolutionRung::Native,
+        "a discrete GPU still cannot render a 4K pane at native resolution, \
+         which is the compromise this stage is for",
+    );
+    assert_eq!(after.size, FOUR_K);
+    // And the sum still holds with six of them budgeted at once.
+    check_invariants(
+        &DeviceProfile {
+            class: DeviceClass::Discrete,
+            ..shipped_profile(BudgetLimits::DESKTOP)
+        },
+        "discrete desktop",
+    );
+
+    // An integrated desktop GPU is left exactly where it was, and that is the
+    // measurement's answer rather than an omission: the same cost model puts it
+    // at 12-23 ms for a *1440 x 900* pane.
+    let integrated = resolve(&DeviceProfile {
+        class: DeviceClass::Integrated,
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    });
+    assert_eq!(integrated.promotion, Promotion::Step);
+    assert_eq!(integrated.offscreen_bytes, unpromoted.offscreen_bytes);
+}
+
+/// **Every arm of the mobile bracket is pinned, and it is pinned on purpose.**
+///
+/// aarch64 is three of five targets and is entirely unmeasured from here. This
+/// test is the standing note in executable form: if somebody unpins a mobile
+/// rung, they have to come and delete this and say what they measured.
+#[test]
+fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
+    let pinned = |b: Bracket| b.floor == b.step && b.step == b.ceiling;
+    let limits = BudgetLimits::MOBILE;
+    assert!(pinned(limits.offscreen_bytes));
+    assert!(pinned(limits.volume_texture_bytes));
+    assert!(pinned(limits.app_texture_ceiling_bytes));
+    assert_eq!(limits.grid_cells.floor, limits.grid_cells.ceiling);
+    for class in CLASSES {
+        let profile = DeviceProfile {
+            class,
+            adapter: AdapterCeilings {
+                max_texture_dimension_2d: 32768,
+                max_texture_dimension_3d: 16384,
+            },
+            ..shipped_profile(BudgetLimits::MOBILE)
+        };
+        assert_eq!(
+            resolve(&profile),
+            Budgets {
+                // The rung is still *resolved* — a pinned bracket is a bracket
+                // with nothing to spend it on, not a signal that was ignored —
+                // so the claim is that every field came out the same, whatever
+                // rung this class earned.
+                promotion: profile.promotion(),
+                ..resolve(&shipped_profile(BudgetLimits::MOBILE))
+            },
+            "a {class:?} adapter moved a mobile budget, on a target nobody has \
+             run this on",
+        );
+    }
+}
+
+/// **The ladder is ordered, and lighting goes first.**
+///
+/// The order is the plan's, and it is the order the measurements argue for: the
+/// cloud rung is 0.766 ms dense against 0.263 for the flat march, which is the
+/// cheapest large saving in the application and the one a user is least likely
+/// to be able to name. Resolution is next, and the picture itself gets coarser
+/// only after both.
+#[test]
+fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
+    use crate::volume::quality::{GradientShading, ResolutionRung};
+
+    let stepped = |steps: u32| {
+        resolve(&DeviceProfile {
+            class: DeviceClass::Discrete,
+            memo: Some(BudgetMemo {
+                loop_pool_bytes: None,
+                steps_back: steps,
+            }),
+            ..shipped_profile(BudgetLimits::DESKTOP)
+        })
+    };
+    let top = stepped(0);
+    assert_eq!(top.quality_ceiling.shading, GradientShading::On);
+    assert_eq!(top.quality_ceiling.resolution, ResolutionRung::Native);
+
+    // 1: lighting, and nothing else.
+    let one = stepped(1);
+    assert_eq!(one.quality_ceiling.shading, GradientShading::Off);
+    assert_eq!(one.quality_ceiling.resolution, ResolutionRung::Native);
+    assert_eq!(one.offscreen_bytes, top.offscreen_bytes);
+    assert_eq!(one.grid_cells, top.grid_cells);
+
+    // 2: the offscreen, both the rung and the budget that enforces it.
+    let two = stepped(2);
+    assert_eq!(two.quality_ceiling.resolution, ResolutionRung::Half);
+    assert_eq!(
+        two.offscreen_bytes,
+        BudgetLimits::DESKTOP.offscreen_bytes.floor
+    );
+    assert_eq!(two.grid_cells, top.grid_cells);
+    assert_eq!(two.raster_side_ceiling_px, top.raster_side_ceiling_px);
+
+    // The picture's own resolution is late, and the raster side is last.
+    let deep = stepped(9);
+    assert_eq!(deep.grid_cells, BudgetLimits::DESKTOP.grid_cells.floor);
+    assert_eq!(
+        deep.raster_side_ceiling_px,
+        BudgetLimits::DESKTOP.long_range_image_side_px.floor,
+    );
+}
+
+/// **A machine that keeps failing lands on the configuration this build already
+/// shipped it, and stops.**
+///
+/// The floor is a decision, not a limit that happens to be reached: below it
+/// the answer is not a smaller budget, it is `volume::degrade` retiring the 3D
+/// view, which latches after two surface losses and is a different mechanism.
+/// So the ladder has to be *total* — any number of steps, on any bracket, still
+/// resolves inside the bracket.
+#[test]
+fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
+    for limits in BudgetLimits::SHIPPED {
+        let unreadable = resolve(&shipped_profile(limits));
+        for steps in [0u32, 1, 2, 3, 4, 5, 8, 64, u32::MAX / 2] {
+            // Capped so the test itself stays quick; `demote` loops per step.
+            let steps = steps.min(64);
+            let profile = DeviceProfile {
+                class: DeviceClass::Discrete,
+                adapter: AdapterCeilings {
+                    max_texture_dimension_2d: 32768,
+                    max_texture_dimension_3d: 16384,
+                },
+                memo: Some(BudgetMemo {
+                    loop_pool_bytes: None,
+                    steps_back: steps,
+                }),
+                ..shipped_profile(limits)
+            };
+            check_invariants(&profile, &format!("{steps} steps back"));
+            let b = resolve(&profile);
+            assert!(
+                b.offscreen_bytes >= limits.offscreen_bytes.floor
+                    && b.grid_cells == limits.grid_cells.at(Promotion::Floor)
+                    || steps < 3,
+                "{}: {steps} steps took the grid off its floor",
+                b.name,
+            );
+            if steps >= 4 {
+                // Everything this ladder owns is at its stop, and what is left
+                // is the same configuration a device that said nothing got.
+                assert_eq!(b.offscreen_bytes, unreadable.offscreen_bytes);
+                assert_eq!(b.grid_cells, unreadable.grid_cells);
+                assert_eq!(b.volume_texture_bytes, unreadable.volume_texture_bytes);
+                assert_eq!(
+                    b.app_texture_ceiling_bytes,
+                    unreadable.app_texture_ceiling_bytes,
+                );
+            }
+        }
+    }
+}
+
+/// **What a machine learned by crashing survives the restart, and reads back as
+/// the same budgets.**
+///
+/// The 1:1 reopen rule, on the one value that must not be lost to the 3 s
+/// autosave timer. A decimal count of rungs in its own key, so a corrupt entry
+/// costs one integer rather than every setting on the next load — and an
+/// unreadable one is the same answer a first launch gets.
+#[test]
+fn a_ladder_position_survives_its_own_config_entry() {
+    use rustdar_egui::config_store::MemoryConfigStore;
+
+    let store = MemoryConfigStore::default();
+    assert_eq!(remembered_steps(Some(&store)), None, "nothing learned yet");
+
+    remember_steps(Some(&store), 2);
+    assert_eq!(remembered_steps(Some(&store)), Some(2));
+    assert_eq!(store.load(BUDGET_MEMO_KEY).as_deref(), Some("2"));
+
+    let reopened = DeviceProfile {
+        class: DeviceClass::Discrete,
+        memo: Some(BudgetMemo {
+            loop_pool_bytes: None,
+            steps_back: remembered_steps(Some(&store)).unwrap_or(0),
+        }),
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    assert_eq!(resolve(&reopened).steps_back, 2);
+
+    // Anything unreadable is a re-probe rather than a panic or a zero written
+    // over the top of what the machine actually said.
+    store
+        .store(BUDGET_MEMO_KEY, "not a number")
+        .expect("the memory store cannot fail");
+    assert_eq!(remembered_steps(Some(&store)), None);
+    assert_eq!(remembered_steps(None), None);
 }

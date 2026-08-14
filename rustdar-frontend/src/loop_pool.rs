@@ -171,7 +171,7 @@
 //! re-probe, and a user who had backed off would see a different loop length
 //! every start.
 
-use crate::budget::Budgets;
+use crate::budget::{Budgets, Promotion};
 use crate::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
     LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
@@ -441,13 +441,36 @@ impl LoopPool {
         remembered: Option<usize>,
         limits: LoopPoolLimits,
     ) -> Self {
+        Self::for_promotion(Promotion::for_class(class), remembered, limits)
+    }
+
+    /// The same, at the [`Promotion`] the whole budget set was resolved at.
+    ///
+    /// **The arm the application takes, and the one that fixes the browser.**
+    /// The class is the only signal [`Self::for_device`] has, and on the web it
+    /// says `Unknown` whatever the silicon is — so a desktop browser and a
+    /// phone browser both took the floor, which is one half of the complaint
+    /// this stage answers. `crate::budget::DeviceProfile::promotion` folds the
+    /// adapter's own reported ceilings in beside the class, so a browser that
+    /// reports desktop-class figures reaches this ceiling on exactly the rung
+    /// every other budget it gets was resolved at, and one that does not is
+    /// left where it was.
+    ///
+    /// Nothing native moves: `Promotion::for_class` reproduces the arms above
+    /// exactly, so a `Discrete` adapter took the ceiling before and takes it
+    /// now, and an `Integrated` one took a doubling and takes a doubling.
+    pub fn for_promotion(
+        promotion: Promotion,
+        remembered: Option<usize>,
+        limits: LoopPoolLimits,
+    ) -> Self {
         if let Some(bytes) = remembered {
             return Self::new(bytes, limits);
         }
-        let bytes = match class {
-            DeviceClass::Discrete => limits.ceiling,
-            DeviceClass::Integrated => limits.floor.saturating_mul(2),
-            DeviceClass::Virtual | DeviceClass::Unknown | DeviceClass::Software => limits.floor,
+        let bytes = match promotion {
+            Promotion::Ceiling => limits.ceiling,
+            Promotion::Step => limits.floor.saturating_mul(2),
+            Promotion::Floor => limits.floor,
         };
         Self::new(bytes, limits)
     }

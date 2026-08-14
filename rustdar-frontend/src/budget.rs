@@ -24,21 +24,39 @@
 //!   body and no globals, so all three shipped configurations and every
 //!   synthetic one in between are reachable from a single host test run.
 //!
-//! # What it does *today*: nothing, exactly
+//! # What it does: spends a [`Promotion`], and only ever upward from the floor
 //!
-//! [`resolve`] takes each field's floor. The brackets are populated from the
-//! shipped constants, so the floor **is** the constant on every arm, and
-//! `the_resolver_reproduces_every_shipped_constant` puts the two side by side
-//! field for field. That is the whole point of landing this step on its own: the
-//! app stops reading nineteen `cfg` cascades and starts reading one struct, and
-//! not a byte moves. What is gained is that every arm of every budget is now
-//! exercised by the host test run instead of one of three, and that the app is
-//! one constructor argument away from being device-aware.
+//! A device that says nothing about itself still takes every floor, and the
+//! floors are the shipped constants — `the_resolver_reproduces_every_shipped_constant`
+//! puts the two side by side field for field, so a machine this build cannot
+//! read gets exactly what it got before any of this existed.
 //!
-//! Making a field leave its floor — promoting a discrete GPU's grid, promoting a
-//! browser that reports 16384 rather than the 2048 WebGL2 guarantees — is the
-//! *next* step and is a change in behaviour that has to be argued on its own.
-//! `docs/cross-platform-resource-limits.md` is where that argument lives.
+//! What a device *can* say is spent through one three-rung [`Promotion`],
+//! derived once in [`DeviceProfile::promotion`] from two signals that are
+//! positive evidence apiece and are available on different targets:
+//!
+//! * the **device class** the driver names, which is the rule
+//!   `LoopPool::for_device` already ships — discrete takes the ceiling,
+//!   integrated one step, anything unnamed the floor;
+//! * the **ceilings the adapter reports**, which is the only signal a browser
+//!   offers at all and the one that separates a desktop browser from a phone
+//!   browser without asking either what it is called.
+//!
+//! Neither is a prerequisite for the other, so the better of the two wins: a
+//! browser has no class, a desktop GPU behind GL reports `Other` and no useful
+//! class either, and a discrete card behind a downlevel adapter is still
+//! discrete. Taking the better answer is what lets one rule serve both
+//! platforms with **no `Platform` term in it at all**.
+//!
+//! # And only ever downward again from failure
+//!
+//! [`BudgetMemo::steps_back`] is what a machine learned by refusing an
+//! allocation, in rungs of the ladder `docs/cross-platform-resource-limits.md`
+//! §4.3 orders — lighting, then offscreen resolution, then loop history, then
+//! grid cells, then the raster side. [`demote`] walks it. A rung never crosses
+//! its bracket floor, so the worst a machine that keeps failing can reach is
+//! the configuration this build already shipped to it, and below that the 3D
+//! view retires entirely, which `volume::degrade` already latches.
 //!
 //! # There is no browser in [`DeviceProfile`], and there must not be
 //!
@@ -60,7 +78,51 @@
 //! first-class outcome rather than a surprise.
 
 use crate::constants;
-use crate::volume::quality::{DeviceClass, VolumeQuality};
+use crate::volume::quality::{DeviceClass, GradientShading, VolumeQuality};
+use rustdar_egui::config_store::ConfigStore;
+
+/// Key the ladder position [`BudgetMemo::steps_back`] is persisted under.
+///
+/// Its own `ConfigStore` entry, beside `crate::loop_pool::LOOP_POOL_KEY` and
+/// for the identical reason: `autosave_config` writes the `UiConfig` blob on a
+/// 3 s timer behind a string compare, so a value learned in the last three
+/// seconds of a session is lost — and a session that has just lost its
+/// rendering surface may not get three more seconds. One entry holding one
+/// integer also means the blast radius of a corrupt value is one integer,
+/// rather than every setting on the next load.
+///
+/// **One key for the whole struct, not one per field.** The ladder is an
+/// ordering over subsystems and a per-field memo could not express it: three
+/// separate counts could describe a machine that had surrendered its grid
+/// without surrendering its lighting, which is a state this ladder says does
+/// not exist.
+pub const BUDGET_MEMO_KEY: &str = "budget_steps";
+
+/// What a previous session learned, read back.
+///
+/// A decimal count of rungs and nothing else, the format
+/// `crate::loop_pool::remembered` already argues for: one integer, not JSON,
+/// because a format with structure gives a corrupt entry more ways to be
+/// almost-readable. Anything unreadable is `None`, which is the same answer a
+/// first launch gets — the cost of losing it is one re-probe, and configuration
+/// is never allowed to be load-bearing.
+pub fn remembered_steps(store: Option<&dyn ConfigStore>) -> Option<u32> {
+    let raw = store?.load(BUDGET_MEMO_KEY)?;
+    raw.trim().parse().ok().or_else(|| {
+        log::warn!("budget memo is not a number ({raw:?}); starting this device at its ladder top");
+        None
+    })
+}
+
+/// Write what this session settled on, synchronously. See [`BUDGET_MEMO_KEY`].
+pub fn remember_steps(store: Option<&dyn ConfigStore>, steps: u32) {
+    let Some(store) = store else {
+        return;
+    };
+    if let Err(e) = store.store(BUDGET_MEMO_KEY, &steps.to_string()) {
+        log::warn!("could not persist the budget ladder position: {e}");
+    }
+}
 
 /// Which APIs exist. **Not** which machine this is.
 ///
@@ -132,19 +194,101 @@ impl AdapterCeilings {
     };
 }
 
+/// The componentwise least either desktop-class machine this project has
+/// **measured** a browser report on.
+///
+/// | machine | `max_texture_dimension_2d` | `_3d` |
+/// |---|---:|---:|
+/// | Firefox 153, RTX 3090 | 32768 | 16384 |
+/// | Chrome 151, Radeon 890M | 16384 | 8192 |
+///
+/// Stated for what it is: a **measured lower bound on desktop-class**, not a
+/// proven upper bound on handhelds. The two rows differ in both browser and
+/// GPU, so neither is attributable to a browser alone; what they establish
+/// between them is that the reported ceiling genuinely varies across real
+/// devices and that the least a desktop-class one offered is this pair.
+///
+/// # Why no halving here, when [`Budgets::raster_side_for_adapter`] halves
+///
+/// Because nothing is *allocated* at this size. The 3090 reports 32768 and
+/// refuses to allocate it, which is fatal to a rule that spends the figure and
+/// irrelevant to one that only reads it: what gets allocated after this line is
+/// crossed is the **tier's own budget**, a figure argued in bytes and already
+/// shipped to hardware. Overstating a ceiling cannot overstate a budget that
+/// was never derived from it.
+///
+/// # What a wrong answer costs
+///
+/// A handheld browser that reports desktop-class figures is promoted one tier,
+/// and one tier up from the web floor is the budget this project already ships
+/// to phones — so the cost of the misclassification is bounded by hardware that
+/// runs it. Below that, `LoopPool::back_off` and [`BudgetMemo::steps_back`] are
+/// the behavioural backstop, which is what actually makes the web safe: every
+/// browser signal is spoofable in a line of JavaScript and a lost context is
+/// not.
+pub const DESKTOP_CLASS_REPORT: AdapterCeilings = AdapterCeilings {
+    max_texture_dimension_2d: 16384,
+    max_texture_dimension_3d: 8192,
+};
+
+/// How far up its bracket each budget may be spent on this device.
+///
+/// Three rungs and not a scalar, because every bracket names its middle rung
+/// explicitly: a budget interpolated halfway up a pair is a number nobody
+/// chose, and the whole argument for the brackets is that each figure was
+/// argued somewhere. `Ord` is the rung order, which is what lets
+/// [`DeviceProfile::promotion`] take the better of two signals with a `max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Promotion {
+    /// What a device that says nothing about itself gets: the shipped
+    /// constants, unchanged.
+    Floor,
+    /// One rung. What an integrated GPU takes, which is the rule
+    /// `LoopPool::for_device` already ships for the pool.
+    Step,
+    /// The most this build will spend on this class of machine.
+    Ceiling,
+}
+
+impl Promotion {
+    /// What the driver's own classification is worth.
+    ///
+    /// Exactly `LoopPool::for_device`'s rule, restated once so that the pool
+    /// and everything beside it cannot drift: **`Discrete`** has memory nothing
+    /// else competes for; **`Integrated`** shares one pool of DRAM with the
+    /// operating system and takes one step; **`Virtual`**, **`Software`** and
+    /// **`Unknown`** are unknown quantities, and `Unknown` is every browser.
+    pub fn for_class(class: DeviceClass) -> Self {
+        match class {
+            DeviceClass::Discrete => Self::Ceiling,
+            DeviceClass::Integrated => Self::Step,
+            DeviceClass::Virtual | DeviceClass::Unknown | DeviceClass::Software => Self::Floor,
+        }
+    }
+}
+
 /// What a previous session learned by **failing**.
 ///
 /// Evidence beats classification: a figure arrived at by watching this machine
 /// refuse an allocation is better than any guess from a device type, and
 /// honouring it is also what keeps a reopen 1:1 rather than showing a different
-/// loop length on every start. `crate::loop_pool::LOOP_POOL_KEY` is where the
-/// one field of it is persisted today, in its own `ConfigStore` entry written
-/// synchronously — because a value learned by crashing the GPU is exactly the
-/// value that must not be lost to a 3 s autosave timer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// loop length on every start. Both fields are persisted in their own
+/// `ConfigStore` entries, written synchronously — `crate::loop_pool::LOOP_POOL_KEY`
+/// for the pool and `crate::budget::BUDGET_MEMO_KEY` for the ladder — because a
+/// value learned by crashing the GPU is exactly the value that must not be lost
+/// to a 3 s autosave timer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BudgetMemo {
-    /// The loop pool this machine settled at, in bytes.
-    pub loop_pool_bytes: usize,
+    /// The loop pool this machine settled at, in bytes. `None` where nothing
+    /// has been learned, which is every first launch.
+    pub loop_pool_bytes: Option<usize>,
+    /// Rungs of the degradation ladder this machine has already surrendered.
+    ///
+    /// One per latched failure, and one-way: a device that could not serve a
+    /// texture will not be able to serve it after a restart either. See
+    /// [`demote`] for the ladder and for which rungs a running session can
+    /// actually reach.
+    pub steps_back: u32,
 }
 
 /// Everything known about the machine, at the moment the budgets are decided.
@@ -174,6 +318,52 @@ pub struct DeviceProfile {
     pub form_factor: Option<FormFactor>,
     /// See [`BudgetMemo`]. Wins outright when present.
     pub memo: Option<BudgetMemo>,
+}
+
+impl DeviceProfile {
+    /// How far up its bracket every budget may be spent here.
+    ///
+    /// **The better of two signals, and no `Platform` term.** Each is positive
+    /// evidence on its own and each is missing on some target: a browser
+    /// reports no class at all, this project's own RTX 3090 reports
+    /// `DiscreteGpu` through Vulkan and `Other` through GL, and a discrete card
+    /// behind a downlevel adapter is still discrete. A `min` would let the
+    /// missing half veto the present one and pin every browser to the floor for
+    /// ever, which is the complaint this whole module exists to answer.
+    ///
+    /// **`Software` overrides both**, and is the one class where the reports
+    /// say nothing worth having: a software rasteriser will happily advertise
+    /// 16384 and then take seconds a frame, and `quality::select` already puts
+    /// it at the bottom of its own ladder for that reason.
+    pub fn promotion(&self) -> Promotion {
+        if matches!(self.class, DeviceClass::Software) {
+            return Promotion::Floor;
+        }
+        Promotion::for_class(self.class).max(self.reported_promotion())
+    }
+
+    /// What the adapter's own reported ceilings are worth on their own.
+    ///
+    /// Two rungs rather than three: [`DESKTOP_CLASS_REPORT`] is a measured
+    /// line and there is no second measured line to put between it and the
+    /// WebGL2 guarantee, so a middle rung here would be a number nobody read
+    /// off a machine.
+    fn reported_promotion(&self) -> Promotion {
+        let desktop_class = self.adapter.max_texture_dimension_2d
+            >= DESKTOP_CLASS_REPORT.max_texture_dimension_2d
+            && self.adapter.max_texture_dimension_3d
+                >= DESKTOP_CLASS_REPORT.max_texture_dimension_3d;
+        if desktop_class {
+            Promotion::Ceiling
+        } else {
+            Promotion::Floor
+        }
+    }
+
+    /// Rungs of the ladder this machine has already surrendered. See [`demote`].
+    fn steps_back(&self) -> u32 {
+        self.memo.map_or(0, |memo| memo.steps_back)
+    }
 }
 
 impl DeviceProfile {
@@ -216,32 +406,58 @@ impl DeviceProfile {
 ///   row's const-assert guards for the grid shape today.
 /// * **ceiling** — a guard against a lie. The most this build will ever spend
 ///   even if the device claims infinity.
+///
+/// The **step** between them is named rather than interpolated. Half of a pair
+/// is a number nobody argued, and every figure in this file was argued
+/// somewhere — usually as a tier this project already ships to real hardware,
+/// which is what makes a wrong promotion a disappointment rather than a crash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Bracket {
     /// Never resolved below this.
     pub floor: usize,
+    /// What [`Promotion::Step`] resolves to.
+    pub step: usize,
     /// Never resolved above this.
     pub ceiling: usize,
 }
 
 impl Bracket {
-    /// A number with no room to move yet: floor and ceiling are the same.
+    /// A number with no room to move: all three rungs are the same.
     ///
-    /// Most brackets are this today, and saying so in one place is better than
-    /// nineteen repetitions of the same pair. Raising a ceiling off its floor is
-    /// what "no compromises when the hardware is available" costs, and it is a
-    /// deliberate, reviewed, one-line change per field once the measurement to
-    /// justify it exists.
+    /// Most brackets are still this, and saying so in one place is better than
+    /// nineteen repetitions of the same triple. Raising a ceiling off its floor
+    /// is what "no compromises when the hardware is available" costs, and it is
+    /// a deliberate, reviewed, one-line change per field once the measurement
+    /// to justify it exists — so a field that stays pinned here is a field
+    /// whose measurement does not.
     pub const fn pinned(value: usize) -> Self {
         Self {
             floor: value,
+            step: value,
             ceiling: value,
         }
     }
 
-    /// A genuine pair.
+    /// A pair only a [`Promotion::Ceiling`] reaches.
+    ///
+    /// The step is the floor, which is the honest shape wherever the middle
+    /// rung has no evidence behind it: an integrated GPU gets what it got
+    /// before, rather than half of a promotion nobody measured.
     pub const fn new(floor: usize, ceiling: usize) -> Self {
-        Self { floor, ceiling }
+        Self {
+            floor,
+            step: floor,
+            ceiling,
+        }
+    }
+
+    /// All three rungs, named.
+    pub const fn stepped(floor: usize, step: usize, ceiling: usize) -> Self {
+        Self {
+            floor,
+            step,
+            ceiling,
+        }
     }
 
     /// `value` held inside the pair, with the floor winning a crossed one.
@@ -253,6 +469,19 @@ impl Bracket {
     pub fn hold(&self, value: usize) -> usize {
         value.clamp(self.floor, self.ceiling.max(self.floor))
     }
+
+    /// The rung `promotion` buys, held inside the pair.
+    ///
+    /// Held rather than taken raw, so a `step` edited above the ceiling or
+    /// below the floor is a budget that stays inside its bracket rather than a
+    /// promotion that escapes it.
+    pub fn at(&self, promotion: Promotion) -> usize {
+        self.hold(match promotion {
+            Promotion::Floor => self.floor,
+            Promotion::Step => self.step,
+            Promotion::Ceiling => self.ceiling,
+        })
+    }
 }
 
 /// The same, for the one field that is three numbers.
@@ -260,6 +489,8 @@ impl Bracket {
 pub struct CellBracket {
     /// The cell triple this build never budgets below.
     pub floor: [u32; 3],
+    /// What [`Promotion::Step`] budgets.
+    pub step: [u32; 3],
     /// The cell triple it never budgets above.
     pub ceiling: [u32; 3],
 }
@@ -269,8 +500,93 @@ impl CellBracket {
     pub const fn pinned(cells: [u32; 3]) -> Self {
         Self {
             floor: cells,
+            step: cells,
             ceiling: cells,
         }
+    }
+
+    /// A triple only a [`Promotion::Ceiling`] reaches. See [`Bracket::new`].
+    pub const fn new(floor: [u32; 3], ceiling: [u32; 3]) -> Self {
+        Self {
+            floor,
+            step: floor,
+            ceiling,
+        }
+    }
+
+    /// The rung `promotion` buys.
+    ///
+    /// Held per axis against the floor, so a ceiling edited below the floor on
+    /// one axis cannot quietly coarsen that axis — a cell budget is three
+    /// numbers and a per-axis regression is exactly the kind that hides.
+    pub fn at(&self, promotion: Promotion) -> [u32; 3] {
+        let raw = match promotion {
+            Promotion::Floor => self.floor,
+            Promotion::Step => self.step,
+            Promotion::Ceiling => self.ceiling,
+        };
+        let mut out = [0u32; 3];
+        for axis in 0..3 {
+            out[axis] = raw[axis]
+                .max(self.floor[axis])
+                .min(self.ceiling[axis].max(self.floor[axis]));
+        }
+        out
+    }
+}
+
+/// The same again, for the field that is a quality rather than a number.
+///
+/// **Every arm ships pinned, and that is a finding rather than an omission.**
+/// A quality rung is paid for in *frame time*, not in bytes, and the only
+/// frame-time table this project has is `volume::quality`'s, measured on one
+/// RTX 3090 over Vulkan. What it already supports is shipped: the desktop
+/// ceiling is `VolumeQuality::BEST` and a discrete GPU there already reaches
+/// it. What it does not support is raising the other two arms —
+///
+/// * **mobile** is held at Half and unshaded by an *extrapolation* from that
+///   table (cloud at native size lands at 23-38 ms on an integrated GPU), and
+///   an extrapolation is a reason to stay put, not a reason to move;
+/// * **web** is held there by the same figures plus the fact that a browser
+///   reports `DeviceClass::Unknown` whatever the silicon is, so it is the
+///   *class*, not this ceiling, that picks Half and unshaded. Raising the
+///   ceiling above what the class picks changes nothing at all; changing what
+///   the class picks is a claim about a browser's frame, and nothing has
+///   measured a browser's frame.
+///
+/// So the mechanism is here and every rung is reachable from the host tests,
+/// and the numbers wait on a measurement. Promoting a rung on a target where
+/// the cost is a frame the user is panning in would trade interaction latency
+/// for picture quality, which is the one trade this application does not make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QualityBracket {
+    /// The best quality a device that says nothing about itself may select.
+    pub floor: VolumeQuality,
+    /// What [`Promotion::Step`] allows.
+    pub step: VolumeQuality,
+    /// The best this build will ever allow on this class of machine.
+    pub ceiling: VolumeQuality,
+}
+
+impl QualityBracket {
+    /// One ceiling for every rung. See the type doc for why all three shipped
+    /// arms are this.
+    pub const fn pinned(quality: VolumeQuality) -> Self {
+        Self {
+            floor: quality,
+            step: quality,
+            ceiling: quality,
+        }
+    }
+
+    /// The rung `promotion` buys, capped by the bracket's own ceiling.
+    pub fn at(&self, promotion: Promotion) -> VolumeQuality {
+        match promotion {
+            Promotion::Floor => self.floor,
+            Promotion::Step => self.step,
+            Promotion::Ceiling => self.ceiling,
+        }
+        .capped_by(self.ceiling)
     }
 }
 
@@ -328,10 +644,9 @@ pub struct BudgetLimits {
     pub mirror_bytes: Bracket,
     /// `constants::MAX_RENDER_CACHE_ENTRIES`.
     pub render_cache_entries: Bracket,
-    /// `volume::quality::PLATFORM_CEILING` — already a ceiling, so it has no
-    /// pair. The floor of a quality ladder is `VolumeQuality::CHEAPEST` on
-    /// every target and naming it would state nothing.
-    pub quality_ceiling: VolumeQuality,
+    /// `volume::quality::PLATFORM_CEILING`. See [`QualityBracket`] for why
+    /// every shipped arm of this one is pinned.
+    pub quality_ceiling: QualityBracket,
     /// `rustdar_egui::pane`'s pane cap for this class. Not a `cfg` cascade over
     /// there — it is chosen at runtime by width class — and it is carried here
     /// because it is the other half of the multiplication the whole-application
@@ -341,9 +656,20 @@ pub struct BudgetLimits {
     ///
     /// Deliberately **not** device-derived, now or later: the moment both sides
     /// of the snugness test move together it becomes a tautology and stops
-    /// catching anything. If a 24 GiB card should raise it, raise the constant,
-    /// deliberately, and let `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling`
-    /// bite and be re-argued.
+    /// catching anything.
+    ///
+    /// A bracket is not that. Every rung of this one is a constant somebody
+    /// argued in bytes, so raising it for a 24 GiB card is still the deliberate,
+    /// reviewed change that recommendation asks for — it is simply written as a
+    /// second rung rather than as an edit to the first, so the machines that do
+    /// not earn the promotion keep the ceiling they were proved against. The
+    /// snugness test runs at **every** rung, which is what keeps it biting:
+    /// desktop is 3768 MiB against 3840 at the floor and 3936 against 4032 at
+    /// the ceiling, 1.02x and 1.02x, both far inside the 1.25x line.
+    ///
+    /// The ceiling stays under 4096 MiB for a reason that is not aesthetic:
+    /// this is a `usize`, wasm32's is 32 bits, and `BudgetLimits::DESKTOP` is a
+    /// `const` compiled on every target — 4096 MiB is exactly `u32::MAX + 1`.
     pub app_texture_ceiling_bytes: Bracket,
     /// The largest side a static plan-view raster may reach on this class,
     /// however much the adapter offers.
@@ -380,12 +706,36 @@ impl BudgetLimits {
             constants::WASM_LOOP_POOL_FLOOR_BYTES,
             constants::WASM_LOOP_POOL_CEILING_BYTES,
         ),
-        grid_cells: CellBracket::pinned(constants::WASM_VOLUME_GRID_CELLS),
-        volume_texture_bytes: Bracket::pinned(constants::WASM_VOLUME_TEXTURE_BUDGET_BYTES),
+        // **The one promotion a browser can earn, and the whole of what
+        // separates a desktop browser from a phone browser.** The ceiling is
+        // the *mobile tier's own budget* rather than a new number: a browser
+        // reporting `DESKTOP_CLASS_REPORT` gets the grid this project already
+        // ships to handheld hardware at the same Half-and-unshaded rung, so the
+        // worst a misread can do is hand a phone browser a phone's budget. The
+        // desktop tier is deliberately **not** offered here — its cells are
+        // 8x the web floor's and the march steps one cell along the ray, so
+        // that is a frame-time claim, and nothing has measured a browser's
+        // frame.
+        grid_cells: CellBracket::new(
+            constants::WASM_VOLUME_GRID_CELLS,
+            constants::MOBILE_VOLUME_GRID_CELLS,
+        ),
+        // Follows the grid it has to pay for, to the same tier. A promoted grid
+        // against an unpromoted per-pane budget would be a refused allocation.
+        volume_texture_bytes: Bracket::new(
+            constants::WASM_VOLUME_TEXTURE_BUDGET_BYTES,
+            constants::MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
+        ),
+        // Pinned, and not because nobody thought about it: the offscreen is the
+        // one budget whose promotion is paid in *fill rate* rather than only in
+        // memory — `VolumeQuality::fit` steps the rung down until it fits, so
+        // raising it is what puts a 4K browser pane back at Half instead of
+        // Quarter, and that is four times the march. On web there is no frame
+        // measurement to justify it. See `QualityBracket`.
         offscreen_bytes: Bracket::pinned(constants::WASM_VOLUME_OFFSCREEN_BUDGET_BYTES),
         mirror_bytes: Bracket::pinned(constants::WASM_VOLUME_MIRROR_BYTES_MAX),
         render_cache_entries: Bracket::pinned(constants::NON_MOBILE_MAX_RENDER_CACHE_ENTRIES),
-        quality_ceiling: crate::volume::quality::WASM_PLATFORM_CEILING,
+        quality_ceiling: QualityBracket::pinned(crate::volume::quality::WASM_PLATFORM_CEILING),
         max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_DESKTOP),
         app_texture_ceiling_bytes: Bracket::pinned(constants::WASM_APP_TEXTURE_BUDGET_BYTES),
         raster_side_ceiling_px: constants::WASM_RASTER_SIDE_CEILING,
@@ -407,12 +757,23 @@ impl BudgetLimits {
             constants::MOBILE_LOOP_POOL_FLOOR_BYTES,
             constants::MOBILE_LOOP_POOL_CEILING_BYTES,
         ),
+        // **Every field of this bracket is pinned, deliberately.** aarch64 is
+        // three of five targets and is entirely unmeasured: macOS, iOS and
+        // Android all report `IntegratedGpu` or `Other`, so a promotion rule
+        // written from a Linux box would be a guess applied to the population
+        // with the least headroom. An M-series Mac with 64 GiB of unified
+        // memory taking a laptop's budget is the user's complaint verbatim and
+        // it stays open here — `docs/cross-platform-resource-limits.md` §7
+        // item 4 is the standing note, and the answer is somebody running this
+        // on Apple Silicon and on a flagship and a bargain handset, not a
+        // number chosen here. What mobile does get from this stage is the
+        // back-off ladder, which is a floor rather than a ceiling.
         grid_cells: CellBracket::pinned(constants::MOBILE_VOLUME_GRID_CELLS),
         volume_texture_bytes: Bracket::pinned(constants::MOBILE_VOLUME_TEXTURE_BUDGET_BYTES),
         offscreen_bytes: Bracket::pinned(constants::MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES),
         mirror_bytes: Bracket::pinned(constants::MOBILE_VOLUME_MIRROR_BYTES_MAX),
         render_cache_entries: Bracket::pinned(constants::MOBILE_MAX_RENDER_CACHE_ENTRIES),
-        quality_ceiling: crate::volume::quality::MOBILE_PLATFORM_CEILING,
+        quality_ceiling: QualityBracket::pinned(crate::volume::quality::MOBILE_PLATFORM_CEILING),
         max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_MOBILE),
         app_texture_ceiling_bytes: Bracket::pinned(constants::MOBILE_APP_TEXTURE_BUDGET_BYTES),
         raster_side_ceiling_px: constants::MOBILE_RASTER_SIDE_CEILING,
@@ -436,14 +797,50 @@ impl BudgetLimits {
             constants::DESKTOP_LOOP_POOL_FLOOR_BYTES,
             constants::DESKTOP_LOOP_POOL_CEILING_BYTES,
         ),
+        // Pinned at the tier's own cells, and the reason is in another crate:
+        // `rustdar_radar::voxel::VOXEL_TEXTURE_BUDGET_BYTES` is one byte per
+        // cell of the largest index plane this workspace produces, the desktop
+        // tier is *exactly* at it, and `offload::decode_job` refuses a request
+        // past it at the wire boundary. A fourth shape is a decision in
+        // `rustdar-radar` about what travels, not a promotion this resolver may
+        // make on its own.
         grid_cells: CellBracket::pinned(constants::DESKTOP_VOLUME_GRID_CELLS),
         volume_texture_bytes: Bracket::pinned(constants::DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES),
-        offscreen_bytes: Bracket::pinned(constants::DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES),
+        // **The compromise a 24 GiB card was still eating.** 20 MiB pays for
+        // the 2560 x 1440 reference pane at `Native` and nothing larger, so a
+        // maximised pane on a 4K display — 3840 x 2160 x 4 B = 31.64 MiB — was
+        // stepped down to `Half` and upscaled by the blit, on a machine with
+        // 24576 MiB of VRAM. The ceiling is that pane plus the same headroom
+        // the shipped figure keeps (14.06 -> 20 MiB is 1.42x; 31.64 x 1.42 =
+        // 44.9, rounded up to a whole 48 MiB, which is 1.52x — room for the
+        // alignment a real allocation carries, not enough to hide a doubling).
+        //
+        // The fill rate is measured rather than assumed: `volume::quality`'s
+        // 3090 table is 0.766 ms for the cloud rung at 1440 x 900 over a dense
+        // real volume, and the cost model behind it is fetch-bound and linear
+        // in covered pixels, so 4K native is 6.4x that — about 4.9 ms of a
+        // 16.7 ms frame for one pane, which is what a maximised pane is.
+        //
+        // The step stays at the floor: an integrated desktop GPU extrapolates
+        // to 12-23 ms at *1440 x 900* on the same model, so it is the one class
+        // the measurement argues against promoting.
+        offscreen_bytes: Bracket::new(
+            constants::DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES,
+            constants::DESKTOP_VOLUME_OFFSCREEN_CEILING_BYTES,
+        ),
         mirror_bytes: Bracket::pinned(constants::DESKTOP_VOLUME_MIRROR_BYTES_MAX),
         render_cache_entries: Bracket::pinned(constants::NON_MOBILE_MAX_RENDER_CACHE_ENTRIES),
-        quality_ceiling: crate::volume::quality::DESKTOP_PLATFORM_CEILING,
+        quality_ceiling: QualityBracket::pinned(crate::volume::quality::DESKTOP_PLATFORM_CEILING),
         max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_DESKTOP),
-        app_texture_ceiling_bytes: Bracket::pinned(constants::DESKTOP_APP_TEXTURE_BUDGET_BYTES),
+        // The one bracket that moves *because another one did*. See
+        // `Self::app_texture_ceiling_bytes` — both rungs are named constants
+        // argued in bytes, neither is measured off the device, so the snugness
+        // test still bites at each rung rather than degenerating into two sides
+        // that move together.
+        app_texture_ceiling_bytes: Bracket::new(
+            constants::DESKTOP_APP_TEXTURE_BUDGET_BYTES,
+            constants::DESKTOP_APP_TEXTURE_CEILING_BYTES,
+        ),
         raster_side_ceiling_px: constants::DESKTOP_RASTER_SIDE_CEILING,
     };
 
@@ -490,6 +887,12 @@ impl BudgetLimits {
 pub struct Budgets {
     /// The bracket set this came out of, for failure messages.
     pub name: &'static str,
+    /// How far up its bracket each field was spent. Carried so a log line and a
+    /// failure message can say *why* a machine got what it got, and so a test
+    /// can assert that a profile which should have been promoted was.
+    pub promotion: Promotion,
+    /// Rungs of the ladder surrendered before this was resolved. See [`demote`].
+    pub steps_back: u32,
     /// The side a static plan-view render takes at the base size.
     pub image_side_px: usize,
     /// The side it may grow to for a sweep reaching past the base extent.
@@ -787,53 +1190,173 @@ impl Budgets {
 /// `MirrorLimits::for_device` each already have for one number and this has for
 /// all of them at once.
 ///
-/// # Today it takes every floor, and that is the point
+/// # A device that says nothing still takes every floor
 ///
 /// The brackets are populated from the shipped constants, so a floor **is** the
-/// constant on its arm and this reproduces today's configuration byte for byte
-/// on all three. `the_resolver_reproduces_every_shipped_constant` puts the two
-/// side by side field for field rather than asserting the claim.
+/// constant on its arm, and a profile with no class, no useful report and no
+/// memo reproduces today's configuration byte for byte on all three.
+/// `the_resolver_reproduces_every_shipped_constant` puts the two side by side
+/// field for field rather than asserting the claim, and `DeviceProfile::for_target`
+/// — what the application resolves before it has met an adapter — is exactly
+/// such a profile.
+///
+/// # What a device that says something gets
+///
+/// One [`Promotion`], spent on every bracket at once. Most brackets are still
+/// pinned, so most fields do not move; the ones that do are named in
+/// [`BudgetLimits`] beside the measurement that pays for them. Spending one
+/// rung across the whole struct rather than a different signal per field is
+/// what makes the ordering *between* subsystems expressible at all — the thing
+/// nineteen independent `cfg` cascades could not say.
 ///
 /// The loop pool is the one field that leaves as a *pair* — see
 /// [`Budgets::loop_pool_floor_bytes`] — because it already has a runtime
-/// resolution and a back-off path of its own, and moving those is a change in
-/// behaviour rather than a change in plumbing.
+/// resolution and a back-off path of its own. `LoopPool::for_promotion` is
+/// where the same rung is spent on it.
 ///
-/// Nothing here reads [`DeviceProfile::class`], [`DeviceProfile::adapter`],
-/// [`DeviceProfile::vram_bytes`] or [`DeviceProfile::memo`] yet. That is not an
-/// oversight to be tidied: promoting a field off its floor changes what the app
-/// allocates on a real machine, and this step exists precisely so that change
-/// can be argued and landed on its own, against a resolver whose every arm is
-/// already under test.
+/// # And then walks back down
+///
+/// [`demote`] applies what this machine already learned by failing, after the
+/// promotion rather than before it: a memo is evidence about the machine, and
+/// evidence outranks classification. A device that has backed off twice and
+/// then reports desktop-class ceilings is still a device that failed twice.
 pub fn resolve(profile: &DeviceProfile) -> Budgets {
     let limits = &profile.limits;
-    Budgets {
+    let promotion = profile.promotion();
+    let mut budgets = Budgets {
         name: limits.name,
-        image_side_px: limits.image_side_px.floor,
-        long_range_image_side_px: limits.long_range_image_side_px.floor,
-        loop_image_side_px: limits.loop_image_side_px.floor,
-        section_width_px: limits.section_width_px.floor,
-        concurrent_renders: limits.concurrent_renders.floor,
-        concurrent_loop_downloads: limits.concurrent_loop_downloads.floor,
-        loop_frames_held: limits.loop_frames_held.floor,
-        loop_span_secs: limits.loop_span_secs.floor,
-        loop_render_budget: limits.loop_render_budget.floor,
+        promotion,
+        steps_back: 0,
+        image_side_px: limits.image_side_px.at(promotion),
+        long_range_image_side_px: limits.long_range_image_side_px.at(promotion),
+        loop_image_side_px: limits.loop_image_side_px.at(promotion),
+        section_width_px: limits.section_width_px.at(promotion),
+        concurrent_renders: limits.concurrent_renders.at(promotion),
+        concurrent_loop_downloads: limits.concurrent_loop_downloads.at(promotion),
+        loop_frames_held: limits.loop_frames_held.at(promotion),
+        loop_span_secs: limits.loop_span_secs.at(promotion),
+        loop_render_budget: limits.loop_render_budget.at(promotion),
         loop_pool_floor_bytes: limits.loop_pool_bytes.floor,
         loop_pool_ceiling_bytes: limits
             .loop_pool_bytes
             .ceiling
             .max(limits.loop_pool_bytes.floor),
-        grid_cells: limits.grid_cells.floor,
-        volume_texture_bytes: limits.volume_texture_bytes.floor,
-        offscreen_bytes: limits.offscreen_bytes.floor,
-        mirror_bytes: limits.mirror_bytes.floor,
-        render_cache_entries: limits.render_cache_entries.floor,
-        quality_ceiling: limits.quality_ceiling,
-        max_panes: limits.max_panes.floor,
-        app_texture_ceiling_bytes: limits.app_texture_ceiling_bytes.floor,
+        grid_cells: limits.grid_cells.at(promotion),
+        volume_texture_bytes: limits.volume_texture_bytes.at(promotion),
+        offscreen_bytes: limits.offscreen_bytes.at(promotion),
+        mirror_bytes: limits.mirror_bytes.at(promotion),
+        render_cache_entries: limits.render_cache_entries.at(promotion),
+        quality_ceiling: limits.quality_ceiling.at(promotion),
+        max_panes: limits.max_panes.at(promotion),
+        app_texture_ceiling_bytes: limits.app_texture_ceiling_bytes.at(promotion),
         raster_side_ceiling_px: limits
             .raster_side_ceiling_px
             .max(limits.long_range_image_side_px.floor),
+    };
+    demote(&mut budgets, limits, profile.steps_back());
+    budgets
+}
+
+/// Walk `steps` rungs down the degradation ladder, in the order
+/// `docs/cross-platform-resource-limits.md` §4.3 fixes.
+///
+/// # The ordering principle, and where each rung came from
+///
+/// *Degrade what the user is least likely to notice, and degrade smoothly
+/// before degrading discretely.* One rung per latched failure, so a machine
+/// that is one step too ambitious does not lose everything over one event —
+/// the same shape `LoopPool::back_off`'s halving already has, and for the same
+/// reason.
+///
+/// 1. **Lighting.** `GradientShading::On -> Off`. The cheapest large saving in
+///    the application (0.766 ms dense against 0.263 for the flat march on the
+///    measured 3090) and the one a user is least likely to be able to name.
+///    `volume::quality`'s own module doc already states "lighting degrades
+///    before resolution"; this is that rule, one level up.
+/// 2. **Offscreen resolution**, both halves at once: the quality's rung and the
+///    budget that enforces it. ~3.4x per step at ~85 % efficiency. Blurrier,
+///    still correct, still interactive.
+/// 3. **Grid cells**, back to the bracket floor. Now the picture itself gets
+///    coarser, so it is deliberately late.
+/// 4. **The raster side ceiling**, back to the long-range image side. The most
+///    visible rung of all, and the last one this function owns.
+///
+/// # Four rungs of a ladder of eight, and the four missing ones are not
+/// oversights
+///
+/// * **Loop history** — the plan's rung 3, and it is `LoopPool::back_off`,
+///   which already exists, already halves toward the pool floor, already
+///   persists synchronously and is driven from the same event. Duplicating it
+///   here would give one failure two effects on the same resource.
+/// * **Overlay area** — the plan's rung 4. Not a field of [`Budgets`] yet; it
+///   arrives with the overlay figures another agent is measuring.
+/// * **Concurrency** — the plan's rung 7. Every arm is pinned, because
+///   device-resolved concurrency is blocked on an unmeasured per-worker wasm
+///   instance memory, so there is no rung to take.
+/// * **Pane count** — the plan's rung 8, and it is *refused* rather than
+///   deferred: `ui_layout` already documents why a saved layout is never
+///   silently rewritten, and a budget is not a licence to take a pane the user
+///   asked for.
+///
+/// # Only the first rungs are reachable, and that is by design
+///
+/// `volume::degrade` retires the 3D view after **two** surface losses. So a
+/// machine walking this ladder gets one rung, then a second, then loses 3D
+/// entirely — the floor the plan names. The later rungs exist so the ordering
+/// is stated and testable, not because a session will spend them.
+///
+/// Every rung stops at its bracket floor, so this can never take a machine
+/// below the configuration this build already shipped it.
+pub fn demote(budgets: &mut Budgets, limits: &BudgetLimits, steps: u32) {
+    /// One rung: mutate, and say whether anything actually moved.
+    type Rung = fn(&mut Budgets, &BudgetLimits) -> bool;
+
+    const LADDER: [Rung; 4] = [
+        |b, _| {
+            let cheaper = b.quality_ceiling.shading.cheaper_of(GradientShading::Off);
+            let moved = cheaper != b.quality_ceiling.shading;
+            b.quality_ceiling.shading = cheaper;
+            moved
+        },
+        |b, limits| {
+            let coarser = b.quality_ceiling.resolution.next_coarser();
+            let floor = limits.offscreen_bytes.floor;
+            let moved = coarser.is_some() || b.offscreen_bytes > floor;
+            if let Some(coarser) = coarser {
+                b.quality_ceiling.resolution = coarser;
+            }
+            b.offscreen_bytes = floor;
+            // The bound the offscreen's promotion moved comes back with it.
+            // Leaving it high would be harmless — it is a bound, not a spend —
+            // but it would leave the snugness proof slack on exactly the
+            // machine that just proved it could not afford the spend.
+            b.app_texture_ceiling_bytes = limits.app_texture_ceiling_bytes.floor;
+            moved
+        },
+        |b, limits| {
+            let moved = b.grid_cells != limits.grid_cells.floor;
+            b.grid_cells = limits.grid_cells.floor;
+            b.volume_texture_bytes = limits.volume_texture_bytes.floor;
+            moved
+        },
+        |b, limits| {
+            let floor = limits.long_range_image_side_px.floor;
+            let moved = b.raster_side_ceiling_px > floor;
+            b.raster_side_ceiling_px = floor;
+            moved
+        },
+    ];
+
+    budgets.steps_back = steps;
+    for _ in 0..steps {
+        // The *first rung that moves*, not the nth rung: a machine whose
+        // lighting was already off should surrender its resolution on the next
+        // failure rather than spending a step on a knob already at its stop.
+        for rung in LADDER {
+            if rung(budgets, limits) {
+                break;
+            }
+        }
     }
 }
 
