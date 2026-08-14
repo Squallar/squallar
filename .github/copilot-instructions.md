@@ -45,7 +45,6 @@ Overlay fetching uses `OverlayRegistry::create_fetch_tasks()` → handler-specif
 ```bash
 cargo build --workspace                      # Desktop (needs libudev-dev on Ubuntu)
 cargo run -p rustdar-platform
-cargo clippy --all-targets --all-features    # Lint (matches CI)
 
 cd rustdar-android/android && ./gradlew assembleRelease   # Android APK (needs SDK + NDK)
 cd rustdar-android/android && ./gradlew bundleRelease     # Android .aab
@@ -55,6 +54,38 @@ Android is built by Gradle + cargo-ndk, not cargo-apk. The Gradle project lives 
 `rustdar-android/android/`; it stages `librustdar_android.so` into `jniLibs` for
 `arm64-v8a` and `x86_64`, and compiles `res/xml/network_security_config.xml` into
 the resource table so the manifest can reference it.
+
+## Before Landing
+
+The Clippy workflow alone holds five gates, and no single command matches CI.
+Three are cheap enough to run before every land, listed in the order CI reaches
+them:
+
+```bash
+cargo fmt --all -- --check                                             # Format job
+cargo check --workspace --all-targets --target wasm32-unknown-unknown  # Clippy job, wasm32 row
+cargo clippy --all-targets --all-features -- -D warnings               # Clippy job, gating run
+```
+
+- **`-D warnings` is the gate.** A bare `cargo clippy --all-targets --all-features` is the autofix step that runs *before* it and fails on nothing, so it is not the CI-matching command.
+- **The wasm32 row goes before clippy**, as it does in CI: it sits several steps ahead of `Run Clippy` in the same job, so a break there aborts the job and hides every lint finding behind it. It is also the only build that type-checks `rustdar-web` — the crate's deps are under `[target.'cfg(target_arch = "wasm32")'.dependencies]`, so every other target compiles it as an empty shell and reports success.
+- **The other two gates are not cheap**, and CI is the right place for them: the host build (`cargo build --workspace --all-targets --all-features`) and the Android arm (`cargo ndk -t arm64-v8a -P <minSdk> check -p rustdar-android --lib`). Test runs `cargo llvm-cov --no-report --all-features` in its own workflow.
+- **Check `--all`, fix `-p`.** Any formatter or lint-fixer that *writes* stays package-scoped (`cargo fmt -p <package>`); only checks go workspace-wide. An `--all` write reformats files the branch does not own, and a package-scoped *check* hides breakage elsewhere.
+
+Two optional hooks in `.githooks/` run a subset of this locally. They are inert
+until turned on, per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`pre-commit` rustfmt-checks the staged `.rs` files only and runs no cargo;
+`pre-push` runs the wasm32 row once per push. Both are escapable with
+`--no-verify` for work in progress. The path is relative on purpose: git
+resolves `core.hooksPath` against the root of the working tree the hook runs in,
+so this one setting covers every worktree and each finds its own copy. The hooks
+are tracked files, so they travel with the branch rather than living in a
+`.git/hooks` nobody else can see.
 
 ## Architecture Patterns
 
