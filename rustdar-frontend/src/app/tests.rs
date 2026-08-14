@@ -2409,9 +2409,25 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
     // listing is in flight names no frame, and the sweep takes its whole
     // window one frame before the listing would have saved it.
     assert!(
-        body.contains("is_fetching()"),
+        body.contains("listing_wait(now)"),
         "the grace rule for a loop still fetching its scan listing is gone, so \
          every product switch and loop re-init re-downloads its window: {body}"
+    );
+    // And the clock on it. An exemption with no bound is not a milder bug than
+    // no sweep at all on wasm32, where nothing else ever ends the wait — see
+    // `constants::LOOP_LISTING_GRACE`.
+    assert!(
+        body.contains("LOOP_LISTING_GRACE"),
+        "the grace exemption is unbounded again: on wasm32 a listing future \
+         that never completes then exempts its site for the life of the tab, \
+         and the leak resumes at full rate: {body}"
+    );
+    // The queues are swept by the same predicate as the cache. Split apart,
+    // the download filter re-queues what the sweep just evicted.
+    assert!(
+        body.contains("retain_plan_frames(keep)") && body.contains("retain_scans(keep)"),
+        "the frame plan and the cache are no longer swept by one predicate, so \
+         a re-plan can queue a download for a volume the sweep evicts: {body}"
     );
 }
 

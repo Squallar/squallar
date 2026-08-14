@@ -2609,6 +2609,14 @@ impl App {
     /// through a loop frame's timestamp against the loop's own site. An entry
     /// no frame names is an entry nothing can ask for.
     ///
+    /// One reader does **not** resolve through a loop frame, and it is the one
+    /// an enumeration of the loop path misses: `prepare_volume`'s third arm
+    /// (`App::extract_loop_volume` reached through `handle_prepare_volume`)
+    /// serves a 3D pane whose target is neither live nor the base. So each
+    /// pane's own `(scan_info.site, scan_info.timestamp)` is in the set too —
+    /// two entries per pane, normally holding nothing here at all. See the
+    /// comment at the insert for the branch that makes it reachable.
+    ///
     /// `frame_gates` is the one reader that asks with a *response's* timestamp
     /// rather than a frame's, and it needs no exception: a response naming a
     /// frame the window has since retired is refused by `accept_render_result`
@@ -2637,22 +2645,51 @@ impl App {
     /// on it would name a site whose entries this cache does not hold and let
     /// the ones it does hold go.
     ///
-    /// # The grace rule
+    /// # The grace rule, and the clock on it
     ///
     /// A loop in `LoopPhase::FetchingScanList` has no frames yet — its listing
     /// is in flight — so its site is skipped whole. Without it, every product
     /// switch and every loop re-init would evict its own window in the gap
     /// before the new listing installs frames, and re-download all of it. That
-    /// is the contract `begin_loop_for_pane` states as "the scan cache is
-    /// global and deliberately kept" across the rebuild it performs, and this
-    /// is what preserves it now that the cache is swept at all.
+    /// is the contract `begin_loop_for_pane` states across the rebuild it
+    /// performs, and this is what preserves it now that the cache is swept.
     ///
-    /// The exemption is **bounded by one listing round-trip**, which is what
-    /// stops it from being a hole the leak comes back through: a listing that
-    /// succeeds installs frames, and one that fails arrives as an empty list
-    /// that `accept_scan_listing` answers by switching the loop off. There is
-    /// no path that leaves a pane in `FetchingScanList` indefinitely, so no
-    /// site is exempt indefinitely.
+    /// **The exemption expires after [`LOOP_LISTING_GRACE`], and it has to.**
+    /// An earlier draft of this doc claimed the wait was bounded by one listing
+    /// round-trip because a failed listing arrives as an empty list that
+    /// `accept_scan_listing` answers by switching the loop off. That is true of
+    /// a listing that *fails* and false of one that never returns:
+    ///
+    /// * On **wasm32** nothing ends the wait at all. `rustdar_radar::tls::client`
+    ///   accepts and ignores its timeout — reqwest's wasm `ClientBuilder` has no
+    ///   `timeout`, and a browser `fetch()` has no default of its own — so a
+    ///   black-holed connection leaves the future pending for the life of the
+    ///   tab. Nothing else rescues the loop: `settle_loop_phase` returns early
+    ///   on an empty frame list, and `accept_scan_listing` returns without
+    ///   touching the phase when the site does not match. The site stays exempt
+    ///   every frame while the poll and chunk-feed paths keep writing a volume
+    ///   per seal — the leak at full rate, inside the address space this sweep
+    ///   exists to protect.
+    /// * **Natively** the wait is bounded but not by one round-trip:
+    ///   `ARCHIVE_TIMEOUT` is 300 s *per request* and `list_scans_for_range`
+    ///   issues one listing per UTC day the window touches, so a stall exempts a
+    ///   site for minutes — 35–170 MB at the accumulation rate above.
+    ///
+    /// The clock is [`LoopPlaybackState::listing_since`](rustdar_egui::pane::LoopPlaybackState::listing_since),
+    /// stamped by `new_for_loop`, which is the only writer of that phase. The
+    /// frame plan cannot stand in for it: `begin_loop_for_pane` calls
+    /// `remove_pending`, which deletes the plan, so "no plan" and "listing in
+    /// flight" are the same observation through it.
+    ///
+    /// # The accepted UX consequence
+    ///
+    /// Turning a loop off sheds its window, so re-enabling it re-downloads that
+    /// window — noticeable on a slow link, and the same cost a grace expiry
+    /// imposes. This is deliberate under the project rule that interaction stays
+    /// realtime while data may lag: the alternative is a cache bounded by
+    /// nothing, which costs the session rather than one re-fetch.
+    ///
+    /// [`LOOP_LISTING_GRACE`]: crate::constants::LOOP_LISTING_GRACE
     fn evict_unneeded_loop_scans(&mut self) {
         // Borrowed from `self.gui` and read against `self.loop_mgr`: two
         // disjoint fields, so no clone of a site name is needed per frame.
@@ -2665,15 +2702,40 @@ impl App {
         let mut needed: HashMap<&str, std::collections::HashSet<chrono::NaiveDateTime>> =
             HashMap::new();
         let mut settling: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // One instant for the whole sweep, so two panes fetching the same
+        // listing cannot be judged against two different clocks.
+        let now = web_time::Instant::now();
         for idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
+            // **The volume the pane itself is viewing, whatever its loop is
+            // doing.** `prepare_volume`'s third arm serves a 3D pane out of
+            // this cache when the target is neither the live stamp nor the
+            // base, and that arm is reachable: the scan drain's `feed_is_ahead`
+            // branch *moves* an archive volume into the loop cache and writes
+            // neither `scan_data` nor `base_scans`. Swept from under such a
+            // target, `prepare_volume` answers `Waiting` — level-triggered, so
+            // for ever — and the pane never builds. Two entries per pane at
+            // most, and normally none of them is in this cache at all.
+            if let Some(info) = pane.scan_info.as_ref() {
+                needed
+                    .entry(info.site.name)
+                    .or_default()
+                    .insert(info.timestamp);
+            }
             let ls = &pane.loop_state;
             if !ls.is_active() {
                 continue;
             }
-            if ls.is_fetching() {
+            // The grace rule, with its clock. `listing_wait` answers `None` for
+            // a loop that is not fetching, so a loop past the bound is treated
+            // exactly like one that never asked — see this function's doc for
+            // why an unbounded exemption is a wasm32 leak rather than a nicety.
+            if ls
+                .listing_wait(now)
+                .is_some_and(|waited| waited < crate::constants::LOOP_LISTING_GRACE)
+            {
                 settling.insert(ls.site.as_str());
             }
             let frames = needed.entry(ls.site.as_str()).or_default();
@@ -2681,6 +2743,22 @@ impl App {
                 frames.insert(frame.timestamp);
             }
         }
+        // One predicate, passed by value to both sweeps below: it captures two
+        // shared references and nothing else, so it is `Copy` and the second
+        // call is not a second rule.
+        let keep = |site: &str, ts: &chrono::NaiveDateTime| {
+            settling.contains(site) || needed.get(site).is_some_and(|frames| frames.contains(ts))
+        };
+        // **The queues are swept by the same predicate, before the cache.**
+        // `dispatch_pending_loop_downloads` skips a queued timestamp whose
+        // volume `is_cached` already has, so the queue and the cache have to
+        // agree about which timestamps still matter — and `FramePlan::frames`
+        // is the *original listing*, which `append_polled_frame` never prunes
+        // as the window walks forward. Leaving it stale turns the next product
+        // switch into a re-download of a whole retired window, which is the
+        // refetch churn this design refuses a byte-LRU for. See
+        // `LoopDownloadManager::retain_plan_frames`.
+        self.loop_mgr.retain_plan_frames(keep);
         // Handed over rather than freed here, for the reason the three maps
         // above are — and with the same caveat, which is larger on this path:
         // a loop frame's volume is very often the same `Arc<Scan>` the pane's
@@ -2689,13 +2767,7 @@ impl App {
         // That is the correct outcome, not a shortfall: whichever holder turns
         // out to hold the last handle pays the deep free, and it is paid
         // off-frame only if every holder hands its own over.
-        crate::offload::discard_each(
-            "evicted-loop-volume",
-            self.loop_mgr.retain_scans(|site, ts| {
-                settling.contains(site)
-                    || needed.get(site).is_some_and(|frames| frames.contains(ts))
-            }),
-        );
+        crate::offload::discard_each("evicted-loop-volume", self.loop_mgr.retain_scans(keep));
     }
 
     /// Persist the config if it has changed and the interval has elapsed.

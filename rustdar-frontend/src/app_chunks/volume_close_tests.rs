@@ -310,11 +310,17 @@ fn a_completed_volume_stamps_freshness_for_its_own_cuts() {
 /// `volume_complete` with a single sweep. `cut_selection_for` keeps that off the
 /// live display by widening to `All` whenever a whole-volume product appears —
 /// but the loop cache is written unconditionally, read product-blind by
-/// `frame_data`, never re-downloaded once `is_cached`, and cleared only by
-/// `clear_all` on a site switch. So a one-sweep volume cached under a
-/// Reflectivity loop is still there when the pane is switched to echo tops, and
-/// `compute_echo_tops` clamps every column to 0.5° and reports a plausible,
-/// low, wrong altitude in kft.
+/// `frame_data`, and never re-downloaded once `is_cached`. So a one-sweep volume
+/// cached under a Reflectivity loop is still there when the pane is switched to
+/// echo tops, and `compute_echo_tops` clamps every column to 0.5° and reports a
+/// plausible, low, wrong altitude in kft.
+///
+/// Its lifetime no longer helps: `App::evict_unneeded_loop_scans` now sweeps the
+/// cache every frame, but it keeps exactly what the live loop frames name — and
+/// a frame naming this volume is precisely the case that goes wrong — so the
+/// entry survives for as long as it can do harm. The eviction pass made this
+/// guard no less necessary, which is why it is said here rather than left to
+/// read as a note about `clear_all`.
 ///
 /// Asserted on the *cache*, not on the frame list, because the cache write in
 /// `append_scan_to_active_loops` does not require an active loop — the entry is

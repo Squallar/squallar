@@ -879,6 +879,46 @@ pub const DESKTOP_LOOP_POOL_CEILING_BYTES: usize = 3072 * 1024 * 1024;
 /// for at this count, which is what makes it reachable rather than aspirational.
 pub const MIN_LOOP_FRAMES_PER_PANE: usize = 2;
 
+/// How long a loop waiting on its scan listing keeps its site exempt from
+/// `App::evict_unneeded_loop_scans`.
+///
+/// # Why the exemption needs a clock at all
+///
+/// A loop in `LoopPhase::FetchingScanList` names no frame, so the sweep would
+/// take its whole window in the gap before the listing installs one — every
+/// product switch and every loop re-init re-downloading what it already had.
+/// The exemption is what prevents that, and this is what prevents the exemption
+/// from being permanent.
+///
+/// It is not a formality. **On wasm32 nothing else ever ends it**:
+/// `rustdar_radar::tls::client` accepts and ignores the timeout it is handed,
+/// because reqwest's wasm `ClientBuilder` has no `timeout` and a browser
+/// `fetch()` has no default of its own, so a black-holed connection leaves the
+/// listing future pending for the life of the tab. `settle_loop_phase` returns
+/// early on an empty frame list and `accept_scan_listing` never runs, so the
+/// phase never moves — while the poll and chunk-feed paths go on writing a
+/// volume per seal into the very cache the exemption is protecting. Without
+/// this the leak resumes at full rate inside the 4 GiB address space.
+///
+/// # Why sixty seconds
+///
+/// A scan listing is an S3 directory listing of a few kilobytes; a healthy one
+/// answers in well under a second, and a bad mobile link in a few. Sixty is two
+/// orders of magnitude above that, so no honest listing is cut off.
+///
+/// It is priced from the other end too. At the 0.4–1 GB/h accumulation this
+/// sweep exists to stop, a 60 s exemption is worth at most ~17 MB — a figure
+/// under a single decoded volume's own order of magnitude, rather than a
+/// fraction of an address space. Native `ARCHIVE_TIMEOUT` is 300 s **per
+/// request** and `list_scans_for_range` issues one listing per UTC day the
+/// window touches, so this bounds the native stall well before the transport
+/// does, and it is the only bound on wasm.
+///
+/// A listing that really does overrun this is not lost: the sweep sheds that
+/// window, the listing lands, and the loop re-downloads it — the same cost as
+/// toggling the loop off and on, which this feature already accepts.
+pub const LOOP_LISTING_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How much larger a share has to get before every loop on screen is re-planned
 /// to use it.
 ///

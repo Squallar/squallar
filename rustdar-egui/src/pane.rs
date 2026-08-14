@@ -646,6 +646,37 @@ pub struct LoopPlaybackState {
     pub scan_step_secs: Option<u32>,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<web_time::Instant>,
+    /// When this loop entered [`LoopPhase::FetchingScanList`], or `None` for a
+    /// loop that was never built ([`Self::new`]).
+    ///
+    /// # It exists to bound a memory exemption, not to time the network
+    ///
+    /// `App::evict_unneeded_loop_scans` skips a site whole while any loop on it
+    /// is still fetching, because such a loop names no frame yet and would
+    /// otherwise have its whole window swept one frame before the listing that
+    /// would have saved it. That exemption has to end even when the listing
+    /// never does. On wasm32 there is no timeout to end it: `rustdar_radar::tls`
+    /// accepts and ignores the one it is handed, because reqwest's wasm
+    /// `ClientBuilder` has no `timeout` and a browser `fetch()` has no default
+    /// of its own — a black-holed connection leaves the future pending for the
+    /// life of the tab. Natively `ARCHIVE_TIMEOUT` does end it, but at 300 s
+    /// **per request** and `list_scans_for_range` issues one listing per UTC day
+    /// the window touches, so the bound there is minutes rather than one
+    /// round-trip.
+    ///
+    /// # Why a stamp here rather than the pane's frame plan
+    ///
+    /// The plan would be the obvious witness — "a loop with no plan is still
+    /// listing" — and it is the wrong one: `begin_loop_for_pane` calls
+    /// `LoopDownloadManager::remove_pending`, which deletes the plan, so a
+    /// rebuilt loop has neither a plan nor a frame and the two states are
+    /// indistinguishable through it.
+    ///
+    /// Stamped by [`Self::new_for_loop`], which is the **only** writer of
+    /// `FetchingScanList` in the workspace — so this cannot go stale behind a
+    /// phase that re-entered fetching by some other route, because there is no
+    /// other route.
+    pub listing_since: Option<web_time::Instant>,
     /// NEXRAD site code the loop's geometry belongs to, captured at loop creation
     /// from the same lookup as `site_lat`/`site_lon`. Every frame in this loop is
     /// rendered and positioned with those coordinates, so this — not the pane's
@@ -843,6 +874,7 @@ impl LoopPlaybackState {
             listing_sampled: None,
             scan_step_secs: None,
             last_advance: None,
+            listing_since: None,
             site: String::new(),
             site_lat: 0.0,
             site_lon: 0.0,
@@ -875,6 +907,9 @@ impl LoopPlaybackState {
             listing_sampled: None,
             scan_step_secs: None,
             last_advance: None,
+            // The one place `FetchingScanList` is written, so the one place the
+            // clock on that phase starts. See [`Self::listing_since`].
+            listing_since: Some(web_time::Instant::now()),
             site: site.name.to_string(),
             site_lat: site.lat,
             site_lon: site.lon,
@@ -905,6 +940,29 @@ impl LoopPlaybackState {
     /// True during the initial scan list fetch.
     pub fn is_fetching(&self) -> bool {
         matches!(self.phase, LoopPhase::FetchingScanList)
+    }
+
+    /// How long this loop has been waiting for its scan listing, or `None` if
+    /// it is not waiting for one.
+    ///
+    /// The caller supplies `now` rather than reading the clock here, so one
+    /// sweep judges every pane against one instant — and so a test can drive
+    /// the bound without sleeping.
+    ///
+    /// `saturating_duration_since`, because `web_time::Instant` is the
+    /// browser's monotonic clock on wasm and a non-monotonic reading would
+    /// otherwise panic in a subtraction rather than answer "no time has
+    /// passed".
+    pub fn listing_wait(&self, now: web_time::Instant) -> Option<std::time::Duration> {
+        if !self.is_fetching() {
+            return None;
+        }
+        Some(
+            self.listing_since
+                .map_or(std::time::Duration::ZERO, |since| {
+                    now.saturating_duration_since(since)
+                }),
+        )
     }
 
     /// True if playback was previously started (could be paused or playing).
