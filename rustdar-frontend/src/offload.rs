@@ -1612,9 +1612,18 @@ enum Handoff {
 /// browser has exactly one choice — a Web Worker cannot touch the page's
 /// memory, so the reply crosses a message port and `deliver` runs on the main
 /// thread. A native pool has two, and it takes the one that keeps a measured
-/// cost off the frame: `deliver` builds the `egui::ColorImage`, which at the
-/// 7362 px desktop ceiling is a 206.75 MiB copy. Running it here is running it
-/// on the pool thread, which is where it ran when this was a thread per job.
+/// cost off the frame.
+///
+/// `deliver` builds the `egui::ColorImage` (`render_dispatch::plan_view_image`),
+/// and that is still a copy after the premultiply moved to the producer: 206.75
+/// MiB at the 7362 px desktop ceiling, **13.85 ms** on this box, against a 16.7
+/// ms frame. Delivering on the frame thread would spend 83% of a frame budget
+/// per still render to make the two arms agree about a thread nobody can
+/// observe — `offload`'s own note explains why: every `deliver` ends in a
+/// channel send drained on a later frame, so a send before the caller returns
+/// and one after it are indistinguishable to the receiver and to the render
+/// budget. Running it here is running it on the pool thread, which is where it
+/// ran when this was a thread per job.
 ///
 /// An `id` with no pending entry is ignored: it is a reply to a job that
 /// [`abandon_worker`] already failed, and delivering it twice would send two

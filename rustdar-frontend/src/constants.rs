@@ -286,6 +286,38 @@ pub fn raster_side_from_rgba_len(rgba_len: usize) -> Option<usize> {
 /// renders could run back to back inside a single frame — six times the stall
 /// this cap exists to bound. Raise it in step with the worker pool, not alone.
 ///
+/// # What a second browser worker would cost, measured
+///
+/// The native arm's pool (`crate::offload`) is the same architecture on a
+/// target that has threads, and it does **not** move this number: the browser
+/// still has exactly one instance, so the sentence above still holds. What has
+/// changed is that the price of a second one is no longer unknown.
+///
+/// Each worker is its own wasm instance with its own linear memory, and that
+/// memory only grows. Measured by reading `WebAssembly.Memory.buffer.byteLength`
+/// inside four freshly-booted instances of this build, each given one real job:
+///
+/// |  | Firefox 153 | Chrome 151 |
+/// |---|---|---|
+/// | at boot | 3.63 MiB | 3.63 MiB |
+/// | after one 2048 px Level II render | 87.06 MiB | 87.06 MiB |
+/// | after one 16.9 MB Level II decode | 200.81 MiB | 200.81 MiB |
+///
+/// Byte-identical across the two engines and across all four instances, which
+/// is what says it is a property of this module rather than of a browser. **A
+/// pool sized from `navigator.hardwareConcurrency` would be a catastrophe**: 32
+/// on the box these were taken on, and the decode row makes that 6.3 GiB of
+/// linear memory before a single texture. If this is ever raised, it is
+/// resolved against that column and not against a core count.
+///
+/// The other half of the same finding is that a second worker is **not** the
+/// way to fix a render queued behind decodes. With the eight decodes
+/// [`MAX_CONCURRENT_LOOP_DOWNLOADS`] permits already posted, a render answers in
+/// 8210.6 ms (Firefox) / 7783.8 ms (Chrome). Letting the page post the render
+/// first — one worker, no extra memory — answers in 185.5 ms / 194.1 ms, and a
+/// second worker answers in 190.4 ms / 201.4 ms. The two are the same latency
+/// and one of them is free.
+///
 /// The three arms are named outside the cascade for the reason
 /// [`WASM_VOLUME_GRID_CELLS`] gives: a `cfg`-selected literal can only be
 /// checked by the target that compiles it, and this workspace runs `cargo test`
