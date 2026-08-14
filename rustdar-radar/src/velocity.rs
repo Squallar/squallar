@@ -329,12 +329,11 @@ fn offer_dealiased(builder: &mut WindProfileBuilder, tilt: &VelocityTilt<'_>, se
     // stricter profile censors residual fold walls that a fit would simply
     // have discarded. The clone is one tilt's grid at a time and is dropped
     // with `unfolded` at the end of the call.
-    let _ = crate::nrot::dealias(
+    let _ = crate::nrot::dealias_for_refit(
         &mut unfolded,
         &tilt.grid.sweep(None),
         tilt.elevation_deg,
         Some(seed),
-        crate::nrot::DealiasProfile::Coverage,
     );
     builder.add_sweep(
         &VelocitySweep {

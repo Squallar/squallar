@@ -3078,6 +3078,15 @@ pub(crate) struct DealiasKnobs {
     /// ([`incoherent_velocity`]) exactly as the radar reported it, rather
     /// than unfolding, censoring or dropping any of it.
     pub refuse_incoherent: bool,
+    /// Run [`region_assign`] between two rounds of the propagation passes.
+    /// [`RegionKnobs::SHIPPED`] in both profiles since the composition was
+    /// measured against the RPG's own field; that constant carries the table.
+    ///
+    /// It stays an `Option`, and `None` stays a working path, deliberately:
+    /// `None` is the pre-region dealiaser to the bit — the pass loop runs once
+    /// and nothing else changes — so the next campaign can measure against the
+    /// old behaviour inside one build, and so this is one word to revert.
+    pub region: Option<RegionKnobs>,
 }
 
 impl DealiasProfile {
@@ -3087,11 +3096,13 @@ impl DealiasProfile {
                 rawmin_bins: DA_RAWMIN_BINS,
                 censor_vny_frac: CENSOR_VNY_FRAC,
                 refuse_incoherent: true,
+                region: Some(RegionKnobs::SHIPPED),
             },
             DealiasProfile::Coverage => DealiasKnobs {
                 rawmin_bins: COVERAGE_RAWMIN_BINS,
                 censor_vny_frac: CENSOR_VNY_FRAC,
                 refuse_incoherent: false,
+                region: Some(RegionKnobs::SHIPPED),
             },
         }
     }
@@ -3170,6 +3181,42 @@ pub(crate) fn dealias(
         elevation_deg,
         profile,
         dealias_profile.knobs(),
+    )
+}
+
+/// The dealias the VAD's refit runs, with **region assignment deliberately
+/// off**.
+///
+/// [`crate::velocity`] fits a wind on aliased velocity, unfolds under that fit,
+/// and refits on what came back. Once the shipped postures carry
+/// [`RegionKnobs::SHIPPED`], routing that refit through [`dealias`] would put
+/// region assignment inside the loop that produces the wind that seeds region
+/// assignment — and that loop does not settle. Iterating the refit past its
+/// shipped depth of one, the profile does not stop moving on 8 of 11
+/// low-Nyquist volumes: KGRB swings 21.5 m/s between the second and third refit
+/// while 4.7% of its gates change branch, and the change *grows* rather than
+/// shrinks at KGRB, KFTG-2025, KLSX and KTLX. Every high-Nyquist volume settles.
+/// A stopping depth of one is then an arbitrary point on an oscillation, not a
+/// fixed point.
+///
+/// So the seed is produced the way it was produced when the arm was measured:
+/// by the wall-local dealiaser alone. Region assignment runs once, on the final
+/// field, where its output is read and not fed back into the wind that seeded it.
+pub(crate) fn dealias_for_refit(
+    vel_grid: &mut [Vec<f64>],
+    sweep: &VelocitySweep,
+    elevation_deg: f64,
+    profile: Option<&WindProfile>,
+) -> Option<Vec<bool>> {
+    dealias_with_knobs(
+        vel_grid,
+        sweep,
+        elevation_deg,
+        profile,
+        DealiasKnobs {
+            region: None,
+            ..DealiasProfile::Coverage.knobs()
+        },
     )
 }
 
@@ -3689,6 +3736,586 @@ fn incoherent_velocity(
     refused
 }
 
+/// A campaign arm, off in both shipped [`DealiasProfile`]s: assign a fold
+/// branch to a whole **region** rather than to a gate near a wall.
+///
+/// # Why a region at all
+///
+/// Every pass in [`dealias_with_knobs`] propagates a decision from a gate that
+/// has one to a gate beside it, under a continuity test. That reaches a gate
+/// whose own wrapped value sits near the fold wall, because there the test has
+/// something to see. It does not reach the **interior** of a folded region,
+/// whose gates are ordinary-looking velocity surrounded by ordinary-looking
+/// velocity — measured, against the RPG's own branch integers over 93 rungs at
+/// 20 sites: 44.16% recall at |v| ≥ 0.5·Vny and **12.50%** below it, under the
+/// best seed any of five produced. Py-ART's `dealias_region_based` reads 91.73%
+/// and 89.56% on the identical gates: flat, because it assigns a branch to a
+/// region and a region has no inside or outside.
+///
+/// # What is borrowed, and what is emphatically not
+///
+/// Borrowed: the region *is* a connected component of gates whose wrapped value
+/// falls in one sub-interval of the Nyquist interval, and the branch structure
+/// is solved as a graph over those regions. That is the mechanism, and it is
+/// published.
+///
+/// Not borrowed: `dealias_region_based` has **no acceptance test**. Its
+/// `_combine_regions` loops until `pop_edge` reports a negative weight — that
+/// is, until every edge has been consumed — so every pair of touching regions
+/// is merged at `round(mean difference)` whatever the evidence behind that
+/// mean. On a field with no coherent structure the mean difference across a
+/// short boundary is uniform on the interval and `round()` of it is ±1 most of
+/// the time, which is why on KHNX 2024-12-16 — a field three independent
+/// oracles adjudicated as unrecoverable noise — it places **69.41%** of gates
+/// off branch 0, and `dealias_unwrap_phase` 46.85%, where this module places
+/// 2.93%. Inheriting that would be a regression however the recall column read.
+///
+/// # The composition: the refusal acts three times, on three different objects
+///
+/// 1. **On the gate, before regions exist.** [`incoherent_velocity`]'s mask is
+///    already NaN in `raw` by the time this runs, so refused ground is in no
+///    region, carries no edge and is handed back as reported. Measured, this
+///    alone caps what any arm can claim on KHNX: the mask covers 92.98% of that
+///    volume's N0G gates and 70.31% of its N1G.
+/// 2. **On the edge.** An edge is a claim only if its boundary agrees on
+///    *which* branch ([`RegionKnobs::int_tol`], integrality) and its own gate
+///    pairs concentrate about that branch ([`RegionKnobs::pair_tol`],
+///    [`RegionKnobs::agree_frac`]). A failed edge is **deleted**, not merged —
+///    the one structural difference from the published algorithm.
+/// 3. **On the component.** An accepted edge that closes a cycle must agree
+///    with the offset already implied. It is dropped when it does not, and a
+///    component whose contradicting edges exceed [`RegionKnobs::contra_frac`]
+///    of its own is refused whole, back to branch 0. The greedy reduction in
+///    the published algorithm never revisits a merge, so it cannot see this: it
+///    resolves contradictory constraints by whichever merge happened first.
+///
+/// # The anchor is the other half, and it is not `centered`
+///
+/// The graph solves branches *relative to each other*. Measured on the design
+/// bench, that relative solution is essentially right — of folded gates that
+/// land in a component, 99.2% carry the correct relative branch, and an oracle
+/// anchor turns that into 96.10% recall, above region-based's 91.03%. So the
+/// absolute branch is the entire remaining question, and it is exactly the
+/// information a wind profile carries.
+///
+/// `dealias_region_based` answers it with `centered=True`: shift the sweep so
+/// the size-weighted mean fold is zero. That works there **only because it
+/// refuses nothing** — with every edge merged the sweep is one component, and
+/// "most of me is unfolded" is true of a whole sweep. A refusal fragments the
+/// graph, and the same prior is not true of a fragment. So the two properties
+/// are coupled: the global connectivity that makes a seedless anchor work is
+/// the same global connectivity that invents structure on noise.
+///
+/// This arm anchors each component on evidence instead: the branch the shipped
+/// passes already placed inside it, and the branch the environmental wind
+/// predicts for its gates (the same [`DA_SEED_TOL`] agreement Seed 1 uses,
+/// counted over a component rather than a 5 × 10 tile). A component whose
+/// evidence does not agree with itself to [`RegionKnobs::anchor_frac`] gets no
+/// branch. That is the fourth refusal.
+#[derive(Debug, Clone, Copy)]
+pub struct RegionKnobs {
+    /// Sub-intervals the Nyquist interval is split into for region finding.
+    /// 3 is `dealias_region_based`'s default and its documented compromise.
+    pub splits: usize,
+    /// Gates below which a connected component is speckle: no branch, no edge.
+    pub region_min: usize,
+    /// Gate pairs an edge needs before its mean is evidence of anything.
+    pub min_pairs: usize,
+    /// Integrality: `|mean/interval − round(mean/interval)|` at most this. A
+    /// boundary that lands halfway between two branches has named neither.
+    pub int_tol: f64,
+    /// Per-pair agreement radius about the edge's branch, in units of Vny.
+    pub pair_tol: f64,
+    /// Fraction of an edge's own gate pairs that must fall inside `pair_tol`.
+    pub agree_frac: f64,
+    /// Fraction of a component's cycle-closing edges that may contradict
+    /// before the whole component is refused.
+    pub contra_frac: f64,
+    /// Anchor votes a component needs before its evidence counts.
+    pub anchor_min: usize,
+    /// Fraction of those votes the winning branch must hold.
+    pub anchor_frac: f64,
+    /// Fall back to "the component's largest region is branch 0" when it has
+    /// no anchor evidence at all — `centered`'s prior, taken per component.
+    /// Off is the strict posture: no evidence, no claim.
+    pub anchor_largest: bool,
+    /// Run between the seeds and the propagation passes rather than after
+    /// them. **This is not a detail; it was measured, and it is most of the
+    /// arm.** Run after, the pass-placed gates dominate the anchor vote — and a
+    /// gate the passes left on branch 0 because they never had evidence about
+    /// it reads exactly like a gate they placed there on purpose, so a folded
+    /// region that the passes flooded at its raw value votes its own error and
+    /// the component anchors on it. Interior recall then moves 1.53% -> 2.08%,
+    /// which is nothing. Run before, the only evidence in the vote is the
+    /// seeds' (wind agreement, zero isodop) and the wind profile's own
+    /// prediction, both of which are about the environment rather than about
+    /// what a pass already decided.
+    pub before_passes: bool,
+    /// Replace a branch a pass already placed when the region disagrees.
+    /// Irrelevant when `before_passes`, where the only prior placements are
+    /// the seeds'.
+    pub overrule: bool,
+}
+
+impl RegionKnobs {
+    /// The shipped thresholds — **exactly the values the shipping arm was
+    /// measured at**, unrounded and untidied, so that what runs is what was
+    /// scored.
+    ///
+    /// Measured against the RPG's own N0G/N1G/N3U field (product 154 and 99,
+    /// gate-for-gate, MetPy-decoded) on 93 rungs at 21 volumes, 20 scored plus
+    /// KHNX as the noise floor, every arm on one locked gate population.
+    /// `Coverage`, pooled over 13 863 343 locked gates of which 5.37% are
+    /// RPG-folded:
+    ///
+    /// | arm | recall | precision | interior | wall |
+    /// |---|---|---|---|---|
+    /// | shipped, before this | 31.94% | 88.57% | 3.78% | 42.93% |
+    /// | **this** | **58.46%** | **96.49%** | **22.50%** | **72.48%** |
+    /// | `dealias_region_based` | 92.41% | 83.44% | 89.83% | 93.41% |
+    /// | `unwrap_phase` | 72.57% | 51.58% | 60.56% | 77.26% |
+    ///
+    /// Two of those thresholds are not the ones the arm was first scored at,
+    /// and both moved for a measured reason rather than a tidying one.
+    /// `anchor_largest` is **off**: with it on, a component carrying no anchor
+    /// evidence at all falls back to `centered`'s prior, and on a two-region
+    /// field that is enough to resolve a 2.00·Vny ambiguity — a step that is
+    /// equally a real shear line and a folded uniform field — which the
+    /// reference refuses to resolve. Off costs 0.05 pp of recall and 0.01 pp of
+    /// interior, and takes precision from 94.07% to 96.49% and the KHNX floor
+    /// from 3.26% to 2.15%. And the edge predicate carries the
+    /// `CENSOR_VNY_FRAC` clause below.
+    ///
+    /// Precision **rises** because the arm withdraws as well as adds: of the
+    /// claims the pre-region dealiaser made, it drops 27 458 that were only
+    /// 6.92% right, and adds 229 692 that are 90.07% right — 232 425 gates
+    /// fixed for every 22 257 broken, 10.4:1. That ratio is the reason this
+    /// ships; a dealiaser that found folds by inventing them would move every
+    /// velocity-derived product.
+    ///
+    /// The floor, pre-registered before scoring and adopted unchanged rather
+    /// than re-derived: on KHNX 2024-12-16, a clear-air field three oracles
+    /// adjudicated as noise, this places **2.15%** of the locked population off
+    /// branch zero under `Coverage` against a registered ceiling of 8.0% (worst
+    /// rung 3.07% against 15%), and **0.02%** under `NoFalseShear`. Both figures
+    /// are the *shipped dealiaser's own*, to the gate: region assignment claims
+    /// a great deal more ground and none of the extra lands on that field. The
+    /// two published algorithms fail it outright at 69.88% and 47.87%.
+    ///
+    /// **The reason to ship this is the region arm, not any interaction with
+    /// the seed.** Crossing the VAD repairs against this arm, the seed alone is
+    /// worth +4.29 pp of recall, this arm alone +25.09 pp, and both together
+    /// +31.72 pp against an additive +29.38 — an interaction of **+2.34 pp**,
+    /// which survives every leave-one-volume-out but is positive at only 9 of
+    /// the 15 volumes with a usable fold population and negative at 6. The
+    /// halves overwhelmingly **add**. Anyone reading a multiplication into
+    /// these two is reading 2 pp of one.
+    ///
+    /// **The graph is done; the anchor is the binding constraint.** 96.87% of
+    /// folded gates land in a component and 99.2% of those carry the correct
+    /// *relative* branch, so region finding is not what is missing. Anchored by
+    /// an oracle the same arm reaches 96.10%, and the repaired VAD buys about a
+    /// fifth of that headroom; the whole of the remaining gap to
+    /// `dealias_region_based` (58.65 vs 92.35) is the absolute branch. **The
+    /// next campaign here is the anchor, not the region finding.**
+    pub const SHIPPED: RegionKnobs = RegionKnobs {
+        splits: 3,
+        region_min: 1,
+        min_pairs: 2,
+        int_tol: 0.20,
+        pair_tol: 0.35,
+        agree_frac: 0.80,
+        contra_frac: 0.25,
+        anchor_min: 8,
+        anchor_frac: 0.60,
+        anchor_largest: false,
+        before_passes: true,
+        overrule: false,
+    };
+}
+
+/// What one region-assignment pass did, for the campaign harness to report.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegionStats {
+    pub regions: usize,
+    pub edges: usize,
+    pub accepted: usize,
+    pub components: usize,
+    pub contested: usize,
+    pub placed: usize,
+    /// Components refused for want of an anchor: no evidence at all, or
+    /// evidence that did not agree with itself to `anchor_frac`. Reported
+    /// because it is the arm's binding constraint, not a footnote.
+    pub no_anchor: usize,
+    /// Gates in a component that got a branch of zero — reached by the graph,
+    /// and left where they were.
+    pub zeroed: usize,
+}
+
+/// Union-find over regions carrying a fold-branch offset:
+/// `branch(x) = off[x] + branch(find(x))`.
+struct BranchDsu {
+    parent: Vec<u32>,
+    off: Vec<i32>,
+    size: Vec<u32>,
+    contra: Vec<u32>,
+    agree: Vec<u32>,
+}
+
+impl BranchDsu {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n as u32).collect(),
+            off: vec![0; n],
+            size: vec![1; n],
+            contra: vec![0; n],
+            agree: vec![0; n],
+        }
+    }
+
+    /// Root of `x` and `x`'s branch offset relative to it. Iterative, with the
+    /// offsets rewritten on the way back down so the walk stays flat.
+    fn find(&mut self, x: u32) -> (u32, i32) {
+        let (mut root, mut acc) = (x, 0i32);
+        while self.parent[root as usize] != root {
+            acc += self.off[root as usize];
+            root = self.parent[root as usize];
+        }
+        let (mut cur, mut cacc) = (x, acc);
+        while self.parent[cur as usize] != cur {
+            let (next, noff) = (self.parent[cur as usize], self.off[cur as usize]);
+            self.parent[cur as usize] = root;
+            self.off[cur as usize] = cacc;
+            cacc -= noff;
+            cur = next;
+        }
+        (root, acc)
+    }
+
+    /// Assert `branch(x) − branch(y) == d`. A cycle that contradicts what is
+    /// already implied is counted and the edge dropped: the edges arrive in
+    /// descending weight order, so the contradicting one is the weaker
+    /// evidence by construction.
+    fn union(&mut self, x: u32, y: u32, d: i32) {
+        let (rx, ox) = self.find(x);
+        let (ry, oy) = self.find(y);
+        if rx == ry {
+            if ox - oy == d {
+                self.agree[rx as usize] += 1;
+            } else {
+                self.contra[rx as usize] += 1;
+            }
+            return;
+        }
+        let (a, b, oa, ob, d) = if self.size[rx as usize] >= self.size[ry as usize] {
+            (rx, ry, ox, oy, d)
+        } else {
+            (ry, rx, oy, ox, -d)
+        };
+        self.parent[b as usize] = a;
+        self.off[b as usize] = oa - ob - d;
+        self.size[a as usize] += self.size[b as usize];
+        self.contra[a as usize] += self.contra[b as usize];
+        self.agree[a as usize] += self.agree[b as usize];
+    }
+}
+
+/// Label 4-connected components of gates whose wrapped velocity falls in one
+/// sub-interval of the Nyquist interval. Returns `(labels, count)`, label 0
+/// meaning "no region".
+///
+/// Azimuth does **not** wrap here, matching the published algorithm, which
+/// labels without a wrap and then lets the *edge* across the seam bind the two
+/// halves at whatever fold the boundary evidence supports. That is the better
+/// arrangement anyway: the seam is then subject to the acceptance test like any
+/// other boundary rather than being fused before one is applied.
+fn label_regions(
+    raw: &[Vec<f64>],
+    gc: usize,
+    nyquist: f64,
+    splits: usize,
+) -> (Vec<u32>, usize) {
+    let n = raw.len();
+    let mut label = vec![0u32; n * gc];
+    let mut nf = 0usize;
+    let width = 2.0 * nyquist / splits as f64;
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for b in 0..splits {
+        let lo = -nyquist + b as f64 * width;
+        let hi = lo + width;
+        let last = b + 1 == splits;
+        let inband = |v: f64| !v.is_nan() && v >= lo && (v < hi || (last && v <= hi));
+        for si in 0..n {
+            for sj in 0..gc {
+                if label[si * gc + sj] != 0 || !inband(raw[si][sj]) {
+                    continue;
+                }
+                nf += 1;
+                let id = nf as u32;
+                label[si * gc + sj] = id;
+                stack.push((si, sj));
+                while let Some((ci, cj)) = stack.pop() {
+                    let mut visit = |i: usize, j: usize, label: &mut Vec<u32>| {
+                        if j < gc && label[i * gc + j] == 0 && inband(raw[i][j]) {
+                            label[i * gc + j] = id;
+                            stack.push((i, j));
+                        }
+                    };
+                    if ci > 0 {
+                        visit(ci - 1, cj, &mut label);
+                    }
+                    if ci + 1 < n {
+                        visit(ci + 1, cj, &mut label);
+                    }
+                    if cj > 0 {
+                        visit(ci, cj - 1, &mut label);
+                    }
+                    visit(ci, cj + 1, &mut label);
+                }
+            }
+        }
+    }
+    (label, nf)
+}
+
+/// The pass itself. Writes `valid`/`value` only where it places a **non-zero**
+/// branch, so that a gate this refuses is left exactly where the shipped passes
+/// left it — including in the never-reached population the kept-raw region floor
+/// and the fold censor act on. The arm is then attributable to branch
+/// assignment alone and not to a coverage change.
+#[allow(clippy::too_many_arguments)]
+fn region_assign(
+    raw: &[Vec<f64>],
+    rows: crate::azimuth::Rows,
+    gc: usize,
+    nyquist: f64,
+    valid: &mut [bool],
+    value: &mut [f64],
+    predict: &dyn Fn(usize, usize) -> Option<f64>,
+    k: RegionKnobs,
+) -> RegionStats {
+    let n = raw.len();
+    let interval = 2.0 * nyquist;
+    let (mut label, nf) = label_regions(raw, gc, nyquist, k.splits.max(1));
+    let mut stats = RegionStats::default();
+    if nf < 2 {
+        return stats;
+    }
+    let mut size = vec![0u32; nf + 1];
+    for &l in &label {
+        size[l as usize] += 1;
+    }
+    // Speckle is neither a claimant nor evidence.
+    for l in label.iter_mut() {
+        if *l != 0 && (size[*l as usize] as usize) < k.region_min {
+            *l = 0;
+        }
+    }
+    stats.regions = (1..=nf)
+        .filter(|&l| size[l] as usize >= k.region_min)
+        .count();
+
+    // ── the boundary evidence ────────────────────────────────────────────
+    // Each unordered region pair keeps its gate-pair count and the sum of the
+    // differences across it. `visit` walks every 4-adjacency once: along the
+    // ray, and to the next row, which is where a closed sweep's seam lives.
+    let mut index: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut ea: Vec<u32> = Vec::new();
+    let mut eb: Vec<u32> = Vec::new();
+    let mut cnt: Vec<u32> = Vec::new();
+    let mut sum: Vec<f64> = Vec::new();
+    let each_pair = |mut f: Box<dyn FnMut(u32, u32, f64) + '_>| {
+        for i in 0..n {
+            let up = rows.neighbour(i, 1);
+            for j in 0..gc {
+                let la = label[i * gc + j];
+                if la == 0 {
+                    continue;
+                }
+                let va = raw[i][j];
+                if j + 1 < gc {
+                    let lb = label[i * gc + j + 1];
+                    if lb != 0 && lb != la {
+                        f(la, lb, va - raw[i][j + 1]);
+                    }
+                }
+                if let Some(ni) = up {
+                    let lb = label[ni * gc + j];
+                    if lb != 0 && lb != la {
+                        f(la, lb, va - raw[ni][j]);
+                    }
+                }
+            }
+        }
+    };
+    each_pair(Box::new(|la, lb, d| {
+        let (a, b, d) = if la < lb { (la, lb, d) } else { (lb, la, -d) };
+        let key = ((a as u64) << 32) | b as u64;
+        let e = *index.entry(key).or_insert_with(|| {
+            ea.push(a);
+            eb.push(b);
+            cnt.push(0);
+            sum.push(0.0);
+            ea.len() - 1
+        });
+        cnt[e] += 1;
+        sum[e] += d;
+    }));
+    stats.edges = ea.len();
+    if ea.is_empty() {
+        return stats;
+    }
+    let branch_of: Vec<i32> = (0..ea.len())
+        .map(|e| (sum[e] / cnt[e] as f64 / interval).round() as i32)
+        .collect();
+    // Second walk: how much of each boundary's own evidence sits on that branch.
+    let mut agree = vec![0u32; ea.len()];
+    let tol = k.pair_tol * nyquist;
+    each_pair(Box::new(|la, lb, d| {
+        let (a, b, d) = if la < lb { (la, lb, d) } else { (lb, la, -d) };
+        let e = index[&(((a as u64) << 32) | b as u64)];
+        if (d - branch_of[e] as f64 * interval).abs() <= tol {
+            agree[e] += 1;
+        }
+    }));
+
+    // ── the acceptance test the published algorithm does not have ────────
+    //
+    // The last clause is the censor's own boundary, reused rather than
+    // reinvented. Integrality alone cannot separate a fold from shear: at
+    // `int_tol` 0.20 a boundary of 1.70·Vny reads as `round(0.85) == 1` and is
+    // merged as one fold, and on a two-region field there is no cycle to
+    // contradict it and a uniform boundary passes `agree_frac` trivially. That
+    // unfolds a real shear line by 2·Vny — a −0.85·Vny half comes back
+    // +1.15·Vny — and it does it in the posture named for not doing it.
+    //
+    // [`CENSOR_VNY_FRAC`] is already this module's *measured* boundary between
+    // shear the reference paints and a fold displacement: it keeps a 1.70·Vny
+    // jump and drops a 2.00·Vny one. A boundary below it is shear by this
+    // module's own standing measurement, so it may not be called a fold here
+    // either. In these units the mean is `m` intervals, an interval is 2·Vny,
+    // so the boundary in units of Vny is `2·|m|`.
+    //
+    // Edges claiming branch **zero** are exempt, and that is not a softening:
+    // such an edge asserts the two regions are continuous, which is a claim
+    // about *no* fold, needs no fold-sized evidence, and is what keeps
+    // neighbouring unfolded regions in one component for the anchor vote.
+    // Guarding those instead would fragment the graph for nothing.
+    let mut accepted: Vec<usize> = (0..ea.len())
+        .filter(|&e| {
+            let m = sum[e] / cnt[e] as f64 / interval;
+            cnt[e] as usize >= k.min_pairs
+                && (m - branch_of[e] as f64).abs() <= k.int_tol
+                && agree[e] as f64 >= k.agree_frac * cnt[e] as f64
+                && (branch_of[e] == 0 || 2.0 * m.abs() >= CENSOR_VNY_FRAC)
+        })
+        .collect();
+    stats.accepted = accepted.len();
+    // Descending weight, exactly as `pop_edge` orders them: the longest shared
+    // boundary is the best-attested constraint, and a later contradiction of it
+    // is the weaker claim.
+    accepted.sort_unstable_by(|&x, &y| cnt[y].cmp(&cnt[x]).then(x.cmp(&y)));
+    let mut dsu = BranchDsu::new(nf + 1);
+    for &e in &accepted {
+        // v_a − v_b ≈ (branch_b − branch_a)·interval
+        dsu.union(eb[e], ea[e], branch_of[e]);
+    }
+
+    // ── components ───────────────────────────────────────────────────────
+    let mut members: std::collections::HashMap<u32, Vec<(u32, i32)>> =
+        std::collections::HashMap::new();
+    for l in 1..=nf as u32 {
+        if (size[l as usize] as usize) < k.region_min {
+            continue;
+        }
+        let (root, off) = dsu.find(l);
+        members.entry(root).or_default().push((l, off));
+    }
+    stats.components = members.len();
+
+    // ── the anchor ───────────────────────────────────────────────────────
+    // Where each region's gates are, so a component's evidence can be gathered
+    // without rewalking the grid once per region.
+    let mut gates_of: Vec<Vec<u32>> = vec![Vec::new(); nf + 1];
+    for (g, &l) in label.iter().enumerate() {
+        if l != 0 {
+            gates_of[l as usize].push(g as u32);
+        }
+    }
+    let mut branch = vec![0i32; nf + 1];
+    for (root, mem) in &members {
+        let (c, a) = (
+            dsu.contra[*root as usize] as f64,
+            dsu.agree[*root as usize] as f64,
+        );
+        if c > k.contra_frac * (c + a).max(1.0) {
+            stats.contested += 1;
+            continue;
+        }
+        let mut votes: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+        for &(l, off) in mem {
+            for &g in &gates_of[l as usize] {
+                let (g, i, j) = (g as usize, g as usize / gc, g as usize % gc);
+                // The shipped passes' own decision, where they made one.
+                if valid[g] {
+                    let b = ((value[g] - raw[i][j]) / interval).round() as i32;
+                    *votes.entry(b - off).or_default() += 1;
+                }
+                // The environment, on Seed 1's own agreement test.
+                if let Some(p) = predict(i, j) {
+                    let b = ((p - raw[i][j]) / interval).round() as i32;
+                    if (raw[i][j] + b as f64 * interval - p).abs() < DA_SEED_TOL {
+                        *votes.entry(b - off).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let total: usize = votes.values().sum();
+        let best = votes.iter().max_by_key(|(b, c)| (**c, -**b));
+        let base = match best {
+            Some((&b, &c))
+                if total >= k.anchor_min && c as f64 >= k.anchor_frac * total as f64 =>
+            {
+                b
+            }
+            // No evidence, or evidence that disagrees with itself.
+            _ if k.anchor_largest => {
+                stats.no_anchor += 1;
+                -mem
+                .iter()
+                    .max_by_key(|(l, _)| size[*l as usize])
+                    .map_or(0, |(_, off)| *off)
+            }
+            _ => {
+                stats.no_anchor += 1;
+                continue;
+            }
+        };
+        for &(l, off) in mem {
+            branch[l as usize] = base + off;
+        }
+    }
+
+    // ── place ────────────────────────────────────────────────────────────
+    for (g, &l) in label.iter().enumerate() {
+        let b = branch[l as usize];
+        if l == 0 {
+            continue;
+        }
+        if b == 0 {
+            stats.zeroed += 1;
+            continue;
+        }
+        if valid[g] && !k.overrule {
+            continue;
+        }
+        valid[g] = true;
+        value[g] = raw[g / gc][g % gc] + b as f64 * interval;
+        stats.placed += 1;
+    }
+    stats
+}
+
 /// Returns the `n · gc` incoherence mask this dealiasing set aside, so that
 /// [`llsd_nrot`] — which refuses exactly the same ground — can read it instead
 /// of asking [`incoherent_velocity`] the same question about the same grid a
@@ -3989,6 +4616,23 @@ pub(crate) fn dealias_with_knobs(
             .any(|(a, b)| !a.is_nan() && !b.is_nan() && (a - b).abs() >= 0.01)
     };
 
+    // The environment along one line of sight, for the region arm's anchor —
+    // the same question Seed 1 asks of a 5 × 10 tile, asked of a component.
+    let predict = |i: usize, j: usize| -> Option<f64> {
+        let r = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
+        profile?.predict(az_rad[i]?, r, elevation_deg)
+    };
+    let mut region_done = false;
+    let mut region_stats = RegionStats::default();
+    // The region arm's own place in the order. Before the passes it is a SEED
+    // pass — it hands whole regions a branch and the bridges and floods then
+    // propagate out of them, which is the job those passes are good at. After
+    // them it is a correction pass, and it is measured to be a much weaker one.
+    if let Some(k) = knobs.region.filter(|k| k.before_passes) {
+        region_done = true;
+        region_stats =
+            region_assign(&raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
+    }
     for _pass in 0..DA_PASSES {
         let mut changed = false;
 
@@ -4188,8 +4832,38 @@ pub(crate) fn dealias_with_knobs(
         }
 
         if !changed {
-            break;
+            // The passes have converged. The region arm runs exactly here and
+            // exactly once, because it sits between the two halves of the
+            // composition: it reads their decisions as anchor evidence, and
+            // they read its branches as seeds to bridge and flood out of. With
+            // `knobs.region` `None` this is the unconditional `break` it was.
+            match knobs.region.filter(|_| !region_done) {
+                Some(k) => {
+                    region_done = true;
+                    region_stats =
+                        region_assign(&raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
+                }
+                None => break,
+            }
         }
+    }
+    if region_done {
+        // Campaign instrument: the arm's own account of what it refused.
+        if std::env::var_os("RUSTDAR_REGION_STATS").is_some() {
+            eprintln!("REGIONSTATS {region_stats:?}");
+        }
+        log::debug!(
+            "region-assign: {} regions, {}/{} edges accepted, {} components \
+             ({} contested, {} unanchored), {} gates placed, {} left at zero",
+            region_stats.regions,
+            region_stats.accepted,
+            region_stats.edges,
+            region_stats.components,
+            region_stats.contested,
+            region_stats.no_anchor,
+            region_stats.placed,
+            region_stats.zeroed
+        );
     }
 
     // Convert unresolved to ND; write dealiased values back. Never-reached
@@ -4400,6 +5074,344 @@ mod tests {
 
     fn ring_azimuths(n: usize) -> Vec<f64> {
         (0..n).map(|i| i as f64 * 360.0 / n as f64).collect()
+    }
+
+    // ---- the region arm ---------------------------------------------------
+
+    /// A sweep whose *true* radial velocity is known, and the wrapped field the
+    /// radar would report for it. Nothing here is produced by the dealiaser, so
+    /// what the tests below assert is agreement with the constructed field
+    /// rather than with any output of the code under test.
+    ///
+    /// Flat at 15 m/s out to gate 100, then a ramp to 45 — which crosses the
+    /// 20 m/s limit at gate 110, so the outer two thirds are genuinely folded.
+    /// Past gate 160 the true field is 45 and the reported field is **+5**:
+    /// a quarter of the limit, deep inside the interior column where the
+    /// wall-local passes have nothing to see.
+    fn folded_ramp(n: usize, gc: usize, ny: f64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let truth: Vec<Vec<f64>> = (0..n)
+            .map(|_| {
+                (0..gc)
+                    .map(|j| match j {
+                        0..=100 => 15.0,
+                        101..=160 => 15.0 + 30.0 * (j - 100) as f64 / 60.0,
+                        _ => 45.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let wrapped = truth
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&v| v - (v / (2.0 * ny)).round() * 2.0 * ny)
+                    .collect()
+            })
+            .collect();
+        (truth, wrapped)
+    }
+
+    /// A field an actual wind produces, and the wind that produced it.
+    ///
+    /// [`folded_ramp`]'s truth is constant in azimuth, which no wind can make:
+    /// a VAD field is `u·sin(az) + v·cos(az)`. So a fixture that wants to hand
+    /// the dealiaser a *seed* has to be built from a profile rather than from a
+    /// shape, and it is built by asking the profile itself — the same
+    /// [`WindProfile::predict`] the anchor consults — so that the constructed
+    /// truth and the evidence agree by construction rather than by my
+    /// arithmetic.
+    ///
+    /// The wind ramps 15 -> 45 m/s between 1.0 and 2.5 km, so along any radial
+    /// not across the flow the field crosses the limit exactly as
+    /// [`folded_ramp`] does — a real wall, and an interior beyond it that no
+    /// wall-local pass can cross.
+    ///
+    /// Two profiles come back. The first is the atmosphere and is what the
+    /// truth is built from. The second is the **seed**, and it is fitted only
+    /// below 1.0 km: that is not a convenience, it is the situation — a VAD
+    /// stops fitting where its samples run out, which is exactly where the
+    /// folding starts, so the evidence lives near the radar and the branch has
+    /// to travel outward to be of any use. `predict` returns `None` above the
+    /// fitted layers (it falls back one layer and no further), so no seed of any
+    /// kind fires on the folded ground itself.
+    fn vad_folded(
+        n: usize,
+        gc: usize,
+        ny: f64,
+        elev: f64,
+    ) -> (WindProfile, Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let speed = |h: f64| match h {
+            h if h < 1.0 => 15.0,
+            h if h < 2.5 => 15.0 + 30.0 * (h - 1.0) / 1.5,
+            _ => 45.0,
+        };
+        let level = |l: usize| (l as f64 + 0.5) * PROFILE_LAYER_KM;
+        let air: Vec<(f64, f64, f64)> = (0..PROFILE_LAYERS)
+            .map(|l| (level(l), 0.0, speed(level(l))))
+            .collect();
+        let full = WindProfile::from_levels(&air).expect("profile");
+        let wp = WindProfile::from_levels(
+            &air.iter()
+                .copied()
+                .filter(|&(h, _, _)| h < 1.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("seed profile");
+        let az = ring_azimuths(n);
+        let truth: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..gc)
+                    .map(|j| {
+                        let r = 2.125 + j as f64;
+                        full.predict(az[i].to_radians(), r, elev).expect("prediction")
+                    })
+                    .collect()
+            })
+            .collect();
+        let wrapped = truth
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&v| v - (v / (2.0 * ny)).round() * 2.0 * ny)
+                    .collect()
+            })
+            .collect();
+        (wp, az, truth, wrapped)
+    }
+
+    fn coverage_knobs(region: Option<RegionKnobs>) -> DealiasKnobs {
+        DealiasKnobs {
+            rawmin_bins: COVERAGE_RAWMIN_BINS,
+            censor_vny_frac: CENSOR_VNY_FRAC,
+            refuse_incoherent: false,
+            region,
+        }
+    }
+
+    /// The same fixture as
+    /// [`the_interior_of_a_folded_region_is_recovered_from_a_seed`], with the
+    /// seed taken away — and with it, every scrap of evidence about which
+    /// absolute branch the region sits on.
+    ///
+    /// The fixture is unchanged from when it pinned the opposite claim. What
+    /// changed is `anchor_largest`, and the reason is in
+    /// [`RegionKnobs::SHIPPED`]: a component with no anchor evidence at all used
+    /// to fall back to `centered`'s prior — "my largest region is branch zero" —
+    /// and on a field like this one that prior is a coin toss dressed as an
+    /// answer. Here the graph still solves the region's *relative* branch
+    /// perfectly; what it cannot do is name the absolute one, and it says so.
+    ///
+    /// The second half is the discrimination check, and without it this test
+    /// pins nothing: the same call with `anchor_largest` **on** must move the
+    /// interior, or the posture under test is not what is producing the refusal.
+    #[test]
+    fn a_region_with_no_anchor_evidence_is_refused_rather_than_guessed() {
+        let (ny, n, gc) = (20.0, 72usize, 200usize);
+        let (truth, wrapped) = folded_ramp(n, gc, ny);
+        let az = ring_azimuths(n);
+        let sweep = VelocitySweep {
+            vel_grid: &wrapped,
+            azimuths_deg: &az,
+            gate_count: gc,
+            first_gate_range_km: 2.125,
+            gate_interval_km: 0.5,
+            declared_nyquist_ms: Some(ny),
+            status: None,
+        };
+        // Same preconditions as ever: gate 180 is deep interior, folded, and
+        // reported at a quarter of the limit.
+        assert!(
+            wrapped[0][180].abs() < 0.5 * ny
+                && (truth[0][180] - 45.0).abs() < 1e-9
+                && (wrapped[0][180] - 5.0).abs() < 1e-9,
+            "precondition: the fixture's folded interior is not +45 reported as +5",
+        );
+
+        let mut arm = wrapped.clone();
+        dealias_with_knobs(
+            &mut arm,
+            &sweep,
+            0.5,
+            None,
+            coverage_knobs(Some(RegionKnobs::SHIPPED)),
+        );
+        let interior: Vec<(usize, usize)> =
+            (0..n).flat_map(|i| (165..gc).map(move |j| (i, j))).collect();
+        let moved = interior
+            .iter()
+            .filter(|&&(i, j)| (arm[i][j] - wrapped[i][j]).abs() > 1e-9)
+            .count();
+        assert_eq!(
+            moved,
+            0,
+            "{moved} of {} interior gates were given a branch on no evidence",
+            interior.len(),
+        );
+
+        // Discrimination: the prior is what was doing it, and with the prior
+        // back on this same fixture is resolved — to the *right* answer, which
+        // is exactly why it is seductive and exactly why it is not evidence.
+        let mut guessed = wrapped.clone();
+        dealias_with_knobs(
+            &mut guessed,
+            &sweep,
+            0.5,
+            None,
+            coverage_knobs(Some(RegionKnobs {
+                anchor_largest: true,
+                ..RegionKnobs::SHIPPED
+            })),
+        );
+        let guessed_right = interior
+            .iter()
+            .filter(|&&(i, j)| (guessed[i][j] - truth[i][j]).abs() < 1e-9)
+            .count();
+        assert_eq!(
+            guessed_right,
+            interior.len(),
+            "with `anchor_largest` on this fixture must resolve, or the refusal \
+             above is not the posture's doing and this test is pinning nothing",
+        );
+    }
+
+    /// The defect the arm exists for: a folded region's **interior** is not
+    /// reachable by propagation from a wall, and is reachable by assigning a
+    /// branch to the region — from evidence.
+    ///
+    /// This is the claim the fixture above used to carry on a seedless field,
+    /// where it rested on a prior rather than on evidence. Here the field is
+    /// one an actual wind produces, the wind that produced it is supplied, and
+    /// the branch is anchored on what the environment says rather than on which
+    /// region happens to be biggest.
+    #[test]
+    fn the_interior_of_a_folded_region_is_recovered_from_a_seed() {
+        let (ny, n, gc, elev) = (20.0, 72usize, 200usize, 0.5);
+        let (wp, az, truth, wrapped) = vad_folded(n, gc, ny, elev);
+        let sweep = VelocitySweep {
+            vel_grid: &wrapped,
+            azimuths_deg: &az,
+            gate_count: gc,
+            first_gate_range_km: 2.125,
+            gate_interval_km: 1.0,
+            declared_nyquist_ms: Some(ny),
+            status: None,
+        };
+        // The gates this test is about: genuinely folded, and reported well
+        // inside the interior column where a wall-local rule has nothing to see.
+        let interior: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| (0..gc).map(move |j| (i, j)))
+            .filter(|&(i, j)| {
+                (truth[i][j] - wrapped[i][j]).abs() > 1e-9 && wrapped[i][j].abs() < 0.5 * ny
+            })
+            .collect();
+        assert!(
+            interior.len() > 500,
+            "precondition: the fixture has only {} folded interior gates to \
+             measure, which is too few to conclude anything from",
+            interior.len(),
+        );
+
+        let mut shipped = wrapped.clone();
+        dealias_with_knobs(
+            &mut shipped,
+            &sweep,
+            elev,
+            Some(&wp),
+            coverage_knobs(None),
+        );
+        let mut arm = wrapped.clone();
+        dealias_with_knobs(
+            &mut arm,
+            &sweep,
+            elev,
+            Some(&wp),
+            coverage_knobs(Some(RegionKnobs::SHIPPED)),
+        );
+        let right = |g: &Vec<Vec<f64>>| {
+            interior
+                .iter()
+                .filter(|&&(i, j)| (g[i][j] - truth[i][j]).abs() < 1e-9)
+                .count()
+        };
+        let (a, b) = (right(&shipped), right(&arm));
+        assert!(
+            b > a,
+            "the region arm recovered {b} of {} folded interior gates and the \
+             wall-local one {a}: this fixture is not isolating the assignment",
+            interior.len(),
+        );
+        assert!(
+            2 * b > interior.len(),
+            "the region arm recovered only {b} of {} folded interior gates",
+            interior.len(),
+        );
+    }
+
+    /// The constraint that makes the arm shippable at all: on a field with no
+    /// coherent structure it must claim nothing, and the refusal must be what
+    /// makes it so. The second half is the ablation — the same field and the
+    /// same graph in the **published algorithm's posture**, every edge merged
+    /// and no merge ever revisited — and it is what separates "this field
+    /// happens to be unmergeable" from "the rule refused it".
+    ///
+    /// Opening the acceptance test *alone* is not that ablation, and finding
+    /// out why was worth the test: with every edge merged the sweep becomes one
+    /// component whose constraints contradict each other, the component check
+    /// then refuses the whole thing, and **nothing** moves. Two refusals in
+    /// series each mask the other's absence. Only with both off does the field
+    /// acquire the invented branch structure `dealias_region_based` reads on
+    /// KHNX, which is what this asserts.
+    #[test]
+    fn a_field_with_no_structure_gets_no_branch_and_the_refusal_is_why() {
+        let (ny, n, gc) = (20.0, 72usize, 200usize);
+        // Deterministic uniform noise on the Nyquist interval: no seed, no
+        // fixture file, and identical on every platform.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 * ny - ny
+        };
+        let noise: Vec<Vec<f64>> = (0..n).map(|_| (0..gc).map(|_| next()).collect()).collect();
+        let az = ring_azimuths(n);
+        let sweep = VelocitySweep {
+            vel_grid: &noise,
+            azimuths_deg: &az,
+            gate_count: gc,
+            first_gate_range_km: 2.125,
+            gate_interval_km: 0.5,
+            declared_nyquist_ms: Some(ny),
+            status: None,
+        };
+        let moved = |knobs: DealiasKnobs| {
+            let mut g = noise.clone();
+            dealias_with_knobs(&mut g, &sweep, 0.5, None, knobs);
+            (0..n)
+                .flat_map(|i| (0..gc).map(move |j| (i, j)))
+                .filter(|&(i, j)| g[i][j].is_finite() && (g[i][j] - noise[i][j]).abs() > 1e-9)
+                .count()
+        };
+        let refused = moved(coverage_knobs(Some(RegionKnobs::SHIPPED)));
+        let admitted = moved(coverage_knobs(Some(RegionKnobs {
+            min_pairs: 1,
+            int_tol: 1.0,
+            agree_frac: 0.0,
+            contra_frac: 1.01,
+            ..RegionKnobs::SHIPPED
+        })));
+        let total = n * gc;
+        assert!(
+            refused * 50 < total,
+            "the arm moved {refused} of {total} gates on structureless noise — the \
+             floor this whole design exists to hold is 2% and it did not hold it",
+        );
+        assert!(
+            admitted > refused * 4,
+            "the published posture moved {admitted} gates against this arm's \
+             {refused}; if those are comparable then the refusal is not what \
+             holds this field and the ablation proves nothing",
+        );
     }
 
     // ---- the wind fit is in the ground frame ------------------------------
@@ -5401,6 +6413,68 @@ mod tests {
         assert!(
             nrot.iter().flatten().all(|v| v.is_nan()),
             "a coin toss carries no rotation to report",
+        );
+    }
+
+    /// Region assignment is on by default in **both** shipped postures, at the
+    /// thresholds the shipping arm was scored at. The flip is the shipped
+    /// behaviour, so it is pinned here rather than left to the profile bodies:
+    /// a threshold that drifts off the measured value silently invalidates the
+    /// table on [`RegionKnobs::SHIPPED`].
+    ///
+    /// The `None` path is asserted to still exist and still bite, because it is
+    /// the revert and it is how the next campaign measures against the old
+    /// behaviour. A knob nothing exercises is a knob that has quietly stopped
+    /// working.
+    #[test]
+    fn both_shipped_postures_assign_regions_at_the_measured_thresholds() {
+        let s = RegionKnobs::SHIPPED;
+        for p in [DealiasProfile::Coverage, DealiasProfile::NoFalseShear] {
+            let k = p.knobs().region.expect("region assignment ships on");
+            assert_eq!(
+                (k.splits, k.region_min, k.min_pairs, k.anchor_min),
+                (s.splits, s.region_min, s.min_pairs, s.anchor_min),
+            );
+            assert_eq!(
+                (k.int_tol, k.pair_tol, k.agree_frac, k.contra_frac, k.anchor_frac),
+                (s.int_tol, s.pair_tol, s.agree_frac, s.contra_frac, s.anchor_frac),
+            );
+            assert!(!k.anchor_largest && k.before_passes && !k.overrule);
+        }
+        // The ordering is most of the arm, and it was measured: run after the
+        // passes instead of before them and interior recall is 2.08%, not 12.49%.
+        assert!(s.before_passes && !s.overrule);
+        // `anchor_largest` off is the strict posture — no evidence, no claim.
+        // With it on, a component with no anchor evidence at all takes
+        // `centered`'s prior, and on a two-region field that is enough to
+        // resolve a 2.00·Vny ambiguity the reference refuses to resolve.
+        assert!(!s.anchor_largest);
+
+        // The revert path still runs, still produces a field, and still differs
+        // on ground built to fold.
+        let (ny, n, gc) = (20.0, 72usize, 200usize);
+        let (_truth, wrapped) = folded_ramp(n, gc, ny);
+        let az = ring_azimuths(n);
+        let sweep = VelocitySweep {
+            vel_grid: &wrapped,
+            azimuths_deg: &az,
+            gate_count: gc,
+            first_gate_range_km: 2.125,
+            gate_interval_km: 0.5,
+            declared_nyquist_ms: Some(ny),
+            status: None,
+        };
+        let mut off = wrapped.clone();
+        let mut on = wrapped.clone();
+        dealias_with_knobs(&mut off, &sweep, 0.5, None, coverage_knobs(None));
+        dealias_with_knobs(&mut on, &sweep, 0.5, None, coverage_knobs(Some(s)));
+        assert!(
+            off.iter().flatten().any(|v| v.is_finite()),
+            "the `None` path must still produce a field, not an empty one",
+        );
+        assert!(
+            off != on,
+            "if the two paths agree on a folded field the knob has stopped doing anything",
         );
     }
 
