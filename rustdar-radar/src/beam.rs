@@ -172,26 +172,30 @@
 //! true arc on [`crate::types::EARTH_RADIUS_KM`] — the split described above,
 //! and the one `polar_to_geo` makes as well.
 //!
-//! # What still spells the tangent plane
+//! # Nothing spells the tangent plane any more
 //!
-//! **This pair is not what the plan view paints with.** `render`'s
-//! `sweep_ground_factor` and [`crate::volumetric::RangeBinning`]'s
-//! `range_scale` each hoist `cos e` of their sweep's median elevation once and
-//! multiply it through the gate loop. That is not an oversight to sweep up in
-//! passing: a scalar can be hoisted out of a third of a million iterations and
-//! an arc cannot, because the arc is not linear in `r` and so does not survive
-//! being folded into the uniform gate spacing a raster's `first_gate_km` +
-//! `j·sample_km` walk assumes. Those two are the tangent plane's remaining
-//! spellings, and the table above is still the error in what a viewer sees.
+//! For two commits it did, and the table above was the error a viewer was
+//! still looking at rather than one that had been fixed: `render`'s four
+//! per-tilt paths and [`crate::volumetric::RangeBinning`] each hoisted `cos e`
+//! of their sweep's median elevation through their gate loop, so this pair had
+//! no caller outside tests and the plan view went on placing gates on the
+//! plane. Both now walk the arc per gate, `render::gate_ground_edges` and
+//! `RangeBinning::range_of`, and the readout inverts the same arc through
+//! `render::polar::PolarGeometry::pick`.
 //!
-//! So [`ground_range_km`] has, as of this commit, **no caller outside tests**.
-//! It is the reference those two hoists are to be replaced by, and until they
-//! are, a section sampled through [`slant_range_for_ground_km`] sits up to that
-//! table's distance from the plan view drawn above it. Recording that here is
-//! the point: it used to be invisible because both sides were wrong together,
-//! which is the failure this module was created to end, and it is now a stated
-//! difference with a measured size. The 6371-vs-6378 inconsistency
-//! [`crate::types::ImageBounds`] used to carry is a tenth of a pixel beside it.
+//! The scalar could not simply be swapped for a factor — an arc is not one —
+//! so it became a per-gate call, and that was measured before it was accepted
+//! rather than argued about: +2.4 % native, +3.1 % in Chrome, nothing
+//! measurable in Firefox, on a path that runs once per sweep in a worker and
+//! never per animation frame. The worst burst in the system is a 14-frame
+//! browser loop build at +0.28 s on ~9.1 s.
+//!
+//! What that buys is that a section sampled through
+//! [`slant_range_for_ground_km`] and the plan view drawn above it are back in
+//! register — this time because both are right, not because both were wrong
+//! together, which is the failure this module was created to end. The
+//! 6371-vs-6378 inconsistency [`crate::types::ImageBounds`] used to carry is a
+//! tenth of a pixel beside what was closed here.
 
 use crate::types::EARTH_RADIUS_KM;
 
@@ -471,7 +475,7 @@ pub fn site_bearing_range_km(site_lat: f64, site_lon: f64, lat: f64, lon: f64) -
 /// [`crate::render`]'s rasterizers do not, and this line used to claim they
 /// did. They multiply by a hoisted `cos e` instead, which was the same answer
 /// while [`ground_range_km`] was the tangent plane and is no longer — the
-/// module doc's "What still spells the tangent plane" measures what that is
+/// module doc's "Nothing spells the tangent plane any more" measures what that is
 /// worth and why the hoist cannot simply be swapped for a call.
 ///
 /// A range past half the circumference wraps over the pole and keeps going,

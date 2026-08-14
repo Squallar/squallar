@@ -122,14 +122,14 @@
 //! `the_cos_e_correction_is_worth_a_measured_number_of_pixels` keeps that and
 //! the 2.4° / 230 km figure beside it.
 //!
-//! **This module and the plan view no longer use the same conversion.** This
-//! one inverts the arc; the rasterizers hoist `cos e` of the sweep's median
-//! elevation, which is the tangent plane. So they register to within that
-//! difference rather than exactly — 666 m at 460 km on a 0.5° cut, about three
-//! plan-view cells, and 1227 m on a 1.8° one. `beam`'s "What still spells the
-//! tangent plane" carries the table and says why a scalar hoist cannot simply
-//! call the arc. A reader comparing a section against the map above it is
-//! seeing that, not a defect in either sampler.
+//! **This module and the plan view use the same conversion**, which for two
+//! commits they did not: this one inverted the arc while the rasterizers still
+//! hoisted `cos e`, and they registered only to within the difference — 666 m
+//! at 460 km on a 0.5° cut, about three plan-view cells. Both walk the arc per
+//! gate now (`render::gate_ground_edges`), and
+//! `render::polar::PolarGeometry::pick` inverts it to answer a hover, so a
+//! section, the map above it and the readout over both agree by construction
+//! rather than by each being wrong the same way.
 //!
 //! # Status, rather than `NaN`
 //!
@@ -1441,7 +1441,7 @@ impl<'a> VolumeSampler<'a> {
         let Some((lo, hi, fa)) = azimuth_bracket(rung, azimuth) else {
             return Sample::missing(SampleStatus::NoCoverage);
         };
-        // The same `cos e` the plan view applies, run backwards: a caller
+        // The same arc the plan view paints with, run backwards: a caller
         // names ground, a gate is indexed by beam. See the module doc.
         let slant_km = beam::slant_range_for_ground_km(ground_range_km, rung.elevation_deg);
 
