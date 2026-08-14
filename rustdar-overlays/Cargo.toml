@@ -30,7 +30,7 @@ futures = "=0.3.34"
 # LCFA granules are deflate-compressed, so dropping `deflate` takes the lightning
 # overlay dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`,
 # which is C and breaks wasm32/iOS cross-compilation.
-hdf5-pure = "=0.35.0"
+hdf5-pure = "=0.36.0"
 log = { workspace = true }
 # `json` only, NOT `default`: reqwest's `default-tls` aliases `rustls` with
 # aws-lc-rs, pulling `aws-lc-sys` in. TLS backend comes from the workspace pin.
