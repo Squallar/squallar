@@ -1566,6 +1566,9 @@ pub fn rasterize_model_data(
 mod alpha_tests;
 
 #[cfg(test)]
+mod dateline_tests;
+
+#[cfg(test)]
 mod glm_energy_tests;
 
 #[cfg(test)]
