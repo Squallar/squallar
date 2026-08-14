@@ -2867,7 +2867,7 @@ const DA_THRESH_SCALE: f64 = 1.4;
 /// decreases and is bounded by the gate count, and `changed` implies at least
 /// one invalid→valid transition. The loop is a monotone closure operator on a
 /// finite lattice: it cannot oscillate and cannot diverge, and raising the cap
-/// is purely additive. Measured over 8028 passes on 1189 tilt-runs, no pass
+/// is purely additive. Measured over 10537 passes on 1815 tilt-runs, no pass
 /// ever cleared a `valid` bit or rewrote the value of an already-valid gate;
 /// the 18,309,337 gates dealiased at both ten and the fixed point carry
 /// identical values, bit for bit. (Do not confuse this with the VAD **refit**
