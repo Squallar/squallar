@@ -42,11 +42,12 @@
 //!   offers at all and the one that separates a desktop browser from a phone
 //!   browser without asking either what it is called.
 //!
-//! Neither is a prerequisite for the other, so the better of the two wins: a
-//! browser has no class, a desktop GPU behind GL reports `Other` and no useful
-//! class either, and a discrete card behind a downlevel adapter is still
-//! discrete. Taking the better answer is what lets one rule serve both
-//! platforms with **no `Platform` term in it at all**.
+//! The reports speak only where the class is silent. A class the driver named
+//! is the better signal and the ceilings cannot argue with it; `Unknown` is not
+//! a bad device but an *absent answer*, and it is the majority arm — every
+//! browser reports it whatever the silicon is, and so does at least one real GL
+//! adapter. That one rule serves both platforms with **no `Platform` term in it
+//! at all**.
 //!
 //! # And only ever downward again from failure
 //!
@@ -323,26 +324,38 @@ pub struct DeviceProfile {
 impl DeviceProfile {
     /// How far up its bracket every budget may be spent here.
     ///
-    /// **The better of two signals, and no `Platform` term.** Each is positive
-    /// evidence on its own and each is missing on some target: a browser
-    /// reports no class at all, this project's own RTX 3090 reports
-    /// `DiscreteGpu` through Vulkan and `Other` through GL, and a discrete card
-    /// behind a downlevel adapter is still discrete. A `min` would let the
-    /// missing half veto the present one and pin every browser to the floor for
-    /// ever, which is the complaint this whole module exists to answer.
+    /// **Two signals, and the reports speak only where the class is silent.**
+    /// There is no `Platform` term and there must not be one.
     ///
-    /// **`Software` overrides both**, and is the one class where the reports
-    /// say nothing worth having: a software rasteriser will happily advertise
-    /// 16384 and then take seconds a frame, and `quality::select` already puts
-    /// it at the bottom of its own ladder for that reason.
+    /// * A class the driver actually **named** is the better signal and the
+    ///   report cannot argue with it, in either direction. A reported texture
+    ///   dimension is a statement about *capacity*; `Integrated` is a statement
+    ///   about shared DRAM and fill rate, and this project's own second
+    ///   measured machine — a Radeon 890M reporting 16384/8192 — is exactly the
+    ///   device that would otherwise be promoted past what
+    ///   `constants::DESKTOP_VOLUME_OFFSCREEN_CEILING_BYTES` says it can hold a
+    ///   frame at.
+    /// * **`Unknown` is not a bad device, it is an absent answer**, and it is
+    ///   the majority arm: every browser reports it whatever the silicon is,
+    ///   and so does at least one real GL adapter — this project's RTX 3090
+    ///   reports `DiscreteGpu` through Vulkan and `Other` through GL. There the
+    ///   adapter's own ceilings are all there is, and reading them is what
+    ///   stops a desktop browser being handed a phone's budget for ever.
+    ///
+    /// `Virtual` and `Software` stay at the floor whatever they report: a
+    /// hosted adapter's ceilings say nothing about the host's contention, and a
+    /// software rasteriser will advertise 16384 and then take seconds a frame,
+    /// which is why `quality::select` already puts it at the bottom of its own
+    /// ladder.
     pub fn promotion(&self) -> Promotion {
-        if matches!(self.class, DeviceClass::Software) {
-            return Promotion::Floor;
+        match self.class {
+            DeviceClass::Unknown => self.reported_promotion(),
+            named => Promotion::for_class(named),
         }
-        Promotion::for_class(self.class).max(self.reported_promotion())
     }
 
-    /// What the adapter's own reported ceilings are worth on their own.
+    /// What the adapter's own reported ceilings are worth, where nothing else
+    /// answered.
     ///
     /// Two rungs rather than three: [`DESKTOP_CLASS_REPORT`] is a measured
     /// line and there is no second measured line to put between it and the

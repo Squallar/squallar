@@ -899,15 +899,34 @@ fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
         "discrete desktop",
     );
 
-    // An integrated desktop GPU is left exactly where it was, and that is the
+    // **An integrated desktop GPU is left exactly where it was, and it stays
+    // there even when it reports desktop-class ceilings.** That is the
     // measurement's answer rather than an omission: the same cost model puts it
-    // at 12-23 ms for a *1440 x 900* pane.
-    let integrated = resolve(&DeviceProfile {
-        class: DeviceClass::Integrated,
-        ..shipped_profile(BudgetLimits::DESKTOP)
-    });
-    assert_eq!(integrated.promotion, Promotion::Step);
-    assert_eq!(integrated.offscreen_bytes, unpromoted.offscreen_bytes);
+    // at 12-23 ms for a *1440 x 900* pane, so a 4K one is not a frame. It is
+    // also the row this project actually measured — a Radeon 890M reporting
+    // 16384/8192, which clears `DESKTOP_CLASS_REPORT` outright. A rule that let
+    // the report raise a class the driver had already named would promote that
+    // machine past what it can hold a frame at, on the strength of a number
+    // about capacity answering a question about fill rate.
+    for adapter in [
+        AdapterCeilings::WEBGL2_GUARANTEE,
+        AdapterCeilings {
+            max_texture_dimension_2d: 16384,
+            max_texture_dimension_3d: 8192,
+        },
+    ] {
+        let integrated = resolve(&DeviceProfile {
+            class: DeviceClass::Integrated,
+            adapter,
+            ..shipped_profile(BudgetLimits::DESKTOP)
+        });
+        assert_eq!(integrated.promotion, Promotion::Step);
+        assert_eq!(
+            integrated.offscreen_bytes, unpromoted.offscreen_bytes,
+            "an integrated GPU reporting {adapter:?} was promoted to a 4K \
+             offscreen the cost model says it cannot fill in a frame",
+        );
+    }
 }
 
 /// **Every arm of the mobile bracket is pinned, and it is pinned on purpose.**
@@ -1085,4 +1104,77 @@ fn a_ladder_position_survives_its_own_config_entry() {
         .expect("the memory store cannot fail");
     assert_eq!(remembered_steps(Some(&store)), None);
     assert_eq!(remembered_steps(None), None);
+}
+
+/// **What five machines get, in the units a user would notice.**
+///
+/// The stage's whole answer on one page, pinned so that a change to any rule
+/// has to come past a table someone can read. Four of the five are real: two
+/// adapters on this project's own RTX 3090 (Vulkan naming it `DiscreteGpu`, GL
+/// naming it `Other`), the Radeon 890M whose browser reading was measured, and
+/// Firefox 153 on the 3090 at its **allocatable** 16384 rather than its
+/// reported 32768. The fifth is the WebGL2 guarantee, which is what the web
+/// budgets were derived from and is the honest stand-in for a device this
+/// project has not measured.
+///
+/// The two rows that carry the point are the last two: same binary, same
+/// origin, same backend, same `DeviceClass::Unknown`, and 3.4x the voxels
+/// between them. No `cfg` can express the difference — not coarsely, none.
+#[test]
+fn what_five_real_machines_get() {
+    let row = |limits, class, two_d, three_d| {
+        let profile = DeviceProfile {
+            class,
+            adapter: AdapterCeilings {
+                max_texture_dimension_2d: two_d,
+                max_texture_dimension_3d: three_d,
+            },
+            ..shipped_profile(limits)
+        };
+        let b = resolve(&profile);
+        let pool = crate::loop_pool::LoopPool::for_promotion(
+            b.promotion,
+            None,
+            crate::loop_pool::LoopPoolLimits::from_budgets(&b),
+        )
+        .bytes();
+        (
+            b.promotion,
+            b.grid_cells.iter().map(|&n| n as usize).product::<usize>(),
+            b.offscreen_bytes / (1024 * 1024),
+            pool / (1024 * 1024),
+            b.raster_side_for_adapter(two_d),
+        )
+    };
+    let d = BudgetLimits::DESKTOP;
+    let w = BudgetLimits::WASM;
+
+    // machine                       | rung     | cells     | offscreen | pool | raster
+    assert_eq!(
+        row(d, DeviceClass::Discrete, 32768, 16384),
+        (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
+        "RTX 3090 over Vulkan",
+    );
+    assert_eq!(
+        row(d, DeviceClass::Unknown, 32768, 16384),
+        (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
+        "the same RTX 3090 over GL, where the driver names it `Other` — the \
+         case a class-only rule gets wrong on real hardware",
+    );
+    assert_eq!(
+        row(d, DeviceClass::Integrated, 16384, 8192),
+        (Promotion::Step, 8_388_608, 20, 1152, 8192),
+        "a desktop integrated GPU: promoted by nothing it reports, because \
+         what it reports is capacity and what holds it back is fill rate",
+    );
+    assert_eq!(
+        row(w, DeviceClass::Unknown, 16384, 16384),
+        (Promotion::Ceiling, 3_538_944, 5, 192, 2048),
+        "Firefox 153 on the RTX 3090, at what it will actually allocate",
+    );
+    assert_eq!(
+        row(w, DeviceClass::Unknown, 2048, 256),
+        (Promotion::Floor, 1_048_576, 5, 56, 2048),
+        "a browser at the WebGL2 guarantee, which keeps every byte it had",
+    );
 }
