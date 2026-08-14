@@ -117,16 +117,15 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
 /// `RadarSites` raster covers the same viewport as any other overlay's. They
 /// are no longer two of one shape, though, and each is pinned to its own:
 ///
-/// * The **opaque** arm — the hit-map kinds and the model grid, still
-///   closures — has rasterizers whose alpha convention varies by kind:
-///   tiny-skia writes premultiplied, `rasterize_model_data` writes straight,
-///   and both arrive through the same `prepare_rasterize` arm. So its
-///   conversion must be `overlay_color_image`, the one function that reads
-///   `RasterizeOutput::alpha`, and a call site that picked an egui
+/// * The **opaque** arm — the model grid, the one closure kind left — has
+///   the rasterizer that writes straight alpha (`rasterize_model_data`), so
+///   its conversion must be `overlay_color_image`, the one function that
+///   reads `RasterizeOutput::alpha`, and a call site that picked an egui
 ///   constructor itself would be the regression.
-/// * The **described** arms — sites and the three polygon kinds — share one
-///   deliver, `overlay_job_deliver`, and their replies' convention does not
-///   vary: `offload::execute` converts inside the job at the rasterizer's own
+/// * The **described** arms — sites, and the handler kinds (the three
+///   polygon kinds and the two hit-map kinds) — share one deliver,
+///   `overlay_job_deliver`, and their replies' convention does not vary:
+///   `offload::execute` converts inside the job at the rasterizer's own
 ///   declaration, the contract on `offload::JobOutput::OverlayRaster` is
 ///   premultiplied-always, and the per-kind
 ///   `..._is_byte_identical_direct_and_via_the_wire` parity tests in
@@ -159,7 +158,7 @@ fn both_overlay_rasterizers_convert_before_they_send() {
         body.matches("Self::overlay_job_deliver(").count(),
         2,
         "`spawn_overlay_render`'s described arms — the sites dispatch and the \
-         polygon-kind dispatch — must both hand their reply to the one shared \
+         handler-kind dispatch — must both hand their reply to the one shared \
          `overlay_job_deliver`. Fewer means a described arm grew a deliver of \
          its own, which is the drift the shared builder exists to prevent.",
     );

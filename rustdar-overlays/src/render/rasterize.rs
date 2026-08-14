@@ -10,35 +10,48 @@ use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Tr
 
 use std::sync::Arc;
 
-use crate::glm::GlmFlash;
 use crate::nws::alert::AlertCategory;
 use crate::render::overlay_state::OverlayItem;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
-use crate::spc::reports::{StormReport, StormReportKind};
+use crate::spc::reports::StormReportKind;
 use crate::types::{GeoBounds, GeoPolygonRing, OverlayFeature};
 
 // ── Hit buffer types ─────────────────────────────────────────────────────
 
-/// Click detection against the pixels the rasterizer actually drew. Stored at
-/// 1/4 resolution per axis, and sparsely, to keep memory down.
-#[derive(Clone)]
-pub struct HitMap {
+/// The portable half of click detection: which quarter-resolution cells the
+/// rasterizer drew which item **indices** into. Plain data — this is what a
+/// described hit-map render answers over a message port, where the trait
+/// objects a click resolves to cannot follow.
+///
+/// An id here is the item's position in the rasterizer's own input list
+/// (`ReportsInput::reports`, `GlmStrikesInput::flashes`). That makes the pair
+/// `(HitCells, id_map)` meaningful only when the id_map was captured **from
+/// the same list in the same order** — see [`HitMap::from_cells`], where the
+/// zip happens and where that invariant is stated as the contract it is.
+///
+/// Stored at 1/4 resolution per axis, and sparsely, to keep memory and wire
+/// size down — the same layout the pre-split `HitMap` used.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HitCells {
     /// Quarter-resolution, not texture width.
     pub width: u32,
     pub height: u32,
-    /// `qy * width + qx` → covering item IDs. Occupied cells only.
-    cells: HashMap<u32, Vec<u32>>,
-    id_map: HashMap<u32, Arc<dyn OverlayItem>>,
+    /// `qy * width + qx` → covering item indices. Occupied cells only.
+    ///
+    /// Public because this is a wire form: the codec in
+    /// `rustdar_frontend::offload` reads and rebuilds it, and *it* polices the
+    /// in-range invariant on untrusted bytes. Everything built through
+    /// [`record`](Self::record) is in range by construction.
+    pub cells: HashMap<u32, Vec<u32>>,
 }
 
-impl HitMap {
+impl HitCells {
     /// Takes *full*-resolution dimensions and quarters them.
     pub fn new(full_width: u32, full_height: u32) -> Self {
         Self {
             width: full_width.div_ceil(4),
             height: full_height.div_ceil(4),
             cells: HashMap::new(),
-            id_map: HashMap::new(),
         }
     }
 
@@ -59,26 +72,71 @@ impl HitMap {
         }
     }
 
-    pub fn register_id(&mut self, item_id: u32, item: Arc<dyn OverlayItem>) {
-        self.id_map.insert(item_id, item);
-    }
-
-    /// `(u, v)` are texture UVs in `[0, 1]`.
-    pub fn hit_test(&self, u: f32, v: f32) -> Vec<Arc<dyn OverlayItem>> {
+    /// The item indices covering `(u, v)` — texture UVs in `[0, 1]`.
+    pub fn ids_at(&self, u: f32, v: f32) -> &[u32] {
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-            return Vec::new();
+            return &[];
         }
         let qx = ((u * self.width as f32) as u32).min(self.width.saturating_sub(1));
         let qy = ((v * self.height as f32) as u32).min(self.height.saturating_sub(1));
         let idx = qy * self.width + qx;
+        self.cells.get(&idx).map_or(&[], Vec::as_slice)
+    }
+
+    /// The largest item index any cell records, or `None` for an empty map.
+    /// What the page-side zip checks its id_map against — see
+    /// [`HitMap::from_cells`].
+    pub fn max_id(&self) -> Option<u32> {
+        self.cells.values().flatten().copied().max()
+    }
+}
+
+/// Click detection against the pixels the rasterizer actually drew: the
+/// portable [`HitCells`] zipped with the page-side `id_map` of the trait
+/// objects a hit resolves to.
+///
+/// The two halves used to be one struct filled in one function. They are
+/// split because only one of them can cross a message port: the cells travel
+/// back from the worker, the `Arc<dyn OverlayItem>`s never leave the page.
+#[derive(Clone)]
+pub struct HitMap {
+    cells: HitCells,
+    id_map: HashMap<u32, Arc<dyn OverlayItem>>,
+}
+
+impl HitMap {
+    /// Zip the worker's cells with the items captured at dispatch.
+    ///
+    /// # The order-stability invariant
+    ///
+    /// `items[i]` **must** be the item whose row travelled at position `i` of
+    /// the described input, because a cell records positions and nothing else.
+    /// Both halves are built from one iteration of the handler's data — the
+    /// input rows by the handler's `paint_input` helper, the items by its
+    /// `hit_items` — and the wire codec appends and reads lists in order, so
+    /// the invariant holds by construction. It is pinned rather than trusted:
+    /// `rustdar_frontend::offload::tests` zips a deliberately shuffled id_map
+    /// and asserts the hit comes back **wrong**, because a silent order
+    /// mismatch here is a hover that names the wrong storm report — worse than
+    /// no hit map at all.
+    pub fn from_cells(cells: HitCells, items: &[Arc<dyn OverlayItem>]) -> Self {
+        Self {
+            cells,
+            id_map: items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (i as u32, Arc::clone(item)))
+                .collect(),
+        }
+    }
+
+    /// `(u, v)` are texture UVs in `[0, 1]`.
+    pub fn hit_test(&self, u: f32, v: f32) -> Vec<Arc<dyn OverlayItem>> {
         self.cells
-            .get(&idx)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.id_map.get(id).cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
+            .ids_at(u, v)
+            .iter()
+            .filter_map(|id| self.id_map.get(id).cloned())
+            .collect()
     }
 }
 
@@ -109,7 +167,11 @@ pub enum AlphaMode {
 pub struct RasterizeOutput {
     /// `width × height × 4` bytes, in the convention [`Self::alpha`] names.
     pub rgba: Vec<u8>,
-    pub hit_map: Option<HitMap>,
+    /// The portable half of the hit map — item **indices**, never items. The
+    /// consumer zips it with the id_map it captured at dispatch
+    /// ([`HitMap::from_cells`]); a rasterizer that answers `Some` here is one
+    /// whose kind resolves clicks by pixel rather than by polygon containment.
+    pub hit_cells: Option<HitCells>,
     /// How to read [`Self::rgba`]. See [`AlphaMode`].
     pub alpha: AlphaMode,
 }
@@ -313,7 +375,7 @@ pub fn rasterize_spc_outlooks(
         );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Premultiplied,
         };
     };
@@ -330,7 +392,7 @@ pub fn rasterize_spc_outlooks(
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_map: None,
+        hit_cells: None,
         alpha: AlphaMode::Premultiplied,
     }
 }
@@ -380,7 +442,7 @@ pub fn rasterize_spc_discussions(
         );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Premultiplied,
         };
     };
@@ -420,7 +482,7 @@ pub fn rasterize_spc_discussions(
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_map: None,
+        hit_cells: None,
         alpha: AlphaMode::Premultiplied,
     }
 }
@@ -482,7 +544,7 @@ pub fn rasterize_nws_alerts(
         );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Premultiplied,
         };
     };
@@ -501,7 +563,7 @@ pub fn rasterize_nws_alerts(
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_map: None,
+        hit_cells: None,
         alpha: AlphaMode::Premultiplied,
     }
 }
@@ -572,7 +634,7 @@ pub fn rasterize_radar_sites(
         );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Premultiplied,
         };
     };
@@ -672,7 +734,7 @@ pub fn rasterize_radar_sites(
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_map: None,
+        hit_cells: None,
         alpha: AlphaMode::Premultiplied,
     }
 }
@@ -772,18 +834,56 @@ fn draw_wind_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
     }
 }
 
+/// The paint-relevant slice of one storm report: what
+/// [`rasterize_storm_reports`] reads of a
+/// [`StormReport`](crate::spc::reports::StormReport), and nothing else. The
+/// time, magnitude, location and comments stay page-side — popup content the
+/// raster never draws, and not worth bytes on the message port the described
+/// job crosses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportPaint {
+    /// Chooses the colour and the symbol.
+    pub kind: StormReportKind,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// Everything [`rasterize_storm_reports`] reads besides the raster's own
+/// geometry — the **wire form** of the storm-reports render. See
+/// [`OutlooksInput`] for the shape's reason.
+///
+/// A report's position in `reports` is its **hit-map id**: the cells this
+/// render answers record indices into this list, and the page zips them with
+/// an item list captured from the same handler data in the same order
+/// ([`HitMap::from_cells`] states the invariant).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportsInput {
+    pub reports: Vec<ReportPaint>,
+    /// The actual zoom — the marker radius is a function of it.
+    pub zoom: f64,
+    /// Picks the outline colour.
+    pub is_dark: bool,
+    /// See the `device_scale` note on
+    /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
+    pub device_scale: f32,
+}
+
 /// Tornado = red, hail = green, wind = blue. Below a 5 px radius the symbols
 /// are unreadable, so it falls back to filled dots.
 pub fn rasterize_storm_reports(
-    reports: &[StormReport],
-    items: &[Arc<dyn OverlayItem>],
+    input: &ReportsInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    ctx: &crate::render::overlay_state::RasterizeContext,
 ) -> RasterizeOutput {
-    let (zoom, is_dark) = (ctx.zoom, ctx.is_dark);
-    let scale = sane_device_scale(ctx.device_scale);
+    let ReportsInput {
+        reports,
+        zoom,
+        is_dark,
+        device_scale,
+    } = input;
+    let (zoom, is_dark) = (*zoom, *is_dark);
+    let scale = sane_device_scale(*device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_storm_reports ({}×{})",
@@ -792,7 +892,7 @@ pub fn rasterize_storm_reports(
         );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Premultiplied,
         };
     };
@@ -812,7 +912,7 @@ pub fn rasterize_storm_reports(
         Color::from_rgba8(40, 40, 40, 220)
     };
 
-    let mut hit_map = HitMap::new(width, height);
+    let mut hit_cells = HitCells::new(width, height);
 
     for (idx, report) in reports.iter().enumerate() {
         // Into the viewport's frame first — see `rasterize_radar_sites`. The
@@ -879,10 +979,9 @@ pub fn rasterize_storm_reports(
             }
         }
 
+        // The report's position in the input list **is** its id — the page's
+        // id_map is keyed the same way, which is the whole zip contract.
         let item_id = idx as u32;
-        if let Some(item) = items.get(idx) {
-            hit_map.register_id(item_id, item.clone());
-        }
         let min_x = (px - hit_radius).max(0.0) as i32;
         let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
         let min_y = (py - hit_radius).max(0.0) as i32;
@@ -896,7 +995,7 @@ pub fn rasterize_storm_reports(
                 let dx = sx as f32 - px;
                 let dy = sy as f32 - py;
                 if dx * dx + dy * dy <= r2 {
-                    hit_map.record(sx as f32, sy as f32, item_id);
+                    hit_cells.record(sx as f32, sy as f32, item_id);
                 }
                 sx += 4;
             }
@@ -906,7 +1005,7 @@ pub fn rasterize_storm_reports(
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_map: Some(hit_map),
+        hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
     }
 }
@@ -975,24 +1074,65 @@ fn energy_size_scale(energy: Option<f32>) -> f32 {
     }
 }
 
-pub struct GlmRenderParams {
+/// The paint-relevant slice of one GLM flash: what [`rasterize_glm_strikes`]
+/// reads of a [`GlmFlash`], and nothing else — the satellite, level and area
+/// stay page-side with the popup.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlashPaint {
+    pub lat: f64,
+    pub lon: f64,
+    /// UTC. Aged against [`GlmStrikesInput::now`] for the fade ramp and the
+    /// window cull.
+    pub time: chrono::NaiveDateTime,
+    /// Radiant energy in joules; sizes the bolt. `None` means unknown — see
+    /// [`energy_size_scale`].
+    pub energy: Option<f32>,
+}
+
+/// Everything [`rasterize_glm_strikes`] reads besides the raster's own
+/// geometry — the **wire form** of the lightning render. See
+/// [`OutlooksInput`] for the shape's reason, and [`ReportsInput`] for the
+/// hit-map id contract, which is the same here: a flash's position in
+/// `flashes` is its hit-map id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlmStrikesInput {
+    pub flashes: Vec<FlashPaint>,
     pub zoom: f64,
     pub is_dark: bool,
+    /// Flashes older than this many seconds are dropped; younger ones fade
+    /// through [`time_decay_color`]'s ramp over it.
     pub time_window_secs: f64,
+    /// **The page's clock at dispatch, never the worker's.** Flash age — the
+    /// fade colour and the window cull — is `now - flash.time`, and a worker
+    /// that re-read its own clock here would render a different picture than
+    /// the direct call: parity between the two paths is only byte-exact
+    /// because this value travels on the wire with the flashes it ages. The
+    /// capture site is [`RasterizeContext::now`], filled by the dispatching
+    /// pane; `rustdar_frontend::offload::tests` pins that a shifted `now`
+    /// really does change the picture on a fixture whose flashes straddle the
+    /// fade steps, so a worker re-derivation cannot pass the parity gate.
+    ///
+    /// [`RasterizeContext::now`]: crate::render::overlay_state::RasterizeContext::now
     pub now: chrono::NaiveDateTime,
-    /// Texels per logical point — see
-    /// `crate::render::overlay_state::RasterizeContext::device_scale`.
+    /// See the `device_scale` note on
+    /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
     pub device_scale: f32,
 }
 
 pub fn rasterize_glm_strikes(
-    flashes: &[GlmFlash],
-    items: &[Arc<dyn OverlayItem>],
+    input: &GlmStrikesInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    params: &GlmRenderParams,
 ) -> RasterizeOutput {
+    let GlmStrikesInput {
+        flashes,
+        zoom,
+        is_dark,
+        time_window_secs,
+        now,
+        device_scale,
+    } = input;
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_glm_strikes ({}×{})",
@@ -1001,18 +1141,18 @@ pub fn rasterize_glm_strikes(
         );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Premultiplied,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
-    let mut hit_map = HitMap::new(width, height);
+    let mut hit_cells = HitCells::new(width, height);
 
     // ~12 points at zoom 6, clamped to 6-20 points, then taken into texels.
-    let zoom_f32 = params.zoom as f32;
-    let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(params.device_scale);
+    let zoom_f32 = *zoom as f32;
+    let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(*device_scale);
 
     for (i, flash) in flashes.iter().enumerate() {
         // Into the viewport's frame before either test: the flash carries a
@@ -1022,8 +1162,8 @@ pub fn rasterize_glm_strikes(
             continue;
         }
 
-        let age_secs = (params.now - flash.time).num_milliseconds().max(0) as f64 / 1000.0;
-        if age_secs > params.time_window_secs {
+        let age_secs = (*now - flash.time).num_milliseconds().max(0) as f64 / 1000.0;
+        if age_secs > *time_window_secs {
             continue;
         }
 
@@ -1034,35 +1174,34 @@ pub fn rasterize_glm_strikes(
 
         let bolt_size = base_size * (0.8 + energy_size_scale(flash.energy) * 0.4);
 
-        let rgba = time_decay_color(age_secs, params.time_window_secs, params.is_dark);
+        let rgba = time_decay_color(age_secs, *time_window_secs, *is_dark);
         draw_lightning_bolt(&mut pixmap, px, py, bolt_size, rgba);
 
-        if let Some(item) = items.get(i) {
-            let item_id = i as u32;
-            hit_map.register_id(item_id, Arc::clone(item));
-            let r = bolt_size * 0.6;
-            let r2 = r * r;
-            let mut sy = (py - r) as i32;
-            let sy_end = (py + r) as i32;
-            while sy <= sy_end {
-                let mut sx = (px - r) as i32;
-                let sx_end = (px + r) as i32;
-                while sx <= sx_end {
-                    let dx = sx as f32 - px;
-                    let dy = sy as f32 - py;
-                    if dx * dx + dy * dy <= r2 {
-                        hit_map.record(sx as f32, sy as f32, item_id);
-                    }
-                    sx += 4;
+        // The flash's position in the input list **is** its id — see
+        // `rasterize_storm_reports`, whose contract this shares.
+        let item_id = i as u32;
+        let r = bolt_size * 0.6;
+        let r2 = r * r;
+        let mut sy = (py - r) as i32;
+        let sy_end = (py + r) as i32;
+        while sy <= sy_end {
+            let mut sx = (px - r) as i32;
+            let sx_end = (px + r) as i32;
+            while sx <= sx_end {
+                let dx = sx as f32 - px;
+                let dy = sy as f32 - py;
+                if dx * dx + dy * dy <= r2 {
+                    hit_cells.record(sx as f32, sy as f32, item_id);
                 }
-                sy += 4;
+                sx += 4;
             }
+            sy += 4;
         }
     }
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_map: Some(hit_map),
+        hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
     }
 }
@@ -1578,7 +1717,7 @@ pub fn rasterize_model_data(
     if grid.values.is_empty() || width == 0 || height == 0 || grid.ni == 0 || grid.nj == 0 {
         return RasterizeOutput {
             rgba,
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Straight,
         };
     }
@@ -1598,7 +1737,7 @@ pub fn rasterize_model_data(
     if win.is_empty() {
         return RasterizeOutput {
             rgba,
-            hit_map: None,
+            hit_cells: None,
             alpha: AlphaMode::Straight,
         };
     }
@@ -1689,7 +1828,7 @@ pub fn rasterize_model_data(
 
     RasterizeOutput {
         rgba,
-        hit_map: None,
+        hit_cells: None,
         alpha: AlphaMode::Straight,
     }
 }

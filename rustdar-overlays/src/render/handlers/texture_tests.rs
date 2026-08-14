@@ -42,11 +42,17 @@ const BOUNDS: GeoBounds = GeoBounds {
 /// The rasterize context a pane hands over: the light theme, because it is the
 /// one in which the site plate's own fill is bright enough for the two alpha
 /// conventions to disagree about it.
+///
+/// `now` is a real clock read, as the dispatch's is, because [`glm_fixture`]
+/// timestamps its flash *now* — and each test reads this **once** and hands
+/// the same context to both paths it compares, so the two cannot age a flash
+/// differently.
 fn rctx() -> RasterizeContext {
     RasterizeContext {
         device_scale: 1.0,
         is_dark: false,
         zoom: 7.0,
+        now: chrono::Utc::now().naive_utc(),
     }
 }
 
@@ -242,12 +248,44 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
         }),
         OverlayKind::StormReports => Box::new(super::reports::StormReportsFetchResult(Ok(
             crate::spc::reports::StormReportRound {
-                reports: vec![report_fixture()],
+                // Three, at distinct positions: a one-row seed cannot express
+                // order, and the alignment pin below reversed a one-item list
+                // to no effect the first time it was tried.
+                reports: vec![
+                    report_fixture(),
+                    crate::spc::reports::StormReport {
+                        kind: crate::spc::reports::StormReportKind::Tornado,
+                        lat: 34.4,
+                        lon: -98.6,
+                        ..report_fixture()
+                    },
+                    crate::spc::reports::StormReport {
+                        kind: crate::spc::reports::StormReportKind::Wind,
+                        lat: 35.6,
+                        lon: -97.4,
+                        ..report_fixture()
+                    },
+                ],
                 failed_kinds: Vec::new(),
             },
         ))),
         OverlayKind::Lightning => Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
-            flashes: vec![glm_fixture()],
+            // Three, spread across the box, so the seeded layer clears the
+            // painted-pixel floors the byte-parity walks stand on — one
+            // ~14 px bolt is real ink but near-vacuous ink.
+            flashes: vec![
+                glm_fixture(),
+                crate::glm::GlmFlash {
+                    lat: 34.4,
+                    lon: -98.6,
+                    ..glm_fixture()
+                },
+                crate::glm::GlmFlash {
+                    lat: 35.6,
+                    lon: -97.4,
+                    ..glm_fixture()
+                },
+            ],
             dead_feeds: Vec::new(),
             queried: Vec::new(),
             parse_failures: None,
@@ -377,12 +415,30 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
 #[test]
 fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     let now = chrono::Utc::now().naive_utc();
-    let glm_params = rasterize::GlmRenderParams {
+    let flash = glm_fixture();
+    let glm_input = rasterize::GlmStrikesInput {
+        flashes: vec![rasterize::FlashPaint {
+            lat: flash.lat,
+            lon: flash.lon,
+            time: flash.time,
+            energy: flash.energy,
+        }],
         device_scale: 1.0,
         zoom: 7.0,
         is_dark: false,
         time_window_secs: 600.0,
         now,
+    };
+    let report = report_fixture();
+    let reports_input = rasterize::ReportsInput {
+        reports: vec![rasterize::ReportPaint {
+            kind: report.kind,
+            lat: report.lat,
+            lon: report.lon,
+        }],
+        zoom: 7.0,
+        is_dark: false,
+        device_scale: 1.0,
     };
 
     assert_eq!(
@@ -390,23 +446,11 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
         AlphaMode::Premultiplied,
     );
     assert_eq!(
-        rasterize_storm_reports(
-            &[report_fixture()],
-            &[],
-            &BOUNDS,
-            0,
-            0,
-            &RasterizeContext {
-                is_dark: false,
-                zoom: 7.0,
-                device_scale: 1.0,
-            },
-        )
-        .alpha,
+        rasterize_storm_reports(&reports_input, &BOUNDS, 0, 0).alpha,
         AlphaMode::Premultiplied,
     );
     assert_eq!(
-        rasterize_glm_strikes(&[glm_fixture()], &[], &BOUNDS, 0, 0, &glm_params).alpha,
+        rasterize_glm_strikes(&glm_input, &BOUNDS, 0, 0).alpha,
         AlphaMode::Premultiplied,
     );
 
@@ -605,17 +649,32 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
 
 // ── The described-job set ────────────────────────────────────────────────
 
-/// Whether `kind` is one of the three the dispatch routes as described jobs.
+/// Whether `kind` is one the dispatch routes as a described job: the three
+/// polygon kinds and the two hit-map kinds. Only the model grid still runs
+/// opaque.
 fn is_described(kind: OverlayKind) -> bool {
     matches!(
         kind,
-        OverlayKind::NwsAlerts | OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions
+        OverlayKind::NwsAlerts
+            | OverlayKind::SpcOutlook
+            | OverlayKind::SpcDiscussions
+            | OverlayKind::StormReports
+            | OverlayKind::Lightning
     )
 }
 
-/// **The set of kinds with a wire form is exactly the polygon kinds**, and on
-/// each of them `prepare_job` agrees with `prepare_rasterize` about whether
-/// there is anything to draw, in every state the layer stack can reach.
+/// Whether `kind` resolves clicks through a hit map, and therefore must
+/// answer [`OverlayHandler::hit_items`] exactly when it answers
+/// `prepare_job` — an input with rows and no items is a layer whose every
+/// hover zips to nothing.
+fn has_hit_map(kind: OverlayKind) -> bool {
+    matches!(kind, OverlayKind::StormReports | OverlayKind::Lightning)
+}
+
+/// **The set of kinds with a wire form is every texture kind but the model
+/// grid**, and on each of them `prepare_job` agrees with `prepare_rasterize`
+/// about whether there is anything to draw — and, for the hit-map kinds,
+/// `hit_items` agrees with both — in every state the layer stack can reach.
 ///
 /// `rustdar-frontend`'s `spawn_overlay_render` routes by an explicit match on
 /// kind, not by probing `prepare_job` — so the match there and the
@@ -625,7 +684,7 @@ fn is_described(kind: OverlayKind) -> bool {
 /// layer would silently never draw: precisely the disagreement the
 /// permanent-wakeup guard above exists to catch on the closure path.
 #[test]
-fn the_kinds_with_a_described_job_are_exactly_the_polygon_kinds() {
+fn the_kinds_with_a_described_job_are_all_but_the_model_grid() {
     let ctx = rctx();
     let mut described = 0;
     for handler in create_handlers().iter_mut() {
@@ -652,6 +711,32 @@ fn the_kinds_with_a_described_job_are_exactly_the_polygon_kinds() {
                      to the wire (`offload::OverlayJobInput`) together.",
                 );
             }
+            if has_hit_map(kind) {
+                assert_eq!(
+                    h.hit_items().is_some(),
+                    h.prepare_job(&ctx).is_some(),
+                    "{kind:?}'s `hit_items` disagrees with its `prepare_job` \
+                     while {state}. The dispatch captures the two together, \
+                     and rows without items is a layer whose every hover \
+                     resolves to nothing.",
+                );
+                if let (Some(items), Some(_)) = (h.hit_items(), h.prepare_job(&ctx)) {
+                    assert_eq!(
+                        items.len(),
+                        h.item_count(),
+                        "{kind:?}'s `hit_items` while {state} does not cover \
+                         its data one item per row; a shorter list truncates \
+                         the id space the cells index into",
+                    );
+                }
+            } else {
+                assert!(
+                    h.hit_items().is_none(),
+                    "{kind:?} grew a `hit_items` while {state}; only the \
+                     hit-map kinds have an id_map to capture, and a stray one \
+                     here would make the dispatch zip cells of another kind",
+                );
+            }
         };
 
         agree(handler.as_ref(), "empty");
@@ -672,10 +757,83 @@ fn the_kinds_with_a_described_job_are_exactly_the_polygon_kinds() {
         }
     }
     assert_eq!(
-        described, 3,
-        "the three polygon kinds must all have been walked seeded; a kind \
-         that stopped seeding is a kind whose agreement was never tested",
+        described, 5,
+        "the three polygon kinds and the two hit-map kinds must all have \
+         been walked seeded; a kind that stopped seeding is a kind whose \
+         agreement was never tested",
     );
+}
+
+/// **The order-stability invariant at its source**: `hit_items()[i]` is the
+/// item whose row `prepare_job` describes at position `i`, checked against
+/// the item's **own** identity — its stored index and coordinates — rather
+/// than against the list it came from.
+///
+/// This is the one place the check can be independent. The frontend's zip
+/// and probe tests take `hit_items` as the ground truth to zip with, so a
+/// handler that shuffled its items relative to its rows would satisfy them
+/// while every hover named the wrong report; here the concrete item types
+/// are nameable and each carries the index its data row was built at, which
+/// is a statement of order the shuffle cannot forge.
+#[test]
+fn a_hit_map_kinds_items_align_with_its_described_rows() {
+    let ctx = rctx();
+    let mut checked = 0;
+    for handler in create_handlers().iter_mut() {
+        let kind = handler.kind();
+        if !has_hit_map(kind) || !seed(handler.as_mut()) {
+            continue;
+        }
+        let input = handler
+            .prepare_job(&ctx)
+            .expect("seeded, and the agreement walk pins this");
+        let items = handler.hit_items().expect("seeded");
+        match input {
+            HandlerJobInput::Reports(input) => {
+                assert_eq!(items.len(), input.reports.len(), "one item per row");
+                for (i, (row, item)) in input.reports.iter().zip(&items).enumerate() {
+                    let item = item
+                        .as_any()
+                        .downcast_ref::<super::reports::StormReportItem>()
+                        .expect("a reports handler captures report items");
+                    assert_eq!(
+                        item.index, i,
+                        "{kind:?} item {i} carries another position's index",
+                    );
+                    assert_eq!(
+                        (item.report.lat, item.report.lon),
+                        (row.lat, row.lon),
+                        "{kind:?} row {i} and item {i} are different reports — \
+                         a hover here would name the wrong one, and no \
+                         downstream test can see it because they all zip with \
+                         this very list",
+                    );
+                }
+            }
+            HandlerJobInput::Glm(input) => {
+                assert_eq!(items.len(), input.flashes.len(), "one item per row");
+                for (i, (row, item)) in input.flashes.iter().zip(&items).enumerate() {
+                    let item = item
+                        .as_any()
+                        .downcast_ref::<super::glm::GlmFlashItem>()
+                        .expect("a GLM handler captures flash items");
+                    assert_eq!(
+                        item.index, i,
+                        "{kind:?} item {i} carries another position's index",
+                    );
+                    assert_eq!(
+                        (item.flash.lat, item.flash.lon),
+                        (row.lat, row.lon),
+                        "{kind:?} row {i} and item {i} are different flashes — \
+                         a hover here would name the wrong one",
+                    );
+                }
+            }
+            other => panic!("{kind:?} described {other:?}, another kind's input"),
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
 }
 
 /// The described job and the closure paint **the same bytes** on the same
@@ -716,6 +874,14 @@ fn a_described_job_and_the_closure_paint_the_same_bytes() {
                 OverlayKind::SpcDiscussions,
                 rasterize_spc_discussions(&input, &BOUNDS, W, H),
             ),
+            HandlerJobInput::Reports(input) => (
+                OverlayKind::StormReports,
+                rasterize_storm_reports(&input, &BOUNDS, W, H),
+            ),
+            HandlerJobInput::Glm(input) => (
+                OverlayKind::Lightning,
+                rasterize_glm_strikes(&input, &BOUNDS, W, H),
+            ),
         };
         assert_eq!(
             named, kind,
@@ -733,7 +899,27 @@ fn a_described_job_and_the_closure_paint_the_same_bytes() {
              the same state: the two answers have stopped being built from \
              one captured input",
         );
+        // The hit-map kinds must also answer the same **cells** on both
+        // paths: a described job that painted the same pixels but recorded
+        // different indices is a hover that names the wrong item, which no
+        // pixel comparison can see.
+        assert_eq!(
+            closure.hit_cells, job.hit_cells,
+            "{kind:?}'s described job records different hit cells from its \
+             closure on the same state",
+        );
+        if has_hit_map(kind) {
+            let cells = job
+                .hit_cells
+                .as_ref()
+                .expect("a hit-map kind answers cells on its drawing path");
+            assert!(
+                !cells.cells.is_empty(),
+                "{kind:?}'s fixture recorded no hit cells, so the cell \
+                 equality above is vacuous for the one thing it is about",
+            );
+        }
         checked += 1;
     }
-    assert_eq!(checked, 3, "all three described kinds must be compared");
+    assert_eq!(checked, 5, "all five described kinds must be compared");
 }

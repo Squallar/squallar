@@ -66,18 +66,22 @@ fn render_one(energy: Option<f32>) -> usize {
         max_lon: -96.0,
     };
     let out = rasterize_glm_strikes(
-        std::slice::from_ref(&flash),
-        &[],
-        &bounds,
-        128,
-        128,
-        &GlmRenderParams {
+        &GlmStrikesInput {
+            flashes: vec![FlashPaint {
+                lat: flash.lat,
+                lon: flash.lon,
+                time: flash.time,
+                energy: flash.energy,
+            }],
             device_scale: 1.0,
             zoom: 8.0,
             is_dark: true,
             time_window_secs: 300.0,
             now: flash.time,
         },
+        &bounds,
+        128,
+        128,
     );
     // Bolt size is the only thing varying, so painted-pixel count is a
     // proxy for the size the strike was drawn at.
@@ -128,18 +132,22 @@ fn render_at(lon: f64, min_lon: f64, max_lon: f64) -> usize {
         max_lon,
     };
     let out = rasterize_glm_strikes(
-        std::slice::from_ref(&flash),
-        &[],
-        &bounds,
-        128,
-        128,
-        &GlmRenderParams {
+        &GlmStrikesInput {
+            flashes: vec![FlashPaint {
+                lat: flash.lat,
+                lon: flash.lon,
+                time: flash.time,
+                energy: flash.energy,
+            }],
             device_scale: 1.0,
             zoom: 8.0,
             is_dark: true,
             time_window_secs: 300.0,
             now: flash.time,
         },
+        &bounds,
+        128,
+        128,
     );
     out.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
 }

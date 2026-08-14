@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 10;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 10. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 11;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 11. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -590,7 +590,13 @@ fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
          space with the three polygon overlay kinds (alerts, outlooks, \
          discussions, input codes 2-4): a version 9 worker refuses those \
          codes and answers a failed job, which is a warning layer that \
-         silently never draws. Changing \
+         silently never draws. Version 11 added the two hit-map kinds (storm \
+         reports code 5, lightning code 6) and reframed `outkind` code 5's \
+         payload: a hit-cells block now precedes the raw RGBA, and the GLM \
+         input carries the page's clock so a worker never ages a flash \
+         against its own. A version 10 pairing exchanges inner codes one \
+         half refuses and reply payloads whose length check the other half \
+         fails — a storm-reports layer that silently never draws. Changing \
          the message shapes without changing this number is the whole failure \
          it prevents.",
     );
@@ -860,13 +866,17 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///   * `rustdar_frontend::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
 ///     for the page->worker direction named below.
 ///
-/// The overlay raster `OUT` carries under code 5 (protocol version 9) has no
-/// digest **because it has no layout**: the payload is raw premultiplied RGBA,
-/// accepted only by the dispatching page's own `width × height × 4` length
-/// check. What that leaves under this test's floor is the code byte itself and
-/// the job framing's new row, both pinned by the `offload::tests` digest and
-/// tag table named above — this test sees code 5 not at all, since neither
-/// half of version 9 touched a field name.
+/// The overlay payload `OUT` carries under code 5 was raw premultiplied RGBA
+/// with no layout at all until protocol version 11, when the hit-map kinds'
+/// cells started riding ahead of the pixels — the first reply-shape change
+/// since these guards landed, and one this test sees not at all, since no
+/// field name moved. It is digested now like the other three codecs:
+/// `rustdar_frontend::offload::tests::the_overlay_reply_framing_is_the_one_this_protocol_ships`
+/// pins `encode_overlay_out`'s bytes over a literal fixture. The RGBA tail
+/// inside that framing still has no layout to digest, and its guard is still
+/// the dispatching page's own `width × height × 4` length check — which is
+/// also what fails, on either side, when a version 10 half meets a version 11
+/// half over this code.
 ///
 /// Each was measured against an uncooperative regressor: a same-width field
 /// reorder made to encoder and decoder in step left every other test in its
@@ -945,7 +955,7 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     assert_eq!(
         shape,
         [
-            "PROTOCOL_VERSION = 10",
+            "PROTOCOL_VERSION = 11",
             "frame | IMAGE | image",
             "frame | MAX_RANGE | range",
             "frame | MELTING_LAYER | mls",

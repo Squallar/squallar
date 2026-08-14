@@ -218,11 +218,14 @@ fn post_result(
                 // below, so the page adopts the buffer instead of being sent a
                 // second copy of it.
                 JobOutput::Volume(volume) => volume.to_bytes(),
-                // Already bytes: the raster **is** the payload, raw
-                // premultiplied RGBA with no framing of its own — the page
-                // side's guard is the dispatch's length check, see
-                // `offload::OUT_KIND_OVERLAY`.
-                JobOutput::OverlayRaster(rgba) => rgba,
+                // A hit-cells tag and optional framed cells, then the raster
+                // as the rest — raw premultiplied RGBA whose guard is still
+                // the dispatch's length check, see `offload::OUT_KIND_OVERLAY`.
+                // The cells carry item *indices*; the items they resolve to
+                // never left the page, which zips the two at delivery.
+                JobOutput::OverlayRaster { rgba, hit_cells } => {
+                    rustdar_frontend::offload::encode_overlay_out(&rgba, hit_cells.as_ref())
+                }
                 // Answered above; naming it keeps the match exhaustive by value
                 // so a sixth output kind stops the build here rather than
                 // falling into a catch-all that posts an empty payload.

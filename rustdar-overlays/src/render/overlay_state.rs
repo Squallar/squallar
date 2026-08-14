@@ -32,11 +32,12 @@ pub type RasterizeFn = Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput +
 /// posts it as a `JobRequest::Overlay`, which is what lets these kinds
 /// rasterize in the web worker instead of inline on the browser's one thread.
 ///
-/// Only the polygon-fill kinds without hit maps are here. The hit-map kinds
-/// (storm reports, lightning) answer clicks through an
-/// `Arc<dyn OverlayItem>` map that cannot cross a message port, and the model
-/// grid's input has no wire form yet — they stay on [`prepare_rasterize`]'s
-/// closure until each gains a variant of its own.
+/// The hit-map kinds (storm reports, lightning) are here too: their inputs
+/// carry plain rows whose **position is the hit-map id**, and the
+/// `Arc<dyn OverlayItem>` half that cannot cross a message port is captured
+/// beside the input through [`OverlayHandler::hit_items`] and zipped with the
+/// returned cells at delivery. Only the model grid still runs opaque — its
+/// input has no wire form yet.
 ///
 /// [`prepare_rasterize`]: OverlayHandler::prepare_rasterize
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +49,14 @@ pub enum HandlerJobInput {
     /// SPC mesoscale discussions —
     /// [`crate::render::rasterize::rasterize_spc_discussions`].
     Discussions(crate::render::rasterize::DiscussionsInput),
+    /// SPC storm reports —
+    /// [`crate::render::rasterize::rasterize_storm_reports`]. The first
+    /// hit-map kind through the wire.
+    Reports(crate::render::rasterize::ReportsInput),
+    /// GLM lightning — [`crate::render::rasterize::rasterize_glm_strikes`].
+    /// Carries the page's own `now`, captured at dispatch; see
+    /// [`crate::render::rasterize::GlmStrikesInput::now`].
+    Glm(crate::render::rasterize::GlmStrikesInput),
 }
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
@@ -623,9 +632,9 @@ pub trait OverlayHandler: Send {
     ///
     /// A handler that implements this must keep it in agreement with
     /// [`prepare_rasterize`]: same `Some`-ness in every reachable state, and
-    /// the same captured input — the shipped three build both answers from one
-    /// private helper, and
-    /// `handlers::texture_tests::the_kinds_with_a_described_job_are_exactly_the_polygon_kinds`
+    /// the same captured input — the shipped five build both answers from one
+    /// private helper each, and
+    /// `handlers::texture_tests::the_kinds_with_a_described_job_are_all_but_the_model_grid`
     /// is the pin. The dispatch site (`rustdar_frontend`'s
     /// `spawn_overlay_render`) routes by an explicit match on kind, not by
     /// probing this method, so a kind moved between the two paths is a
@@ -634,6 +643,30 @@ pub trait OverlayHandler: Send {
     /// [`prepare_rasterize`]: OverlayHandler::prepare_rasterize
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
         let _ = ctx;
+        None
+    }
+
+    /// The `Arc<dyn OverlayItem>`s a hit-map kind's clicks resolve to,
+    /// **index-aligned with the rows [`prepare_job`] describes** — `None` for
+    /// a kind whose clicks resolve some other way, which is the default and
+    /// every kind but storm reports and lightning.
+    ///
+    /// This is the half of a hit map that never crosses a message port. The
+    /// dispatch captures it beside the described input and zips it with the
+    /// returned cells at delivery
+    /// ([`HitMap::from_cells`](crate::render::rasterize::HitMap::from_cells),
+    /// where the order invariant is stated). A handler that implements this
+    /// must build it and the input's rows from **one iteration of one list**
+    /// — the shipped two build both from `state.data`, in order, out of one
+    /// pair of methods sitting side by side — because an item at the wrong
+    /// index is a hover that names the wrong report, which no guard downstream
+    /// can see.
+    ///
+    /// Same `Some`-ness as [`prepare_job`] for the kinds that answer at all:
+    /// an input with rows and no items would zip every hit to nothing.
+    ///
+    /// [`prepare_job`]: OverlayHandler::prepare_job
+    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
         None
     }
 
@@ -797,6 +830,18 @@ pub struct RasterizeContext {
     /// `1.0` is one texel per point, which is every display that is not scaled
     /// and every reading this field had before it existed.
     pub device_scale: f32,
+    /// The page's clock at dispatch, UTC.
+    ///
+    /// The one time-dependent rasterizer input in this crate: GLM's flash-age
+    /// fade reads it and nothing else does. It lives here rather than being
+    /// read inside the handler so that the capture site is the **dispatch** —
+    /// the same moment every other page-side fact in this context is captured
+    /// — and travels with the described job from there. A worker (or a
+    /// handler) re-reading its own clock instead would render a different
+    /// picture than the direct call; see
+    /// [`GlmStrikesInput::now`](crate::render::rasterize::GlmStrikesInput::now)
+    /// for the parity pin that keeps it on the wire.
+    pub now: chrono::NaiveDateTime,
 }
 
 // ── Fetch-path thread bounds ─────────────────────────────────────────────
@@ -1189,6 +1234,13 @@ impl OverlayRegistry {
         ctx: &RasterizeContext,
     ) -> Option<HandlerJobInput> {
         self.handler(kind).and_then(|h| h.prepare_job(ctx))
+    }
+
+    /// [`OverlayHandler::hit_items`] through the registry — the page-side
+    /// half of a hit-map kind's described render, captured at the dispatch
+    /// beside [`prepare_job`](Self::prepare_job).
+    pub fn hit_items(&self, kind: OverlayKind) -> Option<Vec<Arc<dyn OverlayItem>>> {
+        self.handler(kind).and_then(|h| h.hit_items())
     }
 
     pub fn create_fetch_tasks(&self, kind: OverlayKind, ctx: &FetchConfig) -> Vec<FetchTask> {

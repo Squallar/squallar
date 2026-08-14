@@ -9,16 +9,19 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
+    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
+    RasterizeFn, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
 use crate::types::GeoBounds;
 
-pub(crate) struct StormReportsFetchResult(
-    pub Result<StormReportRound, crate::fetch_policy::FetchError>,
-);
+// `pub`, not `pub(crate)`, for `alert::NwsAlertFetchResult`'s reason: the
+// described-job dispatch and hit-map zip tests in `rustdar-frontend` seed a
+// live registry through `apply_fetch_result`, and the payload type has to be
+// nameable where the test constructs it.
+pub struct StormReportsFetchResult(pub Result<StormReportRound, crate::fetch_policy::FetchError>);
 /// [`Assembled`]: three CSVs, one per report kind, fetched independently and
 /// refused as a round only when **all three** failed. One failing arrives here
 /// as `Ok` with a whole kind of report absent from the map.
@@ -160,6 +163,40 @@ impl StormReportsHandler {
             enabled: false,
         }
     }
+
+    /// What the rasterizer reads, captured once — the **one** builder both
+    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
+    /// and the described job cannot come to capture different state.
+    ///
+    /// The rows are [`rasterize::ReportPaint`], not whole [`StormReport`]s:
+    /// the kind and the coordinates are everything the raster reads, and the
+    /// described job serialises this struct onto a message port — the time,
+    /// magnitude and comments are popup content the raster never draws.
+    ///
+    /// **Row `i` is `state.data[i]`'s report**, which is the same indexing
+    /// [`Self::hit_items`] answers — one iteration order, stated in both
+    /// places, because a hit-map id is a position in this list and the item
+    /// it resolves to is the same position in that one.
+    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::ReportsInput> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(rasterize::ReportsInput {
+            reports: self
+                .state
+                .data
+                .iter()
+                .map(|i| rasterize::ReportPaint {
+                    kind: i.report.kind,
+                    lat: i.report.lat,
+                    lon: i.report.lon,
+                })
+                .collect(),
+            zoom: ctx.zoom,
+            is_dark: ctx.is_dark,
+            device_scale: ctx.device_scale,
+        })
+    }
 }
 
 impl OverlayHandler for StormReportsHandler {
@@ -286,20 +323,33 @@ impl OverlayHandler for StormReportsHandler {
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
+        let input = self.paint_input(ctx)?;
+        Some(Box::new(move |bounds: &GeoBounds, width, height| {
+            rasterize::rasterize_storm_reports(&input, bounds, width, height)
+        }))
+    }
+
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+        // The same helper `prepare_rasterize` captures from, so the described
+        // job and the closure cannot come to capture different state.
+        Some(HandlerJobInput::Reports(self.paint_input(ctx)?))
+    }
+
+    /// Index-aligned with [`Self::paint_input`]'s rows: both iterate
+    /// `state.data` in order, so `hit_items()[i]` **is** the item whose
+    /// report travelled at row `i` — the invariant
+    /// [`rasterize::HitMap::from_cells`] zips on.
+    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
         if self.state.data.is_empty() {
             return None;
         }
-        let reports: Vec<StormReport> = self.state.data.iter().map(|i| i.report.clone()).collect();
-        let items: Vec<Arc<dyn OverlayItem>> = self
-            .state
-            .data
-            .iter()
-            .map(|i| i.clone() as Arc<dyn OverlayItem>)
-            .collect();
-        let ctx = *ctx;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_storm_reports(&reports, &items, bounds, width, height, &ctx)
-        }))
+        Some(
+            self.state
+                .data
+                .iter()
+                .map(|i| i.clone() as Arc<dyn OverlayItem>)
+                .collect(),
+        )
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

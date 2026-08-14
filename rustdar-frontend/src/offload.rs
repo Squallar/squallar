@@ -6,9 +6,9 @@
 //! four have the same shape — a `FnOnce` that ends by sending its result on an
 //! `mpsc::Sender` and calling `notify_redraw` — and all four had the same
 //! `std::thread::Builder` call written out inline. Nearly all of it is
-//! described jobs now ([`JobRequest::Overlay`] carries the sites raster and
-//! the three polygon overlay kinds); what remains on the closure is the
-//! hit-map overlay kinds and the model grid.
+//! described jobs now ([`JobRequest::Overlay`] carries the sites raster, the
+//! three polygon overlay kinds, and the two hit-map kinds); what remains on
+//! the closure is the model grid, alone.
 //!
 //! They are funnelled through here so the wasm arm exists once.
 //!
@@ -70,17 +70,16 @@ pub use rustdar_radar::srv::SrvMotion;
 /// input. The one that cannot stays here:
 ///
 /// * `overlay-render` captures a `RasterizeFn` — a `Box<dyn FnOnce(..) -> ..>`
-///   holding overlay handler state — and answers with a `HitMap` whose
-///   `id_map` is a `HashMap<u32, Arc<dyn OverlayItem>>`. Neither a trait-object
-///   closure nor a trait-object map crosses a message port. Making it portable
-///   means returning a `u32` id image and rebuilding the map on this side, a
-///   refactor of `rustdar-overlays` against a rasterizer that draws vector
-///   shapes rather than the 28 M projections the radar one does. It is being
-///   dismantled kind by kind: `sites-render` left first, and the polygon
-///   kinds — NWS alerts, SPC outlooks, SPC discussions, none of which build a
-///   hit map — followed; all four are [`JobRequest::Overlay`] now. The
-///   hit-map kinds and the model grid remain, and when they leave this arm's
-///   caller count reaches zero and the inline path is deleted.
+///   holding overlay handler state. It is being dismantled kind by kind:
+///   `sites-render` left first, then the polygon kinds — NWS alerts, SPC
+///   outlooks, SPC discussions — and then the hit-map kinds, storm reports
+///   and lightning, once their `HitMap` was split into portable index cells
+///   (`rustdar_overlays::render::rasterize::HitCells`, which travel back on
+///   the reply) and the page-side `Arc<dyn OverlayItem>` id_map (captured at
+///   dispatch, zipped at delivery, never on the wire). All six are
+///   [`JobRequest::Overlay`] now. **Only the model grid remains** — its input
+///   has no wire form yet — and when it leaves, this arm's caller count
+///   reaches zero and the inline path is deleted.
 ///
 /// Inline execution preserves the contract the callers actually depend on. Each
 /// `job` delivers through a channel that is drained on a later frame, so a send
@@ -505,11 +504,11 @@ pub enum JobRequest {
     /// statement of one fact, which is the disagreement
     /// [`agree_on_product`] exists to refuse elsewhere.
     ///
-    /// The sites render and the three polygon kinds (NWS alerts, SPC
-    /// outlooks, SPC discussions) are described. The hit-map kinds and the
-    /// model grid still capture a `RasterizeFn` trait object and stay on
-    /// [`offload`]'s opaque arm — see that function's own note — until each
-    /// gains a wire form of its own.
+    /// The sites render, the three polygon kinds (NWS alerts, SPC outlooks,
+    /// SPC discussions) and the two hit-map kinds (storm reports, GLM
+    /// lightning) are described. Only the model grid still captures a
+    /// `RasterizeFn` trait object and stays on [`offload`]'s opaque arm — see
+    /// that function's own note — until it gains a wire form of its own.
     Overlay {
         /// Texture width in physical texels, from the pane's
         /// `OverlayTexturePlan` — never re-derived on the far side.
@@ -562,12 +561,11 @@ pub enum JobRequest {
 /// `rustdar_overlays::render::rasterize::SitesInput`, whose doc states the
 /// contract from the rasterizer's side.
 ///
-/// Four variants: the sites render and the three polygon-fill kinds without
-/// hit maps, whose handlers describe them through
-/// `rustdar_overlays::render::overlay_state::HandlerJobInput`. The hit-map
-/// kinds (storm reports, lightning) and the model grid are next; each lands
-/// here as a variant plus an [`OVERLAY_INPUT_SITES`]-style code, and until
-/// then those kinds stay on [`offload`]'s opaque arm.
+/// Six variants: the sites render, the three polygon-fill kinds, and the two
+/// hit-map kinds, whose handlers describe them through
+/// `rustdar_overlays::render::overlay_state::HandlerJobInput`. The model grid
+/// is last; it lands here as a variant plus an [`OVERLAY_INPUT_SITES`]-style
+/// code, and until then it stays on [`offload`]'s opaque arm.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayJobInput {
     /// The radar-site markers: catalogue rows plus the appearance inputs.
@@ -590,6 +588,17 @@ pub enum OverlayJobInput {
     /// SPC mesoscale discussions: per-MD type and rings, plus the texel
     /// density.
     Discussions(rustdar_overlays::render::rasterize::DiscussionsInput),
+    /// SPC storm reports — the first hit-map kind on the wire. A row's
+    /// position in the list is its hit-map id, so the codec must never
+    /// reorder rows: the page zips the reply's cells with an item list it
+    /// captured in this same order at dispatch.
+    Reports(rustdar_overlays::render::rasterize::ReportsInput),
+    /// GLM lightning. Beside the rows it carries `now` — the page's clock at
+    /// dispatch — because flash age (the fade colour and the window cull) is
+    /// computed from it, and a worker re-reading its own clock would render a
+    /// picture the direct call would not; see
+    /// `rustdar_overlays::render::rasterize::GlmStrikesInput::now`.
+    Glm(rustdar_overlays::render::rasterize::GlmStrikesInput),
 }
 
 /// What a job produces.
@@ -623,16 +632,31 @@ pub enum JobOutput {
     Volume(Box<rustdar_radar::scan::DecodedScan>),
     /// An overlay raster — the answer to [`JobRequest::Overlay`]: the RGBA
     /// texture, **always premultiplied** ([`execute`]'s overlay arm converts
-    /// any rasterizer that declares straight alpha), and nothing else.
+    /// any rasterizer that declares straight alpha), and — for the two
+    /// hit-map kinds — the portable half of their hit map.
     ///
-    /// Deliberately a bare buffer with no width, height or framing, for the
-    /// reason [`RenderedFrame`] has no width: nothing on this port describes
-    /// its own shape. The dispatch site captured the texture's dimensions and
-    /// its `deliver` believes the buffer only if its length is exactly
-    /// `width × height × 4` of *those* values — a payload from another build,
-    /// or one tagged with the wrong kind, fails that arithmetic and reads as
-    /// "nothing to draw" rather than as a picture of the wrong shape.
-    OverlayRaster(Vec<u8>),
+    /// `rgba` is deliberately a bare buffer with no width, height or framing,
+    /// for the reason [`RenderedFrame`] has no width: nothing on this port
+    /// describes its own shape. The dispatch site captured the texture's
+    /// dimensions and its `deliver` believes the buffer only if its length is
+    /// exactly `width × height × 4` of *those* values — a payload from
+    /// another build, or one tagged with the wrong kind, fails that
+    /// arithmetic and reads as "nothing to draw" rather than as a picture of
+    /// the wrong shape.
+    ///
+    /// `hit_cells` carries item **indices**, never items: the
+    /// `Arc<dyn OverlayItem>`s a click resolves to stay on the page, captured
+    /// at dispatch and zipped with these cells at delivery
+    /// (`rustdar_overlays::render::rasterize::HitMap::from_cells` states the
+    /// order invariant the zip stands on). The deliver believes the cells
+    /// only if their quarter-res grid is the one its own captured dimensions
+    /// imply and every index fits the id_map it captured — anything else is
+    /// a reply from a build whose layout this is not, and reads as a failed
+    /// render.
+    OverlayRaster {
+        rgba: Vec<u8>,
+        hit_cells: Option<rustdar_overlays::render::rasterize::HitCells>,
+    },
 }
 
 impl JobOutput {
@@ -645,7 +669,9 @@ impl JobOutput {
     pub fn frame(self) -> Option<RenderedFrame> {
         match self {
             Self::Frame(frame) => Some(frame),
-            Self::Section(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster(_) => None,
+            Self::Section(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster { .. } => {
+                None
+            }
         }
     }
 
@@ -653,7 +679,7 @@ impl JobOutput {
     pub fn section(self) -> Option<Box<CrossSection>> {
         match self {
             Self::Section(section) => Some(section),
-            Self::Frame(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster(_) => None,
+            Self::Frame(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster { .. } => None,
         }
     }
 
@@ -661,7 +687,9 @@ impl JobOutput {
     pub fn voxels(self) -> Option<Box<VoxelGrid>> {
         match self {
             Self::Voxels(grid) => Some(grid),
-            Self::Frame(_) | Self::Section(_) | Self::Volume(_) | Self::OverlayRaster(_) => None,
+            Self::Frame(_) | Self::Section(_) | Self::Volume(_) | Self::OverlayRaster { .. } => {
+                None
+            }
         }
     }
 
@@ -674,18 +702,29 @@ impl JobOutput {
     pub fn volume(self) -> Option<Box<rustdar_radar::scan::DecodedScan>> {
         match self {
             Self::Volume(volume) => Some(volume),
-            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::OverlayRaster(_) => None,
+            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::OverlayRaster { .. } => {
+                None
+            }
         }
     }
 
-    /// The overlay raster, or `None` for an output of another kind.
+    /// The overlay raster and its optional hit cells, or `None` for an output
+    /// of another kind.
     ///
-    /// The narrow accessor the four above are, for the same reason — and the
-    /// buffer it answers is believed nowhere until its length is checked
-    /// against the dispatch's own dimensions; see [`JobOutput::OverlayRaster`].
-    pub fn overlay_raster(self) -> Option<Vec<u8>> {
+    /// The narrow accessor the four above are, for the same reason — and
+    /// neither half it answers is believed anywhere until the dispatch's
+    /// `deliver` has checked it: the buffer against its own captured
+    /// `width × height × 4`, the cells against the quarter-res grid those
+    /// dimensions imply and the id_map it captured. See
+    /// [`JobOutput::OverlayRaster`].
+    pub fn overlay_raster(
+        self,
+    ) -> Option<(
+        Vec<u8>,
+        Option<rustdar_overlays::render::rasterize::HitCells>,
+    )> {
         match self {
-            Self::OverlayRaster(rgba) => Some(rgba),
+            Self::OverlayRaster { rgba, hit_cells } => Some((rgba, hit_cells)),
             Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::Volume(_) => None,
         }
     }
@@ -717,7 +756,7 @@ impl JobOutput {
             Self::Section(_) => Some(OUT_KIND_SECTION),
             Self::Voxels(_) => Some(OUT_KIND_VOXELS),
             Self::Volume(_) => Some(OUT_KIND_VOLUME),
-            Self::OverlayRaster(_) => Some(OUT_KIND_OVERLAY),
+            Self::OverlayRaster { .. } => Some(OUT_KIND_OVERLAY),
         }
     }
 }
@@ -729,16 +768,29 @@ pub const OUT_KIND_SECTION: u8 = 2;
 pub const OUT_KIND_VOXELS: u8 = 3;
 /// A decoded Level II volume. The first code that never was a `RenderView`.
 pub const OUT_KIND_VOLUME: u8 = 4;
-/// An overlay raster: raw premultiplied RGBA, no framing of its own.
+/// An overlay raster: a one-byte hit-cells tag, the framed hit cells when the
+/// tag says so, and then raw premultiplied RGBA as the rest.
 ///
-/// The one `OUT` payload without a magic to refuse the wrong bytes — raw
-/// pixels have no header to carry one. What stands in for the magic is the
-/// length check at the consumer ([`JobOutput::OverlayRaster`]): another kind's
-/// payload arriving under this code is believed only if it happens to be
-/// exactly `width × height × 4` bytes of the raster the dispatch asked for,
-/// and anything else is "nothing to draw". The protocol version beside the
-/// code (`rustdar-web`'s `PROTOCOL_VERSION`, bumped to 9 with it) is what
-/// keeps a worker that predates the fifth code from being attached at all.
+/// The payload was unframed raw RGBA until protocol version 11, when the
+/// hit-map kinds crossed the wire and the reply had to carry their cells —
+/// the **first reply-shape change since the guards over this port landed**,
+/// and one no field-name scrape can see, since the reply still rides the
+/// same `OUT`/`OUT_KIND` pair. What pins the framing instead is
+/// `offload::tests`' digest over [`encode_overlay_out`]'s bytes
+/// (`the_overlay_reply_framing_is_the_one_this_protocol_ships`), beside the
+/// code-byte pin this constant has always had.
+///
+/// The RGBA tail still has no magic — raw pixels have no header to carry one
+/// — so what stands in for it is unchanged: the length check at the consumer
+/// ([`JobOutput::OverlayRaster`]) believes the tail only at exactly
+/// `width × height × 4` bytes of the raster the dispatch asked for. The
+/// hit-cells block *does* refuse malformed bytes ([`decode_overlay_out`]),
+/// and the length check is also what catches a cross-version pairing the
+/// token missed: a raw version-10 payload read as framed loses its first
+/// byte to the tag and fails the arithmetic either way the byte falls, and a
+/// framed payload read raw is at least one byte too long — both read as
+/// "nothing to draw". The protocol version beside the code is what keeps
+/// such a worker from being attached at all.
 pub const OUT_KIND_OVERLAY: u8 = 5;
 
 /// What a rasterizing job produces: the RGBA texture, the half-width it was
@@ -1229,6 +1281,8 @@ impl JobRequest {
                 OverlayJobInput::Alerts(_) => "overlay/alerts",
                 OverlayJobInput::Outlooks(_) => "overlay/outlooks",
                 OverlayJobInput::Discussions(_) => "overlay/discussions",
+                OverlayJobInput::Reports(_) => "overlay/reports",
+                OverlayJobInput::Glm(_) => "overlay/glm",
             },
         }
     }
@@ -1416,6 +1470,11 @@ const OVERLAY_INPUT_ALERTS: u8 = 2;
 const OVERLAY_INPUT_OUTLOOKS: u8 = 3;
 /// [`OverlayJobInput::Discussions`]'s code.
 const OVERLAY_INPUT_DISCUSSIONS: u8 = 4;
+/// [`OverlayJobInput::Reports`]'s code — the next free number after the
+/// discussions code, and the first hit-map kind on this inner wire.
+const OVERLAY_INPUT_REPORTS: u8 = 5;
+/// [`OverlayJobInput::Glm`]'s code.
+const OVERLAY_INPUT_GLM: u8 = 6;
 
 /// The variant's own bytes after [`JobRequest::Overlay`]'s fixed header:
 /// one input-kind byte, then the kind's fields — scalars first, then the
@@ -1485,6 +1544,49 @@ fn encode_overlay_input(out: &mut Vec<u8>, input: &OverlayJobInput) {
             for md in &discussions.discussions {
                 out.push(MdTypeWire(md.md_type).wire_code());
                 encode_polygon(out, &md.polygon);
+            }
+        }
+        // The two hit-map kinds. **Row order is load-bearing on both**: a
+        // row's position is its hit-map id, and the page zips the reply's
+        // cells with an item list captured in this order — so these loops
+        // append in input order and their decoders push in read order, like
+        // every list on this wire, and unlike every other list a reorder
+        // here would not merely move pixels, it would hand hovers to the
+        // wrong items.
+        OverlayJobInput::Reports(reports) => {
+            out.push(OVERLAY_INPUT_REPORTS);
+            out.extend_from_slice(&reports.zoom.to_le_bytes());
+            out.push(u8::from(reports.is_dark));
+            out.extend_from_slice(&reports.device_scale.to_le_bytes());
+            out.extend_from_slice(&(reports.reports.len() as u32).to_le_bytes());
+            for report in &reports.reports {
+                out.push(StormReportKindWire(report.kind).wire_code());
+                out.extend_from_slice(&report.lat.to_le_bytes());
+                out.extend_from_slice(&report.lon.to_le_bytes());
+            }
+        }
+        OverlayJobInput::Glm(glm) => {
+            out.push(OVERLAY_INPUT_GLM);
+            out.extend_from_slice(&glm.zoom.to_le_bytes());
+            out.push(u8::from(glm.is_dark));
+            out.extend_from_slice(&glm.device_scale.to_le_bytes());
+            out.extend_from_slice(&glm.time_window_secs.to_le_bytes());
+            // The page's clock, on the wire. The worker ages every flash
+            // against this and never against a clock of its own — the parity
+            // gates over an age-straddling fixture are what enforce it.
+            encode_datetime(out, &glm.now);
+            out.extend_from_slice(&(glm.flashes.len() as u32).to_le_bytes());
+            for flash in &glm.flashes {
+                out.extend_from_slice(&flash.lat.to_le_bytes());
+                out.extend_from_slice(&flash.lon.to_le_bytes());
+                encode_datetime(out, &flash.time);
+                match flash.energy {
+                    None => out.push(0),
+                    Some(energy) => {
+                        out.push(1);
+                        out.extend_from_slice(&energy.to_le_bytes());
+                    }
+                }
             }
         }
     }
@@ -1601,8 +1703,83 @@ fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
                 },
             ))
         }
+        OVERLAY_INPUT_REPORTS => {
+            let zoom = r.f64()?;
+            let is_dark = flag(r.u8()?)?;
+            let device_scale = r.f32()?;
+            let count = r.u32()? as usize;
+            let mut reports = Vec::new();
+            for _ in 0..count {
+                reports.push(rustdar_overlays::render::rasterize::ReportPaint {
+                    kind: StormReportKindWire::from_wire_code(r.u8()?)?.0,
+                    lat: r.f64()?,
+                    lon: r.f64()?,
+                });
+            }
+            Some(OverlayJobInput::Reports(
+                rustdar_overlays::render::rasterize::ReportsInput {
+                    reports,
+                    zoom,
+                    is_dark,
+                    device_scale,
+                },
+            ))
+        }
+        OVERLAY_INPUT_GLM => {
+            let zoom = r.f64()?;
+            let is_dark = flag(r.u8()?)?;
+            let device_scale = r.f32()?;
+            let time_window_secs = r.f64()?;
+            let now = decode_datetime(r)?;
+            let count = r.u32()? as usize;
+            let mut flashes = Vec::new();
+            for _ in 0..count {
+                flashes.push(rustdar_overlays::render::rasterize::FlashPaint {
+                    lat: r.f64()?,
+                    lon: r.f64()?,
+                    time: decode_datetime(r)?,
+                    energy: match r.u8()? {
+                        0 => None,
+                        1 => Some(r.f32()?),
+                        _ => return None,
+                    },
+                });
+            }
+            Some(OverlayJobInput::Glm(
+                rustdar_overlays::render::rasterize::GlmStrikesInput {
+                    flashes,
+                    zoom,
+                    is_dark,
+                    time_window_secs,
+                    now,
+                    device_scale,
+                },
+            ))
+        }
         _ => None,
     }
+}
+
+/// A UTC timestamp as twelve bytes: the `i64` Unix seconds and the `u32`
+/// subsecond nanoseconds. Two fields rather than one `i64` of nanoseconds
+/// because the pair is total — every `NaiveDateTime` chrono can represent
+/// encodes, where nanoseconds-since-epoch overflows in 2262 — and exact, so
+/// a request round-trips to itself and the parity gates compare identical
+/// inputs on both paths.
+fn encode_datetime(out: &mut Vec<u8>, t: &chrono::NaiveDateTime) {
+    let utc = t.and_utc();
+    out.extend_from_slice(&utc.timestamp().to_le_bytes());
+    out.extend_from_slice(&utc.timestamp_subsec_nanos().to_le_bytes());
+}
+
+/// The inverse of [`encode_datetime`]: `None` for a short buffer or a
+/// (seconds, nanos) pair outside chrono's representable range — which is a
+/// payload from a build whose layout this is not, refused rather than
+/// clamped to some time nobody stated.
+fn decode_datetime(r: &mut Reader) -> Option<chrono::NaiveDateTime> {
+    let secs = i64::from_le_bytes(r.take(8)?.try_into().ok()?);
+    let nanos = r.u32()?;
+    Some(chrono::DateTime::from_timestamp(secs, nanos)?.naive_utc())
 }
 
 /// A `u16` length prefix and then the bytes, truncated to what the prefix can
@@ -1750,6 +1927,37 @@ impl AlertCategoryWire {
             _ => return None,
         };
         Some(Self(category))
+    }
+}
+
+/// A [`StormReportKind`](rustdar_overlays::spc::reports::StormReportKind) as
+/// a number. See [`AlertCategoryWire`]. The numbering is the enum's own
+/// declaration order — a kind byte misread as another decodes cleanly and
+/// paints a tornado as hail, which is what the per-kind parity fixture with
+/// all three kinds exists to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StormReportKindWire(rustdar_overlays::spc::reports::StormReportKind);
+
+impl StormReportKindWire {
+    fn wire_code(self) -> u8 {
+        use rustdar_overlays::spc::reports::StormReportKind as K;
+        match self.0 {
+            K::Tornado => 0,
+            K::Hail => 1,
+            K::Wind => 2,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use rustdar_overlays::spc::reports::StormReportKind as K;
+        let kind = match code {
+            0 => K::Tornado,
+            1 => K::Hail,
+            2 => K::Wind,
+            _ => return None,
+        };
+        Some(Self(kind))
     }
 }
 
@@ -1930,8 +2138,11 @@ fn premultiplied(output: JobOutput) -> JobOutput {
         // Already premultiplied: [`execute`]'s overlay arm converted at the
         // rasterizer's own declaration, which is the one place the declared
         // `AlphaMode` is still in hand. Running the table again here would
-        // double-multiply every translucent pixel.
-        JobOutput::OverlayRaster(rgba) => JobOutput::OverlayRaster(rgba),
+        // double-multiply every translucent pixel. The hit cells carry
+        // indices, not pixels.
+        JobOutput::OverlayRaster { rgba, hit_cells } => {
+            JobOutput::OverlayRaster { rgba, hit_cells }
+        }
     }
 }
 
@@ -2135,6 +2346,22 @@ pub fn execute(request: &JobRequest) -> JobResult {
                         *height,
                     )
                 }
+                OverlayJobInput::Reports(reports) => {
+                    rustdar_overlays::render::rasterize::rasterize_storm_reports(
+                        reports, bounds, *width, *height,
+                    )
+                }
+                // Ages every flash against the `now` the input carries — the
+                // page's clock at dispatch. Reading a clock here instead is
+                // exactly the divergence the parity gates over an
+                // age-straddling fixture go red on: this may run seconds
+                // after the dispatch, on a worker whose picture must still
+                // be the one the direct call would have drawn.
+                OverlayJobInput::Glm(glm) => {
+                    rustdar_overlays::render::rasterize::rasterize_glm_strikes(
+                        glm, bounds, *width, *height,
+                    )
+                }
             };
             // The output contract is **premultiplied, always** — stated on
             // [`JobOutput::OverlayRaster`] — where each rasterizer's own
@@ -2156,12 +2383,14 @@ pub fn execute(request: &JobRequest) -> JobResult {
                     premultiply_raster(&mut rgba)
                 }
             }
-            // `output.hit_map` is dropped, correctly *for the kinds described
-            // so far*: the sites, alert, outlook and discussion rasterizers
-            // all answer `None` on every path. The hit-map kinds cannot take
-            // this arm until the id-image reply exists — that is a later
-            // slice, and their inputs are not describable here yet either.
-            Some(JobOutput::OverlayRaster(rgba))
+            // The cells ride the reply; the items they index into never left
+            // the dispatch, which zips the two at delivery. The four
+            // no-hit-map kinds answer `None` here on every path, and the
+            // reply says so with its own tag byte.
+            Some(JobOutput::OverlayRaster {
+                rgba,
+                hit_cells: output.hit_cells,
+            })
         }
     };
     // One place, after every arm, so no rasterizing arm can be added that
@@ -2203,6 +2432,91 @@ pub fn execute_bytes(bytes: &[u8]) -> JobResult {
 /// way, and a reply that says it does comes from a build whose protocol is not
 /// this one. All three are "nothing to draw", which is what a failed render has
 /// always meant, and all three still deliver.
+/// The [`OUT_KIND_OVERLAY`] payload's bytes: a hit-cells tag, the framed
+/// cells when the tag says so, and the raw RGBA as the rest.
+///
+/// The cells are written **sorted by cell index** — a `HashMap`'s iteration
+/// order is seeded per process, and these bytes have to be a function of the
+/// value for two encodes of one reply to agree and for the framing digest in
+/// `offload::tests` to pin them. The RGBA takes the rest, so no length prefix
+/// can lie about it; its one guard stays the dispatch's length check.
+pub fn encode_overlay_out(
+    rgba: &[u8],
+    hit_cells: Option<&rustdar_overlays::render::rasterize::HitCells>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() + 64);
+    match hit_cells {
+        None => out.push(0),
+        Some(cells) => {
+            out.push(1);
+            out.extend_from_slice(&cells.width.to_le_bytes());
+            out.extend_from_slice(&cells.height.to_le_bytes());
+            let mut occupied: Vec<(&u32, &Vec<u32>)> = cells.cells.iter().collect();
+            occupied.sort_by_key(|(idx, _)| **idx);
+            out.extend_from_slice(&(occupied.len() as u32).to_le_bytes());
+            for (idx, ids) in occupied {
+                out.extend_from_slice(&idx.to_le_bytes());
+                out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+                for id in ids {
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+        }
+    }
+    out.extend_from_slice(rgba);
+    out
+}
+
+/// The inverse of [`encode_overlay_out`]. `None` for a tag outside `{0, 1}`,
+/// a cell index at or past the grid the stated dimensions span, indices out
+/// of ascending order or repeated (the canonical form the encoder writes and
+/// the only one accepted, so one value has one byte string), an empty id
+/// list (the rasterizer never records one), or a buffer shorter than its own
+/// counts claim. The RGBA tail is handed back **unjudged**: only the
+/// dispatch knows the dimensions it must match.
+pub fn decode_overlay_out(
+    bytes: &[u8],
+) -> Option<(
+    Vec<u8>,
+    Option<rustdar_overlays::render::rasterize::HitCells>,
+)> {
+    let mut r = Reader::new(bytes);
+    let hit_cells = match r.u8()? {
+        0 => None,
+        1 => {
+            let width = r.u32()?;
+            let height = r.u32()?;
+            let grid = u64::from(width) * u64::from(height);
+            let occupied = r.u32()? as usize;
+            let mut cells = HashMap::new();
+            let mut previous: Option<u32> = None;
+            for _ in 0..occupied {
+                let idx = r.u32()?;
+                if u64::from(idx) >= grid || previous.is_some_and(|p| p >= idx) {
+                    return None;
+                }
+                previous = Some(idx);
+                let id_count = r.u32()? as usize;
+                if id_count == 0 {
+                    return None;
+                }
+                let mut ids = Vec::new();
+                for _ in 0..id_count {
+                    ids.push(r.u32()?);
+                }
+                cells.insert(idx, ids);
+            }
+            Some(rustdar_overlays::render::rasterize::HitCells {
+                width,
+                height,
+                cells,
+            })
+        }
+        _ => return None,
+    };
+    Some((r.rest().to_vec(), hit_cells))
+}
+
 pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
     match kind {
         OUT_KIND_SECTION => {
@@ -2213,10 +2527,11 @@ pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
         }
         OUT_KIND_VOLUME => rustdar_radar::scan::DecodedScan::from_bytes(bytes)
             .map(|volume| JobOutput::Volume(Box::new(volume))),
-        // Raw RGBA: no codec to refuse it here, so acceptance is deferred to
-        // the dispatch's own length check — see [`OUT_KIND_OVERLAY`] for why
-        // that is the guard rather than a magic.
-        OUT_KIND_OVERLAY => Some(JobOutput::OverlayRaster(bytes.to_vec())),
+        // The hit-cells block refuses its malformed shapes; the RGBA tail is
+        // still raw, and its acceptance is still deferred to the dispatch's
+        // own length check — see [`OUT_KIND_OVERLAY`] for what stands where.
+        OUT_KIND_OVERLAY => decode_overlay_out(bytes)
+            .map(|(rgba, hit_cells)| JobOutput::OverlayRaster { rgba, hit_cells }),
         _ => {
             log::error!(
                 "a worker sent an out-of-band payload tagged {kind}, which this build has no decoder for"

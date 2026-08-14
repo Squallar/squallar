@@ -14,8 +14,10 @@
 //! shape — the port records nothing, because a closure is executed rather
 //! than posted — and fails the un-wedge half by silence, since no failure
 //! response can exist for a job that was never described. The hit-map kinds
-//! staying opaque is pinned from the other side by
-//! `rustdar-overlays`' `the_kinds_with_a_described_job_are_exactly_the_polygon_kinds`.
+//! took the same route a slice later; their dispatches are pinned in
+//! `hitmap_wire_tests`, and the described set as a whole from the other side
+//! by `rustdar-overlays`'
+//! `the_kinds_with_a_described_job_are_all_but_the_model_grid`.
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
@@ -221,6 +223,8 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
             crate::offload::OverlayJobInput::Outlooks(_) => OverlayKind::SpcOutlook,
             crate::offload::OverlayJobInput::Discussions(_) => OverlayKind::SpcDiscussions,
             crate::offload::OverlayJobInput::Sites(_) => OverlayKind::RadarSites,
+            crate::offload::OverlayJobInput::Reports(_) => OverlayKind::StormReports,
+            crate::offload::OverlayJobInput::Glm(_) => OverlayKind::Lightning,
         };
         assert_eq!(
             named, kind,
