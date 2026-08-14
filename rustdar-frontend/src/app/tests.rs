@@ -2713,6 +2713,34 @@ fn a_deferred_exit_leaves_by_the_same_door_as_an_immediate_one() {
     );
 }
 
+/// The save on the way out has to be in `exit_now`, not only where the exit
+/// was requested.
+///
+/// On the deferred route — Android's primary one, since the menu is processed
+/// during a redraw with no event loop to hand out — `handle_redraw` runs
+/// between the request and the replay. Its `autosave_config` *queues* a write,
+/// because the config store hands writes to a writer thread, and the
+/// `process::exit` in `exit_now` discards anything that thread has not reached.
+/// The lost write is the one covering the last change the user made, in the
+/// very redraw that processed Exit.
+///
+/// Read off the source because `exit_now` needs an `ActiveEventLoop` and ends
+/// the process, which is the same reason the test above reads it that way.
+#[test]
+fn the_way_out_saves_the_config_where_the_process_actually_ends() {
+    let body = fn_body("fn exit_now(");
+    let save = body
+        .find("save_ui_config")
+        .expect("exit_now no longer saves the config, so a deferred exit loses the last change");
+    let exit = body
+        .find("needs_process_exit")
+        .expect("exit_now no longer ends the process");
+    assert!(
+        save < exit,
+        "the save must come before the process ends, or it is not a save: {body}",
+    );
+}
+
 /// Two things the app hands the bridge that it can only get back by asking.
 ///
 /// The theme read is Android's only source — NativeActivity never emits

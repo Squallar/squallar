@@ -677,12 +677,17 @@ pub fn remembered(store: Option<&dyn ConfigStore>, limits: LoopPoolLimits) -> Op
 /// definition one where the graphics device is misbehaving and may not get
 /// three more seconds. A failed write is logged and dropped: losing the memo
 /// costs one re-probe, and configuration is never allowed to be load-bearing.
+///
+/// [`ConfigStore::store_now`] is what keeps that true. The ordinary `store`
+/// defers to a writer thread, and a process killed moments later drops the memo
+/// exactly as if it had waited for the timer — which is the outcome this
+/// function was written to rule out.
 pub fn remember(store: Option<&dyn ConfigStore>, bytes: usize) {
     let Some(store) = store else {
         return;
     };
     let mib = bytes / (1024 * 1024);
-    if let Err(e) = store.store(LOOP_POOL_KEY, &mib.to_string()) {
+    if let Err(e) = store.store_now(LOOP_POOL_KEY, &mib.to_string()) {
         log::warn!("could not persist the loop pool size: {e}");
     }
 }

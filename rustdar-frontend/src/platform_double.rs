@@ -65,6 +65,15 @@ impl ConfigStore for SharedStore {
         self.writes.set(self.writes.get() + 1);
         self.inner.store(key, value)
     }
+
+    /// Spelled out rather than left to the trait's default, which would forward
+    /// to `store` and count — correct today only by coincidence. A decorator
+    /// that forwards one method and forgets the other silently turns a caller's
+    /// durable write into a deferred one, and this is a decorator.
+    fn store_now(&self, key: &str, value: &str) -> Result<(), String> {
+        self.writes.set(self.writes.get() + 1);
+        self.inner.store_now(key, value)
+    }
 }
 
 /// The GPS config the bridge was last started with, or `None` when stopped.
