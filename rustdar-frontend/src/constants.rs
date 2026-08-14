@@ -1325,6 +1325,28 @@ pub const MOBILE_APP_TEXTURE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// The desktop arm. See [`APP_TEXTURE_BUDGET_BYTES`].
 pub const DESKTOP_APP_TEXTURE_BUDGET_BYTES: usize = 3840 * 1024 * 1024;
 
+/// What the desktop arm becomes for a machine that earned
+/// [`crate::budget::Promotion::Ceiling`].
+///
+/// The **second rung** of `budget::BudgetLimits::app_texture_ceiling_bytes`,
+/// and it exists for one reason: [`DESKTOP_VOLUME_OFFSCREEN_CEILING_BYTES`]
+/// moves a term of the sum, so the bound over the sum has to move with it or
+/// the promotion is unprovable. Both rungs are argued in bytes and neither is
+/// read off the device, which is what keeps
+/// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` biting rather than
+/// degenerating into two sides that move together.
+///
+/// The arithmetic at the promoted rung: 3072 MiB of loop pool ceiling + 576 MiB
+/// of volume-store floor + 6 panes x 48 MiB of offscreen = **3936 MiB**,
+/// against this 4032 MiB. That is 1.02x, the same snugness the unpromoted
+/// 3768-against-3840 keeps.
+///
+/// **Not 4096 MiB**, and the reason is not aesthetic: this is a `usize`,
+/// wasm32's is 32 bits, and `budget::BudgetLimits::DESKTOP` is a `const`
+/// compiled on every target including that one. 4096 MiB is exactly
+/// `u32::MAX + 1`.
+pub const DESKTOP_APP_TEXTURE_CEILING_BYTES: usize = 4032 * 1024 * 1024;
+
 /// Ceiling on the compressed tile bytes each basemap/label tile source
 /// retains beside its textures: `TILE_CACHE_ENTRIES` PNGs at a generous
 /// 30 KiB each — ~7.5 MiB per source, four sources at most (light and dark,
@@ -1713,6 +1735,42 @@ pub const WASM_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
 pub const MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
 /// The desktop arm. See [`WASM_VOLUME_OFFSCREEN_BUDGET_BYTES`].
 pub const DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 20 * 1024 * 1024;
+
+/// What the desktop arm becomes on an adapter that named itself discrete or
+/// reported desktop-class texture ceilings — `crate::budget::Promotion::Ceiling`.
+///
+/// **The compromise a 24 GiB card was still eating.** The table above stops at
+/// the 2560 x 1440 reference pane; the paragraph under it states the
+/// consequence and then accepts it — *"a maximised pane on a 4K display is 31.6
+/// MiB at `Native`, so it steps to `Half` and is upscaled by the blit's
+/// `Linear` sampler"*. On an RTX 3090 with 24576 MiB of measured VRAM, a 4K
+/// pane being upscaled from half resolution because of a 20 MiB budget is the
+/// user's complaint in one line.
+///
+/// # The number
+///
+/// 3840 x 2160 x 4 B = **31.64 MiB** for the pane, plus the headroom the
+/// shipped figure keeps: 14.06 -> 20 MiB is 1.42x, and 31.64 x 1.42 = 44.9,
+/// rounded up to a whole 48 MiB. That is 1.52x — enough for the alignment a
+/// real allocation carries, not enough to hide a doubling.
+///
+/// # The fill rate, measured rather than assumed
+///
+/// `volume::quality`'s own table is 0.766 ms for the cloud rung at 1440 x 900
+/// over a dense real volume on this exact class of device, and the cost model
+/// behind it is fetch-bound and linear in covered pixels. 4K is 6.4x that area,
+/// so about **4.9 ms** of a 16.7 ms frame for one pane — which is what a
+/// maximised pane is, and which is the same ~4 ms the paragraph above already
+/// worked out. The interaction rule is not at risk: the raymarch is offscreen
+/// precisely so a frame can drop quality without the map dropping anything.
+///
+/// # Which machines do *not* get it
+///
+/// The middle rung stays at the unpromoted figure, so an integrated GPU keeps
+/// 20 MiB. Same model, same table: integrated extrapolates to 12-23 ms at
+/// *1440 x 900*, so it is the class the measurement argues against promoting
+/// rather than the class nobody got round to.
+pub const DESKTOP_VOLUME_OFFSCREEN_CEILING_BYTES: usize = 48 * 1024 * 1024;
 
 #[cfg(target_arch = "wasm32")]
 pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = WASM_VOLUME_OFFSCREEN_BUDGET_BYTES;
