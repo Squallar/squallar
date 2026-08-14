@@ -955,7 +955,15 @@ impl VolumeAssembler {
             accepted: true,
             ..Default::default()
         };
-        if let Some(vcp) = contents.coverage_pattern {
+        if let Some(vcp) = contents.coverage_pattern
+            // Learning it again is not learning it: a repeat of the same table
+            // changes nothing to rebuild the chunk map for and nothing for a
+            // reader to redraw. Guarded like the reported site below rather than
+            // left to the fact that a sequence is ingested once, so the cost of
+            // this arm is bounded by the code and not by an argument about the
+            // caller.
+            && self.coverage_pattern.as_ref() != Some(&vcp)
+        {
             let vcp = self.coverage_pattern.insert(vcp);
             self.chunk_map = ElevationChunkMap::from_coverage_pattern(vcp);
             outcome.learned_coverage_pattern = true;
@@ -1467,6 +1475,17 @@ impl std::fmt::Debug for ClosedVolume {
 #[derive(Debug, Clone, Default)]
 pub struct PollOutcome {
     pub ingested: usize,
+    /// A chunk this round carried the coverage pattern, so the volume being
+    /// assembled can key its own sweeps from now on and could not before.
+    ///
+    /// **A render trigger in its own right**, and the only one on the round it
+    /// fires: the start chunk carries no radials, so nothing seals, and the
+    /// snapshot every reader held until now carried
+    /// `placeholder_coverage_pattern` — which `crate::current::resolve` refuses,
+    /// having no cut table to key by. Images already drawn from that refusal
+    /// stay drawn until something invalidates them, and
+    /// [`Self::sealed_elevations`] is empty here.
+    pub learned_coverage_pattern: bool,
     /// Elevation numbers whose cut completed this round, ascending. **The render
     /// trigger**, and the test for whether a snapshot is worth building.
     pub sealed_elevations: Vec<u8>,
@@ -1779,6 +1798,7 @@ impl ChunkPoller {
             Ok(o) if o.accepted => {
                 outcome.ingested += 1;
                 outcome.sealed_elevations.extend(o.sealed);
+                outcome.learned_coverage_pattern |= o.learned_coverage_pattern;
             }
             Ok(_) => {}
             Err(e) => {
@@ -2061,6 +2081,7 @@ impl ChunkPoller {
                 Ok(o) if o.accepted => {
                     outcome.ingested += 1;
                     outcome.sealed_elevations.extend(o.sealed);
+                    outcome.learned_coverage_pattern |= o.learned_coverage_pattern;
                 }
                 Ok(_) => {}
                 // A chunk that will not decode is skipped, not fatal: the volume

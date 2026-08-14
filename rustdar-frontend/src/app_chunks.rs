@@ -334,6 +334,20 @@ impl super::App {
                 // walks every radial of every sweep and `reset_panes_for_tilts`
                 // sweeps the render cache, and most rounds seal nothing.
                 if outcome.sealed_elevations.is_empty() {
+                    // One round is not "no change" though: the one the coverage
+                    // pattern arrived on. Until it lands the snapshot carries
+                    // `placeholder_coverage_pattern`, whose cut table is empty,
+                    // and `current::resolve` refuses a volume that cannot key
+                    // its own sweeps — so every plan pane on this site drew
+                    // without the live volume in it. The start chunk carries no
+                    // radials, so this round seals nothing and no tilt reset
+                    // covers it, and a plan pane's image is held in
+                    // `render_cache` until something drops it. Per-frame
+                    // consumers re-resolve on their own; the drawn picture does
+                    // not, which is what the user is looking at.
+                    if outcome.learned_coverage_pattern {
+                        self.render.reset_panes_for_site(site, &self.gui);
+                    }
                     return;
                 }
                 let Some(live) = self.chunk_feeds.snapshot(site) else {

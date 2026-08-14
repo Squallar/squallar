@@ -1500,7 +1500,55 @@ fn round_ingest(
     if o.accepted {
         outcome.ingested += 1;
         outcome.sealed_elevations.extend(o.sealed);
+        outcome.learned_coverage_pattern |= o.learned_coverage_pattern;
     }
+}
+
+/// The round the start chunk lands on reports the pattern it brought.
+///
+/// Without this the flag dies in [`IngestOutcome`]: the round seals nothing —
+/// a start chunk carries no radials — so a caller gating on
+/// `sealed_elevations` learns nothing happened, and every image drawn while
+/// the pattern was the placeholder stays on screen. The invalidation the
+/// frontend does with it is pinned in
+/// `app_chunks::volume_close_tests::a_learned_coverage_pattern_resets_the_sites_panes`.
+#[test]
+fn the_round_the_coverage_pattern_arrives_on_says_so() {
+    let mut p = ChunkPoller::resume("KTLX", vol(42));
+    let chunks = golden_chunks();
+
+    // The radial chunks first: the start chunk is the one that 404'd.
+    let mut quiet = PollOutcome::default();
+    for chunk in chunks.iter().skip(1).take(2).cloned() {
+        round_ingest(&mut p, &mut quiet, chunk);
+    }
+    assert!(
+        !quiet.learned_coverage_pattern,
+        "no chunk here carried a coverage pattern"
+    );
+
+    let mut landing = PollOutcome::default();
+    round_ingest(&mut p, &mut landing, chunks[0].clone());
+    assert!(
+        landing.learned_coverage_pattern,
+        "the round the start chunk landed on did not report the pattern"
+    );
+    assert!(
+        landing.sealed_elevations.is_empty(),
+        "and it sealed nothing, which is why the flag has to carry the round \
+             on its own"
+    );
+
+    // Learning the same table again is not learning it.
+    let mut again = PollOutcome::default();
+    let mut repeat = chunks[0].clone();
+    repeat.0 = 998;
+    round_ingest(&mut p, &mut again, repeat);
+    assert!(
+        !again.learned_coverage_pattern,
+        "a repeat of the pattern already held reported a change, which would \
+             throw away every pane's image for nothing"
+    );
 }
 
 /// A round that seals rebuilds the snapshot cache before it returns, so the
@@ -1874,6 +1922,13 @@ fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
                      `return Err` check below"
             );
         }
+
+        assert!(
+            body.contains("outcome.learned_coverage_pattern |= o.learned_coverage_pattern;"),
+            "{signature} drops the ingest's `learned_coverage_pattern`, so the \
+                 round the coverage pattern arrives on reports nothing and the \
+                 panes drawn without it are never invalidated"
+        );
 
         let mut from = 0;
         let mut found = 0;
