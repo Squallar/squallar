@@ -4029,12 +4029,7 @@ impl BranchDsu {
 /// halves at whatever fold the boundary evidence supports. That is the better
 /// arrangement anyway: the seam is then subject to the acceptance test like any
 /// other boundary rather than being fused before one is applied.
-fn label_regions(
-    raw: &[Vec<f64>],
-    gc: usize,
-    nyquist: f64,
-    splits: usize,
-) -> (Vec<u32>, usize) {
+fn label_regions(raw: &[Vec<f64>], gc: usize, nyquist: f64, splits: usize) -> (Vec<u32>, usize) {
     let n = raw.len();
     let mut label = vec![0u32; n * gc];
     let mut nf = 0usize;
@@ -4273,16 +4268,13 @@ fn region_assign(
         let total: usize = votes.values().sum();
         let best = votes.iter().max_by_key(|(b, c)| (**c, -**b));
         let base = match best {
-            Some((&b, &c))
-                if total >= k.anchor_min && c as f64 >= k.anchor_frac * total as f64 =>
-            {
+            Some((&b, &c)) if total >= k.anchor_min && c as f64 >= k.anchor_frac * total as f64 => {
                 b
             }
             // No evidence, or evidence that disagrees with itself.
             _ if k.anchor_largest => {
                 stats.no_anchor += 1;
-                -mem
-                .iter()
+                -mem.iter()
                     .max_by_key(|(l, _)| size[*l as usize])
                     .map_or(0, |(_, off)| *off)
             }
@@ -4630,8 +4622,7 @@ pub(crate) fn dealias_with_knobs(
     // them it is a correction pass, and it is measured to be a much weaker one.
     if let Some(k) = knobs.region.filter(|k| k.before_passes) {
         region_done = true;
-        region_stats =
-            region_assign(&raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
+        region_stats = region_assign(&raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
     }
     for _pass in 0..DA_PASSES {
         let mut changed = false;
@@ -5111,6 +5102,22 @@ mod tests {
         (truth, wrapped)
     }
 
+    /// What [`vad_folded`] hands back: a folded field, the truth it was folded
+    /// from, the geometry the two share, and the only wind evidence the
+    /// dealiaser is allowed to see.
+    struct VadFolded {
+        /// The environmental profile the dealiaser is given. Fitted only below
+        /// 1.0 km — see [`vad_folded`] for why that is the situation and not a
+        /// convenience.
+        seed: WindProfile,
+        /// Ring azimuths in degrees, one per radial of `truth` and `wrapped`.
+        azimuths_deg: Vec<f64>,
+        /// The unfolded field the wind produces: what recovery is scored against.
+        truth: Vec<Vec<f64>>,
+        /// `truth` wrapped onto the Nyquist interval: the dealiaser's input.
+        wrapped: Vec<Vec<f64>>,
+    }
+
     /// A field an actual wind produces, and the wind that produced it.
     ///
     /// [`folded_ramp`]'s truth is constant in azimuth, which no wind can make:
@@ -5126,20 +5133,15 @@ mod tests {
     /// [`folded_ramp`] does — a real wall, and an interior beyond it that no
     /// wall-local pass can cross.
     ///
-    /// Two profiles come back. The first is the atmosphere and is what the
-    /// truth is built from. The second is the **seed**, and it is fitted only
-    /// below 1.0 km: that is not a convenience, it is the situation — a VAD
-    /// stops fitting where its samples run out, which is exactly where the
-    /// folding starts, so the evidence lives near the radar and the branch has
-    /// to travel outward to be of any use. `predict` returns `None` above the
-    /// fitted layers (it falls back one layer and no further), so no seed of any
-    /// kind fires on the folded ground itself.
-    fn vad_folded(
-        n: usize,
-        gc: usize,
-        ny: f64,
-        elev: f64,
-    ) -> (WindProfile, Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    /// Two profiles are built and only one comes back. The atmosphere is what
+    /// the truth is built from and it stays here; what the caller gets is the
+    /// **seed** in [`VadFolded::seed`], fitted only below 1.0 km. That is not a
+    /// convenience, it is the situation — a VAD stops fitting where its samples
+    /// run out, which is exactly where the folding starts, so the evidence lives
+    /// near the radar and the branch has to travel outward to be of any use.
+    /// `predict` returns `None` above the fitted layers (it falls back one layer
+    /// and no further), so no seed of any kind fires on the folded ground itself.
+    fn vad_folded(n: usize, gc: usize, ny: f64, elev: f64) -> VadFolded {
         let speed = |h: f64| match h {
             h if h < 1.0 => 15.0,
             h if h < 2.5 => 15.0 + 30.0 * (h - 1.0) / 1.5,
@@ -5150,20 +5152,21 @@ mod tests {
             .map(|l| (level(l), 0.0, speed(level(l))))
             .collect();
         let full = WindProfile::from_levels(&air).expect("profile");
-        let wp = WindProfile::from_levels(
+        let seed = WindProfile::from_levels(
             &air.iter()
                 .copied()
                 .filter(|&(h, _, _)| h < 1.0)
                 .collect::<Vec<_>>(),
         )
         .expect("seed profile");
-        let az = ring_azimuths(n);
+        let azimuths_deg = ring_azimuths(n);
         let truth: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 (0..gc)
                     .map(|j| {
                         let r = 2.125 + j as f64;
-                        full.predict(az[i].to_radians(), r, elev).expect("prediction")
+                        full.predict(azimuths_deg[i].to_radians(), r, elev)
+                            .expect("prediction")
                     })
                     .collect()
             })
@@ -5176,7 +5179,12 @@ mod tests {
                     .collect()
             })
             .collect();
-        (wp, az, truth, wrapped)
+        VadFolded {
+            seed,
+            azimuths_deg,
+            truth,
+            wrapped,
+        }
     }
 
     fn coverage_knobs(region: Option<RegionKnobs>) -> DealiasKnobs {
@@ -5235,8 +5243,9 @@ mod tests {
             None,
             coverage_knobs(Some(RegionKnobs::SHIPPED)),
         );
-        let interior: Vec<(usize, usize)> =
-            (0..n).flat_map(|i| (165..gc).map(move |j| (i, j))).collect();
+        let interior: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| (165..gc).map(move |j| (i, j)))
+            .collect();
         let moved = interior
             .iter()
             .filter(|&&(i, j)| (arm[i][j] - wrapped[i][j]).abs() > 1e-9)
@@ -5286,10 +5295,15 @@ mod tests {
     #[test]
     fn the_interior_of_a_folded_region_is_recovered_from_a_seed() {
         let (ny, n, gc, elev) = (20.0, 72usize, 200usize, 0.5);
-        let (wp, az, truth, wrapped) = vad_folded(n, gc, ny, elev);
+        let VadFolded {
+            seed,
+            azimuths_deg,
+            truth,
+            wrapped,
+        } = vad_folded(n, gc, ny, elev);
         let sweep = VelocitySweep {
             vel_grid: &wrapped,
-            azimuths_deg: &az,
+            azimuths_deg: &azimuths_deg,
             gate_count: gc,
             first_gate_range_km: 2.125,
             gate_interval_km: 1.0,
@@ -5316,7 +5330,7 @@ mod tests {
             &mut shipped,
             &sweep,
             elev,
-            Some(&wp),
+            Some(&seed),
             coverage_knobs(None),
         );
         let mut arm = wrapped.clone();
@@ -5324,7 +5338,7 @@ mod tests {
             &mut arm,
             &sweep,
             elev,
-            Some(&wp),
+            Some(&seed),
             coverage_knobs(Some(RegionKnobs::SHIPPED)),
         );
         let right = |g: &Vec<Vec<f64>>| {
@@ -6436,8 +6450,20 @@ mod tests {
                 (s.splits, s.region_min, s.min_pairs, s.anchor_min),
             );
             assert_eq!(
-                (k.int_tol, k.pair_tol, k.agree_frac, k.contra_frac, k.anchor_frac),
-                (s.int_tol, s.pair_tol, s.agree_frac, s.contra_frac, s.anchor_frac),
+                (
+                    k.int_tol,
+                    k.pair_tol,
+                    k.agree_frac,
+                    k.contra_frac,
+                    k.anchor_frac
+                ),
+                (
+                    s.int_tol,
+                    s.pair_tol,
+                    s.agree_frac,
+                    s.contra_frac,
+                    s.anchor_frac
+                ),
             );
             assert!(!k.anchor_largest && k.before_passes && !k.overrule);
         }
