@@ -160,7 +160,7 @@ fn deliver(data: &JsValue) {
                     proto::field(data, proto::STORM_MOTION_SPEED).and_then(|v| v.as_f64())? as f32;
                 let direction_deg =
                     proto::field(data, proto::STORM_MOTION_DIR).and_then(|v| v.as_f64())? as f32;
-                Some(rustdar_radar::srv::SrvMotion {
+                Some(offload::SrvMotion {
                     speed_kt,
                     direction_deg,
                     source,
