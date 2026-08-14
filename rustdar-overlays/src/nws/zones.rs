@@ -165,6 +165,81 @@ fn needs_zones(alert: &NwsAlert) -> bool {
     alert.features.is_empty() && !alert.affected_zones.is_empty()
 }
 
+/// A zone URL as the seen-set in [`distinct_zone_urls`] keys it.
+///
+/// A newtype over the `&str` rather than the `&str` itself because it is then
+/// the **one place a zone URL is hashed or compared**, and under `cfg(test)`
+/// those two impls tally each examination. That is what lets
+/// `the_zone_list_costs_one_pass_not_one_scan_per_url` state the cost of the
+/// dedup as a count of URLs looked at rather than as a ratio of two
+/// `Instant`s, which is a reading of whatever else the machine was doing.
+///
+/// **The tally is stable within a band, not exact**, and the distinction
+/// matters enough to spell out. The hash half is one call per reference and is
+/// the same integer everywhere. The `eq` half is not: `hashbrown` calls it only
+/// when a 7-bit control byte collides, so it depends on `RandomState`'s
+/// per-process seed. Measured over two runs of the small round, the hash half
+/// held at 5,580 and the `eq` half moved 184 to 202, carrying the total from
+/// 5,764 to 5,782 — 10% of the `eq` half, 0.3% of the total, against the 1.7x
+/// of headroom the assertion leaves. That is why the band is a band
+/// and not an equality, and it is the one respect in which this count is weaker
+/// than `the_hover_lookup_does_not_walk_the_gates`', which has no randomness in
+/// it and is asserted as an exact `64`.
+///
+/// Outside `cfg(test)` the two impls are what `derive` would have written and
+/// forward straight to `&str`'s, so no build that ships pays for the wrapper or
+/// knows it was here.
+///
+/// **The tally has to move with the key type.** A rewrite of the dedup that is
+/// perfectly good on its own terms -- a `BTreeSet<String>`, a sort-and-dedup, a
+/// `HashMap<&str, usize>` -- stops going through these impls, the count reads
+/// zero, and the test red-gates on a change that broke nothing. The failure
+/// message says so in as many words rather than leaving it to be worked out,
+/// but the counter belongs wherever the membership decision ends up.
+struct SeenUrl<'a>(&'a str);
+
+impl PartialEq for SeenUrl<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        note_url_examination();
+        self.0 == other.0
+    }
+}
+
+impl Eq for SeenUrl<'_> {}
+
+impl std::hash::Hash for SeenUrl<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        #[cfg(test)]
+        note_url_examination();
+        self.0.hash(state);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Zone URLs examined -- hashed or compared -- on this thread since
+    /// [`take_url_examinations`] last took the tally.
+    ///
+    /// Thread-local rather than a `static`: the suite runs its tests in
+    /// parallel threads of one process, and [`distinct_zone_urls`] runs start
+    /// to finish on the thread that called it, so a per-thread tally is both
+    /// the whole tally and nobody else's.
+    static URL_EXAMINATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One more URL looked at by the dedup.
+#[cfg(test)]
+fn note_url_examination() {
+    URL_EXAMINATIONS.with(|n| n.set(n.get() + 1));
+}
+
+/// The examinations since this was last called, and the tally back to zero.
+#[cfg(test)]
+fn take_url_examinations() -> u64 {
+    URL_EXAMINATIONS.with(|n| n.replace(0))
+}
+
 /// Every zone boundary a round has to obtain, once each, in the order the
 /// alerts first name them.
 ///
@@ -182,17 +257,19 @@ fn needs_zones(alert: &NwsAlert) -> bool {
 /// the same URLs in an order that changes every run.
 ///
 /// The set is not an optimisation detail, it is the difference between one
-/// pass and `n²/2` string compares. A measured live round — 361 alerts, 223 of
+/// pass and `n²/2` string compares — which is why it is keyed by [`SeenUrl`],
+/// so that a test can count those compares instead of timing them. A
+/// measured live round — 361 alerts, 223 of
 /// them geometryless, 1,904 references, 1,690 distinct — spent **22.5 ms in
 /// Firefox and 13.7 ms in Chrome** scanning the list it was building, on the
 /// browser's main thread, once per alert poll. That is a dropped frame at
 /// 60 Hz and three at 144 Hz, in the middle of a pan.
 pub fn distinct_zone_urls(alerts: &[NwsAlert]) -> Vec<String> {
     let mut needed_urls: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<SeenUrl<'_>> = HashSet::new();
     for alert in alerts.iter().filter(|alert| needs_zones(alert)) {
         for url in &alert.affected_zones {
-            if seen.insert(url.as_str()) {
+            if seen.insert(SeenUrl(url.as_str())) {
                 needed_urls.push(url.clone());
             }
         }
@@ -899,23 +976,54 @@ mod tests {
     /// A round costs one pass over its zone references, not one scan of
     /// everything already collected per reference.
     ///
-    /// Stated as a shape rather than a millisecond budget, because the budget
-    /// would be a statement about this machine: quadrupling the round
-    /// quadruples the work of one pass and multiplies the work of a rescan by
-    /// sixteen, and no machine changes which of those it is. The threshold sits
-    /// halfway between the two in the log, so it takes a 2x mismeasurement in
-    /// either direction to call this wrong.
+    /// **A count of URLs looked at, not a duration.** The property is a
+    /// traversal count, and a traversal count is the same integer on every
+    /// machine under every load; a duration is a statement about the machine
+    /// that took it. This test used to divide two `Instant`s and assert the
+    /// ratio was under 8, and on a contended box the numerator and denominator
+    /// sample different slices of a machine that is busy with something else —
+    /// it read 11.2x at a load average of 46 with nothing whatever wrong with
+    /// the code, and no number of repeats rescues a ratio, because both halves
+    /// of it are noise.
     ///
-    /// Reverting the set in [`distinct_zone_urls`] to `needed_urls.contains`
-    /// fails it at roughly 15x. The live round this was written for -- 1,904
-    /// references, 1,690 distinct -- cost 22.5 ms on Firefox's main thread that
-    /// way, per alert poll.
+    /// [`SeenUrl`] is the one place a zone URL is hashed or compared, so
+    /// [`take_url_examinations`] is the whole cost of the dedup. It is asserted
+    /// in **two halves, and the first one is not optional**: that the count is
+    /// there at all and is the size one pass is — **between one and five
+    /// examinations per reference, and a little under three in fact** — and
+    /// only then that the per-reference figure does not move when the round
+    /// grows tenfold. A counter that had gone dead reads zero at both sizes,
+    /// and zero is perfectly invariant under anything; a test asserting only
+    /// the shape would pass on it while protecting nothing.
+    ///
+    /// Where the three comes from: one hash per reference, plus the set's own
+    /// rehashes as it grows, which `hashbrown` pays by re-hashing every element
+    /// it already holds at each doubling and which sum to about two more each.
+    /// The band is one to five rather than something tighter because that
+    /// number is a property of the set's growth policy, not of this code, and a
+    /// band that tracked it exactly would red-gate on a dependency bump. Even
+    /// five is a factor of two hundred below the rescan at this size.
+    ///
+    /// Reverting the set to `needed_urls.contains` looks at
+    /// `references × distinct / 2` instead: a thousand times as many at the
+    /// small size, growing a hundredfold rather than tenfold when the round
+    /// does. The live round this was written for -- 1,904 references, 1,690
+    /// distinct -- cost 22.5 ms on Firefox's main thread that way, per alert
+    /// poll.
     #[test]
     fn the_zone_list_costs_one_pass_not_one_scan_per_url() {
         /// Zones per alert, as the feed groups them.
         const PER_ALERT: usize = 8;
-        /// Distinct URLs at the small size; the large size is 4x this.
+        /// Distinct URLs at the small size, each named exactly once, so this is
+        /// the reference count too.
         const SMALL: usize = 2_000;
+        /// ...and at the large one. Ten rather than the two that would separate
+        /// linear from quadratic, so that an implementation scaling only partly
+        /// has less room to sit: one pass grows tenfold and a rescan per URL a
+        /// hundredfold. The threshold sits at twenty, which is 2x above linear
+        /// and 5x below quadratic -- not the same margin on both sides, and the
+        /// tight side is the one that would cry wolf.
+        const LARGE: usize = SMALL * 10;
 
         /// Full-length zone URLs, because the compare being counted here is a
         /// `String` compare and short strings would flatter it.
@@ -935,29 +1043,52 @@ mod tests {
                 .collect()
         }
 
-        /// Fastest of three: interference only ever adds time, so the minimum
-        /// is the reading least contaminated by the rest of the machine.
-        fn fastest(alerts: &[NwsAlert]) -> std::time::Duration {
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    let urls = distinct_zone_urls(alerts);
-                    let taken = start.elapsed();
-                    assert_eq!(urls.len(), alerts.len() * PER_ALERT);
-                    taken
-                })
-                .min()
-                .expect("three runs")
+        /// What one pass over `alerts` looked at, with the tally taken fresh
+        /// first so that nothing the fixture did is counted in it.
+        fn examinations(alerts: &[NwsAlert]) -> u64 {
+            let _ = take_url_examinations();
+            let urls = distinct_zone_urls(alerts);
+            let examined = take_url_examinations();
+            assert_eq!(urls.len(), alerts.len() * PER_ALERT);
+            examined
         }
 
-        let small = fastest(&round(SMALL));
-        let large = fastest(&round(SMALL * 4));
+        let small = examinations(&round(SMALL));
+        let large = examinations(&round(LARGE));
 
-        let growth = large.as_secs_f64() / small.as_secs_f64();
+        // Half one, and the half that does the work: the number is *there*, and
+        // it is the size one pass is. A counter that had gone dead reads zero at
+        // both sizes, and zero is perfectly invariant under anything, so a
+        // ratio alone would pass over it.
+        for (examined, references, size) in [
+            (small, SMALL as u64, "small"),
+            (large, LARGE as u64, "large"),
+        ] {
+            assert!(
+                (references..references * 5).contains(&examined),
+                "the {size} round looked at {examined} URLs for {references} \
+                 references, {:.2} each, where one pass is a little under three \
+                 -- a hash apiece, and about two more amortized over the \
+                 set's rehashes as it grows. Below one, the dedup is no longer \
+                 deciding through the membership test this counts and nothing \
+                 here means anything; above five it is scanning. A rescan per \
+                 URL looks at {}.",
+                examined as f64 / references as f64,
+                references * references / 2,
+            );
+        }
+
+        // Half two: and it does not grow when the round does. Mostly implied by
+        // half one, which bounds both sizes per reference -- it bites on its own
+        // only where the small round comes in under 5,000 -- but it is the
+        // sentence the test is named for and it names the two growth curves in
+        // the failure, so it stays.
         assert!(
-            growth < 8.0,
-            "four times the round took {growth:.1}x the time ({small:?} -> {large:?}). \
-             One pass grows 4x and a rescan-per-URL grows 16x, so this is the rescan.",
+            large < small * 20,
+            "ten times the round looked at {:.1}x the URLs ({small} -> \
+             {large}). One pass grows 10x and a rescan-per-URL grows 100x, so \
+             this is the rescan.",
+            large as f64 / small as f64,
         );
     }
 
