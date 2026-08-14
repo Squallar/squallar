@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use chrono::Utc;
 use rustdar_units::UserPreferences;
 
 use crate::fetch_policy::Assembled;
@@ -15,8 +14,9 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
+    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
+    RasterizeFn, RenderMode,
 };
 use crate::render::rasterize;
 use crate::types::GeoBounds;
@@ -436,6 +436,47 @@ impl GlmHandler {
         }
     }
 
+    /// What the rasterizer reads, captured once — the **one** builder both
+    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
+    /// and the described job cannot come to capture different state.
+    ///
+    /// The rows are [`rasterize::FlashPaint`], not whole [`GlmFlash`]es: the
+    /// coordinates, the timestamp and the energy are everything the raster
+    /// reads — the satellite and level stay page-side with the popup.
+    ///
+    /// `now` is **`ctx.now`**, the dispatch's own clock capture, not a read of
+    /// this handler's — see
+    /// [`rasterize::GlmStrikesInput::now`] for why re-reading it anywhere
+    /// downstream of the dispatch is the bug the parity gate exists to catch.
+    ///
+    /// **Row `i` is `state.data[i]`'s flash**, which is the same indexing
+    /// [`Self::hit_items`] answers — one iteration order, stated in both
+    /// places, because a hit-map id is a position in this list and the item it
+    /// resolves to is the same position in that one.
+    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::GlmStrikesInput> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(rasterize::GlmStrikesInput {
+            flashes: self
+                .state
+                .data
+                .iter()
+                .map(|i| rasterize::FlashPaint {
+                    lat: i.flash.lat,
+                    lon: i.flash.lon,
+                    time: i.flash.time,
+                    energy: i.flash.energy,
+                })
+                .collect(),
+            zoom: ctx.zoom,
+            is_dark: ctx.is_dark,
+            time_window_secs: self.time_window_secs,
+            now: ctx.now,
+            device_scale: ctx.device_scale,
+        })
+    }
+
     /// Log window-gap *changes* only, and keep the current set for the panel.
     ///
     /// Same shape as [`report_feed_changes`](Self::report_feed_changes) and for
@@ -842,37 +883,35 @@ impl OverlayHandler for GlmHandler {
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
+        let input = self.paint_input(ctx)?;
+        Some(Box::new(move |bounds: &GeoBounds, width, height| {
+            rasterize::rasterize_glm_strikes(&input, bounds, width, height)
+        }))
+    }
+
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+        // The same helper `prepare_rasterize` captures from, so the described
+        // job and the closure cannot come to capture different state — the
+        // dispatch's own `ctx.now` included, which is what keeps the flash
+        // ages a worker renders the ages this page computed.
+        Some(HandlerJobInput::Glm(self.paint_input(ctx)?))
+    }
+
+    /// Index-aligned with [`Self::paint_input`]'s rows: both iterate
+    /// `state.data` in order, so `hit_items()[i]` **is** the item whose flash
+    /// travelled at row `i` — the invariant
+    /// [`rasterize::HitMap::from_cells`] zips on.
+    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
         if self.state.data.is_empty() {
             return None;
         }
-        let flashes: Vec<GlmFlash> = self.state.data.iter().map(|i| i.flash.clone()).collect();
-        let items: Vec<Arc<dyn OverlayItem>> = self
-            .state
-            .data
-            .iter()
-            .map(|i| i.clone() as Arc<dyn OverlayItem>)
-            .collect();
-        let zoom = ctx.zoom;
-        let is_dark = ctx.is_dark;
-        let device_scale = ctx.device_scale;
-        let time_window_secs = self.time_window_secs;
-        let now = Utc::now().naive_utc();
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_glm_strikes(
-                &flashes,
-                &items,
-                bounds,
-                width,
-                height,
-                &rasterize::GlmRenderParams {
-                    device_scale,
-                    zoom,
-                    is_dark,
-                    time_window_secs,
-                    now,
-                },
-            )
-        }))
+        Some(
+            self.state
+                .data
+                .iter()
+                .map(|i| i.clone() as Arc<dyn OverlayItem>)
+                .collect(),
+        )
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

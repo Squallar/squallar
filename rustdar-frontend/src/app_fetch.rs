@@ -1076,8 +1076,9 @@ impl super::App {
         }
     }
 
-    /// The deliver every **described** overlay job shares — sites and the
-    /// three polygon kinds — built once so the four dispatches cannot drift.
+    /// The deliver every **described** overlay job shares — sites, the three
+    /// polygon kinds and the two hit-map kinds — built once so the dispatches
+    /// cannot drift.
     ///
     /// `response` arrives **image-less**, which is the failure shape: the
     /// dispatch site fills in every field the poller reads, and this deliver
@@ -1091,6 +1092,21 @@ impl super::App {
     /// what stands between a payload from another build and a texture of the
     /// wrong shape.
     ///
+    /// `id_map` is the page-side half of a hit map: the
+    /// `Arc<dyn OverlayItem>`s captured at dispatch, **index-aligned with the
+    /// rows the described input carried** (`OverlayHandler::hit_items` states
+    /// the invariant). A reply's cells are zipped with it here — and believed
+    /// only if their grid is the quarter-res one this dispatch's dimensions
+    /// imply and every index they record names an item the map has. Anything
+    /// else is a reply from a build whose layout this is not, and a hit map
+    /// zipped across such a mismatch is a hover that names the **wrong**
+    /// report — worse than no picture, so the whole render is failed rather
+    /// than shown without its clicks.
+    ///
+    /// The two halves are allowed to be absent together — the four kinds with
+    /// no hit map dispatch `id_map: None` and their replies say `None` — and
+    /// a mixed pairing is refused for the mismatch it is.
+    ///
     /// The pixels arrive premultiplied by `offload::execute`'s contract, so
     /// the constructor below is the straight copy
     /// [`Self::overlay_color_image`] performs for every tiny-skia rasterizer
@@ -1100,31 +1116,70 @@ impl super::App {
         label: &'static str,
         width: u32,
         height: u32,
+        id_map: Option<
+            Vec<std::sync::Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>,
+        >,
         mut response: OverlayRenderResponse,
         sender: Sender<OverlayRenderResponse>,
         window: Option<crate::WindowRef>,
     ) -> impl FnOnce(crate::offload::JobResult) + Send + 'static {
         move |result| {
             let expected = (width as usize) * (height as usize) * 4;
-            response.image = result
-                .and_then(crate::offload::JobOutput::overlay_raster)
-                .and_then(|rgba| {
-                    if rgba.len() == expected {
-                        Some(std::sync::Arc::new(
+            if let Some((rgba, hit_cells)) =
+                result.and_then(crate::offload::JobOutput::overlay_raster)
+            {
+                let sized = rgba.len() == expected;
+                if !sized {
+                    log::error!(
+                        "{label} answered {} bytes where {width}x{height} \
+                         needs {expected}; treating it as a failed render",
+                        rgba.len(),
+                    );
+                }
+                let hit_map = match (hit_cells, &id_map) {
+                    (None, None) => Ok(None),
+                    (Some(cells), Some(items)) => {
+                        let grid_agrees =
+                            cells.width == width.div_ceil(4) && cells.height == height.div_ceil(4);
+                        let ids_fit = cells
+                            .max_id()
+                            .is_none_or(|max| (max as usize) < items.len());
+                        if grid_agrees && ids_fit {
+                            Ok(Some(
+                                rustdar_overlays::render::rasterize::HitMap::from_cells(
+                                    cells, items,
+                                ),
+                            ))
+                        } else {
+                            Err("cells that do not fit this dispatch's grid or its items")
+                        }
+                    }
+                    (Some(_), None) => Err("cells this dispatch captured no items for"),
+                    (None, Some(_)) => Err("no cells where this dispatch captured items"),
+                };
+                match hit_map {
+                    Ok(hit_map) if sized => {
+                        response.hit_map = hit_map;
+                        response.image = Some(std::sync::Arc::new(
                             egui::ColorImage::from_rgba_premultiplied(
                                 [width as usize, height as usize],
                                 &rgba,
                             ),
-                        ))
-                    } else {
-                        log::error!(
-                            "{label} answered {} bytes where {width}x{height} \
-                             needs {expected}; treating it as a failed render",
-                            rgba.len(),
-                        );
-                        None
+                        ));
                     }
-                });
+                    Ok(_) => {}
+                    Err(what) => {
+                        // A mismatched hit map zipped anyway would hand
+                        // hovers to the wrong items; shown without one, the
+                        // mismatch would be invisible until someone clicked.
+                        // Both halves came from one build's `execute`, so a
+                        // disagreement means the reply is not this build's —
+                        // fail the render whole and leave the layer
+                        // dispatchable.
+                        log::error!("{label} answered {what}; treating it as a failed render");
+                    }
+                }
+            }
             let _ = sender.send(response);
             super::notify_redraw(&window);
         }
@@ -1204,14 +1259,18 @@ impl super::App {
         // `rustdar-overlays`' texture tests pin that set, and
         // `app_fetch::polygon_wire_tests` pins this routing.
         match kind {
-            // The polygon-fill kinds without hit maps — NWS alerts, SPC
-            // outlooks, SPC mesoscale discussions — are **described jobs**
+            // The handler-backed described kinds — the three polygon kinds
+            // and the two hit-map kinds — are **described jobs**
             // (`JobRequest::Overlay`). On the web the job posts to the worker
             // instead of running inline on the browser's one thread, which is
             // where the frame-thread audit measured 224 ms of gesture-end
-            // stall for exactly this layer set; on native it rides the
+            // stall for the polygon layer set alone; on native it rides the
             // pool's interactive lane, the same lane the closures rode.
-            OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts => {
+            OverlayKind::SpcOutlook
+            | OverlayKind::SpcDiscussions
+            | OverlayKind::NwsAlerts
+            | OverlayKind::StormReports
+            | OverlayKind::Lightning => {
                 use rustdar_overlays::render::overlay_state::HandlerJobInput;
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
@@ -1221,6 +1280,12 @@ impl super::App {
                     // than the one its texture was sized at draws every marker
                     // at the wrong size. See `OverlayTexturePlan`.
                     device_scale: texture.pixels_per_point,
+                    // THE capture of the page's clock, and the only one on
+                    // this path: the GLM flash-age fade reads it off the
+                    // described input wherever the job runs, so the worker
+                    // renders the ages this dispatch computed rather than
+                    // re-reading a clock of its own.
+                    now: chrono::Utc::now().naive_utc(),
                 };
                 let Some(input) = self.gui.overlays.prepare_job(kind, &rctx) else {
                     // Nothing to render — clear in-flight. `prepare_job` and
@@ -1230,6 +1295,12 @@ impl super::App {
                     self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
+                // The page-side half of a hit map, captured in the same
+                // synchronous breath as the input above so the two index the
+                // same data in the same order — `Some` for exactly the two
+                // hit-map kinds. It never touches the wire; the deliver zips
+                // it with the reply's cells.
+                let id_map = self.gui.overlays.hit_items(kind);
                 let (label, input) = match input {
                     HandlerJobInput::Alerts(input) => (
                         "alerts-render",
@@ -1243,6 +1314,13 @@ impl super::App {
                         "discussions-render",
                         crate::offload::OverlayJobInput::Discussions(input),
                     ),
+                    HandlerJobInput::Reports(input) => (
+                        "reports-render",
+                        crate::offload::OverlayJobInput::Reports(input),
+                    ),
+                    HandlerJobInput::Glm(input) => {
+                        ("glm-render", crate::offload::OverlayJobInput::Glm(input))
+                    }
                 };
                 let request = crate::offload::JobRequest::Overlay {
                     width,
@@ -1257,6 +1335,7 @@ impl super::App {
                         label,
                         width,
                         height,
+                        id_map,
                         OverlayRenderResponse {
                             image: None,
                             geo_bounds: render_bounds,
@@ -1271,17 +1350,20 @@ impl super::App {
                     ),
                 );
             }
-            // The hit-map kinds and the model grid: still opaque closures
-            // through `prepare_rasterize`, because a hit map's
-            // `Arc<dyn OverlayItem>` id map cannot cross a message port and
-            // the model grid has no wire form yet — see `offload::offload`'s
-            // own note. On the web these still rasterize inline on the frame.
-            OverlayKind::StormReports | OverlayKind::Lightning | OverlayKind::ModelData => {
+            // The model grid: the one kind still an opaque closure through
+            // `prepare_rasterize`, because its gridded input has no wire form
+            // yet — see `offload::offload`'s own note. On the web it still
+            // rasterizes inline on the frame.
+            OverlayKind::ModelData => {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
                     // See the described arm's note on this field.
                     device_scale: texture.pixels_per_point,
+                    // Unread on this arm — nothing in the model grid's raster
+                    // reads a clock — and captured at the dispatch anyway,
+                    // because that is what the field means everywhere.
+                    now: chrono::Utc::now().naive_utc(),
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
                     // Nothing to render — clear in-flight
@@ -1304,7 +1386,10 @@ impl super::App {
                         generation: data_generation,
                         pane_indices,
                         zoom,
-                        hit_map: output.hit_map,
+                        // The model grid builds no hit cells, and a kind that
+                        // does belongs on the described path, where the
+                        // id_map zip lives.
+                        hit_map: None,
                     });
                     super::notify_redraw(&window);
                 });
@@ -1356,6 +1441,7 @@ impl super::App {
                         "sites-render",
                         width,
                         height,
+                        None,
                         OverlayRenderResponse {
                             image: None,
                             geo_bounds: render_bounds,
@@ -2660,6 +2746,13 @@ mod sites_wire_tests;
 #[cfg(test)]
 #[path = "app_fetch/polygon_wire_tests.rs"]
 mod polygon_wire_tests;
+
+/// The two hit-map overlay dispatches are described jobs whose delivered
+/// cells zip with the dispatch-captured items — and a mismatched reply is a
+/// failed render, never a wrong hit map.
+#[cfg(test)]
+#[path = "app_fetch/hitmap_wire_tests.rs"]
+mod hitmap_wire_tests;
 
 #[path = "app_fetch/site_switch_tests.rs"]
 #[cfg(test)]

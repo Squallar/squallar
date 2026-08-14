@@ -1,7 +1,9 @@
-// The three polygon-kind modules are `pub` because their fetch-result types
-// are: `rustdar-frontend`'s described-job dispatch tests seed a live registry
-// through `apply_fetch_result`, and the payload type has to be nameable where
-// the test constructs it. Everything else in them keeps its own visibility.
+// The polygon-kind modules and `reports` are `pub` because their fetch-result
+// types are: `rustdar-frontend`'s described-job dispatch tests seed a live
+// registry through `apply_fetch_result`, and the payload type has to be
+// nameable where the test constructs it. (`glm` needs no widening for the
+// same tests: its payload type, `crate::glm::GlmFetchResult`, is already
+// public where it lives.) Everything else in them keeps its own visibility.
 pub mod alert;
 mod colorscale;
 pub mod discussion;
@@ -12,7 +14,7 @@ mod metar;
 mod model;
 pub mod outlook;
 mod radar;
-mod reports;
+pub mod reports;
 mod sites;
 
 /// Invariants over *every* texture handler at once. Here rather than beside one

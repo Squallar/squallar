@@ -222,7 +222,30 @@ pub const OUT_KIND: &str = "outkind";
 /// `decode_overlay_input` refuses them), which is a warning layer that
 /// silently never draws — the degradation the token turns into a clean
 /// termination and a respawn.
-const PROTOCOL_VERSION: u32 = 10;
+///
+/// Version 11 is the first bump since the overlay reply gained guards to
+/// change what that reply **carries**: the two hit-map overlay kinds — storm
+/// reports and GLM lightning — travel under tag 8 as input codes 5 and 6, and
+/// `OUT` code 5's payload stopped being bare RGBA. It now opens with a
+/// one-byte hit-cells tag and, when the tag says so, a framed block of
+/// quarter-res cell → item-index lists, with the raw RGBA as the rest — the
+/// portable half of a hit map, whose `Arc` id_map half never crosses this
+/// port (the page zips the two at delivery). The GLM input also carries the
+/// page's own `now`: flash age is a page-side fact captured at dispatch, and
+/// a worker re-reading its clock would render a picture the page never asked
+/// for. Like versions 8–10 this changes **no field name**, so the reply-shape
+/// scrape cannot see either half; what pins them is `rustdar_frontend`'s
+/// `offload::tests` — two new framing-digest rows, input codes 5–6 in the
+/// literal table, and a digest over the reply codec itself
+/// (`the_overlay_reply_framing_is_the_one_this_protocol_ships`), which `OUT`
+/// code 5 never needed before because it had no layout to digest. A version
+/// 10 worker refuses codes 5–6 and answers a failed job; a mismatched pairing
+/// of the reply framing fails the page's `width × height × 4` length check
+/// whichever side is older — a first byte lost to the tag, or a tag byte
+/// counted as a pixel — and reads as a failed render. Both degrade quietly,
+/// which is exactly what the token turns into a clean termination and a
+/// respawn.
+const PROTOCOL_VERSION: u32 = 11;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

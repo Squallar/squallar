@@ -859,6 +859,12 @@ mod tests {
             is_dark: false,
             zoom: 5.0,
             device_scale: 1.0,
+            // A literal: nothing on the model grid's raster path reads a
+            // clock, which is exactly what keeps this fixture deterministic.
+            now: chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .unwrap(),
         }
     }
 

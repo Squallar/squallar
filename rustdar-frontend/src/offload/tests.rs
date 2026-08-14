@@ -504,6 +504,114 @@ pub(super) fn an_overlay_discussions_job() -> JobRequest {
     }
 }
 
+/// The storm-reports overlay job, on a fixture with real content: one report
+/// of **each kind** — the kind byte picks the colour *and* the symbol, so a
+/// kind code misread as another decodes cleanly and paints a tornado as hail,
+/// and byte-parity over all three is what notices — at separated in-box
+/// positions, plus one far outside so the cull path runs. Zoom 6.5 puts the
+/// marker radius past the symbol threshold, so the symbol drawing paths are
+/// the ones compared.
+///
+/// Report order is the hit-map id space: the zip and shuffle tests below
+/// lean on report `i` being the fixture's `i`th row.
+pub(super) fn an_overlay_reports_job() -> JobRequest {
+    use rustdar_overlays::render::rasterize::{ReportPaint, ReportsInput};
+    use rustdar_overlays::spc::reports::StormReportKind;
+    JobRequest::Overlay {
+        width: 96,
+        height: 64,
+        bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        input: OverlayJobInput::Reports(ReportsInput {
+            reports: vec![
+                ReportPaint {
+                    kind: StormReportKind::Tornado,
+                    lat: 35.33,
+                    lon: -97.28,
+                },
+                ReportPaint {
+                    kind: StormReportKind::Hail,
+                    lat: 36.2,
+                    lon: -98.5,
+                },
+                ReportPaint {
+                    kind: StormReportKind::Wind,
+                    lat: 33.8,
+                    lon: -96.7,
+                },
+                // Far outside the box: the cull path, and an id the cells
+                // must therefore never record.
+                ReportPaint {
+                    kind: StormReportKind::Tornado,
+                    lat: 10.0,
+                    lon: -150.0,
+                },
+            ],
+            zoom: 6.5,
+            is_dark: false,
+            device_scale: 1.0,
+        }),
+    }
+}
+
+/// The wire fixture's clock — a literal, never a clock read, so the GLM
+/// fixture's flash ages are the same bytes on every run.
+fn glm_fixture_now() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 8, 14)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+}
+
+/// The GLM overlay job, on the fixture the `now` hazard demands: five flashes
+/// whose ages **straddle every boundary the clock decides** — one in each
+/// third of the fade ramp (60 s, 270 s, 480 s into a 600 s window), one at
+/// 570 s hugging the window edge, and one at 660 s already past it. A worker
+/// that re-read its own clock instead of using the wire's `now` moves every
+/// flash across a fade step and the edge pair across the cull, so the parity
+/// gate cannot be passed by accident; a fixture of fresh flashes could.
+///
+/// Energies span reported and unknown, so the option tag both encodes; flash
+/// order is the hit-map id space, as in [`an_overlay_reports_job`].
+pub(super) fn an_overlay_glm_job() -> JobRequest {
+    use rustdar_overlays::render::rasterize::{FlashPaint, GlmStrikesInput};
+    let now = glm_fixture_now();
+    let at = |age_secs: i64, lat: f64, lon: f64, energy: Option<f32>| FlashPaint {
+        lat,
+        lon,
+        time: now - chrono::Duration::seconds(age_secs),
+        energy,
+    };
+    JobRequest::Overlay {
+        width: 96,
+        height: 64,
+        bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        input: OverlayJobInput::Glm(GlmStrikesInput {
+            flashes: vec![
+                at(60, 35.3, -97.3, Some(1e-15)),  // first third: white-ish
+                at(270, 36.2, -98.5, None),        // second third; unknown energy
+                at(480, 33.8, -96.7, Some(1e-13)), // last third: red-ish
+                at(570, 34.5, -98.2, Some(1e-14)), // inside, hugging the window edge
+                at(660, 35.8, -96.5, Some(1e-14)), // past the window: culled
+            ],
+            zoom: 6.5,
+            is_dark: true,
+            time_window_secs: 600.0,
+            now,
+            device_scale: 1.0,
+        }),
+    }
+}
+
 /// The voxel job a pane whose viewport is **not square** posts.
 ///
 /// The two axes are two `f64`s on the wire, adjacent and same-typed, so an
@@ -541,6 +649,8 @@ fn every_job_kind_survives_the_wire_format() {
         an_overlay_alerts_job(),
         an_overlay_outlooks_job(),
         an_overlay_discussions_job(),
+        an_overlay_reports_job(),
+        an_overlay_glm_job(),
     ] {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),
@@ -598,7 +708,7 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // And the encoder really posts those bytes — the constant could be
     // right while the arm that writes it is not. Every constructible kind,
     // framed against its literal rather than against its own constant.
-    let framing: [(JobRequest, u8); 10] = [
+    let framing: [(JobRequest, u8); 12] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 4),
@@ -609,6 +719,8 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
         (an_overlay_alerts_job(), 8),
         (an_overlay_outlooks_job(), 8),
         (an_overlay_discussions_job(), 8),
+        (an_overlay_reports_job(), 8),
+        (an_overlay_glm_job(), 8),
     ];
     for (job, tag) in framing {
         let bytes = job.to_bytes();
@@ -661,11 +773,13 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
 #[test]
 fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(&str, u8, u8); 4] = [
+    let table: [(&str, u8, u8); 6] = [
         ("OVERLAY_INPUT_SITES", OVERLAY_INPUT_SITES, 1),
         ("OVERLAY_INPUT_ALERTS", OVERLAY_INPUT_ALERTS, 2),
         ("OVERLAY_INPUT_OUTLOOKS", OVERLAY_INPUT_OUTLOOKS, 3),
         ("OVERLAY_INPUT_DISCUSSIONS", OVERLAY_INPUT_DISCUSSIONS, 4),
+        ("OVERLAY_INPUT_REPORTS", OVERLAY_INPUT_REPORTS, 5),
+        ("OVERLAY_INPUT_GLM", OVERLAY_INPUT_GLM, 6),
     ];
     for (name, actual, expected) in table {
         assert_eq!(
@@ -677,11 +791,13 @@ fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
     // And the encoder really writes those bytes where the decoder reads them:
     // the input-kind byte sits after the fixed header — tag(1) + width(4) +
     // height(4) + bounds(32) = offset 41 — for every overlay kind alike.
-    let by_fixture: [(JobRequest, u8); 4] = [
+    let by_fixture: [(JobRequest, u8); 6] = [
         (an_overlay_sites_job(), 1),
         (an_overlay_alerts_job(), 2),
         (an_overlay_outlooks_job(), 3),
         (an_overlay_discussions_job(), 4),
+        (an_overlay_reports_job(), 5),
+        (an_overlay_glm_job(), 6),
     ];
     for (job, code) in by_fixture {
         let bytes = job.to_bytes();
@@ -697,11 +813,11 @@ fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
     }
 
     // The unallocated bytes on either end stay unallocated: 0 so a zeroed
-    // buffer never decodes, and 5 so a fifth kind cannot arrive without a
+    // buffer never decodes, and 7 so a seventh kind cannot arrive without a
     // line in the table above. **2 through 4 left this list when the polygon
-    // kinds took them.**
+    // kinds took them, and 5 and 6 when the hit-map kinds did.**
     let mut bytes = an_overlay_sites_job().to_bytes();
-    for unallocated in [0u8, 5] {
+    for unallocated in [0u8, 7] {
         bytes[41] = unallocated;
         assert_eq!(
             JobRequest::from_bytes(&bytes),
@@ -1497,6 +1613,8 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         an_overlay_alerts_job(),
         an_overlay_outlooks_job(),
         an_overlay_discussions_job(),
+        an_overlay_reports_job(),
+        an_overlay_glm_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1525,10 +1643,12 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
             "overlay/alerts | 760 | 0xa89f5057b3b51a4a",
             "overlay/outlooks | 557 | 0x62486e4e14434bb0",
             "overlay/discussions | 264 | 0x3d28f1976f832a20",
+            "overlay/reports | 127 | 0x533f15051c5cc607",
+            "overlay/glm | 240 | 0xca1519d51136a8ef",
         ]
         .map(str::to_string),
         "the framing `JobRequest::to_bytes` writes is not the framing protocol \
-         version 10 shipped. Left is what this build posts; right is what this \
+         version 11 shipped. Left is what this build posts; right is what this \
          list was last told. Something about a request's layout moved — a \
          field added, removed, reordered, retyped, or written at a different \
          width, or a tag renumbered. This encoding carries no version of its \
@@ -1592,7 +1712,7 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
         "the fixture painted nothing, so byte-identity would be vacuous",
     );
 
-    let via_wire = execute_bytes(
+    let (via_wire, hit_cells) = execute_bytes(
         &JobRequest::Overlay {
             width,
             height,
@@ -1614,6 +1734,11 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
         "the sites raster differs between the direct call and the wire — the \
          two paths have stopped being one renderer",
     );
+    assert_eq!(
+        hit_cells, None,
+        "the sites render answered hit cells; it resolves no clicks by pixel, \
+         and a stray Some here would be refused at the deliver as a mismatch",
+    );
 }
 
 /// Painted pixels — the non-vacuity floor every parity test below stands on:
@@ -1625,6 +1750,17 @@ fn painted(rgba: &[u8]) -> usize {
 
 /// [`execute_bytes`] on an overlay job's own wire form, down to the raster.
 fn overlay_raster_via_wire(job: &JobRequest) -> Vec<u8> {
+    overlay_reply_via_wire(job).0
+}
+
+/// [`execute_bytes`] on an overlay job's own wire form: the raster **and**
+/// the hit cells, for the kinds whose reply carries them.
+fn overlay_reply_via_wire(
+    job: &JobRequest,
+) -> (
+    Vec<u8>,
+    Option<rustdar_overlays::render::rasterize::HitCells>,
+) {
     execute_bytes(&job.to_bytes())
         .and_then(JobOutput::overlay_raster)
         .expect("the described overlay job rasterizes")
@@ -1838,6 +1974,799 @@ fn the_discussions_render_is_byte_identical_direct_and_via_the_wire() {
     );
 }
 
+// ── The hit-map kinds ───────────────────────────────────────────────────────
+
+/// Every item index any cell of `cells` records.
+fn ids_of(cells: &rustdar_overlays::render::rasterize::HitCells) -> HashSet<u32> {
+    cells.cells.values().flatten().copied().collect()
+}
+
+/// The UV at the centre of cell `idx`, in the coordinates
+/// `HitMap::hit_test` takes.
+fn uv_of_cell(cells: &rustdar_overlays::render::rasterize::HitCells, idx: u32) -> (f32, f32) {
+    let qx = idx % cells.width;
+    let qy = idx / cells.width;
+    (
+        (qx as f32 + 0.5) / cells.width as f32,
+        (qy as f32 + 0.5) / cells.height as f32,
+    )
+}
+
+/// **The parity gate for the storm-reports render** — the first hit-map kind
+/// through the wire. Byte-identity on a fixture with all three report kinds,
+/// and beyond the pixels: the **cells** must be equal too, because a described
+/// job that painted the same picture while recording different indices is a
+/// hover that names the wrong report, which no pixel comparison can see.
+#[test]
+fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_reports_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Reports(reports) = input else {
+        unreachable!("the fixture is a reports job");
+    };
+
+    let direct = rustdar_overlays::render::rasterize::rasterize_storm_reports(
+        &reports, &bounds, width, height,
+    );
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the reports rasterizer changed its alpha convention; the parity \
+         claim below is now comparing across a conversion",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+
+    let (via_wire, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Reports(reports.clone()),
+    });
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the reports raster differs between the direct call and the wire — \
+         the two paths have stopped being one renderer",
+    );
+    let wire_cells = wire_cells.expect("a hit-map kind answers cells over the wire");
+    assert_eq!(
+        Some(&wire_cells),
+        direct.hit_cells.as_ref(),
+        "the hit cells differ between the direct call and the wire — same \
+         picture, different hover targets",
+    );
+    assert_eq!(
+        ids_of(&wire_cells),
+        HashSet::from([0, 1, 2]),
+        "the three in-box reports must each record cells and the culled \
+         fourth must not: the id space is the row order the dispatch \
+         captured its items in",
+    );
+
+    // The kind byte is a live input through the wire, not a field a broken
+    // codec could zero: recolouring the first report repaints its marker.
+    let mut rekinded = reports;
+    rekinded.reports[0].kind = rustdar_overlays::spc::reports::StormReportKind::Hail;
+    let repainted = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Reports(rekinded),
+    });
+    assert_ne!(
+        repainted, via_wire,
+        "recolouring a report through the wire changed nothing, so the kind \
+         byte is not reaching the rasterizer and the parity above says \
+         nothing about it",
+    );
+}
+
+/// **The parity gate for the GLM render**, on the fixture whose flash ages
+/// straddle every boundary the clock decides — see [`an_overlay_glm_job`].
+/// Byte-identity, cell equality, and the window cull decided by the **wired**
+/// clock: the past-window flash's id must be absent from the cells on both
+/// paths.
+#[test]
+fn the_glm_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_glm_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Glm(glm) = input else {
+        unreachable!("the fixture is a GLM job");
+    };
+
+    let direct =
+        rustdar_overlays::render::rasterize::rasterize_glm_strikes(&glm, &bounds, width, height);
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the GLM rasterizer changed its alpha convention; the parity claim \
+         below is now comparing across a conversion",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+
+    let (via_wire, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Glm(glm.clone()),
+    });
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the GLM raster differs between the direct call and the wire — the \
+         two paths have stopped being one renderer",
+    );
+    let wire_cells = wire_cells.expect("a hit-map kind answers cells over the wire");
+    assert_eq!(
+        Some(&wire_cells),
+        direct.hit_cells.as_ref(),
+        "the hit cells differ between the direct call and the wire — same \
+         picture, different hover targets",
+    );
+    assert_eq!(
+        ids_of(&wire_cells),
+        HashSet::from([0, 1, 2, 3]),
+        "the four in-window flashes must each record cells and the \
+         past-window fifth must not: the cull ran against the clock the wire \
+         carried",
+    );
+}
+
+/// **The negative control the `now` capture stands on.** Hand the same
+/// described GLM job to a renderer whose clock has moved 60 s — which is
+/// exactly what a worker re-deriving `now` instead of reading it off the
+/// wire would do — and the picture must change: the fade colours cross their
+/// steps and the 570 s flash falls out of the 600 s window. If this test can
+/// tell the two clocks apart, so can the byte-parity gate above, which is
+/// the whole claim that `now` travels; a fixture of fresh flashes would let
+/// a worker re-read its clock and pass everything.
+#[test]
+fn a_worker_that_re_read_its_own_clock_would_fail_the_glm_parity() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_glm_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Glm(glm) = input else {
+        unreachable!("the fixture is a GLM job");
+    };
+
+    let honest =
+        rustdar_overlays::render::rasterize::rasterize_glm_strikes(&glm, &bounds, width, height);
+
+    let rederived = rustdar_overlays::render::rasterize::GlmStrikesInput {
+        now: glm.now + chrono::Duration::seconds(60),
+        ..glm
+    };
+    let drifted = rustdar_overlays::render::rasterize::rasterize_glm_strikes(
+        &rederived, &bounds, width, height,
+    );
+
+    assert_ne!(
+        drifted.rgba, honest.rgba,
+        "a 60 s clock re-read changed nothing, so the parity gate could not \
+         catch a worker that re-derived `now` — the fixture has stopped \
+         straddling the fade steps",
+    );
+    assert!(
+        painted(&drifted.rgba) < painted(&honest.rgba),
+        "the edge flash (570 s of 600) must fall out of the window under the \
+         re-read clock — the fixture has stopped straddling the cull boundary",
+    );
+    let honest_ids = ids_of(honest.hit_cells.as_ref().expect("cells"));
+    let drifted_ids = ids_of(drifted.hit_cells.as_ref().expect("cells"));
+    assert!(
+        honest_ids.contains(&3) && !drifted_ids.contains(&3),
+        "the culled flash must leave the hit space too, or a hover could \
+         name a flash the re-read clock no longer draws \
+         (honest {honest_ids:?}, drifted {drifted_ids:?})",
+    );
+}
+
+// ── The hit-map zip: cells from the wire, items from the dispatch ───────────
+
+/// A live registry seeded with three storm reports through the production
+/// ingest path, so `prepare_job` and `hit_items` are the real handler's own
+/// answers — the pair whose index alignment the zip stands on.
+fn a_seeded_reports_registry() -> rustdar_overlays::render::overlay_state::OverlayRegistry {
+    use rustdar_overlays::render::handlers::reports::StormReportsFetchResult;
+    use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    use rustdar_overlays::spc::reports::{StormReport, StormReportKind, StormReportRound};
+    let report = |kind, lat, lon| StormReport {
+        kind,
+        time: "2015".into(),
+        magnitude: None,
+        location: "NORMAN".into(),
+        county: "CLEVELAND".into(),
+        state: "OK".into(),
+        lat,
+        lon,
+        comments: String::new(),
+    };
+    let mut registry = OverlayRegistry::default();
+    registry.set_enabled(
+        rustdar_overlays::render::overlay_state::OverlayKind::StormReports,
+        true,
+    );
+    registry.apply_fetch_result(OverlayFetchResult {
+        kind: rustdar_overlays::render::overlay_state::OverlayKind::StormReports,
+        data: Box::new(StormReportsFetchResult(Ok(StormReportRound {
+            reports: vec![
+                report(StormReportKind::Tornado, 35.33, -97.28),
+                report(StormReportKind::Hail, 36.2, -98.5),
+                report(StormReportKind::Wind, 33.8, -96.7),
+            ],
+            failed_kinds: Vec::new(),
+        }))),
+    });
+    registry
+}
+
+/// A live registry seeded with GLM flashes whose ages sit inside the
+/// handler's default 300 s window relative to [`glm_fixture_now`].
+fn a_seeded_glm_registry() -> rustdar_overlays::render::overlay_state::OverlayRegistry {
+    use rustdar_overlays::glm::{
+        GlmDataLevel, GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, RecordDrops,
+    };
+    use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    let now = glm_fixture_now();
+    let flash = |age_secs: i64, lat: f64, lon: f64| GlmFlash {
+        lat,
+        lon,
+        energy: Some(1e-14),
+        area: None,
+        time: now - chrono::Duration::seconds(age_secs),
+        satellite: GlmSatellite::GoesEast,
+        level: GlmDataLevel::Flash,
+    };
+    let mut registry = OverlayRegistry::default();
+    registry.set_enabled(
+        rustdar_overlays::render::overlay_state::OverlayKind::Lightning,
+        true,
+    );
+    registry.apply_fetch_result(OverlayFetchResult {
+        kind: rustdar_overlays::render::overlay_state::OverlayKind::Lightning,
+        data: Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
+            flashes: vec![
+                flash(30, 35.3, -97.3),
+                flash(130, 36.2, -98.5),
+                flash(230, 33.8, -96.7),
+            ],
+            dead_feeds: Vec::new(),
+            queried: Vec::new(),
+            parse_failures: None,
+            transport_failures: None,
+            level_failures: Vec::new(),
+            evaluated_levels: Vec::new(),
+            listing_failures: Vec::new(),
+            window_gaps: Vec::new(),
+            record_drops: RecordDrops::default(),
+        }))),
+    });
+    registry
+}
+
+/// The dispatch-moment context the zip fixtures share: a literal clock, so
+/// the GLM ages are the same on every run.
+fn a_zip_ctx() -> rustdar_overlays::render::overlay_state::RasterizeContext {
+    rustdar_overlays::render::overlay_state::RasterizeContext {
+        is_dark: false,
+        zoom: 6.5,
+        device_scale: 1.0,
+        now: glm_fixture_now(),
+    }
+}
+
+/// **The hit-map parity gate, per kind**: the cells that came back over the
+/// wire, zipped with the id_map the dispatch captured, answer every probe on
+/// a full quarter-cell grid with the items the direct call's zip answers —
+/// with a positive floor, because a probe walk that never hits proves only
+/// that nothing was drawn anywhere.
+///
+/// The rows and the items both come from the live handler
+/// (`prepare_job` / `hit_items` on a registry seeded through the production
+/// ingest path), so the index alignment under test is the shipped one, not a
+/// fixture's.
+#[test]
+fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
+    use rustdar_overlays::render::overlay_state::{HandlerJobInput, OverlayKind};
+    use rustdar_overlays::render::rasterize::HitMap;
+    let bounds = rustdar_overlays::types::GeoBounds {
+        min_lat: 33.0,
+        max_lat: 37.0,
+        min_lon: -99.0,
+        max_lon: -96.0,
+    };
+    let (width, height) = (96u32, 64u32);
+    let ctx = a_zip_ctx();
+
+    for (registry, kind) in [
+        (a_seeded_reports_registry(), OverlayKind::StormReports),
+        (a_seeded_glm_registry(), OverlayKind::Lightning),
+    ] {
+        let input = registry
+            .prepare_job(kind, &ctx)
+            .expect("the seeded registry describes a job");
+        let items = registry
+            .hit_items(kind)
+            .expect("a hit-map kind captures items beside its input");
+        let (direct, job) = match input {
+            HandlerJobInput::Reports(input) => {
+                assert_eq!(items.len(), input.reports.len(), "one item per row");
+                (
+                    rustdar_overlays::render::rasterize::rasterize_storm_reports(
+                        &input, &bounds, width, height,
+                    ),
+                    OverlayJobInput::Reports(input),
+                )
+            }
+            HandlerJobInput::Glm(input) => {
+                assert_eq!(items.len(), input.flashes.len(), "one item per row");
+                (
+                    rustdar_overlays::render::rasterize::rasterize_glm_strikes(
+                        &input, &bounds, width, height,
+                    ),
+                    OverlayJobInput::Glm(input),
+                )
+            }
+            other => panic!("{kind:?} described {other:?}, another kind's input"),
+        };
+        let (_, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
+            width,
+            height,
+            bounds,
+            input: job,
+        });
+        let wire_cells = wire_cells.expect("a hit-map kind answers cells over the wire");
+        let direct_map = HitMap::from_cells(
+            direct.hit_cells.expect("the direct call builds cells"),
+            &items,
+        );
+        let wire_map = HitMap::from_cells(wire_cells.clone(), &items);
+
+        let mut probes_that_hit = 0;
+        for idx in 0..(wire_cells.width * wire_cells.height) {
+            let (u, v) = uv_of_cell(&wire_cells, idx);
+            let direct_hits = direct_map.hit_test(u, v);
+            let wire_hits = wire_map.hit_test(u, v);
+            assert_eq!(
+                direct_hits.len(),
+                wire_hits.len(),
+                "{kind:?}: probe {idx} answers a different number of items \
+                 via the wire",
+            );
+            for (d, w) in direct_hits.iter().zip(&wire_hits) {
+                assert!(
+                    d.matches(w.as_ref()),
+                    "{kind:?}: probe {idx} names a different item via the wire",
+                );
+            }
+            if !direct_hits.is_empty() {
+                probes_that_hit += 1;
+            }
+        }
+        assert!(
+            probes_that_hit > 0,
+            "{kind:?}: no probe hit anything, so the agreement above is \
+             vacuous — the fixture stopped drawing where the grid looks",
+        );
+    }
+}
+
+/// **The order-stability pin.** A hit map's cells record *positions*, so the
+/// zip is only as correct as the id_map's order — and this proves the probe
+/// can tell: zipped in dispatch order, the marker's own cell names its item;
+/// zipped with a deliberately reversed id_map, the same cell names the
+/// **wrong** item, deterministically. A silent order mismatch between the
+/// dispatch capture and the worker's row enumeration is therefore something
+/// the identity assertions here and the parity gate above genuinely detect —
+/// and it is worth detecting, because a hover that names the wrong storm
+/// report is worse than no hit map at all.
+#[test]
+fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
+    use rustdar_overlays::render::overlay_state::{HandlerJobInput, OverlayKind};
+    use rustdar_overlays::render::rasterize::HitMap;
+    let bounds = rustdar_overlays::types::GeoBounds {
+        min_lat: 33.0,
+        max_lat: 37.0,
+        min_lon: -99.0,
+        max_lon: -96.0,
+    };
+    let (width, height) = (96u32, 64u32);
+    let registry = a_seeded_reports_registry();
+    let ctx = a_zip_ctx();
+    let Some(HandlerJobInput::Reports(input)) =
+        registry.prepare_job(OverlayKind::StormReports, &ctx)
+    else {
+        panic!("the seeded registry describes a reports job");
+    };
+    let items = registry
+        .hit_items(OverlayKind::StormReports)
+        .expect("items");
+    let (_, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Reports(input),
+    });
+    let wire_cells = wire_cells.expect("cells");
+
+    // A cell covered by report 0 alone: its own marker's centre.
+    let (idx, _) = wire_cells
+        .cells
+        .iter()
+        .find(|(_, ids)| ids.as_slice() == [0])
+        .expect("report 0 has cells of its own");
+    let (u, v) = uv_of_cell(&wire_cells, *idx);
+
+    let straight = HitMap::from_cells(wire_cells.clone(), &items);
+    let hit = straight.hit_test(u, v);
+    assert_eq!(hit.len(), 1, "the probe sits on one marker");
+    assert!(
+        hit[0].matches(items[0].as_ref()),
+        "zipped in dispatch order, report 0's marker names report 0",
+    );
+
+    let reversed: Vec<_> = items.iter().rev().cloned().collect();
+    let shuffled = HitMap::from_cells(wire_cells, &reversed);
+    let wrong = shuffled.hit_test(u, v);
+    assert_eq!(wrong.len(), 1, "the shuffle moves identity, not coverage");
+    assert!(
+        !wrong[0].matches(items[0].as_ref()),
+        "the reversed zip still answered the right item, so these probes \
+         could never catch an order mismatch and every identity assertion \
+         in this file is vacuous",
+    );
+    assert!(
+        wrong[0].matches(items[items.len() - 1].as_ref()),
+        "the reversed zip must answer exactly the mirrored item — anything \
+         else means the probe is not reading the id space these tests think \
+         it is",
+    );
+}
+
+// ── The overlay reply's own framing ─────────────────────────────────────────
+
+/// A literal cells fixture for the reply codec: three occupied cells on a
+/// 4×2 grid, one of them with two ids — enough for the sort, the counts and
+/// the id lists all to be load-bearing.
+fn a_hit_cells_fixture() -> rustdar_overlays::render::rasterize::HitCells {
+    let mut cells = HashMap::new();
+    cells.insert(7u32, vec![2u32]);
+    cells.insert(0u32, vec![0]);
+    cells.insert(5u32, vec![1, 0]);
+    rustdar_overlays::render::rasterize::HitCells {
+        width: 4,
+        height: 2,
+        cells,
+    }
+}
+
+/// The reply payload round-trips through its own codec, cells present or
+/// absent — and one value has **one** byte string: the encoder sorts the
+/// cell map, so two encodes agree whatever iteration order the `HashMap`
+/// happens to yield. (Removing the sort does not fail *this* assertion
+/// deterministically — a map can iterate sorted by luck — which is why the
+/// digest test below pins the exact bytes: an unsorted encode disagrees
+/// with it on almost every run, and the two tests together are the claim.)
+#[test]
+fn the_overlay_reply_round_trips_and_is_canonical() {
+    let rgba: Vec<u8> = (0..32).collect();
+    for cells in [None, Some(a_hit_cells_fixture())] {
+        let encoded = encode_overlay_out(&rgba, cells.as_ref());
+        assert_eq!(
+            decode_overlay_out(&encoded),
+            Some((rgba.clone(), cells.clone())),
+            "the overlay reply did not survive its own codec",
+        );
+    }
+    assert_eq!(
+        encode_overlay_out(&rgba, Some(&a_hit_cells_fixture())),
+        encode_overlay_out(&rgba, Some(&a_hit_cells_fixture())),
+        "two encodes of one reply disagree: the cell walk is not canonical",
+    );
+}
+
+/// The framing the overlay reply ships is **this** framing — the digest the
+/// `OUT` code 5 payload never needed while it was raw RGBA with no layout at
+/// all. It has one since protocol version 11, and no guard over the reply
+/// direction can see it otherwise: the reply-shape scrape in
+/// `rustdar-web/tests/pwa_assets.rs` watches field names, and no field name
+/// moved.
+#[test]
+fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
+    let rgba: Vec<u8> = (0..16).collect();
+    let bare = encode_overlay_out(&rgba, None);
+    let with_cells = encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()));
+    let rows = [
+        format!("bare | {} | {:#018x}", bare.len(), layout_digest(&bare)),
+        format!(
+            "cells | {} | {:#018x}",
+            with_cells.len(),
+            layout_digest(&with_cells)
+        ),
+    ];
+    assert_eq!(
+        rows,
+        [
+            "bare | 17 | 0x770d1b313226dd5f".to_string(),
+            "cells | 69 | 0x6637c90fa10e397a".to_string(),
+        ],
+        "the framing `encode_overlay_out` writes is not the framing protocol \
+         version 11 shipped. Left is what this build posts; right is what \
+         this list was last told. If the change was deliberate, bump \
+         `PROTOCOL_VERSION` in `rustdar-web/src/worker_protocol.rs` FIRST and \
+         then re-pin the rows here, in that order and never the numbers \
+         alone: a page and a worker on opposite sides of a deploy share a \
+         build token whenever `GITHUB_SHA` is absent, and the older half \
+         reads the newer bytes in the old order — a payload whose length \
+         check fails, which is a hit-map layer that silently never draws.",
+    );
+}
+
+/// The reply codec's malformed shapes, each with a paired positive control
+/// proving the mutation landed where this test believes it did. The RGBA
+/// tail is deliberately unjudged here — it takes the rest, and its guard is
+/// the dispatch's own length check (`OUT_KIND_OVERLAY` states what stands
+/// where) — so the walk covers the framed prefix and only it.
+#[test]
+fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
+    let rgba: Vec<u8> = (0..16).collect();
+    let encoded = encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()));
+    let prefix = encoded.len() - rgba.len();
+
+    // Control first: untouched bytes decode, so every refusal below is the
+    // mutation's doing.
+    assert!(decode_overlay_out(&encoded).is_some());
+
+    // Layout, stated once: tag(1) + width(4) + height(4) + count(4) = 13,
+    // then the sorted entries — idx 0 at 13 (count at 17, one id), idx 5 at
+    // 25 (count at 29, two ids), idx 7 at 41 (count at 45, one id) — and the
+    // raw tail from 53. The premise behind every offset below:
+    assert_eq!(
+        prefix, 53,
+        "the fixture's framed prefix moved; re-derive the offsets"
+    );
+
+    // Truncation anywhere inside the framed prefix is a refusal. Cuts into
+    // the tail are invisible here by design: the tail is raw, and shortening
+    // it is exactly what the dispatch's length check exists to catch.
+    for cut in 1..prefix {
+        assert_eq!(
+            decode_overlay_out(&encoded[..cut]),
+            None,
+            "the reply truncated to {cut} bytes was accepted",
+        );
+    }
+
+    // A hit-cells tag this build does not have.
+    let mut bad_tag = encoded.clone();
+    bad_tag[0] = 2;
+    assert_eq!(decode_overlay_out(&bad_tag), None, "tag 2 was accepted");
+
+    // The last entry's index: 8 is one past the 4×2 grid. Positive control
+    // first — 6 is in range, still sorted, and decodes to a map whose last
+    // occupied cell moved — then the refusal.
+    let mut moved = encoded.clone();
+    moved[41..45].copy_from_slice(&6u32.to_le_bytes());
+    let (_, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
+    assert!(
+        cells.expect("cells").cells.contains_key(&6),
+        "bytes 41..45 are not the last entry's index; the refusal below \
+         would be about some other field",
+    );
+    let mut out_of_range = encoded.clone();
+    out_of_range[41..45].copy_from_slice(&8u32.to_le_bytes());
+    assert_eq!(
+        decode_overlay_out(&out_of_range),
+        None,
+        "a cell index past the stated grid was accepted",
+    );
+
+    // Order is canonical: the first entry rewritten to 6 makes the walk
+    // 6, 5, 7 — refused — and rewritten to 5 makes it 5, 5, 7 — a duplicate,
+    // refused. The in-range control above already proved this offset window
+    // is an entry index.
+    for (rewritten, what) in [(6u32, "an unsorted"), (5u32, "a duplicated")] {
+        let mut disordered = encoded.clone();
+        disordered[13..17].copy_from_slice(&rewritten.to_le_bytes());
+        assert_eq!(
+            decode_overlay_out(&disordered),
+            None,
+            "{what} cell index was accepted: the canonical form has stopped \
+             being the only readable one, and one value has two byte strings",
+        );
+    }
+
+    // An empty id list, which the rasterizer never records. The read-back
+    // control: the untouched count really is 1 at this offset.
+    assert_eq!(
+        u32::from_le_bytes(encoded[17..21].try_into().unwrap()),
+        1,
+        "bytes 17..21 are not the first entry's id count; the refusal below \
+         would be about some other field",
+    );
+    let mut emptied = encoded.clone();
+    emptied[17..21].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        decode_overlay_out(&emptied),
+        None,
+        "a cell with no ids was accepted; nothing writes one, so it can only \
+         be a layout disagreement",
+    );
+}
+
+/// The reports job's own malformed shapes: the shared truncation walk, then
+/// the two byte positions this kind's decoder judges — the report-kind code
+/// and the `is_dark` flag — each mutated to a *valid different value* first,
+/// read back, and only then to the refused one.
+#[test]
+fn a_malformed_reports_job_is_refused_rather_than_misread() {
+    let job = an_overlay_reports_job();
+    assert_refuses_cuts_and_trailing(&job);
+    let bytes = job.to_bytes();
+
+    // Offsets: header 41 (input code), zoom 42..50, is_dark 50,
+    // device_scale 51..55, count 55..59, first row's kind byte 59.
+    let mut rekinded = bytes.clone();
+    assert_eq!(rekinded[59], 0, "premise: row 0 travels as tornado, code 0");
+    rekinded[59] = 2;
+    match JobRequest::from_bytes(&rekinded) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Reports(reports),
+            ..
+        }) => assert_eq!(
+            reports.reports[0].kind,
+            rustdar_overlays::spc::reports::StormReportKind::Wind,
+            "byte 59 is not the first row's kind; the refusal below would be \
+             about some other field",
+        ),
+        other => panic!("the rekinded control failed to decode: {other:?}"),
+    }
+    let mut bad_kind = bytes.clone();
+    bad_kind[59] = 3;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_kind),
+        None,
+        "report-kind code 3 is a build this one is not",
+    );
+
+    let mut bad_flag = bytes;
+    bad_flag[50] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_flag),
+        None,
+        "is_dark is a bool, not a byte",
+    );
+}
+
+/// The GLM job's own malformed shapes. Beside the flag and the energy tag,
+/// the field this kind exists to carry gets its own pair: the dispatch clock
+/// at bytes 63..71, moved to a different valid second and read back —
+/// proving the wire really is where the worker's `now` comes from — then
+/// pushed outside chrono's range and refused.
+#[test]
+fn a_malformed_glm_job_is_refused_rather_than_misread() {
+    let job = an_overlay_glm_job();
+    assert_refuses_cuts_and_trailing(&job);
+    let bytes = job.to_bytes();
+
+    // Offsets: header 41 (input code), zoom 42..50, is_dark 50,
+    // device_scale 51..55, time_window 55..63, now 63..75 (secs then nanos),
+    // count 75..79, first flash at 79 — lat 79..87, lon 87..95, time
+    // 95..107, energy tag 107, energy 108..112.
+    let mut renow = bytes.clone();
+    let secs = i64::from_le_bytes(renow[63..71].try_into().unwrap());
+    renow[63..71].copy_from_slice(&(secs + 60).to_le_bytes());
+    match JobRequest::from_bytes(&renow) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Glm(glm),
+            ..
+        }) => assert_eq!(
+            glm.now,
+            glm_fixture_now() + chrono::Duration::seconds(60),
+            "bytes 63..71 are not the dispatch clock; the refusal below \
+             would be about some other field",
+        ),
+        other => panic!("the re-clocked control failed to decode: {other:?}"),
+    }
+    let mut bad_now = bytes.clone();
+    bad_now[63..71].copy_from_slice(&i64::MAX.to_le_bytes());
+    assert_eq!(
+        JobRequest::from_bytes(&bad_now),
+        None,
+        "a clock outside chrono's range was accepted rather than refused",
+    );
+
+    // The nanos half: half a second in decodes and reads back, and a value
+    // no clock writes refuses.
+    let mut renanos = bytes.clone();
+    renanos[71..75].copy_from_slice(&500_000_000u32.to_le_bytes());
+    match JobRequest::from_bytes(&renanos) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Glm(glm),
+            ..
+        }) => assert_eq!(
+            glm.now,
+            glm_fixture_now() + chrono::Duration::milliseconds(500),
+            "bytes 71..75 are not the clock's subsecond half",
+        ),
+        other => panic!("the nanos control failed to decode: {other:?}"),
+    }
+    let mut bad_nanos = bytes.clone();
+    bad_nanos[71..75].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+        JobRequest::from_bytes(&bad_nanos),
+        None,
+        "four billion nanoseconds is not a subsecond",
+    );
+
+    let mut bad_flag = bytes.clone();
+    bad_flag[50] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_flag),
+        None,
+        "is_dark is a bool, not a byte",
+    );
+
+    // The energy option tag. Read-back first: the first flash's energy is
+    // present, and moving its value bytes moves the decoded energy.
+    assert_eq!(bytes[107], 1, "premise: flash 0 carries an energy");
+    let mut re_energized = bytes.clone();
+    re_energized[108..112].copy_from_slice(&2e-15f32.to_le_bytes());
+    match JobRequest::from_bytes(&re_energized) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Glm(glm),
+            ..
+        }) => assert_eq!(
+            glm.flashes[0].energy,
+            Some(2e-15),
+            "bytes 108..112 are not the first flash's energy; the refusal \
+             below would be about some other field",
+        ),
+        other => panic!("the energy control failed to decode: {other:?}"),
+    }
+    let mut bad_energy_tag = bytes;
+    bad_energy_tag[107] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_energy_tag),
+        None,
+        "energy's option tag is 0 or 1, not a byte",
+    );
+}
+
 /// The overlay reply's kind code and its raw round trip — plus the accessor
 /// narrowness every other output kind already pins.
 #[test]
@@ -1863,14 +2792,18 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
             .is_none()
     );
 
-    // The raw payload round-trips through `decode_output` unchanged: there is
-    // no codec under code 5, deliberately — see `OUT_KIND_OVERLAY` — so what
-    // goes in is exactly what comes out, and acceptance is the dispatcher's
-    // length check rather than a magic.
-    let rgba = output.overlay_raster().expect("an overlay raster");
+    // The payload round-trips through its own codec and `decode_output`: the
+    // hit-cells block is framed since protocol version 11, the RGBA is still
+    // the raw rest — see `OUT_KIND_OVERLAY` — and acceptance of the tail is
+    // still the dispatcher's length check rather than a magic.
+    let (rgba, hit_cells) = output.overlay_raster().expect("an overlay raster");
+    let encoded = encode_overlay_out(&rgba, hit_cells.as_ref());
     assert_eq!(
-        decode_output(OUT_KIND_OVERLAY, &rgba),
-        Some(JobOutput::OverlayRaster(rgba.clone())),
+        decode_output(OUT_KIND_OVERLAY, &encoded),
+        Some(JobOutput::OverlayRaster {
+            rgba: rgba.clone(),
+            hit_cells,
+        }),
     );
     // And the accessor is as narrow as its four siblings.
     assert!(
@@ -2226,6 +3159,14 @@ fn a_described_overlay_job_rides_the_interactive_lane() {
     assert!(
         alerts_lane.starts_with("rd-opaque"),
         "the alerts job delivered on {alerts_lane}: a described polygon \
+         overlay is queueing behind radar renders",
+    );
+    // And a hit-map kind: the routing is still by the `Overlay` request
+    // kind, so describing the reports render kept the closures' scheduling.
+    let reports_lane = lane_of(an_overlay_reports_job());
+    assert!(
+        reports_lane.starts_with("rd-opaque"),
+        "the reports job delivered on {reports_lane}: a described hit-map \
          overlay is queueing behind radar renders",
     );
     let radar_lane = lane_of(a_job());
