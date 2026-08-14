@@ -1093,3 +1093,190 @@ fn a_zero_storm_motion_vector_is_a_reading_and_is_carried_like_any_other() {
         Some((41.0, 190.0)),
     );
 }
+
+// ── A loop frame is keyed by the archive, the cache by the first radial ────
+
+/// The two timestamps for one volume, built exactly as the two production
+/// routes build them: `(cached-side, loop-frame-side)`.
+///
+/// * The **cache** side is `latest_scan_time_for_site` → `ScanInfo::timestamp`
+///   → `types::ScanInfo::from_scan`, which reads the first radial of the first
+///   sweep through `DateTime::from_timestamp_millis` and keeps the
+///   milliseconds.
+/// * The **loop frame** side is `scan::list_scans_for_range`, which parses
+///   `%H%M%S` out of the S3 archive key and so has no sub-second field.
+///
+/// Neither is written as a literal: the defect *was* the difference between
+/// the two constructions, so a test that spelled both out by hand would be
+/// asserting against its own arithmetic instead of against the code's.
+fn the_two_statements_of_one_volume(
+    hms: &str,
+    millis_into_the_second: i64,
+) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 2).expect("a real date");
+    let from_key = date.and_time(
+        chrono::NaiveTime::parse_from_str(hms, "%H%M%S").expect("a real archive key tail"),
+    );
+    let from_radial = chrono::DateTime::from_timestamp_millis(
+        from_key.and_utc().timestamp_millis() + millis_into_the_second,
+    )
+    .expect("a real collection timestamp")
+    .naive_utc();
+    (from_radial, from_key)
+}
+
+/// **The regression.** A classification loop frame reaches the `N0M` object
+/// cached for the very volume it draws.
+///
+/// The two sides are built by different code and were compared with `==`, so
+/// they never matched: the cache holds `ScanInfo::timestamp`, which keeps the
+/// first radial's milliseconds, and a loop frame carries the archive key's
+/// time, which is that instant truncated to the whole second. Measured over
+/// 108 archive volumes the key trails the first radial by 1–993 ms (median
+/// 517 ms) and is never equal — so **every** frame of every classification
+/// loop silently dropped to a lower melting-layer rung, including the newest
+/// frame, which is the one volume the app actually fetched an object for.
+///
+/// The same volume then classified one way as a still frame and another way
+/// inside a loop, with nothing on screen to say which had happened.
+///
+/// `scan::names_same_volume` carries the argument for why this cannot pair a
+/// neighbouring volume; `a_neighbouring_volume_never_pairs_however_its_start_was_stated`
+/// pins it, and the loop's own restatement is below.
+#[test]
+fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer() {
+    let hca = RadarProduct::HydrometeorClassification;
+    let gui = gui_showing("KTLX");
+
+    for millis in [1, 517, 993] {
+        let (from_radial, from_key) = the_two_statements_of_one_volume("120347", millis);
+        assert_ne!(
+            from_radial, from_key,
+            "premise: the two routes never state one volume identically",
+        );
+
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        assert!(d.set_melting_layer(
+            "KTLX",
+            MeltingLayerObject {
+                volume_start: from_radial,
+                bytes: Arc::new(vec![0xAB; 8]),
+            },
+            &gui,
+        ));
+
+        assert!(
+            d.melting_layer_product_for(hca, "KTLX", from_radial)
+                .is_some(),
+            "premise: the still frame, where both sides come off the radial",
+        );
+        assert!(
+            d.melting_layer_product_for(hca, "KTLX", from_key).is_some(),
+            "the loop frame keyed {from_key} was refused the object measured \
+             for it at {from_radial}",
+        );
+    }
+}
+
+/// [`a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer`]'s
+/// sibling, in SRV's terms: a loop frame reaches the `N0S` vector fetched for
+/// the volume it draws.
+///
+/// The failure this closes is the sharper of the two — a storm motion error is
+/// a solid-body shift of every gate in the field — and it fired on exactly the
+/// same frames, the newest one included.
+#[test]
+fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_storm_motion() {
+    let srv = RadarProduct::StormRelativeVelocity;
+    let gui = gui_showing("KTLX");
+
+    for millis in [1, 517, 993] {
+        let (from_radial, from_key) = the_two_statements_of_one_volume("120347", millis);
+
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        assert!(d.set_storm_motion(
+            "KTLX",
+            StormMotionObject {
+                volume_start: from_radial,
+                motion: (34.0, 225.0),
+            },
+            &gui,
+        ));
+
+        assert_eq!(
+            d.rpg_storm_motion_for(srv, "KTLX", from_radial),
+            Some((34.0, 225.0)),
+            "premise: the still frame, where both sides come off the radial",
+        );
+        assert_eq!(
+            d.rpg_storm_motion_for(srv, "KTLX", from_key),
+            Some((34.0, 225.0)),
+            "the loop frame keyed {from_key} was refused the vector fetched \
+             for it at {from_radial}",
+        );
+    }
+}
+
+/// The widening stops at the volume boundary: a frame one scan cycle away gets
+/// nothing, whichever way either start was stated.
+///
+/// The shortest WSR-88D cadence measured anywhere in this tree is 198 s
+/// (`rustdar-frontend/src/constants/tests.rs:468`), against the under-1 s
+/// spread the pairing admits — a margin of 198×. This is the frontend's
+/// restatement of that bound through the two accessors, so the guarantee the
+/// two tests above rely on is pinned where it is read and not only where it is
+/// defined.
+#[test]
+fn a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion() {
+    let hca = RadarProduct::HydrometeorClassification;
+    let srv = RadarProduct::StormRelativeVelocity;
+    let gui = gui_showing("KTLX");
+
+    let (from_radial, from_key) = the_two_statements_of_one_volume("120347", 517);
+
+    let mut d = RenderDispatcher::new();
+    d.ensure_pane_count(1);
+    assert!(d.set_melting_layer(
+        "KTLX",
+        MeltingLayerObject {
+            volume_start: from_radial,
+            bytes: Arc::new(vec![0xAB; 8]),
+        },
+        &gui,
+    ));
+    assert!(d.set_storm_motion(
+        "KTLX",
+        StormMotionObject {
+            volume_start: from_radial,
+            motion: (34.0, 225.0),
+        },
+        &gui,
+    ));
+
+    // The shortest measured WSR-88D volume interval, then the nominal precip,
+    // TDWR and clear-air figures — and one second, the finest step the archive
+    // key can express, which is already a different volume.
+    for gap in [1, 198, 259, 360, 517] {
+        for neighbour in [
+            from_radial + chrono::Duration::seconds(gap),
+            from_radial - chrono::Duration::seconds(gap),
+            from_key + chrono::Duration::seconds(gap),
+            from_key - chrono::Duration::seconds(gap),
+        ] {
+            assert!(
+                d.melting_layer_product_for(hca, "KTLX", neighbour)
+                    .is_none(),
+                "a melting layer measured at {from_radial} reached a frame \
+                 {gap} s away at {neighbour}",
+            );
+            assert_eq!(
+                d.rpg_storm_motion_for(srv, "KTLX", neighbour),
+                None,
+                "a storm motion fetched for {from_radial} reached a frame \
+                 {gap} s away at {neighbour}",
+            );
+        }
+    }
+}
