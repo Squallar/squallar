@@ -2249,8 +2249,12 @@ impl super::App {
                     // all. Counted against the loop pool whether or not a
                     // volume was on screen, because the loops are the largest
                     // thing this application allocates. The pool lives on `App`
-                    // precisely so it survives the `self.state = None` below.
-                    self.back_off_loop_pool();
+                    // precisely so it survives the `self.state = None` below,
+                    // and so does the profile the rest of the budgets are
+                    // resolved from — `install_volume_bridge` re-resolves off
+                    // it when the surface comes back, so a rung surrendered
+                    // here is a rung the recovered renderer is built at.
+                    self.back_off_budgets();
 
                     // Surface is irrecoverably lost (e.g. display changed on a
                     // foldable). Drop the entire rendering state so the next
@@ -2918,7 +2922,7 @@ impl super::App {
         self.loop_pool_state.allocation()
     }
 
-    /// Step the pool down after the device refused, and remember it.
+    /// Step the whole budget set down after the device refused, and remember it.
     ///
     /// The behavioural half of the sizing, and on every target that can report
     /// nothing it is the *only* half. Written to the config store at the moment
@@ -2926,20 +2930,80 @@ impl super::App {
     /// because a session that has just lost its rendering surface may not get
     /// three more seconds — and because a browser's answer to GPU memory
     /// exhaustion is exactly this event.
-    pub(super) fn back_off_loop_pool(&mut self) {
+    ///
+    /// # Two halves, because the two resources step differently
+    ///
+    /// * **The pool halves.** A continuous quantity divided among the loops
+    ///   that want one, so halving is a real intermediate answer and a machine
+    ///   one step too ambitious does not lose its whole loop over one event.
+    ///   This is `LoopPool::back_off`, unchanged, and it is the ladder's loop
+    ///   history rung — which is why `budget::demote` deliberately does not
+    ///   own one.
+    /// * **Everything else takes one rung.** `budget::demote` walks the
+    ///   ordered ladder: lighting, then the offscreen, then the grid, then the
+    ///   raster side. Discrete knobs with named stops, so there is no halving
+    ///   to do — there is a next rung or there is the floor.
+    ///
+    /// # The count is a ladder position, not a failure count
+    ///
+    /// It stops rising the moment nothing moves, so a device that keeps losing
+    /// its surface at the floor writes the same number rather than an
+    /// ever-growing one. Below the floor the answer is not a smaller budget:
+    /// `volume::degrade` retires the 3D view after two such losses, which is a
+    /// different mechanism and the real bottom of this ladder.
+    pub(super) fn back_off_budgets(&mut self) {
+        // The bracket the *resolved* budgets carry, not `for_target`'s: the two
+        // are the same figures today because no bracket promotes the pool, and
+        // reading the resolved one is what keeps them the same when one does.
         if self
             .loop_pool
-            .back_off(crate::loop_pool::LoopPoolLimits::for_target())
+            .back_off(crate::loop_pool::LoopPoolLimits::from_budgets(
+                &self.budgets,
+            ))
         {
+            let bytes = self.loop_pool.bytes();
             log::warn!(
                 "Loop pool: backed off to {} MiB after a lost surface",
-                self.loop_pool.bytes() / (1024 * 1024),
+                bytes / (1024 * 1024),
             );
-            crate::loop_pool::remember(
-                self.platform.config_store().as_deref(),
-                self.loop_pool.bytes(),
-            );
+            if let Some(memo) = self.device_profile.memo.as_mut() {
+                memo.loop_pool_bytes = Some(bytes);
+            }
+            crate::loop_pool::remember(self.platform.config_store().as_deref(), bytes);
         }
+
+        let memo = self
+            .device_profile
+            .memo
+            .get_or_insert_with(Default::default);
+        let stepped = memo.steps_back.saturating_add(1);
+        memo.steps_back = stepped;
+        let resolved = crate::budget::resolve(&self.device_profile);
+        // Compared with the count itself held equal, because the count is a
+        // field of what is being compared: `steps_back` always differs after an
+        // increment, and what is being asked is whether *the budgets* moved.
+        let same_but_for_the_count = crate::budget::Budgets {
+            steps_back: self.budgets.steps_back,
+            ..resolved
+        };
+        if same_but_for_the_count == self.budgets {
+            // Every rung this ladder owns is already at its stop. Roll the count
+            // back rather than persisting a number that describes nothing, so
+            // the memo stays a position on the ladder.
+            if let Some(memo) = self.device_profile.memo.as_mut() {
+                memo.steps_back = stepped.saturating_sub(1);
+            }
+            return;
+        }
+        log::warn!(
+            "Budgets: stepped down to rung {stepped} after a lost surface: {:?} 3D quality \
+             ceiling, {} MiB of offscreen, {:?} grid cells",
+            resolved.quality_ceiling,
+            resolved.offscreen_bytes / (1024 * 1024),
+            resolved.grid_cells,
+        );
+        self.budgets = resolved;
+        crate::budget::remember_steps(self.platform.config_store().as_deref(), stepped);
     }
 
     fn dispatch_loop_renders(&mut self) {
