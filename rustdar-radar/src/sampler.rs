@@ -113,16 +113,23 @@
 //!
 //! # Geometry
 //!
-//! All of it comes from [`crate::beam`] — 4/3 earth, quadratic height,
-//! closed-form inverse. A query here names a **ground** range and this module
-//! converts it to the slant range a gate was measured at, which is the same
-//! `cos e` the plan view's four per-tilt rasterizers apply in the other
-//! direction. The two therefore register at any tilt, which they did not
-//! before the plan view learned the factor: it drew a 19.5° / 70 km gate
-//! 4.0151 km — 17.876 px — further out than a section drawn from here.
-//! `the_cos_e_correction_is_worth_a_measured_number_of_pixels` keeps those
-//! figures, now as the size of the correction rather than as the size of a
-//! disagreement.
+//! All of it comes from [`crate::beam`] — 4/3 earth, quadratic height, and for
+//! the horizontal the spherical arc and its closed-form inverse. A query here
+//! names a **ground** range and [`beam::slant_range_for_ground_km`] converts it
+//! to the slant range a gate was measured at. Before the plan view corrected at
+//! all it drew a 19.5° / 70 km gate 4.1974 km — 18.688 px — further out than a
+//! section drawn from here, and
+//! `the_cos_e_correction_is_worth_a_measured_number_of_pixels` keeps that and
+//! the 2.4° / 230 km figure beside it.
+//!
+//! **This module and the plan view no longer use the same conversion.** This
+//! one inverts the arc; the rasterizers hoist `cos e` of the sweep's median
+//! elevation, which is the tangent plane. So they register to within that
+//! difference rather than exactly — 666 m at 460 km on a 0.5° cut, about three
+//! plan-view cells, and 1227 m on a 1.8° one. `beam`'s "What still spells the
+//! tangent plane" carries the table and says why a scalar hoist cannot simply
+//! call the arc. A reader comparing a section against the map above it is
+//! seeing that, not a defect in either sampler.
 //!
 //! # Status, rather than `NaN`
 //!

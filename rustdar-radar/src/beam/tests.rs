@@ -5,6 +5,13 @@ use super::*;
 /// called through `polar_to_geo` because that function also applies an
 /// antenna height and converts to geography; the residual under test is
 /// the height model alone.
+///
+/// This deliberately shadows `super::spherical_height_km`, which the glob
+/// import above would otherwise bring in. Keeping an independent transcription
+/// is the point: a test that measured the module's helper against itself would
+/// pass through any change to it. The two also differ in their argument — this
+/// one takes degrees, the module's takes radians — so a future deletion of this
+/// one fails to compile rather than silently retargeting the assertions.
 fn spherical_height_km(slant_range_km: f64, elev_deg: f64) -> f64 {
     let r = slant_range_km;
     let re = RE_EFF_KM;
@@ -285,7 +292,7 @@ fn the_beam_height_residual_depends_only_on_the_height() {
 /// domain the echo-tops cube evaluates it on (1-km cell centres × the
 /// tilt ladder, plus the ±half-beamwidth offsets `BeamHeights` uses).
 /// This is the fast, local guard for the same property the five pinned
-/// `0x5385ddeb1814353b` digests guard end to end.
+/// `0x7718c8e4c1f550ef` digests guard end to end.
 #[test]
 fn the_lifted_beam_height_is_bit_identical_to_the_one_volumetric_shipped() {
     // Verbatim from the pre-lift `volumetric::beam_height_km`, including
@@ -322,53 +329,208 @@ fn the_lifted_beam_height_is_bit_identical_to_the_one_volumetric_shipped() {
     );
 }
 
-/// Ground range and its inverse round-trip, and the closed-form height
-/// over a ground range agrees with going through the slant range.
+/// The height over a ground range *is* the height over the slant range that
+/// reaches the same point, to the bit.
+///
+/// This used to be a measurement, of the 2.8e-14 km between the folded
+/// `s·tan e + s²/(2·Rₑ·cos²e)` and the composition it cancelled down from.
+/// There is nothing left to measure: `height_at_ground_km` is now written as
+/// that composition, because the exact spherical inverse does not cancel the
+/// way the tangent-plane one did. The assertion stays as the statement of what
+/// the function means — a re-folding for speed would have to face it again,
+/// and would face it as a bit-exact equality rather than a tolerance to argue
+/// about.
 #[test]
 fn the_ground_range_height_is_the_slant_range_height_over_the_same_point() {
-    let mut worst_trip = 0.0f64;
-    let mut worst_height = (0.0f64, 0.0f64, 0.0f64);
+    let mut checked = 0usize;
     for &e in &ELEVS {
         for r in 1..=460 {
             let r = f64::from(r);
             let g = ground_range_km(r, e);
-            worst_trip = worst_trip.max((slant_range_for_ground_km(g, e) - r).abs());
-
             let folded = height_at_ground_km(g, e);
             let composed = height_km(slant_range_for_ground_km(g, e), e);
-            let err = (folded - composed).abs();
-            if err > worst_height.0 {
-                worst_height = (err, r, e);
-            }
+            assert_eq!(
+                folded.to_bits(),
+                composed.to_bits(),
+                "the ground-range and slant-range heights parted at {r} km / \
+                 {e}°: {folded} vs {composed}",
+            );
+            checked += 1;
         }
     }
-    // Both bounds are ~1.5 orders above the measured worst case (5.7e-14
-    // and 2.8e-14 km) and four below a slack 1e-9, so a reassociation that
-    // really changed the arithmetic has nowhere to hide.
-    assert!(
-        worst_trip < 1e-12,
-        "the ground-range round trip is not exact: worst error {worst_trip:e} km",
-    );
-    assert!(
-        worst_height.0 < 1e-12,
-        "the folded and composed height forms disagree by {:e} km at \
-             {} km / {}° — more than the 2.8e-14 km the doc measures",
-        worst_height.0,
-        worst_height.1,
-        worst_height.2,
+    assert_eq!(
+        checked,
+        ELEVS.len() * 460,
+        "precondition: the grid did not cover every tilt × range",
     );
 
-    // The `cos e` every renderer here now applies, at the two tilts the
-    // module doc quotes it at: 0.2 km at 2.4° and 4.0 km at 19.5°.
+    // The arc's shortening against the slant range at the two tilts the
+    // `ground_range_km` doc quotes. These moved with the tangent plane's
+    // removal: 0.2017 km and 4.0151 km were `r·(1 − cos e)`, which is the
+    // *chord* correction alone and leaves the curvature of the arc out.
     let at_low = 230.0 - ground_range_km(230.0, 2.4);
     let at_high = 70.0 - ground_range_km(70.0, 19.5);
     assert!(
-        (at_low - 0.2017).abs() < 1e-3,
-        "the 2.4° slant/ground gap moved: {at_low:.4} km, expected 0.2017",
+        (at_low - 0.5178).abs() < 1e-3,
+        "the 2.4° slant/ground gap moved: {at_low:.4} km, expected 0.5178",
     );
     assert!(
-        (at_high - 4.0151).abs() < 1e-3,
-        "the 19.5° slant/ground gap moved: {at_high:.4} km, expected 4.0151",
+        (at_high - 4.1974).abs() < 1e-3,
+        "the 19.5° slant/ground gap moved: {at_high:.4} km, expected 4.1974",
+    );
+}
+
+/// `ground_range_km` and `slant_range_for_ground_km` invert each other to
+/// rounding, over both networks' whole reach and every beam edge.
+///
+/// The property the exact pair exists to have, and the reason
+/// `ground_range_km` computes the *spherical* height internally rather than
+/// reusing the public quadratic `height_km`: the two functions are the law of
+/// sines read in opposite directions on one triangle, so they cancel
+/// algebraically. Feeding the forward one a quadratic height would leave this
+/// short by the quadratic's own residual — metres, not picometres — and the
+/// sampler would read a gate a cell away from the one the arc names.
+#[test]
+fn a_ground_range_round_trip_is_exact_on_both_networks() {
+    /// Bottom, centre and top of a beam of `full_width_deg` about `e`.
+    fn beam_edges(e: f64, full_width_deg: f64) -> [f64; 3] {
+        let half = full_width_deg / 2.0;
+        [e - half, e, e + half]
+    }
+
+    let mut worst = (0.0f64, 0.0f64, 0.0f64);
+    let mut points = 0usize;
+    let mut check = |r: f64, e: f64| {
+        let back = slant_range_for_ground_km(ground_range_km(r, e), e);
+        let err = (back - r).abs();
+        if err > worst.0 {
+            worst = (err, r, e);
+        }
+        points += 1;
+    };
+
+    // A WSR-88D: the VCP 212 ladder out to the 460.125 km surveillance reach,
+    // stepped at 0.1 km — finer than any gate the network produces.
+    for i in 1..=4601 {
+        let r = f64::from(i) * 0.1;
+        for &e in &ELEVS {
+            for e in beam_edges(e, WSR88D_HALF_POWER_BEAMWIDTH_DEG) {
+                check(r, e);
+            }
+        }
+    }
+
+    // A TDWR: its 88.8 km Doppler reach at 0.3 km, climbing to the 60° of
+    // VCP 80 — the tilt the old doc named as the one to worry about.
+    const TDWR_ELEVS: [f64; 17] = [
+        0.6, 1.0, 2.0, 3.0, 4.0, 5.0, 6.5, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0,
+        60.0,
+    ];
+    for i in 1..=296 {
+        let r = f64::from(i) * 0.3;
+        for &e in &TDWR_ELEVS {
+            for e in beam_edges(e, TDWR_HALF_POWER_BEAMWIDTH_DEG) {
+                check(r, e);
+            }
+        }
+    }
+
+    assert_eq!(
+        points, 235_944,
+        "precondition: the round-trip grid changed size",
+    );
+    // Measured worst is 1.7053e-13 km at 316.3 km / 7.525° — 5.4e-16 of that
+    // range, two or three ulps, which is the floor of evaluating an `asin` and
+    // coming back through a `sin` and not a residual of the model. The bound
+    // sits one order above the measurement and three below a slack 1e-9, so an
+    // inverse that stopped being the algebraic one has nowhere to hide.
+    assert!(
+        worst.0 < 1e-12,
+        "the ground-range round trip is not exact: {:e} km at {} km / {}°",
+        worst.0,
+        worst.1,
+        worst.2,
+    );
+}
+
+/// The arc agrees with `nexrad_model`'s `polar_to_geo`, the same-constants
+/// implementation this crate already depends on.
+///
+/// An outside check rather than a restatement: `polar_to_geo` is a direct
+/// dependency, it spells the effective radius as `6_371_000.0 * 4.0 / 3.0`
+/// metres, and it is the function the module doc cites as the exact form. It
+/// never *returns* the arc — it consumes it internally and hands back
+/// geography — so the arc is recovered the only way available, by measuring
+/// the great circle from the site to the point it lands on. That the recovery
+/// closes at all is itself the check that this crate and the dependency walk
+/// the arc on the same 6371 km sphere.
+///
+/// The antenna is at zero on purpose, and the site's own coordinates are read
+/// back off the oracle rather than passed in. `polar_to_geo` adds the antenna
+/// height to the beam height *before* dividing by `Rₑ + h`, so a real tower
+/// shrinks the arc it reports — 21.6 m at 460 km / 0.5° for a 400 m antenna,
+/// a tenth of a plan-view cell, from a term that has no business being in a
+/// horizontal distance. And `Site` carries latitude and longitude as `f32`, so
+/// the site this crate names and the site the oracle placed differ by up to a
+/// fifth of a metre unless the comparison starts from the oracle's copy. Both
+/// are why this crate keeps its own spelling instead of calling through.
+#[test]
+fn the_ground_arc_matches_the_nexrad_model_oracle() {
+    use nexrad_model::geo::{PolarPoint, RadarCoordinateSystem};
+    use nexrad_model::meta::Site;
+
+    // KTLX: mid-latitude and off the prime meridian, so neither a latitude nor
+    // a longitude error can hide in a zero. Ground and tower at zero so the
+    // oracle's antenna height — which it folds into the arc — is zero too.
+    let system = RadarCoordinateSystem::new(&Site::new(*b"KTLX", 35.3333, -97.2778, 0, 0));
+    let (site_lat, site_lon) = (system.latitude(), system.longitude());
+
+    let mut worst = (0.0f64, 0.0f64, 0.0f64);
+    let mut points = 0usize;
+    for &e in &ELEVS {
+        for i in 1..=460 {
+            let r = f64::from(i);
+            // `PolarPoint` takes the elevation as `f32`, so narrow it once and
+            // widen it back, and give both sides the same angle.
+            let e32 = e as f32;
+            let e = f64::from(e32);
+            for &az in &[0.0f32, 37.5, 123.25, 271.0] {
+                let geo = system.polar_to_geo(PolarPoint {
+                    azimuth_degrees: az,
+                    range_km: r,
+                    elevation_degrees: e32,
+                });
+                let (_, oracle_arc_km) =
+                    site_bearing_range_km(site_lat, site_lon, geo.latitude, geo.longitude);
+                let err = (ground_range_km(r, e) - oracle_arc_km).abs();
+                if err > worst.0 {
+                    worst = (err, r, e);
+                }
+                points += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        points,
+        ELEVS.len() * 460 * 4,
+        "precondition: the oracle grid changed size",
+    );
+    // Measured worst is 2.21e-12 km — 2.2 nanometres, at 52 km / 19.5°, and
+    // 4e-14 of that range. That is the cost of the recovery, not a difference
+    // of formula: the oracle walks its arc out to a latitude and longitude and
+    // this measures a haversine back, so what is left is two trigonometric
+    // round trips' worth of rounding. The bound is one micrometre, ~2.7 orders
+    // above the measurement and eleven under the 224.66 m plan-view cell this
+    // would have to move to be visible at all. It can therefore only fail on a
+    // real change of model, which is the only thing worth learning from a
+    // dependency that already agrees to the nanometre.
+    assert!(
+        worst.0 < 1e-9,
+        "the arc parted from `polar_to_geo` by {:e} km at {} km / {}°",
+        worst.0,
+        worst.1,
+        worst.2,
     );
 }
 

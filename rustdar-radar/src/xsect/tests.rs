@@ -987,13 +987,16 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
             );
         }
     }
-    // The figure the beam module quotes as a percentage, restated as the
-    // kilometres this test depends on: 5.7 % of 60 km at 19.5°.
+    // The figure the beam module quotes, restated as the kilometres this
+    // test depends on. It was 3.6509 km — `60/cos 19.5° − 60`, the
+    // tangent-plane inverse, 5.7 % of 60 km. The arc's inverse has to reach
+    // further, because 60 km of curved ground is more ground than 60 km of
+    // tangent plane, so it is now 3.8116 km, 6.35 %.
     let at_195 = beam::slant_range_for_ground_km(60.0, 19.5) - 60.0;
     assert!(
-        (at_195 - 3.6509).abs() < 0.001,
+        (at_195 - 3.8116).abs() < 0.001,
         "the 19.5° divergence at a 60 km wall moved: {at_195:.4} km, \
-             documented as 3.6509 km",
+             documented as 3.8116 km",
     );
 }
 

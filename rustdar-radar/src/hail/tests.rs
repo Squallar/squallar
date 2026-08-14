@@ -85,18 +85,26 @@ fn env(h0_km: f64, hm20_km: f64) -> EnvHeights {
 /// Four tilts at 0.5°/1.5°/2.5°/3.5° exercising every column rule under
 /// `H₀ = 1.0`, `H₋₂₀ = 2.0` km (radar at 0 ft). Layer bounds at r = 30 —
 /// 30.5 km of **ground**, matching the `RangeBinning::Ground` cube
-/// `compute_hail` builds — in the 4/3 model, `s·tan e + s²/(2·Re′·cos²e)`:
+/// `compute_hail` builds — in the 4/3 model, through
+/// `beam::height_at_ground_km`:
 ///
-/// * tilt 0: 0 – 0.5871958 (entirely below `H₀`);
-/// * tilt 1: 0.5871958 – 1.1199906 (straddles `H₀`: clipped);
-/// * tilt 2: 1.1199906 – 1.6534689;
-/// * tilt 3: 1.6534689 – 2.1744143 (half-power flank cap).
+/// * tilt 0: 0 – 0.5872472 (entirely below `H₀`);
+/// * tilt 1: 0.5872472 – 1.1201513 (straddles `H₀`: clipped);
+/// * tilt 2: 1.1201513 – 1.6538062;
+/// * tilt 3: 1.6538062 – 2.1749803 (half-power flank cap).
 ///
-/// Each boundary is 0.2–2.5 m above the slant-range figure it replaced
-/// (0.5870331 / 1.1191491 / 1.6509408 / 1.6990515), because a column over
+/// Each boundary is 0.2–5.9 m above the slant-range figure it replaced
+/// (0.5870331 / 1.1191491 / 1.6509408 / 2.1690515), because a column over
 /// 30.5 km of ground is reached by a beam slightly longer than 30.5 km and
 /// so stands slightly higher. SHI integrates those depths, so the products
 /// move with them — see each test's own arithmetic.
+///
+/// The four rose again — by 0.05, 0.16, 0.34 and 0.57 m from 0.5871958 /
+/// 1.1199906 / 1.6534689 / 2.1744143 — when `beam::ground_range_km` became
+/// the spherical arc rather than the tangent-plane `r·cos e`. Same cause one
+/// step further: reaching 30.5 km of ground *arc* takes a longer beam still
+/// than reaching 30.5 km on the tangent plane, and every SHI, POSH and MEHS
+/// figure in this file moved a few parts in ten thousand with them.
 ///
 /// Columns:
 ///
@@ -316,21 +324,21 @@ fn env_heights_resolve_msl_to_arl_against_the_site_elevation() {
 /// r = 30 with `H₀ = 1.0`, `H₋₂₀ = 2.0` km ARL (WT floored at 20):
 ///
 /// * az 10 (50 dBZ ×4): tilt 0's layer tops at 0.587 km — below `H₀`,
-///   nothing; tilt 1 clips to [1.0, 1.1200], `W_T` 0.0600 at its
+///   nothing; tilt 1 clips to [1.0, 1.1202], `W_T` 0.0601 at its
 ///   midpoint; tilts 2–3 carry full depths at `W_T` 0.387/0.914 —
-///   SHI **5.464906**, POSH `29·ln(5.4649/20) + 50` = **12.375823** %,
-///   MEHS `2.54·√5.4649` = **5.937793** mm;
-/// * az 20 (45 dBZ ×4): the same column at `Ė(45)` — SHI **1.038850**,
-///   POSH 0 (clamped), MEHS **2.588869**;
+///   SHI **5.470174**, POSH `29·ln(5.4702/20) + 50` = **12.403768** %,
+///   MEHS `2.54·√5.4702` = **5.940655** mm;
+/// * az 20 (45 dBZ ×4): the same column at `Ė(45)` — SHI **1.039851**,
+///   POSH 0 (clamped), MEHS **2.590117**;
 /// * az 30 (graded): only the 50 dBZ tilt-1 and 45 dBZ tilt-2 layers
 ///   contribute (tilt 0 is below `H₀`, 35 dBZ is under the ramp) — SHI
-///   **0.367835**, MEHS **1.540495**;
+///   **0.368291**, MEHS **1.541449**;
 /// * az 40 (39.9 dBZ): a **defined 0** across all three grids;
 /// * az 50 (censored): `NaN` across all three;
 /// * az 60 (50 dBZ lowest only): the whole echo sits below `H₀` —
 ///   defined 0;
 /// * az 70 (50 dBZ top only): one layer, [1.6535, 2.1744] — SHI
-///   **3.772947**, POSH **1.631597**, MEHS **4.933715**.
+///   **3.776468**, POSH **1.658650**, MEHS **4.936016**.
 #[test]
 fn the_documented_rules_produce_hand_computed_hail() {
     let grids = compute_hail(&golden_scan(), Some(&env(1.0, 2.0)), 0.0, BEAM).unwrap();
@@ -339,16 +347,16 @@ fn the_documented_rules_produce_hand_computed_hail() {
     let r = 30;
 
     let at = |g: &VolumetricGrid, az: usize| f64::from(g.values[az][r]);
-    assert_close(at(&grids.shi, 10), 5.464_905_653, 1e-5, "az10 SHI");
-    assert_close(at(&grids.posh, 10), 12.375_823, 1e-4, "az10 POSH");
-    assert_close(at(&grids.mehs_mm, 10), 5.937_793, 1e-5, "az10 MEHS");
+    assert_close(at(&grids.shi, 10), 5.470_174_31, 1e-5, "az10 SHI");
+    assert_close(at(&grids.posh, 10), 12.403_768, 1e-4, "az10 POSH");
+    assert_close(at(&grids.mehs_mm, 10), 5.940_655, 1e-5, "az10 MEHS");
 
-    assert_close(at(&grids.shi, 20), 1.038_849_6, 1e-6, "az20 SHI");
+    assert_close(at(&grids.shi, 20), 1.039_851_07, 1e-6, "az20 SHI");
     assert_eq!(grids.posh.values[20][r], 0.0, "az20 POSH clamps to 0");
-    assert_close(at(&grids.mehs_mm, 20), 2.588_869, 1e-5, "az20 MEHS");
+    assert_close(at(&grids.mehs_mm, 20), 2.590_117, 1e-5, "az20 MEHS");
 
-    assert_close(at(&grids.shi, 30), 0.367_835_3, 1e-6, "az30 SHI");
-    assert_close(at(&grids.mehs_mm, 30), 1.540_495, 1e-5, "az30 MEHS");
+    assert_close(at(&grids.shi, 30), 0.368_291_26, 1e-6, "az30 SHI");
+    assert_close(at(&grids.mehs_mm, 30), 1.541_449, 1e-5, "az30 MEHS");
 
     for (az, why) in [(40, "sub-40 dBZ echo"), (60, "echo entirely below H0")] {
         assert_eq!(grids.shi.values[az][r], 0.0, "{why}: SHI");
@@ -361,16 +369,16 @@ fn the_documented_rules_produce_hand_computed_hail() {
     assert!(grids.mehs_mm.values[50][r].is_nan());
     assert!(grids.posh.values[10][GATES].is_nan(), "beyond the data");
 
-    assert_close(at(&grids.shi, 70), 3.772_946_65, 1e-5, "az70 SHI");
-    assert_close(at(&grids.posh, 70), 1.631_597, 1e-4, "az70 POSH");
-    assert_close(at(&grids.mehs_mm, 70), 4.933_715, 1e-5, "az70 MEHS");
+    assert_close(at(&grids.shi, 70), 3.776_468_04, 1e-5, "az70 SHI");
+    assert_close(at(&grids.posh, 70), 1.658_650, 1e-4, "az70 POSH");
+    assert_close(at(&grids.mehs_mm, 70), 4.936_016, 1e-5, "az70 MEHS");
 }
 
 /// The column split by `H₋₂₀`: lowering it from 2.0 to 1.5 km saturates
 /// `W_T` over the upper layers and SHI rises to the hand value
-/// **7.512132** (POSH 21.602825, MEHS 6.961700). The degenerate
+/// **7.517438** (POSH 21.623302, MEHS 6.964159). The degenerate
 /// `H₋₂₀ = H₀` environment steps `W_T` to 1 everywhere above `H₀`:
-/// **9.306606**.
+/// **9.311091**.
 #[test]
 fn the_minus_20_height_splits_the_column() {
     let scan = golden_scan();
@@ -379,13 +387,13 @@ fn the_minus_20_height_splits_the_column() {
     let split = compute_hail(&scan, Some(&env(1.0, 1.5)), 0.0, BEAM).unwrap();
     assert_close(
         f64::from(split.shi.values[10][r]),
-        7.512_132_2,
+        7.517_438_4,
         1e-5,
         "Hm20 = 1.5 SHI",
     );
     assert_close(
         f64::from(split.posh.values[10][r]),
-        21.602_825,
+        21.623_302,
         1e-4,
         "Hm20 = 1.5 POSH",
     );
@@ -393,15 +401,15 @@ fn the_minus_20_height_splits_the_column() {
     let step = compute_hail(&scan, Some(&env(1.0, 1.0)), 0.0, BEAM).unwrap();
     assert_close(
         f64::from(step.shi.values[10][r]),
-        9.306_606_1,
+        9.311_091_4,
         1e-5,
         "degenerate SHI",
     );
 }
 
 /// A single-tilt volume: the one layer runs from the ground to the
-/// half-power upper flank — `[0, 0.5738382]` km over 30.5 km of ground for
-/// a 0.5° tilt — clipped at `H₀ = 0.2`: SHI **0.692177**.
+/// half-power upper flank — `[0, 0.5738793]` km over 30.5 km of ground for
+/// a 0.5° tilt — clipped at `H₀ = 0.2`: SHI **0.692330**.
 #[test]
 fn a_single_tilt_column_is_capped_at_the_beam_flank() {
     let scan = Scan::new(
@@ -411,7 +419,7 @@ fn a_single_tilt_column_is_capped_at_the_beam_flank() {
     let grids = compute_hail(&scan, Some(&env(0.2, 1.0)), 0.0, BEAM).unwrap();
     assert_close(
         f64::from(grids.shi.values[10][30]),
-        0.692_177_31,
+        0.692_329_59,
         1e-6,
         "single-tilt SHI",
     );
@@ -425,9 +433,9 @@ fn a_single_tilt_column_is_capped_at_the_beam_flank() {
 /// The same single-tilt column, once with the WSR-88D's 0.95° and once with
 /// the TDWR's 0.55° ([`crate::beam::TDWR_HALF_POWER_BEAMWIDTH_DEG`], sourced
 /// there). The top layer runs to the beam's upper flank, so 0.475° of it
-/// reaches 0.5738382 km over 30.5 km of ground where 0.275° reaches
-/// 0.4673423 — 107 m less ceiling. SHI integrates depth above `H₀ = 0.2`, so
-/// it falls 0.692177 → 0.353985, a **49 %** cut on this column.
+/// reaches 0.5738793 km over 30.5 km of ground where 0.275° reaches
+/// 0.4673699 — 107 m less ceiling. SHI integrates depth above `H₀ = 0.2`, so
+/// it falls 0.692330 → 0.354059, a **49 %** cut on this column.
 ///
 /// That is the size of the error a TDWR was carrying: the fleet's wider beam
 /// bought its ceiling layer depth the antenna never illuminated, and PoSH and
@@ -447,10 +455,10 @@ fn a_narrower_antenna_caps_the_ceiling_layer_lower() {
         )
     };
 
-    assert_close(shi(BEAM), 0.692_177_31, 1e-6, "WSR-88D ceiling");
+    assert_close(shi(BEAM), 0.692_329_59, 1e-6, "WSR-88D ceiling");
     assert_close(
         shi(crate::beam::TDWR_HALF_POWER_BEAMWIDTH_DEG),
-        0.353_985_50,
+        0.354_058_59,
         1e-6,
         "TDWR ceiling",
     );

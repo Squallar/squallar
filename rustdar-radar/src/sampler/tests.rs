@@ -1327,24 +1327,30 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
         );
     }
     // precondition: the two height forms really do differ at the steep
-    // tilt, so the assertion above discriminates. 286 m at 10° / 100 km.
+    // tilt, so the assertion above discriminates. 326 m at 10° / 100 km,
+    // where it was 286 m while the ground range was the tangent plane —
+    // the arc's inverse reaches further for the same ground distance, so
+    // the ground arm stands higher and the two part by more.
     let height_gap =
         (beam::height_at_ground_km(WALL_KM, 10.0) - beam::height_km(WALL_KM, 10.0)).abs();
     assert!(
-        (height_gap - 0.2862).abs() < 1e-3,
+        (height_gap - 0.3263).abs() < 1e-3,
         "the 10° ground/slant height gap moved: {height_gap:.4} km, \
-             documented as 0.2862",
+             documented as 0.3263",
     );
 
     // The discriminating half. A sampler that fed the ground range to the
     // gate index as if it were a slant range reads the 10° tilt's wall at
-    // `100 · cos 10° = 98.48` km — 1.52 km, six gates, inward. That
-    // position must be clear air.
+    // 98.28 km — 1.72 km, seven gates, inward. That position must be clear
+    // air. It was 98.48 km and 1.52 km, six gates, while the ground range
+    // was the tangent-plane `100 · cos 10°`; the arc shortens further, so
+    // the discrimination this test rests on got wider rather than narrower.
     let uncorrected = beam::ground_range_km(WALL_KM, 10.0);
     let error_km = WALL_KM - uncorrected;
     assert!(
-        (error_km - 1.5192).abs() < 1e-3,
-        "the 10° cos e error moved: {error_km:.4} km, documented as 1.5192",
+        (error_km - 1.7245).abs() < 1e-3,
+        "the 10° slant-to-ground error moved: {error_km:.4} km, \
+             documented as 1.7245",
     );
     let off_wall = sampler.column(120.0, uncorrected);
     let steep = off_wall
@@ -1358,14 +1364,18 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
         "the 10° rung found the wall at {uncorrected:.3} km ground, which \
              is where an uncorrected slant range would have put it",
     );
-    // At 0.5° the same mistake is 0.004 km — a sixtieth of a gate — which
-    // is why the low tilts cannot be the test.
+    // At 0.5° the same mistake is 0.019 km at this range — a thirteenth of
+    // a 250 m gate, against the 10° tilt's seven whole gates — which is why
+    // the low tilts cannot be the test. It was 0.004 km under the tangent
+    // plane, and the bound moves 0.01 → 0.03 km with it; the ratio between
+    // the two tilts is what this precondition is really about, and it went
+    // from 380× to 92×, still two orders.
     let shallow_error = WALL_KM - beam::ground_range_km(WALL_KM, 0.5);
     assert!(
-        shallow_error < 0.01,
-        "precondition: the 0.5° cos e error is {shallow_error:.4} km, so \
-             the low tilts would have discriminated too and the steep tilt is \
-             not doing the work",
+        shallow_error < 0.03,
+        "precondition: the 0.5° slant-to-ground error is {shallow_error:.4} \
+             km, so the low tilts would have discriminated too and the steep \
+             tilt is not doing the work",
     );
 
     // And the point query agrees with the column, at a height inside the
@@ -1378,15 +1388,23 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
     );
 }
 
-/// What the `cos e` correction is **worth**, shipped as a measurement rather
-/// than as a comment.
+/// What the slant-to-ground correction is **worth**, shipped as a measurement
+/// rather than as a comment.
 ///
-/// Both renderers apply it now — this module has always converted a ground
-/// range to a slant one before reading a gate, and the plan view's four
-/// per-tilt rasterizers hoist the same factor — so these figures are no
-/// longer a disagreement between them. They are how far every echo on those
-/// tilts moved when the plan view started applying it, which is the number a
-/// reader comparing this display against an older screenshot needs.
+/// These are how far every echo on those tilts moved when the plan view
+/// started applying the correction at all, which is the number a reader
+/// comparing this display against an older screenshot needs.
+///
+/// **The two renderers no longer apply the same one, and these figures are
+/// `beam`'s.** This module converts a ground range to a slant one through
+/// `beam::slant_range_for_ground_km`, which is the spherical arc's inverse;
+/// the plan view's four per-tilt rasterizers still hoist `cos e` of the
+/// sweep's median elevation, which is the tangent plane. The gap between the
+/// two is the table in `beam`'s "What still spells the tangent plane" — 666 m
+/// at 460 km on 0.5°, about three plan-view cells — and it is a real
+/// registration difference between a section and the map above it until those
+/// hoists are converted. It is recorded there rather than here because it is
+/// the hoists' to close.
 ///
 /// The pixel figures are the same on both targets now that `IMAGE_SIZE` is
 /// 2048 everywhere, but they are still derived from the constant and still
@@ -1394,7 +1412,10 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
 /// (see `types::IMAGE_SIZE`), and a change to either has to come past here.
 #[test]
 fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
-    let cases = [(230.0f64, 2.4f64, 0.2017f64), (70.0, 19.5, 4.0151)];
+    // 0.2017 and 4.0151 km before the arc replaced the tangent plane —
+    // those were `r·(1 − cos e)`, which is the chord's shortening with the
+    // earth's curvature left out.
+    let cases = [(230.0f64, 2.4f64, 0.5178f64), (70.0, 19.5, 4.1974)];
     for (slant, elev, expected_km) in cases {
         let gap_km = slant - beam::ground_range_km(slant, elev);
         assert!(
@@ -1410,10 +1431,11 @@ fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
     let px_per_km = crate::types::IMAGE_SIZE as f64 / (2.0 * crate::types::BASE_EXTENT_KM);
     let px = |slant: f64, elev: f64| (slant - beam::ground_range_km(slant, elev)) * px_per_km;
     // 2048 px over 460 km is 4.4522 px/km.
+    // 0.898 and 17.876 px under the tangent plane.
     #[cfg(not(target_arch = "wasm32"))]
-    let (expected_low, expected_high) = (0.898, 17.876);
+    let (expected_low, expected_high) = (2.305, 18.688);
     #[cfg(target_arch = "wasm32")]
-    let (expected_low, expected_high) = (0.898, 17.876);
+    let (expected_low, expected_high) = (2.305, 18.688);
     assert_eq!(
         crate::types::IMAGE_SIZE,
         2048,
@@ -1433,13 +1455,26 @@ fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
              {}-pixel image, documented as {expected_high}",
         crate::types::IMAGE_SIZE,
     );
-    // precondition: the correction is invisible at the low tilts, which is
-    // what makes it landable on a fleet that mostly flies them.
+    // The low tilts, where this used to assert near-invariance at under
+    // 0.2 px — and where that was an artifact of the probe range rather
+    // than a property of the tilt. Both figures below are 0.5°; they differ
+    // only in how far out they are asked, so name the range with every one.
+    //
+    // At 230 km the correction is 0.531 px (0.039 under the tangent plane).
+    // At 460.125 km — the 0.5° surveillance cut's *actual* reach, not the
+    // 230 km ring — it is 3.043 px, which is not invisible at all. The old
+    // claim survived because it was only ever evaluated half way along the
+    // cut.
     assert!(
-        px(230.0, 0.5) < 0.2,
-        "the 0.5° correction is now {:.3} px, so the near-invariance the \
-             module doc claims is wrong",
+        (px(230.0, 0.5) - 0.531).abs() < 0.01,
+        "the 0.5° correction at 230 km moved: {:.3} px, documented as 0.531",
         px(230.0, 0.5),
+    );
+    assert!(
+        (px(460.125, 0.5) - 3.043).abs() < 0.01,
+        "the 0.5° correction at its 460.125 km reach moved: {:.3} px, \
+             documented as 3.043",
+        px(460.125, 0.5),
     );
 }
 

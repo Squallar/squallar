@@ -165,6 +165,25 @@ pub enum DedupPolicy {
 /// because a cell indexed by ground range whose height was computed from a
 /// slant range is a cell whose two coordinates describe two different points
 /// in the air.
+///
+/// # The two coordinates are no longer exactly the same ground range
+///
+/// [`range_scale`](Self::range_scale) indexes with the tangent-plane `r·cos e`,
+/// while [`crate::beam::height_at_ground_km`] now inverts the spherical arc.
+/// Under [`Ground`](Self::Ground) a cell's height is therefore the height at
+/// the arc-inverse of a tangent-plane pseudo-range, which is not the height of
+/// the gate that landed in it. Measured over this cube's own domain — 230 bins
+/// × the VCP 212 ladder — the gap is at most **50.3 m below 20 km of altitude**
+/// (at 197.5 km / 5.1°), a fifth of a 250 m gate; it reaches 875 m only at
+/// 229.5 km / 19.5°, where the beam is 85 km up and the cut is range-truncated
+/// far short of it.
+///
+/// This is `range_scale`'s defect, not the height's: the scale factor is the
+/// last tangent-plane spelling on this path, kept because a per-sweep scalar
+/// hoists out of the gate loop and an arc does not. Closing it means giving
+/// this cube a per-gate arc, which moves `golden_echo_tops_grid_is_pinned` and
+/// four more digests and so is its own change. Until then the bound above is
+/// the honest statement of what "the heights go with the bins" is worth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeBinning {
     /// Bin `r` holds the gates whose **slant** range falls in `[r, r+1)` km.
