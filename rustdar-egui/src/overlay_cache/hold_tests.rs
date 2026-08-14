@@ -126,6 +126,48 @@ fn a_newer_raster_supersedes_one_still_arriving() {
     assert_eq!(cache.current().expect("swapped").geo_bounds.max_lat, 44.0);
 }
 
+/// A superseding hold gives the replaced picture's allocation back.
+///
+/// The other half of [`a_newer_raster_supersedes_one_still_arriving`]: not
+/// only is the older held picture no longer what lands, its texture is
+/// *retired* — the handle drops inside `hold`, egui frees the id at the next
+/// pass boundary, and `TextureUploads::free` throws away whatever bands it had
+/// left. That drop is what keeps a mid-gesture burst of renders from piling
+/// up: however many results land while one picture is on screen, the cache
+/// pins at most two rasters — shown and arriving.
+#[test]
+fn a_superseding_hold_releases_the_picture_it_replaces() {
+    let ctx = egui::Context::default();
+    let live = || ctx.tex_manager().read().num_allocated();
+    let mut cache = OverlayTextureCache::new();
+
+    cache.show(data(texture(&ctx, "first"), 36.0));
+    let _ = ctx.end_pass();
+    let shown_and_arriving = {
+        cache.hold(data(texture(&ctx, "second"), 40.0), None);
+        let _ = ctx.end_pass();
+        live()
+    };
+
+    for burst in 0..3 {
+        cache.hold(data(texture(&ctx, &format!("burst-{burst}")), 44.0), None);
+        let _ = ctx.end_pass();
+        assert_eq!(
+            live(),
+            shown_and_arriving,
+            "supersede {burst} left the replaced held texture allocated: a \
+             burst of mid-gesture renders accumulates a full-size raster per \
+             result instead of pinning two",
+        );
+    }
+
+    // And the picture on screen was never touched by any of it.
+    assert_eq!(
+        cache.current().expect("still showing").geo_bounds.max_lat,
+        36.0,
+    );
+}
+
 /// Clearing a pane clears what it was about to show as well.
 ///
 /// The third way a hold ends. A clear that left the hold behind would put the

@@ -271,12 +271,13 @@ fn re_enabling_asks_for_a_fresh_render() {
 
     {
         let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(KIND);
-        // Twice: `needs_rerender` records the zoom it was asked about and calls
-        // a gesture settled when two consecutive calls agree, so the second
-        // answer is the settled one — the stricter of the two.
-        cache.needs_rerender(TOKEN, ZOOM, &viewport(), &plan());
+        // Twice, a settle apart: `needs_rerender` records the zoom it was
+        // asked about and calls the gesture settled once it has been still
+        // for `SETTLE_REPAINT_DELAY`, so the second answer is the settled one
+        // — the stricter of the two.
+        cache.needs_rerender(TOKEN, ZOOM, 100.0, &viewport(), &plan());
         assert!(
-            !cache.needs_rerender(TOKEN, ZOOM, &viewport(), &plan()),
+            !cache.needs_rerender(TOKEN, ZOOM, 100.5, &viewport(), &plan()),
             "premise: the parked texture must satisfy the gate for these exact \
              arguments, or the assertion below would pass without any toggle",
         );
@@ -287,7 +288,7 @@ fn re_enabling_asks_for_a_fresh_render() {
 
     let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(KIND);
     assert!(
-        cache.needs_rerender(TOKEN, ZOOM, &viewport(), &plan()),
+        cache.needs_rerender(TOKEN, ZOOM, 101.0, &viewport(), &plan()),
         "a re-enabled layer is not asking for its picture back: the cache is \
          empty and the gate still says no, so the layer would stay blank",
     );

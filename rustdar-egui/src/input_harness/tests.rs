@@ -14988,18 +14988,19 @@ fn every_zoom_the_map_offers_reaches_a_cache_that_is_satisfied() {
     }
 }
 
-/// Walk the zoom by `step` for `frames` frames, one frame per step, and return
-/// how many rasterizes were asked for along the way.
+/// Walk the zoom by `step` for `frames` frames, one 120 Hz frame per step, and
+/// return how many rasterizes were asked for along the way.
 ///
-/// One frame per step is the whole point: the cache decides a gesture has
-/// *settled* by seeing the same zoom on two consecutive frames, so a helper
-/// that ran `warm_up`'s three frames per step would be holding the map still
-/// between steps and would measure the settle, not the gesture.
+/// One frame per step, with the clock moving at gesture rate: the cache
+/// decides a gesture has *settled* by the zoom having been still for
+/// `SETTLE_REPAINT_DELAY` of `InputState::time`, so a helper that paused the
+/// zoom for longer than that between steps would be measuring the settle, not
+/// the gesture.
 fn zoom_gesture(h: &mut InputHarness, from: f64, step: f64, frames: usize) -> usize {
     let mut asked = 0;
     for i in 1..=frames {
         set_pane_zoom(h, from + step * i as f64);
-        h.frame();
+        h.frame_after(1.0 / 120.0);
         asked += rasterizes_requested(h, OverlayKind::NwsAlerts);
     }
     asked
@@ -15078,9 +15079,21 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     assert_eq!(asked, 0, "fixture: the gesture itself must be free");
     let stopped_at = Z0 + 0.6;
 
-    // The map is now still. The very next frame is the second one at this zoom,
-    // which is what "settled" means.
-    h.frame();
+    // The map is now still, but the fingers only just stopped: the next few
+    // frames arrive inside SETTLE_REPAINT_DELAY and are not yet a settle.
+    // (Two frames at the same zoom *used* to be one — see
+    // `a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle` for what
+    // that misread on a phone.)
+    h.frame_after(1.0 / 120.0);
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "one 120 Hz frame of stillness was called a settle; on a coalesced \
+         touch stream that fires in the middle of the gesture"
+    );
+
+    // A settle delay later, the exact render is asked for.
+    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
     assert_eq!(
         rasterizes_requested(&h, OverlayKind::NwsAlerts),
         1,
@@ -15096,7 +15109,7 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     // Land it, and the asking stops — one settle, not a loop.
     settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
     for frame in 0..4 {
-        h.frame();
+        h.frame_after(1.0 / 120.0);
         assert_eq!(
             rasterizes_requested(&h, OverlayKind::NwsAlerts),
             0,
@@ -15110,6 +15123,65 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
             .zoom_is_stale(stopped_at),
         "the settle landed and the overlay is still at another zoom — this is \
          the permanent-blur failure, and it is invisible without this assertion"
+    );
+}
+
+/// **The misfire that hid the alert layer on a phone.** A pause shorter than
+/// [`SETTLE_REPAINT_DELAY`] — including the bit-identical zoom a coalesced
+/// touch stream produces on consecutive frames mid-gesture — is not a settle,
+/// and dispatches nothing.
+///
+/// The settle used to be "the same zoom on two frames running". A 120 Hz
+/// display outdraws the digitizer's sampling, and a frame lengthened by an
+/// inline raster coalesces the events behind it, so mid-gesture frames read
+/// equal zoom routinely — and each equality dispatched a full-size raster
+/// whose upload replaced the on-screen texture with a transparent stand-in.
+/// The producer and the cost compounded: every misfire lengthened frames,
+/// longer frames coalesced more, more coalescing manufactured the next
+/// misfire.
+///
+/// The last stanza is the positive control: after the pauses this test insists
+/// are free, a real stop still settles — so the zeros above are the delay's
+/// doing and not a cache that has stopped listening.
+#[test]
+fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+
+    // The gesture moves, then the event stream under-samples: four frames at
+    // 120 Hz reading exactly the same zoom, then the gesture moves on. Under
+    // the two-frame equality, every still frame after the first dispatched.
+    set_pane_zoom(&mut h, Z0 + 0.2);
+    h.frame_after(1.0 / 120.0);
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "fixture: a zoom inside the band must be free while it moves",
+    );
+    for frame in 0..4 {
+        h.frame_after(1.0 / 120.0);
+        assert_eq!(
+            rasterizes_requested(&h, OverlayKind::NwsAlerts),
+            0,
+            "frame {frame} of a coalesced pause dispatched a raster \
+             mid-gesture: the settle misfire, back again",
+        );
+    }
+    set_pane_zoom(&mut h, Z0 + 0.4);
+    h.frame_after(1.0 / 120.0);
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "the gesture resumed and the resume frame itself dispatched",
+    );
+
+    // Control: an actual stop, held for the delay, settles once.
+    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        1,
+        "control: a real stop no longer settles, so the zeros above prove \
+         nothing",
     );
 }
 
@@ -15130,11 +15202,13 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
     let asked = zoom_gesture(&mut h, Z0, 0.05, 12);
     assert_eq!(asked, 0, "fixture: the gesture itself must be free");
 
-    // A render is in flight over the frame the gesture ends on.
+    // A render is in flight over the frame the gesture ends on — and over the
+    // frame the settle delay elapses on, which is the frame that would have
+    // dispatched.
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(OverlayKind::NwsAlerts)
         .render_in_flight = true;
-    h.frame();
+    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64() + 0.01);
     assert_eq!(
         rasterizes_requested(&h, OverlayKind::NwsAlerts),
         0,
@@ -15146,7 +15220,7 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(OverlayKind::NwsAlerts)
         .render_in_flight = false;
-    h.frame();
+    h.frame_after(1.0 / 120.0);
     assert_eq!(
         rasterizes_requested(&h, OverlayKind::NwsAlerts),
         1,

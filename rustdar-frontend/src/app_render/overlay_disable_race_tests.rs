@@ -200,11 +200,26 @@ fn a_result_for_an_enabled_layer_still_lands() {
 
     deliver(&mut app, &ctx);
 
-    let landed = current_id(&mut app).expect("the poller placed an overlay on this pane");
-    assert_ne!(
-        landed, parked,
+    // Kept, not dropped — but *held*, because the pane already has a picture
+    // and the new one's pixels are not on the GPU yet. The parked texture
+    // staying on screen here is the hold doing its job, not the guard
+    // over-filtering; the promotion below is what tells the two apart.
+    assert_eq!(
+        current_id(&mut app),
+        Some(parked),
+        "the poller swapped a picture onto the screen before its pixels had \
+         all arrived",
+    );
+    assert!(
+        app.gui.pane(0).expect("pane 0").is_holding_raster(),
         "the poller dropped a result for a layer that is switched on — the \
          disable guard is filtering more than the disabled",
+    );
+    app.deliver_held_rasters();
+    let landed = current_id(&mut app).expect("the promoted overlay is on this pane");
+    assert_ne!(
+        landed, parked,
+        "the held result never made it to the screen once its pixels landed",
     );
     assert!(
         !in_flight(&mut app),

@@ -4933,15 +4933,18 @@ impl Gui {
         self.panes.iter().any(PaneState::is_holding_raster)
     }
 
-    /// Show every held raster whose pixels have all landed.
+    /// Show every held raster whose pixels have all landed — the radar raster
+    /// and every layer texture alike.
     ///
     /// One pass, over every pane for the reason above. `delivered` is
     /// `EguiRenderer::is_delivered`, asked once per held id — panes served from
-    /// one raster hold clones of one handle (`PlanViewUploads`), so a split of
-    /// four on one site swaps on one answer.
+    /// one raster hold clones of one handle (`PlanViewUploads`, and the overlay
+    /// poller clones one handle across the panes a result names), so a split
+    /// of four on one site swaps on one answer.
     pub fn promote_held_rasters(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {
         for pane in &mut self.panes {
             pane.promote_held_raster(&delivered);
+            pane.promote_held_overlays(&delivered);
         }
     }
 

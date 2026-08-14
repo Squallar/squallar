@@ -48,6 +48,12 @@ fn quantize_zoom(zoom: f64) -> i32 {
 /// How far the map may zoom away from a texture's own zoom, in zoom units,
 /// before the texture is re-rasterized mid-gesture.
 ///
+/// **On native only.** The wasm build never re-rasterizes mid-gesture — see
+/// [`mid_gesture_rerender_allowed`] — because there the raster runs inline on
+/// the frame thread, and a mid-gesture render is a purchase of resolution with
+/// interaction latency. There the drift budget below is unbounded until the
+/// settle.
+///
 /// One zoom unit is a factor of two in scale, so this is the whole budget: a
 /// texture on screen during a gesture may be magnified up to 2× (soft) or
 /// minified up to 2× (aliased) before a fresh one is asked for. That is a
@@ -88,17 +94,33 @@ fn quantize_zoom(zoom: f64) -> i32 {
 /// the plate stretches for a tenth of a second instead.
 pub const ZOOM_REBUILD_BAND: f64 = 1.0;
 
-/// How long after a zoom stops before the settle render is asked for.
+/// How long a zoom must be still before the gesture counts as settled — and so
+/// also how long after it stops before the settle render is asked for.
+///
+/// It is the settle *test*, not only the repaint schedule:
+/// [`OverlayTextureCache::needs_rerender`] decides the gesture has settled by
+/// the zoom having been unchanged for this long. It used to decide by seeing
+/// the same zoom twice running, and two frames agreeing is not fingers having
+/// stopped. Touch samples come from the digitizer and are coalesced by the
+/// platform, so whenever they arrive slower than frames are drawn — a 120 Hz
+/// display outpacing the touch sampling, or events queueing behind a long
+/// frame — two consecutive frames read bit-identical zoom in the middle of a
+/// gesture, and each such misfire dispatched a full-size raster. On wasm the
+/// raster runs inline on the frame thread, so the misfires lengthened the
+/// frames, longer frames coalesced more events, and more coalescing
+/// manufactured more misfires: a feedback loop, felt as a zoom that stutters
+/// and locks. A duration cannot misfire that way — equality sustained for a
+/// tenth of a second is the fingers actually resting.
 ///
 /// egui is reactive: it draws a frame when something asks for one. A wheel or
-/// pinch gesture's *last* frame is driven by the input event that ended it, and
-/// [`OverlayTextureCache::needs_rerender`] decides the gesture has settled by
-/// seeing the same zoom twice running — so without something asking for that
-/// second frame, the overlay would sit at the gesture's last mid-flight
-/// resolution indefinitely. `ui_map_pane` requests a repaint this far out for
-/// as long as [`OverlayTextureCache::zoom_is_stale`] is true, which makes the
-/// settle a consequence of the code rather than of another frame happening to
-/// come along.
+/// pinch gesture's *last* frame is driven by the input event that ended it, so
+/// without something asking for a later frame, the overlay would sit at the
+/// gesture's last mid-flight resolution indefinitely. `ui_map_pane` requests a
+/// repaint this far out for as long as
+/// [`OverlayTextureCache::zoom_is_stale`] is true, which makes the settle a
+/// consequence of the code rather than of another frame happening to come
+/// along — and it is the same constant on both sides, so the frame the repaint
+/// buys is a frame on which the settle test passes.
 ///
 /// It doubles as the gesture's debounce. During a gesture the input frames
 /// arrive well inside this window and supersede it, so the settle costs nothing
@@ -513,22 +535,37 @@ pub struct OverlayTextureCache {
     current: Option<OverlayTextureData>,
     /// A picture whose pixels have not all reached the GPU yet.
     ///
-    /// `None` for every overlay kind but the radar raster: nothing else this
-    /// application draws is large enough for its upload to outlast the frame it
-    /// was handed over on.
+    /// Any overlay kind can be holding one, and the sizes say why: an upload
+    /// moves at most `UPLOAD_BAND_BYTES` — 8 MiB — of a texture per band, and a
+    /// full-viewport layer raster exceeds that on any phone-class display
+    /// (measured on the reporting device: 1081×2341 physical at the current
+    /// [`OVERDRAW_FRACTION`] is 22.8 MB, and even the WebGL2-clamped
+    /// 1081×2048 is 8.9 MB). This slot used to be described as radar-only,
+    /// on the claim that every other raster crossed within its own frame —
+    /// true of the desktop panes it was measured on, false one device class
+    /// away.
     held: Option<HeldOverlayTexture>,
     /// Whether a background render is in progress for this cache.
     pub render_in_flight: bool,
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
-    /// how it knows on the next call whether the gesture has stopped.
+    /// how it notices the zoom moving and re-stamps [`Self::zoom_still_since`].
     ///
     /// Private, and written by the query itself rather than by a separate
     /// `note_zoom` the caller has to remember, because forgetting to call that
     /// is precisely the permanent-blur failure this design has to make
-    /// unreachable: a cache that never sees a second frame at the same zoom
-    /// never settles, and the overlay stays soft until something else
-    /// invalidates it. Asking the question *is* recording the answer.
+    /// unreachable: a cache that never learns the zoom has stopped never
+    /// settles, and the overlay stays soft until something else invalidates
+    /// it. Asking the question *is* recording the answer.
     last_seen_zoom: Option<f64>,
+    /// When [`Self::last_seen_zoom`] last changed, in the caller's clock
+    /// (`egui::InputState::time`, seconds). The gesture has settled once `now`
+    /// is [`SETTLE_REPAINT_DELAY`] past this.
+    ///
+    /// `-inf` until the first query writes it, and always written before the
+    /// first read: the first query finds `last_seen_zoom` `None`, which is a
+    /// change. Kept beside `last_seen_zoom` because the pair is one fact — the
+    /// zoom seen and when it started being the zoom seen.
+    zoom_still_since: f64,
 }
 
 impl Default for OverlayTextureCache {
@@ -544,6 +581,7 @@ impl OverlayTextureCache {
             held: None,
             render_in_flight: false,
             last_seen_zoom: None,
+            zoom_still_since: f64::NEG_INFINITY,
         }
     }
 
@@ -554,11 +592,25 @@ impl OverlayTextureCache {
 
     /// Put `data` on screen now, and let go of anything being held.
     ///
-    /// For a texture whose pixels are already all on the GPU. Two callers have
-    /// one: `poll_overlay_render_results`, whose overlay rasters are small
-    /// enough to cross in the frame they are handed over on, and
-    /// `restore_cached_render`, which is rebuilding a dead context's textures
-    /// and so has no predecessor to keep on screen anyway.
+    /// For a picture with nothing to protect: its pixels have been reported
+    /// delivered (the promotion paths, `PaneState::promote_held_raster` and
+    /// `PaneState::promote_held_overlays`), or the pane has no picture on
+    /// screen for a banded upload to spoil — `poll_overlay_render_results`
+    /// shows only into an empty cache and holds otherwise, and
+    /// `restore_cached_render` is rebuilding a dead context's textures and so
+    /// has no predecessor to keep on screen anyway.
+    ///
+    /// This sentence used to license the overlay poller to show
+    /// unconditionally, on the claim that overlay rasters are "small enough to
+    /// cross in the frame they are handed over on". That claim was true only
+    /// where it was measured — desktop panes under ~723 pt at 1.0 pixels per
+    /// point stay inside the 8 MiB `texture_upload` moves per band — and false
+    /// on the phone-class displays nobody measured: 8.9–22.8 MB there, so the
+    /// swap replaced a whole picture with an id still bound to a transparent
+    /// 1×1 stand-in for the frames the bands took. Whether a raster crosses in
+    /// its frame is a property of the viewport it was planned for, not of this
+    /// call, which is why the guarantee now lives at the call sites that can
+    /// see the cache's state rather than in a size assumption here.
     ///
     /// Dropping the hold is the point rather than a side effect: a picture the
     /// caller has decided to show *now* supersedes one that was still arriving,
@@ -603,7 +655,10 @@ impl OverlayTextureCache {
     /// returned record a [`Self::show`]; it comes back rather than going
     /// straight on screen because the pane stamp that travels with it does not
     /// live in this type. [`crate::pane::PaneState::promote_held_raster`] is
-    /// that caller and the only one.
+    /// that caller for the radar raster, and
+    /// [`crate::pane::PaneState::promote_held_overlays`] for every other kind
+    /// — the two exist apart because only the radar swap writes the pane's
+    /// `data_time`.
     ///
     /// The predicate is passed in because this crate has no renderer: the only
     /// thing that knows how far an upload has got is
@@ -655,10 +710,25 @@ impl OverlayTextureCache {
     /// Check whether a re-render is needed for this overlay.
     ///
     /// Triggers on: cache token change, the zoom drifting a whole
-    /// [`ZOOM_REBUILD_BAND`] from the texture's own, the zoom having *settled*
-    /// anywhere other than the texture's own, or pan exceeding the overdraw
-    /// margin. `token` is `ui_map_pane::overlay_cache_token`'s answer — see
-    /// [`OverlayTextureData::data_generation`].
+    /// [`ZOOM_REBUILD_BAND`] from the texture's own (where
+    /// [`mid_gesture_rerender_allowed`] — not on wasm), the zoom having
+    /// *settled* anywhere other than the texture's own, or pan exceeding the
+    /// overdraw margin. `token` is `ui_map_pane::overlay_cache_token`'s answer
+    /// — see [`OverlayTextureData::data_generation`]. `now` is the frame's
+    /// `egui::InputState::time`, the clock the settle is measured on.
+    ///
+    /// # It judges the newest picture this cache has, held or shown
+    ///
+    /// A held picture ([`Self::hold`]) is newer than the one on screen, and it
+    /// is what a dispatch from here would supersede — so it is what staleness
+    /// is measured against. Judging `current` instead re-asks the question the
+    /// hold already answered: the result lands, is held, the old texture still
+    /// reads stale, and this method dispatches again — every frame of the
+    /// upload — with each fresh result superseding the hold and **restarting
+    /// its bands**, so the upload never completes and the dispatch never
+    /// stops. A held picture that no longer describes what the pane wants
+    /// (the zoom moved on) still answers `true` here, and the result of that
+    /// dispatch supersedes it: nothing waits behind a stale hold.
     ///
     /// # Why the zoom test is a band and a settle, and not an equality
     ///
@@ -683,25 +753,35 @@ impl OverlayTextureCache {
     /// The middle row is the one this method changes; the top row is what the
     /// quarter-overdraw commit before it started from, and it is quoted because
     /// cheaper renders alone *raise* the count — capping it is this method's
-    /// job, not that constant's.
+    /// job, not that constant's. All three rows are native measurements, and
+    /// the settle in the bottom row was the two-frame test of its day; the
+    /// duration-based settle below can only fire less often than that one did.
     ///
     /// The bottom row is 2 renders + 1 settle and 5 + 1 over the 2 s drag.
     ///
     /// The two halves replace it with a claim about *when* the picture has to be
     /// right rather than *how often*:
     ///
-    /// - **In motion**, drift up to a whole zoom unit is tolerated. The texture
-    ///   is drawn through the current projector either way ([`draw_overlay_texture`]),
-    ///   so it is in the geometrically correct place; only its resolution is
-    ///   behind, by at most 2× in each direction.
-    /// - **At rest**, `settled` — this cache saw the same `zoom` on the previous
-    ///   frame — asks for the exact texture, once. That is what makes the
-    ///   tolerance above temporary rather than permanent, and it is the half
-    ///   whose failure mode is silent: a settle that never fires leaves the
-    ///   overlay soft with nothing on screen to say so. It is level-triggered,
-    ///   not edge-triggered — `settled` stays true for as long as the map is
-    ///   still — so a frame lost to `render_in_flight`, or to a render landing
-    ///   late, costs a frame of delay and not the settle itself.
+    /// - **In motion**, drift up to a whole zoom unit is tolerated — and on
+    ///   wasm, any drift at all, for the length of the gesture
+    ///   ([`mid_gesture_rerender_allowed`]). The texture is drawn through the
+    ///   current projector either way ([`draw_overlay_texture`]), so it is in
+    ///   the geometrically correct place; only its resolution is behind.
+    /// - **At rest**, `settled` — the `zoom` this cache is asked about has not
+    ///   changed for [`SETTLE_REPAINT_DELAY`] — asks for the exact texture,
+    ///   once. That is what makes the tolerance above temporary rather than
+    ///   permanent, and it is the half whose failure mode is silent: a settle
+    ///   that never fires leaves the overlay soft with nothing on screen to
+    ///   say so. It is level-triggered, not edge-triggered — `settled` stays
+    ///   true for as long as the map is still — so a frame lost to
+    ///   `render_in_flight`, or to a render landing late, costs a frame of
+    ///   delay and not the settle itself.
+    ///
+    ///   A **duration**, not "the same zoom two frames running": two frames
+    ///   agreeing is not fingers having stopped. See [`SETTLE_REPAINT_DELAY`]
+    ///   for the misfire mechanism the equality had — touch coalescing made
+    ///   consecutive frames read equal mid-gesture, most reliably on exactly
+    ///   the devices whose frames were already long.
     ///
     /// Relaxing the zoom key cannot strand the viewport off the texture: see
     /// [`pan_exceeds_coverage`], whose containment result holds for any zoom
@@ -710,13 +790,57 @@ impl OverlayTextureCache {
         &mut self,
         token: u64,
         zoom: f64,
+        now: f64,
         viewport_bounds: &GeoBounds,
         plan: &OverlayTexturePlan,
     ) -> bool {
-        let settled = self.last_seen_zoom == Some(zoom);
-        self.last_seen_zoom = Some(zoom);
+        self.needs_rerender_with_policy(
+            token,
+            zoom,
+            now,
+            viewport_bounds,
+            plan,
+            mid_gesture_rerender_allowed(),
+        )
+    }
 
-        let Some(ref tex) = self.current else {
+    /// [`Self::needs_rerender`] with the platform policy as a parameter.
+    ///
+    /// Split out so the host test suite can drive both arms of a `cfg` it can
+    /// only ever compile one side of: what the wasm arm *shares* — the settle,
+    /// the token, the size and pan checks, and the band arm's own comparison —
+    /// is tested here with the policy forced either way, and what remains
+    /// untested on the host is exactly [`mid_gesture_rerender_allowed`]'s
+    /// one-line body. Production code has one caller, above, and it passes
+    /// that function's answer.
+    fn needs_rerender_with_policy(
+        &mut self,
+        token: u64,
+        zoom: f64,
+        now: f64,
+        viewport_bounds: &GeoBounds,
+        plan: &OverlayTexturePlan,
+        mid_gesture_band: bool,
+    ) -> bool {
+        if self.last_seen_zoom != Some(zoom) {
+            self.last_seen_zoom = Some(zoom);
+            self.zoom_still_since = now;
+        }
+        // `now >= since + delay` rather than `now - since >= delay`: the two
+        // differ only in the last ulp, but `(t + delay) - t` rounds below
+        // `delay` for most `t`, so the subtraction form calls a frame that
+        // arrives exactly one delay later — the frame the settle repaint
+        // schedules — not yet settled and costs it another repaint cycle.
+        let settled = now >= self.zoom_still_since + SETTLE_REPAINT_DELAY.as_secs_f64();
+
+        // The newest picture this cache has — see the doc note. A held picture
+        // outranks the one on screen: it is what a dispatch would supersede.
+        let Some(tex) = self
+            .held
+            .as_ref()
+            .map(|held| &held.data)
+            .or(self.current.as_ref())
+        else {
             return true;
         };
         if tex.data_generation != token {
@@ -736,7 +860,7 @@ impl OverlayTextureCache {
             return true;
         }
         let render_zoom = tex.render_zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
-        if (zoom - render_zoom).abs() >= ZOOM_REBUILD_BAND {
+        if mid_gesture_band && (zoom - render_zoom).abs() >= ZOOM_REBUILD_BAND {
             return true;
         }
         if settled && tex.render_zoom != quantize_zoom(zoom) {
@@ -745,6 +869,35 @@ impl OverlayTextureCache {
         // Check if the viewport has panned outside the texture coverage
         pan_exceeds_coverage(&tex.geo_bounds, viewport_bounds)
     }
+}
+
+/// Whether a zoom that has drifted [`ZOOM_REBUILD_BAND`] from the texture's own
+/// may be re-rasterized while the gesture is still moving.
+///
+/// Native: yes. The raster and the `ColorImage` conversion run off the frame
+/// thread there, so a mid-gesture rebuild costs the gesture only the
+/// `write_texture` rows and buys back resolution while the fingers are still
+/// down.
+///
+/// wasm: no — the settle render is the only zoom-driven dispatch. `offload`
+/// has no thread to give on that target, so the whole raster runs **inline on
+/// the frame thread** — measured in-browser at 224 ms against a p50 gesture
+/// frame of 289.5 ms — which makes a mid-gesture render, by construction, a
+/// purchase of texture resolution with interaction latency. Interaction wins:
+/// the texture is drawn through the current projector wherever the zoom goes
+/// ([`draw_overlay_texture`]), so unlimited drift costs sharpness, never
+/// placement, and the settle restores the sharpness a beat after the fingers
+/// stop. Revisit when overlay rasterization moves off the frame thread into a
+/// worker on this target — once the raster runs elsewhere, a mid-gesture
+/// refresh stops costing input latency and the native band is right here too.
+///
+/// A function with a `cfg!` body rather than a `cfg` at the dispatch site, so
+/// the policy has a name, one home, and a host-side test pinning the native
+/// arm; the wasm arm's coverage is the `wasm32` type-check plus review of this
+/// one line, and [`OverlayTextureCache::needs_rerender_with_policy`] is how
+/// everything downstream of the answer is tested on the host.
+fn mid_gesture_rerender_allowed() -> bool {
+    !cfg!(target_arch = "wasm32")
 }
 
 /// Returns `true` if the viewport has panned far enough outside the texture's
@@ -1022,6 +1175,12 @@ pub fn current_quantized_zoom(zoom: f64) -> i32 {
 /// ends, and the one thing that must not happen while it lasts.
 #[cfg(test)]
 mod hold_tests;
+
+/// When a re-render may be dispatched: the settle duration, the platform
+/// policy on the mid-gesture band, and the hold as a dispatch already
+/// answered.
+#[cfg(test)]
+mod settle_tests;
 
 #[cfg(test)]
 mod geo_click_tests;
