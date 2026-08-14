@@ -453,7 +453,17 @@ fn golden_chunks() -> Vec<(u16, ChunkKind, ChunkContents)> {
 
 /// Feed chunks to a fresh assembler in the order given.
 fn assemble(chunks: Vec<(u16, ChunkKind, ChunkContents)>) -> VolumeAssembler {
-    let mut a = VolumeAssembler::new("KTLX", vol(42));
+    assemble_into(vol(42), chunks)
+}
+
+/// [`assemble`] at a chosen index, for tests that have to tell two closed
+/// volumes apart — `roll` reports the index of the volume it *closed*, so two
+/// assemblers built at the same index close indistinguishably.
+fn assemble_into(
+    volume: VolumeIndex,
+    chunks: Vec<(u16, ChunkKind, ChunkContents)>,
+) -> VolumeAssembler {
+    let mut a = VolumeAssembler::new("KTLX", volume);
     for (sequence, kind, contents) in chunks {
         a.ingest_contents(sequence, kind, volume_time(), contents);
     }
@@ -1604,6 +1614,145 @@ fn a_seal_after_warming_still_invalidates_the_cache() {
     );
 }
 
+/// A volume that completed is still reported when the very next fetch fails.
+///
+/// `roll` closes a volume by replacing the assembler `snapshot` reads, so the
+/// `ClosedVolume` in the outcome is the only way back to it. Both round paths
+/// roll before they fetch, and an `Err` return drops the outcome — so the
+/// volume went missing entirely, while the caller saw what looked like an
+/// ordinary transient failure. Nothing anywhere said a finished volume had been
+/// thrown away.
+#[test]
+fn a_volume_that_closed_survives_the_round_that_failed_after_it() {
+    let mut p = ChunkPoller::new("KTLX");
+    p.current = Some(assemble(golden_chunks()));
+    let expected = crate::volumetric::tests::golden_scan().sweeps().len();
+
+    // The round rolls...
+    let mut failing = PollOutcome {
+        closed: p.pending_closed.pop_front(),
+        ..Default::default()
+    };
+    let closed = p.roll(vol(43));
+    p.deliver_or_queue(&mut failing, closed);
+    failing.rolled_to = Some(vol(43));
+    assert!(
+        failing
+            .closed
+            .as_ref()
+            .is_some_and(|c| c.progress.volume_complete),
+        "the fixture must close complete, or this proves nothing"
+    );
+
+    // ...and then fails. This is what every `return Err` in a round does.
+    p.park_for_next_round(&mut failing);
+    drop(failing);
+    assert!(
+        p.snapshot().is_some_and(|s| s.sweeps().is_empty()),
+        "the roll already replaced the assembler, so the closed volume cannot \
+             be read back off the poller — which is what makes losing the \
+             report permanent"
+    );
+
+    // The next round carries it, wherever that round then goes.
+    let next = PollOutcome {
+        closed: p.pending_closed.pop_front(),
+        ..Default::default()
+    };
+    let closed = next
+        .closed
+        .expect("the volume that completed was dropped with the failing round");
+    assert!(closed.progress.volume_complete);
+    assert_eq!(
+        closed
+            .scan
+            .as_ref()
+            .expect("a completed volume hands back its scan")
+            .sweeps()
+            .len(),
+        expected,
+        "the report survived but not the volume it describes"
+    );
+    assert!(
+        p.pending_closed.is_empty(),
+        "a delivered volume must not be delivered again"
+    );
+}
+
+/// A second volume closing before the first was delivered queues behind it —
+/// neither is overwritten.
+///
+/// The state this needs was argued unreachable when the park was a single slot,
+/// and the argument was wrong: a round that ingests a chunk and *then* fails
+/// leaves through `Err`, re-parking as it goes, so the assembler has a volume
+/// time while a volume is still parked. From there `should_roll_to` is true and
+/// the next roll had nowhere to put its volume that did not discard the first —
+/// the exact loss the park exists to prevent, reintroduced by it.
+#[test]
+fn a_second_volume_closing_queues_behind_the_first_rather_than_replacing_it() {
+    let mut p = ChunkPoller::new("KTLX");
+    p.current = Some(assemble(golden_chunks()));
+
+    // Round 1 rolls to V43 and fails.
+    // `roll` reports the volume it *closed*, so the two rounds assemble at
+    // different indices — otherwise both reports read 42 and every assertion
+    // below is satisfied by either volume, which is no test at all.
+    let mut first = PollOutcome::default();
+    let closed = p.roll(vol(43));
+    p.deliver_or_queue(&mut first, closed);
+    assert_eq!(
+        first.closed.as_ref().map(|c| c.progress.volume),
+        Some(vol(42)),
+        "the first round closed the volume it was assembling"
+    );
+    p.park_for_next_round(&mut first);
+    drop(first);
+
+    // Round 2 drains 42's report, assembles 43, and fails after ingesting —
+    // which is what puts a volume time on the assembler with one still parked.
+    let mut second = PollOutcome {
+        closed: p.pending_closed.pop_front(),
+        ..Default::default()
+    };
+    p.current = Some(assemble_into(vol(43), golden_chunks()));
+    assert!(
+        p.current
+            .as_ref()
+            .and_then(VolumeAssembler::volume_time)
+            .is_some(),
+        "the state the old argument called unreachable: a parked volume and an \
+             assembler that can be rolled"
+    );
+
+    // Round 2's own roll must not displace the volume it is already carrying.
+    let closed = p.roll(vol(44));
+    p.deliver_or_queue(&mut second, closed);
+    assert_eq!(
+        second.closed.as_ref().map(|c| c.progress.volume),
+        Some(vol(42)),
+        "the older volume is the one that leaves first"
+    );
+    assert_eq!(
+        p.pending_closed
+            .iter()
+            .map(|c| c.progress.volume)
+            .collect::<Vec<_>>(),
+        vec![vol(43)],
+        "the volume that closed this round was dropped instead of queued"
+    );
+
+    // And a failure now keeps both, still in order.
+    p.park_for_next_round(&mut second);
+    assert_eq!(
+        p.pending_closed
+            .iter()
+            .map(|c| c.progress.volume)
+            .collect::<Vec<_>>(),
+        vec![vol(42), vol(43)],
+        "the queue is no longer oldest-first"
+    );
+}
+
 /// The body of one `ChunkPoller` method, for the placement probes below.
 ///
 /// A method's own closing brace is the first one at four-space indentation
@@ -1681,6 +1830,70 @@ fn the_aborting_round_warms_the_snapshot_before_it_returns_the_error() {
         "a download failure returns from inside the chunk loop again, which \
              skips the warm entirely"
     );
+}
+
+/// Every way a round can fail parks the closed volume first, and every round
+/// starts by picking up whatever a previous one parked.
+///
+/// The behavioural test above drives the park by hand, so it passes with either
+/// call site deleted; these two error paths are the only places the loss can be
+/// reintroduced, and a new fallible call before the epilogue would be a third.
+/// Adjacency is asserted rather than mere presence, so a park that drifts above
+/// an intervening early return does not read as covered.
+#[test]
+fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
+    const PARK: &str = "self.park_for_next_round(&mut outcome);";
+    const DRAIN: &str = "closed: self.pending_closed.pop_front(),";
+    for signature in ["pub async fn poll(", "pub async fn fetch_notified("] {
+        let body = poller_method(signature);
+        let drain = body.find(DRAIN).unwrap_or_else(|| {
+            panic!(
+                "{signature} does not collect a volume parked by an earlier \
+                 round, so a parked one is never delivered"
+            )
+        });
+        // Position, not presence: a drain below an early return is a drain that
+        // round never reaches.
+        let first_return = body.find("return ").unwrap_or(body.len());
+        assert!(
+            drain < first_return,
+            "{signature} collects the parked volume after it can already have \
+                 returned, so that exit delivers nothing"
+        );
+
+        // `?` would return without parking and the loop below would not see it,
+        // which is precisely how this loss comes back: one
+        // `list_chunks(..).await?` after the roll is enough. Covers the operator
+        // in the forms that reach a fallible call — the only `?` either body may
+        // otherwise hold is the `{e:?}` of a log line.
+        for operator in ["?;", "await?", ")?"] {
+            assert!(
+                !body.contains(operator),
+                "{signature} uses `{operator}`, which returns the error without \
+                     parking the closed volume — and without tripping the \
+                     `return Err` check below"
+            );
+        }
+
+        let mut from = 0;
+        let mut found = 0;
+        while let Some(rel) = body[from..].find("return Err(") {
+            let at = from + rel;
+            assert!(
+                body[..at].trim_end().ends_with(PARK),
+                "{signature} has a `return Err` at byte {at} that does not park \
+                     the closed volume first, so a volume that finished \
+                     assembling is dropped when that call fails"
+            );
+            found += 1;
+            from = at + 1;
+        }
+        assert!(
+            found > 0,
+            "{signature} has no error return; this probe is no longer reading \
+                 the method it thinks it is"
+        );
+    }
 }
 
 // -- selective download --------------------------------------------------
@@ -2216,7 +2429,11 @@ async fn live_a_few_poll_rounds_assemble_and_seal() {
             // The end of a sealing round is where `warm_snapshot` runs; this
             // is the one test that reaches it through the real `poll`.
             assert!(
-                poller.current.as_ref().expect("a volume").snapshot_is_warm(),
+                poller
+                    .current
+                    .as_ref()
+                    .expect("a volume")
+                    .snapshot_is_warm(),
                 "a sealing poll round returned with the snapshot cache cold"
             );
         }
