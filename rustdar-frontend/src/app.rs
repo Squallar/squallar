@@ -1278,6 +1278,38 @@ impl App {
     }
 
     /// Lazily initialize wgpu rendering state on first redraw after window creation.
+    ///
+    /// # This blocks the frame thread on purpose, and it was measured
+    ///
+    /// It is the one place in the application that does, so it gets raised
+    /// every time somebody audits the frame thread. It costs **135 ms median**
+    /// on an RTX 3090 over Vulkan (`request_device` 99 ms of it,
+    /// `request_adapter` 11 ms, surface configure 17 ms, `EguiRenderer::new`
+    /// 6 ms), which is about half of the 262 ms from `exec` to first pixel.
+    ///
+    /// Two things say to leave it blocking, both of them readings rather than
+    /// arguments:
+    ///
+    /// 1. **Nothing yields.** Driven by hand with a no-op waker, the future
+    ///    this awaits reaches `Ready` on **poll one**, every run: native wgpu's
+    ///    `request_adapter` and `request_device` are synchronous behind an
+    ///    async facade. So the browser's shape below — hold a receiver, collect
+    ///    on a later frame — buys native nothing at all. A per-frame state
+    ///    machine would sit in exactly this call for exactly this long, inside
+    ///    one poll. Only a real OS thread moves it, which is what was tried.
+    /// 2. **The thread made it worse.** Ported onto the arm below with
+    ///    `std::thread::spawn` in place of `spawn_local`, `exec` to first pixel
+    ///    went **262 ms -> 315 ms (+20%)** over five runs each, with no
+    ///    overlap between the two samples. `request_adapter` alone went
+    ///    **11.4 ms -> 51.8 ms**: asked from off the main thread, matching a
+    ///    Wayland surface against each adapter has to reach the compositor
+    ///    through the connection the event loop owns.
+    ///
+    /// And there is no frame to protect. Nothing can be drawn until the device
+    /// exists, so this time is not taken from a frame — it *is* the wait before
+    /// the first one, and moving it only delays the first pixel. The browser
+    /// arm is not the same case: there `block_on` would spin forever, and the
+    /// future really does yield.
     #[cfg(not(target_arch = "wasm32"))]
     fn ensure_rendering_state(&mut self) {
         if self.state.is_none() && self.window.is_some() {
