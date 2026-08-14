@@ -40,7 +40,8 @@
 //!   than re-implementing the `image` → [`egui::ColorImage`] → texture path means
 //!   the pixels cannot drift from what `HttpTiles` produced.
 //! * **A bounded in-memory cache** of [`TILE_CACHE_ENTRIES`] tiles with LRU
-//!   eviction, sized as walkers sizes it.
+//!   eviction — walkers' size on desktop, halved on mobile and halved again
+//!   on wasm32, where the texture budget the tiles come out of is smaller.
 //! * **In-flight de-duplication**: a tile already requested is not requested
 //!   again while it is pending. See [`HttpsTiles::request_once`] — as in walkers,
 //!   the cache's `None` entry *is* the in-flight marker.
@@ -94,11 +95,68 @@ use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 /// rather than a performance dial.
 pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 
-/// Tiles retained in the in-memory cache before LRU eviction starts.
+/// Tiles retained in one source's in-memory cache before LRU eviction starts.
 ///
-/// walkers' figure. A 256-entry cache at 256x256 RGBA is ~64 MiB of texture in
-/// the worst case, which is why it is bounded at all.
-pub const TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(256).expect("256 is not zero");
+/// Per device tier, because a tile texture costs the same 256 KiB (256x256
+/// RGBA) everywhere while the memory it comes out of does not:
+///
+/// | tier    | entries | texture worst case, per source |
+/// |---------|--------:|-------------------------------:|
+/// | desktop |     256 |                        ~64 MiB |
+/// | mobile  |     128 |                        ~32 MiB |
+/// | wasm32  |      64 |                        ~16 MiB |
+///
+/// The desktop arm is walkers' own figure, unchanged. "Per source" is the
+/// multiplier that makes the small arms worth having: each map source owns one
+/// of these caches — base and labels, light and dark, four at most with two
+/// live per theme — so the desktop figure carried onto wasm32 could put
+/// 256 MiB of basemap texture against the 288 MiB
+/// `rustdar-frontend`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES` allows the
+/// whole application.
+///
+/// The tiers follow that crate's budget cascade (`APP_TEXTURE_BUDGET_BYTES`'s
+/// wasm32/mobile/desktop arms, with mobile the `target_os` rule of
+/// `rustdar-frontend/src/mobile_cfg.rs`: `"android" | "ios"`), **spelled
+/// rather than imported** because the dependency runs rustdar-frontend →
+/// rustdar-egui and cannot run back — the same boundary
+/// `MODEL_GRID_CACHE_ENTRIES` in rustdar-overlays states.
+///
+/// What the wasm arm accepts, quantified: the working set at native zoom is
+/// the window's own tile count (`tiles::tiles_resident_for`), so a
+/// 1920x1080-point canvas keeps ~54 tiles per source and fits, while a
+/// 2560x1440-point one keeps ~77 and overruns — beyond that the fetcher stops
+/// settling for the overrun source, the churn `tiles.rs` describes. The
+/// deeper-zoom floor bias never adds to this on its own: `Gui`'s
+/// `tile_zoom_bias_for_pane` measures its working set against whichever arm
+/// of this constant is in force before taking the bias.
+#[cfg(target_arch = "wasm32")]
+pub const TILE_CACHE_ENTRIES: NonZeroUsize = WASM_TILE_CACHE_ENTRIES;
+/// See the wasm32 arm above.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "android", target_os = "ios")
+))]
+pub const TILE_CACHE_ENTRIES: NonZeroUsize = MOBILE_TILE_CACHE_ENTRIES;
+/// See the wasm32 arm above.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
+pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
+
+/// The wasm32 arm of [`TILE_CACHE_ENTRIES`].
+///
+/// All three arms are named outside the cascade, the shape
+/// `rustdar-frontend`'s `constants::WASM_VOLUME_GRID_CELLS` documents and for
+/// the reason it gives: this workspace runs `cargo test` on one arm, so the
+/// other two are only reachable from a test if they have names.
+pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is not zero");
+/// The mobile arm. See [`WASM_TILE_CACHE_ENTRIES`].
+pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(128).expect("128 is not zero");
+/// The desktop arm — walkers' own figure. See [`WASM_TILE_CACHE_ENTRIES`].
+pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(256).expect("256 is not zero");
 
 /// Per-tile request timeout.
 ///
@@ -336,6 +394,22 @@ impl HttpsTiles {
         egui_ctx: Context,
         client: reqwest::Client,
     ) -> Self {
+        Self::with_client_and_cache(source, egui_ctx, client, TILE_CACHE_ENTRIES)
+    }
+
+    /// [`Self::with_client`], with the cache bound supplied.
+    ///
+    /// Crate-private and exists for the tests, like the client injection above:
+    /// [`TILE_CACHE_ENTRIES`] is cfg-selected, one arm per compiled target, and
+    /// this workspace runs `cargo test` on the desktop arm only — so eviction
+    /// at the mobile and wasm bounds is only exercisable if the bound can be
+    /// handed in.
+    fn with_client_and_cache<S: AsyncTileSource>(
+        source: S,
+        egui_ctx: Context,
+        client: reqwest::Client,
+        cache_entries: NonZeroUsize,
+    ) -> Self {
         let attribution = source.attribution();
         let tile_size = source.tile_size();
         let max_zoom = source.max_zoom();
@@ -354,7 +428,7 @@ impl HttpsTiles {
             attribution,
             tile_size,
             max_zoom,
-            cache: LruCache::new(TILE_CACHE_ENTRIES),
+            cache: LruCache::new(cache_entries),
             request_tx,
             tile_rx,
             runtime,
@@ -393,14 +467,12 @@ impl HttpsTiles {
             cache, request_tx, ..
         } = self;
 
-        let outcome = cache.try_get_or_insert(
-            tile_id,
-            || -> Result<Option<Tile>, TrySendError<TileId>> {
+        let outcome =
+            cache.try_get_or_insert(tile_id, || -> Result<Option<Tile>, TrySendError<TileId>> {
                 request_tx.try_send(tile_id)?;
                 log::trace!("requested tile {tile_id:?}");
                 Ok(None)
-            },
-        );
+            });
 
         match outcome {
             Ok(_) => {}
@@ -447,6 +519,18 @@ impl HttpsTiles {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn cached_entries(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Whether `tile_id` currently occupies a slot, pending and failed markers
+    /// included.
+    ///
+    /// A peek, not a use: `LruCache::contains` leaves the recency order alone,
+    /// which is what lets the eviction tests read membership back without the
+    /// reading itself protecting the entry. Test-gated like
+    /// [`Self::cached_entries`], its only caller.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn tile_is_cached(&self, tile_id: TileId) -> bool {
+        self.cache.contains(&tile_id)
     }
 }
 

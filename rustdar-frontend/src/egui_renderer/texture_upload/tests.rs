@@ -252,7 +252,8 @@ fn an_id_that_was_never_filed_has_not_been_delivered() {
 /// A freed id stops being delivered, which is what bounds the set.
 ///
 /// `delivered` is a `HashSet` that would otherwise hold one key per texture ever
-/// created — the map tiles alone churn a 256-entry LRU for the life of a
+/// created — the map tiles alone churn a whole LRU of textures
+/// (`tile_source::TILE_CACHE_ENTRIES`, 256 on desktop) for the life of a
 /// session. `free` is called from `EguiRenderer::free_textures` with exactly the
 /// ids egui retired, so the set tracks the live textures and nothing else.
 #[test]
