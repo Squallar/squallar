@@ -68,10 +68,14 @@ use std::collections::HashMap;
 pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::thread::Builder::new()
-            .name(name.into())
-            .spawn(job)
-            .unwrap_or_else(|e| panic!("failed to spawn {name} thread: {e}"));
+        // The pool's opaque lane, not a thread of its own. A closure that
+        // cannot be described still has somewhere bounded to run, and the one
+        // remaining `std::thread::Builder::spawn` in this module is the one
+        // that builds the lanes. See [`pool`].
+        if let Err(job) = pool::run_opaque(name, Box::new(job)) {
+            log::error!("{name}: the job pool has no worker left; running it here");
+            job();
+        }
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1377,7 +1381,38 @@ thread_local! {
     /// owns a `web_sys::Worker`, which is `!Send` and can only ever be touched
     /// on the thread that created it. The *registry* above is shared; the
     /// handle to the transport is not, and does not need to be.
-    static WORKER: RefCell<Option<(u64, Box<dyn JobSink>)>> = const { RefCell::new(None) };
+    static WORKER: RefCell<Option<(u64, Box<dyn JobSink>)>> = RefCell::new(installed(default_sink()));
+}
+
+/// The transport a thread starts with, before anything is installed over it.
+///
+/// **This is the module's one target fork, and it selects a transport rather
+/// than a behaviour** — the same shape `rustdar-egui/src/tile_source.rs` has
+/// carried for its two runtimes since before any of this existed. Both arms
+/// answer the same question with the mechanism their platform has: natively a
+/// handle to the process's job pool, and in a browser nothing, because a
+/// browser's transport is a `Worker` that has to start and prove itself first
+/// (`rustdar-web`'s `worker_port::attach`) and until it does there is genuinely
+/// nowhere else for a job to run.
+///
+/// It replaces a fork that was **behavioural**: `offload` used to spawn an
+/// unbounded OS thread on one arm and block the frame on the other, with no
+/// id, no registry entry and no failure path on the arm that had threads.
+#[cfg(not(target_arch = "wasm32"))]
+fn default_sink() -> Option<Box<dyn JobSink>> {
+    Some(pool::sink())
+}
+
+/// See the native arm.
+#[cfg(target_arch = "wasm32")]
+fn default_sink() -> Option<Box<dyn JobSink>> {
+    None
+}
+
+/// Give a sink the id its jobs will be filed under.
+fn installed(port: Option<Box<dyn JobSink>>) -> Option<(u64, Box<dyn JobSink>)> {
+    let sink = NEXT_SINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    port.map(|port| (sink, port))
 }
 
 /// Route [`offload_job`] through `port` from now on.
@@ -1393,8 +1428,7 @@ thread_local! {
 /// can ever release.
 pub fn set_worker(port: Box<dyn JobSink>) {
     abandon_worker("replaced by a new port");
-    let sink = NEXT_SINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    WORKER.with(|w| *w.borrow_mut() = Some((sink, port)));
+    WORKER.with(|w| *w.borrow_mut() = installed(Some(port)));
 }
 
 /// Give up on the worker: it died, or answered the handshake with a build that
@@ -1618,6 +1652,10 @@ pub fn jobs_in_worker() -> usize {
     };
     pending().values().filter(|job| job.sink == sink).count()
 }
+
+/// The native transport. See the module's own doc for why it is a pool.
+#[cfg(not(target_arch = "wasm32"))]
+mod pool;
 
 #[cfg(test)]
 mod tests;
