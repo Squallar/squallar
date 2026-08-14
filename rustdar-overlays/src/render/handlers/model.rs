@@ -998,7 +998,11 @@ mod tests {
     /// reader that silently returned `None` could not pass either.
     #[test]
     fn every_read_path_counts_as_a_use() {
-        assert!(
+        // The fixture requirement, stated so that lowering the cap fails the
+        // build rather than quietly weakening this test into one that walks
+        // fewer parameters than it claims to. `const` rather than a runtime
+        // `assert!`, which clippy reads as a constant-valued assertion.
+        const _: () = assert!(
             MODEL_GRID_CACHE_ENTRIES >= 3,
             "this test walks three distinct parameters through the cache",
         );
