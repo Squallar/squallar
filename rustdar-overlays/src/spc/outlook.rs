@@ -377,10 +377,17 @@ fn parse_outlook_feature(
         .unwrap_or("")
         .to_string();
 
+    // Not `#888888`: that is [`SIGNIFICANT_SEVERE_FILL`], the sentinel
+    // [`OutlookLayer::of`] reads as "this feature *is* the significant-severe
+    // layer". Defaulting a *missing* fill to it made the fallback colour and
+    // the classifier's sentinel the same constant, so a risk feature arriving
+    // without a `fill` was lifted out of the risk stack and drawn over the
+    // whole ladder. Empty is the honest default, and is already the value SPC
+    // itself publishes on features it draws no geometry for.
     let fill_hex = properties
         .get("fill")
         .and_then(|v| v.as_str())
-        .unwrap_or("#888888");
+        .unwrap_or("");
 
     let stroke_hex = properties
         .get("stroke")
@@ -673,6 +680,58 @@ mod tests {
              because it is an overlay, having been moved to the *front* of \
              SPC's array to prove position is not what decides — and the \
              overlay tier keeps the feed's own order within itself",
+        );
+    }
+
+    /// **A probability contour that arrives with no `fill` stays in the risk
+    /// stack.**
+    ///
+    /// The default for a missing `fill` used to be `"#888888"` — byte-identical
+    /// to [`SIGNIFICANT_SEVERE_FILL`], the sentinel [`OutlookLayer::of`] reads
+    /// as "this is the significant-severe layer". The fallback colour and the
+    /// classifier's sentinel were the same constant, so one missing property
+    /// moved a probability band out of the ladder and drew it last, over every
+    /// contour beneath it, at the overlay alpha — the same shape of failure the
+    /// [`OutlookLayer`] type was introduced to break, arriving through the
+    /// other door.
+    ///
+    /// Not reachable on anything SPC has published: the key is present on every
+    /// feature of the 1023-product Day 1 archive checked for this
+    /// (`campaign-harness`, `campaigns/spc-scn26-11/`). It is a defence against
+    /// the feed, not a repair of it.
+    #[test]
+    fn a_probability_contour_with_no_fill_property_is_not_promoted_to_an_overlay() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(CIG_PRODUCT).expect("the fixture is SPC's own JSON");
+        let features = json["features"].as_array_mut().expect("a feature array");
+        let stripped = features
+            .iter_mut()
+            .find(|f| f["properties"]["LABEL"] == "0.30")
+            .expect("fixture premise: the hail ladder carries a 30% band");
+        stripped["properties"]
+            .as_object_mut()
+            .expect("properties is an object")
+            .remove("fill")
+            .expect("fixture premise: it had a fill to remove");
+
+        let outlook = parse_geojson(&json, OutlookDay::Day1, OutlookProduct::Hail)
+            .expect("a missing fill must not fail the product");
+        let band = outlook
+            .features
+            .iter()
+            .find(|f| f.label == "0.30")
+            .expect("the band is kept, not dropped");
+
+        assert_eq!(
+            band.fill_rgba[3], REGULAR_FILL_ALPHA,
+            "a probability band with no fill is still a probability band",
+        );
+        assert_eq!(band.hatch, HatchPattern::None);
+        assert_eq!(
+            labels(&outlook),
+            ["0.05", "0.15", "0.30", "0.45", "CIG1", "CIG2"],
+            "it keeps its place in the ladder rather than being drawn last \
+             over the contours above it",
         );
     }
 
