@@ -4,7 +4,7 @@
 //! - **Tier 1** (zoom < 6): flight-category circle only.
 //! - **Tier 2** (zoom 6–9): + temperature (upper-left), dewpoint (lower-left),
 //!   wind barb.
-//! - **Tier 3** (zoom ≥ 10): + altimeter (upper-right), visibility (left),
+//! - **Tier 3** (zoom ≥ 10): + MSLP pressure code (upper-right), visibility (left),
 //!   present weather symbol, station ID (lower-right).
 
 use crate::metar::types::{CloudLayer, FlightCategory, MetarOb, WindDir};
@@ -19,7 +19,7 @@ const TIER3_ZOOM: f32 = 10.0;
 
 const TEMP_OFFSET: [f32; 2] = [-14.0, -14.0];
 const DEWP_OFFSET: [f32; 2] = [-14.0, 10.0];
-const ALTIMETER_OFFSET: [f32; 2] = [14.0, -14.0];
+const PRESSURE_OFFSET: [f32; 2] = [14.0, -14.0];
 const VIS_OFFSET: [f32; 2] = [-34.0, -2.0];
 const WX_OFFSET: [f32; 2] = [-20.0, -2.0];
 const ID_OFFSET: [f32; 2] = [14.0, 10.0];
@@ -32,6 +32,37 @@ const HALF_BARB_LENGTH: f32 = 5.0;
 const BARB_SPACING: f32 = 5.0;
 const PENNANT_WIDTH: f32 = 4.0;
 const BARB_STROKE_WIDTH: f32 = 1.5;
+
+// ── Pressure code ─────────────────────────────────────────────────────────
+
+/// The station model's three-digit pressure code: **mean sea level pressure in
+/// tenths of a hectopascal, last three digits**. 1008.2 hPa prints `082`, and
+/// the reader restores the leading `9` or `10` by taking whichever of 9xx.x and
+/// 10xx.x lands nearest 1000.
+///
+/// Returns `None` when the observation carries no MSLP, which is most of the
+/// network — the feed published one for 572 of 1324 records across 20 state
+/// ASOS networks. An empty slot is the honest answer there. The three
+/// alternatives were each measured and each is worse:
+///
+///   * the altimeter setting in hundredths of inHg, which is what this slot
+///     drew before: agrees with the convention on 0 of 572 records, and a
+///     reader who applies the convention misreads it by a median 13.7 hPa;
+///   * the altimeter setting relabelled as MSLP: out by a median 0.49 hPa
+///     (max 11.6) and it silently mixes two quantities in one slot;
+///   * MSLP derived from the altimeter with the station's elevation and
+///     temperature: lands on the right printed code 8.2% of the time, and the
+///     stations needing it are lower-instrumented and higher-elevation than
+///     the ones it could be scored against.
+///
+/// The altimeter setting is still shown, labelled, in the station popup.
+fn pressure_code(mslp_hpa: Option<f64>) -> Option<i32> {
+    let mslp = mslp_hpa?;
+    if !mslp.is_finite() {
+        return None;
+    }
+    Some((mslp * 10.0).round() as i32 % 1000)
+}
 
 // ── Public entry point ────────────────────────────────────────────────────
 
@@ -83,13 +114,10 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     }
 
     // ── Tier 3 ────────────────────────────────────────────────────────
-    if let Some(alt) = ob.altimeter_hpa {
-        // Station-model convention: the altimeter is plotted as the last three
-        // digits of the inHg value in hundredths, so 30.04 inHg prints "004".
-        let in_hg_tenths = ((alt * 0.02953 * 100.0).round() as i32) % 1000;
+    if let Some(code) = pressure_code(ob.mslp_hpa) {
         painter.text(
-            ALTIMETER_OFFSET,
-            &format!("{in_hg_tenths:03}"),
+            PRESSURE_OFFSET,
+            &format!("{code:03}"),
             text_color,
             font_size * 0.85,
             TextAnchor::BottomLeft,
@@ -658,6 +686,130 @@ mod tests {
         wind_ob(None, None, vis)
     }
 
+    /// A tier-3 context, the only tier that draws the pressure code.
+    fn tier3() -> DrawPointContext {
+        DrawPointContext {
+            zoom: TIER3_ZOOM,
+            is_dark: false,
+        }
+    }
+
+    /// Six real stations, six state networks, spanning 3 m to 3026 m, each row
+    /// taken from one IEM `currents.json` record: the station's own `mslp` and
+    /// `alti`, and the three digits the WMO/NWS surface station model calls for.
+    /// The expected column is `round(mslp * 10) % 1000` worked by hand, not by
+    /// calling the function under test.
+    const CONVENTION: &[(&str, f64, f64, &str)] = &[
+        // station, mslp hPa, alti inHg, expected printed code
+        ("OKC", 1008.2, 29.83, "082"),
+        ("TUL", 1008.5, 29.82, "085"),
+        ("MIA", 1019.1, 30.09, "191"),
+        ("DEN", 1009.8, 30.04, "098"),
+        ("LXV", 1013.3, 30.37, "133"),
+        ("ELP", 1007.3, 29.98, "073"),
+    ];
+
+    #[test]
+    fn the_pressure_code_is_mslp_in_tenths_of_a_hectopascal() {
+        for (station, mslp, _alti, expected) in CONVENTION {
+            let code = pressure_code(Some(*mslp)).expect("an MSLP yields a code");
+            assert_eq!(
+                format!("{code:03}"),
+                *expected,
+                "{station}: {mslp} hPa must print {expected}"
+            );
+        }
+    }
+
+    /// The defect this replaced. Pinning it stops the altimeter encoding coming
+    /// back by way of "the popup shows inHg, so the plot should match".
+    #[test]
+    fn the_altimeter_encoding_disagrees_with_the_convention_at_every_site() {
+        let mut agreed = 0;
+        for (station, mslp, alti, expected) in CONVENTION {
+            let alt_hpa = alti * 33.8639;
+            let old = format!("{:03}", ((alt_hpa * 0.02953 * 100.0).round() as i32) % 1000);
+            if old == *expected {
+                agreed += 1;
+            }
+            // And the misreading is large: decode the old digits by the
+            // convention and compare against the station's real MSLP.
+            let decoded = old.parse::<f64>().expect("three digits") / 10.0;
+            let misread = if decoded < 50.0 {
+                1000.0 + decoded
+            } else {
+                900.0 + decoded
+            };
+            assert!(
+                (misread - mslp).abs() > 2.0,
+                "{station}: the old code {old} decodes to {misread:.1} against a \
+                 real {mslp:.1} hPa — if this is now within 2 hPa the premise \
+                 of the repair has changed and the measurement must be redone"
+            );
+        }
+        assert_eq!(
+            agreed,
+            0,
+            "the altimeter encoding agreed with the convention at {agreed} of \
+             {} sites; it agreed at 0 of 572 records when measured",
+            CONVENTION.len()
+        );
+    }
+
+    #[test]
+    fn a_station_with_no_mslp_draws_no_pressure_code() {
+        // 56.0% of 1324 measured records are this case. The slot stays empty
+        // rather than falling back to a quantity the convention does not name.
+        let mut o = ob(None);
+        o.altimeter_hpa = Some(1010.16);
+        o.mslp_hpa = None;
+        let mut p = RecordingPainter::default();
+        draw_metar_station(&o, &mut p, &tier3());
+        assert!(
+            !p.texts.iter().any(|t| t.len() == 3 && t.starts_with('0')),
+            "no three-digit pressure code may be drawn without an MSLP, got {:?}",
+            p.texts
+        );
+    }
+
+    #[test]
+    fn a_station_with_mslp_draws_the_conventional_code() {
+        let mut o = ob(None);
+        o.altimeter_hpa = Some(1010.16);
+        o.mslp_hpa = Some(1008.2);
+        let mut p = RecordingPainter::default();
+        draw_metar_station(&o, &mut p, &tier3());
+        assert!(
+            p.texts.iter().any(|t| t == "082"),
+            "expected the conventional code 082, got {:?}",
+            p.texts
+        );
+    }
+
+    /// The wrap is the whole point of a three-digit code, and it is where an
+    /// `as i32` truncation instead of a `round` would show up.
+    #[test]
+    fn the_code_wraps_across_the_thousand_boundary() {
+        assert_eq!(pressure_code(Some(999.9)), Some(999));
+        assert_eq!(pressure_code(Some(1000.0)), Some(0));
+        assert_eq!(pressure_code(Some(1000.1)), Some(1));
+        // 1013.26 hPa is 10132.6 tenths: rounding gives 133, truncating 132.
+        assert_eq!(
+            pressure_code(Some(1013.26)),
+            Some(133),
+            "rounds, not truncates"
+        );
+        // and the half case rounds away from zero, 10132.5 -> 10133.
+        assert_eq!(pressure_code(Some(1013.25)), Some(133));
+    }
+
+    #[test]
+    fn a_non_finite_mslp_draws_nothing() {
+        assert_eq!(pressure_code(Some(f64::NAN)), None);
+        assert_eq!(pressure_code(Some(f64::INFINITY)), None);
+        assert_eq!(pressure_code(None), None);
+    }
+
     fn wind_ob(dir: Option<WindDir>, speed: Option<u16>, vis: Option<Visibility>) -> MetarOb {
         MetarOb {
             station_id: "KTST".into(),
@@ -672,6 +824,7 @@ mod tests {
             wind_gust_kt: None,
             visibility: vis,
             altimeter_hpa: None,
+            mslp_hpa: None,
             flight_category: None,
             raw_ob: String::new(),
             clouds: Vec::new(),

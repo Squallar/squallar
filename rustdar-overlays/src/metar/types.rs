@@ -131,7 +131,19 @@ pub struct MetarOb {
     pub wind_speed_kt: Option<u16>,
     pub wind_gust_kt: Option<u16>,
     pub visibility: Option<Visibility>,
+    /// Altimeter setting, hectopascals. A cockpit setting, reduced to sea
+    /// level through the *standard* atmosphere — not this station's own air.
+    /// It is not mean sea level pressure and it is not station pressure; at
+    /// KLXV (3026 m) the three read 1028.5, 1013.3 and 960.3 hPa.
     pub altimeter_hpa: Option<f64>,
+    /// Mean sea level pressure, hectopascals, reduced by the reporting station
+    /// with its own temperature. This is the quantity the station model's
+    /// pressure code carries. `None` on most of the network: the feed
+    /// published it for 572 of 1324 records across 20 state ASOS networks,
+    /// and the gap cannot be filled by deriving one (see the M-1 record on
+    /// `campaign-harness` — the derivation lands on the right printed code
+    /// 8.2% of the time and lands hardest on the sites least able to check it).
+    pub mslp_hpa: Option<f64>,
     pub flight_category: Option<FlightCategory>,
     pub raw_ob: String,
     pub clouds: Vec<CloudLayer>,

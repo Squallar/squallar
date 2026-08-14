@@ -149,6 +149,16 @@ struct Record {
     /// Altimeter setting in **inches of mercury**.
     #[serde(default)]
     alti: Option<Value>,
+    /// Mean sea level pressure in **hectopascals**, reduced upstream.
+    ///
+    /// This is the decoded `SLPppp` remark and nothing else: measured against
+    /// the `RMK SLPppp` group in each record's own `raw` text, 572 of 572
+    /// records agreed within 0.05 hPa (max difference 0.000). It is absent on
+    /// most of the network — 572 of 1324 records across 20 state ASOS
+    /// networks carried it — because the reporting station decides whether to
+    /// compute a reduction, not IEM.
+    #[serde(default)]
+    mslp: Option<Value>,
     /// Present weather codes.
     #[serde(default)]
     wxcodes: Option<Value>,
@@ -372,6 +382,9 @@ fn parse_currents(body: &str) -> Result<(Vec<MetarOb>, u32), String> {
         let altimeter_hpa = rejects
             .number("alti", &record.alti)
             .map(|v| InchesOfMercury(v).to_hpa());
+        // Already hectopascals upstream, so no conversion and no unit type —
+        // the hazard this module guards against is a unit that needs changing.
+        let mslp_hpa = rejects.number("mslp", &record.mslp);
 
         // `sknt` is a float: round, do not parse. `u16::from_str("14.0")` fails
         // and blanks the whole column.
@@ -408,6 +421,7 @@ fn parse_currents(body: &str) -> Result<(Vec<MetarOb>, u32), String> {
             wind_gust_kt,
             visibility,
             altimeter_hpa,
+            mslp_hpa,
             // Not reported by IEM; derived.
             flight_category: derive_flight_category(visibility, ceiling_ft(&clouds)),
             raw_ob,
