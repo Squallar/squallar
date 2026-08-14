@@ -18,6 +18,7 @@ struct LevelSpec {
     lat: &'static str,
     lon: &'static str,
     time_offset: &'static str,
+    energy: &'static str,
 }
 
 const LEVELS: [LevelSpec; 3] = [
@@ -26,18 +27,21 @@ const LEVELS: [LevelSpec; 3] = [
         lat: "flash_lat",
         lon: "flash_lon",
         time_offset: "flash_time_offset_of_first_event",
+        energy: "flash_energy",
     },
     LevelSpec {
         name: "group",
         lat: "group_lat",
         lon: "group_lon",
         time_offset: "group_time_offset",
+        energy: "group_energy",
     },
     LevelSpec {
         name: "event",
         lat: "event_lat",
         lon: "event_lon",
         time_offset: "event_time_offset",
+        energy: "event_energy",
     },
 ];
 
@@ -49,6 +53,17 @@ struct Counts {
     levels: usize,
     levels_all_dropped: usize,
     levels_any_dropped: usize,
+    /// NON-TRIVIALITY CONTROL 1. `None`s in the *energy* column, which the
+    /// product fills with `_FillValue = -1s`. A non-zero count proves the
+    /// `_FillValue` -> `None` machinery in `cf::unpack` fires on *this* data,
+    /// so a zero on lat/lon/time is a property of the data and not a reader
+    /// that never marks anything missing.
+    fill_in_energy: usize,
+    /// NON-TRIVIALITY CONTROL 2. The `off_globe` branch re-run against a
+    /// deliberately impossible band (lat within +/-1 deg). A large count proves
+    /// the drop branch is reachable and reported, so a zero on the real
+    /// predicate is a measurement rather than dead code.
+    off_narrow_band: usize,
 }
 
 impl Counts {
@@ -59,6 +74,8 @@ impl Counts {
         self.levels += o.levels;
         self.levels_all_dropped += o.levels_all_dropped;
         self.levels_any_dropped += o.levels_any_dropped;
+        self.fill_in_energy += o.fill_in_energy;
+        self.off_narrow_band += o.off_narrow_band;
     }
 }
 
@@ -72,13 +89,25 @@ fn measure_granule(bytes: &[u8]) -> Result<Vec<(String, Counts)>, String> {
         };
         let lons = VarSource::read_unpacked(&g, spec.lon)?.ok_or("no lon")?;
         let times = VarSource::read_unpacked(&g, spec.time_offset)?.ok_or("no time")?;
+        // Read as the parser does: `*_energy` is a *required* column, so a level
+        // without one fails outright and its records are a level failure, never
+        // a record drop. Excluding it here keeps the denominator honest.
+        let energies = VarSource::read_unpacked(&g, spec.energy)?.ok_or("no energy")?;
         let count = lats.values.len();
+        // The parser's length check: a short column fails the level, so those
+        // records never reach the drop predicates either.
+        if lons.values.len() != count || times.values.len() != count {
+            return Err(format!("{}: column length mismatch", spec.name));
+        }
         let mut c = Counts {
             total: count,
             levels: 1,
             ..Counts::default()
         };
         for i in 0..count {
+            if energies.values.get(i).copied().flatten().is_none() {
+                c.fill_in_energy += 1;
+            }
             let (Some(lat), Some(lon), Some(_off)) =
                 (lats.values[i], lons.values[i], times.values[i])
             else {
@@ -86,6 +115,9 @@ fn measure_granule(bytes: &[u8]) -> Result<Vec<(String, Counts)>, String> {
                 continue;
             };
             let lon = normalize_longitude(lon);
+            if !(-1.0..=1.0).contains(&lat) {
+                c.off_narrow_band += 1;
+            }
             if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
                 c.off_globe += 1;
             }
@@ -117,7 +149,10 @@ fn measure_record_drops_over_real_granules() {
 
     let mut grand = Counts::default();
     let mut grand_files = 0usize;
-    println!("site,granules,level,records,missing,off_globe,levels,levels_any_dropped");
+    println!(
+        "site,granules,level,records,missing,off_globe,levels,levels_any_dropped,\
+         CTL_fill_in_energy,CTL_off_narrow_band"
+    );
     for site in &sites {
         let mut files: Vec<_> = std::fs::read_dir(site)
             .expect("read site")
@@ -142,7 +177,7 @@ fn measure_record_drops_over_real_granules() {
         for (name, c) in &per_level {
             grand.add(*c);
             println!(
-                "{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{}",
                 site.file_name().unwrap().to_string_lossy(),
                 files.len(),
                 name,
@@ -151,6 +186,8 @@ fn measure_record_drops_over_real_granules() {
                 c.off_globe,
                 c.levels,
                 c.levels_any_dropped,
+                c.fill_in_energy,
+                c.off_narrow_band,
             );
         }
     }
@@ -159,5 +196,20 @@ fn measure_record_drops_over_real_granules() {
          levels={} levels_any_dropped={} levels_all_dropped={}",
         grand.total, grand.missing, grand.off_globe, grand.levels, grand.levels_any_dropped,
         grand.levels_all_dropped,
+    );
+    println!(
+        "# CONTROLS fill_in_energy={} off_narrow_band={} (both must be > 0, or the \
+         zero above is vacuous)",
+        grand.fill_in_energy, grand.off_narrow_band,
+    );
+    assert!(
+        grand.fill_in_energy > 0,
+        "CONTROL 1 FAILED: no _FillValue reached `values` as None anywhere in the \
+         corpus, so a zero on lat/lon/time proves nothing about the data",
+    );
+    assert!(
+        grand.off_narrow_band > 0,
+        "CONTROL 2 FAILED: the coordinate-drop branch never fired even against an \
+         impossible band, so it is dead code and the zero above is vacuous",
     );
 }
