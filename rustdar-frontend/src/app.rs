@@ -273,7 +273,9 @@ pub struct App {
     /// from it.
     ///
     /// Loop frames are not in here. They have their own cache and their own
-    /// bound — see `LoopDownloadManager` and `MAX_LOOP_FRAMES`.
+    /// bound — `LoopDownloadManager`, swept by
+    /// [`evict_unneeded_loop_scans`](Self::evict_unneeded_loop_scans) against
+    /// the frames the live loops name, which `MAX_LOOP_FRAMES` caps.
     ///
     /// # Why the table rides beside the volume
     ///
@@ -2580,6 +2582,119 @@ impl App {
         crate::offload::discard_each(
             "evicted-cached-volume",
             evicted(&mut self.latest_cached_scans, &unshown),
+        );
+        self.evict_unneeded_loop_scans();
+    }
+
+    /// Drop the loop cache's decoded volumes no live loop frame names.
+    ///
+    /// # The fourth holder of whole volumes, and the one nothing bounded
+    ///
+    /// `LoopDownloadManager::scan_cache` holds one `Arc<Scan>` per
+    /// `(site, timestamp)`, written by `append_scan_to_active_loops` on every
+    /// auto-poll and every completed live volume, and by the loop download
+    /// path. Nothing removed an entry: loop-frame eviction retires a pane's
+    /// *frame*, `clear_all` fires only when a pane leaves a radar, and the loop
+    /// pool's byte budget counts texture bytes, so these CPU-side volumes sat
+    /// outside every budget in the workspace. A pane parked on a live radar
+    /// accumulated 0.4–1 GB an hour, unbounded — fatal inside wasm32's 4 GiB
+    /// address space, and an OOM rather than a leak on a handheld.
+    ///
+    /// # Needs-based retention, not a window and not an LRU
+    ///
+    /// The retention set is the union of `(ls.site, frame.timestamp)` over every
+    /// **active** pane loop, and that set is exact rather than approximate:
+    /// every reader of the cache — `frame_data`, `frame_sweep`, `frame_section`,
+    /// [`Self::extract_loop_volume`] and a sibling's `own_sweep` — resolves
+    /// through a loop frame's timestamp against the loop's own site. An entry
+    /// no frame names is an entry nothing can ask for.
+    ///
+    /// `frame_gates` is the one reader that asks with a *response's* timestamp
+    /// rather than a frame's, and it needs no exception: a response naming a
+    /// frame the window has since retired is refused by `accept_render_result`
+    /// — which resolves the frame before the gates are used at all — so the
+    /// `None` it now answers changes nothing. A response whose frame is still
+    /// there names an entry the set holds, on either the origin's loop or a
+    /// broadcast sibling's, because `is_rendered_for` already ties the
+    /// receiver's own site to the one in the result.
+    ///
+    /// The two rules that look cheaper are both wrong here:
+    ///
+    /// * A **wall-clock window** would evict a historic loop's entire working
+    ///   set. `begin_loop_for_pane` anchors the window at the pane's *viewed*
+    ///   scan, not at now, so a loop parked on last week's storm holds frames a
+    ///   clock-anchored rule calls stale — every one of them.
+    /// * A **byte-LRU** may evict an entry a live frame still names, and that
+    ///   frame's dispatch immediately re-requests it: permanent refetch churn,
+    ///   over a network, on the loop the user is watching.
+    ///
+    /// # The site is the loop's own, not the pane's
+    ///
+    /// `LoopPlaybackState::site` is the geometry site captured at loop
+    /// creation, and it is the site downloads file under —
+    /// `begin_loop_for_pane` builds both from one `scan_info.site`. `pane.site`
+    /// is re-synced across panes without their loops being rebuilt, so keying
+    /// on it would name a site whose entries this cache does not hold and let
+    /// the ones it does hold go.
+    ///
+    /// # The grace rule
+    ///
+    /// A loop in `LoopPhase::FetchingScanList` has no frames yet — its listing
+    /// is in flight — so its site is skipped whole. Without it, every product
+    /// switch and every loop re-init would evict its own window in the gap
+    /// before the new listing installs frames, and re-download all of it. That
+    /// is the contract `begin_loop_for_pane` states as "the scan cache is
+    /// global and deliberately kept" across the rebuild it performs, and this
+    /// is what preserves it now that the cache is swept at all.
+    ///
+    /// The exemption is **bounded by one listing round-trip**, which is what
+    /// stops it from being a hole the leak comes back through: a listing that
+    /// succeeds installs frames, and one that fails arrives as an empty list
+    /// that `accept_scan_listing` answers by switching the loop off. There is
+    /// no path that leaves a pane in `FetchingScanList` indefinitely, so no
+    /// site is exempt indefinitely.
+    fn evict_unneeded_loop_scans(&mut self) {
+        // Borrowed from `self.gui` and read against `self.loop_mgr`: two
+        // disjoint fields, so no clone of a site name is needed per frame.
+        //
+        // Nested by site rather than a flat set of `(site, timestamp)` pairs,
+        // and not for tidiness: the predicate is handed a `&str` borrowed from
+        // the cache's own key, which is shorter-lived than these, and a tuple
+        // key would need it to outlive them. A map keyed on `&str` is looked up
+        // through `Borrow<str>` and takes any lifetime.
+        let mut needed: HashMap<&str, std::collections::HashSet<chrono::NaiveDateTime>> =
+            HashMap::new();
+        let mut settling: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane(idx) else {
+                continue;
+            };
+            let ls = &pane.loop_state;
+            if !ls.is_active() {
+                continue;
+            }
+            if ls.is_fetching() {
+                settling.insert(ls.site.as_str());
+            }
+            let frames = needed.entry(ls.site.as_str()).or_default();
+            for frame in &ls.frames {
+                frames.insert(frame.timestamp);
+            }
+        }
+        // Handed over rather than freed here, for the reason the three maps
+        // above are — and with the same caveat, which is larger on this path:
+        // a loop frame's volume is very often the same `Arc<Scan>` the pane's
+        // still image is drawn from, so a hand-over whose twin is still in
+        // `scan_data` or `base_scans` decrements a refcount and frees nothing.
+        // That is the correct outcome, not a shortfall: whichever holder turns
+        // out to hold the last handle pays the deep free, and it is paid
+        // off-frame only if every holder hands its own over.
+        crate::offload::discard_each(
+            "evicted-loop-volume",
+            self.loop_mgr.retain_scans(|site, ts| {
+                settling.contains(site)
+                    || needed.get(site).is_some_and(|frames| frames.contains(ts))
+            }),
         );
     }
 
