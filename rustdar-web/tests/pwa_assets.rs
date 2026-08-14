@@ -10,7 +10,7 @@
 //! policy could be deleted outright and everything here would still pass.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rustdar_radar::sources::DataSources;
@@ -697,4 +697,273 @@ fn the_frame_arm_of_the_worker_reply_is_unchanged() {
          IMAGE/POLAR/MAX_RANGE/NYQUIST and nothing else, and a reply carrying \
          both leaves the page arbitrating between two outputs for one job"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the reply's shape, read off the source rather than restated
+// ---------------------------------------------------------------------------
+//
+// Everything above enumerates *names it expects to find*, which catches a
+// deletion and is blind to an addition: the three tests before this one all
+// stayed green through a version-7 reply that wrote two fields no list here
+// mentioned. What follows extracts the whole set instead, so a field nobody
+// added to a list is a field that fails.
+
+/// `ident -> wire key` for every `pub const <NAME>: &str = "<key>";` in
+/// `worker_protocol.rs` — the vocabulary a message may be built out of.
+///
+/// The declarations are the whole specification of this boundary. There is no
+/// serde on it: both directions build a bare `js_sys::Object` and set fields on
+/// it by name, so no type anywhere binds a reply's shape and nothing but a read
+/// of this source can say what the shape is.
+fn worker_protocol_vocabulary() -> BTreeMap<String, String> {
+    let src = without_line_comments(WORKER_PROTOCOL);
+    let mut out = BTreeMap::new();
+    for line in src.lines() {
+        let Some(rest) = line.trim().strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((ident, rest)) = rest.split_once(": &str = \"") else {
+            continue;
+        };
+        let Some((key, _)) = rest.split_once('"') else {
+            continue;
+        };
+        out.insert(ident.to_string(), key.to_string());
+    }
+    assert!(
+        !out.is_empty(),
+        "no `pub const <NAME>: &str = \"...\";` declarations found in \
+         worker_protocol.rs. The field names moved or changed form, and every \
+         extraction below is now reading nothing and would pass on an empty \
+         set — fix this helper before trusting anything under it."
+    );
+    out
+}
+
+/// The `PROTOCOL_VERSION` literal, as a number.
+fn declared_protocol_version() -> u32 {
+    let src = without_line_comments(WORKER_PROTOCOL);
+    let rest = src
+        .split_once("const PROTOCOL_VERSION: u32 = ")
+        .expect("worker_protocol.rs no longer declares PROTOCOL_VERSION: u32")
+        .1;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("PROTOCOL_VERSION is not a plain decimal literal")
+}
+
+/// `post_result`'s body, cut at the `post_message` that ends it so the only
+/// `&message` left in it belongs to a `set_field`.
+fn post_result_body() -> String {
+    let src = without_line_comments(RASTER_WORKER_RS);
+    src.split_once("fn post_result(")
+        .expect("worker.rs no longer has a post_result")
+        .1
+        .split_once("scope.post_message_with_transfer")
+        .expect("post_result no longer ends by posting the message it built")
+        .0
+        .to_string()
+}
+
+/// That body split into the three places a field can be written: before the
+/// match, in the `Frame` arm, in the arm that carries everything else.
+///
+/// The same three slices the tests above take, by the same markers. The `None`
+/// arm falls in no slice because it writes nothing; if it ever writes something
+/// the call-site count in
+/// [`the_worker_reply_shape_is_the_one_this_protocol_version_declares`] is what
+/// notices, which is the point of counting.
+fn post_result_arms() -> Vec<(&'static str, String)> {
+    let body = post_result_body();
+    let (head, tail) = body
+        .split_once("match result {")
+        .expect("post_result no longer matches on the result");
+    let (frame, out) = tail
+        .split_once("Some(JobOutput::Frame(RenderedFrame {")
+        .expect("post_result no longer has a Frame arm")
+        .1
+        .split_once("Some(output) => {")
+        .expect("the Frame arm is no longer followed by the out-of-band arm");
+    vec![
+        ("head", head.to_string()),
+        ("frame", frame.to_string()),
+        ("out", out.to_string()),
+    ]
+}
+
+/// The key argument of every `set_field(&message, <KEY>, ..)` in one slice, in
+/// source order.
+///
+/// Reads the *argument*, not every `proto::` token: `KIND`'s value is
+/// `proto::DONE`, and a token scan would call that a field.
+fn message_field_idents(arm: &str) -> Vec<String> {
+    arm.split("&message,")
+        .skip(1)
+        .filter_map(|chunk| {
+            let rest = chunk.trim_start().strip_prefix("proto::")?;
+            Some(
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The shape of a `done` reply, whole, pinned against the version that declares
+/// it.
+///
+/// # What was blind, exactly
+///
+/// `the_worker_protocol_version_is_the_one_these_shapes_ship` asserts that
+/// `PROTOCOL_VERSION` is 7. It fires for someone who bumps the number and
+/// forgets this file — the harmless direction. The direction that ships a
+/// defect is the inverse: change what a reply carries, leave the number alone,
+/// and a page from one side of a deploy and a worker from the other exchange a
+/// message one of them cannot read, with `build_token` reporting a match. That
+/// is the failure the number exists to prevent, and nothing checked it. The
+/// three enumerations above are no help: each is a list of names it expects to
+/// *find*, so a reply that grows a field passes all of them.
+///
+/// # Why a list and not a digest
+///
+/// A hash of the shape would be exactly as binding and would say nothing. This
+/// list makes the diff of a shape change read `+ "frame | HAIL_SIZE | hsz"`
+/// beside `- "PROTOCOL_VERSION = 7"`, which is the sentence the author needs to
+/// see, and it stays greppable: the wire key of any field is findable from
+/// here.
+///
+/// # Why a source scrape
+///
+/// `worker_protocol` and `worker` are both `#[cfg(target_arch = "wasm32")]`, so
+/// nothing a host `cargo test` compiles can name `post_result` or
+/// `PROTOCOL_VERSION`, and the wasm CI rows are `wasm-pack build` and
+/// `cargo check` — neither runs a test. There is no `wasm-bindgen-test` in this
+/// workspace. Reading the source is the only instrument available, and the
+/// tests above already do it.
+///
+/// # What this does not cover
+///
+/// The page→worker `job` direction, and the `hello`/`fatal` messages. Those are
+/// built elsewhere and are as unbound as this one was.
+#[test]
+fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
+    let vocabulary = worker_protocol_vocabulary();
+    let arms = post_result_arms();
+
+    let mut shape = vec![format!("PROTOCOL_VERSION = {}", declared_protocol_version())];
+    let mut written = Vec::new();
+    for (arm, slice) in &arms {
+        for ident in message_field_idents(slice) {
+            let key = vocabulary.get(&ident).unwrap_or_else(|| {
+                panic!(
+                    "post_result's {arm} writes proto::{ident}, which is not a \
+                     `pub const <NAME>: &str` in worker_protocol.rs. Every field \
+                     on this wire is named by a constant there; a key that is \
+                     not is one the page has no name for either."
+                )
+            });
+            written.push(format!("{arm} | {ident} | {key}"));
+        }
+    }
+    written.sort();
+    shape.extend(written.iter().cloned());
+
+    // A `set_field` the extractor above did not recognise — a different target
+    // than `&message`, a key that is not a `proto::` path — would otherwise be
+    // silently skipped, and a guard with a hole in it is worse than none
+    // because it reads green over the hole.
+    let call_sites = post_result_body().matches("proto::set_field(").count();
+    assert_eq!(
+        call_sites,
+        written.len(),
+        "post_result makes {call_sites} set_field calls but only {} of them \
+         were recognised as `set_field(&message, proto::NAME, ..)`. The \
+         unrecognised ones are invisible to the shape below, so fix the \
+         extraction (or the call) before reading its verdict.",
+        written.len()
+    );
+
+    assert_eq!(
+        shape,
+        [
+            "PROTOCOL_VERSION = 7",
+            "frame | IMAGE | image",
+            "frame | MAX_RANGE | range",
+            "frame | MELTING_LAYER | mls",
+            "frame | NYQUIST | nyq",
+            "frame | POLAR | polar",
+            "frame | STORM_MOTION | smv",
+            "frame | STORM_MOTION_DIR | smd",
+            "frame | STORM_MOTION_SPEED | sms",
+            "head | ID | id",
+            "head | IMAGE | image",
+            "head | KIND | kind",
+            "head | MAX_RANGE | range",
+            "head | MELTING_LAYER | mls",
+            "head | NYQUIST | nyq",
+            "head | OUT | out",
+            "head | OUT_KIND | outkind",
+            "head | POLAR | polar",
+            "head | STORM_MOTION | smv",
+            "head | STORM_MOTION_DIR | smd",
+            "head | STORM_MOTION_SPEED | sms",
+            "out | OUT | out",
+            "out | OUT_KIND | outkind",
+        ]
+        .map(str::to_string),
+        "the shape of a `done` reply is not the shape PROTOCOL_VERSION says it \
+         is. Left is what worker.rs and worker_protocol.rs say today; right is \
+         what this list was last told.\n\n\
+         If a wire key appeared or disappeared: bump PROTOCOL_VERSION in \
+         worker_protocol.rs FIRST, then update this list to match — in that \
+         order, because the number is the thing a page and a worker from \
+         opposite sides of a deploy actually compare, and a list brought into \
+         line without it leaves this test green over exactly the mismatch it \
+         exists to catch.\n\n\
+         If the wire keys are unchanged and only an arm moved — a field \
+         defaulted before the match that used to be written inside one arm — \
+         then both halves still read the same message, the version stands, and \
+         only this list moves."
+    );
+}
+
+/// Every field an arm writes is also written before the match.
+///
+/// This is the invariant `post_result` states in prose over its default block:
+/// *written first and overwritten by the arm that has one, so no path out of
+/// this function can leave a field absent*. An arm that writes a field the
+/// defaults do not breaks it, and breaks it quietly — the page reads an absent
+/// field and a null one through the same `as_f64` filter, so the reply that
+/// omits one is indistinguishable from the reply that says "none" until some
+/// later reader stops being lenient about the difference.
+///
+/// It is a derived check and needs no list: the two sets come out of the same
+/// extraction the shape test uses. `smv`'s speed and direction were written on
+/// the `Frame` arm and nowhere else, which is what this catches.
+#[test]
+fn no_arm_of_the_worker_reply_writes_a_field_the_defaults_do_not() {
+    let arms = post_result_arms();
+    let defaults: BTreeSet<String> = arms
+        .iter()
+        .find(|(arm, _)| *arm == "head")
+        .map(|(_, slice)| message_field_idents(slice).into_iter().collect())
+        .expect("post_result no longer has a block before the match");
+
+    for (arm, slice) in arms.iter().filter(|(arm, _)| *arm != "head") {
+        for ident in message_field_idents(slice) {
+            assert!(
+                defaults.contains(&ident),
+                "post_result's {arm} arm writes proto::{ident}, and the block \
+                 before the match does not. Every other path out of this \
+                 function therefore posts a reply with that field absent \
+                 rather than null, against the invariant stated over that \
+                 block. Add `proto::set_field(&message, proto::{ident}, \
+                 &JsValue::NULL);` there."
+            );
+        }
+    }
 }
