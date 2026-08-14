@@ -499,14 +499,20 @@ impl PolarField {
     /// `rustdar_web`'s protocol token already refuses a worker built from
     /// different source.
     ///
-    /// **That token is the only thing standing behind this layout, and the
-    /// guard beside it does not cover this function.**
+    /// **The guard in `rustdar_web` does not cover this function, and the one
+    /// that does is
+    /// `tests::the_polar_wire_layout_is_the_one_this_protocol_ships`.**
     /// `rustdar_web`'s `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
     /// scrapes the *field names* of the worker's reply object, so it fires when
     /// a reply grows or loses a field. These bytes travel **inside** one of
     /// those fields, so changing this encoding leaves the field set identical
-    /// and the guard silent. Whoever edits this function must bump
-    /// `PROTOCOL_VERSION` by hand; the mismatch it prevents is a page and a
+    /// and that guard silent — measured: the header grew an `f64` at protocol
+    /// version 8 and it did not fire. The digest test beside this module pins
+    /// the bytes themselves, so an edit here goes red; what it *cannot* do is
+    /// check that `PROTOCOL_VERSION` was raised, because that constant is
+    /// `#[cfg(target_arch = "wasm32")]` in a crate downstream of this one.
+    /// Whoever edits this function still bumps it by hand, and the digest is
+    /// what makes sure they are asked. The mismatch it prevents is a page and a
     /// worker on opposite sides of a deploy exchanging a buffer they lay out
     /// differently. `from_bytes` length-checks would turn most such pairs into
     /// `None` and a quiet readout rather than a wrong one, but "degrades

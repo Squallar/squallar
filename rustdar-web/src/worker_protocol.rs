@@ -175,10 +175,21 @@ pub const OUT_KIND: &str = "outkind";
 /// change, so `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
 /// — which scrapes field names out of `worker.rs` — cannot see it and did not
 /// fire. **A change to `PolarField::to_bytes`'s layout has to be bumped here by
-/// hand.** Mismatched halves would mostly fail `from_bytes`'s length checks and
-/// answer `None`, so the readout would go quiet rather than lie; but "degrades
-/// quietly" is the exact failure this number exists to convert into a clean
-/// termination, which is the argument versions 3, 4 and 6 were each landed on.
+/// hand** — but it is no longer *unwatched*: `rustdar_radar`'s
+/// `render::polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships`
+/// digests the bytes that encoder produces over a fixture built from literals,
+/// so an edit to the layout goes red and its message names this constant. What
+/// it cannot check is that the bump happened, because this constant is
+/// `wasm32`-only in a crate downstream of that one. The same holds in the other
+/// direction for `rustdar_frontend`'s `JobRequest` framing, whose own digest is
+/// `offload::tests::the_job_framing_is_the_one_this_protocol_ships`, and for the
+/// decoded volume `OUT` carries under code 4, pinned by `rustdar_radar`'s
+/// `volume_wire::tests::the_volume_wire_layout_is_the_one_this_version_ships`
+/// against its own `VERSION`. Mismatched halves would mostly fail `from_bytes`'s
+/// length checks and answer `None`, so the readout would go quiet rather than
+/// lie; but "degrades quietly" is the exact failure this number exists to
+/// convert into a clean termination, which is the argument versions 3, 4 and 6
+/// were each landed on.
 const PROTOCOL_VERSION: u32 = 8;
 
 /// What the page and the worker compare before the page trusts the worker.

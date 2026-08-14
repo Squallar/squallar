@@ -828,7 +828,7 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 /// three enumerations above are no help: each is a list of names it expects to
 /// *find*, so a reply that grows a field passes all of them.
 ///
-/// # What this still cannot see
+/// # What this still cannot see, and what now sees it instead
 ///
 /// It watches the reply's **field set**, so it catches a field added, removed
 /// or renamed. It cannot catch a change to the *bytes inside* a field, because
@@ -836,11 +836,30 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 /// `rustdar_radar::render::polar::PolarField::to_bytes`, a hand-rolled layout
 /// whose header grew an `f64` at protocol version 8 without a single name here
 /// changing — this test passed, unmodified, across that change, and the bump
-/// was made by hand. That is a real gap and it is recorded here rather than in
-/// a commit message because this is where someone looks when they wonder what
-/// the guard covers. Closing it would mean scraping or pinning that encoding
-/// too; until then, a buffer-valued field is a place the author is on their
-/// own.
+/// was made by hand.
+///
+/// That gap is now covered by a digest rather than by this test, because a
+/// buffer's layout is not visible from a crate that cannot link the encoder.
+/// Each of the three codecs that crosses this port inside a buffer pins the
+/// bytes it produces over a fixture built from literals:
+///
+///   * `rustdar_radar::render::polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships`
+///     for `POLAR`;
+///   * `rustdar_radar::volume_wire::tests::the_volume_wire_layout_is_the_one_this_version_ships`
+///     for the decoded volume `OUT` carries under code 4 (`OUT`'s other two
+///     payloads, a section and a voxel grid, were already pinned by their own
+///     crates);
+///   * `rustdar_frontend::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
+///     for the page->worker direction named below.
+///
+/// Each was measured against an uncooperative regressor: a same-width field
+/// reorder made to encoder and decoder in step left every other test in its
+/// crate green (890 of 891 in `rustdar-radar`, 807 of 808 in
+/// `rustdar-frontend`) and these two guards here green as well, and only the
+/// digest fell over. None of them can check that `PROTOCOL_VERSION` was
+/// *raised* — it is `wasm32`-only and downstream of both crates — so what they
+/// buy is that the person who changes a layout is stopped and told what they
+/// owe, which is the direction that was missing.
 ///
 /// # Why a list and not a digest
 ///
@@ -861,8 +880,11 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///
 /// # What this does not cover
 ///
-/// The page→worker `job` direction, and the `hello`/`fatal` messages. Those are
-/// built elsewhere and are as unbound as this one was.
+/// The page→worker `job` direction and the `hello`/`fatal` messages. The `job`
+/// direction is a byte codec rather than a field set, and it is pinned by
+/// `rustdar_frontend`'s `the_job_framing_is_the_one_this_protocol_ships` — see
+/// above. `hello` and `fatal` are still built elsewhere and are as unbound as
+/// this one was.
 #[test]
 fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     let vocabulary = worker_protocol_vocabulary();
