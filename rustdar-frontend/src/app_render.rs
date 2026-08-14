@@ -1275,13 +1275,7 @@ impl super::App {
                 // `OverlayTextureCache` for the counter that used to be
                 // compared here and why it had to go rather than be renamed.
 
-                // The assignment below is what retires the texture this pane was
-                // showing: the replaced `OverlayTextureData` drops with it, and
-                // that is the whole of the cleanup. See the note in
-                // `App::apply_render_to_pane` for why no frame of deferral is
-                // needed — this is the path it costs the most on, because these
-                // are the full-viewport overlay rasters.
-                cache.show(OverlayTextureData {
+                let data = OverlayTextureData {
                     texture: texture.clone(),
                     geo_bounds: resp.geo_bounds,
                     data_generation: resp.generation,
@@ -1290,7 +1284,38 @@ impl super::App {
                     height,
                     radar_meta: None,
                     hit_map: resp.hit_map.clone(),
-                });
+                };
+                // **The swap, or the promise of one** — the overlay half of the
+                // rule `apply_render_to_pane` states for the radar raster, and
+                // held to it for the same reason: `load_texture` above minted a
+                // handle, not pixels on the GPU. Any image past the 8 MiB
+                // upload band crosses in bands over several frames, and until
+                // the last one lands the id draws as a transparent 1×1 stand-in
+                // (`texture_upload::seed`) — every phone-class viewport's
+                // overlay raster is past that band. Showing here is what made
+                // alert overlays vanish mid-zoom on such devices: the swap
+                // replaced a whole picture with frames of transparency.
+                //
+                // So a pane with a picture *holds* the new one, keeps drawing
+                // what it has — stretched or stale, but whole — and
+                // `promote_uploaded_rasters` swaps in one step once the last
+                // band lands. A pane with no picture shows the new one
+                // arriving: with no predecessor the hold protects nothing and
+                // costs the whole upload in latency (`PaneState::
+                // place_radar_raster` states the rule).
+                //
+                // Either branch retires what it replaces — `show` drops the
+                // previous `OverlayTextureData`, `hold` drops any older hold,
+                // whose bands `TextureUploads::free` then throws away — so a
+                // mid-gesture burst of renders cannot pile up: at most one on
+                // screen and one arriving, per kind per pane. See the note in
+                // `App::apply_render_to_pane` for why no frame of deferral is
+                // needed on the drop.
+                if cache.current().is_none() {
+                    cache.show(data);
+                } else {
+                    cache.hold(data, None);
+                }
             }
         }
     }
@@ -5045,3 +5070,11 @@ mod one_render_per_sweep_tests;
 #[path = "app_render/overlay_disable_race_tests.rs"]
 #[cfg(test)]
 mod overlay_disable_race_tests;
+
+/// The overlay half of the hold: a pane keeps the layer picture it has —
+/// alerts, outlooks — until the next one's pixels have all landed, the swap
+/// leaves the radar caption alone, and a renderer rebuild releases what it can
+/// never deliver.
+#[path = "app_render/overlay_hold_tests.rs"]
+#[cfg(test)]
+mod overlay_hold_tests;

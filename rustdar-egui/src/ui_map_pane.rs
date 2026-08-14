@@ -543,6 +543,12 @@ pub(super) fn render_pane_map_content(
         // multiplies by this for the 3D offscreen; the 2D path did not.
         let tex_plan =
             plan_overlay_texture(screen_rect, max_texture_side, ui.ctx().pixels_per_point());
+        // The frame's clock, for the settle test: `needs_rerender` calls the
+        // gesture settled once the zoom has been still for
+        // `SETTLE_REPAINT_DELAY` of this time — the same clock the
+        // `request_repaint_after` below schedules against, so the frame that
+        // repaint buys is a frame on which the settle can actually pass.
+        let now = ui.input(|i| i.time);
 
         // Whether any overlay on this pane is showing a texture rasterised at a
         // zoom other than the map's — i.e. whether a settle render is still owed.
@@ -563,15 +569,14 @@ pub(super) fn render_pane_map_content(
             let cache = ctx.pane.overlay_cache_mut(kind);
             // Asked on every frame the overlay is live, and *not* gated on
             // `render_in_flight` the way it used to be. `needs_rerender` is also
-            // what records the zoom it was shown, and it decides a gesture has
-            // settled by comparing two consecutive frames — so a frame skipped
-            // here is a frame missing from that comparison, and a gesture that
-            // ends while a render is in flight would take an extra frame to
-            // notice. The flight check moved to the dispatch below, where it
+            // what records the zoom it was shown and when it last moved — so a
+            // frame skipped here is a frame missing from the settle clock, and
+            // a gesture that ends while a render is in flight would take longer
+            // to notice. The flight check moved to the dispatch below, where it
             // belongs.
             let stale = enabled
                 && has_data
-                && cache.needs_rerender(token, zoom, &viewport_bounds, &tex_plan);
+                && cache.needs_rerender(token, zoom, now, &viewport_bounds, &tex_plan);
             if stale && !cache.render_in_flight {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,

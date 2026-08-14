@@ -2368,14 +2368,20 @@ impl PaneState {
         }
     }
 
-    /// Whether this pane is waiting on a raster's pixels to finish arriving.
+    /// Whether this pane is waiting on any raster's pixels to finish arriving.
     ///
     /// The frame loop's own term: the app runs on `ControlFlow::Wait`, so a pane
     /// holding a picture is a pane that has to be given the frames to finish
     /// arriving on and the frame to swap on. See `App::handle_redraw`.
+    ///
+    /// Over every overlay kind, not just the radar raster: any layer's texture
+    /// can be held now (see `OverlayTextureCache::held`), and a held alert
+    /// overlay that nothing wakes the loop for is a pane showing the previous
+    /// alert picture until some unrelated input happens by.
     pub fn is_holding_raster(&self) -> bool {
-        self.overlay_cache(OverlayKind::Radar)
-            .is_some_and(OverlayTextureCache::is_holding)
+        self.overlay_textures
+            .values()
+            .any(OverlayTextureCache::is_holding)
     }
 
     /// The id of the raster this pane is waiting on, if it is waiting on one.
@@ -2383,7 +2389,7 @@ impl PaneState {
         Some(self.overlay_cache(OverlayKind::Radar)?.held_texture()?.id())
     }
 
-    /// Let go of a raster that is still arriving, without showing it.
+    /// Let go of every raster that is still arriving, without showing any.
     ///
     /// For the one event that ends a hold the upload path will never end: a
     /// renderer rebuilt after suspend, resume or surface loss holds nothing for
@@ -2391,8 +2397,16 @@ impl PaneState {
     /// forever. `App::restore_cached_render` calls this on every pane before it
     /// re-uploads, including the panes it goes on to skip — a pane with no
     /// cached render is exactly a pane nothing else would come back for.
+    ///
+    /// Every kind's hold, not just the radar raster's, and for the same reason
+    /// [`Self::is_holding_raster`] asks about every kind: all of the held ids
+    /// belong to the context that died, so any one of them left standing keeps
+    /// `Gui::any_raster_held` true — and the event loop at refresh rate — for
+    /// the rest of the session, over a question whose answer cannot change.
     pub fn release_held_raster(&mut self) {
-        self.overlay_cache_mut(OverlayKind::Radar).release_hold();
+        for cache in self.overlay_textures.values_mut() {
+            cache.release_hold();
+        }
     }
 
     /// Show the raster this pane is holding, if every texel of it has landed.
@@ -2417,6 +2431,33 @@ impl PaneState {
         cache.show(held.data);
         self.data_time = held.data_time;
         true
+    }
+
+    /// Show every non-radar overlay picture this pane is holding whose pixels
+    /// have all landed.
+    ///
+    /// [`Self::promote_held_raster`]'s sibling for the layer textures — the
+    /// alert polygons, outlooks, county lines and the rest — which cross in
+    /// bands exactly as the radar raster does on any pane large enough (see
+    /// `OverlayTextureCache::held` for the sizes). The swap is the same one
+    /// step: the picture on screen stays whole until the question comes back
+    /// yes, then the held record goes up entire, bounds and hit map with it.
+    ///
+    /// Kept apart from the radar promotion rather than folded into it because
+    /// the radar swap writes one thing no layer texture has: the pane's
+    /// `data_time`, the caption dating the sweep on screen. A layer texture
+    /// has no pane-level caption — everything describing it travels inside its
+    /// own `OverlayTextureData` — so this sweep deliberately touches nothing
+    /// on the pane.
+    pub fn promote_held_overlays(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {
+        for (&kind, cache) in &mut self.overlay_textures {
+            if kind == OverlayKind::Radar {
+                continue;
+            }
+            if let Some(held) = cache.take_held_if_delivered(&delivered) {
+                cache.show(held.data);
+            }
+        }
     }
 
     /// Put a freshly placed raster on this pane — now, or when it is whole.
