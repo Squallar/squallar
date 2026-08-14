@@ -40,10 +40,15 @@ fn attach(accept: bool) -> Posted {
     posted
 }
 
-/// Every test shares one thread-local port and pending map, and `cargo
-/// test` runs them concurrently on separate threads — which is precisely
-/// why the state is thread-local. Each test still tears down so a panic
-/// mid-test cannot leak a port into the next one on the same thread.
+/// Leave this thread with no sink at all, so the funnel's `NoSink` arm — not
+/// the pool handle a native thread starts with — is what takes the next job.
+///
+/// The registry is **one map for the whole process** and `cargo test` runs
+/// these concurrently on separate threads, so what keeps one test from tearing
+/// down another's jobs is not the map: it is `Pending::sink`. Each `attach`
+/// takes a fresh sink id and `abandon_worker` fails only that id's jobs. Every
+/// test still tears down, so a panic mid-test cannot leak a port into the next
+/// one on the same thread.
 fn detach() {
     abandon_worker("test teardown");
 }
@@ -738,10 +743,15 @@ fn an_undecodable_level3_payload_renders_nothing() {
     );
 }
 
-/// With no worker installed, `offload_job` is the old behaviour: the job
-/// runs and `deliver` sees its result.
+/// With no sink installed, `offload_job` falls through to [`offload`] and
+/// `deliver` still sees the result.
+///
+/// That fallthrough is the browser-without-a-worker case, and it is the one
+/// path that stays inline: on a native thread [`offload`] hands the closure to
+/// the pool's opaque lane instead, which is why this asserts on the *result*
+/// arriving rather than on where it arrived from.
 #[test]
-fn without_a_worker_the_job_runs_here() {
+fn without_a_sink_the_job_still_runs_and_delivers() {
     detach();
     let (tx, rx) = mpsc::channel();
     offload_job("test", Job::Described(a_job()), move |result| {
@@ -750,9 +760,44 @@ fn without_a_worker_the_job_runs_here() {
     assert_eq!(
         rx.recv_timeout(std::time::Duration::from_secs(10)),
         Ok(true),
-        "the inline arm must deliver the rendered frame"
+        "the fallthrough arm must deliver the rendered frame"
     );
     assert_eq!(jobs_in_worker(), 0);
+}
+
+/// **The convergence, asserted where it is visible**: a native thread starts
+/// with a sink already installed, so a described job goes through the same
+/// registry, the same id space and the same `deliver_job_reply` the browser's
+/// worker replies through — and *not* through a thread spawned for it.
+///
+/// The wasm arm has no default sink (there is nowhere for a job to run until
+/// `worker_port::attach` proves a `Worker`), so this is a native claim and says
+/// so.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_native_thread_starts_with_the_pool_as_its_sink() {
+    assert!(
+        worker_attached(),
+        "a native thread must reach the job pool through the same trait the \
+         browser's worker is installed behind",
+    );
+    let (tx, rx) = mpsc::channel();
+    offload_job("test", Job::Described(a_job()), move |result| {
+        // The pool answers on a pool thread, so this send is what proves the
+        // job crossed the transport and came back — not merely that
+        // `offload_job` returned.
+        let _ = tx.send(result.is_some());
+    });
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(30)),
+        Ok(true),
+        "the pool must run the job and deliver its frame",
+    );
+    assert_eq!(
+        jobs_in_worker(),
+        0,
+        "a delivered job must be out of the registry, or its render slot leaks",
+    );
 }
 
 /// With a worker, nothing runs here — the job is posted and `deliver` waits

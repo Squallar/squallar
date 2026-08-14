@@ -231,3 +231,6 @@ impl JobSink for Handle {
             .map_err(|returned| returned.0.1)
     }
 }
+
+#[cfg(test)]
+mod tests;
