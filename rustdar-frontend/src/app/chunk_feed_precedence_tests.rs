@@ -2,6 +2,16 @@ use super::tests::{empty_scan, headless};
 use super::*;
 use crate::platform_double::TestBridge;
 
+/// The cell budget a device that says nothing about itself resolves.
+///
+/// It is `constants::VOLUME_GRID_CELLS`, and it is written as the resolver's
+/// answer rather than as the constant because that is what the production call
+/// site now passes: a machine that earns a promotion carries a *different*
+/// budget into the same request. The tests below are about the axis limit
+/// rather than about the budget, so they pin the unpromoted one deliberately —
+/// `budget::tests` is where the promoted rows are checked.
+const SHIPPED_CELLS: [u32; 3] = crate::constants::VOLUME_GRID_CELLS;
+
 fn at(minute: u32) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
         .unwrap()
@@ -229,7 +239,7 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
     };
 
     for axis in [256u32, 512, 2048] {
-        let request = voxel_request_for(&target, 35.33, -97.28, axis);
+        let request = voxel_request_for(&target, 35.33, -97.28, SHIPPED_CELLS, axis);
         assert_eq!(
             request.shape,
             crate::constants::volume_grid_shape(axis),
@@ -255,6 +265,7 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
             &target,
             35.33,
             -97.28,
+            SHIPPED_CELLS,
             crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
         )
         .shape,
@@ -285,7 +296,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         region,
     };
 
-    let default = voxel_request_for(&target(None), 35.33, -97.28, DEVICE_AXIS);
+    let default = voxel_request_for(&target(None), 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
     assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
     assert_eq!(
         default.half_extent_km, None,
@@ -301,7 +312,13 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         rustdar_radar::voxel::HalfExtentKm::square(22.5),
     )
     .expect("a valid region");
-    let aimed = voxel_request_for(&target(Some(picked)), 35.33, -97.28, DEVICE_AXIS);
+    let aimed = voxel_request_for(
+        &target(Some(picked)),
+        35.33,
+        -97.28,
+        SHIPPED_CELLS,
+        DEVICE_AXIS,
+    );
     assert_eq!(
         aimed.centre,
         (36.1, -98.4),
@@ -343,7 +360,7 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
     );
 
     for target in [make(None), make(picked)] {
-        let request = voxel_request_for(&target, 35.33, -97.28, DEVICE_AXIS);
+        let request = voxel_request_for(&target, 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
         assert_eq!(
             request.base_km_msl,
             rustdar_radar::voxel::DEFAULT_BASE_KM_MSL
@@ -1261,4 +1278,112 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
         "a volume the app does not hold was answered for, which stops the pane \
          ever asking again",
     );
+}
+
+/// **The request carries the budget this device resolved, not the one this
+/// binary compiled.**
+///
+/// The far end of the promotion, and the half that is easy to leave behind: a
+/// resolver can promote every field it likes and the picture will not change by
+/// one voxel while the wire still says `constants::VOLUME_GRID_CELLS`. That
+/// constant is one answer for every machine that compiled the same binary, and
+/// a browser on an RTX 3090 and a browser on a phone compile the same binary —
+/// which is the whole complaint.
+///
+/// Two claims, because either alone would pass while the seam was broken: the
+/// function *uses* the argument, and the production call site *passes the
+/// resolved budget* rather than re-reading the constant beside it.
+#[test]
+fn the_requested_shape_is_the_budget_this_device_resolved() {
+    use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
+
+    let target = VolumeTarget {
+        volume: VolumeStamp {
+            site: "KTLX".to_owned(),
+            collected: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                .expect("a real date")
+                .and_hms_opt(22, 33, 0)
+                .expect("a real time"),
+        },
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        region: None,
+    };
+
+    // A browser at the WebGL2 guarantee against one reporting what a measured
+    // desktop machine reports: the pair a `cfg` cascade cannot tell apart.
+    let web = |two_d: u32, three_d: u32| {
+        crate::budget::resolve(&crate::budget::DeviceProfile {
+            limits: crate::budget::BudgetLimits::WASM,
+            platform: crate::budget::Platform::Web,
+            adapter: crate::budget::AdapterCeilings {
+                max_texture_dimension_2d: two_d,
+                max_texture_dimension_3d: three_d,
+            },
+            ..crate::budget::DeviceProfile::for_target()
+        })
+    };
+    let phone = web(2048, 256);
+    let desktop = web(
+        crate::budget::DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
+        crate::budget::DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
+    );
+
+    let cells_on = |budgets: crate::budget::Budgets, axis: u32| {
+        voxel_request_for(&target, 35.33, -97.28, budgets.grid_cells, axis)
+            .shape
+            .cells()
+    };
+    assert!(
+        cells_on(desktop, 8192) > cells_on(phone, 256),
+        "a browser on desktop-class silicon is put on the wire asking for the \
+         same grid as one at the spec floor",
+    );
+
+    // And the call site passes the resolved figure. A `voxel_request_for` that
+    // took the budget and a caller that handed it `constants::VOLUME_GRID_CELLS`
+    // would satisfy every assertion above and change nothing on any machine.
+    let call = include_str!("../app.rs")
+        .split_once("let request = voxel_request_for(")
+        .map(|(_, rest)| rest.split_once(");").expect("a call site").0)
+        .expect("`voxel_request_for` is still called from `prepare_volume`");
+    assert!(
+        call.contains("self.budgets.grid_cells"),
+        "the production call site passes `{call}` — the resolved budget is the \
+         only thing that carries a promotion this far",
+    );
+}
+
+/// **The budgets are re-resolved before anything downstream reads them.**
+///
+/// `install_volume_bridge` is the one place an adapter first exists, and three
+/// things in it spend `self.budgets`: the quality ceiling `quality::select` is
+/// capped by, the pool `LoopPoolLimits::from_budgets` brackets, and the
+/// offscreen budget the painter fits every pane against. A re-resolve placed
+/// after any of them would leave that one on the pre-adapter answer — a
+/// silently half-promoted machine, which reads green everywhere and draws a
+/// phone's picture on a workstation.
+#[test]
+fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
+    let body = include_str!("../app.rs")
+        .split_once("fn install_volume_bridge(&mut self)")
+        .and_then(|(_, rest)| rest.split_once("\n    }"))
+        .map(|(body, _)| body)
+        .expect("`install_volume_bridge` is still a method on `App`");
+
+    let update = body
+        .find("self.update_device_profile(")
+        .expect("`install_volume_bridge` no longer re-resolves the budgets");
+    for spender in [
+        "LoopPoolLimits::from_budgets",
+        "self.budgets.quality_ceiling",
+    ] {
+        let at = body
+            .find(spender)
+            .unwrap_or_else(|| panic!("`{spender}` is no longer read there"));
+        assert!(
+            update < at,
+            "`{spender}` is read before the adapter's own reading is folded in, \
+             so that one budget stays at the floor while the rest are promoted",
+        );
+    }
 }

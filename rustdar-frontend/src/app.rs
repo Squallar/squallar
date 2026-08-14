@@ -228,14 +228,21 @@ pub struct App {
     /// budget set destroyed by that event would have to be re-resolved on a
     /// path that also handles a device the app has just been refused by.
     ///
-    /// It is resolved from `DeviceProfile::for_target()` — every runtime field
-    /// at its most conservative reading — which is exactly what the `cfg`
-    /// constants said. Handing this constructor a profile built from the
-    /// adapter is the whole of what makes the application device-aware, and it
-    /// is deliberately not done here: promoting a field off its bracket floor
-    /// changes what a real machine allocates, and that has to be argued on its
-    /// own rather than ridden in on a refactor.
+    /// It starts as `DeviceProfile::for_target()`'s — every runtime field at
+    /// its most conservative reading, which is exactly what the `cfg` constants
+    /// said — and is re-resolved once, in [`Self::install_volume_bridge`], from
+    /// the adapter that has just appeared. See [`Self::device_profile`].
     budgets: crate::budget::Budgets,
+    /// Everything known about the machine, and the only input [`Self::budgets`]
+    /// has.
+    ///
+    /// Held rather than dropped after the resolve, because the budgets have to
+    /// be re-resolvable: a back-off is a change to one field of this
+    /// (`BudgetMemo::steps_back`) followed by the same pure function over the
+    /// same profile, which is what keeps *one* statement of how a machine's
+    /// budgets are decided rather than one for the first resolve and another
+    /// for every subsequent one.
+    device_profile: crate::budget::DeviceProfile,
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,
@@ -680,15 +687,23 @@ pub(crate) enum VolumePrepare {
 /// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
 /// the box is centred on.
 ///
-/// `max_axis` is the device's `max_texture_dimension_3d`, which decides how the
-/// tier's cell budget is spent over the three axes — see
-/// [`crate::constants::volume_grid_shape`]. It arrives as an argument rather
+/// `cells` is the **resolved** cell budget — `Budgets::grid_cells`, which is
+/// this device's rung of its bracket rather than the `cfg` constant its
+/// bracket floors at. That distinction is the whole of what a desktop browser
+/// gains here: `constants::VOLUME_GRID_CELLS` is one number for every machine
+/// that compiled the same binary, and a browser on an RTX 3090 and a browser on
+/// a phone compile the same binary.
+///
+/// `max_axis` is the device's `max_texture_dimension_3d`, which decides how that
+/// budget is spent over the three axes — see
+/// [`crate::constants::volume_grid_shape_of`]. Both arrive as arguments rather
 /// than being read in here, for the reason everything else does: this function
 /// is pure, and its tests want to name a device rather than have one.
 fn voxel_request_for(
     target: &rustdar_egui::pane::VolumeTarget,
     site_lat: f64,
     site_lon: f64,
+    cells: [u32; 3],
     max_axis: u32,
 ) -> rustdar_radar::voxel::VoxelRequest {
     // The picked region, or the site with no width at all — `None` is what
@@ -715,11 +730,14 @@ fn voxel_request_for(
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: target.product,
-        // `crate::constants`, not `voxel::default_shape()`: that one takes a
-        // single `is_wasm` bool and cannot return `MOBILE_SHAPE`, because
-        // `mobile` is emitted by *this* crate's `build.rs`. Asking it here is
-        // what made an Android build budget 192³ and request 256³.
-        shape: crate::constants::volume_grid_shape(max_axis),
+        // The resolved budget, not `voxel::default_shape()` and not
+        // `constants::volume_grid_shape`: the first takes a single `is_wasm`
+        // bool and cannot return `MOBILE_SHAPE`, because `mobile` is emitted by
+        // *this* crate's `build.rs` — asking it here is what made an Android
+        // build budget 192³ and request 256³ — and the second is the `cfg`
+        // constant, which is one answer for every machine that compiled this
+        // binary.
+        shape: crate::constants::volume_grid_shape_of(cells, max_axis),
         // The raymarch reads indices only. The value plane is four times larger
         // and exists for a hover readout, which a 3D pane does not have yet.
         values_wanted: false,
@@ -808,11 +826,14 @@ impl App {
         let channels = ChannelHub::new();
         // Owns the single shared render-budget counter used by both the loop and
         // static pane render paths (see `RenderDispatcher::renders_in_flight`).
-        // Resolved once, here, and threaded from this point on. Every field
-        // is this build's own bracket floor, which is the `cfg` constant it
-        // replaces — see `crate::budget`, where the reproduction is asserted
-        // field for field rather than claimed.
-        let budgets = crate::budget::resolve(&crate::budget::DeviceProfile::for_target());
+        // Resolved here and threaded from this point on. Every field is this
+        // build's own bracket floor, which is the `cfg` constant it replaces —
+        // see `crate::budget`, where the reproduction is asserted field for
+        // field rather than claimed. There is no adapter yet, so there is
+        // nothing to promote on; `install_volume_bridge` re-resolves the moment
+        // there is.
+        let device_profile = crate::budget::DeviceProfile::for_target();
+        let budgets = crate::budget::resolve(&device_profile);
         let render = RenderDispatcher::with_budgets(&budgets);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -926,6 +947,7 @@ impl App {
             volume_painter: None,
             mirror_rungs: crate::egui_renderer::MirrorRungs::default(),
             budgets,
+            device_profile,
             loop_pool,
             loop_pool_state: crate::loop_pool::LoopPoolState::new(
                 loop_pool,
@@ -1413,6 +1435,57 @@ impl App {
     /// The painter is installed **even when the probe said no**, because it is
     /// what tells the pane *why*. A pane with no painter falls back to a generic
     /// "unavailable", which is the one message that helps nobody.
+    /// Fold what the adapter says about itself into the profile, and re-resolve.
+    ///
+    /// **The one place a real device meets the budgets**, and the seam the whole
+    /// of `crate::budget` was extracted to have. Two readings go in and nothing
+    /// else does:
+    ///
+    /// * the **class** the driver names, which is honest on Vulkan/Metal/DX12
+    ///   and is `Unknown` in every browser and on at least one real GL adapter
+    ///   (this project's own RTX 3090 reports `DiscreteGpu` through Vulkan and
+    ///   `Other` through GL);
+    /// * the **ceilings the adapter reports**, off the *device* rather than off
+    ///   the adapter, because the web arm of `app_state::device_limits` has
+    ///   already reconciled them with what WebGL2 can express — so this is the
+    ///   figure the app can actually spend on every target rather than a claim
+    ///   one of them would refuse.
+    ///
+    /// There is no browser term and there cannot be one: two browsers on one
+    /// machine are the same binary from the same origin and differ only in what
+    /// they report, so what separates them is these two numbers or nothing.
+    ///
+    /// Idempotent, and it has to be: this runs on first start, on resume from
+    /// suspend and on recovery from a lost surface. `resolve` is pure over the
+    /// profile, so running it again on an unchanged profile is the same answer —
+    /// which is also what keeps a reopen 1:1 rather than showing a different
+    /// loop length every time a display comes back.
+    fn update_device_profile(&mut self, class: crate::volume::quality::DeviceClass) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let limits = state.device.limits();
+        self.device_profile.class = class;
+        self.device_profile.adapter = crate::budget::AdapterCeilings {
+            max_texture_dimension_2d: limits.max_texture_dimension_2d,
+            max_texture_dimension_3d: limits.max_texture_dimension_3d,
+        };
+        let resolved = crate::budget::resolve(&self.device_profile);
+        if resolved != self.budgets {
+            log::info!(
+                "Budgets: {:?} on a {class:?} adapter reporting {} px 2D and {} px 3D textures: \
+                 {:?} grid cells, {} MiB of offscreen, {} MiB of 3D texture",
+                resolved.promotion,
+                limits.max_texture_dimension_2d,
+                limits.max_texture_dimension_3d,
+                resolved.grid_cells,
+                resolved.offscreen_bytes / (1024 * 1024),
+                resolved.volume_texture_bytes / (1024 * 1024),
+            );
+        }
+        self.budgets = resolved;
+    }
+
     fn install_volume_bridge(&mut self) {
         use crate::volume::quality;
 
@@ -1424,8 +1497,22 @@ impl App {
             return;
         };
 
+        // **Where the application stops guessing.** Until this line the budgets
+        // are `DeviceProfile::for_target()`'s — every runtime field at its most
+        // conservative reading, which resolves to the `cfg` constants this
+        // build shipped. Here an adapter exists, so the profile can carry what
+        // it says about itself, and `budget::resolve` spends it.
+        //
+        // It runs *before* everything below reads `self.budgets`: the quality
+        // ceiling `select` is capped by, the offscreen budget the painter fits
+        // every pane against, and the cell budget `voxel_request_for` puts on
+        // the wire. Moving it after any of those would leave that one on the
+        // pre-adapter answer, which is the shape of bug this whole module
+        // exists to make impossible.
+        self.update_device_profile(class);
+
         // The same signal, spent a second time on a different question, and the
-        // *only* one there is: wgpu 29.0.4 reports no memory capacity on any
+        // *only* one there is for capacity: wgpu 29.0.4 reports no memory on any
         // backend. `Device::generate_allocator_report` reports what this process
         // has allocated, not what the device has, and `VK_EXT_memory_budget`'s
         // `heapBudget` is read by wgpu-hal solely to refuse an allocation past a
@@ -1433,14 +1520,19 @@ impl App {
         // `crate::loop_pool` for the citations.
         if !self.loop_pool_sized {
             self.loop_pool_sized = true;
-            self.loop_pool = crate::loop_pool::LoopPool::for_device(
-                class,
+            // The rung, not the class. They are the same answer on every native
+            // adapter — `Promotion::for_class` reproduces `for_device`'s arms
+            // exactly — and they differ on the one target that reports no class
+            // at all, which is the browser this stage is here for.
+            self.loop_pool = crate::loop_pool::LoopPool::for_promotion(
+                self.budgets.promotion,
                 None,
                 crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
             );
             log::info!(
-                "Loop pool: {} MiB for a {class:?} adapter",
+                "Loop pool: {} MiB for a {class:?} adapter at {:?}",
                 self.loop_pool.bytes() / (1024 * 1024),
+                self.budgets.promotion,
             );
         }
 
@@ -1671,7 +1763,13 @@ impl App {
             started.elapsed().as_millis(),
         );
 
-        let request = voxel_request_for(target, site.lat, site.lon, self.volume_grid_axis_limit());
+        let request = voxel_request_for(
+            target,
+            site.lat,
+            site.lon,
+            self.budgets.grid_cells,
+            self.volume_grid_axis_limit(),
+        );
         let spawned = self.render.spawn_voxel_build(
             target,
             input,
