@@ -159,6 +159,37 @@ impl ZoneResolution {
     }
 }
 
+/// An alert this pass is asked to place: one that named zones and brought no
+/// geometry of its own.
+fn needs_zones(alert: &NwsAlert) -> bool {
+    alert.features.is_empty() && !alert.affected_zones.is_empty()
+}
+
+/// Every zone boundary a round has to obtain, once each, in the order the
+/// alerts first name them.
+///
+/// Named and separated from [`resolve_zone_geometries`] because it is the one
+/// part of the round whose cost is set by the size of the round rather than by
+/// the network, and because that makes it measurable on its own. A busy
+/// afternoon names on the order of 1,900 zones across 220 geometryless alerts,
+/// and on wasm32 this runs on the browser's main thread — the thread that also
+/// has to keep the map moving under the user's hand.
+///
+/// First-seen order is part of the contract: it is the order the fetches are
+/// issued in, so a round that is interrupted has fetched a prefix that depends
+/// on nothing but the alert feed.
+pub fn distinct_zone_urls(alerts: &[NwsAlert]) -> Vec<String> {
+    let mut needed_urls: Vec<String> = Vec::new();
+    for alert in alerts.iter().filter(|alert| needs_zones(alert)) {
+        for url in &alert.affected_zones {
+            if !needed_urls.contains(url) {
+                needed_urls.push(url.clone());
+            }
+        }
+    }
+    needed_urls
+}
+
 /// Fills in `features` for alerts that carry only `affectedZones`, and reports
 /// what it managed. URLs are deduplicated, so each county is fetched at most
 /// once. Without `cache_dir` this is 1000+ requests on every launch.
@@ -173,19 +204,12 @@ pub async fn resolve_zone_geometries(
     alerts: &mut [NwsAlert],
     cache_dir: Option<&Path>,
 ) -> ZoneResolution {
-    let mut resolution = ZoneResolution::default();
-    let mut needed_urls: Vec<String> = Vec::new();
-    for alert in alerts.iter() {
-        if alert.features.is_empty() && !alert.affected_zones.is_empty() {
-            resolution.alerts_expected += 1;
-            for url in &alert.affected_zones {
-                if !needed_urls.contains(url) {
-                    needed_urls.push(url.clone());
-                }
-            }
-        }
-    }
-    resolution.zones_requested = needed_urls.len();
+    let needed_urls = distinct_zone_urls(alerts);
+    let mut resolution = ZoneResolution {
+        alerts_expected: alerts.iter().filter(|alert| needs_zones(alert)).count(),
+        zones_requested: needed_urls.len(),
+        ..Default::default()
+    };
 
     if needed_urls.is_empty() {
         return resolution;
