@@ -56,8 +56,11 @@ pub fn start() -> Result<(), JsValue> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     // Started before the app so the handshake is in flight while the event loop
-    // and WebGL context come up. It never blocks: rasterization runs on this
-    // thread until the worker answers, and forever if it does not.
+    // and WebGL context come up. It never blocks: a job dispatched before the
+    // worker answers waits out `worker_port::HANDSHAKE_WINDOW` and then runs on
+    // this thread, and a worker that is lost later is replaced rather than
+    // written off — which is what keeps one mid-session error from putting
+    // every later scan, scrub and loop frame back on this thread.
     crate::worker_port::attach();
 
     // Nothing about location happens here. `WebPlatform::new` starts a
