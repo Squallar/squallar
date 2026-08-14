@@ -1,6 +1,6 @@
 nexrad-level3/src/decode/header.rs	141	141
 nexrad-level3/src/decode/mod.rs	97	57
-nexrad-level3/src/decode/radial.rs	451	280
+nexrad-level3/src/decode/radial.rs	489	328
 nexrad-level3/src/decode/symbology.rs	195	172
 nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
@@ -45,8 +45,8 @@ rustdar-egui/src/volume_alpha.rs	166	164
 rustdar-egui/src/volume_iso.rs	75	60
 rustdar-egui/src/volume_view.rs	266	259
 rustdar-frontend/src/app.rs	1178	836
-rustdar-frontend/src/app_chunks.rs	227	134
-rustdar-frontend/src/app_fetch.rs	1136	637
+rustdar-frontend/src/app_chunks.rs	227	143
+rustdar-frontend/src/app_fetch.rs	1136	616
 rustdar-frontend/src/app_render.rs	2125	1480
 rustdar-frontend/src/app_state.rs	194	108
 rustdar-frontend/src/budget.rs	237	199
@@ -92,7 +92,7 @@ rustdar-overlays/src/glm/mod.rs	19	19
 rustdar-overlays/src/hrrr/fetch.rs	340	133
 rustdar-overlays/src/hrrr/lambert.rs	352	338
 rustdar-overlays/src/hrrr/mod.rs	743	554
-rustdar-overlays/src/metar/fetch.rs	319	291
+rustdar-overlays/src/metar/fetch.rs	321	293
 rustdar-overlays/src/metar/networks.rs	102	100
 rustdar-overlays/src/metar/types.rs	42	16
 rustdar-overlays/src/nws/alert.rs	177	71
@@ -106,7 +106,7 @@ rustdar-overlays/src/render/handlers/discussion.rs	356	250
 rustdar-overlays/src/render/handlers/glm.rs	604	475
 rustdar-overlays/src/render/handlers/labels.rs	63	36
 rustdar-overlays/src/render/handlers/location.rs	63	36
-rustdar-overlays/src/render/handlers/metar.rs	488	337
+rustdar-overlays/src/render/handlers/metar.rs	492	340
 rustdar-overlays/src/render/handlers/mod.rs	47	46
 rustdar-overlays/src/render/handlers/model.rs	430	380
 rustdar-overlays/src/render/handlers/outlook.rs	943	869
@@ -116,13 +116,13 @@ rustdar-overlays/src/render/handlers/sites.rs	63	36
 rustdar-overlays/src/render/hatch.rs	272	262
 rustdar-overlays/src/render/layers.rs	61	19
 rustdar-overlays/src/render/overlay_state.rs	879	751
-rustdar-overlays/src/render/rasterize.rs	834	720
+rustdar-overlays/src/render/rasterize.rs	835	722
 rustdar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
-rustdar-overlays/src/render/station_model.rs	581	322
+rustdar-overlays/src/render/station_model.rs	646	397
 rustdar-overlays/src/spc/colors.rs	44	42
 rustdar-overlays/src/spc/discussion.rs	328	313
 rustdar-overlays/src/spc/fetch.rs	106	59
-rustdar-overlays/src/spc/outlook.rs	342	304
+rustdar-overlays/src/spc/outlook.rs	368	330
 rustdar-overlays/src/spc/reports.rs	148	138
 rustdar-overlays/src/types.rs	49	49
 rustdar-platform/src/config_store.rs	72	67
@@ -135,11 +135,11 @@ rustdar-platform/src/os_location/unsupported.rs	11	0
 rustdar-platform/src/os_location/windows.rs	233	233
 rustdar-platform/src/platform.rs	236	122
 rustdar-platform/src/run.rs	31	0
-rustdar-radar/src/archive.rs	249	222
+rustdar-radar/src/archive.rs	249	225
 rustdar-radar/src/azimuth.rs	191	191
 rustdar-radar/src/beam.rs	73	73
-rustdar-radar/src/catalogue.rs	137	122
-rustdar-radar/src/chunks.rs	916	666
+rustdar-radar/src/catalogue.rs	137	125
+rustdar-radar/src/chunks.rs	916	672
 rustdar-radar/src/current.rs	120	119
 rustdar-radar/src/derive.rs	210	196
 rustdar-radar/src/dpprep.rs	1022	956
@@ -150,7 +150,7 @@ rustdar-radar/src/hhc.rs	411	380
 rustdar-radar/src/hover.rs	49	46
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	134
+rustdar-radar/src/level3.rs	188	124
 rustdar-radar/src/nrot.rs	3216	3157
 rustdar-radar/src/nyquist.rs	126	107
 rustdar-radar/src/palette.rs	244	243
@@ -159,7 +159,7 @@ rustdar-radar/src/render/polar.rs	235	232
 rustdar-radar/src/render_input.rs	667	636
 rustdar-radar/src/sampler.rs	584	564
 rustdar-radar/src/sampler/seam_fixture.rs	178	167
-rustdar-radar/src/scan.rs	365	212
+rustdar-radar/src/scan.rs	365	213
 rustdar-radar/src/site_position.rs	81	81
 rustdar-radar/src/sites.rs	581	581
 rustdar-radar/src/sounding.rs	234	207
@@ -167,7 +167,7 @@ rustdar-radar/src/sources.rs	204	204
 rustdar-radar/src/srm.rs	107	102
 rustdar-radar/src/srv.rs	205	205
 rustdar-radar/src/tls.rs	32	32
-rustdar-radar/src/twin.rs	350	315
+rustdar-radar/src/twin.rs	425	387
 rustdar-radar/src/types.rs	490	480
 rustdar-radar/src/velocity.rs	108	103
 rustdar-radar/src/vil.rs	364	354
