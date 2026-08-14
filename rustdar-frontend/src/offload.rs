@@ -31,6 +31,17 @@ use rustdar_radar::xsect::{CrossSection, SectionRequest};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// The storm motion vector [`RenderedFrame::storm_motion`] carries,
+/// re-exported for the reason [`crate::tls`] is: a platform adapter that has to
+/// *rebuild* one of these off a message port should not need its own
+/// `rustdar-radar` dependency to name the type.
+///
+/// `rustdar-web` is the adapter in question, and it does not have one — the
+/// browser build reaches this crate and stops. Naming the path through
+/// `rustdar_radar` there compiles nowhere, which is a thing only a wasm32
+/// target check finds.
+pub use rustdar_radar::srv::SrvMotion;
+
 /// Run `job` away from the frame that requested it.
 ///
 /// Native spawns a named OS thread and returns immediately.
