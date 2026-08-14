@@ -2855,8 +2855,44 @@ const DA_SEEDGATE_NEIGHBORS: i32 = 3;
 /// on branch `campaign-harness`; the probe that would re-run it is.
 const DA_THRESH_SCALE: f64 = 1.4;
 
-/// Iteration cap for the pass loop; propagation converges within ten on
-/// every volume measured.
+/// Iteration cap for the pass loop. **The loop converges; ten does not reach
+/// it**, on 26 of the 72 velocity tilts of the five-volume storm corpus.
+///
+/// The comment that stood here claimed propagation converged within ten on
+/// every volume measured. That was false, and carried no reading to check it
+/// against — which is why it went unexamined for as long as it did.
+///
+/// **Convergence is structural, not empirical.** Every write to `valid` in
+/// this module is `= true` — eight sites, none clearing it — so `|valid|` never
+/// decreases and is bounded by the gate count, and `changed` implies at least
+/// one invalid→valid transition. The loop is a monotone closure operator on a
+/// finite lattice: it cannot oscillate and cannot diverge, and raising the cap
+/// is purely additive. Measured over 8028 passes on 1189 tilt-runs, no pass
+/// ever cleared a `valid` bit or rewrote the value of an already-valid gate;
+/// the 18,309,337 gates dealiased at both ten and the fixed point carry
+/// identical values, bit for bit. (Do not confuse this with the VAD **refit**
+/// loop, one level up, which *calls* this one and has no fixed point: its
+/// state is continuous layers plus a discrete branch set that can flip back.)
+///
+/// So ten is an under-budget, not a guard against a runaway. What it costs,
+/// measured against the fixed point on a 41-volume corpus:
+///
+/// - **Coverage**: 644 bins gained, 745 lost — running to convergence paints
+///   slightly *fewer* bins, because resolving gates shrinks the unresolved
+///   components `rawmin_bins` size-gates and some fall under it.
+/// - **Values**: 2449 gates, and **every one differs by a whole 2·Vny** — when
+///   truncation moves a value it moves it by a fold, never by a little. 2431 of
+///   those are one VCP 31 long-pulse volume, 2269 of them on a single tilt
+///   where they are 2.17% of its painted bins; 38 of the 41 volumes change no
+///   value at all.
+/// - **Censoring**: 869 gates, including 16 whose own value is identical and
+///   which the censor withdrew only because a neighbour moved.
+///
+/// Raising it was measured and **refused**: the storm corpus pays +110% pass
+/// work to reach the fixed point, and the volume that would benefit is a
+/// clear-air VCP the corpus barely covers (`vcp31/` is empty). The single-site
+/// result wants replication before this constant moves. See
+/// `campaigns/nrot/dacap/` on branch `harness/nrot-dealias-cap`.
 const DA_PASSES: i32 = 10;
 
 /// Raw-continuity flood-fill threshold as a Vny fraction. The aliased flood
