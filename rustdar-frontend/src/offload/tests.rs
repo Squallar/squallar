@@ -774,7 +774,7 @@ fn with_a_worker_the_job_is_posted_and_deferred() {
     );
 
     let id = posted.lock().unwrap()[0].0;
-    deliver_worker_reply(id, None);
+    deliver_job_reply(id, None);
     assert!(ran.load(Ordering::Relaxed), "the reply must reach deliver");
     assert_eq!(jobs_in_worker(), 0, "the pending entry must be retired");
     detach();
@@ -801,7 +801,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
 
     wanted.store(false, Ordering::Relaxed);
     let id = posted.lock().unwrap()[0].0;
-    deliver_worker_reply(
+    deliver_job_reply(
         id,
         Some(JobOutput::Frame(RenderedFrame {
             image: vec![0; 4],
@@ -872,7 +872,7 @@ fn a_reply_for_a_retired_job_is_ignored() {
 
     abandon_worker("test");
     assert_eq!(count.load(Ordering::Relaxed), 1);
-    deliver_worker_reply(id, None);
+    deliver_job_reply(id, None);
     assert_eq!(
         count.load(Ordering::Relaxed),
         1,

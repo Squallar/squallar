@@ -1310,6 +1310,15 @@ pub trait JobSink {
 struct Pending {
     kind: &'static str,
     started: web_time::Instant,
+    /// Which installed sink owes this job an answer.
+    ///
+    /// The registry below is one map for the whole process, so an entry has to
+    /// say who is carrying it. [`abandon_worker`] fails **that sink's** jobs and
+    /// no others, which is the difference between "the browser's worker died"
+    /// and "every job anywhere is now cancelled" — and, under `cargo test`,
+    /// between a test tearing down its own fake port and a test tearing down
+    /// the port of whichever test happens to be running beside it.
+    sink: u64,
     /// Holds the `RenderGuard`, the pane's `Arc<AtomicBool>` and the response
     /// channel. Consuming it is what decrements the render budget and clears
     /// the pane's in-flight mark, so it must run on *every* path out of the
@@ -1317,13 +1326,58 @@ struct Pending {
     deliver: Box<dyn FnOnce(JobResult) + Send>,
 }
 
+/// Every job any sink in this process owes an answer for.
+///
+/// # Why this is process-wide and not thread-local
+///
+/// It used to be a `thread_local!`, which was exactly right while the only
+/// transport was a browser Web Worker: a browser has one thread, so a
+/// thread-local map is a process-wide map with a cheaper lock.
+///
+/// A native pool is the same architecture on a target that has more than one
+/// thread, and it moves two things at once. `offload_job` is called from the
+/// frame thread *and* from tokio's workers — `App::decode_offloaded` runs
+/// inside a spawned future — so the registry has to be reachable from any of
+/// them; and the reply is produced on a pool thread, which is not the thread
+/// that submitted. A thread-local map would have made the pool answer into a
+/// map nobody was holding.
+///
+/// The lock is uncontended on the browser (one thread) and held only for a
+/// hash-map operation anywhere else. Nothing user-supplied runs under it: a
+/// `deliver` is always called *after* its entry has been removed, so a job that
+/// dispatches another job from inside its own delivery cannot deadlock.
+static PENDING: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Pending>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The registry, recovered from a poisoned lock rather than propagating the
+/// panic.
+///
+/// A thread that panicked while holding this lock left a `HashMap` behind, not
+/// a half-written one — every operation under it is a single insert, remove or
+/// scan. Refusing to hand it back would turn one panicked render into an
+/// application that can never dispatch or retire another job, and every pane
+/// would wedge holding a render slot. See [`Pending::deliver`] for what a slot
+/// that is never retired costs.
+fn pending() -> std::sync::MutexGuard<'static, HashMap<u64, Pending>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Job ids, unique across the process because [`PENDING`] is.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Sink ids. A fresh one per installed sink, so [`Pending::sink`] identifies the
+/// *installation* and not merely the kind of transport: a port that is retired
+/// and replaced does not inherit the jobs the previous one owed.
+static NEXT_SINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 thread_local! {
-    /// Single-threaded by construction: only the browser build installs a port,
-    /// and the browser's main thread is the only place these are registered or
-    /// retired.
-    static WORKER: RefCell<Option<Box<dyn JobSink>>> = const { RefCell::new(None) };
-    static PENDING: RefCell<HashMap<u64, Pending>> = RefCell::new(HashMap::new());
-    static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// The sink this thread hands jobs to, and the id its jobs are filed under.
+    ///
+    /// Thread-local rather than global because the browser's implementation
+    /// owns a `web_sys::Worker`, which is `!Send` and can only ever be touched
+    /// on the thread that created it. The *registry* above is shared; the
+    /// handle to the transport is not, and does not need to be.
+    static WORKER: RefCell<Option<(u64, Box<dyn JobSink>)>> = const { RefCell::new(None) };
 }
 
 /// Route [`offload_job`] through `port` from now on.
@@ -1332,28 +1386,47 @@ thread_local! {
 /// itself with a build-token handshake. Until then — and forever, on a browser
 /// where the worker could not start — [`offload_job`] runs jobs inline, which
 /// is the behaviour the web build had before any of this existed.
+///
+/// A port already installed here is **abandoned**, not dropped: it may be
+/// carrying jobs, and a job whose sink is replaced out from under it would
+/// otherwise sit in the registry forever holding a render slot that nothing
+/// can ever release.
 pub fn set_worker(port: Box<dyn JobSink>) {
-    WORKER.with(|w| *w.borrow_mut() = Some(port));
+    abandon_worker("replaced by a new port");
+    let sink = NEXT_SINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    WORKER.with(|w| *w.borrow_mut() = Some((sink, port)));
 }
 
 /// Give up on the worker: it died, or answered the handshake with a build that
 /// is not this one.
 ///
-/// Every job it still owes is failed rather than forgotten. Dropping them would
-/// leak the render budget and leave panes marked in-flight forever; failing
-/// them clears both, and the next frame re-dispatches — inline now, because the
-/// port is gone.
+/// Every job **it** still owes is failed rather than forgotten. Dropping them
+/// would leak the render budget and leave panes marked in-flight forever;
+/// failing them clears both, and the next frame re-dispatches — inline now,
+/// because the port is gone.
+///
+/// Scoped to the retired sink's own jobs. The registry holds every job in the
+/// process, and a browser worker dying says nothing about a job some other
+/// sink is carrying.
 pub fn abandon_worker(reason: &str) {
-    let had_port = WORKER.with(|w| w.borrow_mut().take().is_some());
-    let orphaned: Vec<Pending> = PENDING.with(|p| p.borrow_mut().drain().map(|(_, v)| v).collect());
-    if had_port || !orphaned.is_empty() {
-        log::warn!(
-            "rasterization worker abandoned ({reason}); failing {} in-flight job(s)",
-            orphaned.len()
-        );
-    }
-    for pending in orphaned {
-        (pending.deliver)(None);
+    let Some((sink, _port)) = WORKER.with(|w| w.borrow_mut().take()) else {
+        return;
+    };
+    let orphaned: Vec<Pending> = {
+        let mut registry = pending();
+        let ids: Vec<u64> = registry
+            .iter()
+            .filter(|(_, job)| job.sink == sink)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.iter().filter_map(|id| registry.remove(id)).collect()
+    };
+    log::warn!(
+        "rasterization worker abandoned ({reason}); failing {} in-flight job(s)",
+        orphaned.len()
+    );
+    for job in orphaned {
+        (job.deliver)(None);
     }
 }
 
@@ -1418,73 +1491,132 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
         Job::Opaque(run) => return offload(name, move || deliver(run())),
     };
     let kind = request.kind();
-    let id = NEXT_ID.with(|n| {
-        let id = n.get();
-        n.set(id.wrapping_add(1));
-        id
-    });
+    // Boxed here rather than at the one place that stores it, because every arm
+    // below either files it or runs it and the two must be the same closure.
+    let deliver: Box<dyn FnOnce(JobResult) + Send> = Box::new(deliver);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Try the sink on every target. Nothing installs one outside the browser,
-    // so this is a single load of a `None` on desktop — and it means the
-    // browser path is reachable from a host test with a fake sink rather than
-    // only from a browser.
+    // Try the sink on every target: one implementation of the lifecycle, and
+    // whichever transport this target installed underneath it.
     //
     // The request goes in **by value**, so nothing is serialised here on behalf
     // of a transport that would rather move it; `JobSink` says what that buys.
     // `Err` hands the job straight back, which is what lets the fallthrough
     // below exist without the funnel keeping a copy against a refusal it almost
     // never sees.
-    let refused = WORKER.with(|w| match w.borrow().as_ref() {
-        Some(sink) => sink.send(id, request).err().map(|back| (back, true)),
-        None => Some((request, false)),
+    let handoff = WORKER.with(|w| {
+        let borrowed = w.borrow();
+        let Some((sink_id, sink)) = borrowed.as_ref() else {
+            return Handoff::NoSink(request, deliver);
+        };
+        // Registered **before** the handover, not after it. A transport that
+        // executes in another thread of this same process can finish and answer
+        // before `send` has returned, and a reply that arrives before its entry
+        // does is a reply with no job to pair it to — the job would be dropped
+        // silently, holding its render slot forever. The browser's transport
+        // cannot lose that race and the native pool can, so the order is the
+        // one that is right for both.
+        pending().insert(
+            id,
+            Pending {
+                kind,
+                started: web_time::Instant::now(),
+                sink: *sink_id,
+                deliver,
+            },
+        );
+        match sink.send(id, request) {
+            Ok(()) => Handoff::Taken,
+            Err(back) => Handoff::Refused(back),
+        }
     });
-    let Some((request, had_sink)) = refused else {
-        PENDING.with(|p| {
-            p.borrow_mut().insert(
-                id,
-                Pending {
-                    kind,
-                    started: web_time::Instant::now(),
-                    deliver: Box::new(deliver),
-                },
-            );
-        });
-        return;
-    };
-    if had_sink {
-        // The sink exists but would not take the job. Falling through runs it
-        // here, which is slow but correct; a sink that keeps refusing is a
-        // worker that has died, and `abandon_worker` is what retires it.
-        log::warn!("{name}: worker refused the job; running it here");
-    }
 
-    offload(name, move || deliver(execute(&request)));
+    match handoff {
+        Handoff::Taken => {}
+        Handoff::NoSink(request, deliver) => offload(name, move || deliver(execute(&request))),
+        Handoff::Refused(request) => {
+            // The sink exists but would not take the job. Falling through runs
+            // it here, which is slow but correct; a sink that keeps refusing is
+            // a worker that has died, and `abandon_worker` is what retires it.
+            log::warn!("{name}: the sink refused the job; running it here");
+            // `None` if the sink was abandoned between the insert and the
+            // refusal, in which case `abandon_worker` has already failed this
+            // job and running it again would answer one render twice.
+            if let Some(job) = pending().remove(&id) {
+                offload(name, move || (job.deliver)(execute(&request)));
+            }
+        }
+    }
 }
 
-/// Hand a worker's answer to the job that asked for it.
+/// What [`offload_job`] learned by offering the job to this thread's sink.
 ///
-/// Called by `rustdar-web` from the worker's `onmessage`, on the main thread.
+/// A three-way answer rather than an `Option`, because "there is no sink" and
+/// "the sink would not take it" run the job in the same place for entirely
+/// different reasons: the first is the normal state of a build with no
+/// transport installed, and the second is a transport in trouble that has to be
+/// logged and whose registry entry has to be reclaimed.
+enum Handoff {
+    /// The sink took it; the reply will come through [`deliver_job_reply`].
+    Taken,
+    /// No sink is installed on this thread. Carries the job back untouched.
+    NoSink(JobRequest, Box<dyn FnOnce(JobResult) + Send>),
+    /// A sink is installed and refused. The `deliver` is in the registry under
+    /// this job's id.
+    Refused(JobRequest),
+}
+
+/// Hand a sink's answer to the job that asked for it.
+///
+/// The one place a job leaves the registry with a result, whichever transport
+/// produced it: `rustdar-web` calls this from the worker's `onmessage`, and the
+/// native pool calls it from the pool thread that ran the job.
+///
+/// # It runs `deliver` on the calling thread, deliberately
+///
+/// Which thread that is, is the transport's business and not this function's. A
+/// browser has exactly one choice — a Web Worker cannot touch the page's
+/// memory, so the reply crosses a message port and `deliver` runs on the main
+/// thread. A native pool has two, and it takes the one that keeps a measured
+/// cost off the frame: `deliver` builds the `egui::ColorImage`, which at the
+/// 7362 px desktop ceiling is a 206.75 MiB copy. Running it here is running it
+/// on the pool thread, which is where it ran when this was a thread per job.
+///
 /// An `id` with no pending entry is ignored: it is a reply to a job that
 /// [`abandon_worker`] already failed, and delivering it twice would send two
 /// responses for one render.
-pub fn deliver_worker_reply(id: u64, result: JobResult) {
-    let Some(pending) = PENDING.with(|p| p.borrow_mut().remove(&id)) else {
-        log::debug!("worker reply {id} has no pending job; already abandoned");
+///
+/// The entry is removed **before** `deliver` runs, so the registry lock is not
+/// held across anything a caller wrote and a job that dispatches another job
+/// from inside its own delivery is not a deadlock.
+pub fn deliver_job_reply(id: u64, result: JobResult) {
+    let Some(job) = pending().remove(&id) else {
+        log::debug!("reply {id} has no pending job; already abandoned");
         return;
     };
     // The counterpart of `offload`'s wasm log line: the same measurement, for
-    // the arm where the time is *not* spent on this thread.
+    // the arms where the time is *not* spent on the frame's thread.
     log::info!(
-        "{} took {} ms in the worker",
-        pending.kind,
-        pending.started.elapsed().as_millis()
+        "{} took {} ms off the frame",
+        job.kind,
+        job.started.elapsed().as_millis()
     );
-    (pending.deliver)(result);
+    (job.deliver)(result);
 }
 
-/// How many jobs a worker owes an answer for. For diagnostics and tests.
+/// How many jobs this thread's sink owes an answer for. For diagnostics and
+/// tests.
+///
+/// Scoped to the sink rather than counting the whole registry, for
+/// [`Pending::sink`]'s reason: the registry is process-wide, and a count of
+/// every job everywhere would answer a question nobody asked — and would make
+/// any assertion on it depend on what the test running beside it happened to be
+/// doing.
 pub fn jobs_in_worker() -> usize {
-    PENDING.with(|p| p.borrow().len())
+    let Some(sink) = WORKER.with(|w| w.borrow().as_ref().map(|(id, _)| *id)) else {
+        return 0;
+    };
+    pending().values().filter(|job| job.sink == sink).count()
 }
 
 #[cfg(test)]

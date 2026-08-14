@@ -157,7 +157,7 @@ fn deliver(data: &JsValue) {
     // rather than a branch so a message carrying both — which only a build
     // mismatch the token check already refuses could produce — still resolves to
     // exactly one output rather than to a pair somebody has to arbitrate.
-    offload::deliver_worker_reply(id as u64, frame.or_else(|| decode_out(data)));
+    offload::deliver_job_reply(id as u64, frame.or_else(|| decode_out(data)));
 }
 
 /// The non-frame half of a reply: one transferred `Uint8Array` plus the tag
