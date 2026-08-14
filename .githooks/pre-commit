@@ -1,0 +1,82 @@
+#!/bin/sh
+# pre-commit -- rustfmt over the staged Rust files. Nothing else.
+#
+# Runs no cargo, deliberately. This checkout carries several hundred
+# worktrees, nothing sets CARGO_TARGET_DIR, and so each one has its own
+# target/: a `cargo check` in a pre-commit hook is a cold full-workspace build
+# the first time it fires in a new worktree, and a wait on the build-directory
+# lock any time another session is already compiling in that one. Either way
+# the commit stalls for minutes, which is how a hook earns a permanent
+# `--no-verify` habit. This one only ever reads source text, and never writes.
+#
+# Scoped to the staged files, never the workspace. A workspace-wide check run
+# from one worktree fails over an unformatted file a *different* worktree owns
+# -- a failure the committer cannot act on, and the same trap that makes
+# `--all` writes dangerous in this checkout.
+#
+# This mirrors CI's Format job (`cargo fmt --all -- --check`, .github/workflows/
+# clippy.yaml), narrowed to what you are about to commit.
+#
+# Inert until opted into with `git config core.hooksPath .githooks`.
+
+set -u
+
+root=$(git rev-parse --show-toplevel) || exit 1
+
+# `--diff-filter=ACM` drops deletions and rename sources: paths with no content
+# left to format. Output is repo-relative regardless of the cwd git was run in.
+# `core.quotePath=false` keeps a non-ASCII path readable as itself -- quoted, it
+# would not match a file on disk and would be skipped silently, which is the one
+# failure mode a gate must never have.
+staged=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACM -- '*.rs') || exit 1
+[ -n "$staged" ] || exit 0
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+	echo "pre-commit: rustfmt is not on PATH -- cannot check formatting." >&2
+	echo "  install it with: rustup component add rustfmt" >&2
+	echo "  or skip this hook for now: git commit --no-verify" >&2
+	exit 1
+fi
+
+# The edition rustfmt parses with, read out of [workspace.package] in the
+# workspace manifest so an edition bump cannot leave this hook checking against
+# the old grammar. 2024 is the value there today.
+edition=$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9]\{4\}\)".*/\1/p' "$root/Cargo.toml" | head -n 1)
+[ -n "$edition" ] || edition=2024
+
+# Note: rustfmt reads the file in the working tree, not the staged blob. A
+# partially staged file (`git add -p`) is therefore judged by its worktree
+# content -- which is also the only content you can act on the advice about.
+failed=0
+while IFS= read -r file; do
+	[ -n "$file" ] || continue
+	# Staged, then deleted or moved away since. Nothing on disk to read.
+	[ -f "$root/$file" ] || continue
+	# `skip_children=true` is what confines this to the named file. Without it
+	# rustfmt follows `mod` declarations and formats the whole module tree, so
+	# staging one `mod.rs` would report a diff in an unstaged sibling. It is a
+	# config key, not a CLI flag -- stable rustfmt has no `--skip-children`.
+	rustfmt --check --edition "$edition" --config skip_children=true "$root/$file" || failed=1
+done <<EOF
+$staged
+EOF
+
+[ "$failed" -eq 0 ] && exit 0
+
+cat >&2 <<MSG
+
+pre-commit: the staged Rust files above are not rustfmt-clean. CI's Format job
+runs the same check across the workspace and will go red on this.
+
+Fix exactly the files listed, then re-stage them:
+
+    rustfmt --edition $edition <file>...
+    git add -- <file>...
+
+If you want a wider sweep, keep the write package-scoped -- "cargo fmt -p
+<package>", not "cargo fmt --all". An --all write reformats files this branch
+does not own, in a checkout where another session may be holding them.
+
+Committing work in progress? "git commit --no-verify" skips this hook.
+MSG
+exit 1

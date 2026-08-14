@@ -1,0 +1,57 @@
+#!/bin/sh
+# pre-push -- the wasm32 check, once per push batch.
+#
+# Why this check and not clippy or the tests: nothing else a developer runs
+# locally type-checks `rustdar-web`. Its dependencies are declared under
+# [target.'cfg(target_arch = "wasm32")'.dependencies] and its code sits behind
+# `#[cfg(target_arch = "wasm32")]`, so a host, Android or iOS build compiles
+# the crate as an empty shell and reports success. Only a wasm32 build reads
+# the browser code at all. (build.yaml's web-wasm32 row does compile it, by
+# `wasm-pack build --release` -- a different workflow, later, and not over
+# `--all-targets`, so the crate's tests are not in it.)
+#
+# And it does not surface cleanly there either. CI runs this same command
+# inside the Clippy job, at "Verify the autofixed tree still builds (wasm32)",
+# several steps *before* "Run Clippy" (.github/workflows/clippy.yaml). A wasm32
+# break therefore aborts that job early, and every lint finding in the tree
+# stays hidden behind it until the wasm32 arm compiles again. Catching it here
+# is what keeps the lint gate legible.
+#
+# Once per push rather than per commit: the cost lands on a batch of commits,
+# not on each one, and it is the last moment before other people see the work.
+#
+# `-j 4` because this box is shared: other sessions compile in this checkout at
+# the same time, and an unbounded job count starves them.
+#
+# Refs being pushed arrive on stdin and are deliberately ignored: the tree is
+# checked as it stands, whatever is being pushed where.
+#
+# Inert until opted into with `git config core.hooksPath .githooks`.
+
+set -u
+
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+
+echo "pre-push: cargo check --workspace --all-targets --target wasm32-unknown-unknown"
+
+if cargo check --workspace --all-targets --target wasm32-unknown-unknown -j 4; then
+	exit 0
+fi
+
+cat >&2 <<'MSG'
+
+pre-push: the wasm32 arm does not compile. Pushing this reaches CI as a failed
+Clippy job that stops before it lints anything.
+
+If the failure is a missing standard library rather than your code:
+
+    rustup target add wasm32-unknown-unknown
+
+Host-only test files are a recurring cause -- `--all-targets` compiles the
+integration tests for wasm32 too. Gate any host-only test module on
+#[cfg(not(target_arch = "wasm32"))].
+
+Genuinely need to push first? "git push --no-verify" skips this hook.
+MSG
+exit 1
