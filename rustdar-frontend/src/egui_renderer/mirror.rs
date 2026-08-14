@@ -73,8 +73,9 @@ pub const MIRROR_MAX_SIDE: u32 = 2048;
 ///
 /// * **The tile cache.** A rung is only worth having with a matching tile zoom
 ///   bias, and the bias is `log2(rung)`. Each level is four times the tiles,
-///   against the single `tile_source::TILE_CACHE_ENTRIES` (256) LRU every pane
-///   and every layer shares. A 900-point-square floor strip drawing a basemap
+///   against the single `tile_source::TILE_CACHE_ENTRIES` LRU every pane and
+///   every layer shares — 256 on desktop, and the smaller mobile and wasm
+///   arms only tighten this argument. A 900-point-square floor strip drawing a basemap
 ///   and a label layer needs about 32 tiles at bias 0, 162 at bias 1 and 594 at
 ///   bias 2 — so bias 2 cannot fit however the window is arranged, while bias 1
 ///   fits some windows and not others.

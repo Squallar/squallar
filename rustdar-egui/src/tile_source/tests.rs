@@ -29,8 +29,9 @@ use walkers::sources::{Attribution, TileSource};
 use walkers::{Tile, TileId, TilePiece, Tiles};
 
 use super::{
-    HttpsTiles, MAX_PARALLEL_DOWNLOADS, TILE_CACHE_ENTRIES, interpolate_from_lower_zoom,
-    tile_client, tile_id_is_valid,
+    DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles, MAX_PARALLEL_DOWNLOADS, MOBILE_TILE_CACHE_ENTRIES,
+    TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES, interpolate_from_lower_zoom, tile_client,
+    tile_id_is_valid,
 };
 use crate::tiles::CartoDb;
 
@@ -90,7 +91,7 @@ fn whole_tile_uv() -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
 }
 
-/// The two tuning values, restated as literals.
+/// The tuning values, restated as literals.
 ///
 /// Deliberately *not* read from [`super::TILE_CACHE_ENTRIES`] and
 /// [`super::MAX_PARALLEL_DOWNLOADS`]. A test that took its expectation from the
@@ -98,9 +99,11 @@ fn whole_tile_uv() -> egui::Rect {
 /// could never fail — the first version of
 /// [`no_more_than_the_concurrency_limit_is_downloaded_at_once`] did exactly
 /// that, and a mutant raising the limit from 6 to 64 sailed through it.
-/// [`the_tuning_constants_are_the_ones_walkers_uses`] is what ties these back to
-/// the code.
+/// [`the_tuning_constants_are_the_written_figures_on_every_tier`] is what ties
+/// these back to the code.
 const EXPECTED_CACHE_ENTRIES: usize = 256;
+const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 128;
+const EXPECTED_WASM_CACHE_ENTRIES: usize = 64;
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
 
 // ---------------------------------------------------------------------------
@@ -379,6 +382,19 @@ fn loopback_tiles(server: &TileServer, ctx: &Context) -> HttpsTiles {
         LoopbackSource::new(&server.base_url),
         ctx.clone(),
         loopback_client(),
+    )
+}
+
+/// [`loopback_tiles`] with the cache bound handed in, for the per-tier
+/// eviction test — `cargo test` only ever compiles one arm of
+/// [`TILE_CACHE_ENTRIES`], so the other tiers' bounds have to arrive through
+/// the same seam the client does.
+fn loopback_tiles_with_capacity(server: &TileServer, ctx: &Context, capacity: usize) -> HttpsTiles {
+    HttpsTiles::with_client_and_cache(
+        LoopbackSource::new(&server.base_url),
+        ctx.clone(),
+        loopback_client(),
+        std::num::NonZeroUsize::new(capacity).expect("a test capacity is not zero"),
     )
 }
 
@@ -1069,20 +1085,60 @@ fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
     );
 }
 
-/// The cache bound and the concurrency limit are the values walkers uses.
+/// The cache tiers and the concurrency limit are the written figures.
 ///
 /// This is the one place the constants are compared to a literal, which is what
-/// keeps every other test that spends them from being self-fulfilling.
+/// keeps every other test that spends them from being self-fulfilling. All
+/// three cache arms are checked, not just the one this target compiles into
+/// [`TILE_CACHE_ENTRIES`] — the arms have names precisely so the tiers a
+/// desktop test run never activates cannot drift unobserved.
+///
+/// The cfg-gated assertion at the end restates the cascade's selection rule in
+/// independent text: it cannot catch a wrong *value* (the literals above do
+/// that), but it does catch the cascade wiring an arm to the wrong target —
+/// swapped arms fail here on whichever target the tests run on.
 #[test]
-fn the_tuning_constants_are_the_ones_walkers_uses() {
+fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     assert_eq!(
         MAX_PARALLEL_DOWNLOADS, EXPECTED_PARALLEL_DOWNLOADS,
         "the parallel-download limit is a provider term of use, not a dial"
     );
     assert_eq!(
-        TILE_CACHE_ENTRIES.get(),
+        DESKTOP_TILE_CACHE_ENTRIES.get(),
         EXPECTED_CACHE_ENTRIES,
-        "the tile cache bound is what keeps texture memory finite"
+        "the desktop arm is walkers' own figure"
+    );
+    assert_eq!(
+        MOBILE_TILE_CACHE_ENTRIES.get(),
+        EXPECTED_MOBILE_CACHE_ENTRIES,
+        "the mobile arm is half the desktop figure"
+    );
+    assert_eq!(
+        WASM_TILE_CACHE_ENTRIES.get(),
+        EXPECTED_WASM_CACHE_ENTRIES,
+        "the wasm arm is a quarter of the desktop figure"
+    );
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
+    assert_eq!(
+        TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES,
+        "a desktop target must carry the desktop arm"
+    );
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(target_os = "android", target_os = "ios")
+    ))]
+    assert_eq!(
+        TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
+        "a handheld target must carry the mobile arm"
+    );
+    #[cfg(target_arch = "wasm32")]
+    assert_eq!(
+        TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
+        "wasm32 must carry the wasm arm"
     );
 }
 
@@ -1113,6 +1169,99 @@ fn the_tile_cache_is_bounded() {
         Some(capacity),
         "the cache did not settle at its bound"
     );
+}
+
+/// Eviction is exercised at every tier's cap, by recency, not only compiled in.
+///
+/// `cargo test` runs on one arm of [`super::TILE_CACHE_ENTRIES`] — the desktop
+/// one — so the mobile and wasm bounds would otherwise ship as numbers no test
+/// had ever driven a cache to. The bound arrives through
+/// [`loopback_tiles_with_capacity`]; what is under test is the wiring (the
+/// handed-in bound is the one in force) and the direction (the victim is the
+/// least recently touched id, so a touch is what protects an entry).
+///
+/// Every count is exact and read back, never merely "at most the cap": a fill
+/// below the cap must evict *nothing* (the paired negative control — an empty
+/// or pass-through cache fails the very first count), and the one insert at
+/// the cap must remove exactly the LRU id while the just-touched oldest id
+/// survives.
+#[test]
+fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
+    for capacity in [
+        EXPECTED_WASM_CACHE_ENTRIES,
+        EXPECTED_MOBILE_CACHE_ENTRIES,
+        EXPECTED_CACHE_ENTRIES,
+    ] {
+        let server = TileServer::start(Behaviour::NotFound);
+        let ctx = Context::default();
+        let mut tiles = loopback_tiles_with_capacity(&server, &ctx, capacity);
+        let id = |x: u32| TileId { x, y: 0, zoom: 10 };
+
+        // The counter moves before any bound is near: three ids are three
+        // entries, exactly.
+        let reached = pump_until(DEFAULT_TIMEOUT, || {
+            for x in 0..3 {
+                tiles.at(id(x));
+            }
+            (tiles.cached_entries() >= 3).then(|| tiles.cached_entries())
+        });
+        assert_eq!(
+            reached,
+            Some(3),
+            "three requested ids must be three entries at cap {capacity}"
+        );
+
+        // Fill to exactly the cap. Below-or-at the bound nothing may be
+        // evicted, so the exact count doubles as total membership.
+        let reached = pump_until(DEFAULT_TIMEOUT, || {
+            for x in 0..capacity as u32 {
+                tiles.at(id(x));
+            }
+            (tiles.cached_entries() >= capacity).then(|| tiles.cached_entries())
+        });
+        assert_eq!(
+            reached,
+            Some(capacity),
+            "a fill to the cap ({capacity}) must evict nothing"
+        );
+        assert!(
+            tiles.tile_is_cached(id(0)) && tiles.tile_is_cached(id(capacity as u32 - 1)),
+            "both ends of a to-the-cap fill must be resident at {capacity}"
+        );
+
+        // The last full fill pass touched 0..capacity in ascending order, so
+        // the recency order is known. Touch the oldest id: the next victim
+        // must now be x=1, not x=0.
+        tiles.at(id(0));
+
+        // One insert at the cap: admitted, and paid for by exactly the LRU id.
+        let new = id(capacity as u32);
+        let admitted = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.at(new);
+            tiles.tile_is_cached(new).then_some(())
+        });
+        assert!(
+            admitted.is_some(),
+            "the at-cap insert was never admitted at {capacity}"
+        );
+        assert_eq!(
+            tiles.cached_entries(),
+            capacity,
+            "an at-cap insert must not grow the cache past {capacity}"
+        );
+        assert!(
+            !tiles.tile_is_cached(id(1)),
+            "the least recently touched id must be the one evicted at {capacity}"
+        );
+        assert!(
+            tiles.tile_is_cached(id(0)),
+            "the touch must be what protected the oldest id at {capacity}"
+        );
+        assert!(
+            tiles.tile_is_cached(id(capacity as u32 - 1)),
+            "an id younger than the victim must survive at {capacity}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
