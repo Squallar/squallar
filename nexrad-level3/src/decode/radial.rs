@@ -305,10 +305,18 @@ fn skip_xdr_bytes(data: &[u8], offset: usize, n: usize) -> Result<usize> {
 }
 
 /// The on-wire extent of an XDR counted string: its 4-byte length prefix
-/// plus `len` content bytes padded up to a 4-byte boundary.
+/// plus `len` content bytes padded up to a 4-byte boundary. `None` when a
+/// declared length is too large for that extent to exist.
+///
+/// The rounding is done at `u32` width — the width the length is declared
+/// at on the wire — so the same lengths are refused on every target. Done
+/// in `usize` it is only refused on 64-bit: on wasm32 `len.div_ceil(4) * 4`
+/// wraps a length near `u32::MAX` down to a padded size of 0, and the
+/// caller's bounds check then waves the string through as if it were
+/// empty. Same hazard, and the same remedy, as `checked_end`.
 fn xdr_string_extent(len: u32) -> Option<usize> {
-    let padded = len.div_ceil(4) * 4;
-    Some((padded + 4) as usize)
+    let padded = len.checked_next_multiple_of(4)?;
+    Some(padded.checked_add(4)? as usize)
 }
 
 /// Bounds of the XDR string at `offset`: its declared content length, and
@@ -723,6 +731,13 @@ mod tests {
     /// The same length on a *skipped* string, reached through the radial
     /// parameter list rather than the attribute read. `skip_xdr_string`
     /// carried its own copy of the arithmetic.
+    ///
+    /// Caveat, so nobody mistakes this for the guard: it passed against the
+    /// unfixed code in release. A wrapped extent makes the skip land 4 bytes
+    /// in and mis-frame everything after, and this buffer errors only
+    /// because it then runs out of bytes — a longer one would have decoded
+    /// the garbage instead. `a_hostile_xdr_string_length_has_no_extent` is
+    /// what actually holds the line; this covers the second call site.
     #[test]
     fn a_hostile_xdr_string_length_is_an_error_when_skipped() {
         let mut d = xdr_radial_component_prelude();
