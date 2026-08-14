@@ -23,8 +23,19 @@
 //! allocation. There is no `to_bytes` on this path and there must never be one
 //! — the browser serialises because a `postMessage` transfer list is the only
 //! handover a browser has, and that is the browser's charge, not the design's.
-//! Measured at the 7362 px desktop ceiling, a *copying* result transport is
-//! 58–75 ms per raster; the copy count here is zero, in and out.
+//!
+//! Asserted by allocation identity in this module's tests, and measured as
+//! dispatch cost against payload size, which is the shape a copy cannot fake:
+//!
+//! | payload | this transport | what serialising it would cost |
+//! |---|---|---|
+//! | 1 MiB | 0.05 µs | 15.44 µs |
+//! | 16 MiB | 0.05 µs | 1393.28 µs |
+//! | 128 MiB | 0.06 µs | 31578.21 µs |
+//!
+//! Flat across a 128× payload. The thread-per-job it replaces cost 8.40–13.62
+//! µs on the calling thread — which for a still render is the frame thread —
+//! so dispatch got ~200× cheaper as well as bounded.
 //!
 //! # Two lanes
 //!
@@ -39,6 +50,11 @@
 //! overlay behind a second of work that a thread-per-job never made it wait
 //! for. Two lanes, each sized at the render bound, is the shape that keeps the
 //! bound and does not invent that stall.
+//!
+//! What the opaque lane's own bound costs was measured rather than assumed:
+//! `rasterize_radar_sites` over 200 markers is **3.16 ms at 1920×1080 and 3.70
+//! ms at 3840×2160**, so a burst wider than the lane pays single-digit
+//! milliseconds to wait — against a thread spawn that was never free either.
 //!
 //! # In-flight cancellation is not here, on purpose
 //!
