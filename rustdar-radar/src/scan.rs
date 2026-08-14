@@ -737,6 +737,81 @@ pub async fn list_scans_for_range(
     Ok(results)
 }
 
+/// Whether two statements of a Level II volume start name the **same volume
+/// scan**: they agree once truncated to the whole second.
+///
+/// # Why the question has to be asked at all
+///
+/// A volume start reaches the application by two routes, and they do not agree
+/// to the millisecond:
+///
+/// * **From the volume.** `types::ScanInfo::from_scan` takes the collection
+///   time of the *first radial of the first sweep* through
+///   `DateTime::from_timestamp_millis`, so it keeps a millisecond fraction.
+///   This is what a still frame renders under, and what every Level III object
+///   is fetched and cached against.
+/// * **From the archive key.** [`list_scans_for_range`] and
+///   [`fetch_latest_if_newer`] parse `%H%M%S` out of the S3 key, which carries
+///   no sub-second field at all, so the fraction is zero. This is what every
+///   *loop frame* is stamped with, because a loop is a list of keys before it
+///   is a list of volumes.
+///
+/// Measured over 108 archive volumes — 10 sites, 3 dates — the key trails the
+/// first radial by 1 ms to 993 ms, median 517 ms, on **108 of 108**. It is
+/// never equal and never leads, and the Archive II volume header agrees with
+/// the first radial to the millisecond on all 108, so the fraction is the
+/// data's rather than a decode artefact. The key is the volume start
+/// **truncated to the whole second**: every delta lies strictly in
+/// `(-1 s, 0 s]`.
+///
+/// Under exact equality the two routes therefore *never* match, so every frame
+/// of every loop — the newest one included, the one volume the app really did
+/// fetch an object for — silently lost its RPG melting layer and its RPG storm
+/// motion and dropped a rung. That is the defect this exists to close.
+///
+/// # Truncation, not an epsilon
+///
+/// Truncating to the second is not a tolerance sized to cover the measured
+/// spread; it is *exactly the transformation the archive key applies*, applied
+/// to both sides. An epsilon wide enough for 993 ms would be a number with no
+/// authority outside this sample and would have to be re-argued the first time
+/// a volume arrived at 999 ms. `floor(a) == floor(b)` has no such freedom: it
+/// is the inverse of the only lossy step between the two routes, so it is
+/// exactly as wide as the loss and no wider.
+///
+/// # Why it cannot pair the wrong volume
+///
+/// Because consecutive volumes from one site are *minutes* apart. The shortest
+/// WSR-88D cadence anywhere in this tree is a measured 198 s — KPBZ's lowest
+/// 30-minute median, `rustdar-frontend/src/constants/tests.rs:468` — against a
+/// 259 s daily median for the same VCP (`rustdar-frontend/src/budget.rs:640`).
+/// Two timestamps that truncate alike are under 1 s apart, so the nearest
+/// volume this could conceivably confuse for its neighbour sits **198×**
+/// further away than the widest pair it admits. TDWR is wider still at 360 s
+/// and a clear-air VCP wider again at 517 s, so the WSR-88D precipitation
+/// figure is the binding one and the margin above is the worst case, not the
+/// typical one.
+///
+/// # Not [`crate::level3::names_volume`]
+///
+/// That answers a different question — whether a decoded PDB's volume stamp
+/// and a Level II volume start describe the same volume — and it carries
+/// `level3::VOLUME_MATCH_TOLERANCE_SECS` (60 s) of slack because the two are
+/// written by *different subsystems* off the same clock. Here both sides
+/// restate one Level II volume start and differ only in a field the archive
+/// key has no room for, so nothing is tolerated except that truncation.
+///
+/// Pinned by `a_loop_frames_archive_key_names_the_volumes_first_radial` and
+/// `a_neighbouring_volume_never_pairs_however_its_start_was_stated`.
+pub fn names_same_volume(a: NaiveDateTime, b: NaiveDateTime) -> bool {
+    // `and_utc().timestamp()` is whole seconds since the epoch with the
+    // sub-second field dropped: floor on both sides of the epoch, because a
+    // `NaiveDateTime`'s nanosecond field is never negative. Deliberately not
+    // `with_nanosecond(0)`, which is fallible for no reason here, and not a
+    // subtraction against a bound, which would be the epsilon this rejects.
+    a.and_utc().timestamp() == b.and_utc().timestamp()
+}
+
 /// Download one archive object by identifier, **undecoded**. Every loop frame
 /// comes through here. See [`fetch_scan`] for why the decode is the caller's.
 pub async fn fetch_scan_object(identifier: Identifier) -> Result<Vec<u8>> {

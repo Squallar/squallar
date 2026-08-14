@@ -758,3 +758,135 @@ fn the_cuts_the_file_carries_whole_are_not_called_short() {
         "a whole cut covers the circle",
     );
 }
+
+// ── Volume identity across the two ways a start is stated ─────────────────
+
+/// The two timestamps built exactly as the two production routes build them:
+/// `(from the first radial, from the archive key)`.
+///
+/// Neither side is hand-written as a literal, because the whole defect lived
+/// in the difference between the two constructions — a test that spelled both
+/// out by hand would be asserting against its own arithmetic rather than
+/// against the code's.
+fn the_two_routes(hms: &str, millis_into_the_second: i64) -> (NaiveDateTime, NaiveDateTime) {
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 2).expect("a real date");
+    let key_time = NaiveTime::parse_from_str(hms, "%H%M%S").expect("a real archive key tail");
+    // The archive key's route: `list_scans_for_range`, verbatim.
+    let from_key = date.and_time(key_time);
+    // The volume's route: `types::ScanInfo::from_scan`, verbatim — a radial's
+    // `collection_timestamp()` in epoch milliseconds, through
+    // `from_timestamp_millis`.
+    let collection_timestamp = from_key.and_utc().timestamp_millis() + millis_into_the_second;
+    let from_radial = chrono::DateTime::from_timestamp_millis(collection_timestamp)
+        .expect("a real collection timestamp")
+        .naive_utc();
+    (from_radial, from_key)
+}
+
+/// **The regression.** A loop frame is stamped from the S3 key and the object
+/// cached for it is stamped from the volume's first radial, and those two
+/// name one volume.
+///
+/// The measured spread is 1 ms to 993 ms with a median of 517 ms, over 108 of
+/// 108 archive volumes, so the endpoints and the median are all exercised
+/// here — 0 ms is included as the case that never occurs in the archive but is
+/// the still frame's every time, since there both sides come off the radial.
+#[test]
+fn a_loop_frames_archive_key_names_the_volumes_first_radial() {
+    for millis in [0, 1, 517, 993, 999] {
+        let (from_radial, from_key) = the_two_routes("120347", millis);
+
+        assert_eq!(
+            from_key.and_utc().timestamp_subsec_millis(),
+            0,
+            "premise: an archive key has no sub-second field",
+        );
+        assert_eq!(
+            from_radial.and_utc().timestamp_subsec_millis(),
+            u32::try_from(millis).expect("a millisecond offset inside a second"),
+            "premise: the first radial's time keeps its milliseconds",
+        );
+
+        assert!(
+            names_same_volume(from_radial, from_key),
+            "a frame keyed {from_key} was refused the object stamped {from_radial}",
+        );
+        // Symmetric, because the two call sites read it in both orders.
+        assert!(
+            names_same_volume(from_key, from_radial),
+            "the pairing must not depend on which side is named first",
+        );
+    }
+}
+
+/// Exact equality still pairs — the still-frame path, where both sides are
+/// `ScanInfo::timestamp` and the milliseconds are identical.
+///
+/// Widening a comparison is only safe if it is a widening: this is the case
+/// the old `==` got right, and it has to keep working.
+#[test]
+fn a_volume_start_stated_identically_twice_still_names_one_volume() {
+    let (from_radial, _) = the_two_routes("120347", 517);
+    assert!(names_same_volume(from_radial, from_radial));
+
+    let (whole_second, from_key) = the_two_routes("120347", 0);
+    assert!(names_same_volume(whole_second, from_key));
+}
+
+/// A neighbouring volume never pairs, however either start was stated.
+///
+/// One scan cycle is the collision this has to be impossible for. The shortest
+/// WSR-88D cadence in the tree is a measured 198 s (`constants/tests.rs:468`),
+/// so that is the gap tested rather than the 259 s nominal — and the second
+/// either side of it, because "under a second apart" is the whole rule and the
+/// boundary is where a rule of that shape fails.
+#[test]
+fn a_neighbouring_volume_never_pairs_however_its_start_was_stated() {
+    let (from_radial, from_key) = the_two_routes("120347", 517);
+
+    // The shortest measured WSR-88D volume interval, and the two longer ones.
+    for gap_secs in [198, 259, 360, 517] {
+        for shifted in [
+            from_radial + Duration::seconds(gap_secs),
+            from_radial - Duration::seconds(gap_secs),
+            from_key + Duration::seconds(gap_secs),
+            from_key - Duration::seconds(gap_secs),
+        ] {
+            assert!(
+                !names_same_volume(from_radial, shifted),
+                "a volume {gap_secs} s away paired with {from_radial}",
+            );
+            assert!(
+                !names_same_volume(from_key, shifted),
+                "a volume {gap_secs} s away paired with {from_key}",
+            );
+        }
+    }
+
+    // And the boundary, 198 s inside the nearest real collision: one second is
+    // one volume, and the next second is never the same volume however small
+    // the step across the boundary is.
+    let (next_second, _) = the_two_routes("120348", 0);
+    assert!(
+        !names_same_volume(from_radial, next_second),
+        "the second after a volume start is a different second and so a \
+         different volume",
+    );
+    assert!(
+        !names_same_volume(from_key, next_second),
+        "two archive keys one second apart are two volumes",
+    );
+    // The boundary is a boundary and not a rounding: the last instant of a
+    // volume's second still names that volume, and does not also name the one
+    // after. A rule that rounded rather than truncated would answer the
+    // opposite to both of these.
+    let last_instant = next_second - Duration::milliseconds(1);
+    assert!(
+        names_same_volume(from_key, last_instant),
+        "the last millisecond of a volume's second still names that volume",
+    );
+    assert!(
+        !names_same_volume(next_second, last_instant),
+        "the millisecond before a second must not name the second after it",
+    );
+}
