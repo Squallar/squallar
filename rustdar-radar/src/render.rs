@@ -169,12 +169,36 @@ impl MercatorProjection {
         )
     }
 
+    /// Paint one gate over the ground footprint [`GateSpan`] names.
+    ///
+    /// # The span is given, not derived from a centre
+    ///
+    /// This used to take a centre and a depth and split the depth either side.
+    /// That spelling is only correct while the slant-to-ground map is *linear*:
+    /// under `r·cos e` the ground range of a gate's centre is exactly the
+    /// midpoint of its two ground edges, so the two forms agree. Under
+    /// [`crate::beam::ground_range_km`]'s spherical arc they do not — the map
+    /// is convex, so a gate's far half projects shorter than its near half and
+    /// the centre sits off-midpoint. A centred wedge of constant depth would
+    /// then overlap its inner neighbour and leave a gap outside it, which is
+    /// exactly the class of seam `the picture has no seams between one radial
+    /// and the next` closed for azimuth.
+    ///
+    /// So the caller computes both edges and hands them over. A caller that
+    /// walks a radial shares each boundary between the gate inside it and the
+    /// gate outside it — one number, used twice — which makes the tiling exact
+    /// to the bit rather than exact to within rounding. See
+    /// `gate_ground_edges` and
+    /// `tests::consecutive_gates_tile_with_no_seam`.
+    ///
+    /// The centre is still what sizes the tangential sample count, because that
+    /// is a count and not a position; it is the midpoint of the span, which is
+    /// what the old parameter was.
     fn render_gate(
         &self,
         bufs: &RenderBuffers,
         ctx: &RadialContext,
-        range_km: f64,
-        gate_interval: f64,
+        span: GateSpan,
         value: f32,
         from: GateId,
     ) {
@@ -186,8 +210,11 @@ impl MercatorProjection {
         bufs.polar
             .paint(from, ctx.azimuth_deg, ctx.az_half_spacing, value);
 
-        let range_start = range_km - gate_interval / 2.0;
-        let range_end = range_km + gate_interval / 2.0;
+        let GateSpan {
+            near_km: range_start,
+            far_km: range_end,
+        } = span;
+        let range_km = 0.5 * (range_start + range_end);
 
         let mut num_range_samples = ((range_end - range_start) * self.px_per_km).ceil() as i32 + 2;
         let mut num_az_samples =
@@ -251,6 +278,57 @@ impl MercatorProjection {
             }
         }
     }
+}
+
+/// The ground footprint of one gate: the two ranges its wedge runs between.
+///
+/// Half-open in the same sense [`MercatorProjection::render_gate`]'s sample
+/// walk is — `[near_km, far_km)` — so that a boundary shared with the next gate
+/// belongs to the gate outside it, and [`polar::PolarGeometry::pick`] agrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GateSpan {
+    /// The inner edge, ground km.
+    near_km: f64,
+    /// The outer edge, ground km. Never less than `near_km`.
+    far_km: f64,
+}
+
+/// The ground edges of a radial's gates, in order, sharing each boundary
+/// between the gate inside it and the gate outside it.
+///
+/// # Why an iterator over shared edges rather than a span per gate
+///
+/// Gate `j` runs from the slant range `first + (j − ½)·interval` to
+/// `first + (j + ½)·interval`, and the ground edge of each is
+/// [`crate::beam::ground_range_km`] of it. Computing a span per gate would
+/// evaluate every interior boundary **twice**, once as one gate's `far_km` and
+/// once as the next gate's `near_km`, and floating-point arithmetic does not
+/// promise those two evaluations agree: `ground(a)` computed in two different
+/// surrounding expressions can differ in the last place. A sub-ulp gap is still
+/// a gap, and at 4.4522 px/km a systematic one along every gate boundary of
+/// every radial is a moiré the eye picks up long before the arithmetic looks
+/// wrong.
+///
+/// So each boundary is computed **once** and carried, which makes
+/// `far_km == near_km` of the next gate bit-for-bit rather than
+/// nearly. That is the property `tests::consecutive_gates_tile_with_no_seam`
+/// pins, and it is a property of this function, not of the conversion inside
+/// it — it holds for the tangent plane, for the arc, and for anything monotone
+/// that replaces them.
+fn gate_ground_edges(
+    first_gate_slant_km: f64,
+    gate_interval_slant_km: f64,
+    gates: usize,
+    to_ground: impl Fn(f64) -> f64,
+) -> impl Iterator<Item = GateSpan> {
+    let half = gate_interval_slant_km / 2.0;
+    let mut near_km = to_ground(first_gate_slant_km - half);
+    (0..gates).map(move |j| {
+        let far_km = to_ground(first_gate_slant_km + (j as f64 + 0.5) * gate_interval_slant_km);
+        let span = GateSpan { near_km, far_km };
+        near_km = far_km;
+        span
+    })
 }
 
 /// Pre-computed azimuth sin/cos values for a single radial strip.
@@ -2471,19 +2549,24 @@ pub fn render_radar_to_image_full_sized(
                         let first_gate_range = moment.first_gate_range_km();
                         let gate_size = moment.gate_interval_km();
 
+                        // A gate is measured out along the beam and drawn on
+                        // the ground under it, so what this loop counts in and
+                        // what the projection paints in are two different
+                        // ranges. `gate_ground_edges` walks the second, sharing
+                        // each boundary between the gate inside it and the gate
+                        // outside it so the wedges tile exactly.
+                        let edges = gate_ground_edges(
+                            first_gate_range,
+                            gate_size,
+                            moment.gate_count() as usize,
+                            |slant_km| slant_km * cos_e,
+                        );
                         // `iter`, not `values`: the latter is `iter().collect()`
                         // and this walk is strictly sequential, so the `Vec`
                         // would be eight bytes per gate allocated and dropped
                         // for every radial of every render.
-                        for (gate_idx, moment_value) in moment.iter().enumerate() {
-                            // A gate is measured out along the beam and drawn
-                            // on the ground under it, so what this loop counts
-                            // in and what the projection paints in are two
-                            // different ranges. `cos_e` is monotone in neither
-                            // direction here — it is one constant for the
-                            // sweep — so the break below still short-circuits.
-                            let ground_km =
-                                (first_gate_range + (gate_idx as f64 * gate_size)) * cos_e;
+                        for ((gate_idx, moment_value), span) in moment.iter().enumerate().zip(edges)
+                        {
                             // The edge of the image, and the image was sized
                             // from this sweep's own reach — so on a sweep whose
                             // radials agree this never fires, and a 1832-gate
@@ -2493,7 +2576,12 @@ pub fn render_radar_to_image_full_sized(
                             // `types::MAX_EXTENT_KM`, or past a shorter
                             // neighbour's agreed reach on a sweep
                             // `compute_max_range` has already warned about.
-                            if ground_km > proj.extent_km {
+                            //
+                            // The gate's **inner** edge, because a gate that
+                            // starts outside the picture is the first one with
+                            // nothing to contribute; the conversion is monotone,
+                            // so the break still short-circuits.
+                            if span.near_km > proj.extent_km {
                                 break;
                             }
 
@@ -2505,20 +2593,7 @@ pub fn render_radar_to_image_full_sized(
                                 radial: radial_idx,
                                 gate: gate_idx,
                             };
-                            // The depth foreshortens with the range: a gate is
-                            // a segment of the beam, and its shadow on the
-                            // ground is that segment times the same `cos e`.
-                            // Painting a full-depth cell at a shortened range
-                            // would overlap its neighbour by `1 − cos e` of a
-                            // gate and leave the sweep's outer edge long.
-                            proj.render_gate(
-                                bufs,
-                                &ctx,
-                                ground_km,
-                                gate_size * cos_e,
-                                scaled_value,
-                                from,
-                            );
+                            proj.render_gate(bufs, &ctx, span, scaled_value, from);
                         }
                     }
                 });
@@ -2588,14 +2663,18 @@ fn render_nrot_to_image(
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
                 let ctx = RadialContext::new(vg.azimuths_deg[i], half_widths[i]);
 
-                for (j, &nrot_val) in nrot_row.iter().enumerate() {
+                let edges = gate_ground_edges(
+                    vg.first_gate_range_km,
+                    vg.gate_interval_km,
+                    nrot_row.len(),
+                    |slant_km| slant_km * cos_e,
+                );
+                for ((j, &nrot_val), span) in nrot_row.iter().enumerate().zip(edges) {
                     if nrot_val.is_nan() {
                         continue;
                     }
 
-                    let ground_km =
-                        (vg.first_gate_range_km + j as f64 * vg.gate_interval_km) * cos_e;
-                    if ground_km > proj.extent_km {
+                    if span.near_km > proj.extent_km {
                         break;
                     }
 
@@ -2611,14 +2690,7 @@ fn render_nrot_to_image(
                     }
 
                     let from = GateId { radial: i, gate: j };
-                    proj.render_gate(
-                        bufs,
-                        &ctx,
-                        ground_km,
-                        vg.gate_interval_km * cos_e,
-                        scaled_value,
-                        from,
-                    );
+                    proj.render_gate(bufs, &ctx, span, scaled_value, from);
                 }
             });
         },
@@ -2700,24 +2772,21 @@ fn render_srv_to_image(
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(i, row)| {
                 let ctx = RadialContext::new(grid.azimuths_deg[i], half_widths[i]);
-                for (j, &value) in row.iter().enumerate() {
+                let edges = gate_ground_edges(
+                    grid.first_gate_range_km,
+                    grid.gate_interval_km,
+                    row.len(),
+                    |slant_km| slant_km * cos_e,
+                );
+                for ((j, &value), span) in row.iter().enumerate().zip(edges) {
                     if value.is_nan() {
                         continue;
                     }
-                    let ground_km =
-                        (grid.first_gate_range_km + j as f64 * grid.gate_interval_km) * cos_e;
-                    if ground_km > proj.extent_km {
+                    if span.near_km > proj.extent_km {
                         break;
                     }
                     let from = GateId { radial: i, gate: j };
-                    proj.render_gate(
-                        bufs,
-                        &ctx,
-                        ground_km,
-                        grid.gate_interval_km * cos_e,
-                        value as f32,
-                        from,
-                    );
+                    proj.render_gate(bufs, &ctx, span, value as f32, from);
                 }
             });
         },
@@ -2759,7 +2828,11 @@ pub fn render_echo_tops_interp_to_image(
                         radial: az,
                         gate: r,
                     };
-                    proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v, from);
+                    let span = GateSpan {
+                        near_km: r as f64,
+                        far_km: r as f64 + 1.0,
+                    };
+                    proj.render_gate(bufs, &ctx, span, *v, from);
                 }
             });
         },
@@ -2834,7 +2907,11 @@ pub fn render_derived_vild_to_image_sized(
                         radial: az,
                         gate: r,
                     };
-                    proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v, from);
+                    let span = GateSpan {
+                        near_km: r as f64,
+                        far_km: r as f64 + 1.0,
+                    };
+                    proj.render_gate(bufs, &ctx, span, *v, from);
                 }
             });
         },
@@ -2936,7 +3013,11 @@ pub fn render_hail_to_image(
                         radial: az,
                         gate: r,
                     };
-                    proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v * unit_scale, from);
+                    let span = GateSpan {
+                        near_km: r as f64,
+                        far_km: r as f64 + 1.0,
+                    };
+                    proj.render_gate(bufs, &ctx, span, *v * unit_scale, from);
                 }
             });
         },
@@ -3090,7 +3171,12 @@ pub fn render_hhc_to_image(
                         radial: az,
                         gate: r,
                     };
-                    proj.render_gate(bufs, &ctx, range_km, grid.gate_interval_km, v, from);
+                    let half = grid.gate_interval_km / 2.0;
+                    let span = GateSpan {
+                        near_km: range_km - half,
+                        far_km: range_km + half,
+                    };
+                    proj.render_gate(bufs, &ctx, span, v, from);
                 }
             });
         },
@@ -3154,24 +3240,21 @@ pub fn render_derived_kdp_to_image(
         |proj, bufs| {
             derived.values.par_iter().enumerate().for_each(|(i, row)| {
                 let ctx = RadialContext::new(derived.azimuths_deg[i], half_widths[i]);
-                for (j, &v) in row.iter().enumerate() {
+                let edges = gate_ground_edges(
+                    derived.first_gate_km,
+                    derived.gate_interval_km,
+                    row.len(),
+                    |slant_km| slant_km * cos_e,
+                );
+                for ((j, &v), span) in row.iter().enumerate().zip(edges) {
                     if v.is_nan() {
                         continue;
                     }
-                    let ground_km =
-                        (derived.first_gate_km + j as f64 * derived.gate_interval_km) * cos_e;
-                    if ground_km > proj.extent_km {
+                    if span.near_km > proj.extent_km {
                         break;
                     }
                     let from = GateId { radial: i, gate: j };
-                    proj.render_gate(
-                        bufs,
-                        &ctx,
-                        ground_km,
-                        derived.gate_interval_km * cos_e,
-                        v,
-                        from,
-                    );
+                    proj.render_gate(bufs, &ctx, span, v, from);
                 }
             });
         },
@@ -3322,7 +3405,12 @@ fn render_level3_radial_with_gate_km(
                             radial: radial_idx,
                             gate: gate_idx,
                         };
-                        proj.render_gate(bufs, &ctx, range_km, gate_interval, physical_value, from);
+                        let half = gate_interval / 2.0;
+                        let span = GateSpan {
+                            near_km: range_km - half,
+                            far_km: range_km + half,
+                        };
+                        proj.render_gate(bufs, &ctx, span, physical_value, from);
                     }
                 });
         },
