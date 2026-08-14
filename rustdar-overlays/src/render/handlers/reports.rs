@@ -11,11 +11,10 @@ use crate::render::controls::{
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
     OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RasterizeFn, RenderMode,
+    RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
-use crate::types::GeoBounds;
 
 // `pub`, not `pub(crate)`, for `alert::NwsAlertFetchResult`'s reason: the
 // described-job dispatch and hit-map zip tests in `rustdar-frontend` seed a
@@ -164,9 +163,9 @@ impl StormReportsHandler {
         }
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder both
-    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
-    /// and the described job cannot come to capture different state.
+    /// What the rasterizer reads, captured once — the **one** builder
+    /// `prepare_job` answers from, kept a private helper so a second dispatch
+    /// path could not quietly capture different state.
     ///
     /// The rows are [`rasterize::ReportPaint`], not whole [`StormReport`]s:
     /// the kind and the coordinates are everything the raster reads, and the
@@ -322,16 +321,7 @@ impl OverlayHandler for StormReportsHandler {
         });
     }
 
-    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let input = self.paint_input(ctx)?;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_storm_reports(&input, bounds, width, height)
-        }))
-    }
-
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        // The same helper `prepare_rasterize` captures from, so the described
-        // job and the closure cannot come to capture different state.
         Some(HandlerJobInput::Reports(self.paint_input(ctx)?))
     }
 

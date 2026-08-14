@@ -12,7 +12,7 @@ use crate::render::controls::{
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
+    OverlayState, PopupContent, PopupSection, RenderMode,
 };
 use crate::render::station_model;
 
@@ -343,10 +343,6 @@ impl OverlayHandler for MetarHandler {
                 .iter()
                 .any(|item| item.matches(sel.as_ref()))
         });
-    }
-
-    fn prepare_rasterize(&self, _ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        None // PerFramePoint mode; nothing is rasterized in the background.
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

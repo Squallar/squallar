@@ -2,11 +2,11 @@
 //! rather than against the field.
 //!
 //! [`AlphaMode`] exists because this module produces both, and the consumer
-//! (`app_fetch::overlay_color_image`) cannot tell them apart by looking: the two
-//! egui constructors accept identical input and neither can fail. A wrong
-//! declaration is therefore silent all the way to the screen, where it shows up
-//! as every translucent pixel being the wrong colour — which is a thing nobody
-//! diffs.
+//! (`rustdar_frontend::offload::execute`'s convert-inside-the-job seam)
+//! cannot tell them apart by looking: the two conventions are identical bags
+//! of bytes and neither conversion can fail. A wrong declaration is therefore
+//! silent all the way to the screen, where it shows up as every translucent
+//! pixel being the wrong colour — which is a thing nobody diffs.
 //!
 //! So each test below asserts an invariant of the *bytes* that only one
 //! convention can satisfy, and that is what makes the declaration checkable.
@@ -115,17 +115,22 @@ fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
 
 /// **The trap.** `rasterize_model_data` never went through tiny-skia and never
 /// called the un-premultiply, so it was already writing straight alpha while
-/// every neighbour wrote premultiplied-then-converted. It reaches the uploader
-/// through the same `prepare_rasterize` arm as the polygon overlays, so one
-/// global choice of egui constructor is wrong about one of them whichever way
-/// it is made — and HRRR is the half that would go wrong silently, because
-/// nobody has a reference picture of it.
+/// every neighbour wrote premultiplied-then-converted. It reaches
+/// `offload::execute`'s convert-inside-the-job seam through the same described
+/// arm as the polygon overlays, so one global choice of egui constructor is
+/// wrong about one of them whichever way it is made — and HRRR is the half
+/// that would go wrong silently, because nobody has a reference picture of it.
 ///
 /// The assertion is that the bytes are the palette's own, unscaled: a colour
 /// channel *above* alpha, which premultiplied RGBA cannot represent.
 #[test]
 fn model_data_hands_over_straight_alpha() {
-    let out = rasterize_model_data(&cape_grid(), &BOUNDS, W, H);
+    let out = rasterize_model_data(
+        &super::ModelDataInput::Whole(std::sync::Arc::new(cape_grid())),
+        &BOUNDS,
+        W,
+        H,
+    );
     assert_eq!(
         out.alpha,
         AlphaMode::Straight,

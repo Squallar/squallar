@@ -1,4 +1,7 @@
 use super::*;
+// Used only by the gated-render instrument and the tests built on it, which
+// are native-only with `Job::Opaque`; see `gated_render`.
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 
 /// A render that does not finish until the test releases it.
@@ -12,6 +15,12 @@ use std::sync::mpsc;
 /// executed by the funnel with no handle to hold it open. What is under
 /// test is the abandonment protocol around a running render, which is the
 /// same for both job shapes — `deliver` carries the flag either way.
+///
+/// `Opaque` is the native-only test instrument now (the variant does not
+/// exist on wasm32, by design — see its own doc), so this fixture and every
+/// test built on it are native-only with it. The protocol they pin is
+/// target-independent; the instrument is not.
+#[cfg(not(target_arch = "wasm32"))]
 fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
     let (release, held) = mpsc::channel::<()>();
     (
@@ -35,6 +44,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
 /// [`gated_render`] for a render that answers nothing — what
 /// `Job::renders_nothing` produces when no sweep carries the product, held
 /// open so the abandonment protocol can be exercised around it.
+#[cfg(not(target_arch = "wasm32"))]
 fn gated_nothing() -> (mpsc::Sender<()>, crate::offload::Job) {
     let (release, held) = mpsc::channel::<()>();
     (
@@ -245,6 +255,7 @@ fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn dispatch(
     d: &mut RenderDispatcher,
     pane_idx: usize,
@@ -265,6 +276,7 @@ fn dispatch(
 
 /// How many renders were not abandoned. Ends when the last worker drops its
 /// sender, so nothing here waits on a timeout.
+#[cfg(not(target_arch = "wasm32"))]
 fn arrivals(results: mpsc::Sender<RenderResponse>, rx: mpsc::Receiver<RenderResponse>) -> usize {
     drop(results);
     rx.iter().count()
@@ -275,6 +287,7 @@ fn arrivals(results: mpsc::Sender<RenderResponse>, rx: mpsc::Receiver<RenderResp
 /// the receiver and respawned — a 2048² image and value grid redone per pane
 /// per poll, recurring every interval in any multi-site layout.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_scan_for_one_site_leaves_another_sites_render_alone() {
     let gui = gui_showing("KOUN");
     let mut d = RenderDispatcher::new();
@@ -302,6 +315,7 @@ fn a_scan_for_one_site_leaves_another_sites_render_alone() {
 /// pane paints the previous volume over the new one and then stops, since
 /// `last_rendered` records that render as the one it is showing.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_scan_for_the_panes_own_site_abandons_its_render() {
     let gui = gui_showing("KOUN");
     let mut d = RenderDispatcher::new();
@@ -324,6 +338,7 @@ fn a_scan_for_the_panes_own_site_abandons_its_render() {
 /// starts a second. Abandoning only the newest would leave the older free to
 /// arrive last and paint the scan the reset was meant to replace.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn every_render_a_pane_has_running_is_abandoned_at_once() {
     let gui = gui_showing("KOUN");
     let mut d = RenderDispatcher::new();
@@ -341,6 +356,7 @@ fn every_render_a_pane_has_running_is_abandoned_at_once() {
 /// A full reset is site-blind by design — surface loss, a layout change — and
 /// keeps discarding everything.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_full_reset_abandons_every_panes_render() {
     let mut d = RenderDispatcher::new();
     let (results, rx) = mpsc::channel();
@@ -368,6 +384,7 @@ fn a_full_reset_abandons_every_panes_render() {
 /// have. Routine against a volume still being assembled from the real-time
 /// chunk feed, where an upper tilt has simply not been scanned yet.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_render_that_finds_nothing_still_reports_back() {
     let mut d = RenderDispatcher::new();
     let (results, rx) = mpsc::channel();
@@ -402,6 +419,7 @@ fn a_render_that_finds_nothing_still_reports_back() {
 /// Reporting would clear `render_in_flight` for the render that *superseded*
 /// it, and the pane would dispatch a third while the second was still going.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn an_abandoned_render_that_finds_nothing_reports_nothing() {
     let gui = gui_showing("KOUN");
     let mut d = RenderDispatcher::new();
@@ -483,6 +501,7 @@ fn cached(range: f64) -> CachedRenderOutput {
 /// correct image. Resetting it dispatches a render whose `extract` answers
 /// `None` — a wasted slot in the render budget, on every cut of every volume.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_finished_tilt_leaves_a_pane_on_another_tilt_alone() {
     let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 4.0, &[0.5, 4.0]);
     let mut d = RenderDispatcher::new();
@@ -508,6 +527,7 @@ fn a_finished_tilt_leaves_a_pane_on_another_tilt_alone() {
 /// The counterweight: the pane whose tilt it was must be invalidated, or the
 /// new sweep never reaches the screen.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_finished_tilt_invalidates_the_pane_showing_it() {
     let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
     let mut d = RenderDispatcher::new();
@@ -725,6 +745,7 @@ fn a_tilt_reset_keeps_the_other_tilts_cached_renders() {
 /// exact rather than probabilistic. Asserted as `== 1` for that reason: a grace
 /// slot would only hide the race coming back.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn finished_renders_stop_being_tracked() {
     let mut d = RenderDispatcher::new();
     let (results, rx) = mpsc::channel();

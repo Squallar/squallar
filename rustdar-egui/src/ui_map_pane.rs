@@ -595,12 +595,12 @@ pub(super) fn render_pane_map_content(
             // Matching the dispatch above is *not* what makes this right, and
             // the first version of this line matched it exactly and was still
             // wrong. What has to hold is that a dispatched render can actually
-            // land: `spawn_overlay_render` asks the handler for a rasterizer
-            // and abandons the render if it declines, which clears nothing and
-            // leaves `zoom_is_stale` true for ever. `has_data` is that
-            // condition only because
+            // land: `spawn_overlay_render` asks the handler for its described
+            // input and abandons the render if it declines, which clears
+            // nothing and leaves `zoom_is_stale` true for ever. `has_data` is
+            // that condition only because
             // `every_texture_handler_agrees_with_its_own_rasterizer` holds it
-            // to each handler's own `prepare_rasterize` —
+            // to each handler's own `prepare_job` —
             // `SpcOutlookHandler`'s did not, and unticking its products left
             // this pane asking for a frame every 100 ms until the app closed.
             if enabled && has_data && cache.zoom_is_stale(zoom) {

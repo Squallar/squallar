@@ -11,17 +11,18 @@
 //!
 //! The **poller-to-GPU leg only.** These tests hand
 //! `poll_overlay_render_results` a converted response; they do not drive
-//! `spawn_overlay_render` itself, because it captures a
-//! `Box<dyn FnOnce(..) -> ..>` holding overlay-handler state that no test can
-//! construct without a live `OverlayRegistry` and fetched data behind it.
+//! `spawn_overlay_render` itself (the wire tests beside it do —
+//! `sites_wire_tests`, `polygon_wire_tests`, `hitmap_wire_tests`,
+//! `model_wire_tests`).
 //!
-//! So the claim "the poller does not convert" rests on two separate things, and
-//! neither substitutes for the other: the bytes below, and
-//! `frame_thread_conversion_tests::both_overlay_rasterizers_convert_before_they_send`,
-//! which is a **source-text** assertion that both `offload` arms still call
-//! `App::overlay_color_image` on the rasterizer's own output. A conversion that
-//! changed shape inside those closures would be caught textually and not by
-//! comparison. Anyone strengthening this should start there.
+//! So the claim "the poller does not convert" rests on two separate things,
+//! and neither substitutes for the other: the bytes below, and
+//! `frame_thread_conversion_tests::every_overlay_dispatch_is_described_and_converts_nothing`,
+//! which is a **source-text** assertion that no dispatch arm converts at all
+//! — `offload::execute` converts inside the job, at the rasterizer's own
+//! declaration. A conversion that changed shape there would be caught
+//! textually and not by comparison. Anyone strengthening this should start
+//! there.
 //!
 //! The conversion the fixture below hands in is `from_rgba_unmultiplied`, and
 //! it stays that way deliberately. What is under test is that the poller

@@ -10,11 +10,10 @@ use crate::render::controls::{
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
     OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RasterizeFn, RenderMode,
+    RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-use crate::types::GeoBounds;
 
 /// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
 /// dispatch tests seed a live registry through `apply_fetch_result`, whose
@@ -464,9 +463,9 @@ impl SpcOutlookHandler {
         features
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder both
-    /// `prepare_rasterize` and `prepare_job` answer from, so the closure path
-    /// and the described job cannot come to capture different state.
+    /// What the rasterizer reads, captured once — the **one** builder
+    /// `prepare_job` answers from, kept a private helper so a second dispatch
+    /// path could not quietly capture different state.
     ///
     /// The hatch colour is a page-side fact (the theme) resolved **here**, at
     /// capture time, and carried as the resolved value: the worker a described
@@ -660,12 +659,12 @@ impl OverlayHandler for SpcOutlookHandler {
     /// Data **this selection** can draw, not data this layer has ever fetched.
     ///
     /// Every other handler's `has_data` is the same test its own
-    /// `prepare_rasterize` opens with, and this one was not: outlooks are keyed
+    /// `prepare_job` opens with, and this one was not: outlooks are keyed
     /// by `(day, product)`, so a full `state.data` says nothing about whether
     /// the selected day crossed with the ticked products yields a single
     /// feature. Untick every product, or move to a day whose products are not
-    /// ticked, and the old answer was `true` while `prepare_rasterize` returned
-    /// `None`.
+    /// ticked, and the old answer was `true` while the rasterize dispatch
+    /// answered `None`.
     ///
     /// That gap is not cosmetic. `ui_map_pane` reads this to decide both
     /// whether to dispatch a render *and* whether a settle render is still owed
@@ -673,7 +672,7 @@ impl OverlayHandler for SpcOutlookHandler {
     /// owed. An overlay that is asked for for ever and abandoned in
     /// `spawn_overlay_render` for ever is a permanent 10 Hz wakeup on an
     /// otherwise idle app, on the battery, with nothing on screen to say why.
-    /// So this is the exact complement of `prepare_rasterize`'s own early
+    /// So this is the exact complement of `prepare_job`'s own early
     /// return, and `every_texture_handler_agrees_with_its_own_rasterizer` is
     /// what keeps the two from drifting apart again.
     fn has_data(&self) -> bool {
@@ -818,16 +817,7 @@ impl OverlayHandler for SpcOutlookHandler {
         // not on a data ID.
     }
 
-    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let input = self.paint_input(ctx)?;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_spc_outlooks(&input, bounds, width, height)
-        }))
-    }
-
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        // The same helper `prepare_rasterize` captures from, so the described
-        // job and the closure cannot come to read different state.
         self.paint_input(ctx).map(HandlerJobInput::Outlooks)
     }
 

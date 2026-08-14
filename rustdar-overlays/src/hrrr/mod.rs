@@ -920,7 +920,7 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 /// by `MODEL_GRID_CACHE_ENTRIES`, sized to the pane count. The figure above is
 /// still what one resident grid costs on this arm — it is the multiplier that
 /// stopped being unbounded, not the cost.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GridCoords {
     /// GRIB2 template 3.30 — computed on demand from section 3.
     Lambert(lambert::LambertGrid),
@@ -1031,7 +1031,11 @@ impl GridCoords {
 }
 
 /// Parsed HRRR grid data for a single model parameter.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is for the described-overlay wire tests, which compare whole
+/// requests; it is derived and carries the usual `f64`/`f32` caveat that
+/// `NaN != NaN`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct HrrrGridData {
     /// Which parameter this grid represents.
     pub parameter: ModelParameter,

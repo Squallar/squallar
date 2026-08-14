@@ -612,6 +612,123 @@ pub(super) fn an_overlay_glm_job() -> JobRequest {
     }
 }
 
+/// The model-grid fixtures' Lambert constants: a 60×44 grid on HRRR's own
+/// projection and 3 km step, **as stored bits** — printed once from
+/// `LambertGrid::to_parts()` of `rustdar-overlays`' `lambert_fixture` and
+/// embedded with `from_bits`, so no libm runs at fixture build and the bytes
+/// are the same on every platform. That is the property the framing digest
+/// stands on; recomputing any of these through `sin`/`ln` would make the
+/// digest a function of the host's last ulp.
+fn a_lambert_parts() -> rustdar_overlays::hrrr::lambert::LambertGridParts {
+    rustdar_overlays::hrrr::lambert::LambertGridParts {
+        a: f64::from_bits(0x41584de740000000), // 6371229
+        e: 0.0,
+        n: f64::from_bits(0x3fe3eba3d0b47a0e), // 0.6225146366376195
+        big_f: f64::from_bits(0x3fffab310810e319), // 1.979294806964566
+        rho0: f64::from_bits(0x415e8e0126f7b628), // 8009732.608869113
+        lon0: f64::from_bits(0x40125371ed71b637), // 4.581489286485115 rad
+        x0: f64::from_bits(0xc1449498123e289b), // -2697520.1425219304
+        y0: f64::from_bits(0xc138386a270df418), // -1587306.1525566634
+        dx: 3000.0,
+        dy: 3000.0,
+        ni: 60,
+        nj: 44,
+        i_consecutive: true,
+        alternating: false,
+        wraps_longitude: false,
+    }
+}
+
+/// A viewport whose corners sit on grid points (22, 16) and (34, 26) of
+/// [`a_lambert_parts`]'s grid — printed as bits beside the constants, for the
+/// same digest-stability reason. Its projection window is a **proper** subset
+/// of the grid, which the parity test asserts rather than assumes.
+fn a_model_viewport() -> rustdar_overlays::types::GeoBounds {
+    rustdar_overlays::types::GeoBounds {
+        min_lat: f64::from_bits(0x4035b080d763ce74), // 21.68946596323663
+        max_lat: f64::from_bits(0x4036058f2985b42e), // 22.02171573175672
+        min_lon: f64::from_bits(0xc05e8ffce7e7a000), // -122.24981114978436
+        max_lon: f64::from_bits(0xc05e8006a9e45528), // -122.00040671632871
+    }
+}
+
+/// The full grid behind [`an_overlay_model_whole_job`]: 2640 patterned values
+/// (both axes move the value, as the overlays crate's own Lambert fixture
+/// patterns them, so a window cut at the wrong offset paints differently).
+fn a_model_grid() -> rustdar_overlays::hrrr::HrrrGridData {
+    use rustdar_overlays::hrrr::{GridCoords, HrrrGridData, ModelParameter};
+    let parameter = ModelParameter::SurfaceBasedCape;
+    let (ni, nj) = (60usize, 44usize);
+    let values: Vec<f32> = (0..ni * nj)
+        .map(|k| ((k % 4001) + (k / ni) % 997) as f32)
+        .collect();
+    let geometry = rustdar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
+        .expect("the fixture constants are the ones a real template produced");
+    let (visible_points, value_range) =
+        rustdar_overlays::hrrr::summarize_values(&values, parameter);
+    HrrrGridData {
+        parameter,
+        values,
+        coords: GridCoords::Lambert(geometry),
+        ni,
+        nj,
+        // The rasterizer never reads `bounds` (hover does, and hover stays on
+        // the page), and it does not travel; the viewport stands in.
+        bounds: a_model_viewport(),
+        ref_time: chrono::NaiveDate::from_ymd_opt(2026, 8, 14)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+        forecast_hour: 0,
+        visible_points,
+        value_range,
+    }
+}
+
+/// The model overlay job as the **dispatch** builds it: the grid whole, by
+/// `Arc` — what `to_bytes` cuts to its window on the way out.
+pub(super) fn an_overlay_model_whole_job() -> JobRequest {
+    use rustdar_overlays::render::rasterize::ModelDataInput;
+    JobRequest::Overlay {
+        width: 96,
+        height: 72,
+        bounds: a_model_viewport(),
+        input: OverlayJobInput::ModelData(Box::new(ModelDataInput::Whole(std::sync::Arc::new(
+            a_model_grid(),
+        )))),
+    }
+}
+
+/// The model overlay job in its **wire form** — the window carry the decoder
+/// produces — which is the fixture for everything that must round-trip to
+/// itself: the framing digest, the tag and inner-code tables, and the
+/// malformed suite's shared walk. A 6×4 window with 24 distinct finite
+/// values (`NaN` would be honest data but breaks the round trip's
+/// `PartialEq`, so the NaN path is pinned in `model_nan_tests` instead).
+pub(super) fn an_overlay_model_job() -> JobRequest {
+    use rustdar_overlays::render::rasterize::{IndexWindow, ModelDataInput, ModelWindow};
+    let geometry = rustdar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
+        .expect("the fixture constants are the ones a real template produced");
+    JobRequest::Overlay {
+        width: 96,
+        height: 72,
+        bounds: a_model_viewport(),
+        input: OverlayJobInput::ModelData(Box::new(ModelDataInput::Window(ModelWindow {
+            parameter: rustdar_overlays::hrrr::ModelParameter::SurfaceBasedCape,
+            ni: 60,
+            nj: 44,
+            coords: rustdar_overlays::hrrr::GridCoords::Lambert(geometry),
+            win: IndexWindow {
+                i0: 14,
+                i1: 20,
+                j0: 10,
+                j1: 14,
+            },
+            values: (0..24).map(|k| (k * 100) as f32).collect(),
+        }))),
+    }
+}
+
 /// The voxel job a pane whose viewport is **not square** posts.
 ///
 /// The two axes are two `f64`s on the wire, adjacent and same-typed, so an
@@ -651,6 +768,10 @@ fn every_job_kind_survives_the_wire_format() {
         an_overlay_discussions_job(),
         an_overlay_reports_job(),
         an_overlay_glm_job(),
+        // The window form; the whole-grid form deliberately does NOT
+        // round-trip to itself — it canonicalises to this one, which
+        // `the_whole_model_grid_encodes_as_exactly_its_window` pins.
+        an_overlay_model_job(),
     ] {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),
@@ -708,7 +829,7 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // And the encoder really posts those bytes — the constant could be
     // right while the arm that writes it is not. Every constructible kind,
     // framed against its literal rather than against its own constant.
-    let framing: [(JobRequest, u8); 12] = [
+    let framing: [(JobRequest, u8); 13] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 4),
@@ -721,6 +842,7 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
         (an_overlay_discussions_job(), 8),
         (an_overlay_reports_job(), 8),
         (an_overlay_glm_job(), 8),
+        (an_overlay_model_job(), 8),
     ];
     for (job, tag) in framing {
         let bytes = job.to_bytes();
@@ -773,13 +895,14 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
 #[test]
 fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(&str, u8, u8); 6] = [
+    let table: [(&str, u8, u8); 7] = [
         ("OVERLAY_INPUT_SITES", OVERLAY_INPUT_SITES, 1),
         ("OVERLAY_INPUT_ALERTS", OVERLAY_INPUT_ALERTS, 2),
         ("OVERLAY_INPUT_OUTLOOKS", OVERLAY_INPUT_OUTLOOKS, 3),
         ("OVERLAY_INPUT_DISCUSSIONS", OVERLAY_INPUT_DISCUSSIONS, 4),
         ("OVERLAY_INPUT_REPORTS", OVERLAY_INPUT_REPORTS, 5),
         ("OVERLAY_INPUT_GLM", OVERLAY_INPUT_GLM, 6),
+        ("OVERLAY_INPUT_MODEL", OVERLAY_INPUT_MODEL, 7),
     ];
     for (name, actual, expected) in table {
         assert_eq!(
@@ -791,13 +914,14 @@ fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
     // And the encoder really writes those bytes where the decoder reads them:
     // the input-kind byte sits after the fixed header — tag(1) + width(4) +
     // height(4) + bounds(32) = offset 41 — for every overlay kind alike.
-    let by_fixture: [(JobRequest, u8); 6] = [
+    let by_fixture: [(JobRequest, u8); 7] = [
         (an_overlay_sites_job(), 1),
         (an_overlay_alerts_job(), 2),
         (an_overlay_outlooks_job(), 3),
         (an_overlay_discussions_job(), 4),
         (an_overlay_reports_job(), 5),
         (an_overlay_glm_job(), 6),
+        (an_overlay_model_job(), 7),
     ];
     for (job, code) in by_fixture {
         let bytes = job.to_bytes();
@@ -813,11 +937,12 @@ fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
     }
 
     // The unallocated bytes on either end stay unallocated: 0 so a zeroed
-    // buffer never decodes, and 7 so a seventh kind cannot arrive without a
+    // buffer never decodes, and 8 so an eighth kind cannot arrive without a
     // line in the table above. **2 through 4 left this list when the polygon
-    // kinds took them, and 5 and 6 when the hit-map kinds did.**
+    // kinds took them, 5 and 6 when the hit-map kinds did, and 7 when the
+    // model grid — the last opaque kind — did.**
     let mut bytes = an_overlay_sites_job().to_bytes();
-    for unallocated in [0u8, 7] {
+    for unallocated in [0u8, 8] {
         bytes[41] = unallocated;
         assert_eq!(
             JobRequest::from_bytes(&bytes),
@@ -1172,13 +1297,13 @@ fn an_undecodable_level3_payload_renders_nothing() {
     );
 }
 
-/// With no sink installed, `offload_job` falls through to [`offload`] and
+/// With no sink installed, `offload_job` falls through to `run_here` and
 /// `deliver` still sees the result.
 ///
-/// That fallthrough is the browser-without-a-worker case, and it is the one
-/// path that stays inline: on a native thread [`offload`] hands the closure to
-/// the pool's opaque lane instead, which is why this asserts on the *result*
-/// arriving rather than on where it arrived from.
+/// That fallthrough is the browser-without-a-worker case, and the one inline
+/// path wasm has left; natively `run_here` spawns a thread for it instead,
+/// which is why this asserts on the *result* arriving rather than on where
+/// it arrived from.
 #[test]
 fn without_a_sink_the_job_still_runs_and_delivers() {
     detach();
@@ -1615,6 +1740,11 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         an_overlay_discussions_job(),
         an_overlay_reports_job(),
         an_overlay_glm_job(),
+        // The window form: literal constants and literal values, so the
+        // digest is over stored bits and not over anything a platform's libm
+        // computed. (The whole-grid form produces these same bytes — the
+        // canonicalisation test pins that — so one row covers the wire.)
+        an_overlay_model_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1645,10 +1775,11 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
             "overlay/discussions | 264 | 0x3d28f1976f832a20",
             "overlay/reports | 127 | 0x533f15051c5cc607",
             "overlay/glm | 240 | 0xca1519d51136a8ef",
+            "overlay/model | 262 | 0x0133cf4f818a1a23",
         ]
         .map(str::to_string),
         "the framing `JobRequest::to_bytes` writes is not the framing protocol \
-         version 11 shipped. Left is what this build posts; right is what this \
+         version 12 shipped. Left is what this build posts; right is what this \
          list was last told. Something about a request's layout moved — a \
          field added, removed, reordered, retyped, or written at a different \
          width, or a tag renumbered. This encoding carries no version of its \
@@ -2767,6 +2898,333 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     );
 }
 
+/// **The parity gate for the model render** — the last kind through the wire,
+/// and the one whose wire form is a *cut* of its input rather than a copy:
+/// direct call on the whole grid, versus `execute_bytes` on bytes that carry
+/// only the projection window's values. Byte identity here is the proof that
+/// the cut loses nothing a pixel reads.
+///
+/// The direct half is the raw rasterizer **plus the premultiply the wire's
+/// contract owes**: the model rasterizer is the one that declares straight
+/// alpha, so this gate is also what proves `execute`'s convert-inside-the-job
+/// seam really runs for it — skip the seam and every byte with alpha under
+/// 255 differs.
+///
+/// Floors before the equality, so it cannot pass vacuously: the window is a
+/// **proper** subset of the grid (the S5c lesson — a fixture too small proves
+/// nothing), pixels were painted, and the encoded job really is smaller than
+/// the values it did not ship.
+#[test]
+fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
+    use rustdar_overlays::render::rasterize::ModelDataInput;
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_model_whole_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::ModelData(model) = &input else {
+        unreachable!("the fixture is a model job");
+    };
+
+    let grid_points = {
+        let (ni, nj) = model.shape();
+        ni * nj
+    };
+    let win = model.window_for(&bounds, width, height);
+    assert!(win.area() > 0, "the viewport missed the grid");
+    assert!(
+        win.area() < grid_points,
+        "the window is the whole grid ({} of {grid_points} points), so \
+         nothing about the cut is being tested",
+        win.area(),
+    );
+
+    let direct =
+        rustdar_overlays::render::rasterize::rasterize_model_data(model, &bounds, width, height);
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Straight,
+        "the model rasterizer changed its alpha convention; this gate is \
+         calibrated to prove the wire's premultiply seam runs for it",
+    );
+    let mut expected = direct.rgba;
+    premultiply_raster(&mut expected);
+    assert!(
+        painted(&expected) > 100,
+        "the fixture painted {} pixels, so byte-identity would be \
+         near-vacuous",
+        painted(&expected),
+    );
+
+    let job = JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    };
+    // The size claim, on the actual bytes: the job must be smaller than the
+    // values it declined to ship, or the cut exists only in theory.
+    assert!(
+        job.to_bytes().len() < grid_points * 4 / 2,
+        "the encoded model job is {} bytes against {} bytes of whole-grid \
+         values — the encoder is not cutting to the window",
+        job.to_bytes().len(),
+        grid_points * 4,
+    );
+
+    let (via_wire, hit_cells) = overlay_reply_via_wire(&job);
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, expected,
+        "the model raster differs between the direct call and the wire — the \
+         window cut, the codec or the premultiply seam changed the picture",
+    );
+    assert_eq!(
+        hit_cells, None,
+        "the model render answered hit cells; it resolves no clicks by \
+         pixel, and a stray Some would be refused at the deliver",
+    );
+
+    // The values are a live input through the wire, not a block a broken
+    // codec could zero: moving one value *inside* the window must move
+    // pixels through the wire.
+    let mut moved = a_model_grid();
+    let (ci, cj) = ((win.i0 + win.i1) / 2, (win.j0 + win.j1) / 2);
+    moved.values[cj * moved.ni + ci] = 4000.0;
+    let repainted = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::ModelData(Box::new(ModelDataInput::Whole(std::sync::Arc::new(
+            moved,
+        )))),
+    });
+    assert_ne!(
+        repainted, via_wire,
+        "a moved value inside the window did not move a pixel through the \
+         wire, so the equality above says nothing about the values travelling",
+    );
+}
+
+/// The whole-grid carry **canonicalises** to its window on the wire: encode
+/// the dispatch's `Whole` and what decodes is exactly the `Window` the cut
+/// describes — and re-encoding that decode reproduces the same bytes, so the
+/// two carries are one wire form and the framing digest's one row covers
+/// both.
+#[test]
+fn the_whole_model_grid_encodes_as_exactly_its_window() {
+    use rustdar_overlays::render::rasterize::{ModelDataInput, ModelWindow};
+    let whole = an_overlay_model_whole_job();
+    let bytes = whole.to_bytes();
+    let decoded = JobRequest::from_bytes(&bytes).expect("the whole-grid job encodes decodably");
+
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::ModelData(model),
+    } = &decoded
+    else {
+        panic!("the model job decoded as something else: {decoded:?}");
+    };
+
+    // The expected window form, built by the same accessors the encoder uses.
+    let grid = a_model_grid();
+    let source = ModelDataInput::Whole(std::sync::Arc::new(grid.clone()));
+    let win = source.window_for(bounds, *width, *height);
+    let mut values = Vec::with_capacity(win.area());
+    source.for_each_window_row(&win, |row| values.extend_from_slice(row));
+    assert_eq!(
+        **model,
+        ModelDataInput::Window(ModelWindow {
+            parameter: grid.parameter,
+            ni: grid.ni,
+            nj: grid.nj,
+            coords: grid.coords.clone(),
+            win,
+            values,
+        }),
+        "the decode is not the window of the whole grid that was encoded",
+    );
+
+    assert_eq!(
+        decoded.to_bytes(),
+        bytes,
+        "re-encoding the decoded window produced different bytes, so the two \
+         carries are two wire forms and the framing digest row only pins one \
+         of them",
+    );
+}
+
+/// The model job's own malformed shapes, each mutation paired with a
+/// read-back control proving it landed on the byte this test believes it
+/// did.
+///
+/// Offsets, stated once: tag(1) + width(4) + height(4) + bounds(32) = 41 is
+/// the input-kind byte; + 1 + name_len(2) = 44 is the parameter string's
+/// first byte ("sbcape", 6 bytes); + 6 = 50 is `ni`, 54 is `nj`; 58 the
+/// coords tag; + 1 + ten f64 constants (80) = 139 `ni` of the Lambert
+/// parts, 143 `nj`, then three flag bytes at 147..150; the window's four
+/// `u32` edges at 150..166; the values from 166.
+#[test]
+fn a_malformed_model_job_is_refused_rather_than_misread() {
+    use rustdar_overlays::hrrr::ModelParameter;
+    let job = an_overlay_model_job();
+    assert_refuses_cuts_and_trailing(&job);
+    let bytes = job.to_bytes();
+
+    let decoded_model = |bytes: &[u8]| match JobRequest::from_bytes(bytes) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::ModelData(model),
+            ..
+        }) => Some(model),
+        _ => None,
+    };
+
+    // The parameter string. Control first: "sbcape" rewritten to "mlcape" —
+    // a different *valid* code of the same length — decodes and reads back
+    // as the other parameter, so byte 44 really is the string.
+    let mut reparam = bytes.clone();
+    reparam[44] = b'm';
+    reparam[45] = b'l';
+    let model = decoded_model(&reparam).expect("the reparam control decodes");
+    assert_eq!(
+        model.parameter(),
+        ModelParameter::MixedLayerCape,
+        "bytes 44..50 are not the parameter string; the refusals below would \
+         be about some other field",
+    );
+    // A code no build ships refuses (valid UTF-8, unknown parameter)…
+    let mut unknown = bytes.clone();
+    unknown[44] = b'z';
+    assert_eq!(
+        JobRequest::from_bytes(&unknown),
+        None,
+        "parameter \"zbcape\" is a build this one is not",
+    );
+    // …and so does a byte no UTF-8 string contains.
+    let mut not_utf8 = bytes.clone();
+    not_utf8[44] = 0xFF;
+    assert_eq!(JobRequest::from_bytes(&not_utf8), None, "not UTF-8");
+
+    // The coordinates tag: 0 and 3 are unallocated. (The other *valid* tag
+    // is not a read-back control here — the two arms' layouts share no
+    // prefix, so retagging Lambert bytes as Explicit fails the length
+    // arithmetic, which is itself the refusal wanted.)
+    for bad_tag in [0u8, 3] {
+        let mut retagged = bytes.clone();
+        retagged[58] = bad_tag;
+        assert_eq!(
+            JobRequest::from_bytes(&retagged),
+            None,
+            "coords tag {bad_tag} must stay unallocated",
+        );
+    }
+
+    // A Lambert constant. Control: `dx` (the ninth f64, bytes 123..131)
+    // moved to another finite value decodes and reads back moved…
+    let mut restepped = bytes.clone();
+    restepped[123..131].copy_from_slice(&1500.0f64.to_le_bytes());
+    let model = decoded_model(&restepped).expect("the restepped control decodes");
+    match model.coords() {
+        rustdar_overlays::hrrr::GridCoords::Lambert(grid) => assert_eq!(
+            grid.to_parts().dx,
+            1500.0,
+            "bytes 123..131 are not the grid step; the refusal below would \
+             be about some other field",
+        ),
+        other => panic!("the fixture's coords are Lambert, got {other:?}"),
+    }
+    // …and NaN there is a projection that answers NaN for every point:
+    // refused at the boundary, not rasterized into a blank nobody can
+    // explain.
+    let mut poisoned = bytes.clone();
+    poisoned[123..131].copy_from_slice(&f64::NAN.to_le_bytes());
+    assert_eq!(
+        JobRequest::from_bytes(&poisoned),
+        None,
+        "a non-finite Lambert constant was accepted",
+    );
+
+    // The wrap flag (byte 149). Control: flipped to the other valid value it
+    // decodes and reads back flipped; outside {0, 1} it is refused.
+    let mut rewrapped = bytes.clone();
+    assert_eq!(rewrapped[149], 0, "premise: the fixture grid does not wrap");
+    rewrapped[149] = 1;
+    let model = decoded_model(&rewrapped).expect("the rewrapped control decodes");
+    assert!(
+        model.coords().wraps_longitude(),
+        "byte 149 is not the wrap flag",
+    );
+    let mut bad_flag = bytes.clone();
+    bad_flag[149] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&bad_flag),
+        None,
+        "wraps_longitude is a bool, not a byte",
+    );
+
+    // The window's range check. Control first: the whole window shifted one
+    // column right keeps its area (so the values arithmetic still closes)
+    // and decodes, reading back shifted — proving bytes 150..158 are the
+    // `i` edges. Then the same area parked past `ni` must be refused: a
+    // window the grid cannot contain, drawn anyway, would paint the wrong
+    // region of the country under this pane.
+    let (i0, i1) = (14u32, 20u32);
+    let mut shifted = bytes.clone();
+    shifted[150..154].copy_from_slice(&(i0 + 1).to_le_bytes());
+    shifted[154..158].copy_from_slice(&(i1 + 1).to_le_bytes());
+    let model = decoded_model(&shifted).expect("the shifted control decodes");
+    match &*model {
+        rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
+            assert_eq!(
+                (w.win.i0, w.win.i1),
+                (15, 21),
+                "bytes 150..158 are not the window's i edges",
+            );
+        }
+        other => panic!("the wire only ever decodes the window form, got {other:?}"),
+    }
+    let mut escaped = bytes.clone();
+    escaped[150..154].copy_from_slice(&55u32.to_le_bytes());
+    escaped[154..158].copy_from_slice(&61u32.to_le_bytes());
+    assert_eq!(
+        JobRequest::from_bytes(&escaped),
+        None,
+        "a window past the grid's own ni was accepted",
+    );
+    let mut inverted = bytes.clone();
+    inverted[150..154].copy_from_slice(&20u32.to_le_bytes());
+    inverted[154..158].copy_from_slice(&14u32.to_le_bytes());
+    assert_eq!(
+        JobRequest::from_bytes(&inverted),
+        None,
+        "an inside-out window was accepted",
+    );
+
+    // A value byte: the first value (bytes 166..170) moved decodes and reads
+    // back moved — the read-back that proves the values block starts where
+    // the offsets above say, so every cut of it in the shared walk was
+    // cutting what this test believes.
+    let mut revalued = bytes;
+    revalued[166..170].copy_from_slice(&123.5f32.to_le_bytes());
+    let model = decoded_model(&revalued).expect("the revalued control decodes");
+    match &*model {
+        rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
+            assert_eq!(w.values[0], 123.5, "bytes 166..170 are not value 0");
+        }
+        other => panic!("the wire only ever decodes the window form, got {other:?}"),
+    }
+}
+
 /// The overlay reply's kind code and its raw round trip — plus the accessor
 /// narrowness every other output kind already pins.
 #[test]
@@ -3167,6 +3625,15 @@ fn a_described_overlay_job_rides_the_interactive_lane() {
     assert!(
         reports_lane.starts_with("rd-opaque"),
         "the reports job delivered on {reports_lane}: a described hit-map \
+         overlay is queueing behind radar renders",
+    );
+    // And the model grid — the last kind whose closure this lane used to
+    // carry: described, it still rides the lane whose charter is the map's
+    // deadline, which is the whole point of the lane keeping its name.
+    let model_lane = lane_of(an_overlay_model_job());
+    assert!(
+        model_lane.starts_with("rd-opaque"),
+        "the model job delivered on {model_lane}: the described model \
          overlay is queueing behind radar renders",
     );
     let radar_lane = lane_of(a_job());

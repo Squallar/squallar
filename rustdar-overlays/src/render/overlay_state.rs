@@ -15,31 +15,25 @@ use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
-use crate::render::rasterize::RasterizeOutput;
-use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
-
-pub type RasterizeFn = Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>;
+use crate::types::{OverlayFeature, OverlayLabel};
 
 /// A handler's raster **described as data** — what
-/// [`OverlayHandler::prepare_job`] answers where [`prepare_rasterize`] answers
-/// a closure.
+/// [`OverlayHandler::prepare_job`] answers.
 ///
 /// Each variant carries the kind's own rasterizer input struct
-/// ([`crate::render::rasterize::AlertsInput`] and its siblings), captured at
-/// the same moment and from the same state the closure would have captured —
-/// both are built by one per-handler helper, so the two cannot drift. The
-/// frontend maps each variant onto its `offload::OverlayJobInput` twin and
-/// posts it as a `JobRequest::Overlay`, which is what lets these kinds
-/// rasterize in the web worker instead of inline on the browser's one thread.
+/// ([`crate::render::rasterize::AlertsInput`] and its siblings), captured
+/// from the handler's state at the dispatch. The frontend maps each variant
+/// onto its `offload::OverlayJobInput` twin and posts it as a
+/// `JobRequest::Overlay`, which is what lets every texture kind rasterize in
+/// the web worker instead of inline on the browser's one thread. There is no
+/// closure form beside this one any more: a raster a handler cannot describe
+/// is a raster nothing can dispatch.
 ///
 /// The hit-map kinds (storm reports, lightning) are here too: their inputs
 /// carry plain rows whose **position is the hit-map id**, and the
 /// `Arc<dyn OverlayItem>` half that cannot cross a message port is captured
 /// beside the input through [`OverlayHandler::hit_items`] and zipped with the
-/// returned cells at delivery. Only the model grid still runs opaque — its
-/// input has no wire form yet.
-///
-/// [`prepare_rasterize`]: OverlayHandler::prepare_rasterize
+/// returned cells at delivery.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandlerJobInput {
     /// NWS alerts — [`crate::render::rasterize::rasterize_nws_alerts`].
@@ -57,6 +51,14 @@ pub enum HandlerJobInput {
     /// Carries the page's own `now`, captured at dispatch; see
     /// [`crate::render::rasterize::GlmStrikesInput::now`].
     Glm(crate::render::rasterize::GlmStrikesInput),
+    /// The HRRR model grid —
+    /// [`crate::render::rasterize::rasterize_model_data`], the last kind to
+    /// gain a wire form. The handler answers the
+    /// [`Whole`](crate::render::rasterize::ModelDataInput::Whole) carry — an
+    /// `Arc` of the grid as fetched — and the frontend's encoder cuts it to
+    /// its projection window at the one place that knows the texture's
+    /// bounds; see [`crate::render::rasterize::ModelDataInput`].
+    ModelData(crate::render::rasterize::ModelDataInput),
 }
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
@@ -619,28 +621,23 @@ pub trait OverlayHandler: Send {
 
     // ── Rendering (texture mode) ──────────────────────────────────────
 
-    /// `None` when there is nothing to render.
-    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
-        let _ = ctx;
-        None
-    }
-
-    /// This handler's raster as a described job, or `None` — either because
-    /// there is nothing to render (exactly when [`prepare_rasterize`] answers
-    /// `None`) or because this kind has no wire form yet, which is the
-    /// default.
+    /// This handler's raster as a described job, or `None` when there is
+    /// nothing to render — which is also the default, for the kinds whose
+    /// pixels come from somewhere else entirely.
     ///
-    /// A handler that implements this must keep it in agreement with
-    /// [`prepare_rasterize`]: same `Some`-ness in every reachable state, and
-    /// the same captured input — the shipped five build both answers from one
-    /// private helper each, and
-    /// `handlers::texture_tests::the_kinds_with_a_described_job_are_all_but_the_model_grid`
-    /// is the pin. The dispatch site (`rustdar_frontend`'s
+    /// This is the **only** way a handler's raster is dispatched. The closure
+    /// twin it used to agree with (`prepare_rasterize`, a boxed `FnOnce` the
+    /// wasm target could only run inline on the browser's one thread) is
+    /// deleted, so a texture kind without a described input is a texture kind
+    /// that cannot draw — `has_data()` must answer `false` exactly when this
+    /// answers `None`
+    /// (`handlers::texture_tests::every_texture_handler_agrees_with_its_own_rasterizer`),
+    /// or `ui_map_pane`'s settle machinery asks for a render nothing can
+    /// satisfy, every 100 ms, forever. The dispatch site (`rustdar_frontend`'s
     /// `spawn_overlay_render`) routes by an explicit match on kind, not by
-    /// probing this method, so a kind moved between the two paths is a
-    /// decision made there and tested here.
-    ///
-    /// [`prepare_rasterize`]: OverlayHandler::prepare_rasterize
+    /// probing this method, so a kind moved between paths is a decision made
+    /// there and tested in
+    /// `handlers::texture_tests::every_texture_kind_rasterizes_as_a_described_job`.
     fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
         let _ = ctx;
         None
@@ -1218,16 +1215,9 @@ impl OverlayRegistry {
         }
     }
 
-    pub fn prepare_rasterize(
-        &self,
-        kind: OverlayKind,
-        ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
-        self.handler(kind).and_then(|h| h.prepare_rasterize(ctx))
-    }
-
-    /// [`OverlayHandler::prepare_job`] through the registry, the way
-    /// [`prepare_rasterize`](Self::prepare_rasterize) is reached.
+    /// [`OverlayHandler::prepare_job`] through the registry — the only way a
+    /// handler's raster is reached; the closure twin this sat beside is
+    /// deleted.
     pub fn prepare_job(
         &self,
         kind: OverlayKind,

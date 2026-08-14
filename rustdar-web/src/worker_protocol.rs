@@ -245,7 +245,24 @@ pub const OUT_KIND: &str = "outkind";
 /// counted as a pixel — and reads as a failed render. Both degrade quietly,
 /// which is exactly what the token turns into a clean termination and a
 /// respawn.
-const PROTOCOL_VERSION: u32 = 11;
+///
+/// Version 12 completes tag 8's inner code space: the HRRR model grid — the
+/// last overlay kind that still rasterized inline on the page — travels as
+/// input code 7, carrying the grid's Lambert constants and the values of its
+/// projection window (cut at encode time, so a gesture-settle re-render ships
+/// a window's few hundred KB rather than the 7.62 MB grid; a grid wholly in
+/// view still ships whole, because every point of it can paint). The reply
+/// shape is untouched — the model grid has no hit map, so its `OUT` code 5
+/// payload is the tag-0 form version 11 defined. Like versions 8–11 this
+/// changes **no field name**; what pins it is `rustdar_frontend`'s
+/// `offload::tests` — the `overlay/model` framing-digest row, input code 7 in
+/// the literal table, and the model parity and malformed suites. A version 11
+/// worker refuses code 7 and answers a failed job, which is a model layer
+/// that silently never draws — the degradation the token turns into a clean
+/// termination and a respawn. This bump also retires the opaque overlay
+/// closure path on the page side entirely; that is invisible to the wire, but
+/// it is why no thirteenth kind should ever arrive opaque.
+const PROTOCOL_VERSION: u32 = 12;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

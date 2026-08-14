@@ -3,40 +3,42 @@
 //! Four places in this crate used to hand a closure somewhere it would not
 //! stall the frame that created it: the static radar render, the loop-frame
 //! render, the overlay rasterization and the radar-sites rasterization. All
-//! four have the same shape — a `FnOnce` that ends by sending its result on an
-//! `mpsc::Sender` and calling `notify_redraw` — and all four had the same
-//! `std::thread::Builder` call written out inline. Nearly all of it is
-//! described jobs now ([`JobRequest::Overlay`] carries the sites raster, the
-//! three polygon overlay kinds, and the two hit-map kinds); what remains on
-//! the closure is the model grid, alone.
+//! of it is **described jobs** now — [`JobRequest`] values a worker can be
+//! handed, the overlay rasterizations included ([`JobRequest::Overlay`]
+//! carries the sites raster, the three polygon kinds, the two hit-map kinds
+//! and the model grid). The opaque funnel those closures rode — an
+//! `offload(name, FnOnce)` whose wasm arm ran the closure **inline on the
+//! browser's one thread** — is deleted with its last rider: there is no
+//! function left in this module that unconditionally runs work on the wasm
+//! frame, which is what makes "an overlay cannot land inline" a property of
+//! the API rather than of every dispatch site staying careful.
 //!
-//! They are funnelled through here so the wasm arm exists once.
+//! # One shape, one funnel
 //!
-//! # Two shapes, one funnel
+//! [`offload_job`] takes a [`Job`]. Its described form is a [`JobRequest`]:
+//! given a worker it posts; without one it runs [`execute`] on the spot —
+//! unless this thread has said it is [`expect_sink`]ing one shortly, in which
+//! case the job waits for it rather than paying a browser's whole frame for a
+//! transport that is on its way. That fallback is the **only** inline
+//! execution left on wasm, it is shared by every job kind alike, and it runs
+//! exactly when the alternative is a pane wedged forever behind a worker that
+//! is lost. The fallback is not a second code path: it calls the same
+//! [`execute`] and the same `deliver` the worker reply does, so there is no
+//! pair to drift.
 //!
-//! A closure cannot be posted to a Web Worker, so the funnel takes work in two
-//! forms and makes one decision about both:
+//! [`Job::Nothing`] is the description of a render with nothing behind it —
+//! `deliver(None)` run where it stands, because a result known before any
+//! work exists has no work to move. [`Job::Opaque`] survives only off-wasm
+//! and only as a test instrument; its own doc says why it must never carry a
+//! rasterization.
 //!
-//! * [`offload`] takes an opaque `FnOnce`. It runs on a thread natively and
-//!   inline on the web, which is the best available answer for a job whose
-//!   inputs cannot be described — see [`offload`]'s own note on which those are.
-//! * [`offload_job`] takes a [`JobRequest`], which *is* a description. Given a
-//!   worker it posts; without one it runs [`execute`] in exactly the place
-//!   [`offload`] would have run the closure — unless this thread has said it is
-//!   [`expect_sink`]ing one shortly, in which case the job waits for it rather
-//!   than paying a browser's whole frame for a transport that is on its way.
-//!
-//! The second is not a second code path. Both arms of [`offload_job`] call the
-//! same [`execute`] and the same `deliver`, so the fallback is derived from the
-//! worker path rather than written beside it, and there is no pair to drift.
-//!
-//! [`discard`] is the same fork applied to teardown — a job whose whole body is
-//! a `drop`. Natively it goes to a lane of the pool kept for exactly this; on
-//! the web, where [`offload`]'s answer is "inline on this frame", it queues
-//! instead and [`drain_deferred_drops`] frees what a frame can afford, because
-//! a free nobody is waiting on is the one job that never has to run now. What
-//! keeps that queue draining is a term in the frame loop's own wake-up
-//! condition — see [`drain_deferred_drops`], where the invariant is written.
+//! [`discard`] is the same decision applied to teardown — a job whose whole
+//! body is a `drop`. Natively it goes to a lane of the pool kept for exactly
+//! this; on the web, which has no thread to hand it to, it queues instead and
+//! [`drain_deferred_drops`] frees what a frame can afford, because a free
+//! nobody is waiting on is the one job that never has to run now. What keeps
+//! that queue draining is a term in the frame loop's own wake-up condition —
+//! see [`drain_deferred_drops`], where the invariant is written.
 
 use rustdar_radar::render_input::RenderInput;
 use rustdar_radar::voxel::{VoxelGrid, VoxelRequest, VoxelShape};
@@ -55,68 +57,6 @@ use std::collections::{HashMap, HashSet};
 /// target check finds.
 pub use rustdar_radar::srv::SrvMotion;
 
-/// Run `job` away from the frame that requested it.
-///
-/// Native spawns a named OS thread and returns immediately.
-///
-/// wasm32-unknown-unknown has no threads: `std::thread::Builder::spawn` there
-/// returns `Err(Unsupported)` at *runtime* rather than failing to compile, so a
-/// bare spawn site does not break the web build — it compiles clean and then
-/// panics the first time the user asks for a radar frame. That is the failure
-/// this function exists to remove. The web arm runs `job` inline.
-///
-/// Running inline blocks the frame. For rasterization that is a visible stall,
-/// and [`offload_job`] is the answer for the paths that can describe their
-/// input. The one that cannot stays here:
-///
-/// * `overlay-render` captures a `RasterizeFn` — a `Box<dyn FnOnce(..) -> ..>`
-///   holding overlay handler state. It is being dismantled kind by kind:
-///   `sites-render` left first, then the polygon kinds — NWS alerts, SPC
-///   outlooks, SPC discussions — and then the hit-map kinds, storm reports
-///   and lightning, once their `HitMap` was split into portable index cells
-///   (`rustdar_overlays::render::rasterize::HitCells`, which travel back on
-///   the reply) and the page-side `Arc<dyn OverlayItem>` id_map (captured at
-///   dispatch, zipped at delivery, never on the wire). All six are
-///   [`JobRequest::Overlay`] now. **Only the model grid remains** — its input
-///   has no wire form yet — and when it leaves, this arm's caller count
-///   reaches zero and the inline path is deleted.
-///
-/// Inline execution preserves the contract the callers actually depend on. Each
-/// `job` delivers through a channel that is drained on a later frame, so a send
-/// that happens before the caller returns is indistinguishable from one that
-/// happens after it — the receiver cannot tell, and neither can the render
-/// budget, whose `RenderGuard` simply drops sooner.
-///
-/// The `Send` bound is kept on both arms deliberately. It costs the web arm
-/// nothing (every existing caller already satisfies it, since they were written
-/// for threads) and dropping it would silently license a `!Send` job that then
-/// fails to compile on desktop.
-pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        // The pool's opaque lane, not a thread of its own. A closure that
-        // cannot be described still has somewhere bounded to run, and the one
-        // remaining `std::thread::Builder::spawn` in this module is the one
-        // that builds the lanes. See [`pool`].
-        if let Err(job) = pool::run_opaque(name, Box::new(job)) {
-            log::error!("{name}: the job pool has no worker left; running it here");
-            job();
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Timed because this is the one arm where the cost lands on the frame.
-        // The number is what decides whether a worker is needed and how many, so
-        // it is logged rather than estimated.
-        let started = web_time::Instant::now();
-        job();
-        log::info!(
-            "{name} took {} ms on the main thread",
-            started.elapsed().as_millis()
-        );
-    }
-}
-
 /// Free `payload` away from the frame that stopped needing it.
 ///
 /// Teardown is CPU-bound work like any other job here, and "it runs rarely" is
@@ -126,12 +66,13 @@ pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
 /// thread on every target.
 ///
 /// Native hands the payload to the pool's **free lane** — a third queue, one
-/// thread wide, and deliberately not the opaque lane that carries the overlay
-/// rasterizations a pan is waiting on. See [`pool`]'s own doc. The web arm has
-/// no lane to hand it to: [`offload`] runs inline on wasm, so routing through
-/// it would put the free back on the exact frame this function exists to
-/// spare. That arm files the payload in a thread-local queue, and
-/// [`drain_deferred_drops`] retires what a frame can afford.
+/// thread wide, and deliberately not the interactive lane that carries the
+/// overlay rasterizations a pan is waiting on. See [`pool`]'s own doc. The
+/// web arm has no lane to hand it to — wasm has no threads, and routing a
+/// free through the job funnel would spend the worker (or, without one, this
+/// very frame) on the one kind of work nobody is waiting for. That arm files
+/// the payload in a thread-local queue, and [`drain_deferred_drops`] retires
+/// what a frame can afford.
 ///
 /// # Call it from the frame thread
 ///
@@ -492,10 +433,11 @@ pub enum JobRequest {
         input: Box<RenderInput>,
         request: VoxelRequest,
     },
-    /// Rasterize an overlay layer — the first kind of frame-following work to
-    /// leave [`offload`]'s opaque arm, which on the web runs closures **inline
-    /// on the browser's one thread** (a measured 224 ms against a 290 ms p50
-    /// gesture frame for the layer set that prompted this).
+    /// Rasterize an overlay layer — the frame-following work that used to
+    /// ride the opaque closure funnel, whose wasm arm ran it **inline on the
+    /// browser's one thread** (a measured 224 ms against a 290 ms p50
+    /// gesture frame for the layer set that prompted this). That funnel is
+    /// deleted; this variant is how every overlay rasterizes now.
     ///
     /// The raster's geometry travels on this variant — one statement of the
     /// texture's size and ground for every overlay kind — and everything a
@@ -504,11 +446,11 @@ pub enum JobRequest {
     /// statement of one fact, which is the disagreement
     /// [`agree_on_product`] exists to refuse elsewhere.
     ///
-    /// The sites render, the three polygon kinds (NWS alerts, SPC outlooks,
-    /// SPC discussions) and the two hit-map kinds (storm reports, GLM
-    /// lightning) are described. Only the model grid still captures a
-    /// `RasterizeFn` trait object and stays on [`offload`]'s opaque arm — see
-    /// that function's own note — until it gains a wire form of its own.
+    /// Every overlay kind is described: the sites render, the three polygon
+    /// kinds (NWS alerts, SPC outlooks, SPC discussions), the two hit-map
+    /// kinds (storm reports, GLM lightning) and the HRRR model grid — the
+    /// last kind through the wire, and the one whose departure deleted the
+    /// opaque closure path outright.
     Overlay {
         /// Texture width in physical texels, from the pane's
         /// `OverlayTexturePlan` — never re-derived on the far side.
@@ -561,11 +503,9 @@ pub enum JobRequest {
 /// `rustdar_overlays::render::rasterize::SitesInput`, whose doc states the
 /// contract from the rasterizer's side.
 ///
-/// Six variants: the sites render, the three polygon-fill kinds, and the two
-/// hit-map kinds, whose handlers describe them through
-/// `rustdar_overlays::render::overlay_state::HandlerJobInput`. The model grid
-/// is last; it lands here as a variant plus an [`OVERLAY_INPUT_SITES`]-style
-/// code, and until then it stays on [`offload`]'s opaque arm.
+/// Seven variants: the sites render, the three polygon-fill kinds, the two
+/// hit-map kinds, and the model grid — every texture overlay this
+/// application draws, so there is no opaque remainder.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayJobInput {
     /// The radar-site markers: catalogue rows plus the appearance inputs.
@@ -599,6 +539,22 @@ pub enum OverlayJobInput {
     /// picture the direct call would not; see
     /// `rustdar_overlays::render::rasterize::GlmStrikesInput::now`.
     Glm(rustdar_overlays::render::rasterize::GlmStrikesInput),
+    /// The HRRR model grid. The dispatch hands over the
+    /// [`Whole`](rustdar_overlays::render::rasterize::ModelDataInput::Whole)
+    /// carry — an `Arc` of the grid as fetched, so native moves a refcount —
+    /// and [`encode_overlay_input`] cuts it to its projection window at
+    /// `to_bytes` time, the one place that knows the texture's bounds: at a
+    /// storm-watching zoom that is a few hundred KB of the 7.62 MB values
+    /// vector, and only a grid wholly in view ships whole, because every
+    /// point of it can paint. The decoder only ever produces the
+    /// [`Window`](rustdar_overlays::render::rasterize::ModelDataInput::Window)
+    /// form.
+    ///
+    /// Boxed for [`OverlayJobInput::Alerts`]'s reason: the window form's
+    /// inline size (the 104-byte Lambert constants beside the window and two
+    /// vector headers) is more than this enum should carry by value through
+    /// queues and sinks.
+    ModelData(Box<rustdar_overlays::render::rasterize::ModelDataInput>),
 }
 
 /// What a job produces.
@@ -981,34 +937,43 @@ impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
     }
 }
 
-/// A rasterizing job, described where it can be and opaque where it cannot.
-///
-/// Both arms reach [`offload_job`], which is the point: there is one place that
-/// decides where work runs, and adding a job kind does not add a dispatch site.
+/// A rasterizing job. Every arm reaches [`offload_job`], which is the point:
+/// there is one place that decides where work runs, and adding a job kind
+/// does not add a dispatch site.
 pub enum Job {
     /// Portable. Goes to the worker when one is attached, and runs through
     /// [`execute`] when none is. Every rasterizing dispatch is one of these.
     Described(JobRequest),
-    /// Not describable, so it runs where [`offload`] runs things — a thread
-    /// natively, this frame in the browser.
-    ///
-    /// Nothing in production is one today; it is what [`Job::renders_nothing`]
-    /// is built from, and the shape a future job kind takes before it has a
-    /// wire form. Reaching for it for a *rasterizing* job would put that job
-    /// back on the browser's main thread, which is the thing this module
-    /// exists to stop.
+    /// A job whose answer is known to be "nothing to draw" before anything
+    /// runs — a render asked of data that is not there. There is no work to
+    /// move anywhere, so [`offload_job`] runs its `deliver(None)` where it
+    /// stands; it is deliberately still a *job*, because the caller has
+    /// already taken a slot in the render budget and marked its pane in
+    /// flight, and those are unwound by `deliver` running, not by returning
+    /// early. (Every `deliver` ends in a channel send drained on a later
+    /// frame, so a send before the dispatch returns is indistinguishable
+    /// from one after it.)
+    Nothing,
+    /// An arbitrary closure — **a test instrument, not a transport**, and
+    /// deliberately absent from the wasm build: this variant does not exist
+    /// there, so no dispatch compiled for the browser can route work through
+    /// an opaque closure at all, which is the compile-level half of "the
+    /// inline overlay path cannot come back". Production constructs none on
+    /// any target (`Job::renders_nothing()` used to be one and is
+    /// [`Job::Nothing`] now); what remains are `render_dispatch`'s
+    /// invalidation tests, which need a render that *blocks* until released
+    /// — a property no described job can have, since [`execute`] has no
+    /// yield point. Natively it runs on a thread of its own rather than a
+    /// pool lane, so a gated test job can never starve the lane that carries
+    /// real overlay work.
+    #[cfg(not(target_arch = "wasm32"))]
     Opaque(Box<dyn FnOnce() -> JobResult + Send>),
 }
 
 impl Job {
-    /// A job whose answer is "nothing to draw".
-    ///
-    /// Used where a request cannot even be described because there is no data
-    /// behind it. It is deliberately still a *job*: the caller has already
-    /// taken a slot in the render budget and marked its pane in flight, and
-    /// those are unwound by `deliver` running, not by returning early.
+    /// A job whose answer is "nothing to draw". See [`Job::Nothing`].
     pub fn renders_nothing() -> Self {
-        Self::Opaque(Box::new(|| None))
+        Self::Nothing
     }
 }
 
@@ -1092,7 +1057,10 @@ impl JobRequest {
                 out.extend_from_slice(&bounds.max_lat.to_le_bytes());
                 out.extend_from_slice(&bounds.min_lon.to_le_bytes());
                 out.extend_from_slice(&bounds.max_lon.to_le_bytes());
-                encode_overlay_input(&mut out, input);
+                // The geometry rides along because one input — the model
+                // grid — is *cut to it* on the way out; see
+                // [`encode_overlay_input`].
+                encode_overlay_input(&mut out, input, *width, *height, bounds);
                 out
             }
             // The tag and then the archive, which takes the rest: an archive
@@ -1283,6 +1251,7 @@ impl JobRequest {
                 OverlayJobInput::Discussions(_) => "overlay/discussions",
                 OverlayJobInput::Reports(_) => "overlay/reports",
                 OverlayJobInput::Glm(_) => "overlay/glm",
+                OverlayJobInput::ModelData(_) => "overlay/model",
             },
         }
     }
@@ -1475,11 +1444,27 @@ const OVERLAY_INPUT_DISCUSSIONS: u8 = 4;
 const OVERLAY_INPUT_REPORTS: u8 = 5;
 /// [`OverlayJobInput::Glm`]'s code.
 const OVERLAY_INPUT_GLM: u8 = 6;
+/// [`OverlayJobInput::ModelData`]'s code — the next free number after the GLM
+/// code, and the last overlay kind through this wire: nothing rasterizes
+/// opaquely behind it.
+const OVERLAY_INPUT_MODEL: u8 = 7;
 
 /// The variant's own bytes after [`JobRequest::Overlay`]'s fixed header:
 /// one input-kind byte, then the kind's fields — scalars first, then the
 /// count-prefixed lists, on every kind alike.
-fn encode_overlay_input(out: &mut Vec<u8>, input: &OverlayJobInput) {
+///
+/// `width`, `height` and `bounds` are the request's own geometry, threaded in
+/// for exactly one arm: the model grid is **cut to its projection window
+/// here**, at the one moment that knows what ground the texture covers, so
+/// what travels is the window's values rather than 7.62 MB of grid per
+/// gesture-settle re-render. Every other arm ignores them.
+fn encode_overlay_input(
+    out: &mut Vec<u8>,
+    input: &OverlayJobInput,
+    width: u32,
+    height: u32,
+    bounds: &rustdar_overlays::types::GeoBounds,
+) {
     match input {
         OverlayJobInput::Sites(sites) => {
             out.push(OVERLAY_INPUT_SITES);
@@ -1589,7 +1574,166 @@ fn encode_overlay_input(out: &mut Vec<u8>, input: &OverlayJobInput) {
                 }
             }
         }
+        // The window cut. Scalars first as everywhere: the parameter (its
+        // stable `as_str` identifier — the same exhaustive pair the persisted
+        // pane config round-trips through), the grid shape, the coordinates,
+        // the window, and then the window's values as the one bulk block.
+        // Whichever carry arrives — the dispatch's `Whole` or an
+        // already-windowed form — what leaves is the same window form, so
+        // the bytes are a function of the picture and the framing digest can
+        // pin them.
+        OverlayJobInput::ModelData(input) => {
+            out.push(OVERLAY_INPUT_MODEL);
+            encode_str(out, input.parameter().as_str());
+            let (ni, nj) = input.shape();
+            out.extend_from_slice(&(ni as u32).to_le_bytes());
+            out.extend_from_slice(&(nj as u32).to_le_bytes());
+            encode_grid_coords(out, input.coords());
+            let win = input.window_for(bounds, width, height);
+            for edge in [win.i0, win.i1, win.j0, win.j1] {
+                out.extend_from_slice(&(edge as u32).to_le_bytes());
+            }
+            // No count: the length is the window's area, already on the wire
+            // as the four edges, and a second statement of it could lie.
+            input.for_each_window_row(&win, |row| encode_f32s(out, row));
+        }
     }
+}
+
+/// A row of `f32`s, little-endian, in one pass straight off the grid's own
+/// storage — the closest thing to zero-copy a byte codec has. On the
+/// little-endian targets this workspace ships (x86_64, aarch64, wasm32),
+/// `to_le_bytes` is the identity and the loop compiles down to a bulk copy.
+fn encode_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    out.reserve(values.len() * 4);
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// The inverse of [`encode_f32s`] over exactly `count` values: `None` on a
+/// short buffer, checked by [`Reader::take`] **before** anything is sized
+/// from `count` — so a count claiming four billion points fails on the first
+/// short read rather than reserving for it.
+fn decode_f32s(r: &mut Reader, count: usize) -> Option<Vec<f32>> {
+    let bytes = r.take(count.checked_mul(4)?)?;
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("chunks of four")))
+            .collect(),
+    )
+}
+
+/// Grid-coordinate tag: computed Lambert constants. The stored fields of
+/// [`rustdar_overlays::hrrr::lambert::LambertGrid`] travel **as stored** —
+/// derived constants and the measured wrap flag included — so the far side
+/// restores bits and never consults libm; see `LambertGridParts`.
+const GRID_COORDS_LAMBERT: u8 = 1;
+/// Grid-coordinate tag: materialised per-point arrays. No production HRRR
+/// fetch produces one, and such a grid never has a proper-subset window
+/// (only the Lambert case can be narrowed), so this arm always carries its
+/// full 30.5 MB-per-1.9M-points arrays — the honest cost of a source that
+/// materialises its coordinates.
+const GRID_COORDS_EXPLICIT: u8 = 2;
+
+fn encode_grid_coords(out: &mut Vec<u8>, coords: &rustdar_overlays::hrrr::GridCoords) {
+    use rustdar_overlays::hrrr::GridCoords;
+    match coords {
+        GridCoords::Lambert(grid) => {
+            out.push(GRID_COORDS_LAMBERT);
+            let parts = grid.to_parts();
+            for v in [
+                parts.a,
+                parts.e,
+                parts.n,
+                parts.big_f,
+                parts.rho0,
+                parts.lon0,
+                parts.x0,
+                parts.y0,
+                parts.dx,
+                parts.dy,
+            ] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(parts.ni as u32).to_le_bytes());
+            out.extend_from_slice(&(parts.nj as u32).to_le_bytes());
+            out.push(u8::from(parts.i_consecutive));
+            out.push(u8::from(parts.alternating));
+            out.push(u8::from(parts.wraps_longitude));
+        }
+        GridCoords::Explicit { lats, lons } => {
+            out.push(GRID_COORDS_EXPLICIT);
+            // Two counts, not one: the two arrays are allowed to disagree in
+            // length (`GridCoords::len` takes the min), and an encoder that
+            // wrote one count would silently reshape such a grid.
+            out.extend_from_slice(&(lats.len() as u32).to_le_bytes());
+            for v in lats {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(lons.len() as u32).to_le_bytes());
+            for v in lons {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The inverse of [`encode_grid_coords`]. `None` for a tag this build does
+/// not have, constants `LambertGrid::from_parts` refuses (non-finite, a
+/// degenerate cone), a flag byte outside `{0, 1}`, or a buffer shorter than
+/// its own counts claim — each checked by `take` before any allocation is
+/// sized from a count.
+fn decode_grid_coords(r: &mut Reader) -> Option<rustdar_overlays::hrrr::GridCoords> {
+    use rustdar_overlays::hrrr::GridCoords;
+    use rustdar_overlays::hrrr::lambert::{LambertGrid, LambertGridParts};
+    match r.u8()? {
+        GRID_COORDS_LAMBERT => {
+            let mut constants = [0.0f64; 10];
+            for v in &mut constants {
+                *v = r.f64()?;
+            }
+            let [a, e, n, big_f, rho0, lon0, x0, y0, dx, dy] = constants;
+            let parts = LambertGridParts {
+                a,
+                e,
+                n,
+                big_f,
+                rho0,
+                lon0,
+                x0,
+                y0,
+                dx,
+                dy,
+                ni: r.u32()? as usize,
+                nj: r.u32()? as usize,
+                i_consecutive: flag(r.u8()?)?,
+                alternating: flag(r.u8()?)?,
+                wraps_longitude: flag(r.u8()?)?,
+            };
+            Some(GridCoords::Lambert(LambertGrid::from_parts(parts)?))
+        }
+        GRID_COORDS_EXPLICIT => {
+            let lat_count = r.u32()? as usize;
+            let lats = decode_f64s(r, lat_count)?;
+            let lon_count = r.u32()? as usize;
+            let lons = decode_f64s(r, lon_count)?;
+            Some(GridCoords::Explicit { lats, lons })
+        }
+        _ => None,
+    }
+}
+
+/// [`decode_f32s`]'s shape at `f64` width, for the explicit coordinate arrays.
+fn decode_f64s(r: &mut Reader, count: usize) -> Option<Vec<f64>> {
+    let bytes = r.take(count.checked_mul(8)?)?;
+    Some(
+        bytes
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().expect("chunks of eight")))
+            .collect(),
+    )
 }
 
 /// The inverse of [`encode_overlay_input`]. `None` for an input kind this
@@ -1755,6 +1899,48 @@ fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
                     device_scale,
                 },
             ))
+        }
+        OVERLAY_INPUT_MODEL => {
+            use rustdar_overlays::render::rasterize::{IndexWindow, ModelDataInput, ModelWindow};
+            // `FromStr` for the parameter is deliberately total — persisted
+            // pane state must never panic a restore — so an unknown code
+            // parses to a *default*. On this boundary that leniency would be
+            // a misread (a build's new parameter silently rasterized as
+            // CIN), so the code is believed only if it names itself back.
+            let code = decode_str(r)?;
+            let parameter: rustdar_overlays::hrrr::ModelParameter = code.parse().ok()?;
+            (parameter.as_str() == code).then_some(())?;
+            let ni = r.u32()? as usize;
+            let nj = r.u32()? as usize;
+            let coords = decode_grid_coords(r)?;
+            let win = IndexWindow {
+                i0: r.u32()? as usize,
+                i1: r.u32()? as usize,
+                j0: r.u32()? as usize,
+                j1: r.u32()? as usize,
+            };
+            // A window past the grid it indexes, or inside-out, is a layout
+            // this build never writes: refused, not clamped, so a raster of
+            // it cannot silently draw a different region than was asked. An
+            // empty window (a viewport the grid never reaches) is legitimate
+            // and its area — and so its values block — is zero.
+            if win.i0 > win.i1 || win.j0 > win.j1 || win.i1 > ni || win.j1 > nj {
+                return None;
+            }
+            // The values length is the window's own area — no second count
+            // on the wire to disagree with it, and `take` inside refuses a
+            // buffer shorter than the area claims before anything allocates.
+            let values = decode_f32s(r, win.area())?;
+            Some(OverlayJobInput::ModelData(Box::new(
+                ModelDataInput::Window(ModelWindow {
+                    parameter,
+                    ni,
+                    nj,
+                    coords,
+                    win,
+                    values,
+                }),
+            )))
         }
         _ => None,
     }
@@ -2362,16 +2548,25 @@ pub fn execute(request: &JobRequest) -> JobResult {
                         glm, bounds, *width, *height,
                     )
                 }
+                // Whichever carry arrived — natively the dispatch's
+                // `Whole` `Arc`, off the wire the decoded window — the one
+                // rasterizer draws it; the byte parity between the two is
+                // pinned in `model_window_tests` and again through this very
+                // seam in `offload::tests`.
+                OverlayJobInput::ModelData(input) => {
+                    rustdar_overlays::render::rasterize::rasterize_model_data(
+                        input, bounds, *width, *height,
+                    )
+                }
             };
             // The output contract is **premultiplied, always** — stated on
             // [`JobOutput::OverlayRaster`] — where each rasterizer's own
-            // convention is whatever it declares. All four described
-            // rasterizers declare premultiplied on every path (tiny-skia's
-            // pixmap *is* premultiplied), so the arm below is dead for them
-            // today; it is written now because the model-grid rasterizer
-            // declares straight alpha and reaches this seam in a later slice,
-            // and a seam that silently dropped the declaration would ship it
-            // double-bright.
+            // convention is whatever it declares. The tiny-skia rasterizers
+            // declare premultiplied on every path (a pixmap *is*
+            // premultiplied), so the arm below is theirs never; it exists
+            // because the model-grid rasterizer writes straight palette
+            // bytes and declares so, and a seam that silently dropped the
+            // declaration would ship that layer double-bright.
             //
             // The conversion is [`premultiply_raster`] — egui's own
             // constructor per pixel, the exact call the frame-thread consumer
@@ -2910,14 +3105,54 @@ pub(crate) fn clear_sink_wait() {
     });
 }
 
-/// Run `request` where the caller stands, which is [`offload`]'s answer for
-/// this target: a pool lane natively, this frame in a browser.
+/// Run `request` without a transport — the funnel's last resort, and the
+/// **only** inline execution wasm has left now that the opaque funnel is
+/// deleted: a browser whose worker is lost (or refused the job) pays the
+/// render on its one thread, because the alternative is a pane wedged behind
+/// a reply that will never come. With a healthy worker this never runs, and
+/// the respawn machinery exists to keep that the steady state.
+///
+/// Natively "here" is still not the calling thread: a thread is spawned for
+/// the job — the calling thread is the frame's on every rasterizing path,
+/// and the one reachable way in natively is a pool whose lane died, which a
+/// lane-mate would not survive either. Only a failed spawn runs it truly
+/// here, the same last-resort ladder the opaque test instrument descends.
 ///
 /// One function because three arms reach it — no sink and nothing expected, a
 /// sink that refused, and a wait that ran out — and the three must not come to
 /// disagree about where "here" is.
 fn run_here(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(JobResult) + Send>) {
-    offload(name, move || deliver(execute(&request)));
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Timed because this is the one arm where the cost lands on the
+        // frame; the number is what says whether worker respawn is keeping up.
+        let started = web_time::Instant::now();
+        deliver(execute(&request));
+        log::info!(
+            "{name} took {} ms on the main thread",
+            started.elapsed().as_millis()
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let task = std::sync::Arc::new(std::sync::Mutex::new(Some(move || {
+            deliver(execute(&request))
+        })));
+        let on_thread = std::sync::Arc::clone(&task);
+        let spawned = std::thread::Builder::new()
+            .name(format!("rd-fallback-{name}"))
+            .spawn(move || {
+                if let Some(f) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    f()
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("{name}: no thread for the fallback ({e}); running it here");
+            if let Some(f) = task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                f()
+            }
+        }
+    }
 }
 
 /// Hold `request` for the sink this thread expects, or hand it back for
@@ -3113,9 +3348,38 @@ pub fn install_test_worker(port: Box<dyn JobSink>) -> InstalledTestWorker {
 pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult) + Send + 'static) {
     let request = match job {
         Job::Described(request) => request,
-        // Nothing to post. This is the same `offload` the opaque callers use
-        // directly, reached through the funnel rather than around it.
-        Job::Opaque(run) => return offload(name, move || deliver(run())),
+        // Nothing to run and nothing to post: the answer is already known,
+        // and `deliver` is what unwinds the caller's marks. See
+        // [`Job::Nothing`] for why running it here is indistinguishable from
+        // any other placement.
+        Job::Nothing => return deliver(None),
+        // The test instrument. A thread of its own, not a pool lane — see
+        // [`Job::Opaque`] — and inline only if the spawn itself fails, which
+        // is the same last resort a refused described job takes. The task
+        // sits behind an `Option` so the failed-spawn arm can still run it
+        // here: `deliver` is what unwinds the caller's in-flight marks, and
+        // a dropped closure would strand them (`spawn` consumes its closure,
+        // so unlike the pool's `SendError` there is no value handed back).
+        #[cfg(not(target_arch = "wasm32"))]
+        Job::Opaque(run) => {
+            let task = std::sync::Arc::new(std::sync::Mutex::new(Some(move || deliver(run()))));
+            let on_thread = std::sync::Arc::clone(&task);
+            let spawned = std::thread::Builder::new()
+                .name(format!("rd-opaque-{name}"))
+                .spawn(move || {
+                    if let Some(f) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        f()
+                    }
+                });
+            if let Err(e) = spawned {
+                log::error!("{name}: no thread for an opaque job ({e}); running it here");
+                // The thread never started, so the task is still here.
+                if let Some(f) = task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    f()
+                }
+            }
+            return;
+        }
     };
     // Boxed here rather than at the one place that stores it, because every arm
     // below either files it or runs it and the two must be the same closure.

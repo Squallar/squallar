@@ -196,6 +196,7 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
         let named = match input {
             crate::offload::OverlayJobInput::Reports(_) => OverlayKind::StormReports,
             crate::offload::OverlayJobInput::Glm(_) => OverlayKind::Lightning,
+            crate::offload::OverlayJobInput::ModelData(_) => OverlayKind::ModelData,
             crate::offload::OverlayJobInput::Alerts(_) => OverlayKind::NwsAlerts,
             crate::offload::OverlayJobInput::Outlooks(_) => OverlayKind::SpcOutlook,
             crate::offload::OverlayJobInput::Discussions(_) => OverlayKind::SpcDiscussions,

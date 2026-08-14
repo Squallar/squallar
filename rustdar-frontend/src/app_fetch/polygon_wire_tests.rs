@@ -1,23 +1,23 @@
 //! The three polygon overlay dispatches are **described jobs**, end to end.
 //!
-//! `spawn_overlay_render`'s handler arm used to close over `prepare_rasterize`
-//! and hand the closure to `offload`, whose wasm arm runs it inline on the
-//! browser's one thread — 224 ms of measured gesture-end stall for the layer
-//! set these kinds make up. These pin the replacement, per kind: the dispatch
-//! asks the handler for its described input (`prepare_job`), builds a
-//! `JobRequest::Overlay`, and hands it to the funnel — so a browser with a
+//! `spawn_overlay_render`'s handler arm used to close over a rasterize
+//! closure and hand it to the opaque funnel, whose wasm arm ran it inline on
+//! the browser's one thread — 224 ms of measured gesture-end stall for the
+//! layer set these kinds make up. These pin the replacement, per kind: the
+//! dispatch asks the handler for its described input (`prepare_job`), builds
+//! a `JobRequest::Overlay`, and hands it to the funnel — so a browser with a
 //! worker attached posts it across the port instead of paying the raster on
 //! the frame. And a job that is never answered still un-wedges the pane.
 //!
-//! Reverting the dispatch to the closure fails
+//! Reverting the dispatch to a closure fails
 //! [`each_polygon_kind_dispatches_as_a_described_job_of_its_own_input`] by
 //! shape — the port records nothing, because a closure is executed rather
 //! than posted — and fails the un-wedge half by silence, since no failure
 //! response can exist for a job that was never described. The hit-map kinds
-//! took the same route a slice later; their dispatches are pinned in
-//! `hitmap_wire_tests`, and the described set as a whole from the other side
-//! by `rustdar-overlays`'
-//! `the_kinds_with_a_described_job_are_all_but_the_model_grid`.
+//! took the same route a slice later (`hitmap_wire_tests`), the model grid
+//! last (`model_wire_tests`), and the described set as a whole is pinned
+//! from the other side by `rustdar-overlays`'
+//! `every_texture_kind_rasterizes_as_a_described_job`.
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
@@ -225,6 +225,7 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
             crate::offload::OverlayJobInput::Sites(_) => OverlayKind::RadarSites,
             crate::offload::OverlayJobInput::Reports(_) => OverlayKind::StormReports,
             crate::offload::OverlayJobInput::Glm(_) => OverlayKind::Lightning,
+            crate::offload::OverlayJobInput::ModelData(_) => OverlayKind::ModelData,
         };
         assert_eq!(
             named, kind,
