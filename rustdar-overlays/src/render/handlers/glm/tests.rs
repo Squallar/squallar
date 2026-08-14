@@ -139,6 +139,102 @@ fn dead_feed_is_surfaced_in_the_control_panel() {
     );
 }
 
+/// A window gap must be visible without reading logs, and must not borrow the
+/// dead feed's words: "bucket is empty" would send the reader to check the one
+/// thing that is demonstrably fine.
+#[test]
+fn a_window_gap_is_surfaced_in_the_control_panel_in_its_own_words() {
+    let mut handler = GlmHandler::new();
+    handler.enabled = true;
+    handler.report_window_gaps(
+        &BOTH,
+        vec![WindowGap {
+            satellite: GlmSatellite::GoesEast,
+            objects_seen: 180,
+        }],
+    );
+
+    let texts = info_texts(&handler);
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("GOES-19 (East)") && t.contains("listing is healthy")),
+        "the panel must name the satellite and clear the bucket, got {texts:?}",
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("is empty")),
+        "an empty bucket is the opposite condition, got {texts:?}",
+    );
+}
+
+/// A gap that closes takes its notice with it, on the same `queried` rule the
+/// dead-feed recovery uses: a satellite nobody asked about has not recovered.
+#[test]
+fn a_closed_window_gap_clears_its_notice_but_only_if_it_was_queried() {
+    let gap = || {
+        vec![WindowGap {
+            satellite: GlmSatellite::GoesWest,
+            objects_seen: 180,
+        }]
+    };
+    let mut handler = GlmHandler::new();
+    handler.enabled = true;
+    handler.report_window_gaps(&BOTH, gap());
+    handler.report_window_gaps(&[GlmSatellite::GoesEast], Vec::new());
+    assert_eq!(
+        handler.window_gaps.len(),
+        1,
+        "GOES-West was not queried this poll, so nothing was learned about it",
+    );
+
+    handler.report_window_gaps(&BOTH, Vec::new());
+    assert!(
+        handler.window_gaps.is_empty(),
+        "queried and absent from the gaps is the recovery",
+    );
+}
+
+/// **A poll that parsed nothing must not clear the drop notice.**
+///
+/// The 20 s poll interval races a ~20 s granule cadence, so a poll routinely
+/// downloads nothing new, parses nothing, and knows nothing about records. Its
+/// tally is `considered: 0` — indistinguishable, by count alone, from "looked
+/// at some and dropped none". Taking it at face value would blank a standing
+/// notice on roughly every other poll, which is worse than not reporting: a
+/// notice that flickers reads as noise.
+#[test]
+fn a_poll_that_parsed_no_granule_does_not_clear_the_drop_notice() {
+    let mut handler = GlmHandler::new();
+    handler.enabled = true;
+    handler.report_record_drops(RecordDrops {
+        considered: 900,
+        fill_values: 0,
+        off_globe: 12,
+    });
+    assert!(
+        info_texts(&handler).iter().any(|t| t.contains("12")),
+        "the drop is standing",
+    );
+
+    handler.report_record_drops(RecordDrops::default());
+    let texts = info_texts(&handler);
+    assert!(
+        texts.iter().any(|t| t.contains("12 of 900")),
+        "a poll that examined no record cannot vouch for any, got {texts:?}",
+    );
+
+    // ...but a poll that *did* look and found nothing wrong is a real recovery.
+    handler.report_record_drops(RecordDrops {
+        considered: 900,
+        fill_values: 0,
+        off_globe: 0,
+    });
+    assert!(
+        !info_texts(&handler).iter().any(|t| t.contains("dropped")),
+        "a poll that examined records and dropped none clears the notice",
+    );
+}
+
 #[test]
 fn recovered_feed_clears_the_control_panel_notice() {
     let mut handler = GlmHandler::new();
@@ -1351,6 +1447,159 @@ fn a_whole_round_carries_no_mark() {
         "nothing failed and the layer claims a fault: {line}",
     );
     assert_eq!(note, None, "nothing failed and the options say otherwise");
+}
+
+/// A round whose listings were healthy but placed no granule in the window,
+/// for `gapped` satellites out of the two queried.
+fn gapped_round(gapped: Vec<GlmSatellite>) -> FetchPayload {
+    Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+        flashes: Vec::new(),
+        dead_feeds: Vec::new(),
+        queried: vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        parse_failures: None,
+        transport_failures: None,
+        level_failures: Vec::new(),
+        evaluated_levels: Vec::new(),
+        listing_failures: Vec::new(),
+        window_gaps: gapped
+            .into_iter()
+            .map(|satellite| crate::glm::WindowGap {
+                satellite,
+                objects_seen: 180,
+            })
+            .collect(),
+        record_drops: crate::glm::RecordDrops::default(),
+    })))
+}
+
+/// A round that parsed granules and threw records away inside them.
+fn dropping_round(considered: usize, fill_values: usize, off_globe: usize) -> FetchPayload {
+    Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+        flashes: Vec::new(),
+        dead_feeds: Vec::new(),
+        queried: vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        parse_failures: None,
+        transport_failures: None,
+        level_failures: Vec::new(),
+        evaluated_levels: Vec::new(),
+        listing_failures: Vec::new(),
+        window_gaps: Vec::new(),
+        record_drops: crate::glm::RecordDrops {
+            considered,
+            fill_values,
+            off_globe,
+        },
+    })))
+}
+
+/// **A window gap reaches the row and the options.**
+///
+/// The listing answered `200` with objects and none of them covers the window,
+/// so this feed delivered nothing while every existing check stayed quiet: the
+/// dead-feed check needs zero objects, the granule checks need a granule to
+/// have failed, and there was none to fail. The round returned `Ok` on a fresh
+/// clock and `is_complete()` was `true`.
+#[test]
+fn a_window_gap_marks_the_layer_and_says_the_listing_was_healthy() {
+    let (line, note) = marks(gapped_round(vec![GlmSatellite::GoesEast]));
+    assert!(
+        line.starts_with("! incomplete"),
+        "a feed delivered no granule and the row says nothing: {line}",
+    );
+    let note = note.expect("the options must say what the row is marking");
+    assert!(
+        note.contains("missing 1 of 2 satellite feeds"),
+        "one feed contributed nothing, the other is fine: {note}",
+    );
+    assert!(
+        note.contains("listing healthy"),
+        "the operator's next move depends on knowing the bucket is not the \
+         problem, which is the whole reason this is not a dead feed: {note}",
+    );
+    assert!(
+        note.contains("180"),
+        "the object count is the evidence for that claim: {note}",
+    );
+}
+
+/// A window gap is not charged again for granules it never listed. It put
+/// nothing in `in_window`, so there is nothing of its own to have failed, and
+/// counting it among the live feeds would report three faults on two feeds.
+#[test]
+fn a_window_gap_is_not_charged_again_for_the_other_feeds_granules() {
+    let payload = Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+        flashes: Vec::new(),
+        dead_feeds: Vec::new(),
+        queried: vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        parse_failures: None,
+        transport_failures: failures(20, 20),
+        level_failures: Vec::new(),
+        evaluated_levels: Vec::new(),
+        listing_failures: Vec::new(),
+        window_gaps: vec![crate::glm::WindowGap {
+            satellite: GlmSatellite::GoesEast,
+            objects_seen: 180,
+        }],
+        record_drops: crate::glm::RecordDrops::default(),
+    }))) as FetchPayload;
+    let (_, note) = marks(payload);
+    let note = note.expect("note");
+    assert!(
+        note.contains("missing 2 of 2 satellite feeds"),
+        "one feed listed no granule and one lost every granule it listed - two, \
+         not three: {note}",
+    );
+}
+
+/// **Dropped records reach the row and the options, with their own
+/// denominator.**
+///
+/// The count existed and went to a log line. Fails if it stops reaching the
+/// panel, and - because the denominator is asserted inside the same string -
+/// if the record count is ever pooled into the granule figures standing beside
+/// it, where `1200` records would read as `1200` granules.
+#[test]
+fn dropped_records_mark_the_layer_and_carry_their_own_denominator() {
+    let (line, note) = marks(dropping_round(1200, 4, 11));
+    assert!(
+        line.starts_with("! incomplete"),
+        "records were thrown away and the row says nothing: {line}",
+    );
+    let note = note.expect("the options must say what the row is marking");
+    assert!(
+        note.contains("2 of 2 satellite feeds drawing only part of their area"),
+        "a hole in a layer that is otherwise drawing is partial, not missing: {note}",
+    );
+    assert!(
+        note.contains("4 of 1200 records dropped for fill values"),
+        "the record denominator must travel with the record count: {note}",
+    );
+    assert!(
+        note.contains("11 of 1200 records dropped for coordinates off the globe"),
+        "the two causes indict different things and are never merged: {note}",
+    );
+}
+
+/// **The quiet-sky control, at the coverage layer.** A round that listed its
+/// granules, parsed them and kept every record carries no mark, even though it
+/// drew no flashes at all - which is exactly what a calm night looks like.
+///
+/// Without this every assertion above would pass on a `round_coverage` that
+/// reported incomplete whenever the layer was empty, and that is the false
+/// alarm that would make the mark worthless: GLM is genuinely quiet most
+/// nights, and a permanent "incomplete" is one people learn to scroll past.
+#[test]
+fn a_quiet_sky_with_no_flashes_at_all_carries_no_mark() {
+    let (line, note) = marks(dropping_round(1200, 0, 0));
+    assert!(
+        !line.starts_with("!"),
+        "every granule listed, downloaded, parsed and kept every record, and \
+         nothing flashed - that is a correct empty result: {line}",
+    );
+    assert_eq!(
+        note, None,
+        "an empty map is not a fault unless something went missing on the way",
+    );
 }
 
 /// A dead feed and a granule failure at once must not charge the dead feed
