@@ -2401,9 +2401,10 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
     let body = fn_body("fn evict_unneeded_loop_scans(");
     assert_eq!(
         body.matches("crate::offload::discard_each(").count(),
-        1,
-        "the loop cache's evictions are freed where they were evicted — on the \
-         frame thread, 47–69 MiB apiece: {body}"
+        2,
+        "one of the loop's two caches frees its evictions where it evicted them \
+         — on the frame thread, 47–69 MiB apiece for a volume and a decoded \
+         message plus its own bytes for an object: {body}"
     );
     // The grace rule, named rather than described: without it a loop whose
     // listing is in flight names no frame, and the sweep takes its whole
@@ -2428,6 +2429,14 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
         body.contains("retain_plan_frames(keep)") && body.contains("retain_scans(keep)"),
         "the frame plan and the cache are no longer swept by one predicate, so \
          a re-plan can queue a download for a volume the sweep evicts: {body}"
+    );
+    // And the Level III cache, by the same predicate object rather than a
+    // second rule free to disagree with the first.
+    assert!(
+        body.contains("retain_l3(keep)"),
+        "the Level III cache is no longer swept, or is swept by a rule of its \
+         own: one `Level3Product` per frame per AWIPS code, removed by nothing \
+         else, is the sibling of the leak this pass exists for: {body}"
     );
 }
 

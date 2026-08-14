@@ -277,6 +277,27 @@ impl LoopDownloadManager {
             .map_or(0, |pending| pending.queue.len())
     }
 
+    /// How many Level III objects this site is holding, **gaps included**.
+    ///
+    /// A cached `None` occupies a key and answers a dispatch gate exactly as a
+    /// present object does, so a count that skipped them would report a cache
+    /// the sweep had not touched as empty.
+    #[cfg(test)]
+    pub fn cached_l3_count(&self, site: &str) -> usize {
+        self.l3_cache
+            .keys()
+            .filter(|(cached, _, _)| cached == site)
+            .count()
+    }
+
+    /// How many pairings this pane still has queued and undispatched.
+    #[cfg(test)]
+    pub fn pending_l3_queue_count(&self, pane: usize) -> usize {
+        self.pending_l3
+            .get(&pane)
+            .map_or(0, |pending| pending.queue.len())
+    }
+
     /// Whether the map has an entry for this site at all.
     ///
     /// Separate from [`cached_scan_count`](Self::cached_scan_count) because that
@@ -309,6 +330,9 @@ impl LoopDownloadManager {
     /// [`crate::offload::discard_each`](crate::offload::discard_each) instead.
     /// Same reasoning, and the same helper's reasoning, as
     /// [`crate::app::evicted`].
+    ///
+    /// The Level III cache is bounded by [`retain_l3`](Self::retain_l3), which
+    /// mirrors this in shape and is handed the very same predicate.
     ///
     /// # Until this, nothing evicted an entry
     ///
@@ -396,9 +420,11 @@ impl LoopDownloadManager {
     ///
     /// [`pending_l3`](Self::pending_l3) is not pruned here. A Level III loop
     /// downloads no volumes at all — its frames resolve through
-    /// [`l3_cache`](Self::l3_cache), which this sweep does not touch — so
-    /// judging its pairings by a volume-cache predicate would be a category
-    /// error, not a missing case.
+    /// [`l3_cache`](Self::l3_cache), which this call does not touch — so judging
+    /// its pairings by a volume-cache predicate would be a category error, not a
+    /// missing case. They are swept by [`retain_l3`](Self::retain_l3) instead,
+    /// against the cache they *do* resolve through and with the same predicate
+    /// object, so the invariant above holds on both datasources.
     ///
     /// The in-flight marks are untouched for the reason [`retain_scans`] gives.
     pub fn retain_plan_frames(&mut self, keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool) {
@@ -591,6 +617,111 @@ impl LoopDownloadManager {
         let key = Self::l3_key(site, code, &ts);
         self.l3_in_flight.remove(&key);
         self.l3_cache.insert(key, product);
+    }
+
+    /// Take out every paired Level III object whose `(site, volume start)` fails
+    /// `keep` and hand the removed products back **owned**, then drop the
+    /// undispatched pairings the same predicate refuses.
+    ///
+    /// # The Level III half of the same leak
+    ///
+    /// [`l3_cache`](Self::l3_cache) has the shape
+    /// [`scan_cache`](Self::scan_cache) had before
+    /// [`retain_scans`](Self::retain_scans): one entry per frame per AWIPS code,
+    /// written by [`cache_l3_product`](Self::cache_l3_product), and removed by
+    /// nothing at all — `clear_all` emptied the map wholesale when a pane left a
+    /// radar and no other path ever took an entry out. A value is an
+    /// [`Level3Product`], which carries the decoded `message` **and** the
+    /// `bytes` it was decoded from — kept because a `Level3Message` has no wire
+    /// form and the browser's rasterization worker re-decodes the bytes itself —
+    /// so every re-listing (a product switch, a time navigation,
+    /// `reinit_active_loops`) leaves its whole previous window resident, per
+    /// code, for the life of the process. A few hundred kilobytes an entry
+    /// rather than a volume's ~10 MB, which is why it is the sibling leak and
+    /// not the first one found; it is unbounded on the same axis.
+    ///
+    /// Dropping `message` and re-decoding from `bytes` on demand would halve an
+    /// entry and is a different question from *which* entries are held. It is
+    /// not asked here.
+    ///
+    /// # The predicate is `(site, volume start)`, and the AWIPS code is deliberately not asked about
+    ///
+    /// The keys carry three parts and the rule judges two. That is not an
+    /// oversight in any of four respects:
+    ///
+    /// * **The code axis is a compile-time constant and the volume axis is
+    ///   not.** [`RadarProduct::level3_products`] is a fixed table naming four
+    ///   distinct codes across the whole workspace, so ignoring the code costs
+    ///   at most four entries per retained volume. What grows without bound is
+    ///   the volume, which is exactly what this sweep bounds.
+    /// * **A product switch does not move the frames, so it must not move the
+    ///   retention set.** Both frame lists — [`FramePlan::frames`] and
+    ///   `LoopPlaybackState::frames` — come from a Level II archive listing, and
+    ///   `retarget_renders_keyed` re-renders without re-listing. Judged on the
+    ///   code, every switch would evict the objects of frames still in the
+    ///   window and the switch back would re-pair them, at up to
+    ///   `PAIRING_CANDIDATES` object fetches per frame per code. That is the
+    ///   refetch churn the volume design refuses a byte-LRU for, arriving on the
+    ///   other datasource.
+    /// * **These entries are shared between products by construction.** No key
+    ///   here mentions a product, which is what lets one pane looping VIL and
+    ///   another looping VIL density pair each volume's `DVL` exactly once —
+    ///   pinned by `one_pairing_serves_every_product_that_reads_the_code`. A
+    ///   retention set derived from a loop's *current* product would evict the
+    ///   other loop's objects, and there is no per-pane cache to fall back on.
+    /// * **The gaps are the cheapest entries and the most expensive to lose.** A
+    ///   `None` is cached as the answer "this site generated no object for this
+    ///   volume", so a frame is retired once instead of being re-paired on every
+    ///   dispatch pass for the life of the loop. It is removed here with the
+    ///   rest — its key is what the gate reads — and contributes no payload to
+    ///   hand over, because there is nothing in it.
+    ///
+    /// # The undispatched pairings go with the cache, by the same predicate
+    ///
+    /// The invariant [`retain_plan_frames`](Self::retain_plan_frames) states —
+    /// **nothing the sweep would evict stays queued** — on this datasource.
+    /// `dispatch_pending_loop_l3_pairings` drops a queue entry when
+    /// [`l3_is_resolved`](Self::l3_is_resolved) says it is already answered,
+    /// which is the Level III counterpart of the `is_cached` filter, so sweeping
+    /// the cache without the queue turns every retired frame back into a live
+    /// pairing — and a pairing is up to `PAIRING_CANDIDATES` object fetches
+    /// holding the shared `concurrent_loop_downloads` slots the live frames wait
+    /// on.
+    ///
+    /// This is why `retain_plan_frames` leaves [`pending_l3`](Self::pending_l3)
+    /// alone rather than sweeping it there: nothing has changed about that call
+    /// being unable to answer for this cache, only that this one now can.
+    ///
+    /// The **plans** are not swept twice. `FramePlan` is one frame list per pane
+    /// whichever datasource the pane's product reads, and `retain_plan_frames`
+    /// already sweeps it with this very predicate.
+    ///
+    /// # It does not touch the in-flight marks
+    ///
+    /// [`l3_in_flight`](Self::l3_in_flight) mirrors pairings already on the wire,
+    /// for the reason and with the consequence [`retain_scans`](Self::retain_scans)
+    /// states: clearing a mark would let the same object be fetched twice, and
+    /// `in_flight_count` is `saturating_sub`bed on completion, so moving it here
+    /// would wedge the concurrency cap low for the session. A pairing in flight
+    /// for an entry this pass evicted simply lands and is cached again.
+    pub fn retain_l3(
+        &mut self,
+        keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool,
+    ) -> Vec<Arc<Level3Product>> {
+        let removed: Vec<Arc<Level3Product>> = self
+            .l3_cache
+            .extract_if(|(site, _, ts), _| !keep(site.as_str(), ts))
+            // A gap's key goes with the rest and its value is nothing to hand
+            // over. Dropped here rather than unwrapped, because a cached `None`
+            // is an ordinary answer and not a missing entry.
+            .filter_map(|(_, product)| product)
+            .collect();
+        for pending in self.pending_l3.values_mut() {
+            pending
+                .queue
+                .retain(|(ts, _)| keep(pending.site.as_str(), ts));
+        }
+        removed
     }
 
     /// Whether frame `ts` of `product`'s loop on `site` has every object it
@@ -1125,9 +1256,11 @@ mod tests {
     /// A Level III loop's pairings are **not** the volume predicate's business.
     ///
     /// Such a loop downloads no volumes at all — its frames resolve through
-    /// `l3_cache`, which this sweep does not touch — so judging its pairings by
-    /// a volume-cache answer would be a category error rather than a missing
-    /// case. Pinned because the omission otherwise reads as an oversight.
+    /// `l3_cache`, which this call does not touch — so judging its pairings by a
+    /// volume-cache answer would be a category error rather than a missing case.
+    /// `retain_l3` sweeps them against that cache instead, with the same
+    /// predicate object; the pin is on the *split*, not on the pairings being
+    /// unswept.
     #[test]
     fn retain_plan_frames_leaves_level3_pairings_alone() {
         let mut mgr = LoopDownloadManager::new();
@@ -1278,5 +1411,169 @@ mod tests {
         // unanswered for both.
         assert!(!mgr.l3_is_resolved("KTLX", "DVL", &ts(1)));
         assert!(!mgr.l3_is_resolved("KOUN", "DVL", &ts(0)));
+    }
+
+    /// `retain_l3` hands the evicted objects back rather than freeing them, and
+    /// a cached gap goes with them without pretending to be one.
+    ///
+    /// The same reason `retain_scans` is not a `retain`: the caller is the frame
+    /// thread and a value here carries a decoded `Level3Message` *and* the bytes
+    /// it was decoded from. Compared by pointer, so it cannot be satisfied by
+    /// handing back some other object of the right shape.
+    #[test]
+    fn retain_l3_returns_the_products_it_removed() {
+        let mut mgr = LoopDownloadManager::new();
+        let doomed = l3();
+        let kept = l3();
+        mgr.cache_l3_product("KTLX", "EET", ts(0), Some(doomed.clone()));
+        mgr.cache_l3_product("KTLX", "EET", ts(1), Some(kept.clone()));
+        // A gap at the doomed volume: its *key* is what the dispatch gate
+        // reads, so it has to go, and there is nothing in it to hand over.
+        mgr.cache_l3_product("KTLX", "DVL", ts(0), None);
+        assert_eq!(
+            mgr.cached_l3_count("KTLX"),
+            3,
+            "precondition: the cache holds something for the sweep to remove",
+        );
+
+        let removed = mgr.retain_l3(|_, stamp| *stamp == ts(1));
+
+        assert_eq!(removed.len(), 1, "one object failed the predicate");
+        assert!(
+            Arc::ptr_eq(&removed[0], &doomed),
+            "the value handed back is not the one that was evicted, so the \
+             caller cannot hand the evicted object over",
+        );
+        assert!(
+            !mgr.l3_is_resolved("KTLX", "DVL", &ts(0)),
+            "the gap's key outlived the sweep, so the pairing gate goes on \
+             answering \"already resolved\" for a volume nothing holds",
+        );
+        assert!(
+            mgr.l3_is_resolved("KTLX", "EET", &ts(1)),
+            "the surviving entry was removed",
+        );
+        assert_eq!(mgr.cached_l3_count("KTLX"), 1);
+    }
+
+    /// **The AWIPS code is deliberately not in the question.**
+    ///
+    /// The key has three parts and the rule judges two, so a loop that switches
+    /// product keeps the objects of every frame still in its window — including
+    /// the codes the new product does not read, which is the point: the frames
+    /// did not move, only the codes wanted did, and re-pairing them costs up to
+    /// `PAIRING_CANDIDATES` object fetches apiece. The code axis is a
+    /// compile-time table of four entries; the volume axis is the unbounded one.
+    #[test]
+    fn retain_l3_ignores_the_awips_code() {
+        let mut mgr = LoopDownloadManager::new();
+        for code in ["DVL", "EET"] {
+            mgr.cache_l3_product("KTLX", code, ts(0), Some(l3()));
+            mgr.cache_l3_product("KTLX", code, ts(9), Some(l3()));
+        }
+        assert_eq!(
+            mgr.cached_l3_count("KTLX"),
+            4,
+            "precondition: two codes over two volumes",
+        );
+
+        // The window still names ts(0) and has retired ts(9). Which product the
+        // pane is on does not enter: the predicate has nowhere to put it.
+        let removed = mgr.retain_l3(|_, stamp| *stamp == ts(0));
+
+        assert_eq!(removed.len(), 2, "both codes of the retired volume went");
+        for code in ["DVL", "EET"] {
+            assert!(
+                mgr.l3_is_resolved("KTLX", code, &ts(0)),
+                "{code}: an object of a frame still in the window was evicted, \
+                 so a switch to a product reading it re-pairs a volume the loop \
+                 never stopped naming",
+            );
+            assert!(
+                !mgr.l3_is_resolved("KTLX", code, &ts(9)),
+                "{code}: the object of a retired frame survived, which is the \
+                 leak this sweep exists to close",
+            );
+        }
+    }
+
+    /// Both halves of what the rule *does* judge reach it.
+    ///
+    /// Two sites' volume times land on the same second often enough — the
+    /// reason the key carries the site at all — and a rule that answered on the
+    /// volume alone would evict one radar's object because another radar had
+    /// stopped naming that second.
+    #[test]
+    fn retain_l3_judges_the_site_as_well_as_the_volume() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_l3_product("KTLX", "EET", ts(0), Some(l3()));
+        mgr.cache_l3_product("KOUN", "EET", ts(0), Some(l3()));
+
+        let removed = mgr.retain_l3(|site, _| site == "KTLX");
+
+        assert_eq!(removed.len(), 1);
+        assert!(mgr.l3_is_resolved("KTLX", "EET", &ts(0)));
+        assert!(
+            !mgr.l3_is_resolved("KOUN", "EET", &ts(0)),
+            "KOUN's object survived a predicate that named only KTLX",
+        );
+    }
+
+    /// The undispatched pairings are swept by the same predicate as the cache
+    /// they resolve through — the Level III half of the invariant
+    /// `retain_plan_frames` states.
+    ///
+    /// `dispatch_pending_loop_l3_pairings` drops a queue entry that
+    /// `l3_is_resolved` calls answered, so a queue left holding entries the
+    /// cache no longer answers for re-pairs every one of them, at up to
+    /// `PAIRING_CANDIDATES` fetches apiece, holding the shared download slots
+    /// the live frames are waiting on.
+    #[test]
+    fn retain_l3_sweeps_the_undispatched_pairings_too() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan_for("KTLX", &[0, 2, 4]));
+        assert!(mgr.plan_downloads_for(0, RadarProduct::VilDensity));
+        assert_eq!(
+            mgr.pending_l3_queue_count(0),
+            6,
+            "precondition: three frames, two codes apiece, derived before the \
+             window moved",
+        );
+
+        mgr.retain_l3(|_, stamp| *stamp >= ts(4));
+
+        assert_eq!(
+            mgr.pending_l3_queue_count(0),
+            2,
+            "an already-derived pairing queue kept the entries the sweep just \
+             evicted, so each retired frame is paired again and thrown away by \
+             the next sweep",
+        );
+    }
+
+    /// The in-flight marks are not the sweep's to touch, for the reason
+    /// `retain_scans_leaves_the_in_flight_marks_alone` gives on the other
+    /// datasource: one shared concurrency counter, `saturating_sub`bed on
+    /// completion, so moving it here wedges it low for the session.
+    #[test]
+    fn retain_l3_leaves_the_in_flight_marks_alone() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_l3_product("KTLX", "EET", ts(0), Some(l3()));
+        mgr.mark_l3_in_flight("KTLX", "EET", ts(5));
+        mgr.add_spawned(1);
+
+        let removed = mgr.retain_l3(|_, _| false);
+
+        assert_eq!(removed.len(), 1, "precondition: the sweep did evict");
+        assert!(
+            mgr.l3_is_in_flight("KTLX", "EET", &ts(5)),
+            "a pairing already on the wire lost its mark, so the same object is \
+             fetched a second time",
+        );
+        assert_eq!(
+            mgr.available_slots(4),
+            3,
+            "the concurrency cap moved, so it no longer counts what is running",
+        );
     }
 }

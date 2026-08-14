@@ -1,15 +1,23 @@
-//! What bounds `LoopDownloadManager`'s decoded volumes.
+//! What bounds `LoopDownloadManager`'s two data caches.
 //!
-//! The cache holds one whole `Arc<Scan>` — 47–69 MiB — per `(site, timestamp)`,
-//! and until `App::evict_unneeded_loop_scans` nothing ever removed one: a frame
-//! eviction retires a pane's *frame*, `clear_all` fires only when a pane leaves
-//! a radar, and the loop pool's byte budget counts texture bytes rather than
-//! these CPU-side volumes. A pane parked on a live radar accumulated one per
-//! polled scan for the life of the process.
+//! The volume cache holds one whole `Arc<Scan>` — 47–69 MiB — per
+//! `(site, timestamp)`, and until `App::evict_unneeded_loop_scans` nothing ever
+//! removed one: a frame eviction retires a pane's *frame*, `clear_all` fires
+//! only when a pane leaves a radar, and the loop pool's byte budget counts
+//! texture bytes rather than these CPU-side volumes. A pane parked on a live
+//! radar accumulated one per polled scan for the life of the process.
+//!
+//! `l3_cache` is the same defect on the other datasource, and the tests for it
+//! live here rather than beside the Level III dispatch because it is the *same*
+//! sweep and the *same* predicate that bounds them: one `Level3Product` per
+//! `(site, AWIPS code, volume start)`, carrying the decoded message and the
+//! bytes it was decoded from, written for every frame of every Level III loop
+//! and removed by nothing but that same `clear_all`.
 //!
 //! Every test here drives the real writers — `append_scan_to_active_loops` for
-//! the poll path, `accept_scan_listing` for the listing — so a change to what
-//! either of them writes reaches these assertions rather than going around them.
+//! the poll path, `accept_scan_listing` for the listing, `cache_l3_product` for
+//! a landed pairing — so a change to what any of them writes reaches these
+//! assertions rather than going around them.
 
 use super::*;
 use crate::app::tests::{empty_scan, headless};
@@ -116,6 +124,77 @@ fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
 fn poll_scan(app: &mut crate::app::App, minute: u32) {
     let (scan, declared) = volume();
     app.append_scan_to_active_loops(SITE, at(minute), scan, declared);
+}
+
+/// A paired Level III object as the cache holds one. Nothing here decodes or
+/// renders it — every assertion below is about *which* keys are present — so an
+/// object carrying no symbology and no bytes is the honest fixture.
+fn object() -> Arc<rustdar_radar::level3::Level3Product> {
+    Arc::new(rustdar_radar::level3::Level3Product {
+        message: nexrad_level3::model::Level3Message {
+            header: nexrad_level3::model::MessageHeader {
+                message_code: 135,
+                date_of_message: 19723,
+                time_of_message: 90,
+                message_length: 0,
+                source_id: 0,
+                destination_id: 0,
+                number_of_blocks: 3,
+            },
+            pdb: nexrad_level3::model::ProductDescriptionBlock {
+                block_divider: -1,
+                latitude: 35.333,
+                longitude: -97.278,
+                height: 1200,
+                product_code: 135,
+                operational_mode: 2,
+                vcp: 212,
+                sequence_number: 0,
+                volume_scan_number: 1,
+                volume_scan_date: 19723,
+                volume_scan_time: 0,
+                generation_date: 19723,
+                generation_time: 90,
+                product_specific_1: 0,
+                product_specific_2: 0,
+                elevation_number: 1,
+                product_specific_3: 0,
+                thresholds: [0u16; 16],
+                product_specific_47_53: [0i16; 7],
+                version: 0,
+                spot_blank: 0,
+                symbology_offset: 60,
+                graphic_offset: 0,
+                tabular_offset: 0,
+            },
+            symbology: None,
+        },
+        stamp: rustdar_radar::level3::ProductStamp::from_key("TLX_EET_2024_01_01_00_01_30"),
+        bytes: Arc::new(Vec::new()),
+    })
+}
+
+/// Land a pairing for `code` against the volume at `minute`, exactly as
+/// `poll_loop_l3_fetch_results` files one when its response arrives.
+fn pair(app: &mut crate::app::App, code: &str, minute: u32) {
+    app.loop_mgr
+        .cache_l3_product(SITE, code, at(minute), Some(object()));
+}
+
+/// The plan `poll_loop_scan_list_results` files for a listing naming `minutes`.
+fn plan_for(minutes: &[u32]) -> crate::loop_downloads::FramePlan {
+    crate::loop_downloads::FramePlan::new(
+        SITE.to_string(),
+        minutes
+            .iter()
+            .map(|&minute| {
+                (
+                    at(minute),
+                    Identifier::new(format!("KTLX2024010100{minute:02}00_V06")),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn frames(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
@@ -453,19 +532,7 @@ fn a_retired_frame_is_not_re_queued_after_the_window_moves() {
     begin_loop(&mut app, 600);
     install_listing(&mut app, &[0, 2, 4]);
     // The plan the listing produced, as `poll_loop_scan_list_results` files it.
-    let plan = crate::loop_downloads::FramePlan::new(
-        SITE.to_string(),
-        [0u32, 2, 4]
-            .iter()
-            .map(|&minute| {
-                (
-                    at(minute),
-                    Identifier::new(format!("KTLX2024010100{minute:02}00_V06")),
-                )
-            })
-            .collect(),
-    );
-    app.loop_mgr.set_plan(0, plan);
+    app.loop_mgr.set_plan(0, plan_for(&[0, 2, 4]));
     assert_eq!(
         app.loop_mgr.plan_frame_count(0),
         3,
@@ -503,5 +570,219 @@ fn a_retired_frame_is_not_re_queued_after_the_window_moves() {
         1,
         "the re-derived queue would fetch volumes for frames that no longer \
          exist, spending the shared download slots the live frames need",
+    );
+}
+
+/// **The sibling leak.** Paired Level III objects nothing names accumulated
+/// exactly as the volumes did.
+///
+/// `cache_l3_product` writes one entry per frame per AWIPS code — the gaps
+/// deliberately included, so a frame is retired once instead of re-paired every
+/// pass — and until this sweep only `clear_all` ever took one out, which fires
+/// when a pane leaves a radar and never otherwise. Every re-listing leaves the
+/// previous window behind: a product switch, a time navigation,
+/// `reinit_active_loops`.
+///
+/// The count is asserted **before** the sweep as well as after, so this cannot
+/// pass against an empty cache.
+#[test]
+fn paired_objects_no_live_frame_names_are_not_kept() {
+    const PAIRED: u32 = 6;
+
+    let mut app = app_on_site();
+    for minute in 0..PAIRED {
+        pair(&mut app, "EET", minute);
+    }
+
+    assert_eq!(
+        app.loop_mgr.cached_l3_count(SITE),
+        PAIRED as usize,
+        "precondition: the pairing path really did cache every object, so the \
+         sweep below has something to remove",
+    );
+    assert!(
+        !app.gui
+            .pane(0)
+            .expect("a fresh Gui has one pane")
+            .loop_state
+            .is_active(),
+        "precondition: no loop names any of these volumes",
+    );
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.cached_l3_count(SITE),
+        0,
+        "the objects of a window nothing is playing are still resident; \
+         nothing else in this crate ever removes one",
+    );
+}
+
+/// **The keep, on the Level III side.** Every object a live loop frame names
+/// survives, and the lookup the renderer makes still resolves.
+#[test]
+fn a_live_level3_loops_frames_keep_their_objects() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &[0, 4, 8]);
+    for minute in [0, 4, 8] {
+        pair(&mut app, "EET", minute);
+    }
+    // An object no frame names, from a window this loop has moved past.
+    pair(&mut app, "EET", 99);
+    assert_eq!(app.loop_mgr.cached_l3_count(SITE), 4);
+
+    app.evict_unshown_scans();
+
+    let target = RenderTarget::new(SITE, RadarProduct::EchoTops, 0.5);
+    for minute in [0, 4, 8] {
+        assert!(
+            matches!(
+                frame_data(&app.loop_mgr, &target, at(minute)),
+                Some(LoopFrameData::Products(_)),
+            ),
+            "minute {minute}: a frame the loop is playing lost its object, so \
+             its dispatch pairs the volume again on every pass",
+        );
+    }
+    assert!(
+        !app.loop_mgr.l3_is_resolved(SITE, "EET", &at(99)),
+        "an object no frame names survived, which is the leak this sweep \
+         exists to close",
+    );
+}
+
+/// **A product switch does not shed the window.**
+///
+/// The reason the retention rule ignores the AWIPS code. The frames do not move
+/// when the product does — both frame lists come from a Level II archive
+/// listing and `retarget_renders_keyed` re-renders without re-listing — so a
+/// rule that asked which codes the pane's *current* product reads would evict
+/// the objects of frames still in the window, and the switch back would re-pair
+/// every one of them at up to `PAIRING_CANDIDATES` object fetches apiece.
+///
+/// The pane is moved to a product reading **neither** cached code, which is the
+/// case a code-aware rule gets wrong most completely.
+#[test]
+fn switching_product_keeps_the_objects_of_frames_still_in_the_window() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &[0, 4]);
+    for code in ["DVL", "EET"] {
+        for minute in [0, 4] {
+            pair(&mut app, code, minute);
+        }
+    }
+    assert_eq!(
+        app.loop_mgr.cached_l3_count(SITE),
+        4,
+        "precondition: two codes over the two volumes the window names",
+    );
+
+    app.gui
+        .pane_mut(0)
+        .expect("a fresh Gui has one pane")
+        .selected_product = RadarProduct::SpecificDifferentialPhase;
+
+    app.evict_unshown_scans();
+
+    for code in ["DVL", "EET"] {
+        for minute in [0, 4] {
+            assert!(
+                app.loop_mgr.l3_is_resolved(SITE, code, &at(minute)),
+                "{code} at minute {minute}: an object of a frame still in the \
+                 window went when the pane changed product, so switching back \
+                 re-pairs a volume the loop never stopped naming",
+            );
+        }
+    }
+}
+
+/// **The grace rule reaches the Level III cache too**, and expires there too.
+///
+/// One predicate governs both caches, so a loop whose listing is in flight —
+/// naming no frame at all — keeps its objects for exactly as long as it keeps
+/// its volumes, and loses them on the same terms.
+#[test]
+fn a_loop_still_fetching_its_listing_keeps_its_objects() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    for minute in [0, 4, 8] {
+        pair(&mut app, "EET", minute);
+    }
+    assert!(
+        frames(&app).is_empty(),
+        "precondition: a loop fetching its listing names no frame at all",
+    );
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.cached_l3_count(SITE),
+        3,
+        "a loop's objects went in the gap before its listing landed, so every \
+         product switch and every re-init re-pairs the whole window",
+    );
+
+    // The listing lands and names two of the three.
+    install_listing(&mut app, &[0, 4]);
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.cached_l3_count(SITE),
+        2,
+        "the grace rule outlived the listing it was granted for",
+    );
+    assert!(
+        !app.loop_mgr.l3_is_resolved(SITE, "EET", &at(8)),
+        "the entry the new listing does not name survived the sweep that \
+         followed it",
+    );
+}
+
+/// **A retired frame is not re-paired after the window moves.**
+///
+/// The Level III half of `a_retired_frame_is_not_re_queued_after_the_window_moves`,
+/// and it needs its own sweep: `retain_plan_frames` deliberately leaves the
+/// pairing queue alone, because a volume-cache answer cannot judge pairings.
+/// `dispatch_pending_loop_l3_pairings` drops a queue entry that `l3_is_resolved`
+/// calls answered, so once the cache is swept an unswept queue re-pairs every
+/// retired frame — holding the shared `concurrent_loop_downloads` slots the live
+/// frames are waiting on.
+#[test]
+fn a_retired_frame_is_not_re_paired_after_the_window_moves() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 600);
+    install_listing(&mut app, &[0, 2, 4]);
+    app.loop_mgr.set_plan(0, plan_for(&[0, 2, 4]));
+    assert!(
+        app.loop_mgr.plan_downloads_for(0, RadarProduct::EchoTops),
+        "precondition: a Level III product queues pairings rather than volumes",
+    );
+    assert_eq!(
+        app.loop_mgr.pending_l3_queue_count(0),
+        3,
+        "precondition: one pairing per frame of the original listing",
+    );
+
+    // The window walks forward until the first two frames are retired.
+    poll_scan(&mut app, 12);
+    poll_scan(&mut app, 14);
+    assert_eq!(frames(&app), vec![at(4), at(12), at(14)]);
+    assert_eq!(
+        app.loop_mgr.pending_l3_queue_count(0),
+        3,
+        "precondition: the append path prunes the loop's frames and never the \
+         pairing queue — the divergence this sweep has to close",
+    );
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.pending_l3_queue_count(0),
+        1,
+        "the queue still owes pairings for frames the window retired, so each \
+         is fetched again and evicted by the very next sweep",
     );
 }
