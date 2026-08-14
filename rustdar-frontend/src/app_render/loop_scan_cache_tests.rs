@@ -56,6 +56,35 @@ fn begin_loop(app: &mut crate::app::App, lookback_secs: u64) {
         LoopPhase::FetchingScanList,
         "precondition: a freshly built loop is waiting on its listing",
     );
+    assert!(
+        pane.loop_state.listing_since.is_some(),
+        "precondition: entering the fetching phase starts the clock on the \
+         grace exemption",
+    );
+}
+
+/// Backdate pane 0's listing clock by `secs`, the way a listing that has been in
+/// flight that long would leave it.
+///
+/// Subtracting from the stamp rather than sleeping: the bound is a minute, and a
+/// test that waited for it would be a minute long and still be timing-dependent.
+///
+/// `checked_sub` with a named failure, not a bare `-`: `web_time::Instant`'s
+/// `Sub` panics on underflow, and this clock's origin is the host's boot. A
+/// machine less than a couple of minutes old is the only way to reach it, and an
+/// explained refusal is worth more there than a bare arithmetic panic — a panic
+/// is also the one way a negative control can "fail" for the wrong reason.
+fn age_listing(app: &mut crate::app::App, secs: u64) {
+    let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
+    let since = pane
+        .loop_state
+        .listing_since
+        .expect("the loop is fetching, so it has a clock");
+    pane.loop_state.listing_since = Some(
+        since
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("the monotonic clock's origin is younger than the grace bound, which needs a host booted seconds ago"),
+    );
 }
 
 /// Install a listing naming `minutes`, through the function the real listing
@@ -300,5 +329,179 @@ fn a_loop_still_fetching_its_listing_keeps_its_window() {
         app.loop_mgr.get_cached(SITE, &at(8)).is_none(),
         "the entry the new listing does not name survived the sweep that \
          followed it",
+    );
+}
+
+/// **A 3D pane's own volume is kept, even with no loop naming it.**
+///
+/// `prepare_volume` has three arms, and the third — `App::extract_loop_volume` —
+/// serves a volume pane whose target is neither the published live stamp nor the
+/// base. That arm is reachable rather than vestigial: the scan drain's
+/// `feed_is_ahead` branch *moves* an archive volume into the loop cache and
+/// writes neither `scan_data` nor `base_scans`. Swept from under such a target,
+/// `prepare_volume` answers `Waiting` — and it is level-triggered, so the pane
+/// re-asks and is refused every frame for the rest of the session, showing a 3D
+/// view that never builds.
+///
+/// So the retention set carries each pane's own `(scan_info.site,
+/// scan_info.timestamp)` alongside the loop frames. Asserted with **no loop at
+/// all**, because a loop frame naming the same volume would make it pass for the
+/// wrong reason.
+#[test]
+fn the_volume_a_pane_is_viewing_survives_with_no_loop_naming_it() {
+    let mut app = app_on_site();
+    let info = rustdar_radar::types::ScanInfo::from_scan(&empty_scan(), SITE, at(3), None);
+    app.gui.set_scan_info_for_pane(0, info);
+    app.loop_mgr.cache_scan(SITE, at(3), volume());
+    app.loop_mgr.cache_scan(SITE, at(9), volume());
+    assert!(
+        !app.gui
+            .pane(0)
+            .expect("a fresh Gui has one pane")
+            .loop_state
+            .is_active(),
+        "precondition: no loop names anything, so only the pane's own view can \
+         keep an entry",
+    );
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(3)).is_some(),
+        "the volume this pane is viewing was swept out from under it; a 3D pane \
+         served by `prepare_volume`'s loop-cache arm then answers `Waiting` \
+         every frame for the rest of the session",
+    );
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(9)).is_none(),
+        "the pane's own entry is a two-entry exception, not a licence for the \
+         whole site",
+    );
+}
+
+/// **The clock on the grace rule.** A listing that never returns stops exempting
+/// its site.
+///
+/// This is not a tidiness bound. On wasm32 nothing else ever ends the wait:
+/// `rustdar_radar::tls::client` accepts and ignores its timeout because
+/// reqwest's wasm `ClientBuilder` has none and a browser `fetch()` has no
+/// default, so a black-holed connection leaves the future pending for the life
+/// of the tab. `settle_loop_phase` returns early on an empty frame list and
+/// `accept_scan_listing` never runs, so the phase never moves while the poll and
+/// chunk-feed paths go on writing a volume per seal — the full-rate leak, inside
+/// the address space the sweep exists to protect. Natively the wait ends, but at
+/// `ARCHIVE_TIMEOUT` = 300 s *per request* and one listing per UTC day, which is
+/// minutes rather than a round-trip.
+///
+/// Both sides of the bound are asserted from one fixture, so a rule that simply
+/// stopped exempting anything would fail the first half rather than pass this.
+#[test]
+fn a_listing_that_never_returns_stops_exempting_its_site() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    for minute in [0, 4, 8] {
+        app.loop_mgr.cache_scan(SITE, at(minute), volume());
+    }
+
+    // Just inside the bound: still exempt.
+    age_listing(&mut app, crate::constants::LOOP_LISTING_GRACE.as_secs() / 2);
+    app.evict_unshown_scans();
+    assert_eq!(
+        app.loop_mgr.cached_scan_count(SITE),
+        3,
+        "a listing well inside the grace window lost its site's window anyway, \
+         so an ordinary product switch re-downloads what it already had",
+    );
+
+    // Past it: the exemption is gone, and the loop still names no frame.
+    age_listing(&mut app, crate::constants::LOOP_LISTING_GRACE.as_secs() + 1);
+    app.evict_unshown_scans();
+    assert!(
+        app.gui
+            .pane(0)
+            .expect("a fresh Gui has one pane")
+            .loop_state
+            .is_fetching(),
+        "precondition: nothing moved the phase — this is the stuck listing, not \
+         a loop that quietly finished",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_scan_count(SITE),
+        0,
+        "a listing that never returns exempts its site for ever; on wasm32 \
+         nothing else ends that wait, so the leak resumes at full rate",
+    );
+}
+
+/// **The frame plan is swept by the same predicate as the cache.**
+///
+/// `FramePlan::frames` is the original listing and `append_polled_frame` never
+/// prunes it as the window walks forward. While the cache was unbounded that did
+/// not show: a retired frame's volume stayed resident, so
+/// `dispatch_pending_loop_downloads`' `is_cached` filter dropped its queue entry
+/// and nothing re-downloaded it. With the cache swept, a re-plan on the next
+/// product switch would re-queue every retired frame — up to `MAX_LOOP_FRAMES`
+/// ~10 MB volumes, downloaded, cached, and evicted by the very next sweep, while
+/// holding the shared download slots the live frames are waiting on.
+///
+/// The queue is asserted through the real re-derivation
+/// (`plan_downloads_for` under a changed product), not by reading the plan back,
+/// because the queue is what actually spends the network.
+#[test]
+fn a_retired_frame_is_not_re_queued_after_the_window_moves() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 600);
+    install_listing(&mut app, &[0, 2, 4]);
+    // The plan the listing produced, as `poll_loop_scan_list_results` files it.
+    let plan = crate::loop_downloads::FramePlan::new(
+        SITE.to_string(),
+        [0u32, 2, 4]
+            .iter()
+            .map(|&minute| {
+                (
+                    at(minute),
+                    Identifier::new(format!("KTLX2024010100{minute:02}00_V06")),
+                )
+            })
+            .collect(),
+    );
+    app.loop_mgr.set_plan(0, plan);
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        3,
+        "precondition: the plan names every frame of the original listing",
+    );
+
+    // The window walks forward until the first two frames are retired.
+    poll_scan(&mut app, 12);
+    poll_scan(&mut app, 14);
+    assert_eq!(frames(&app), vec![at(4), at(12), at(14)]);
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        3,
+        "precondition: the append path prunes the loop's frames and never the \
+         plan — the divergence this sweep has to close",
+    );
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        1,
+        "the plan still names frames the window retired, so the next re-plan \
+         re-downloads a whole retired window",
+    );
+
+    // A product switch, which is what re-derives the queue from the plan.
+    assert!(
+        app.loop_mgr.plan_downloads_for(0, RadarProduct::Velocity),
+        "precondition: a product the plan was not derived for really does \
+         re-derive the queue",
+    );
+    assert_eq!(
+        app.loop_mgr.pending_queue_count(0),
+        1,
+        "the re-derived queue would fetch volumes for frames that no longer \
+         exist, spending the shared download slots the live frames need",
     );
 }

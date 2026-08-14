@@ -263,6 +263,20 @@ impl LoopDownloadManager {
         self.scan_cache.get(site).map_or(0, |scans| scans.len())
     }
 
+    /// How many frames this pane's plan still names.
+    #[cfg(test)]
+    pub fn plan_frame_count(&self, pane: usize) -> usize {
+        self.plans.get(&pane).map_or(0, |plan| plan.frames.len())
+    }
+
+    /// How many volume downloads this pane still has queued and undispatched.
+    #[cfg(test)]
+    pub fn pending_queue_count(&self, pane: usize) -> usize {
+        self.pending_downloads
+            .get(&pane)
+            .map_or(0, |pending| pending.queue.len())
+    }
+
     /// Whether the map has an entry for this site at all.
     ///
     /// Separate from [`cached_scan_count`](Self::cached_scan_count) because that
@@ -344,6 +358,58 @@ impl LoopDownloadManager {
             !scans.is_empty()
         });
         removed
+    }
+
+    /// Drop from every frame plan, and from every undispatched volume queue,
+    /// the entries whose `(site, timestamp)` fails `keep`.
+    ///
+    /// # Called with the *same* predicate as [`retain_scans`](Self::retain_scans)
+    ///
+    /// That is the whole point, and the invariant is worth stating as one
+    /// sentence: **nothing the sweep would evict stays queued.** The download
+    /// filter in `dispatch_pending_loop_downloads` skips a queued timestamp when
+    /// `is_cached` says the volume is already in hand, so the queue and the
+    /// cache have to agree about which timestamps still matter. Sweeping one
+    /// without the other is what turns a bounded cache into a download loop.
+    ///
+    /// # The plan is where the churn would repeat
+    ///
+    /// [`FramePlan::frames`] is the *original listing*, and `append_polled_frame`
+    /// never prunes it as the window walks forward — it prunes
+    /// `LoopPlaybackState::frames`, which is a different list. While the cache
+    /// was unbounded that divergence was invisible: a retired frame's volume
+    /// stayed resident for ever, so `is_cached` filtered its queue entry and
+    /// nothing re-downloaded it.
+    ///
+    /// With the cache swept it is no longer invisible. Watch a live loop until
+    /// its window has fully turned over, then switch product: the retarget
+    /// re-asks [`plan_downloads_for`](Self::plan_downloads_for), which re-derives
+    /// the queue from the stale plan, and up to `MAX_LOOP_FRAMES` volumes of
+    /// ~10 MB are downloaded, cached, and evicted by the very next sweep — while
+    /// holding the shared `concurrent_loop_downloads` slots the live frames are
+    /// waiting on. It repeats on every product switch. That is precisely the
+    /// refetch churn the retention design refuses a byte-LRU for, arriving
+    /// through the one reader an enumeration of the *cache's* readers does not
+    /// list, because it reads the queue rather than the cache.
+    ///
+    /// # What it deliberately leaves alone
+    ///
+    /// [`pending_l3`](Self::pending_l3) is not pruned here. A Level III loop
+    /// downloads no volumes at all — its frames resolve through
+    /// [`l3_cache`](Self::l3_cache), which this sweep does not touch — so
+    /// judging its pairings by a volume-cache predicate would be a category
+    /// error, not a missing case.
+    ///
+    /// The in-flight marks are untouched for the reason [`retain_scans`] gives.
+    pub fn retain_plan_frames(&mut self, keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool) {
+        for plan in self.plans.values_mut() {
+            plan.frames.retain(|(ts, _)| keep(plan.site.as_str(), ts));
+        }
+        for pending in self.pending_downloads.values_mut() {
+            pending
+                .queue
+                .retain(|(ts, _)| keep(pending.site.as_str(), ts));
+        }
     }
 
     /// Mark a site's timestamp as currently being downloaded.
@@ -968,6 +1034,126 @@ mod tests {
             mgr.available_slots(4),
             2,
             "the concurrency cap moved, so it no longer counts what is running",
+        );
+    }
+
+    /// A plan naming `minutes`, as `accept_scan_listing` builds one.
+    fn plan_for(site: &str, minutes: &[u32]) -> FramePlan {
+        FramePlan::new(
+            site.to_string(),
+            minutes
+                .iter()
+                .map(|&minute| {
+                    (
+                        ts(minute),
+                        Identifier::new(format!("{site}20240101_00{minute:02}00_V06")),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// `retain_plan_frames` drops the plan entries the cache predicate would
+    /// evict — which is what keeps the download filter and the sweep agreeing.
+    ///
+    /// `FramePlan::frames` is the original listing and nothing prunes it as a
+    /// live window walks forward, so without this a re-plan queues downloads
+    /// for volumes the very next sweep throws away.
+    #[test]
+    fn retain_plan_frames_drops_what_the_cache_predicate_would_evict() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan_for("KTLX", &[0, 2, 4]));
+
+        mgr.retain_plan_frames(|site, stamp| site == "KTLX" && *stamp >= ts(4));
+
+        assert_eq!(
+            mgr.plan_frame_count(0),
+            1,
+            "the plan still names frames nothing will draw, so the next \
+             re-derivation queues their downloads",
+        );
+        // And the re-derivation really does read the pruned plan.
+        assert!(mgr.plan_downloads_for(0, RadarProduct::Reflectivity));
+        assert_eq!(mgr.pending_queue_count(0), 1);
+    }
+
+    /// The site half is judged too, and one pane's plan is not pruned by
+    /// another site's predicate.
+    #[test]
+    fn retain_plan_frames_judges_each_plans_own_site() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan_for("KTLX", &[0, 2]));
+        mgr.set_plan(1, plan_for("KOUN", &[0, 2]));
+
+        mgr.retain_plan_frames(|site, _| site == "KOUN");
+
+        assert_eq!(
+            mgr.plan_frame_count(0),
+            0,
+            "KTLX's plan survived a predicate that names only KOUN",
+        );
+        assert_eq!(
+            mgr.plan_frame_count(1),
+            2,
+            "KOUN's plan was pruned by KTLX's answer",
+        );
+    }
+
+    /// An undispatched queue is swept by the same predicate as the plan it came
+    /// from, so a queue derived before the window moved cannot outlive it.
+    #[test]
+    fn retain_plan_frames_sweeps_the_undispatched_queue_too() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan_for("KTLX", &[0, 2, 4]));
+        assert!(mgr.plan_downloads_for(0, RadarProduct::Reflectivity));
+        assert_eq!(
+            mgr.pending_queue_count(0),
+            3,
+            "precondition: the queue was derived before the window moved",
+        );
+
+        mgr.retain_plan_frames(|_, stamp| *stamp >= ts(4));
+
+        assert_eq!(
+            mgr.pending_queue_count(0),
+            1,
+            "an already-derived queue kept entries the sweep will evict, so \
+             they are dispatched and thrown away",
+        );
+    }
+
+    /// A Level III loop's pairings are **not** the volume predicate's business.
+    ///
+    /// Such a loop downloads no volumes at all — its frames resolve through
+    /// `l3_cache`, which this sweep does not touch — so judging its pairings by
+    /// a volume-cache answer would be a category error rather than a missing
+    /// case. Pinned because the omission otherwise reads as an oversight.
+    #[test]
+    fn retain_plan_frames_leaves_level3_pairings_alone() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan_for("KTLX", &[0, 2, 4]));
+        assert!(mgr.plan_downloads_for(0, RadarProduct::EchoTops));
+        let queued = mgr
+            .extract_pending_l3(0)
+            .expect("a Level III product queues pairings rather than volumes");
+        let before = queued.queue.len();
+        assert!(
+            before > 0,
+            "precondition: there are pairings to leave alone"
+        );
+        mgr.insert_pending_l3(0, queued);
+
+        mgr.retain_plan_frames(|_, _| false);
+
+        let after = mgr
+            .extract_pending_l3(0)
+            .expect("the pairings are still there")
+            .queue
+            .len();
+        assert_eq!(
+            after, before,
+            "a volume-cache predicate pruned Level III pairings, which read a \
+             cache it does not sweep",
         );
     }
 

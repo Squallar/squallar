@@ -4365,12 +4365,17 @@ fn frame_sweep(
 /// - The cache is now swept every frame by `App::evict_unneeded_loop_scans`, and
 ///   that sweep cannot reach this entry: what it keeps is the union of
 ///   `(ls.site, frame.timestamp)` over every active pane loop, so **no entry a
-///   live loop frame names is ever evicted** and only unnamed ones go. This
-///   receiver's frame names this entry, which is what puts it in the set. **A
-///   retention rule not derived from the live frames — a wall-clock window, a
-///   byte-LRU — would break that**, and would have to re-check this. So would
-///   dropping the sweep's grace rule for a loop still fetching its listing: a
-///   loop whose frames are momentarily empty names nothing.
+///   live loop frame names is ever evicted** and only unnamed ones go. **The
+///   frame that keeps it is the sender's, not this receiver's** — a distinction
+///   worth stating precisely, because the receiver is not yet known to have one:
+///   this function runs *before* any frame here is resolved, and
+///   `frame_accepting_broadcast` may well refuse. What puts the entry in the set
+///   is the origin loop's own frame, which `accept_render_result` has just
+///   resolved two blocks above to place the image at all. **A retention rule not
+///   derived from the live frames — a wall-clock window, a byte-LRU — would break
+///   that**, and would have to re-check this. So would dropping the sweep's grace
+///   rule for a loop still fetching its listing: a loop whose frames are
+///   momentarily empty names nothing.
 /// - The one thing that empties the cache wholesale under a live loop is
 ///   `clear_all`, reached only from `SwitchRadarSite`, which deactivates every
 ///   affected loop in the same pass. **A second caller of `clear_all` would break

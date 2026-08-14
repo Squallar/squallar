@@ -2298,7 +2298,16 @@ fn begin_loop_for_pane(
     let end = scan_info.timestamp;
 
     // Drop the previous listing's undispatched downloads; they were queued for the
-    // loop this call is replacing. The scan cache is global and deliberately kept.
+    // loop this call is replacing.
+    //
+    // The scan cache is global and deliberately kept across this rebuild — but
+    // only for as long as the new listing takes, and no longer. It is swept
+    // every frame by `App::evict_unneeded_loop_scans` against the frames the
+    // live loops name, and this call has just emptied *this* loop's frames. What
+    // holds the window while the listing is in flight is that sweep's grace
+    // rule, bounded by `constants::LOOP_LISTING_GRACE`; a listing that overruns
+    // the bound loses the window and re-downloads it. Nothing here may assume
+    // the cache is still whole when the listing lands.
     loop_mgr.remove_pending(pane_idx);
 
     // The view the pane is drawing, which is what a loop's frames are pictures
