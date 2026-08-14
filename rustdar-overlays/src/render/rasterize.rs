@@ -122,8 +122,22 @@ fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
     (PI / 4.0 + lat_rad / 2.0).tan().ln()
 }
 
-/// Web Mercator's own limit; the projection diverges past it.
-const MAX_MERCATOR_LAT: f64 = 85.05;
+/// Web Mercator's own limit, from [`rustdar_radar::types`] rather than spelled
+/// again here.
+///
+/// It read `85.05`, under a comment claiming that was where the projection
+/// diverges. Both halves were wrong. The limit is 85.051128779806°, so the
+/// literal was 0.0011287798° — **125.51 m** of meridian — short of it; and the
+/// clamp below is not a divergence guard, because
+/// `rustdar_egui::overlay_cache::OverlayTexturePlan::coverage` has already
+/// clamped these same `GeoBounds` to the true limit before the rasterizer ever
+/// sees them, and stores that clamped rectangle as the texture's placement
+/// bounds. So the only thing `85.05` could ever do was hold the rasterizer's
+/// Y-range 125 m short of the Y-range the texture is *placed* between — the
+/// picture drawn for one rectangle and pinned to another. Sub-pixel at CONUS
+/// latitudes in a whole-world texture, and zero once the two agree, which is
+/// the point of their being one constant.
+const MAX_MERCATOR_LAT: f64 = rustdar_radar::types::MERCATOR_LAT_LIMIT_DEG;
 
 /// Mercator Y for both edges is precomputed once per texture.
 #[derive(Debug, Clone, Copy)]
