@@ -62,6 +62,56 @@ struct MercatorProjection {
     side_px: usize,
 }
 
+/// The longest step `render_gate` will take on either of its axes once it has
+/// to raise the sample count, in pixels.
+///
+/// # What has to be true, and why per-axis sub-pixel steps are not it
+///
+/// `render_gate` walks a lattice of sample points and drops each on the pixel
+/// it lands in. For the raster to come out whole, every pixel square under the
+/// gate has to receive at least one sample — and the property that guarantees
+/// that is the lattice's **covering radius**, the furthest any point in the
+/// plane can be from the nearest sample. A unit square's inradius is 0.5, so a
+/// point within 0.5 of a square's centre is inside that square; a lattice whose
+/// covering radius is under half a pixel therefore cannot miss one.
+///
+/// The lattice's two steps used to be chosen to come out under a pixel *each*,
+/// which is a weaker statement and not enough, because the two axes are radial
+/// and tangential and neither is the raster's. A rectangular lattice with steps
+/// `(s_r, s_t)` has covering radius `hypot(s_r, s_t) / 2`, so two steps of
+/// 0.62 px and 0.91 px give 0.551 — over the bar, and a pixel square lying
+/// diagonally across that lattice falls between four samples and receives none.
+///
+/// Confirmed by rendering solid fields through this module and counting:
+/// **zero** unpainted pixels in every configuration whose covering radius is
+/// under 0.5, and unpainted pixels in every configuration over it, rising
+/// monotonically with it — 6.2e-5 of the picture at 0.533 (a WSR-88D
+/// surveillance cut at the 7362 side), 3.2e-3 at 0.568 (a 1 km volume grid),
+/// 4.0e-2 at 0.648 (a 4 km Level III product).
+///
+/// # Why 0.7 and not 0.5
+///
+/// It is a bound on each *step*, not on the radius: two steps at 0.7 give
+/// `hypot(0.7, 0.7) = 0.9899`, a covering radius of **0.495 px**, which is
+/// under the bar with 1 % of margin. Holding each step at 0.5 instead would
+/// buy nothing and cost 2× the samples on both axes.
+///
+/// The margin is there to absorb the one way the lattice is not exactly
+/// rectangular: the raster is Web Mercator, so its vertical scale is the site's
+/// only at the site, and a raster reaching ±460 km stretches by up to 8 % of
+/// it at the poleward edge (KATX, 48°N). 0.7 × 1.08 = 0.756 still leaves
+/// `hypot(0.54, 0.756) = 0.929`.
+///
+/// # What it costs, and what it deliberately does not
+///
+/// Nothing at all where the lattice is already inside the bar, because the
+/// raise is behind a test on the covering radius rather than applied
+/// unconditionally: those gates keep the sample count they have, land on the
+/// same pixels, and produce the same picture to the bit. That is every WSR-88D
+/// and TDWR sweep at a 2048 or 4096 ceiling — the browser's raster and every
+/// device that cannot take the data-limited one.
+const SAMPLE_STEP_PX: f64 = 0.7;
+
 impl MercatorProjection {
     fn from_bounds(
         radar_lat: f64,
@@ -139,10 +189,33 @@ impl MercatorProjection {
         let range_start = range_km - gate_interval / 2.0;
         let range_end = range_km + gate_interval / 2.0;
 
-        let num_range_samples = ((range_end - range_start) * self.px_per_km).ceil() as i32 + 2;
-        let num_az_samples = ((ctx.az_half_spacing * 2.0 * range_km * PI / 180.0) * self.px_per_km)
-            .ceil() as i32
-            + 2;
+        let mut num_range_samples = ((range_end - range_start) * self.px_per_km).ceil() as i32 + 2;
+        let mut num_az_samples =
+            ((ctx.az_half_spacing * 2.0 * range_km * PI / 180.0) * self.px_per_km).ceil() as i32
+                + 2;
+        // The lattice above steps under a pixel on each of its own two axes,
+        // and that is not enough: those axes are radial and tangential, not the
+        // raster's, so a pixel square lying diagonally across the lattice can
+        // fall between four samples and receive none. What has to be under half
+        // a pixel is the lattice's *covering radius*, `hypot(s_r, s_t) / 2`,
+        // because half a pixel is a unit square's inradius. Raise the counts
+        // where it is not, and only there — every configuration already under
+        // the bar keeps the sample positions it has, and so keeps its picture
+        // to the bit. See `SAMPLE_STEP_PX`.
+        {
+            let len_r = (range_end - range_start) * self.px_per_km;
+            // The gate's *outer* row, not its centre: the arc lengthens with
+            // range across the gate's own depth, so the widest row is the one
+            // the guarantee has to hold for. The count itself still comes from
+            // the centre, so a gate that is already covered is untouched.
+            let len_t = ctx.az_half_spacing * 2.0 * range_end * PI / 180.0 * self.px_per_km;
+            let step_r = len_r / num_range_samples.max(1) as f64;
+            let step_t = len_t / num_az_samples.max(1) as f64;
+            if step_r.hypot(step_t) >= 1.0 {
+                num_range_samples = num_range_samples.max((len_r / SAMPLE_STEP_PX).ceil() as i32);
+                num_az_samples = num_az_samples.max((len_t / SAMPLE_STEP_PX).ceil() as i32);
+            }
+        }
         let inv_num_range = 1.0 / num_range_samples.max(1) as f64;
         let inv_num_az = 1.0 / num_az_samples.max(1) as f64;
 
@@ -1576,6 +1649,10 @@ const MAX_WEDGE_DEG: f64 = 2.0;
 /// not: a sweep with radials missing leaves the gap *empty*. The width no
 /// longer has anything to do with where the next radial is, so a survivor
 /// cannot fan across to it.
+///
+/// This is the **floor** under a wedge and no longer the whole of it:
+/// [`l2_wedge_half_widths_deg`] finishes the answer, and states why the
+/// declaration alone leaves the picture with cracks along every beam.
 fn l2_wedge_width_deg(declared_deg: f64, median_step_deg: f64) -> f64 {
     let base = if declared_deg > 0.0 {
         declared_deg
@@ -1584,6 +1661,104 @@ fn l2_wedge_width_deg(declared_deg: f64, median_step_deg: f64) -> f64 {
     };
     base.min(crate::azimuth::MAX_ADJACENT_GAP_STEPS * median_step_deg)
         .min(MAX_WEDGE_DEG)
+}
+
+/// Half the sky each radial of a sweep is painted over, degrees — one per
+/// radial, in the order they were handed in.
+///
+/// # Why the declared width alone leaves cracks
+///
+/// A radial declares 0.5° or 1.0°, and the antenna does not land the next one
+/// exactly that far away. Measured over eight volumes — KAMX, KATX, KCRP,
+/// KFTG, KPDT, KTLX, TOKC and TORD, 2024-05-26 00 UTC — **46.7 %** of adjacent
+/// pairs are spaced *wider* than the declaration, p90 +0.036° and worst
+/// +0.102° on a 0.5° declaration. Painting each radial 0.5° wide about its own
+/// azimuth therefore leaves an open sliver between nearly half of all
+/// neighbours.
+///
+/// Those slivers used to be invisible, and that was arithmetic rather than
+/// luck: a gap swallows a raster pixel only once it is *wider* than one, and a
+/// fixed angle occupies more pixels as the raster gets denser. 0.036° at
+/// 300 km is 0.56 px at a 4096 side and 1.49 px at 7362 — so the same sweep
+/// that drew clean at the old ceiling draws dotted black lines *along the beam*
+/// at the data-limited one. Measured on KCRP's 0.53° reflectivity cut, raster
+/// pixels left unpainted inside solid echo: 10 at 2048, 88 at 4096, **1440** at
+/// 7362, and the wedge cracks are 69 % of the last figure.
+///
+/// # The rule
+///
+/// A radial's sample stands for the sky from halfway to the radial before it to
+/// halfway to the radial after — because that sky *was measured*, by whichever
+/// of the two was dwelling on it while the antenna crossed it. The declared
+/// width stays as a floor, so no wedge is narrower than it is today, and the
+/// reach is held under [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`], which is
+/// already this crate's statement of how far past a sweep's own spacing a
+/// consumer may reach before it is inventing coverage.
+///
+/// **The missing-radial property survives untouched, and the reach test is
+/// what keeps it.** A radial only reaches for a neighbour that is inside
+/// [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`] of the sky it stands for; a
+/// neighbour further off than that is not a neighbour to meet, it is the far
+/// side of a hole. So a sweep with a radial dropped paints exactly what it
+/// paints today — the survivors either side keep their declared width and the
+/// gap stays open — while a pair spaced 0.53° apart on a 0.5° declaration
+/// close the 0.03° between them, because that sky was measured.
+///
+/// The two regimes do not overlap and there is nothing to tune between them:
+/// the widest real jitter measured is a gap of 1.20 declared widths, and the
+/// narrowest hole a dropped radial can leave is 2.00.
+///
+/// # Why one half-width per radial and not two
+///
+/// A wedge is symmetric — [`polar::Wedge`] carries one half-width and
+/// `render_gate` takes one — so this answers with the *larger* of the two
+/// midpoints. That over-reaches on the tighter side by the jitter, putting the
+/// two wedges in a genuine overlap; nothing goes wrong there, because
+/// overlapping claims were always the common case and [`write_key`] resolves
+/// them radial-major, greatest wins, which is the same order
+/// [`polar::PolarGeometry::pick`] reads them back in. A pair of half-widths
+/// would double [`polar::PolarGeometry`]'s per-radial cost to settle a tie that
+/// is already settled.
+///
+/// `wedges_meet_where_the_antenna_wobbled` and
+/// `a_dropped_radial_still_leaves_its_gap` are the two halves of this, and
+/// `declared_spacing_drives_the_wedge_width` is the pre-existing statement that
+/// the reach test leaves alone.
+fn l2_wedge_half_widths_deg(
+    azimuths_deg: &[f64],
+    declared_deg: &[f64],
+    median_step_deg: f64,
+) -> Vec<f64> {
+    let n = azimuths_deg.len();
+    let base: Vec<f64> = (0..n)
+        .map(|i| l2_wedge_width_deg(declared_deg[i], median_step_deg))
+        .collect();
+    let mut half: Vec<f64> = base.iter().map(|w| w / 2.0).collect();
+    if n < 2 {
+        return half;
+    }
+    // Azimuth order, not the order the radials arrived in: a sweep is stored
+    // as it was collected, so a cut that begins mid-circle wraps, and a
+    // radial's neighbours are its neighbours *in azimuth*.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| azimuths_deg[*a].total_cmp(&azimuths_deg[*b]));
+    for k in 0..n {
+        let i = order[k];
+        let prev = azimuths_deg[order[(k + n - 1) % n]];
+        let next = azimuths_deg[order[(k + 1) % n]];
+        // `rem_euclid` closes the circle, so the first and last radials in
+        // azimuth order are neighbours like any other pair.
+        let reach = crate::azimuth::MAX_ADJACENT_GAP_STEPS * base[i];
+        for gap in [
+            (azimuths_deg[i] - prev).rem_euclid(360.0),
+            (next - azimuths_deg[i]).rem_euclid(360.0),
+        ] {
+            if gap <= reach {
+                half[i] = half[i].max(gap / 2.0);
+            }
+        }
+    }
+    half
 }
 
 /// How wide to paint one row of a derived polar grid, degrees.
@@ -1603,6 +1778,29 @@ fn derived_grid_wedge_deg(azimuths_deg: &[f64]) -> f64 {
     crate::azimuth::median_azimuth_step_deg(azimuths_deg.iter().copied())
         .unwrap_or(1.0)
         .min(MAX_WEDGE_DEG)
+}
+
+/// [`derived_grid_wedge_deg`] finished the way
+/// [`l2_wedge_half_widths_deg`] finishes a sweep's: half-widths that meet
+/// where the rows wobble, and stop where one is missing.
+///
+/// A derived grid's rows carry the azimuths of the radials they were computed
+/// from, jitter and all, so painting every row at the sweep's *median* step
+/// leaves the same cracks along the beam that the declared width left on a
+/// Level II sweep — and for the same reason, more of them the denser the
+/// raster. The median step stands in for the declaration here, which is what
+/// [`derived_grid_wedge_deg`] already argued; this only stops it being the
+/// whole answer.
+///
+/// The floor is exactly `derived_grid_wedge_deg`'s number: with the median
+/// standing in for the declaration, `l2_wedge_width_deg`'s two ceilings reduce
+/// to `min(median, MAX_WEDGE_DEG)`, so a grid whose rows are evenly spaced
+/// paints precisely what it paints today.
+fn derived_grid_half_widths_deg(azimuths_deg: &[f64]) -> Vec<f64> {
+    let median =
+        crate::azimuth::median_azimuth_step_deg(azimuths_deg.iter().copied()).unwrap_or(1.0);
+    let declared = vec![derived_grid_wedge_deg(azimuths_deg); azimuths_deg.len()];
+    l2_wedge_half_widths_deg(azimuths_deg, &declared, median)
 }
 
 /// How far apart two radials' reaches may be before the sweep is reported as
@@ -2110,6 +2308,17 @@ pub fn render_radar_to_image_full_sized(
     let ground_sample_km = compute_gate_interval_km(radials, product) * cos_e;
     let (first_gate_slant_km, gate_count) = compute_gate_span(radials, product);
 
+    // Half-widths for the whole sweep at once, because each one depends on
+    // where its neighbours in azimuth landed; see `l2_wedge_half_widths_deg`.
+    let azimuths_deg: Vec<f64> = radials
+        .iter()
+        .map(|r| f64::from(r.azimuth_angle_degrees()))
+        .collect();
+    let declared_deg: Vec<f64> = radials
+        .iter()
+        .map(|r| f64::from(r.azimuth_spacing_degrees()))
+        .collect();
+    let half_widths = l2_wedge_half_widths_deg(&azimuths_deg, &declared_deg, median_step);
     let output = render_with_projection(
         radar_lat,
         radar_lon,
@@ -2131,11 +2340,7 @@ pub fn render_radar_to_image_full_sized(
                 .enumerate()
                 .for_each(|(radial_idx, radial)| {
                     let azimuth = radial.azimuth_angle_degrees() as f64;
-                    let width = l2_wedge_width_deg(
-                        f64::from(radial.azimuth_spacing_degrees()),
-                        median_step,
-                    );
-                    let ctx = RadialContext::new(azimuth, width / 2.0);
+                    let ctx = RadialContext::new(azimuth, half_widths[radial_idx]);
 
                     if let Some(moment) = product.get_moment(radial) {
                         let first_gate_range = moment.first_gate_range_km();
@@ -2218,7 +2423,7 @@ fn render_nrot_to_image(
     let cos_e = sweep_ground_factor(radials);
     let ground_reach_km =
         (vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km) * cos_e;
-    let wedge_deg = derived_grid_wedge_deg(&vg.azimuths_deg);
+    let half_widths = derived_grid_half_widths_deg(&vg.azimuths_deg);
 
     // The physics keeps the first radial's angle. It is the same number the
     // shear normalization has always divided by, and the two are not
@@ -2256,7 +2461,7 @@ fn render_nrot_to_image(
         "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
-                let ctx = RadialContext::new(vg.azimuths_deg[i], wedge_deg / 2.0);
+                let ctx = RadialContext::new(vg.azimuths_deg[i], half_widths[i]);
 
                 for (j, &nrot_val) in nrot_row.iter().enumerate() {
                     if nrot_val.is_nan() {
@@ -2351,7 +2556,7 @@ fn render_srv_to_image(
     let cos_e = sweep_ground_factor(radials);
     let ground_reach_km =
         (grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km) * cos_e;
-    let wedge_deg = derived_grid_wedge_deg(&grid.azimuths_deg);
+    let half_widths = derived_grid_half_widths_deg(&grid.azimuths_deg);
     let output = render_with_projection(
         radar_lat,
         radar_lon,
@@ -2369,7 +2574,7 @@ fn render_srv_to_image(
         "SRV",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(i, row)| {
-                let ctx = RadialContext::new(grid.azimuths_deg[i], wedge_deg / 2.0);
+                let ctx = RadialContext::new(grid.azimuths_deg[i], half_widths[i]);
                 for (j, &value) in row.iter().enumerate() {
                     if value.is_nan() {
                         continue;
@@ -2804,7 +3009,7 @@ pub fn render_derived_kdp_to_image(
     let cos_e = sweep_ground_factor(radials);
     let ground_reach_km =
         (derived.first_gate_km + max_gates as f64 * derived.gate_interval_km) * cos_e;
-    let wedge_deg = derived_grid_wedge_deg(&derived.azimuths_deg);
+    let half_widths = derived_grid_half_widths_deg(&derived.azimuths_deg);
 
     let output = render_with_projection(
         radar_lat,
@@ -2823,7 +3028,7 @@ pub fn render_derived_kdp_to_image(
         "KDP",
         |proj, bufs| {
             derived.values.par_iter().enumerate().for_each(|(i, row)| {
-                let ctx = RadialContext::new(derived.azimuths_deg[i], wedge_deg / 2.0);
+                let ctx = RadialContext::new(derived.azimuths_deg[i], half_widths[i]);
                 for (j, &v) in row.iter().enumerate() {
                     if v.is_nan() {
                         continue;

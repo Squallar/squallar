@@ -789,6 +789,313 @@ fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
     );
 }
 
+/// Gates in a WSR-88D surveillance cut — the one sweep shape whose raster is
+/// *data-limited* rather than base-sized, which is what the two tests below
+/// need and what the 150 km fixtures above cannot produce.
+const SURVEILLANCE_BINS: usize = 1832;
+
+/// How much further apart than it declares this sweep's antenna ran, degrees.
+///
+/// 0.09° is inside what real antennas do: over the eight volumes
+/// [`super::l2_wedge_half_widths_deg`] cites, the worst gap measured on a 0.5°
+/// declaration was **+0.102°** and the ninetieth percentile +0.036°. So this is
+/// a sweep that could arrive tomorrow, not an adversarial one.
+const WOBBLE_DEG: f32 = 0.09;
+
+/// A surveillance-depth sweep of `azimuths`, drawn at the side its own gates
+/// justify rather than at the base one.
+///
+/// Both halves matter. The depth is what puts the raster on
+/// [`types::data_limited_side_px`]'s branch — 1832 gates of 0.25 km reach
+/// 458 km, past [`types::BASE_EXTENT_KM`] — and the side is what makes the
+/// defect visible: the crack between two wedges is a fixed *angle*, so it
+/// swallows a raster pixel only once it is wider than one, and how many pixels
+/// it spans is the raster's density.
+fn long_range_sweep(azimuths: &[f32], side_ceiling: usize) -> SweepRender {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+    let radials = azimuths
+        .iter()
+        .enumerate()
+        .map(|(i, &azimuth)| {
+            let moment = MomentData::from_fixed_point(
+                SURVEILLANCE_BINS as u16,
+                0,
+                (L2_GATE_KM * 1000.0) as u16,
+                8,
+                SCALE,
+                OFFSET,
+                vec![200; SURVEILLANCE_BINS],
+            );
+            Radial::new(
+                0,
+                i as u16,
+                azimuth,
+                0.5,
+                RadialStatus::IntermediateRadialData,
+                1,
+                L2_ELEVATION,
+                Some(moment),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    let scan = Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    );
+    // `MotionInputs::default()` deliberately, not a supplied vector: `PRODUCT`
+    // here is reflectivity, and storm motion reaches a fill through exactly one
+    // arm of this function, storm-relative velocity. The bundle's third field,
+    // `fallback`, decides nothing on this path either — so the default drops no
+    // value that the pair of `None`s it replaces used to carry.
+    render_radar_to_image_full_sized(
+        &scan,
+        L2_ELEVATION,
+        PRODUCT,
+        LAT,
+        LON,
+        crate::srv::MotionInputs::default(),
+        None,
+        None,
+        &crate::nyquist::DeclaredNyquist::empty(),
+        side_ceiling,
+    )
+    .unwrap()
+}
+
+/// **The seams.** A sweep of solid echo whose radials sit a little further
+/// apart than they declare paints every pixel between them, because that sky
+/// was measured.
+///
+/// # What this reproduces
+///
+/// A real antenna does not land its radials exactly 0.5° apart, and painting
+/// each one 0.5° wide about its own azimuth leaves an open sliver wherever it
+/// ran wide — measured at 46.7% of adjacent pairs over eight volumes. The
+/// sliver is a fixed *angle*, so how much raster it occupies is the raster's
+/// density, and the 2D ceiling becoming device-derived is what made it
+/// visible: 0.09° at 450 km is 0.71 px at a 2048 side and **1.58 px** at the
+/// 4096 one this renders at, and a gap swallows a pixel only once it is wider
+/// than one. The picture then draws dotted black lines *along the beam*,
+/// through solid echo, which is the shape a viewer reported.
+///
+/// Measured on real volumes at the 7362 side a WSR-88D surveillance cut asks
+/// for — raster pixels unpainted inside solid echo, before this change and
+/// after, over six sites chosen apart in latitude, terrain and climate:
+///
+/// | site | before | after |
+/// |---|---:|---:|
+/// | KTLX (Oklahoma, 35.3°N)  | 14 114 | 508 |
+/// | KFTG (Denver, 39.8°N)    |  5 024 | 179 |
+/// | KAMX (Miami, 25.6°N)     |  1 905 |  40 |
+/// | KCRP (Corpus, 27.8°N)    |  1 440 | 390 |
+/// | KATX (Seattle, 48.2°N)   |    106 |  38 |
+/// | KPDT (Pendleton, 45.7°N) |     50 |  34 |
+/// | **total**                | **22 639** | **1 189** |
+///
+/// # Why the probe is every gap and not a sample of them
+///
+/// Because the defect is intermittent by construction. A 1.58 px gap swallows
+/// a whole pixel column only where it happens to straddle one, so some gaps
+/// draw and the rest do not, and a probe at one azimuth could pass on the
+/// baseline by luck. Every wide gap at one range, all 360 of them, is the
+/// sample size that makes the question decidable.
+#[test]
+fn wedges_meet_where_the_antenna_wobbled() {
+    let azimuths: Vec<f32> = (0..720)
+        .map(|i| i as f32 * 0.5 + if i % 2 == 1 { WOBBLE_DEG } else { 0.0 })
+        .collect();
+    let out = long_range_sweep(&azimuths, LONG_RANGE_SIDE);
+    let side = (out.image.len() / 4).isqrt();
+    let mut unpainted = 0;
+    for i in (0..azimuths.len()).step_by(2) {
+        // The middle of the wide gap — between radial `i` and radial `i + 1`,
+        // which sit `0.5 + WOBBLE_DEG` apart.
+        let az = f64::from(azimuths[i]) + f64::from(0.5 + WOBBLE_DEG) / 2.0;
+        if out.values[probe_at(out.max_range_km, side, az, 450.0)].is_nan() {
+            unpainted += 1;
+        }
+    }
+    assert_eq!(
+        unpainted, 0,
+        "{unpainted} of 360 gaps between radials the antenna ran wide on are \
+         unpainted at 450 km, in a sweep that is solid echo everywhere",
+    );
+}
+
+/// And the sky between radials that are genuinely *missing* stays empty, which
+/// is the property the reach test in [`super::l2_wedge_half_widths_deg`] exists
+/// to keep.
+///
+/// The two cases are told apart by arithmetic rather than by a tuned
+/// threshold: the widest wobble measured is a gap of 1.20 declared widths and
+/// the narrowest hole a dropped radial can leave is 2.00, so
+/// [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`] at 1.5 separates them with room
+/// on both sides. Here every fourth radial is gone, so its neighbours are 1.0°
+/// apart on a 0.5° declaration and neither reaches for the other.
+#[test]
+fn a_dropped_radial_still_leaves_its_gap() {
+    let azimuths: Vec<f32> = (0..720)
+        .filter(|i| i % 4 != 1)
+        .map(|i| i as f32 * 0.5)
+        .collect();
+    let out = long_range_sweep(&azimuths, LONG_RANGE_SIDE);
+    let side = (out.image.len() / 4).isqrt();
+    let mut painted = 0;
+    for i in (0..720).filter(|i| i % 4 == 1) {
+        if !out.values[probe_at(out.max_range_km, side, i as f64 * 0.5, 450.0)].is_nan() {
+            painted += 1;
+        }
+    }
+    assert_eq!(
+        painted, 0,
+        "{painted} of 180 dropped radials were painted over by a survivor \
+         fanning across to where they should have been",
+    );
+}
+
+/// **The lattice.** Every pixel under a solid field receives a sample, on a
+/// geometry where the old sample counts could not promise one.
+///
+/// # The property, and why per-axis sub-pixel steps are not it
+///
+/// [`super::SAMPLE_STEP_PX`] carries the argument: what has to be under half a
+/// pixel is the sample lattice's *covering radius*, `hypot(s_r, s_t) / 2`, and
+/// the counts used to be chosen so that each step alone came out under a
+/// pixel, which is weaker. This geometry is one where the difference shows — a
+/// 1 km grid over 460 km at a 4096 side steps 0.636 px radially and 0.941 px
+/// tangentially at the rim, a covering radius of **0.568 px** — and it is not
+/// contrived: it is the shape of every volume product this crate derives
+/// ([`crate::volumetric::RANGE_BIN_KM`]) and of the 1 km Level III products it
+/// fetches.
+///
+/// Before this change the same render left **42 502** pixels of solid echo
+/// unpainted, every one an isolated single-pixel hole with all eight
+/// neighbours painted — the `##.##` shape recorded in
+/// [`the_polar_field_answers_what_the_value_grid_holds`].
+///
+/// # Why the count is exact and not a tolerance
+///
+/// Because the claim is a proof rather than a measurement. A lattice whose
+/// covering radius is under half a pixel cannot miss a unit square, so the
+/// honest assertion is zero, and a tolerance here would be somewhere for the
+/// next geometry to hide.
+#[test]
+fn a_solid_field_leaves_no_pixel_of_itself_unpainted() {
+    const RADIALS: usize = 360;
+    const BINS: usize = 460;
+    let radials = (0..RADIALS)
+        .map(|i| RadialRun {
+            start_angle: i as f32,
+            angle_delta: 1.0,
+            gate_values: vec![160; BINS],
+        })
+        .collect();
+    let packet = RadialPacket {
+        first_range_bin: 0,
+        num_range_bins: BINS as u16,
+        i_center: 0,
+        j_center: 0,
+        // 1 km bins: `RadialPacket::gate_interval_km` is `1 / scale_factor`.
+        scale_factor: 1.0,
+        is_legacy: false,
+        xdr_data_scale: None,
+        xdr_data_offset: None,
+        radials,
+    };
+    let out = render_level3_radial_to_image(
+        &packet,
+        PRODUCT,
+        LAT,
+        LON,
+        SCALE,
+        OFFSET,
+        None,
+        LONG_RANGE_SIDE,
+    )
+    .unwrap();
+    let side = (out.image.len() / 4).isqrt();
+    let painted = |x: usize, y: usize| !out.values[y * side + x].is_nan();
+    let mut holes = Vec::new();
+    for y in 1..side - 1 {
+        for x in 1..side - 1 {
+            // Surrounded on all eight sides: inside the echo rather than at
+            // its rim, where a pixel the truncating cast put one over is the
+            // raster quantizing and not the lattice missing.
+            if !painted(x, y)
+                && (y - 1..=y + 1)
+                    .all(|ny| (x - 1..=x + 1).all(|nx| (nx, ny) == (x, y) || painted(nx, ny)))
+            {
+                holes.push((x, y));
+            }
+        }
+    }
+    assert!(
+        holes.is_empty(),
+        "{} pixels of a solid disc were left unpainted with every neighbour \
+         painted; the first few are {:?}",
+        holes.len(),
+        &holes[..holes.len().min(5)],
+    );
+}
+
+/// The half-width arithmetic on its own, at the cases the fixtures above
+/// cannot reach.
+#[test]
+fn a_half_width_reaches_a_neighbour_only_as_far_as_its_own_sample_goes() {
+    let h = |az: &[f64], declared: f64, median: f64| {
+        super::l2_wedge_half_widths_deg(az, &vec![declared; az.len()], median)
+    };
+    // The wobble: 0.53° apart on a 0.5° declaration, so the wedges meet rather
+    // than leaving 0.03° of measured sky unpainted.
+    let wobbled: Vec<f64> = (0..720)
+        .map(|i| i as f64 * 0.5 + if i % 2 == 1 { 0.03 } else { 0.0 })
+        .collect();
+    let got = h(&wobbled, 0.5, 0.5);
+    assert!(
+        got.iter().all(|w| (*w - 0.265).abs() < 1e-9),
+        "a 0.53° gap wants a 0.265° half-width, got {:?}",
+        &got[..4],
+    );
+    // A dropped radial is not a neighbour to meet: 1.0° apart on a 0.5°
+    // declaration is past `MAX_ADJACENT_GAP_STEPS` of what the sample stands
+    // for, so both survivors keep the width they declare.
+    let sparse: Vec<f64> = (0..360).map(|i| i as f64).collect();
+    assert!(
+        h(&sparse, 0.5, 0.5).iter().all(|w| *w == 0.25),
+        "a survivor must not fan across a dropped radial",
+    );
+    // One radial has no neighbour, and must not read its own azimuth as a
+    // 360° gap.
+    assert_eq!(h(&[17.0], 0.5, 0.5), vec![0.25]);
+    // The circle closes, so a full ring has no seam at north and no radial is
+    // widened by the wrap.
+    let ring: Vec<f64> = (0..720).map(|i| i as f64 * 0.5).collect();
+    let got = h(&ring, 0.5, 0.5);
+    assert_eq!(got[0], 0.25);
+    assert_eq!(got[719], 0.25);
+}
+
 // ── How far a render reaches, and how wide it is drawn ───────────────────
 //
 // A raster used to be ±230 km whatever it held, and the gate loops stopped
@@ -3529,30 +3836,26 @@ fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
 /// The bound is what makes the number an assertion rather than a note. A rule
 /// half a gate out disagrees on roughly half the probes, not a fortieth.
 ///
-/// # A raster defect this found, which is not fixed here
+/// # A raster defect this found, and where it went
 ///
-/// The centre half tolerates a small number of cell centres where the raster is
-/// **unpainted under a gate that was painted** — 4 of 2,028 (0.20%) on the
-/// coarse render. They are single-pixel pinholes: a 5 x 5 neighbourhood around
-/// one reads `##.##` with the hole in the middle, inside a solid echo.
+/// This test is what turned the defect up: cell centres where the raster was
+/// **unpainted under a gate that was painted** — 4 of 2 028 on the coarse
+/// render, single-pixel pinholes reading `##.##` across a 5 x 5 neighbourhood
+/// inside solid echo.
 ///
-/// The cause is `render_gate`'s sample lattice. Its two step counts are
-/// `ceil(len_px) + 2` per axis, which makes each step under a pixel — 0.622 px
-/// radially and 0.910 px tangentially at (308.5 deg, 347 km) — but those axes
-/// are radial and tangential, not the raster's, and a lattice whose *covering
-/// radius* exceeds half a pixel can miss a pixel square entirely when it lies
-/// diagonally across it. `hypot(0.622, 0.910) / 2` is **0.551 px**, over the
-/// 0.5 a unit square needs, and all four holes measured 0.549-0.560.
+/// The cause was `render_gate`'s sample lattice. Its two step counts made each
+/// step under a pixel — 0.622 px radially and 0.910 px tangentially at
+/// (308.5°, 347 km) — but those axes are radial and tangential, not the
+/// raster's, and what has to be under half a pixel is the lattice's *covering
+/// radius*: `hypot(0.622, 0.910) / 2` is 0.551, over the 0.5 a unit square
+/// needs, and all four holes measured 0.549-0.560.
 ///
-/// So a hover over one of those pixels reads nothing today, in the middle of an
-/// echo. The polar field has no pinholes — it is the measurements, not a
-/// resampling of them — so this change removes the symptom from the readout
-/// without touching the cause. The cause is a sample-density change in the
-/// rasterizer's innermost loop: raising the steps to `ceil(len_px * 1.5) + 2`
-/// puts the covering radius at 0.37 px, and costs 2.25x the samples in the loop
-/// `POOLED_CELLS` measures at 233 ms of a browser frame, on top of moving every
-/// picture the display has ever drawn. That is its own change with its own
-/// measurement, and it is deliberately not made here.
+/// [`super::SAMPLE_STEP_PX`] is the fix and carries the argument;
+/// [`a_solid_field_leaves_no_pixel_of_itself_unpainted`] is the direct test of
+/// it, on this same 1 km geometry, where the count was 42 502 pixels and is now
+/// zero. So the tolerance below is zero as well — it is kept as an assertion
+/// rather than deleted because this is the probe that found the defect, and it
+/// is the one that would find the next one.
 #[test]
 fn the_polar_field_answers_what_the_value_grid_holds() {
     let out = render_level3_radial_to_image(
@@ -3626,10 +3929,10 @@ fn the_polar_field_answers_what_the_value_grid_holds() {
         }
     }
     assert!(centres > 1500, "only {centres} centre probes");
-    assert!(
-        pinholes * 200 <= centres,
-        "{pinholes} of {centres} cell centres are unpainted in the raster — over \
-         0.5%, which is more than the rasterizer's known pinholes"
+    assert_eq!(
+        pinholes, 0,
+        "{pinholes} of {centres} cell centres are unpainted in the raster, under \
+         a gate the polar field holds a value for"
     );
 
     // ── Away from them: one cell wide, and rare ──
