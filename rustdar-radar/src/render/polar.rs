@@ -45,11 +45,13 @@
 //!     ½)`, and a range outside `[first − ½gi, first + (gates − ½)gi)` is in no
 //!     gate at all.
 //!   * **Azimuth.** A radial is painted over `[centre − half, centre + half)`,
-//!     half-open for the same reason, at the width
-//!     [`super::l2_wedge_width_deg`] (or [`super::derived_grid_wedge_deg`])
-//!     gave it — *not* at the spacing to its neighbour, which is the whole
-//!     point of those two functions. Those wedges normally tile, but they
-//!     overlap wherever a sweep ran tighter than it declared, so a point can be
+//!     half-open for the same reason, at the half-width
+//!     [`super::l2_wedge_half_widths_deg`] (or
+//!     [`super::derived_grid_half_widths_deg`]) gave it — its declared width,
+//!     widened to meet a neighbour that is close enough to have measured the
+//!     sky between them and *not* to one further off than that, which is the
+//!     whole point of those two functions. Those wedges tile, and they overlap
+//!     wherever a sweep ran tighter than it declared, so a point can be
 //!     inside two.
 //!   * **The tie.** When it is, [`super::write_key`] decides, and it ranks
 //!     claims radial-major: the greatest claim wins a `fetch_max`, so the
@@ -79,9 +81,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub struct Wedge {
     /// The radial's own azimuth, degrees clockwise from true north.
     pub azimuth_deg: f32,
-    /// Half the width it was painted at, degrees — half of
-    /// [`super::l2_wedge_width_deg`]'s answer, or of
-    /// [`super::derived_grid_wedge_deg`]'s.
+    /// Half the width it was painted at, degrees —
+    /// [`super::l2_wedge_half_widths_deg`]'s answer for this radial, or
+    /// [`super::derived_grid_half_widths_deg`]'s for a derived grid's row.
     pub half_width_deg: f32,
 }
 
