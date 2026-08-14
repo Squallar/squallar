@@ -185,21 +185,69 @@ impl MercatorBounds {
         self.min_lon + (lon - self.min_lon).rem_euclid(360.0)
     }
 
+    /// The whole multiple of 360° that carries a datum spanning
+    /// `[min_lon, max_lon]` to its representation *nearest* this box.
+    ///
+    /// [`Self::wrap_lon`] answers a different question, and only the GLM
+    /// strike path wants the one it answers. `wrap_lon` lands in
+    /// `[min_lon, min_lon + 360)`, so a datum a degree *west* of `min_lon`
+    /// comes back 359° east — off the far side rather than just off the near
+    /// one. For a flash that is invisible: either way it fails the pixel
+    /// window. For anything drawn with slack around the texture edge — a
+    /// radar site keeps 50 points of it so a site just off-texture still
+    /// contributes its label — it silently deletes the western margin. This
+    /// picks the nearest representation instead, which is identity whenever
+    /// the datum is already in frame and never moves anything across the
+    /// texture to reach it.
+    ///
+    /// A shift is a *rigid translation*: applied to every vertex of a ring it
+    /// moves the shape without redrawing it, which is the property a polygon
+    /// needs and a per-vertex `wrap_lon` does not have. It is only rigid for a
+    /// datum that fits in a half-turn, so a wider one gets no shift at all —
+    /// see the guard. Measured against the live NWS zone corpus, nothing is
+    /// excluded by that guard: the source is already cut at the antimeridian,
+    /// e.g. marine zone `PKZ784` arrives as a MultiPolygon whose parts span
+    /// `177.62..180.0` and `-180.0..-177.05` separately.
+    #[inline]
+    pub(crate) fn lon_shift(&self, min_lon: f64, max_lon: f64) -> f64 {
+        let span = max_lon - min_lon;
+        // A datum wider than a half-turn has no unambiguous "nearest"
+        // representation, and translating it would be a guess about which
+        // side of the seam it meant. Left alone, and measured never to occur.
+        if !span.is_finite() || !(0.0..180.0).contains(&span) {
+            return 0.0;
+        }
+        let datum_centre = (min_lon + max_lon) / 2.0;
+        let box_centre = (self.min_lon + self.max_lon) / 2.0;
+        360.0 * ((box_centre - datum_centre) / 360.0).round()
+    }
+
+    /// A single point's representation nearest this box. See [`Self::lon_shift`].
+    #[inline]
+    pub(crate) fn nearest_lon(&self, lon: f64) -> f64 {
+        lon + self.lon_shift(lon, lon)
+    }
+
     /// To texture pixel coordinates.
     ///
     /// Longitude is mapped linearly, so a `lon` outside this box's own 360°
     /// frame lands proportionally outside the texture and is culled by the
-    /// caller's pixel-window test. That is why callers whose data is folded
-    /// into [-180, 180] — currently only the GLM strike path — must put it
-    /// through [`Self::wrap_lon`] first, and why the other callers, which pass
-    /// longitudes in the same convention as the bounds, need not.
+    /// caller's pixel-window test. Every caller whose data is folded into
+    /// [-180, 180] must therefore state its frame first, and they do not all
+    /// state it the same way:
     ///
-    /// The wrap is deliberately not applied here. It is identity only for
-    /// longitudes already inside `[min_lon, min_lon + 360)`; applying it to a
-    /// point west of `min_lon` moves that point to the far side of the frame,
-    /// which for a *polygon* vertex would redraw the shape rather than move it
-    /// off-screen. `project_polygon` and the point overlays are untested
-    /// against the dateline either way — see the T17 record.
+    ///  * the GLM strike path uses [`Self::wrap_lon`], whose
+    ///    `[min_lon, min_lon + 360)` guarantee its own `> max_lon` range test
+    ///    is written against;
+    ///  * the point overlays ([`rasterize_radar_sites`],
+    ///    [`rasterize_storm_reports`]) use [`Self::nearest_lon`], which keeps
+    ///    the western edge slack `wrap_lon` would delete;
+    ///  * [`project_polygon`] shifts each polygon rigidly by
+    ///    [`Self::lon_shift`], because a *per-vertex* wrap would move one
+    ///    vertex across the frame and redraw the shape rather than move it.
+    ///
+    /// No shift is applied here, so that each of those stays the caller's own
+    /// stated decision rather than something this function guesses.
     #[inline]
     pub(crate) fn project(&self, lat: f64, lon: f64, w: f32, h: f32) -> (f32, f32) {
         let lon_frac = (lon - self.min_lon) / (self.max_lon - self.min_lon);
@@ -291,6 +339,14 @@ pub fn rasterize_spc_discussions(
             if ring.len() < 3 {
                 continue;
             }
+            // No longitude shift here, unlike every other polygon path, and
+            // that is a fact about the *parser* rather than a gap. A mesoscale
+            // discussion's points are decoded from the `LAT...LON` block by
+            // `spc::discussion::parse_coord_token`, which drops outright any
+            // point failing `(-140.0..=-50.0).contains(&lon)`. So this ring
+            // cannot hold a longitude within 40° of the antimeridian, and the
+            // frame the viewport is in cannot matter to it. Widening that gate
+            // means revisiting this call.
             let pts: Vec<(f32, f32)> = ring
                 .iter()
                 .map(|&(lat, lon)| mb.project(lat, lon, w, h))
@@ -400,7 +456,15 @@ pub fn rasterize_radar_sites(
     };
 
     for site in sites {
-        let (px, py) = mb.project(site.lat, site.lon, w, h);
+        // Into the viewport's frame first: the catalogue validates longitude
+        // into [-180, 180] (`rustdar_radar::catalogue`) while `bounds` is
+        // unfolded, so over the dateline the two disagree by a turn. The
+        // network really does straddle it — of the 208 stations
+        // `api.weather.gov/radar/stations` lists, 4 are east-hemisphere
+        // (PGUA 144.81E, RODN 127.91E, RKSG 127.29E, RKJK 126.62E) and the
+        // westernmost is PAEC at -165.29.
+        let lon = mb.nearest_lon(site.lon);
+        let (px, py) = mb.project(site.lat, lon, w, h);
         // 50 points of slack so a site just off-texture still contributes its
         // label. In texels here, so the ground it stands for does not shrink
         // with density.
@@ -613,7 +677,15 @@ pub fn rasterize_storm_reports(
     let mut hit_map = HitMap::new(width, height);
 
     for (idx, report) in reports.iter().enumerate() {
-        let (px, py) = mb.project(report.lat, report.lon, w, h);
+        // Into the viewport's frame first — see `rasterize_radar_sites`. The
+        // CSV parser accepts any longitude in [-180, 180] verbatim
+        // (`spc::reports::parse_csv`) and `bounds` is unfolded. Measured, this
+        // feed stays far from the seam: over the 70,022 located records of
+        // SPC's 1950-2023 tornado archive the westernmost is -163.53 and none
+        // is east-hemisphere, so this is a guard against the frame, not a
+        // repair of an observed loss.
+        let lon = mb.nearest_lon(report.lon);
+        let (px, py) = mb.project(report.lat, lon, w, h);
         let slack = 20.0 * scale;
         if px < -slack || px > w + slack || py < -slack || py > h + slack {
             continue;
@@ -868,6 +940,17 @@ fn draw_feature(
     scale: f32,
 ) {
     // Geo-AABB cull before any projection work.
+    //
+    // Shifted into the texture's frame first, or the cull is where a Pacific
+    // feature dies: `OverlayFeature::geo_bounds` is the raw GeoJSON extent —
+    // Guam's zone `GUZ001` is 144.62..144.96 — and a dateline viewport arrives
+    // as e.g. -195..-165, two rectangles that cannot overlap however close the
+    // ground is. The shift is the feature's, not each polygon's, and it is
+    // deliberately loose: a feature the source already cut at the antimeridian
+    // pools into a ~360°-wide box, `lon_shift` declines it, and the box
+    // intersects everything. That costs a projection pass this cull existed to
+    // save and never drops a feature that should draw — the failure a cull may
+    // have.
     if let Some(ref fb) = feature.geo_bounds {
         let tb = GeoBounds {
             min_lat: merc_y_to_lat(mb.merc_y_min),
@@ -875,7 +958,13 @@ fn draw_feature(
             min_lon: mb.min_lon,
             max_lon: mb.max_lon,
         };
-        if !fb.intersects(&tb) {
+        let shift = mb.lon_shift(fb.min_lon, fb.max_lon);
+        let shifted = GeoBounds {
+            min_lon: fb.min_lon + shift,
+            max_lon: fb.max_lon + shift,
+            ..*fb
+        };
+        if !shifted.intersects(&tb) {
             return;
         }
     }
@@ -1027,7 +1116,30 @@ pub(crate) struct ProjectedPolygon {
     pub(crate) holes: Vec<Vec<(f32, f32)>>,
 }
 
+/// The rigid longitude shift that carries `ring` into `mb`'s frame, from the
+/// ring's own longitude extent. Zero for an empty ring.
+fn ring_lon_shift(ring: &[(f64, f64)], mb: &MercatorBounds) -> f64 {
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    for &(_, lon) in ring {
+        min_lon = min_lon.min(lon);
+        max_lon = max_lon.max(lon);
+    }
+    if !min_lon.is_finite() || !max_lon.is_finite() {
+        return 0.0;
+    }
+    mb.lon_shift(min_lon, max_lon)
+}
+
 /// `None` when the exterior ring is too short to enclose anything.
+///
+/// The whole polygon — exterior and holes together — is translated into the
+/// viewport's longitude frame by one shared multiple of 360°, taken from the
+/// *exterior* ring. Sharing it is what makes the move rigid: a hole shifted by
+/// a different multiple than the ring it cuts would leave the polygon, and a
+/// per-vertex [`MercatorBounds::wrap_lon`] would tear a ring in half at the
+/// seam. See [`MercatorBounds::lon_shift`] for why the nearest representation
+/// is the right one and when it declines to answer.
 pub(crate) fn project_polygon(
     polygon: &[GeoPolygonRing],
     mb: &MercatorBounds,
@@ -1038,10 +1150,11 @@ pub(crate) fn project_polygon(
     if exterior_ring.len() < 3 {
         return None;
     }
+    let shift = ring_lon_shift(exterior_ring, mb);
     let project = |ring: &[(f64, f64)]| -> Vec<(f32, f32)> {
         strip_closing_dup(ring)
             .iter()
-            .map(|&(lat, lon)| mb.project(lat, lon, w, h))
+            .map(|&(lat, lon)| mb.project(lat, lon + shift, w, h))
             .collect()
     };
     // `polygon[1..]` are interior rings — holes. Dropping them painted a donut
