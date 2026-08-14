@@ -832,7 +832,18 @@ impl App {
         // field rather than claimed. There is no adapter yet, so there is
         // nothing to promote on; `install_volume_bridge` re-resolves the moment
         // there is.
-        let device_profile = crate::budget::DeviceProfile::for_target();
+        let mut device_profile = crate::budget::DeviceProfile::for_target();
+        // Before the first frame, for the reason the site table is resolved
+        // before it: what a session learned by *failing* has to be in force
+        // from the first paint, or a user who had backed off would watch the
+        // application come up at a quality it has already been unable to serve
+        // and then fall out of it. The pool half of the memo is filled in
+        // below, once the bracket it is held inside exists.
+        device_profile.memo = Some(crate::budget::BudgetMemo {
+            loop_pool_bytes: None,
+            steps_back: crate::budget::remembered_steps(platform.config_store().as_deref())
+                .unwrap_or(0),
+        });
         let budgets = crate::budget::resolve(&device_profile);
         let render = RenderDispatcher::with_budgets(&budgets);
 
@@ -938,6 +949,14 @@ impl App {
             loop_pool_memo.unwrap_or(loop_pool_limits.floor),
             loop_pool_limits,
         );
+        // The other half of what this machine learned. `resolve` does not read
+        // it — the pool leaves the resolver as a *pair* and is settled by
+        // `LoopPool::for_promotion` and `LoopPool::back_off` — but the profile
+        // is the one statement of what is known about this device, and a memo
+        // half of which lived somewhere else would be a second one.
+        if let Some(memo) = device_profile.memo.as_mut() {
+            memo.loop_pool_bytes = loop_pool_memo;
+        }
 
         let mut app = Self {
             instance,

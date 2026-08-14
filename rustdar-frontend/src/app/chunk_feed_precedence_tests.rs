@@ -1387,3 +1387,140 @@ fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
         );
     }
 }
+
+/// **A lost surface steps the whole budget set down, not just the loop pool.**
+///
+/// The behavioural backstop, and on the browser it is the *only* signal there
+/// is: WebGL2 answers memory exhaustion by destroying the rendering context
+/// rather than by failing a call, so a lost surface is the one piece of memory
+/// evidence any target here produces.
+///
+/// The order is the ladder's, and the first rung is lighting — the cheapest
+/// large saving (0.766 ms dense against 0.263 for the flat march on the
+/// measured 3090) and the one a user is least likely to be able to name. What
+/// this asserts is that the rung is taken, that the pool halves beside it, and
+/// that both are written to the config store *at the moment of the decision*
+/// rather than left to the 3 s autosave a crashing session may not survive.
+#[test]
+fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
+    use crate::volume::quality::GradientShading;
+    use rustdar_egui::config_store::ConfigStore;
+
+    let platform = TestBridge::desktop();
+    let store = platform.store();
+    let mut app = headless(platform);
+
+    // A headless app has no adapter, so its pool is at the bracket floor and
+    // has nothing to halve. Put it where a discrete GPU would have: the halving
+    // and the rung are two independent halves of one event, and a test that saw
+    // only the rung would pass with the pool half deleted.
+    app.loop_pool = crate::loop_pool::LoopPool::for_promotion(
+        crate::budget::Promotion::Ceiling,
+        None,
+        crate::loop_pool::LoopPoolLimits::from_budgets(&app.budgets),
+    );
+    let before = app.budgets;
+    let pool_before = app.loop_pool.bytes();
+    assert_eq!(
+        before.quality_ceiling.shading,
+        GradientShading::On,
+        "precondition: this build's desktop bracket starts at the cloud rung",
+    );
+
+    app.back_off_budgets();
+
+    assert_eq!(
+        app.budgets.quality_ceiling.shading,
+        GradientShading::Off,
+        "a lost surface left the most expensive rung in the application in \
+         place, so the next one costs the same and the ladder never runs",
+    );
+    assert_eq!(
+        app.budgets.offscreen_bytes, before.offscreen_bytes,
+        "the first rung took two things at once, so a device that only needed \
+         to give up its lighting also lost its resolution",
+    );
+    assert!(
+        app.loop_pool.bytes() < pool_before,
+        "the pool did not halve beside it",
+    );
+    assert_eq!(
+        store.load(crate::budget::BUDGET_MEMO_KEY).as_deref(),
+        Some("1"),
+        "the rung was not persisted at the moment of the decision",
+    );
+    assert!(store.load(crate::loop_pool::LOOP_POOL_KEY).is_some());
+}
+
+/// **What was learned by crashing is in force from the first paint of the next
+/// session.**
+///
+/// The 1:1 reopen rule, on the one value it matters most for. Without this a
+/// second launch re-probes, comes up at a quality this machine has already been
+/// unable to serve, and falls out of it in front of the user — which is worse
+/// than never having promoted it at all.
+#[test]
+fn a_backed_off_machine_reopens_where_it_left_off() {
+    use crate::volume::quality::GradientShading;
+
+    let first = TestBridge::desktop();
+    let store = first.store();
+    let mut app = headless(first);
+    app.back_off_budgets();
+    app.back_off_budgets();
+    let settled = app.budgets;
+    assert_eq!(settled.steps_back, 2);
+
+    // A second launch over the same store, and nothing else carried across.
+    let reopened = headless(TestBridge::desktop().with_store(store));
+    assert_eq!(
+        reopened.budgets.steps_back, 2,
+        "the ladder position was re-probed instead of remembered",
+    );
+    assert_eq!(reopened.budgets.quality_ceiling, settled.quality_ceiling);
+    assert_eq!(reopened.budgets.offscreen_bytes, settled.offscreen_bytes);
+    assert_eq!(
+        reopened.budgets.quality_ceiling.shading,
+        GradientShading::Off,
+    );
+}
+
+/// **A machine that keeps failing stops writing, rather than counting for ever.**
+///
+/// The memo is a *position on a ladder*, not a tally of failures: once every
+/// rung this function owns is at its stop there is nothing left for another
+/// step to mean, and a number that went on rising would be a config entry
+/// growing without bound over a session that is already in trouble. What is
+/// below the last rung is not a smaller budget — it is `volume::degrade`
+/// retiring the 3D view, which latches after two such losses.
+#[test]
+fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
+    use rustdar_egui::config_store::ConfigStore;
+
+    let platform = TestBridge::desktop();
+    let store = platform.store();
+    let mut app = headless(platform);
+
+    for _ in 0..12 {
+        app.back_off_budgets();
+    }
+    let settled = app.budgets.steps_back;
+    assert!(
+        settled > 0 && settled < 12,
+        "twelve lost surfaces resolved to rung {settled}, which is either no \
+         ladder at all or a failure counter wearing one as a hat",
+    );
+    assert_eq!(
+        store.load(crate::budget::BUDGET_MEMO_KEY).as_deref(),
+        Some(settled.to_string().as_str()),
+    );
+    // And the floor is the configuration this build already shipped, reached
+    // rather than crossed.
+    let shipped = crate::budget::BudgetLimits::for_target();
+    assert_eq!(app.budgets.grid_cells, shipped.grid_cells.floor);
+    assert_eq!(app.budgets.offscreen_bytes, shipped.offscreen_bytes.floor);
+    assert_eq!(
+        app.budgets.raster_side_ceiling_px,
+        shipped.long_range_image_side_px.floor,
+    );
+}

@@ -669,7 +669,7 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// arm's safety is staying well under, plus learning from the one event that
 /// does arrive. That event is a lost surface, which
 /// `crate::volume::degrade::MAX_SURFACE_LOSSES_WITH_VOLUME` already counts two
-/// of before retiring the 3D view — and which `App::back_off_loop_pool` now
+/// of before retiring the 3D view — and which `App::back_off_budgets` now
 /// also halves the pool on, so a machine that has lost a context once starts
 /// its next session smaller instead of walking into the same wall.
 ///
