@@ -460,6 +460,25 @@ fn assemble(chunks: Vec<(u16, ChunkKind, ChunkContents)>) -> VolumeAssembler {
     a
 }
 
+/// Indices of the fixture chunks carrying a cut's terminator, ascending. Each
+/// is the chunk whose ingestion seals one cut, so `[0]` is the first chunk that
+/// invalidates a snapshot cache and consecutive entries bracket one cut each.
+fn sealing_positions(chunks: &[(u16, ChunkKind, ChunkContents)]) -> Vec<usize> {
+    chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, c))| {
+            c.radials.iter().any(|r| {
+                matches!(
+                    r.radial_status(),
+                    RadialStatus::ElevationEnd | RadialStatus::ScanEnd
+                )
+            })
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 fn digest(a: &mut VolumeAssembler) -> u64 {
     let scan = a.snapshot();
     crate::volumetric::tests::fnv1a64(&crate::volumetric::compute_echo_tops(&scan))
@@ -1103,13 +1122,8 @@ fn the_snapshot_is_shared_until_a_cut_seals() {
     let mut a = VolumeAssembler::new("KTLX", vol(42));
     let chunks = golden_chunks();
     // Up to but not including the chunk that seals the first cut.
-    let seal_at = chunks
-        .iter()
-        .position(|(_, _, c)| {
-            c.radials
-                .iter()
-                .any(|r| r.radial_status() == RadialStatus::ElevationEnd)
-        })
+    let seal_at = *sealing_positions(&chunks)
+        .first()
         .expect("some chunk seals a cut");
     for (sequence, kind, contents) in chunks.iter().take(seal_at).cloned() {
         a.ingest_contents(sequence, kind, volume_time(), contents);
@@ -1363,6 +1377,220 @@ fn a_notified_chunk_of_the_current_volume_is_just_ingested() {
     let same = ChunkId::parse("KTLX", vol(42), &format!("{VOLUME_TIME}-009-I")).expect("parses");
     assert!(!p.should_roll_to(&same));
     assert!(!p.is_stale_notification(&same));
+}
+
+/// Feed one chunk through the poller's assembler the way a round's ingest arm
+/// does, folding what sealed into the round's outcome.
+///
+/// A copy of production's fold, because a real round needs a bucket and this
+/// crate has no seam to fake one. It can therefore drift from the fold it
+/// mirrors: what holds the two together is
+/// `both_round_paths_warm_the_snapshot_before_they_return`, which reads the
+/// real methods rather than this one.
+fn round_ingest(
+    p: &mut ChunkPoller,
+    outcome: &mut PollOutcome,
+    (sequence, kind, contents): (u16, ChunkKind, ChunkContents),
+) {
+    let o = p
+        .current
+        .as_mut()
+        .expect("the poller has a volume")
+        .ingest_contents(sequence, kind, volume_time(), contents);
+    if o.accepted {
+        outcome.ingested += 1;
+        outcome.sealed_elevations.extend(o.sealed);
+    }
+}
+
+/// A round that seals rebuilds the snapshot cache before it returns, so the
+/// caller's first `snapshot()` after the round — the frame thread's, applying
+/// the outcome — is an `Arc` clone rather than a deep copy of every sealed
+/// gate byte.
+#[test]
+fn a_sealing_round_leaves_the_snapshot_cache_warm() {
+    let mut p = ChunkPoller::resume("KTLX", vol(42));
+    let chunks = golden_chunks();
+    let seal_at = *sealing_positions(&chunks)
+        .first()
+        .expect("some chunk seals a cut");
+
+    let mut outcome = PollOutcome::default();
+    for chunk in chunks.into_iter().take(seal_at + 1) {
+        round_ingest(&mut p, &mut outcome, chunk);
+    }
+    assert!(
+        !outcome.sealed_elevations.is_empty(),
+        "the fixture round must seal a cut for this test to mean anything"
+    );
+    p.warm_snapshot(&outcome);
+
+    assert!(
+        p.current.as_ref().expect("a volume").snapshot_is_warm(),
+        "a sealing round returned with the cache cold, so the deep copy lands \
+             on whoever asks next — the frame thread"
+    );
+    let first = p.snapshot().expect("a volume is assembling");
+    let second = p.snapshot().expect("a volume is assembling");
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "two snapshots with no ingest between them rebuilt the volume"
+    );
+}
+
+/// A round that seals nothing leaves the cache exactly as it found it: cold
+/// stays cold — no volume is built for a round nothing will render — and warm
+/// keeps the very `Arc` a pane may be holding.
+#[test]
+fn a_round_that_seals_nothing_leaves_the_cache_untouched() {
+    let mut p = primed(vol(42));
+    // `primed` ingests one radial chunk and seals nothing, so the cache
+    // starts cold.
+    let quiet = PollOutcome::default();
+    p.warm_snapshot(&quiet);
+    assert!(
+        !p.current.as_ref().expect("a volume").snapshot_is_warm(),
+        "a seal-less round built a snapshot nothing asked for"
+    );
+
+    let held = p.snapshot().expect("a volume is assembling");
+    p.warm_snapshot(&quiet);
+    let after = p.snapshot().expect("a volume is assembling");
+    assert!(
+        std::sync::Arc::ptr_eq(&held, &after),
+        "a seal-less round replaced a cache that was already warm"
+    );
+}
+
+/// Warming is a cache fill, not a cache pin.
+///
+/// `the_snapshot_is_shared_until_a_cut_seals` pins that a seal invalidates a
+/// cache a *caller* filled. What is new here is the poller-filled one: a cache
+/// nothing asked for could otherwise go on being served past the cut that
+/// obsoletes it, which would make warming a staleness bug rather than a saved
+/// copy. The re-warm after the second seal carries the new cut.
+#[test]
+fn a_seal_after_warming_still_invalidates_the_cache() {
+    let mut p = ChunkPoller::resume("KTLX", vol(42));
+    let chunks = golden_chunks();
+    let seals = sealing_positions(&chunks);
+    let (first, second) = match seals.as_slice() {
+        [first, second, ..] => (*first, *second),
+        _ => panic!("the golden volume seals several cuts; got {seals:?}"),
+    };
+
+    let mut chunks = chunks.into_iter();
+    let mut outcome = PollOutcome::default();
+    for chunk in chunks.by_ref().take(first + 1) {
+        round_ingest(&mut p, &mut outcome, chunk);
+    }
+    p.warm_snapshot(&outcome);
+    let warmed = p.snapshot().expect("a volume is assembling");
+
+    let mut next_round = PollOutcome::default();
+    for chunk in chunks.by_ref().take(second - first) {
+        round_ingest(&mut p, &mut next_round, chunk);
+    }
+    assert!(
+        !next_round.sealed_elevations.is_empty(),
+        "the second fixture round must seal at least one more cut"
+    );
+    assert!(
+        !p.current.as_ref().expect("a volume").snapshot_is_warm(),
+        "a seal did not clear the warmed cache"
+    );
+    p.warm_snapshot(&next_round);
+    let after = p.snapshot().expect("a volume is assembling");
+    assert!(
+        !std::sync::Arc::ptr_eq(&warmed, &after),
+        "a snapshot warmed last round survived a seal"
+    );
+    // Counted off what the round reported rather than assuming the span seals
+    // exactly one cut, so re-slicing the fixture cannot quietly weaken this.
+    assert_eq!(
+        after.sweeps().len(),
+        warmed.sweeps().len() + next_round.sealed_elevations.len(),
+        "the rebuilt snapshot is missing a cut the round sealed"
+    );
+}
+
+/// The body of one `ChunkPoller` method, for the placement probes below.
+///
+/// A method's own closing brace is the first one at four-space indentation
+/// after its signature; everything nested inside closes deeper.
+fn poller_method(signature: &str) -> &'static str {
+    let source = include_str!("../chunks.rs");
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} is gone"));
+    let body = &source[start..];
+    let end = body
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("{signature} has no closing brace at method indentation"));
+    &body[..end]
+}
+
+/// **The placement is the whole slice.** Every other test here calls
+/// `warm_snapshot` by hand, so all of them pass with the production calls
+/// deleted and the frame thread back to paying the rebuild. Only the
+/// `#[ignore]`d live test reaches the real round, so without this nothing in a
+/// default run notices the calls going missing.
+///
+/// Probed against the source in the pattern
+/// `app_chunks::volume_close_tests::the_completed_branch_refetches_level_three_and_owns_the_loop_append`
+/// uses, because the alternative — a fake `DataSources` — is a bucket
+/// transport this crate has no seam for.
+#[test]
+fn both_round_paths_warm_the_snapshot_before_they_return() {
+    for signature in ["pub async fn poll(", "pub async fn fetch_notified("] {
+        assert!(
+            poller_method(signature).contains(WARM_CALL),
+            "{signature} returns without warming the snapshot cache, so the \
+                 first snapshot() after a seal rebuilds it on the frame thread"
+        );
+    }
+}
+
+/// The warm call this module probes for.
+const WARM_CALL: &str = "self.warm_snapshot(&outcome);";
+
+/// And the *failing* round warms it too.
+///
+/// A chunk mid-round can seal a cut and a later chunk's download can then abort
+/// the round. The seal has already cleared the cache, so returning from inside
+/// the loop leaves exactly the rounds a flaky network produces paying the
+/// rebuild on the paint path — the stall taken off the happy path and left on
+/// the bad one.
+///
+/// Both positions are asserted separately because `poll` holds two warm calls
+/// and a bare `contains` over the whole method would be satisfied by either
+/// one: deleting the epilogue's call would leave the error arm's, and read
+/// green.
+#[test]
+fn the_aborting_round_warms_the_snapshot_before_it_returns_the_error() {
+    let poll = poller_method("pub async fn poll(");
+    let held = poll
+        .find("if let Some(e) = failure {")
+        .expect("the mid-round failure is no longer held to the end of the round");
+    let returns = held
+        + poll[held..]
+            .find("return Err(e);")
+            .expect("the held failure is no longer returned");
+    assert!(
+        poll[held..returns].contains(WARM_CALL),
+        "the error path returns before warming, so a round that sealed and \
+             then failed hands the rebuild to the frame thread"
+    );
+    assert!(
+        poll[returns..].contains(WARM_CALL),
+        "the successful path no longer warms; the error arm's call is not a \
+             substitute, since a round that never failed does not reach it"
+    );
+    assert!(
+        !poll.contains("return Err(ChunkError::Bucket(e));"),
+        "a download failure returns from inside the chunk loop again, which \
+             skips the warm entirely"
+    );
 }
 
 // -- selective download --------------------------------------------------
@@ -1894,6 +2122,14 @@ async fn live_a_few_poll_rounds_assemble_and_seal() {
     while std::time::Instant::now() < deadline && total_sealed == 0 {
         round += 1;
         let outcome = poller.poll(&sources).await.expect("a poll round");
+        if !outcome.sealed_elevations.is_empty() {
+            // The end of a sealing round is where `warm_snapshot` runs; this
+            // is the one test that reaches it through the real `poll`.
+            assert!(
+                poller.current.as_ref().expect("a volume").snapshot_is_warm(),
+                "a sealing poll round returned with the snapshot cache cold"
+            );
+        }
         let progress = outcome.progress.clone().expect("a volume is being tracked");
         println!(
             "round {round}: volume {} | ingested {} | sealed {:?} | {} cuts so far | complete={} | next in {:?}",

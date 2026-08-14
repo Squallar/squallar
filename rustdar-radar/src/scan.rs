@@ -264,12 +264,17 @@ impl DecodedScan {
 /// # One pool, shared with the renderer
 ///
 /// This is rayon's *global* pool, which is also where [`crate::render`] and
-/// [`crate::voxel`] run their `par_iter`s — some of them from the frame thread.
-/// A render issued while a decode is in flight can now wait for a worker to
-/// finish the record it is holding, which is one bzip2 decompress, 1–8 ms. The
-/// decode window it might land in is also ~10× shorter than it was, so the
-/// integral is very likely better; it is written down because it is a new
-/// interaction, not because it has been observed to hurt.
+/// [`crate::voxel`] run their `par_iter`s. Every production entry into render,
+/// voxel and cross-section work goes through
+/// `rustdar_frontend::offload::execute`: on a pool thread natively, and on the
+/// caller's thread only in the logged fallback where the pool has no worker
+/// left. On wasm it is the worker, or inline on the page thread without one,
+/// where `crate::par` is serial anyway. A render issued while a decode is in
+/// flight can now wait for a worker to finish the record it is holding, which
+/// is one bzip2 decompress, 1–8 ms. The decode window it might land in is also
+/// ~10× shorter than it was, so the integral is very likely better; it is
+/// written down because it is a new interaction, not because it has been
+/// observed to hurt.
 fn decoded(file: &nexrad_data::volume::File) -> Result<DecodedScan> {
     use crate::par::*;
 
