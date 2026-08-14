@@ -387,12 +387,194 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_scan() {
     );
 }
 
+/// **A pane that did not change radar keeps its loop.**
+///
+/// The teardown was written for the pane that moved and applied to every pane
+/// there was. `LoopDownloadManager::clear_all` emptied the *shared* volume
+/// cache, the *shared* Level III cache, every pane's download queue and every
+/// frame plan, and it ran whenever any pane left a radar — so a second pane
+/// looping a different site kept a `LoopPlaybackState` whose frames named
+/// volumes that had just been dropped and whose plan was gone. That is the loop
+/// this file's re-pick test already calls dead: it plays blank, has nothing
+/// queued to fill itself, and raises neither of the two actions that rebuild one
+/// (`handle_enable_loop`, `reinit_active_loops`). Silent, and on the pane the
+/// user was not looking at when they clicked.
+///
+/// Every holder `clear_all` reached is asserted, because a fix that covered the
+/// volume cache and left the Level III half wholesale would look closed here
+/// while leaving the same defect on the other datasource. The Level III fixture
+/// is a cached **gap** rather than an object: a `None` is a real entry — its key
+/// is what the pairing gate reads — and it needs no decoded product to build.
+///
+/// Both directions are asserted from one fixture. The switching pane's own
+/// queues and plan must still go, or this passes just as well against a handler
+/// that stopped tearing anything down at all.
+#[test]
+fn a_pane_that_did_not_change_radar_keeps_its_loop() {
+    use rustdar_radar::archive::Identifier;
+
+    /// The bystander's radar: a third site, so "kept" cannot be confused with
+    /// "the destination's state was rebuilt".
+    const BYSTANDER: &str = "KTLX";
+
+    let mut app = two_pane_app(WSR88D, BYSTANDER);
+    // Panes are layer-linked by default and a linked group moves together,
+    // which would make pane 1 a pane the switch genuinely does move. Unlinking
+    // it is what makes it a bystander.
+    app.gui
+        .pane_mut(1)
+        .expect("the fixture built two panes")
+        .layer_link = false;
+    assert_eq!(
+        app.gui.layer_sync_targets(0),
+        vec![0],
+        "precondition: the switch must move pane 0 alone, or pane 1 is not a \
+         bystander and this asserts nothing",
+    );
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built two panes")
+        .scan_info = Some(wsr88d_scan_info());
+
+    // Pane 1's loop, built the way `begin_loop_for_pane` leaves one and then
+    // filled by the poll path.
+    let bystander_site = rustdar_radar::sites::get_radar_site(BYSTANDER)
+        .expect("KTLX is in the resolved site table")
+        .clone();
+    let pane = app.gui.pane_mut(1).expect("the fixture built two panes");
+    pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
+        3600,
+        &bystander_site,
+        rustdar_radar::types::RenderView::PlanView,
+    );
+    for minute in [0, 4, 8] {
+        let held = crate::app::render::loop_frames_held(
+            crate::app::render::test_loop_allocation(),
+            &pane.loop_state,
+            &crate::app::render::test_budgets(),
+        );
+        super::append_polled_frame(&mut pane.loop_state, BYSTANDER, at(minute), held);
+    }
+    let frames_before: Vec<NaiveDateTime> = pane
+        .loop_state
+        .frames
+        .iter()
+        .map(|frame| frame.timestamp)
+        .collect();
+    assert_eq!(
+        frames_before.len(),
+        3,
+        "precondition: the bystander has frames"
+    );
+
+    // Everything the bystander's loop holds inside the manager: a volume it has
+    // already downloaded, a Level III answer it has already paired, and the
+    // plan its remaining frames are owed through.
+    app.loop_mgr
+        .cache_scan(BYSTANDER, at(0), (empty_scan().into(), Default::default()));
+    app.loop_mgr.cache_l3_product(BYSTANDER, "EET", at(4), None);
+    app.loop_mgr.set_plan(
+        1,
+        crate::loop_downloads::FramePlan::new(
+            BYSTANDER.to_string(),
+            [0u32, 4, 8]
+                .iter()
+                .map(|&minute| {
+                    (
+                        at(minute),
+                        Identifier::new(format!("KTLX20260811_18{minute:02}00_V06")),
+                    )
+                })
+                .collect(),
+        ),
+    );
+    assert!(
+        app.loop_mgr
+            .plan_downloads_for(1, RadarProduct::Reflectivity),
+        "precondition: the plan really does derive a download queue",
+    );
+    // And the switching pane's own, so the teardown that must still happen is
+    // observable rather than assumed.
+    app.loop_mgr.set_plan(
+        0,
+        crate::loop_downloads::FramePlan::new(
+            WSR88D.to_string(),
+            vec![(
+                at(0),
+                Identifier::new("KPBZ20260811_180000_V06".to_string()),
+            )],
+        ),
+    );
+    assert!(
+        app.loop_mgr
+            .plan_downloads_for(0, RadarProduct::Reflectivity)
+    );
+    assert!(!app.loop_mgr.is_pane_done(0));
+    assert!(!app.loop_mgr.is_pane_done(1));
+
+    switch_to(&mut app, TDWR);
+
+    // The bystander, whole.
+    let loop_state = &app
+        .gui
+        .pane(1)
+        .expect("the fixture built two panes")
+        .loop_state;
+    assert!(
+        loop_state.is_active(),
+        "another pane's site switch switched this pane's loop off",
+    );
+    assert_eq!(
+        loop_state
+            .frames
+            .iter()
+            .map(|frame| frame.timestamp)
+            .collect::<Vec<_>>(),
+        frames_before,
+        "another pane's site switch threw away this pane's frame list",
+    );
+    assert!(
+        app.loop_mgr.is_cached(BYSTANDER, &at(0)),
+        "another pane's site switch dropped a volume this pane's loop had \
+         already downloaded and rendered from, so it plays blank",
+    );
+    assert!(
+        app.loop_mgr.l3_is_resolved(BYSTANDER, "EET", &at(4)),
+        "another pane's site switch dropped a Level III answer this pane's loop \
+         had already paired, so the volume is paired again",
+    );
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(1),
+        3,
+        "another pane's site switch took this pane's frame plan, so nothing is \
+         left to re-derive its downloads from",
+    );
+    assert!(
+        !app.loop_mgr.is_pane_done(1),
+        "another pane's site switch emptied this pane's download queue, so its \
+         remaining frames have nothing queued to fill them",
+    );
+
+    // And the pane that really left a radar owes nothing on either datasource.
+    assert!(
+        app.loop_mgr.is_pane_done(0),
+        "the pane that left a radar kept its queue, so the shared download \
+         budget is spent on volumes of a site it is no longer on",
+    );
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        0,
+        "the departed pane's frame plan survived, so the next re-derivation \
+         refills a queue from a listing no loop asked for",
+    );
+}
+
 /// The same no-op pick, on the pane's **loop** — the half the rule above did
 /// not reach.
 ///
 /// The scan, the section and the `data_time` all moved behind the
 /// `pane.site != site` guard when the site-switch release landed; the loop
-/// reset and `LoopDownloadManager::clear_all` were left in front of it. So the
+/// reset and the manager's wholesale clear were left in front of it. So the
 /// two halves of one handler disagreed about what a re-pick is, and this is the
 /// half that costs the most: a re-pick threw away a listing, every downloaded
 /// volume and every rendered frame of a loop that was correct — and raises

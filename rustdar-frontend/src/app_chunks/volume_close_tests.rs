@@ -320,7 +320,7 @@ fn a_completed_volume_stamps_freshness_for_its_own_cuts() {
 /// a frame naming this volume is precisely the case that goes wrong — so the
 /// entry survives for as long as it can do harm. The eviction pass made this
 /// guard no less necessary, which is why it is said here rather than left to
-/// read as a note about `clear_all`.
+/// read as a note about the wholesale clear a site switch used to make.
 ///
 /// Asserted on the *cache*, not on the frame list, because the cache write in
 /// `append_scan_to_active_loops` does not require an active loop — the entry is

@@ -139,7 +139,8 @@ pub struct LoopDownloadManager {
 /// dispatch time labelled those files with whatever site the pane had reached,
 /// cached one radar's scan under another's key, and — because the download filter
 /// then treats that key as satisfied — discarded the real scans that would have
-/// corrected it. Only a site switch (`clear_all`) recovered from that.
+/// corrected it. Only a site switch, which then emptied the manager, recovered
+/// from that.
 pub struct PendingDownloads {
     /// The site the listing was made for. Every identifier in `queue` is one of
     /// this site's files, and the scan each becomes is cached under it.
@@ -336,8 +337,9 @@ impl LoopDownloadManager {
     ///
     /// # Until this, nothing evicted an entry
     ///
-    /// [`clear_all`](Self::clear_all) emptied the map wholesale on a site
-    /// switch and nothing else ever removed one, while
+    /// A site switch emptied the map wholesale — every site's entries, not just
+    /// the departing pane's, which is why that call is gone too — and nothing
+    /// else ever removed one, while
     /// [`cache_scan`](Self::cache_scan) is written on every auto-poll and every
     /// completed live volume. A pane parked on a live radar therefore
     /// accumulated one decoded volume per scan for the life of the process —
@@ -585,6 +587,50 @@ impl LoopDownloadManager {
         self.l3_keys.get(&(site.to_string(), code.to_string()))
     }
 
+    /// Drop the bucket-key listings of every site `keep_site` refuses, and hand
+    /// them back owned.
+    ///
+    /// # Why the question is coarser than the other two sweeps'
+    ///
+    /// Because the key is. A listing is `(site, AWIPS code)` with **no volume in
+    /// it** — the days' worth of keys a site's objects are *ranked* against, not
+    /// one frame's answer — so "does any frame still name this volume" is a
+    /// question it cannot be asked. What it can be asked is whether anything
+    /// still needs the site at all, and the caller derives that from the very
+    /// same two sets the volume and object predicates are built from, so the
+    /// three cannot come to disagree about which sites are live.
+    ///
+    /// # Until this, a site switch was the only thing that removed one
+    ///
+    /// `clear_all` cleared this map when a pane left a radar, which is exactly
+    /// the call that had to go: it emptied every *other* site's state along with
+    /// the departing one's. Nothing else ever removed an entry, so without this
+    /// a session would keep one listing per `(site, code)` it ever looped for
+    /// its whole life — a few hundred keys apiece, small beside the volumes and
+    /// the objects, and unbounded on the one axis a session can walk.
+    ///
+    /// It is also the entry with the longest reach when it is wrong.
+    /// [`claim_l3_listing`](Self::claim_l3_listing) refuses a second listing for
+    /// a `(site, code)` this map already holds, and the days a listing covers
+    /// come from the frames that asked for it — so a listing kept past the loop
+    /// that made it is re-used for a window it does not cover, and every frame
+    /// outside it resolves to a gap that is indistinguishable from the site
+    /// having served nothing.
+    ///
+    /// # It does not touch [`l3_keys_in_flight`](Self::l3_keys_in_flight)
+    ///
+    /// That is an in-flight mark and is left alone for the reason
+    /// [`retain_scans`](Self::retain_scans) gives about the others: clearing it
+    /// would let the same days be listed twice. A listing already on the wire
+    /// lands and is cached, and this sweep collects it on a later pass if
+    /// nothing wants it by then.
+    pub fn retain_l3_keys(&mut self, keep_site: impl Fn(&str) -> bool) -> Vec<Arc<Vec<String>>> {
+        self.l3_keys
+            .extract_if(|(site, _), _| !keep_site(site.as_str()))
+            .map(|(_, keys)| keys)
+            .collect()
+    }
+
     fn l3_key(site: &str, code: &str, ts: &chrono::NaiveDateTime) -> L3FrameKey {
         (site.to_string(), code.to_string(), *ts)
     }
@@ -629,16 +675,16 @@ impl LoopDownloadManager {
     /// [`scan_cache`](Self::scan_cache) had before
     /// [`retain_scans`](Self::retain_scans): one entry per frame per AWIPS code,
     /// written by [`cache_l3_product`](Self::cache_l3_product), and removed by
-    /// nothing at all — `clear_all` emptied the map wholesale when a pane left a
-    /// radar and no other path ever took an entry out. A value is an
-    /// [`Level3Product`], which carries the decoded `message` **and** the
-    /// `bytes` it was decoded from — kept because a `Level3Message` has no wire
-    /// form and the browser's rasterization worker re-decodes the bytes itself —
-    /// so every re-listing (a product switch, a time navigation,
-    /// `reinit_active_loops`) leaves its whole previous window resident, per
-    /// code, for the life of the process. A few hundred kilobytes an entry
-    /// rather than a volume's ~10 MB, which is why it is the sibling leak and
-    /// not the first one found; it is unbounded on the same axis.
+    /// nothing at all — a site switch emptied the map wholesale, and no other
+    /// path ever took an entry out. A value is a [`Level3Product`], which
+    /// carries the decoded `message` **and** the `bytes` it was decoded from —
+    /// kept because a `Level3Message` has no wire form and the browser's
+    /// rasterization worker re-decodes the bytes itself — so every re-listing
+    /// (a product switch, a time navigation, `reinit_active_loops`) leaves its
+    /// whole previous window resident, per code, for the life of the process. A
+    /// few hundred kilobytes an entry rather than a volume's ~10 MB, which is
+    /// why it is the sibling leak and not the first one found; it is unbounded
+    /// on the same axis.
     ///
     /// Dropping `message` and re-decoding from `bytes` on demand would halve an
     /// entry and is a different question from *which* entries are held. It is
@@ -865,27 +911,6 @@ impl LoopDownloadManager {
                 .get(&pane)
                 .is_none_or(|p| p.queue.is_empty())
     }
-
-    /// Reset all loop download state. Used on site switch to avoid stale data.
-    ///
-    /// The undispatched queues go with the rest. Keeping them would not corrupt
-    /// anything now that the site travels with the queue — a leftover download
-    /// still files under the site it was listed for — but every loop this call
-    /// precedes is about to be rebuilt and re-listed, so those entries are network
-    /// spent on files nobody asked for. "Clear all" leaving one field populated is
-    /// also the kind of thing the next reader has to re-derive; it does not.
-    pub fn clear_all(&mut self) {
-        self.scan_cache.clear();
-        self.in_flight_set.clear();
-        self.pending_downloads.clear();
-        self.pending_l3.clear();
-        self.plans.clear();
-        self.l3_keys.clear();
-        self.l3_keys_in_flight.clear();
-        self.l3_cache.clear();
-        self.l3_in_flight.clear();
-        self.in_flight_count = 0;
-    }
 }
 
 #[cfg(test)]
@@ -1014,50 +1039,81 @@ mod tests {
         ));
     }
 
-    /// A site switch drops every site's cached data, not just the one switched away
-    /// from — the loops are all rebuilt.
+    /// **A pane leaving a radar takes only its own pending work.**
     ///
-    /// Including the undispatched queues, which the assertions below cover
-    /// explicitly. Leaving those behind is not a correctness bug — the site travels
-    /// with the queue, so a leftover download still files under the site it was
-    /// listed for — but it is network spent on files no rebuilt loop asked for, and
-    /// a `clear_all` that quietly leaves one field populated is a trap for whoever
-    /// reads it next. Pinning it makes the choice deliberate either way.
+    /// The successor to `clear_all_empties_every_sites_state`, extended rather
+    /// than deleted, and inverted where its premise was the defect. That pin was
+    /// on `clear_all`, which `SwitchRadarSite` called whenever *any* pane left a
+    /// radar and which emptied both shared caches, every pane's queues and every
+    /// frame plan — so a second pane looping a different site silently lost its
+    /// loop. Its queue half is kept here, aimed at `remove_pending`, which is
+    /// what the switch calls now: no entry of the departing pane's is left
+    /// behind to be dispatched for a radar it is no longer on. Its cache half is
+    /// the complement it lacked, and the assertions below say so directly.
+    ///
+    /// The concurrency assertion is inverted rather than dropped, and that is
+    /// not bookkeeping either: `clear_all` reset `in_flight_count` to zero while
+    /// downloads were still on the wire, which raised the effective cap above
+    /// what was running — exactly what `retain_scans` refuses to do and explains
+    /// at length. Nothing moves that counter here.
     #[test]
-    fn clear_all_empties_every_sites_state() {
+    fn a_departing_pane_takes_only_its_own_pending_work() {
         let mut mgr = LoopDownloadManager::new();
         mgr.cache_scan("KTLX", ts(0), volume());
         mgr.cache_scan("KOUN", ts(0), volume());
+        mgr.cache_l3_product("KOUN", "EET", ts(0), Some(l3()));
         mgr.mark_in_flight("KTLX", ts(1));
-        mgr.insert_pending(
-            0,
-            PendingDownloads {
-                site: "KTLX".to_string(),
-                queue: [(
-                    ts(2),
-                    Identifier::new("KTLX20240101_000200_V06".to_string()),
-                )]
-                .into_iter()
-                .collect(),
-            },
-        );
+        for (pane, site) in [(0usize, "KTLX"), (1, "KOUN")] {
+            mgr.insert_pending(
+                pane,
+                PendingDownloads {
+                    site: site.to_string(),
+                    queue: [(ts(2), Identifier::new(format!("{site}20240101_000200_V06")))]
+                        .into_iter()
+                        .collect(),
+                },
+            );
+        }
         mgr.add_spawned(2);
         assert!(
-            !mgr.is_pane_done(0),
-            "precondition: pane 0 has a download queued"
+            !mgr.is_pane_done(0) && !mgr.is_pane_done(1),
+            "precondition: both panes have a download queued"
         );
 
-        mgr.clear_all();
+        mgr.remove_pending(0);
 
-        assert!(!mgr.is_cached("KTLX", &ts(0)));
-        assert!(!mgr.is_cached("KOUN", &ts(0)));
-        assert!(!mgr.is_in_flight("KTLX", &ts(1)));
-        assert!(mgr.is_pane_done(0), "and no pane is still owed a download");
         assert!(
-            mgr.pending_pane_indices().is_empty(),
-            "with no queue entry left behind to be dispatched after the switch"
+            mgr.is_pane_done(0),
+            "the departing pane is still owed a download"
         );
-        assert_eq!(mgr.available_slots(4), 4);
+        assert_eq!(
+            mgr.pending_pane_indices(),
+            vec![1],
+            "either the departing pane left a queue entry to be dispatched for \
+             the radar it is no longer on, or the bystander's went with it"
+        );
+        // The caches are keyed by site, not by pane, and are the sweep's to
+        // collect. A pane-scoped teardown that reached them would take another
+        // site's loop with it, which is the defect this shape replaces.
+        assert!(
+            mgr.is_cached("KTLX", &ts(0)) && mgr.is_cached("KOUN", &ts(0)),
+            "a per-pane teardown emptied the shared volume cache"
+        );
+        assert!(
+            mgr.l3_is_resolved("KOUN", "EET", &ts(0)),
+            "a per-pane teardown emptied the shared Level III cache"
+        );
+        assert!(
+            mgr.is_in_flight("KTLX", &ts(1)),
+            "a download already on the wire lost its mark, so the same file is \
+             requested a second time"
+        );
+        assert_eq!(
+            mgr.available_slots(4),
+            2,
+            "the concurrency counter moved, so the cap no longer counts what is \
+             actually running"
+        );
     }
 
     /// `retain_scans` hands the evicted volumes back rather than freeing them.
@@ -1549,6 +1605,54 @@ mod tests {
              evicted, so each retired frame is paired again and thrown away by \
              the next sweep",
         );
+    }
+
+    /// **The key listings are swept by site, and only by site.**
+    ///
+    /// A listing has no volume in its key — it is the days' worth of bucket keys
+    /// a site's objects are ranked against — so the only question it can be
+    /// asked is whether anything still needs the site. Nothing removed one
+    /// before: the site switch's wholesale clear did it, and that call is what
+    /// had to go.
+    ///
+    /// `l3_keys_in_flight` is left alone, so a listing already on the wire is
+    /// not requested a second time.
+    #[test]
+    fn retain_l3_keys_drops_a_site_nothing_needs_and_keeps_the_rest() {
+        let mut mgr = LoopDownloadManager::new();
+        for (site, code) in [("KTLX", "EET"), ("KTLX", "DVL"), ("KOUN", "EET")] {
+            assert!(mgr.claim_l3_listing(site, code));
+            mgr.cache_l3_keys(
+                site,
+                code,
+                vec![format!("{site}_{code}_2024_01_01_00_00_30")],
+            );
+        }
+        assert!(mgr.claim_l3_listing("KLZK", "EET"), "and one still listing");
+        assert!(
+            mgr.l3_keys("KTLX", "EET").is_some() && mgr.l3_keys("KOUN", "EET").is_some(),
+            "precondition: three listings have landed",
+        );
+
+        let removed = mgr.retain_l3_keys(|site| site == "KOUN");
+
+        assert_eq!(removed.len(), 2, "both of KTLX's codes went");
+        assert!(
+            mgr.l3_keys("KTLX", "EET").is_none() && mgr.l3_keys("KTLX", "DVL").is_none(),
+            "a departed site's listings outlived it, and `claim_l3_listing` \
+             will now refuse to re-list them for a window they do not cover",
+        );
+        assert!(
+            mgr.l3_keys("KOUN", "EET").is_some(),
+            "a site something still needs lost its listing",
+        );
+        assert!(
+            !mgr.claim_l3_listing("KLZK", "EET"),
+            "a listing already on the wire lost its mark, so the same days are \
+             listed a second time",
+        );
+        // And a site the sweep emptied really can be listed again.
+        assert!(mgr.claim_l3_listing("KTLX", "EET"));
     }
 
     /// The in-flight marks are not the sweep's to touch, for the reason

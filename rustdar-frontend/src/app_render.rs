@@ -4422,10 +4422,13 @@ fn frame_sweep(
 ///   that**, and would have to re-check this. So would dropping the sweep's grace
 ///   rule for a loop still fetching its listing: a loop whose frames are
 ///   momentarily empty names nothing.
-/// - The one thing that empties the cache wholesale under a live loop is
-///   `clear_all`, reached only from `SwitchRadarSite`, which deactivates every
-///   affected loop in the same pass. **A second caller of `clear_all` would break
-///   that**, and would have to re-check this.
+/// - **Nothing empties the cache wholesale at all any more.** The one call that
+///   did — `LoopDownloadManager::clear_all`, reached from `SwitchRadarSite` —
+///   is gone, because it emptied every *other* site's state along with the
+///   departing pane's. A site switch now takes only the departing pane's own
+///   queues and plan, and the entries its caches held go on the sweep above,
+///   under the rule this bullet's predecessors state. **A new wholesale clear
+///   would break that**, and would have to re-check this.
 fn own_sweep(
     loop_mgr: &crate::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LoopPlaybackState,

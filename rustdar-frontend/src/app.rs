@@ -2595,18 +2595,19 @@ impl App {
     /// `(site, timestamp)`, written by `append_scan_to_active_loops` on every
     /// auto-poll and every completed live volume, and by the loop download
     /// path. Nothing removed an entry: loop-frame eviction retires a pane's
-    /// *frame*, `clear_all` fires only when a pane leaves a radar, and the loop
-    /// pool's byte budget counts texture bytes, so these CPU-side volumes sat
-    /// outside every budget in the workspace. A pane parked on a live radar
-    /// accumulated 0.4–1 GB an hour, unbounded — fatal inside wasm32's 4 GiB
-    /// address space, and an OOM rather than a leak on a handheld.
+    /// *frame*, the site switch's wholesale clear was the only other remover
+    /// and has since gone, and the loop pool's byte budget counts texture
+    /// bytes, so these CPU-side volumes sat outside every budget in the
+    /// workspace. A pane parked on a live radar accumulated 0.4–1 GB an hour,
+    /// unbounded — fatal inside wasm32's 4 GiB address space, and an OOM rather
+    /// than a leak on a handheld.
     ///
     /// # And the sibling that had the same shape
     ///
     /// `LoopDownloadManager::l3_cache` is the same defect on the other
     /// datasource: one `Level3Product` per `(site, AWIPS code, volume start)`,
     /// written by `cache_l3_product` for every frame of every Level III loop,
-    /// and taken out by nothing but the same `clear_all`. Each carries the
+    /// and taken out by nothing but that same site switch. Each carries the
     /// decoded message *and* the bytes it was decoded from, a few hundred
     /// kilobytes rather than a volume's ~10 MB — smaller per entry, unbounded on
     /// the same axis, and it grows on every re-listing: a product switch, a time
@@ -2794,11 +2795,11 @@ impl App {
         // **The other datasource's cache, by the same rule and the same
         // predicate.** `l3_cache` had exactly the shape `scan_cache` had — one
         // entry per frame per AWIPS code, written by `cache_l3_product` and
-        // removed by nothing but `clear_all` — and each entry carries a decoded
-        // `Level3Message` *and* the bytes it was decoded from. Smaller per entry
-        // than a volume and unbounded on the same axis, so a Level III loop that
-        // re-lists leaves its whole previous window behind, per code, for the
-        // life of the process.
+        // removed by nothing but the site switch — and each entry carries a
+        // decoded `Level3Message` *and* the bytes it was decoded from. Smaller
+        // per entry than a volume and unbounded on the same axis, so a Level III
+        // loop that re-lists leaves its whole previous window behind, per code,
+        // for the life of the process.
         //
         // The predicate is passed unchanged, which is what makes the two caches
         // answer one question. It judges `(site, volume start)` and never the
@@ -2806,6 +2807,24 @@ impl App {
         // rather than a shortcut, and note that the frames a loop names do not
         // move when its product does.
         crate::offload::discard_each("evicted-loop-object", self.loop_mgr.retain_l3(keep));
+        // **The bucket-key listings, at the only resolution their key has.**
+        // `l3_keys` is `(site, AWIPS code)` with no volume in it, so this asks
+        // whether anything still needs the site at all — derived from the *same
+        // two sets* as `keep`, not from a second observation, so the three
+        // sweeps cannot disagree about which sites are live.
+        //
+        // It is here because the site switch no longer wipes the manager:
+        // `clear_all` was the only thing that ever removed one of these, and it
+        // took every other site's state with it. Unswept, a session keeps a
+        // listing per `(site, code)` it ever looped — and worse than the bytes,
+        // `claim_l3_listing` refuses to re-list one this map holds, so a stale
+        // listing is re-used for a window whose days it does not cover and every
+        // frame outside them reads as a gap.
+        let keep_site = |site: &str| settling.contains(site) || needed.contains_key(site);
+        crate::offload::discard_each(
+            "evicted-loop-l3-listing",
+            self.loop_mgr.retain_l3_keys(keep_site),
+        );
     }
 
     /// Persist the config if it has changed and the interval has elapsed.

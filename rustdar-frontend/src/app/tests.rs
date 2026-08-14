@@ -2401,10 +2401,11 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
     let body = fn_body("fn evict_unneeded_loop_scans(");
     assert_eq!(
         body.matches("crate::offload::discard_each(").count(),
-        2,
-        "one of the loop's two caches frees its evictions where it evicted them \
-         — on the frame thread, 47–69 MiB apiece for a volume and a decoded \
-         message plus its own bytes for an object: {body}"
+        3,
+        "one of the loop's three holders frees its evictions where it evicted \
+         them — on the frame thread, 47–69 MiB apiece for a volume, a decoded \
+         message plus its own bytes for an object, a day's bucket keys for a \
+         listing: {body}"
     );
     // The grace rule, named rather than described: without it a loop whose
     // listing is in flight names no frame, and the sweep takes its whole
