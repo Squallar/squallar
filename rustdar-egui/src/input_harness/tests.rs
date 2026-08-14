@@ -15320,7 +15320,7 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
 ///
 /// 1. **Against the pending notice: the `stale_image_on_screen` gate.** Both
 ///    `PaneState::displayed_melting_layer_source` and
-///    `PaneState::displayed_storm_motion_source` return `None` while the pane
+///    `PaneState::displayed_storm_motion` return `None` while the pane
 ///    is showing somebody else's product, because the render input they
 ///    describe is not the one behind the picture on the glass.
 /// 2. **Against each other: the product.** One is gated on
@@ -15342,9 +15342,9 @@ fn the_top_of_pane_notices_never_stack() {
         h.painted_text_strings(),
     );
     assert_eq!(
-        storm_motion_notice_painted(&h),
+        srm_legend_line_painted(&h),
         None,
-        "a classification pane drew a storm-motion notice; painted: {:?}",
+        "a classification pane drew a storm-motion vector; painted: {:?}",
         h.painted_text_strings(),
     );
 
@@ -15366,13 +15366,15 @@ fn the_top_of_pane_notices_never_stack() {
         h.painted_text_strings(),
     );
 
-    // 2. The storm-motion caveat against the pending notice, on exactly the
-    //    same terms — the third notice earns no exemption from the gate the
-    //    second one is held to.
-    let mut srv = storm_relative_showing(Some(StormMotionSource::BunkersRightMover));
+    // 2. **There is no third notice any more.** The storm-motion plate was
+    //    removed rather than reworded: its vector moved into the legend, where
+    //    it is drawn on every rung and cannot contend for this position at all.
+    //    An SRV pane is asserted to leave the plate free, which is the
+    //    property a future rung with a caption "for symmetry" would break.
+    let mut srv = storm_relative_showing(Some(srm_vector(StormMotionSource::BunkersRightMover)));
     assert!(
-        storm_motion_notice_painted(&srv).is_some() && !any_notice_painted(&srv),
-        "precondition: the storm-motion notice alone; painted: {:?}",
+        srm_legend_line_painted(&srv).is_some() && !any_notice_painted(&srv),
+        "precondition: the legend line and no plate; painted: {:?}",
         srv.painted_text_strings(),
     );
     assert_eq!(
@@ -15382,6 +15384,9 @@ fn the_top_of_pane_notices_never_stack() {
         srv.painted_text_strings(),
     );
 
+    // And the legend line is held to the same `stale_image_on_screen` gate the
+    // plate was: a pane showing somebody else's pixels says nothing about what
+    // shifted them, because it did not shift them.
     srv.offer_product(0, RadarProduct::Reflectivity, 0.5);
     srv.select_product(0, RadarProduct::Reflectivity);
     assert!(
@@ -15391,9 +15396,9 @@ fn the_top_of_pane_notices_never_stack() {
         srv.painted_text_strings(),
     );
     assert_eq!(
-        storm_motion_notice_painted(&srv),
+        srm_legend_line_painted(&srv),
         None,
-        "the storm-motion notice was painted under the pending one; painted: {:?}",
+        "the previous product's vector was drawn over reflectivity; painted: {:?}",
         srv.painted_text_strings(),
     );
 }
@@ -15404,7 +15409,7 @@ fn the_top_of_pane_notices_never_stack() {
 /// [`classification_showing`]'s sibling, built the same way — through the real
 /// UI, with the image *placed* rather than the accessor stubbed — so what is
 /// asserted is what a viewer would be looking at.
-fn storm_relative_showing(source: Option<rustdar_radar::srv::StormMotionSource>) -> InputHarness {
+fn storm_relative_showing(source: Option<rustdar_radar::srv::SrvMotion>) -> InputHarness {
     use rustdar_radar::types::RadarProduct;
 
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -15426,115 +15431,185 @@ fn storm_relative_showing(source: Option<rustdar_radar::srv::StormMotionSource>)
     h
 }
 
-/// The storm-motion notice a pane painted, if any.
+/// The storm-motion line a pane painted into its legend, if any.
 ///
-/// Matched on the caption itself, as [`melting_layer_notice_painted`] is and
-/// for the same reason: the notice deliberately carries no leading icon, so
-/// the caption *is* the whole message.
+/// Matched on the `SRM ` prefix rather than on a table of expected strings,
+/// because the whole point of the line is that it carries *numbers* — a probe
+/// that listed the strings it expected could only ever confirm the tag.
 ///
-/// The table is built from the rungs that *have* a caption rather than from a
-/// list written here — `caption` returns `None` for the two that earn no
-/// notice, and a probe that hard-coded four strings would not compile once one
-/// of them stopped existing.
-fn storm_motion_notice_painted(h: &InputHarness) -> Option<String> {
-    use rustdar_radar::srv::StormMotionSource as S;
-    let captions: Vec<&'static str> = [
-        S::UserOverride,
-        S::RpgScitAverage,
-        S::BunkersRightMover,
-        S::MeanWind,
-    ]
-    .into_iter()
-    .filter_map(S::caption)
-    .collect();
+/// This replaced a probe that matched whole caption sentences off
+/// `StormMotionSource::caption`. That method is gone with the plate it fed.
+fn srm_legend_line_painted(h: &InputHarness) -> Option<String> {
     h.painted_text_strings()
         .iter()
-        .find(|t| captions.contains(&t.as_str()))
+        .find(|t| t.starts_with("SRM "))
         .cloned()
 }
 
-/// **A viewer can tell the RPG's own storm motion from a prediction — and is
-/// not nagged about the ordinary case.**
+/// A vector on `source`'s rung, with numbers distinct enough per rung that a
+/// test which mixed two rungs up would also mix two readings up.
+fn srm_vector(source: rustdar_radar::srv::StormMotionSource) -> rustdar_radar::srv::SrvMotion {
+    use rustdar_radar::srv::StormMotionSource as S;
+    let (speed_kt, direction_deg) = match source {
+        S::UserOverride => (45.0, 210.0),
+        S::RpgScitAverage => (31.0, 246.0),
+        S::MeanWind => (26.0, 209.0),
+        S::BunkersRightMover => (38.0, 224.0),
+    };
+    rustdar_radar::srv::SrvMotion {
+        speed_kt,
+        direction_deg,
+        source,
+    }
+}
+
+/// **A viewer reads the vector their picture was shifted by, not an apology.**
 ///
-/// The same two halves `a_classification_says_when_its_melting_layer_was_never_measured`
-/// balances, for the other per-picture render input, and the second half is
-/// again the harder one.
+/// Every gate on an SRV pane is a velocity with `speed \u{b7} cos(direction \u{2212}
+/// azimuth)` already added — a solid-body shift of the whole field. The number
+/// that did that is the one fact about the picture nothing on screen can
+/// recover, and it belongs in the legend on **every** rung.
 ///
-/// SRV shifted by a Bunkers right-mover is not a slightly worse SRV. The
-/// right-mover is a *prediction* of where a supercell would deviate from the
-/// mean wind; the RPG's vector is the average of the cells its SCIT algorithm
-/// actually tracked. The two differ by a signed rotation by construction, and
-/// the correction is `speed · cos(direction − azimuth)` at every gate — a
-/// solid-body shift of the whole field, not a local wobble. A pane that drew
-/// the two identically would be showing one quantity under the other's name.
-///
-/// But the RPG's own vector is the ordinary case, and a caveat on the ordinary
-/// case is worse than none — the section pane's module header records what that
-/// cost. So the rule about which rungs speak is not written at the draw site
-/// and not written here: it is `StormMotionSource::caption`, and this test
-/// reads that method rather than restating it.
+/// This test replaced one that asserted the opposite shape. The pane used to
+/// draw a wrapped two-line plate over the radar on the two derived rungs and
+/// **nothing at all** on the ordinary one — so the reader who most often wanted
+/// to know what shifted their field was told nothing, and the reader on a
+/// fallback was told only that it might be badly wrong, in this codebase's own
+/// vocabulary, with no number and no recourse. The rungs the plate stayed quiet
+/// for are asserted here to speak, which is the half that would silently
+/// regress.
 #[test]
-fn a_storm_relative_field_says_when_the_rpg_did_not_supply_its_vector() {
+fn a_storm_relative_field_shows_the_vector_it_was_shifted_by() {
     use rustdar_radar::srv::StormMotionSource;
 
-    // The two rungs that earn no notice, and they earn none for two different
-    // reasons: the RPG's own is the expected case, and an override is the
-    // user's own deliberate act with a widget already showing it.
-    for quiet in [
+    for rung in [
         StormMotionSource::RpgScitAverage,
         StormMotionSource::UserOverride,
-    ] {
-        let h = storm_relative_showing(Some(quiet));
-        assert_eq!(
-            quiet.caption(),
-            None,
-            "precondition: {quiet:?} earns no notice",
-        );
-        assert_eq!(
-            storm_motion_notice_painted(&h),
-            None,
-            "{quiet:?} drew a caveat on a case that earns none; painted: {:?}",
-            h.painted_text_strings(),
-        );
-    }
-
-    // The two fallback rungs say so, in the source's own words — which name the
-    // *direction* of the discrepancy ("clockwise of the RPG's cell average")
-    // rather than hedging, because a reader who knows which way it is wrong can
-    // correct for it.
-    for spoken in [
-        StormMotionSource::BunkersRightMover,
         StormMotionSource::MeanWind,
+        StormMotionSource::BunkersRightMover,
     ] {
-        let caption = spoken
-            .caption()
-            .unwrap_or_else(|| panic!("precondition: {spoken:?} earns a notice"));
-        let h = storm_relative_showing(Some(spoken));
-        let notice = storm_motion_notice_painted(&h).unwrap_or_else(|| {
+        let motion = srm_vector(rung);
+        let mut h = storm_relative_showing(Some(motion));
+        // In the reader's own unit, so the expected number is converted here
+        // rather than written out — a literal would pin the *default* unit and
+        // say nothing about the conversion. `the_storm_motion_vector_is_drawn_
+        // in_the_readers_speed_unit` is the one that walks all four.
+        h.gui_mut().preferences.speed = rustdar_units::SpeedUnit::Knots;
+        h.warm_up();
+        let line = srm_legend_line_painted(&h).unwrap_or_else(|| {
             panic!(
-                "{spoken:?} said nothing; painted: {:?}",
+                "{rung:?} drew no vector; painted: {:?}",
                 h.painted_text_strings()
             )
         });
+
+        // The quantity: speed, direction, and one short word for the source.
         assert!(
-            notice.contains(caption),
-            "the notice does not carry {spoken:?}'s own caption: {notice:?}",
+            line.contains(&format!("{:.0} kt", motion.speed_kt)),
+            "{rung:?}'s line names no speed: {line:?}",
         );
-        // Over the pane it is about, not somewhere in the chrome: in a split
-        // layout each pane answers for its own image.
+        assert!(
+            line.contains(&format!("{:03.0}\u{b0}", motion.direction_deg)),
+            "{rung:?}'s line names no direction: {line:?}",
+        );
+        assert!(
+            line.contains(rung.tag()),
+            "{rung:?}'s line does not say where the vector came from: {line:?}",
+        );
+
+        // In the legend, on the pane it describes — and **not** as a plate over
+        // the product. One line, and short: the plate this replaced wrapped to
+        // two lines across the middle of the radar.
         let pane_rect = h.pane_rects()[0];
         assert!(
-            h.text_painted_in(pane_rect, caption),
-            "{spoken:?}'s notice was painted outside the pane it describes; \
+            h.text_painted_in(pane_rect, &line),
+            "{rung:?}'s line was painted outside the pane it describes; \
              painted: {:?}",
             h.painted_text_strings(),
         );
+        assert!(
+            line.len() <= 32,
+            "{rung:?}'s legend line is paragraph-sized: {line:?}",
+        );
     }
 
-    // And a render that states no vector at all — every product that shifts
-    // nothing — says nothing either.
-    assert_eq!(
-        storm_motion_notice_painted(&storm_relative_showing(None)),
-        None
-    );
+    // A render that states no vector at all — every product that shifts
+    // nothing — draws no line.
+    assert_eq!(srm_legend_line_painted(&storm_relative_showing(None)), None);
+}
+
+/// **The vector relabels with the reader's speed unit, in the same frame.**
+///
+/// The one rule every user-facing number in this app is held to, applied to the
+/// number that replaced a paragraph. The direction is a compass bearing and
+/// stays in degrees in every unit system, which is asserted alongside — a
+/// conversion applied to it would be a silent, plausible-looking error.
+#[test]
+fn the_storm_motion_vector_is_drawn_in_the_readers_speed_unit() {
+    use rustdar_radar::srv::{SrvMotion, StormMotionSource};
+    use rustdar_units::SpeedUnit;
+
+    // 30.0 kt in each unit, rounded as the line rounds: 34.5 mph, 15.4 m/s,
+    // 55.6 km/h.
+    let motion = SrvMotion {
+        speed_kt: 30.0,
+        direction_deg: 240.0,
+        source: StormMotionSource::RpgScitAverage,
+    };
+    let expected = [
+        (SpeedUnit::Mph, "SRM 35 mph @ 240\u{b0}"),
+        (SpeedUnit::MetersPerSec, "SRM 15 m/s @ 240\u{b0}"),
+        (SpeedUnit::KilometersPerHour, "SRM 56 km/h @ 240\u{b0}"),
+        (SpeedUnit::Knots, "SRM 30 kt @ 240\u{b0}"),
+    ];
+    let mut h = storm_relative_showing(Some(motion));
+    for (unit, prefix) in expected {
+        h.gui_mut().preferences.speed = unit;
+        h.warm_up();
+        let line = srm_legend_line_painted(&h).unwrap_or_else(|| panic!("{unit:?}: nothing drawn"));
+        assert!(
+            line.starts_with(prefix),
+            "{unit:?}: the vector is not in the unit the reader asked for: {line:?}",
+        );
+        assert!(
+            line.contains(StormMotionSource::RpgScitAverage.tag()),
+            "{unit:?}: the source tag went missing with the unit change: {line:?}",
+        );
+    }
+}
+
+/// **The pane never apologises for the rung it is on.**
+///
+/// The old plate's wording is pinned as absent, phrase by phrase, because that
+/// is the thing that would come back: a future rung added to the chain, given a
+/// caption "for symmetry", and drawn over the radar again. A rung within ~10\u{b0}
+/// of what the NWS publishes does not warrant a warning, and the two rungs that
+/// are further off are both reached only because a reader asked for them.
+#[test]
+fn no_storm_motion_rung_apologises_over_the_radar() {
+    use rustdar_radar::srv::StormMotionSource;
+
+    for rung in [
+        StormMotionSource::RpgScitAverage,
+        StormMotionSource::UserOverride,
+        StormMotionSource::MeanWind,
+        StormMotionSource::BunkersRightMover,
+    ] {
+        let h = storm_relative_showing(Some(srm_vector(rung)));
+        for painted in h.painted_text_strings() {
+            let lower = painted.to_ascii_lowercase();
+            for lament in [
+                "no rpg storm motion",
+                "cell average",
+                "unpredictable",
+                "too little shear",
+                "can differ",
+            ] {
+                assert!(
+                    !lower.contains(lament),
+                    "{rung:?} painted {painted:?}, which laments rather than reports",
+                );
+            }
+        }
+    }
 }

@@ -1354,8 +1354,9 @@ impl RadarProduct {
     /// Storm-relative velocity is deliberately absent: it once fetched five
     /// objects here — `N0S` for the vector in its PDB and `N0G`/`N1G`/
     /// `N2U`/`N3U` as dealiased tilts — and is now derived entirely from the
-    /// Level II volume already in hand, dealiased locally with a Bunkers
-    /// right-mover default vector. See [`crate::srv`].
+    /// Level II volume already in hand, dealiased locally and shifted by
+    /// [`crate::srv::storm_motion`]'s chain — which still reads an `N0S` for
+    /// the RPG's own vector, on the Level III round the app already makes.
     pub fn level3_products(&self) -> Option<&'static [&'static str]> {
         match self {
             RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
@@ -1607,8 +1608,9 @@ impl RadarProduct {
     /// They each used to carry their own copy of the match. The copy the chunk
     /// feed read omitted [`StormRelativeVelocity`](Self::StormRelativeVelocity),
     /// so a live SRV pane narrowed its site's feed to a single tilt while SRV
-    /// went on fitting its dealias seed and its default Bunkers vector from
-    /// "every velocity tilt" — of a volume that had deliberately skipped cuts.
+    /// went on fitting its dealias seed and its derived storm motion vector
+    /// from "every velocity tilt" — of a volume that had deliberately skipped
+    /// cuts.
     ///
     /// That is the failure mode of every product below, and it is invisible:
     /// each walks only the tilts *present* — `compute_echo_tops` clamps every

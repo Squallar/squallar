@@ -188,8 +188,10 @@ fn render_from_an_extracted_payload_matches_the_scan_path() {
             product,
             LAT,
             LON,
-            over,
-            None,
+            crate::srv::MotionInputs {
+                user_override: over,
+                ..Default::default()
+            },
             env,
             None,
             &crate::nyquist::DeclaredNyquist::empty(),
@@ -268,8 +270,7 @@ fn a_sweep_that_opened_off_its_tilt_still_renders_after_the_port() {
         product,
         LAT,
         LON,
-        None,
-        None,
+        crate::srv::MotionInputs::default(),
         None,
         None,
         &crate::nyquist::DeclaredNyquist::empty(),
@@ -1003,7 +1004,7 @@ fn the_sentinel_elevation_is_one_no_sweep_can_carry() {
 /// one. Mirrors `xsect`'s and `voxel`'s tests of the same name.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
-    assert_eq!(FORMAT_VERSION, 11);
+    assert_eq!(FORMAT_VERSION, 12);
     let bytes = RenderInput::extract(
         &volume(),
         0.5,
@@ -1018,7 +1019,7 @@ fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(&bytes[..4], b"RDRI", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
-        11,
+        12,
         "the version is not where a decoder from another build looks for it",
     );
 }
@@ -1174,8 +1175,7 @@ fn a_product_with_no_level_two_moment_extracts_nothing() {
             RadarProduct::EchoTops,
             LAT,
             LON,
-            None,
-            None,
+            crate::srv::MotionInputs::default(),
             None,
             None,
             &crate::nyquist::DeclaredNyquist::empty()
@@ -1209,8 +1209,7 @@ fn hail_without_an_environment_renders_nothing_on_both_paths() {
                 product,
                 LAT,
                 LON,
-                None,
-                None,
+                crate::srv::MotionInputs::default(),
                 None,
                 None,
                 &crate::nyquist::DeclaredNyquist::empty()
@@ -1510,6 +1509,73 @@ fn every_product_has_a_stable_distinct_wire_code() {
 /// not depend on a cache its product never consults, or two panes showing
 /// the same reflectivity sweep would hash to different payloads because one
 /// of them happened to have a melting layer cached.
+/// **The reader's derived-rung choice crosses the port, and only for SRV.**
+///
+/// A worker that could not see it would always fall to the shipped default, so
+/// a reader who asked for the Bunkers right-mover would get it on the desktop
+/// and the 0-6 km mean wind in the browser — two different quantities under one
+/// label, with no error and both drawing a full picture. That is exactly the
+/// failure `rpg_storm_motion` crosses the port to close, in its other
+/// direction, and it is why this is a wire field rather than a page-side
+/// setting.
+#[test]
+fn the_derived_rung_choice_round_trips_and_only_for_srv() {
+    use crate::srv::SrvFallback;
+    let scan = volume();
+
+    // The default is the mean wind, and it is what an unstamped payload says.
+    let bare = RenderInput::extract(
+        &scan,
+        0.5,
+        RadarProduct::StormRelativeVelocity,
+        LAT,
+        LON,
+        None,
+        None,
+    )
+    .expect("the fixture carries velocity");
+    assert_eq!(bare.srv_fallback(), SrvFallback::MeanWind);
+
+    for fallback in [SrvFallback::MeanWind, SrvFallback::BunkersRightMover] {
+        let carried = RenderInput::extract(
+            &scan,
+            0.5,
+            RadarProduct::StormRelativeVelocity,
+            LAT,
+            LON,
+            None,
+            None,
+        )
+        .expect("the fixture carries velocity")
+        .with_srv_fallback(fallback);
+        assert_eq!(carried.srv_fallback(), fallback);
+        let after = RenderInput::from_bytes(&carried.to_bytes()).expect("round trips");
+        assert_eq!(
+            after.srv_fallback(),
+            fallback,
+            "{fallback:?} did not survive the port",
+        );
+        assert_eq!(after, carried);
+        // And it reaches the chain the far end resolves through, not just the
+        // accessor: a field that round-tripped but was never read would look
+        // identical here and paint the wrong quantity.
+        assert_eq!(after.storm_motion().fallback, fallback);
+    }
+
+    // Every other product drops it, on the byte-identity rule: a payload's
+    // bytes must not depend on a preference its product never reads.
+    let reflectivity =
+        RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+            .expect("the fixture carries reflectivity");
+    assert_eq!(
+        reflectivity
+            .clone()
+            .with_srv_fallback(SrvFallback::BunkersRightMover)
+            .to_bytes(),
+        reflectivity.to_bytes(),
+    );
+}
+
 #[test]
 fn the_melting_layer_object_round_trips_and_only_for_the_classification() {
     let scan = volume();

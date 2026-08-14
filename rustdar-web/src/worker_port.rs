@@ -143,13 +143,29 @@ fn deliver(data: &JsValue) {
                 .map(|wire| wire.0),
             // The same filter for the same reason — see `proto::STORM_MOTION`.
             // A raster that applied no vector and a byte this build cannot read
-            // both land on `None`, and the page then draws no qualification;
+            // both land on `None`, and the pane then draws no vector at all;
             // the protocol token is what keeps a worker old enough to mean the
             // second by the first from ever being attached.
-            storm_motion_source: proto::field(data, proto::STORM_MOTION)
-                .and_then(|v| v.as_f64())
-                .and_then(|v| offload::StormMotionWire::from_wire_code(v as u8))
-                .map(|wire| wire.0),
+            //
+            // All three fields or none. A trio that arrived half-formed would
+            // otherwise become a legend reading a real source beside a zeroed
+            // speed, which is a confident lie about what shifted the picture —
+            // so the `?`-chain drops the lot.
+            storm_motion: (|| {
+                let source = proto::field(data, proto::STORM_MOTION)
+                    .and_then(|v| v.as_f64())
+                    .and_then(|v| offload::StormMotionWire::from_wire_code(v as u8))?
+                    .0;
+                let speed_kt =
+                    proto::field(data, proto::STORM_MOTION_SPEED).and_then(|v| v.as_f64())? as f32;
+                let direction_deg =
+                    proto::field(data, proto::STORM_MOTION_DIR).and_then(|v| v.as_f64())? as f32;
+                Some(rustdar_radar::srv::SrvMotion {
+                    speed_kt,
+                    direction_deg,
+                    source,
+                })
+            })(),
         })
     });
 

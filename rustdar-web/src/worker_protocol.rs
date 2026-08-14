@@ -71,6 +71,26 @@ pub const MELTING_LAYER: &str = "mls";
 /// not have resolves to "no source stated" rather than to a plausible label.
 pub const STORM_MOTION: &str = "smv";
 
+/// Worker → page: the **speed** of that vector, knots, or null for a raster
+/// that applied none.
+///
+/// Split from [`STORM_MOTION`] rather than packed with it because the page
+/// reads every numeric field back through one `as_f64` filter, and a packed
+/// pair would need a decoder of its own on a boundary whose whole discipline is
+/// that it carries plain numbers.
+///
+/// It travels because the page **cannot recompute it**. The RPG's vector and a
+/// user override are both known page-side, but the two derived rungs are fitted
+/// from a VAD wind profile that exists only where the volume was decoded — so
+/// without these two fields the legend could name the source of a derived
+/// vector and never the vector, which is exactly the pane that could only
+/// apologise.
+pub const STORM_MOTION_SPEED: &str = "sms";
+
+/// Worker → page: the **direction** that vector comes *from*, degrees, or null
+/// for a raster that applied none. See [`STORM_MOTION_SPEED`].
+pub const STORM_MOTION_DIR: &str = "smd";
+
 /// Worker → page: an output that is not a plan-view frame — a cross-section
 /// raster or a voxel grid — as **one** transferred `Uint8Array` in the payload
 /// type's own wire form.
@@ -135,7 +155,18 @@ pub const OUT_KIND: &str = "outkind";
 /// one display level. Left unqualified it is indistinguishable from the one
 /// that sits at the achievable ceiling, which is exactly the silence the token
 /// exists to convert into a clean termination.
-const PROTOCOL_VERSION: u32 = 6;
+/// Version 7 added [`STORM_MOTION_SPEED`] and [`STORM_MOTION_DIR`] beside that
+/// byte, so a storm-relative reply carries the **vector** and not only its
+/// provenance. It is version 6's case one turn further on. The page draws the
+/// speed and direction in its legend now, and the two derived rungs are fitted
+/// from a VAD profile that exists only where the volume was decoded — so a page
+/// reading these two as absent from a version 6 worker draws no vector at all,
+/// on *every* rung including the RPG's own. That is the whole legend entry
+/// gone, silently, on the one product whose gates all carry a shift the reader
+/// cannot otherwise see. The reverse pairing is no better: a version 6 page
+/// ignores the two fields and shows nothing a version 7 worker took the trouble
+/// to send.
+const PROTOCOL_VERSION: u32 = 7;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

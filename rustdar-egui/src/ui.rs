@@ -1205,6 +1205,19 @@ pub struct Gui {
     /// take it. `None` means "use the vector the `N0S` product carries", which
     /// is the default and is what AWIPS calls the average storm motion.
     pub storm_motion_override: StormMotionOverride,
+    /// Which derived rung storm-relative velocity falls to when the reader has
+    /// entered no override and the volume brought no NWS vector.
+    ///
+    /// The default is the 0-6 km mean wind, which is the derived quantity
+    /// measured closest to what the NWS publishes. The Bunkers right-mover is
+    /// the other choice and it is a genuinely different thing to want — a
+    /// supercell motion prediction rather than a stand-in for the average of
+    /// the cells that were tracked — so it is a reader's setting and not an
+    /// accuracy knob. See `rustdar_radar::srv::SrvFallback`.
+    ///
+    /// `pub` for the reason [`Self::storm_motion_override`] beside it is: the
+    /// crate that owns the commit rule is `rustdar_frontend`.
+    pub srv_fallback: rustdar_radar::srv::SrvFallback,
     /// Whether one of the storm-motion `DragValue`s is under the pointer or
     /// holding the keyboard *right now*. See [`Self::storm_motion_mid_edit`].
     ///
@@ -1839,6 +1852,7 @@ impl Gui {
             preferences: UserPreferences::default(),
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: StormMotionOverride::default(),
+            srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             storm_motion_editing: false,
             volume_painter: None,
             volume_alpha: crate::volume_alpha::AlphaCurves::default(),

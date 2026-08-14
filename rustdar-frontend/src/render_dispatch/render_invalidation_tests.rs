@@ -25,7 +25,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
                     polar: Default::default(),
                     nyquist_ms: None,
                     melting_layer_source: None,
-                    storm_motion_source: None,
+                    storm_motion: None,
                 },
             ))
         })),
@@ -474,7 +474,7 @@ fn cached(range: f64) -> CachedRenderOutput {
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
     }
 }
 

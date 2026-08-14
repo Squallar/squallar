@@ -125,7 +125,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
                 max_range_km: 100.0,
                 nyquist_ms: None,
                 melting_layer_source: None,
-                storm_motion_source: None,
+                storm_motion: None,
                 hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
             },
         ));
@@ -158,7 +158,7 @@ fn response(
         max_range_km: 100.0,
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
         polar: Default::default(),
     }
 }

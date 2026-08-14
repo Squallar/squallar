@@ -95,7 +95,7 @@ fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
     }
 }
 
@@ -131,7 +131,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
                 hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
                 melting_layer_source: None,
-                storm_motion_source: None,
+                storm_motion: None,
             }),
             product: PRODUCT,
             elevation: TILT,
@@ -633,7 +633,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
                 max_range_km: 230.0,
                 nyquist_ms: None,
                 melting_layer_source: None,
-                storm_motion_source: None,
+                storm_motion: None,
                 polar: Default::default(),
             })
             .expect("the receiver lives on the App");

@@ -854,7 +854,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
             polar: Default::default(),
             nyquist_ms: None,
             melting_layer_source: None,
-            storm_motion_source: None,
+            storm_motion: None,
         })),
     );
 

@@ -804,16 +804,14 @@ pub fn render_section<'a>(
     req: &SectionRequest,
     lat: f64,
     lon: f64,
-    storm_motion_override: Option<(f32, f32)>,
-    rpg_storm_motion: Option<(f32, f32)>,
+    motion: crate::srv::MotionInputs,
 ) -> Option<CrossSection> {
     let volume = volume.into();
     // The derivation seam: native moments pass through as a borrow; derived
     // products are computed here, per sweep, before anything samples — so a
     // raw volume can never be sampled under a derived label (the sampler's
     // own gate still refuses that combination).
-    let prepared =
-        crate::derive::prepare(volume, req.product, storm_motion_override, rpg_storm_motion)?;
+    let prepared = crate::derive::prepare(volume, req.product, motion)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
     // scan's rungs are the same cuts flown at the same PRFs. `prepare` reads

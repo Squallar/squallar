@@ -210,7 +210,7 @@ fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
         max_range_km: 100.0,
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
     }
 }
@@ -1130,7 +1130,31 @@ fn storm_relative_pane(
     ctx: &egui::Context,
     source: Option<rustdar_radar::srv::StormMotionSource>,
 ) -> PaneState {
-    pane_showing_render(ctx, RadarProduct::StormRelativeVelocity, None, None, source)
+    pane_showing_render(
+        ctx,
+        RadarProduct::StormRelativeVelocity,
+        None,
+        None,
+        source.map(srm_vector),
+    )
+}
+
+/// A storm motion vector on `source`'s rung, with the speed and direction the
+/// legend would draw. Distinct numbers per rung, so a test that mixed two rungs
+/// up would also mix two vectors up and say so.
+fn srm_vector(source: rustdar_radar::srv::StormMotionSource) -> rustdar_radar::srv::SrvMotion {
+    use rustdar_radar::srv::StormMotionSource as S;
+    let (speed_kt, direction_deg) = match source {
+        S::UserOverride => (45.0, 210.0),
+        S::RpgScitAverage => (31.0, 246.0),
+        S::MeanWind => (26.2, 209.5),
+        S::BunkersRightMover => (38.2, 224.6),
+    };
+    rustdar_radar::srv::SrvMotion {
+        speed_kt,
+        direction_deg,
+        source,
+    }
 }
 
 /// A pane showing a finished render of `product`, described by the facts a
@@ -1140,7 +1164,7 @@ fn pane_showing_render(
     product: RadarProduct,
     nyquist_ms: Option<f64>,
     melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
-    storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 ) -> PaneState {
     use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
 
@@ -1167,7 +1191,7 @@ fn pane_showing_render(
                 max_range_km: 100.0,
                 nyquist_ms,
                 melting_layer_source,
-                storm_motion_source,
+                storm_motion,
                 product,
                 elevation: 0.5,
             }),
@@ -1368,24 +1392,25 @@ fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
 
     let rpg = storm_relative_pane(&ctx, Some(StormMotionSource::RpgScitAverage));
     assert_eq!(
-        rpg.displayed_storm_motion_source(),
-        Some(StormMotionSource::RpgScitAverage),
+        rpg.displayed_storm_motion(),
+        Some(srm_vector(StormMotionSource::RpgScitAverage)),
     );
 
-    // The rungs are reported whether or not they earn a notice. This accessor
-    // answers "what were these pixels shifted by"; `caption` is what decides
-    // whether that answer is worth a plate, and keeping the two apart is what
-    // lets the hover name a rung the notice stays quiet about.
-    for derived in [
+    // Every rung is reported, and the *whole vector* is: the legend draws the
+    // speed and direction beside the source tag, so an accessor that answered
+    // provenance alone would leave the two derived rungs' numbers existing
+    // nowhere outside the renderer — which is exactly the state that left the
+    // pane able to apologise for a fallback and unable to report it.
+    for rung in [
         StormMotionSource::UserOverride,
         StormMotionSource::BunkersRightMover,
         StormMotionSource::MeanWind,
     ] {
-        let pane = storm_relative_pane(&ctx, Some(derived));
+        let pane = storm_relative_pane(&ctx, Some(rung));
         assert_eq!(
-            pane.displayed_storm_motion_source(),
-            Some(derived),
-            "{derived:?} was not reported by the pane it shifted",
+            pane.displayed_storm_motion(),
+            Some(srm_vector(rung)),
+            "{rung:?} was not reported by the pane it shifted",
         );
     }
 
@@ -1401,7 +1426,7 @@ fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
     ] {
         other.selected_product = product;
         assert_eq!(
-            other.displayed_storm_motion_source(),
+            other.displayed_storm_motion(),
             None,
             "{product:?} was described as having been shifted by a storm motion",
         );
@@ -1411,10 +1436,10 @@ fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
     // plan-view field this describes.
     let mut ladder = storm_relative_pane(&ctx, Some(StormMotionSource::BunkersRightMover));
     ladder.set_map_render(MapRender::Volume);
-    assert_eq!(ladder.displayed_storm_motion_source(), None);
+    assert_eq!(ladder.displayed_storm_motion(), None);
     ladder.set_map_render(MapRender::Plan);
     ladder.set_kind(PaneKind::CrossSection);
-    assert_eq!(ladder.displayed_storm_motion_source(), None);
+    assert_eq!(ladder.displayed_storm_motion(), None);
 
     // And a classification pane reports no vector while an SRV pane reports no
     // layer: the two per-picture inputs are gated on different products, which
@@ -1430,7 +1455,7 @@ fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
             &ctx,
             Some(rustdar_radar::hca::MeltingLayerSource::FleetDefault)
         )
-        .displayed_storm_motion_source(),
+        .displayed_storm_motion(),
         None,
     );
 }
@@ -1449,17 +1474,17 @@ fn a_looping_storm_relative_pane_reports_the_playing_frames_vector() {
     let mut pane = storm_relative_pane(&ctx, Some(StormMotionSource::RpgScitAverage));
     pane.loop_state = loop_with_frames(3, 1);
     pane.loop_state.frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
-        storm_motion_source: Some(StormMotionSource::BunkersRightMover),
+        storm_motion: Some(srm_vector(StormMotionSource::BunkersRightMover)),
         ..dummy_plan_view(&ctx)
     }));
     assert_eq!(
-        pane.displayed_storm_motion_source(),
-        Some(StormMotionSource::BunkersRightMover),
+        pane.displayed_storm_motion(),
+        Some(srm_vector(StormMotionSource::BunkersRightMover)),
         "the loop reported the static render's vector, not the frame on the glass",
     );
 
     // A playhead on a frame with no picture yet has nothing to describe, and
     // must not fall back to the texture underneath it.
     pane.loop_state.current_frame = 2;
-    assert_eq!(pane.displayed_storm_motion_source(), None);
+    assert_eq!(pane.displayed_storm_motion(), None);
 }

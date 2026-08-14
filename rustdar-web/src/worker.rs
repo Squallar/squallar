@@ -145,7 +145,7 @@ fn post_result(
             polar,
             nyquist_ms,
             melting_layer_source,
-            storm_motion_source,
+            storm_motion,
         })) => {
             let image = js_sys::Uint8Array::from(image.as_slice());
             let polar = js_sys::Uint8Array::from(polar.to_bytes().as_slice());
@@ -172,13 +172,26 @@ fn post_result(
                 );
             }
             // And again: only storm-relative velocity applies a storm motion
-            // vector, so the null written above stands for every other product.
-            if let Some(source) = storm_motion_source {
-                let code = rustdar_frontend::offload::StormMotionWire(source).wire_code();
+            // vector, so the nulls written above stand for every other product.
+            // All three fields are written together or not at all — the page
+            // rebuilds one `SrvMotion` out of them and treats a partial trio as
+            // no vector, because half a vector on the glass is worse than none.
+            if let Some(motion) = storm_motion {
+                let code = rustdar_frontend::offload::StormMotionWire(motion.source).wire_code();
                 proto::set_field(
                     &message,
                     proto::STORM_MOTION,
                     &JsValue::from_f64(f64::from(code)),
+                );
+                proto::set_field(
+                    &message,
+                    proto::STORM_MOTION_SPEED,
+                    &JsValue::from_f64(f64::from(motion.speed_kt)),
+                );
+                proto::set_field(
+                    &message,
+                    proto::STORM_MOTION_DIR,
+                    &JsValue::from_f64(f64::from(motion.direction_deg)),
                 );
             }
         }

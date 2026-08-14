@@ -372,12 +372,15 @@ pub struct RenderedFrame {
     /// `None` for every raster that shifted nothing — which is every product
     /// but storm-relative velocity.
     ///
-    /// See [`rustdar_radar::srv::StormMotionSource`]. It rides beside
+    /// See [`rustdar_radar::srv::SrvMotion`]. It rides beside
     /// `melting_layer_source` and for the same reason: it is a fact about
-    /// *this* picture that the far end cannot recompute, and here it is the
-    /// difference between the vector the reference product was built with and
-    /// a right-mover prediction that runs clockwise of it.
-    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    /// *this* picture that the far end cannot recompute — the projection of
+    /// this vector is already inside every gate value, and the two derived
+    /// rungs are computed from a wind profile the page never sees.
+    ///
+    /// The whole vector rather than its provenance byte, because the legend
+    /// draws the speed and direction and only apologises for nothing.
+    pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// A [`MeltingLayerSource`](rustdar_radar::hca::MeltingLayerSource) as a
@@ -498,7 +501,7 @@ impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
             polar: render.polar,
             nyquist_ms: render.nyquist_ms,
             melting_layer_source: render.melting_layer_source,
-            storm_motion_source: render.storm_motion_source,
+            storm_motion: render.storm_motion,
         }
     }
 }
@@ -1152,8 +1155,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 request,
                 input.radar_lat(),
                 input.radar_lon(),
-                input.storm_motion_override(),
-                input.rpg_storm_motion(),
+                input.storm_motion(),
             )
             .map(|section| JobOutput::Section(Box::new(section)))
         }
@@ -1183,8 +1185,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 request,
                 input.radar_lat(),
                 input.radar_lon(),
-                input.storm_motion_override(),
-                input.rpg_storm_motion(),
+                input.storm_motion(),
             )
             .map(|grid| JobOutput::Voxels(Box::new(grid)))
         }

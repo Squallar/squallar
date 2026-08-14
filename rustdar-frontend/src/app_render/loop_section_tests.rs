@@ -51,7 +51,7 @@ fn line() -> SectionLine {
 }
 
 fn key() -> SectionLoopKey {
-    SectionLoopKey::new(line(), None)
+    SectionLoopKey::new(line(), None, rustdar_radar::srv::SrvFallback::default())
 }
 
 fn target() -> RenderTarget {
@@ -366,7 +366,15 @@ fn a_cut_for_a_line_the_loop_has_left_is_refused_without_uploading() {
         },
     )
     .expect("two distinct points on Earth");
-    ls.retarget_renders_for(PRODUCT, TILT, Some(SectionLoopKey::new(elsewhere, None)));
+    ls.retarget_renders_for(
+        PRODUCT,
+        TILT,
+        Some(SectionLoopKey::new(
+            elsewhere,
+            None,
+            rustdar_radar::srv::SrvFallback::default(),
+        )),
+    );
     ls.frames[0].render_in_flight = true;
 
     let mut sr = section_response(&ctx, 1);
@@ -500,6 +508,7 @@ fn the_cut_dedupe_weighs_both_halves_of_the_key() {
         )
         .expect("two distinct points on Earth"),
         None,
+        rustdar_radar::srv::SrvFallback::default(),
     );
     assert!(
         !section_already_queued(queued.iter(), ts(0), &target(), &elsewhere),

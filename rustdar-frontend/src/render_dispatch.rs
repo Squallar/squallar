@@ -55,7 +55,7 @@ pub struct CachedPaneRender {
     /// replaced by the time a suspended pane resumes, so a restore that
     /// re-derived this would caption a right-mover prediction with the RPG's
     /// name.
-    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// Per-pane render tracking state.
@@ -232,7 +232,7 @@ pub struct CachedRenderOutput {
     /// Where the storm motion vector behind this shared raster came from —
     /// shared for the same argument as the three above: one buffer, one
     /// shift, one provenance, whichever pane is looking at it.
-    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// `(site, product, view, elevation_tenths)` — see [`elevation_key`] and
@@ -558,7 +558,7 @@ pub struct RenderDispatcher {
     /// The RPG's own storm motion vector per site — the second rung of
     /// `rustdar_radar::srv::storm_motion`, staged for the one product that
     /// reads it and invalidated by
-    /// [`set_storm_motion`](Self::set_storm_motion).
+    /// [`set_storm_motion_choice`](Self::set_storm_motion_choice).
     ///
     /// Carries a volume for exactly the reason `melting_layer` does, and the
     /// lie it prevents is the same shape: the previous volume's SCIT average
@@ -625,10 +625,20 @@ pub struct RenderDispatcher {
     /// vector, so without this the field would keep the old motion until the
     /// next scan. Routed into the Level II render parameters by
     /// [`spawn_level2_render`](Self::spawn_level2_render); with no override
-    /// the renderer applies the Bunkers right-mover from the volume's own
-    /// wind profile (`rustdar_radar::srv`). The RPG-vector history that used
-    /// to live beside this left with the five Level III SRM fetches.
+    /// the renderer applies the RPG's own vector for the volume, and failing
+    /// that the derived rung `last_srv_fallback` beside this names
+    /// (`rustdar_radar::srv`).
     last_storm_motion_override: Option<StormMotionSample>,
+    /// Which derived rung the storm-relative renders on screen fell to when no
+    /// override and no RPG vector applied — the reader's own choice.
+    ///
+    /// Beside the override and invalidated by the same setter, because it fails
+    /// the same way: nothing else about a pane changes when the reader picks a
+    /// different derived rung, so without this the field would keep the old
+    /// quantity until the next scan. It is a *quantity* change and not a
+    /// refinement — the 0-6 km mean wind and the Bunkers right-mover agree to
+    /// within one display level on well under half their gates.
+    last_srv_fallback: rustdar_radar::srv::SrvFallback,
     /// The last whole-volume payload extracted for a cross-section, and what it
     /// was extracted from.
     ///
@@ -787,7 +797,7 @@ struct SectionInputKey {
     /// the old one, for up to a whole volume, with nothing saying so.
     ///
     /// In the key rather than as an eviction in
-    /// [`set_storm_motion_override`](RenderDispatcher::set_storm_motion_override),
+    /// [`set_storm_motion_choice`](RenderDispatcher::set_storm_motion_choice),
     /// which is the other place it could go. Two reasons. The payload cache
     /// holds exactly one entry, so an eviction would throw away a
     /// *reflectivity* payload the vector never touched and charge the next
@@ -802,6 +812,16 @@ struct SectionInputKey {
     /// section stood — the quiet kind of failure this file already carries
     /// two notes about.
     storm_motion: Option<(u32, u32)>,
+    /// Which derived rung the payload was derived with when the field above is
+    /// `None`.
+    ///
+    /// The same silent wrong-field the vector above closes, in the half of the
+    /// chain that vector cannot reach: both derived rungs are reached with no
+    /// override at all, so switching between them changes the payload's every
+    /// gate while `storm_motion` stays `None` on both sides. In the key rather
+    /// than as an eviction for this struct's stated reason — a thing the
+    /// payload depends on cannot be left out of the comparison.
+    srv_fallback: rustdar_radar::srv::SrvFallback,
 }
 
 impl SectionInputKey {
@@ -813,13 +833,18 @@ impl SectionInputKey {
     /// read from the dispatcher's own field at the call site, never taken
     /// from the caller, so the vector a payload is keyed on cannot differ
     /// from the vector it was derived with.
-    fn of(target: &rustdar_egui::pane::SectionTarget, motion: Option<(f32, f32)>) -> Self {
+    fn of(
+        target: &rustdar_egui::pane::SectionTarget,
+        motion: Option<(f32, f32)>,
+        fallback: rustdar_radar::srv::SrvFallback,
+    ) -> Self {
         Self {
             site: target.volume.site.clone(),
             collected: target.volume.collected,
             product: target.product,
             ladder: target.ladder,
             storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
+            srv_fallback: fallback,
         }
     }
 }
@@ -909,6 +934,7 @@ impl RenderDispatcher {
             concurrent_renders: budgets.concurrent_renders,
             raster_side_ceiling_px: budgets.image_side_px,
             last_storm_motion_override: None,
+            last_srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             section_input: None,
         }
     }
@@ -963,11 +989,16 @@ impl RenderDispatcher {
     /// [`spawn_level2_render`](Self::spawn_level2_render) reads into the
     /// render parameters, so the vector a pane is invalidated for cannot
     /// differ from the one it is redrawn with.
-    pub fn set_storm_motion_override(&mut self, motion: Option<StormMotionSample>) -> bool {
-        if self.last_storm_motion_override == motion {
+    pub fn set_storm_motion_choice(
+        &mut self,
+        motion: Option<StormMotionSample>,
+        fallback: rustdar_radar::srv::SrvFallback,
+    ) -> bool {
+        if self.last_storm_motion_override == motion && self.last_srv_fallback == fallback {
             return false;
         }
         self.last_storm_motion_override = motion;
+        self.last_srv_fallback = fallback;
         for prs in &mut self.pane_render {
             if matches!(
                 prs.last_rendered,
@@ -985,7 +1016,7 @@ impl RenderDispatcher {
     /// Record a site's environmental heights and, if the pair actually moved,
     /// drop that site's renders of every product that reads it — the per-site
     /// counterpart of
-    /// [`set_storm_motion_override`](Self::set_storm_motion_override), for the
+    /// [`set_storm_motion_choice`](Self::set_storm_motion_choice), for the
     /// other render parameter that is not part of the cache key. Written by
     /// the sounding drain in `app_render`; the field it writes is the same one
     /// [`env_heights_km_msl_for`](Self::env_heights_km_msl_for) reads into the
@@ -1468,15 +1499,36 @@ impl RenderDispatcher {
     }
 
     /// The storm motion override as the `(speed_kt, direction_deg)` pair the
-    /// Level II render parameters carry, or `None` — Bunkers applies.
+    /// Level II render parameters carry, or `None` — a lower rung applies.
     ///
     /// Read from [`last_storm_motion_override`](Self::last_storm_motion_override),
-    /// the same field [`set_storm_motion_override`](Self::set_storm_motion_override)
+    /// the same field [`set_storm_motion_choice`](Self::set_storm_motion_choice)
     /// invalidates on, so the vector a pane is invalidated for cannot differ
     /// from the one it is drawn with.
     pub(crate) fn storm_motion_override_kt(&self) -> Option<(f32, f32)> {
         self.last_storm_motion_override
             .map(|s| (s.motion.speed_kt, s.motion.direction_deg))
+    }
+
+    /// [`set_storm_motion_choice`](Self::set_storm_motion_choice) with the
+    /// shipped derived rung, for a test whose subject is the override alone.
+    ///
+    /// Named rather than defaulted at the call site so that a test which *is*
+    /// about the rung cannot reach it by accident.
+    #[cfg(test)]
+    pub(crate) fn set_storm_motion_choice_default(
+        &mut self,
+        motion: Option<StormMotionSample>,
+    ) -> bool {
+        self.set_storm_motion_choice(motion, rustdar_radar::srv::SrvFallback::default())
+    }
+
+    /// Which derived rung a Level II render's payload should carry, read from
+    /// the same field [`set_storm_motion_choice`](Self::set_storm_motion_choice) invalidates
+    /// on — so the rung a pane is invalidated for cannot differ from the rung it
+    /// is drawn with, exactly as for the vector above.
+    pub(crate) fn srv_fallback(&self) -> rustdar_radar::srv::SrvFallback {
+        self.last_srv_fallback
     }
 
     /// The environmental heights a Level II render's parameters carry: the
@@ -1581,7 +1633,7 @@ impl RenderDispatcher {
     /// **A `(0.0, 0.0)` reading is handed out like any other.** SCIT tracked no
     /// cells and the RPG painted an unshifted field; that is the vector the
     /// reference product was built with, and withholding it here would fall to
-    /// a Bunkers prediction of a storm the RPG did not think was moving.
+    /// a derived vector for a storm the RPG did not think was moving.
     pub(crate) fn rpg_storm_motion_for(
         &self,
         product: RadarProduct,
@@ -1847,6 +1899,7 @@ impl RenderDispatcher {
                     input: Box::new(
                         input
                             .with_declared_nyquist(declared)
+                            .with_srv_fallback(self.last_srv_fallback)
                             .with_melting_layer_product(melting_layer)
                             .with_rpg_storm_motion(rpg_storm_motion),
                     ),
@@ -1928,7 +1981,7 @@ impl RenderDispatcher {
         let motion = (product == RadarProduct::StormRelativeVelocity)
             .then(|| self.storm_motion_override_kt())
             .flatten();
-        let wanted_key = SectionInputKey::of(target, motion);
+        let wanted_key = SectionInputKey::of(target, motion, self.srv_fallback());
         let reusable = self
             .section_input
             .as_ref()
@@ -2163,7 +2216,7 @@ impl RenderDispatcher {
                             )),
                             nyquist_ms: frame.nyquist_ms,
                             melting_layer_source: frame.melting_layer_source,
-                            storm_motion_source: frame.storm_motion_source,
+                            storm_motion: frame.storm_motion,
                         })
                     }),
                     product,

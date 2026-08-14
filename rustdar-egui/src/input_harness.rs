@@ -1541,7 +1541,7 @@ impl InputHarness {
     ///
     /// `melting_layer_source` is the same shape for the other unmeasurable:
     /// `None` for every product but the hybrid classification, which is what a
-    /// test that is not about the melting layer states. `storm_motion_source`
+    /// test that is not about the melting layer states. `storm_motion`
     /// is the third of the same shape — `None` for every product but
     /// storm-relative velocity — and the two are mutually exclusive by product,
     /// so no fixture legitimately states both.
@@ -1552,7 +1552,7 @@ impl InputHarness {
         elevation: f32,
         nyquist_ms: Option<f64>,
         melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
-        storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+        storm_motion: Option<rustdar_radar::srv::SrvMotion>,
     ) {
         use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_radar::types::{BASE_EXTENT_KM, ImageBounds};
@@ -1608,7 +1608,7 @@ impl InputHarness {
                 max_range_km: extent_km,
                 nyquist_ms,
                 melting_layer_source,
-                storm_motion_source,
+                storm_motion,
                 product,
                 elevation,
             }),

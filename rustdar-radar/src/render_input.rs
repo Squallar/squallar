@@ -72,7 +72,8 @@ pub struct RenderInput {
     radar_lon: f64,
     /// The user's storm motion vector, knots and degrees-from. Read by
     /// storm-relative velocity alone; `None` means "no override", which SRV
-    /// answers with the Bunkers right-mover from the volume's own profile.
+    /// answers with the RPG's own vector where one arrived and otherwise with
+    /// the rung `srv_fallback` names.
     storm_motion_override: Option<(f32, f32)>,
     /// The site's environmental 0 °C / −20 °C heights, km MSL
     /// ([`crate::sounding::EnvHeights`]). Read by the hail pair and the
@@ -125,6 +126,21 @@ pub struct RenderInput {
     /// to check the volume it names ([`crate::level3::names_volume`]). Shipping
     /// bytes would decode the same block twice to recover eight bytes.
     rpg_storm_motion: Option<(f32, f32)>,
+    /// Which derived rung storm-relative velocity falls to when neither an
+    /// override nor an `N0S` vector reached this payload.
+    ///
+    /// A **reader's** preference and not an accuracy knob, which is the only
+    /// reason it rides the wire at all: the measured best fallback is the mean
+    /// wind and that is the default, but a chaser watching supercell motion
+    /// wants the Bunkers right-mover, and a preference the worker could not see
+    /// would give the browser a different field from the desktop with no error
+    /// and no visible difference — the failure `rpg_storm_motion` above exists
+    /// to close, in its other direction.
+    ///
+    /// Stamped by [`with_srv_fallback`](RenderInput::with_srv_fallback), and
+    /// left at its default for every product but SRV on the byte-identity rule
+    /// `env_heights_km_msl` follows.
+    srv_fallback: crate::srv::SrvFallback,
     /// The volume coverage pattern number the scan was flown under.
     ///
     /// Nothing on a render path reads it. It travels because the *cut angles*
@@ -476,6 +492,8 @@ impl RenderInput {
             // Stamped afterwards by `with_rpg_storm_motion`, for the same
             // byte-identity reason the override above is gated on the product.
             rpg_storm_motion: None,
+            // Likewise stamped afterwards, by `with_srv_fallback`.
+            srv_fallback: crate::srv::SrvFallback::default(),
             vcp: pattern.pattern_number().number(),
             declared_cut_angles_deg: pattern
                 .elevation_cuts()
@@ -567,6 +585,7 @@ impl RenderInput {
             // Likewise `with_rpg_storm_motion`: the `N0S` it comes from is
             // fetched on the same schedule and pairs the same way.
             rpg_storm_motion: None,
+            srv_fallback: crate::srv::SrvFallback::default(),
             vcp: scan.coverage_pattern().pattern_number().number(),
             declared_cut_angles_deg: scan
                 .coverage_pattern()
@@ -595,7 +614,7 @@ impl RenderInput {
     }
 
     /// The user's storm motion vector, knots and degrees-from, or `None`
-    /// for "no override" — Bunkers applies.
+    /// for "no override" — the chain's next rung applies.
     pub fn storm_motion_override(&self) -> Option<(f32, f32)> {
         self.storm_motion_override
     }
@@ -656,6 +675,43 @@ impl RenderInput {
     /// falls to [`crate::srv::storm_motion`]'s next rung.
     pub fn rpg_storm_motion(&self) -> Option<(f32, f32)> {
         self.rpg_storm_motion
+    }
+
+    /// Stamp which derived rung SRV should fall to when no override and no
+    /// `N0S` vector reached this payload.
+    ///
+    /// A second step for the reason
+    /// [`with_rpg_storm_motion`](Self::with_rpg_storm_motion) is one, and
+    /// dropped for every product but SRV on the same rule: a payload's bytes
+    /// must not depend on a preference its product never reads.
+    #[must_use]
+    pub fn with_srv_fallback(mut self, fallback: crate::srv::SrvFallback) -> Self {
+        if self.product == RadarProduct::StormRelativeVelocity {
+            self.srv_fallback = fallback;
+        }
+        self
+    }
+
+    /// Which derived rung SRV falls to here — the 0–6 km mean wind unless a
+    /// reader asked for the Bunkers right-mover.
+    pub fn srv_fallback(&self) -> crate::srv::SrvFallback {
+        self.srv_fallback
+    }
+
+    /// The three storm-motion facts as the one bundle every derivation seam
+    /// takes.
+    ///
+    /// Assembled here rather than at each call site because the two vectors are
+    /// indistinguishable `(f32, f32)` pairs: a seam that read them off this
+    /// payload separately could transpose them, and a derived vector wearing
+    /// the reference's provenance is the exact failure
+    /// [`crate::srv::storm_motion`]'s guards exist to catch.
+    pub fn storm_motion(&self) -> crate::srv::MotionInputs {
+        crate::srv::MotionInputs {
+            user_override: self.storm_motion_override,
+            rpg: self.rpg_storm_motion,
+            fallback: self.srv_fallback,
+        }
     }
 
     /// Stamp each carried sweep with the Nyquist velocity its cut declared,
@@ -1372,7 +1428,13 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// `crate::srv::storm_motion`'s lower rungs, so a browser render and a desktop
 /// one would shift the same volume by vectors tens of degrees apart — with no
 /// error, and both drawing a full picture under the same label.
-const FORMAT_VERSION: u16 = 11;
+/// Version 12 added the **derived-rung preference** (`crate::srv::SrvFallback`)
+/// as one byte, after the RPG vector. Without it a worker would always fall to
+/// the shipped default when no `N0S` arrived, so a reader who chose the Bunkers
+/// right-mover would get it on the desktop and the mean wind in the browser —
+/// two different quantities under one label, with no error and both drawing a
+/// full picture, which is version 11's failure in the other direction.
+const FORMAT_VERSION: u16 = 12;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -1420,6 +1482,11 @@ impl RenderInput {
                 out.extend_from_slice(&direction_deg.to_le_bytes());
             }
         }
+
+        out.push(match self.srv_fallback {
+            crate::srv::SrvFallback::MeanWind => 0,
+            crate::srv::SrvFallback::BunkersRightMover => 1,
+        });
 
         out.extend_from_slice(&self.vcp.to_le_bytes());
         out.extend_from_slice(&(self.declared_cut_angles_deg.len() as u32).to_le_bytes());
@@ -1527,6 +1594,16 @@ impl RenderInput {
             _ => return None,
         };
 
+        // Refused rather than defaulted: an unknown discriminant means the two
+        // ends disagree about the layout despite the version matching, and
+        // quietly picking the default here would render a field the sender did
+        // not ask for while every byte after this point was misaligned anyway.
+        let srv_fallback = match r.u8()? {
+            0 => crate::srv::SrvFallback::MeanWind,
+            1 => crate::srv::SrvFallback::BunkersRightMover,
+            _ => return None,
+        };
+
         let vcp = r.u16()?;
         // Eight bytes per angle, so the claimed count is measured against what
         // remains before it becomes a capacity.
@@ -1610,6 +1687,7 @@ impl RenderInput {
             env_heights_km_msl,
             melting_layer_product,
             rpg_storm_motion,
+            srv_fallback,
             vcp,
             declared_cut_angles_deg,
             sweeps,
@@ -1634,6 +1712,8 @@ impl RenderInput {
         } else {
             0
         };
+        // One byte, always present: the preference has no absent case.
+        let fallback = 1;
         let sweeps: usize = self
             .sweeps
             .iter()
@@ -1663,7 +1743,7 @@ impl RenderInput {
         // `+ 2` for the coverage pattern number, `+ 4` and its `f64`s for the
         // declared cut table, `+ 4` for the sweep count.
         let declared = 4 + self.declared_cut_angles_deg.len() * 8;
-        header + motion + env + melting_layer + rpg_motion + 2 + declared + 4 + sweeps
+        header + motion + env + melting_layer + rpg_motion + fallback + 2 + declared + 4 + sweeps
     }
 }
 

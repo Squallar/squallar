@@ -109,7 +109,7 @@ const STORM_MOTION_CODE: &str = "N0S";
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct FrameProvenance {
     melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
-    storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 impl super::App {
@@ -1752,6 +1752,7 @@ impl super::App {
                             input: Box::new(
                                 input
                                     .with_declared_nyquist(&declared)
+                                    .with_srv_fallback(self.render.srv_fallback())
                                     .with_melting_layer_product(melting_layer)
                                     .with_rpg_storm_motion(rpg_storm_motion),
                             ),
@@ -1825,7 +1826,7 @@ impl super::App {
                             frame.nyquist_ms,
                             FrameProvenance {
                                 melting_layer_source: frame.melting_layer_source,
-                                storm_motion_source: frame.storm_motion_source,
+                                storm_motion: frame.storm_motion,
                             },
                         ),
                         None => {
@@ -1889,7 +1890,7 @@ impl super::App {
                 max_range_km,
                 nyquist_ms,
                 melting_layer_source: describes.melting_layer_source,
-                storm_motion_source: describes.storm_motion_source,
+                storm_motion: describes.storm_motion,
                 polar,
             });
             super::notify_redraw(&window);
@@ -2083,9 +2084,13 @@ impl super::App {
         let motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
             .then(|| self.render.storm_motion_override_kt())
             .flatten();
+        // Read off the dispatcher for the same reason and stamped on the
+        // payload below, so the rung a frame is keyed on is the rung it is
+        // derived with.
+        let fallback = self.render.srv_fallback();
         debug_assert_eq!(
             key,
-            rustdar_egui::pane::SectionLoopKey::new(key.line, motion),
+            rustdar_egui::pane::SectionLoopKey::new(key.line, motion, fallback),
             "the frame's key must name the vector the extraction is about to use",
         );
 
@@ -2102,7 +2107,11 @@ impl super::App {
         // NROT or SRV is dealiased on the worker, and the whole point of the
         // limits crossing the wire is that the worker folds where this thread
         // would have.
-        .map(|input| input.with_declared_nyquist(&declared)) else {
+        .map(|input| {
+            input
+                .with_declared_nyquist(&declared)
+                .with_srv_fallback(fallback)
+        }) else {
             // This volume carries no field to cut under this product. Nothing
             // was spawned and no slot was taken, so the caller retires the frame
             // rather than waiting on a reply that will never come.
