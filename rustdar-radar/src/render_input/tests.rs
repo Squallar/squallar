@@ -1024,6 +1024,141 @@ fn the_format_version_is_the_one_this_layout_ships() {
     );
 }
 
+/// A payload assembled by hand, for
+/// [`the_wire_layout_is_the_one_this_version_ships`].
+///
+/// Every number is a literal and exactly representable, so the encoding is the
+/// same bytes on every target. The fixtures the rest of this module uses go
+/// through [`RenderInput::extract`] over a built [`Scan`], and a digest of one
+/// of those would be a digest of whichever libm computed its geometry.
+///
+/// **Both arms of every branch the encoder takes.** `to_bytes` writes a
+/// discriminant and then either a payload or nothing for
+/// `storm_motion_override`, `env_heights_km_msl`, `melting_layer_product`,
+/// `rpg_storm_motion`, `cut_angle_deg`, `declared_nyquist_ms`, `moment` and
+/// `extras`. A fixture exercising only the `Some` arm would let the `None`
+/// arm's framing change without moving the digest, so the two sweeps below
+/// are deliberately opposites: the first carries every optional field and two
+/// radials, the second carries none of them and one empty radial.
+///
+/// Struct literals with no `..` throughout, so a new field on any of the four
+/// wire types fails to compile here rather than slipping onto the wire.
+fn layout_fixture() -> RenderInput {
+    let moment = |first: u8| MomentPayload {
+        gate_count: 3,
+        first_gate_range_m: 2125,
+        gate_interval_m: 250,
+        word_size: 8,
+        scale: 2.0,
+        offset: 66.0,
+        gates: vec![first, 128, 255],
+    };
+    RenderInput {
+        product: RadarProduct::Reflectivity,
+        elevation: 0.5,
+        radar_lat: 35.25,
+        radar_lon: -97.5,
+        storm_motion_override: Some((25.5, 220.0)),
+        env_heights_km_msl: Some((3.5, 7.25)),
+        melting_layer_product: Some(std::sync::Arc::new(vec![1, 2, 3, 4, 5])),
+        rpg_storm_motion: Some((18.25, 195.5)),
+        srv_fallback: crate::srv::SrvFallback::BunkersRightMover,
+        vcp: 212,
+        declared_cut_angles_deg: vec![0.5, 1.5, 359.75],
+        sweeps: vec![
+            SweepData {
+                elevation_angle: 0.5,
+                elevation_number: 1,
+                cut_angle_deg: Some(0.5),
+                carried_velocity: true,
+                declared_nyquist_ms: Some(32.5),
+                collected_ms: 1_600_000_000_000,
+                radials: vec![
+                    RadialData {
+                        azimuth: 0.0,
+                        azimuth_spacing: 0.5,
+                        moment: Some(moment(7)),
+                        extras: vec![(2, moment(9))],
+                    },
+                    RadialData {
+                        azimuth: 90.25,
+                        azimuth_spacing: 1.0,
+                        moment: Some(moment(11)),
+                        extras: vec![],
+                    },
+                ],
+            },
+            SweepData {
+                elevation_angle: 1.5,
+                elevation_number: 2,
+                cut_angle_deg: None,
+                carried_velocity: false,
+                declared_nyquist_ms: None,
+                collected_ms: -1,
+                radials: vec![RadialData {
+                    azimuth: 180.5,
+                    azimuth_spacing: 0.25,
+                    moment: None,
+                    extras: vec![],
+                }],
+            },
+        ],
+    }
+}
+
+/// The bytes this version ships are **these** bytes.
+///
+/// [`the_format_version_is_the_one_this_layout_ships`] asserts
+/// `FORMAT_VERSION == 12` and that a `12` is written at byte 4. Its own doc
+/// claims "changing the layout without changing it fails here". **It does
+/// not**, and this test exists because that was measured rather than argued.
+///
+/// `radar_lat` and `radar_lon` were swapped on the wire — encoder and decoder
+/// in step, `FORMAT_VERSION` left at 12 — which is a payload that draws every
+/// site at the wrong coordinates. Of `rustdar-radar`'s **890 library tests
+/// (864 run, 26 ignored)**, the number that failed was **zero** before this
+/// test existed, and **one** after: this one. `the_format_version_is_the_one_
+/// this_layout_ships` passed in both runs. See
+/// `campaigns/wire-layout-pin-audit.md` on `campaign-harness` for the run.
+///
+/// Both assertions there are our value compared against our value, so both
+/// fail for exactly one person: the one who *raises* the number. They are
+/// silent for the one who changes the layout and does not — and that is the
+/// person the number exists to catch, because raising it is the safe act and
+/// forgetting to is what ships a page and a worker that misread each other.
+/// `render_input` had no other guard on its byte layout at all: unlike
+/// [`crate::voxel`] and [`crate::xsect`] it has no hand-written offset
+/// constants, so a reorder moves nothing any test looks at.
+///
+/// This is the encoder's own output over a fixture nothing computes, compared
+/// with the bytes recorded when the version was last set. A field added,
+/// removed, reordered, retyped, or written at a different width moves the
+/// length or the digest, and the only way past it is to write the new numbers
+/// down — which is where the bump obligation is met.
+#[test]
+fn the_wire_layout_is_the_one_this_version_ships() {
+    let bytes = layout_fixture().to_bytes();
+    assert_eq!(
+        (
+            FORMAT_VERSION,
+            bytes.len(),
+            crate::wire::layout_digest(&bytes)
+        ),
+        (12, 260, 0xaa29_1c4f_2a6e_feb5),
+        "the bytes `to_bytes` writes are not the bytes version 12 shipped. \
+         Something about this payload's layout moved — a field added, \
+         removed, reordered, retyped, or written at a different width. That \
+         is the change `FORMAT_VERSION` exists to announce, and a stale \
+         worker that shares a build token with a fresh page (locally it \
+         always does: `GITHUB_SHA` is absent outside CI, so the token \
+         degrades to `…/dev`) will decode the new bytes into the old field \
+         order — a site at the wrong coordinates, a ladder keyed to the \
+         wrong cuts — with no error anywhere. Bump `FORMAT_VERSION`, then \
+         write the new length and digest here — in that order, and never \
+         the numbers alone.",
+    );
+}
+
 /// A merged tilt carries reflectivity *and* velocity. Reading "whichever
 /// moment this radial has" off it would hand a reflectivity render the
 /// velocity gates — a frame that renders, looks like weather, and is wrong.

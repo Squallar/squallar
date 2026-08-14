@@ -2795,6 +2795,116 @@ fn the_format_version_is_the_one_this_layout_ships() {
     );
 }
 
+/// A section assembled by hand, for
+/// [`the_wire_layout_is_the_one_this_version_ships`].
+///
+/// Every number is a literal and exactly representable, so the encoding is the
+/// same bytes on every target. [`wire_fixture`] cannot serve: it is rendered
+/// through beam geometry, so its axes and its whole value plane are whatever
+/// the platform's libm said, and a digest of it would be a digest of that.
+///
+/// **The planes are six pixels, not [`SECTION_WIDTH`] × [`SECTION_HEIGHT`].**
+/// That width is 1024 on the web and 2048 native, so a full-size fixture would
+/// give this test two different digests on two targets — and worse, a *change*
+/// to the raster size would then demand a [`FORMAT_VERSION`] bump it does not
+/// deserve. A raster resize is already handled on the wire by the three length
+/// prefixes, and [`CrossSection::from_bytes`] refuses a payload sized for
+/// another build by reading them; it is not a layout change. Six pixels keeps
+/// this test about the layout and nothing else.
+///
+/// The consequence is that this fixture will not survive
+/// [`CrossSection::from_bytes`] on any real build — its planes are the wrong
+/// size for the raster. That is fine and deliberate: this test only encodes.
+/// The round trip is `a_section_round_trips_through_its_wire_form`'s job.
+///
+/// Struct literals with no `..`, so a new field on [`CrossSection`] or
+/// [`SectionAxes`] fails to compile here rather than slipping onto the wire.
+fn layout_fixture() -> CrossSection {
+    CrossSection {
+        image: vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        ],
+        values: vec![0.0, -1.5, 2.25, f32::NAN, 0.5, -0.75],
+        status: vec![0, 1, 2, 3, 0, 1],
+        axes: SectionAxes {
+            length_km: 120.5,
+            base_km_msl: 0.25,
+            top_km_msl: 18.5,
+            near_ground_range_km: 2.5,
+            far_ground_range_km: 118.0,
+            coverage_ground_range_km: 100.0,
+            cone_of_silence_km: 3.75,
+            tilt_count: 2,
+            widest_tilt_gap_deg: 1.25,
+            top_tilt_deg: 19.5,
+            top_declared_cut_deg: 19.5,
+        },
+        tilt_elevations_deg: vec![0.5, 1.5],
+        tilt_collected_ms: vec![1_600_000_000_000, -1],
+    }
+}
+
+/// The bytes this version ships are **these** bytes.
+///
+/// [`the_format_version_is_the_one_this_layout_ships`] asserts
+/// `FORMAT_VERSION == 3` and that a `3` sits at byte 4. Both are our value
+/// compared against our value: they fail for the one who *raises* the number
+/// and are silent for the one who changes the layout and does not — which is
+/// the person the number exists to catch, because raising it is the safe act.
+///
+/// Measured, not argued. The same class of change was applied to this crate's
+/// two sibling codecs with the version left alone, and their version tests
+/// stayed green through all of it; `render_input`'s survived a `radar_lat` /
+/// `radar_lon` swap with the entire library suite passing. `xsect` is better
+/// defended than `render_input` — its hand-written `IMAGE_LEN_AT` /
+/// `VALUE_LEN_AT` / `STATUS_LEN_AT` offsets catch a header field added or
+/// resized, and its total-length assertion catches an append — but those
+/// offsets are blind to the change its own doc names as the danger: a
+/// **same-width reorder**, two of the seven leading `f64` axes swapped, which
+/// moves no offset and no length. See `campaigns/wire-layout-pin-audit.md` on
+/// `campaign-harness`.
+///
+/// This is the encoder's own output over a fixture nothing computes. A field
+/// added, removed, reordered, retyped, or written at a different width moves
+/// the length or the digest, and the only way past it is to write the new
+/// numbers down — which is where the bump obligation is met.
+///
+/// **This one is about to be exercised.** Carrying the storm-motion vector
+/// into a section takes `FORMAT_VERSION` 3 → 4; when that lands, this test
+/// fails, and the fix is to bump the constant *and* record the new length and
+/// digest. If it ever passes across a layout change, it has stopped working.
+#[test]
+fn the_wire_layout_is_the_one_this_version_ships() {
+    let bytes = layout_fixture().to_bytes();
+    // The claim in `layout_fixture`'s doc, executed rather than asserted in
+    // prose: six pixels is not this build's raster, so the payload is one
+    // `from_bytes` refuses. If this ever starts decoding, the fixture has
+    // become a real section and the reasoning above needs rereading.
+    assert!(
+        CrossSection::from_bytes(&bytes).is_none(),
+        "the layout fixture decoded, so its planes now match this build's \
+         raster — it was sized deliberately not to",
+    );
+    assert_eq!(
+        (
+            FORMAT_VERSION,
+            bytes.len(),
+            crate::wire::layout_digest(&bytes)
+        ),
+        (3, 196, 0x2dbb_d8a8_aebe_23d2),
+        "the bytes `to_bytes` writes are not the bytes version 3 shipped. \
+         Something about this payload's layout moved — a field added, \
+         removed, reordered, retyped, or written at a different width. That \
+         is the change `FORMAT_VERSION` exists to announce, and a stale \
+         worker that shares a build token with a fresh page (locally it \
+         always does: `GITHUB_SHA` is absent outside CI, so the token \
+         degrades to `…/dev`) will decode the new bytes into the old field \
+         order and draw a section with its axes swapped, with no error \
+         anywhere. Bump `FORMAT_VERSION`, then write the new length and \
+         digest here — in that order, and never the numbers alone.",
+    );
+}
+
 /// A real section survives the wire, including one that is `NaN` in every
 /// pixel.
 ///
