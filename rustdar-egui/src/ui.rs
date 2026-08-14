@@ -3035,6 +3035,34 @@ impl Gui {
     ///
     /// An associated function rather than a method so it can borrow the
     /// registry while the caller holds the taken pane.
+    ///
+    /// # The texture goes with the toggle
+    ///
+    /// Switching a layer off used to be a `bool` and nothing else. The
+    /// handlers' own `set_enabled` is a no-op for most kinds
+    /// (`OverlayHandler::set_enabled`'s default body is empty), and the pane's
+    /// [`overlay_textures`](PaneState::overlay_textures) map was released only
+    /// by `Gui::clear_graphics_state` — i.e. on a lost GPU context. A pane that
+    /// is on screen and drawing a map recovered anyway, because the viewport
+    /// loop in `ui_map_pane` clears a disabled kind's cache on the next frame it
+    /// paints; the panes that never reach that loop did not. A pane hidden by a
+    /// split going from four to one, or converted to a cross-section, is not
+    /// drawn by it at all and kept a full-size RGBA texture per kind, per pane,
+    /// for the rest of the session.
+    ///
+    /// So the release happens *here*, where the decision is made, rather than
+    /// being left to whether the pane happens to be painted afterwards. See
+    /// [`PaneState::release_disabled_overlay_textures`] for what it lets go and
+    /// [`PaneState::overlay_texture_releasable`] for why the radar raster is not
+    /// part of it.
+    ///
+    /// **This does not make a hidden pane cheap.** What it recovers is the kinds
+    /// a user *switched off* — on any pane, whether or not that pane is being
+    /// painted. A hidden pane whose five layers are all still on keeps five
+    /// pane-sized textures exactly as before, and on the 4→1 split above that is
+    /// the larger share of what is resident. Releasing a pane's live layers when
+    /// it leaves the layout is a separate rule with a separate trigger, and a
+    /// re-render on every re-split to pay for it; it is not this.
     pub(super) fn write_pane_overlay(
         overlays: &mut OverlayRegistry,
         pane: &mut PaneState,
@@ -3047,6 +3075,8 @@ impl Gui {
         overlays.set_enabled(kind, on);
         pane.overlay_configs = overlays.save_pane_configs();
         pane.enabled_overlays = overlays.save_enabled_map();
+        // After the map is saved, not before: the reconciliation reads it.
+        pane.release_disabled_overlay_textures();
     }
 
     /// [`Self::write_pane_overlay`] plus the enable-fetch rule, in one place
@@ -3231,6 +3261,14 @@ impl Gui {
             p.overlay_configs = active_overlay_configs.clone();
             p.selected_product = active_selected_product;
             p.selected_elevation = active_selected_elevation;
+            // This is the second way a pane's enabled map changes, and it is the
+            // one that bypasses `write_pane_overlay` entirely: the map arrives
+            // wholesale, with no kind named and no `on` to read. Without this
+            // line the release would have a hole exactly the shape of a split —
+            // the pane the user clicked lets its textures go and its linked
+            // siblings, which just adopted the same off-switch, keep theirs.
+            // Worse for the hidden ones, which nothing else would ever clear.
+            p.release_disabled_overlay_textures();
         }
     }
 
@@ -5162,3 +5200,6 @@ mod wake_schedule_tests;
 
 #[cfg(test)]
 mod overlay_retry_tests;
+
+#[cfg(test)]
+mod overlay_texture_release_tests;
