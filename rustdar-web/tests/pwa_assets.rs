@@ -622,7 +622,15 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         // from either would have left every non-SRV, non-classification reply
         // carrying a stale provenance from whatever the worker answered last.
         "proto::MELTING_LAYER,",
+        // The trailing comma is doing real work on these three: without it
+        // `proto::STORM_MOTION,` would be satisfied by `proto::STORM_MOTION_SPEED`
+        // and the plain provenance byte could vanish unnoticed.
         "proto::STORM_MOTION,",
+        // The speed and direction shipped as version 7's whole reason and were
+        // written only inside the `Frame` arm's `if let`, so every other reply
+        // left them absent rather than null while `smv` beside them was null.
+        "proto::STORM_MOTION_SPEED,",
+        "proto::STORM_MOTION_DIR,",
         "proto::OUT,",
         "proto::OUT_KIND,",
     ] {
