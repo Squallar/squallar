@@ -328,8 +328,7 @@ fn xdr_string_bounds(data: &[u8], offset: usize) -> Result<(usize, usize)> {
         expected,
         available: data.len().saturating_sub(offset),
     };
-    let extent =
-        xdr_string_extent(len).ok_or_else(|| eof((len as usize).saturating_add(4)))?;
+    let extent = xdr_string_extent(len).ok_or_else(|| eof((len as usize).saturating_add(4)))?;
     let end = checked_end(data, offset, extent)?;
     if end > data.len() {
         return Err(eof(extent));
