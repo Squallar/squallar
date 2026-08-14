@@ -136,7 +136,7 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
             hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
             nyquist_ms: None,
             melting_layer_source: None,
-            storm_motion_source: None,
+            storm_motion: None,
         },
     );
     app

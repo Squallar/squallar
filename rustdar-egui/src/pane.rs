@@ -83,7 +83,7 @@ pub struct RadarImageData {
     /// RPG's own applied vector beside twenty shifted by a right-mover
     /// prediction. The frame on the glass is the only thing that can say which
     /// this one is.
-    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// Holds a rendered cross-section raster and the little that has to travel with
@@ -419,19 +419,36 @@ pub struct SectionLoopKey {
     /// The storm motion vector the frames were derived with, as raw bits, and
     /// `None` for every product that does not read one.
     pub storm_motion: Option<(u32, u32)>,
+    /// Which derived rung the frames fell to when there was no override and no
+    /// RPG vector — the reader's `Settings > Storm motion` choice.
+    ///
+    /// Here for the same reason the vector above it is, and it is *not* covered
+    /// by that field: the two derived rungs are reached with `storm_motion`
+    /// equal to `None` on both sides, so a preference change moves the whole
+    /// field while every other term of this key stands still. Without it,
+    /// switching between the mean wind and the right-mover would leave a
+    /// running section loop painting the previous quantity, frame after frame,
+    /// with nothing saying so.
+    pub srv_fallback: rustdar_radar::srv::SrvFallback,
 }
 
 impl SectionLoopKey {
-    /// The key for `line` under the storm motion vector `motion`, in the same
-    /// `(speed_kt, direction_from_deg)` form the extraction is handed.
+    /// The key for `line` under the storm motion vector `motion` and derived
+    /// rung `fallback`, in the same `(speed_kt, direction_from_deg)` form the
+    /// extraction is handed.
     ///
     /// The `to_bits` conversion lives here rather than at the call sites for the
     /// reason `SectionInputKey::of` gives: a second copy of it is a second
     /// chance to compare `f32`s that are not reflexive.
-    pub fn new(line: SectionLine, motion: Option<(f32, f32)>) -> Self {
+    pub fn new(
+        line: SectionLine,
+        motion: Option<(f32, f32)>,
+        fallback: rustdar_radar::srv::SrvFallback,
+    ) -> Self {
         Self {
             line,
             storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
+            srv_fallback: fallback,
         }
     }
 }
@@ -472,15 +489,26 @@ pub struct VolumeLoopKey {
     /// The storm motion vector the grids were derived with, as raw bits, and
     /// `None` for every product that does not read one.
     pub storm_motion: Option<(u32, u32)>,
+    /// Which derived rung the grids fell to, for the reason
+    /// [`SectionLoopKey::srv_fallback`] carries one: both derived rungs leave
+    /// `storm_motion` `None`, so nothing else in this key moves when the
+    /// reader changes the preference.
+    pub srv_fallback: rustdar_radar::srv::SrvFallback,
 }
 
 impl VolumeLoopKey {
-    /// The key for `region` under the storm motion vector `motion`, in the same
-    /// `(speed_kt, direction_from_deg)` form the extraction is handed.
-    pub fn new(region: Option<VolumeRegion>, motion: Option<(f32, f32)>) -> Self {
+    /// The key for `region` under the storm motion vector `motion` and derived
+    /// rung `fallback`, in the same `(speed_kt, direction_from_deg)` form the
+    /// extraction is handed.
+    pub fn new(
+        region: Option<VolumeRegion>,
+        motion: Option<(f32, f32)>,
+        fallback: rustdar_radar::srv::SrvFallback,
+    ) -> Self {
         Self {
             region,
             storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
+            srv_fallback: fallback,
         }
     }
 }
@@ -2073,8 +2101,12 @@ impl PaneState {
             .melting_layer_source
     }
 
-    /// Where the storm motion vector behind the storm-relative field **on
-    /// screen** came from, or `None` when the picture is not storm-relative.
+    /// The storm motion vector behind the storm-relative field **on screen**,
+    /// or `None` when the picture is not storm-relative.
+    ///
+    /// The whole vector, because the legend draws its speed and direction and
+    /// not only its provenance. This answered `Option<StormMotionSource>` while
+    /// the pane's only use for it was deciding whether to apologise.
     ///
     /// [`displayed_melting_layer_source`](Self::displayed_melting_layer_source)'s
     /// sibling, sharing every one of its gates and for the same reasons:
@@ -2089,22 +2121,45 @@ impl PaneState {
     /// * **Only what the pixels are.** Gated through
     ///   [`stale_image_on_screen`](Self::stale_image_on_screen), so a pane
     ///   still showing the previous product says nothing about a shift it is
-    ///   not displaying. That gate is also what keeps this from ever sharing
-    ///   the plate with the pending-render notice.
+    ///   not displaying — a legend reading the previous volume's vector over
+    ///   this volume's pixels is the same lie the plate used to be able to
+    ///   tell, told in numbers.
     ///
-    /// It cannot collide with the melting-layer notice either, and by a
-    /// stronger argument than ordering: the two are gated on *different*
-    /// products, so at most one of them is ever `Some`.
+    /// # Map panes only, and widening the gate is not the fix
     ///
-    /// Map panes only, as its sibling is.
-    pub fn displayed_storm_motion_source(&self) -> Option<rustdar_radar::srv::StormMotionSource> {
+    /// A 3D pane and a section pane draw storm-relative fields too, and both
+    /// call `render_color_scales` — so the legend slot the vector is drawn in
+    /// already exists on them. It stays empty there, and the missing piece is
+    /// the **data**, not this gate.
+    ///
+    /// A 3D pane does carry a Radar overlay texture: its floor. So dropping
+    /// `is_map()` would make this answer, with the *floor raster's* vector —
+    /// and the floor and the voxel grid are separately dispatched, separately
+    /// keyed (`VolumeLoopKey` against the dispatcher's plan-view render cache)
+    /// and separately invalidated, so they go out of step by a volume as a
+    /// matter of course. The legend would then describe the voxels with a
+    /// neighbouring volume's vector: precisely the confident lie the plate this
+    /// replaced was capable of, restated in numbers, which is worse than the
+    /// silence it would be curing.
+    ///
+    /// Nor is there an honest partial. A page can recover the vector for the
+    /// override and RPG rungs on its own, but the two derived rungs are fitted
+    /// from a VAD profile that exists only where the volume was decoded — so a
+    /// page-side reconstruction would draw the vector on some rungs and not
+    /// others, which is a worse legend than none.
+    ///
+    /// Closing it properly means `VoxelGrid` and `CrossSection` each carrying
+    /// the vector they were derived with, exactly as
+    /// `SweepRender::storm_motion` does — which needs `derive::prepare` to
+    /// report the motion it resolved, and a format bump on each of those two
+    /// wire encodings. That is real work and it is named rather than
+    /// half-done here.
+    pub fn displayed_storm_motion(&self) -> Option<rustdar_radar::srv::SrvMotion> {
         if self.selected_product != RadarProduct::StormRelativeVelocity || !self.is_map() {
             return None;
         }
         if self.loop_state.is_active() {
-            return self
-                .active_image()
-                .and_then(|frame| frame.storm_motion_source);
+            return self.active_image().and_then(|frame| frame.storm_motion);
         }
         if self.stale_image_on_screen().is_some() {
             return None;
@@ -2113,7 +2168,7 @@ impl PaneState {
             .current()?
             .radar_meta
             .as_ref()?
-            .storm_motion_source
+            .storm_motion
     }
 
     /// Whether this overlay is enabled for this pane.

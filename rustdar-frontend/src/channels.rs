@@ -102,7 +102,7 @@ pub struct RenderedImage {
     /// per-volume and the cache holding it may already have rolled, so the
     /// difference between the two answers is the RPG's own applied vector
     /// against a right-mover prediction rotated clockwise of it.
-    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// Result from a background radar render thread.
@@ -413,7 +413,7 @@ pub struct LoopRenderResponse {
     /// never fetched — falls back to a Bunkers right-mover. One number for the
     /// whole loop would caption most of its frames with another frame's
     /// provenance.
-    pub storm_motion_source: Option<rustdar_radar::srv::StormMotionSource>,
+    pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
     /// Where this frame's gates are, with **no numbers behind them**.
     ///
     /// The half of [`rustdar_radar::render::polar::PolarField`] a loop frame

@@ -15,7 +15,6 @@ use crate::tile_source::HttpsTiles;
 use rustdar_radar::hca::MeltingLayerSource;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::srv::StormMotionSource;
 use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
@@ -249,7 +248,6 @@ pub(super) fn render_pane_map_content(
         // the pane's list is egui's hash-order safety net (see `paint_order`).
         let mut pending_notice: Option<(RadarProduct, f32)> = None;
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
-        let mut storm_motion_caveat: Option<StormMotionSource> = None;
 
         let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
         for &kind in &draw_order {
@@ -356,24 +354,17 @@ pub(super) fn render_pane_map_content(
                         .pane
                         .displayed_melting_layer_source()
                         .filter(|source| !source.is_measured());
-                    // And the third sentence about the same pixels, for the
-                    // other product with an unrecoverable render input: what
-                    // the storm-relative field was shifted by, when it was not
-                    // the RPG's own vector.
-                    //
-                    // Filtered on `caption().is_some()` rather than on a rung
-                    // test written here. That method already encodes which
-                    // rungs earn a notice — the RPG's own because it is the
-                    // expected case, an override because the user set it and
-                    // the widget already shows it — and re-deriving the rule at
-                    // the draw site is how the two come to disagree.
-                    //
-                    // Mutually exclusive with the caveat above by product, not
-                    // by ordering: HHC and SRV cannot both be selected.
-                    storm_motion_caveat = ctx
-                        .pane
-                        .displayed_storm_motion_source()
-                        .filter(|source| source.caption().is_some());
+                    // There used to be a third sentence here, for the other
+                    // product with an unrecoverable render input: a wrapped
+                    // two-line plate saying which vector the storm-relative
+                    // field had been shifted by, when it was not the RPG's
+                    // own. It is gone, and not reworded. It apologised for a
+                    // fallback that measurement has since replaced, it named
+                    // no number the reader could use, and it offered no
+                    // recourse — so the vector itself moved into the legend
+                    // (`legend_second_line`), on every rung, where a reader
+                    // can read `SRM 32 kt @ 240°` and judge the picture
+                    // instead of being told to distrust it.
                 }
                 // City label tiles — the same projector-driven tile pass the
                 // basemap goes through, at the same bias, so the names sit on
@@ -496,22 +487,6 @@ pub(super) fn render_pane_map_content(
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
             draw_melting_layer_notice(
-                &notice_painter,
-                ctx.pane_rect,
-                crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
-                source,
-            );
-        }
-
-        // The third occupant of that one plate, on the same terms — see the
-        // Radar arm. Glass, and exclusive with both of the above: with the
-        // pending notice by `stale_image_on_screen`, and with the melting-layer
-        // caveat by product, since one is gated on HHC and this on SRV.
-        if let Some(source) = storm_motion_caveat
-            && ctx.surfaces.paints(PaneSurface::Glass)
-        {
-            let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
-            draw_storm_motion_notice(
                 &notice_painter,
                 ctx.pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
@@ -1353,15 +1328,20 @@ pub(super) fn color_scale_gutter(
     }
     let mut gutter = SCALE_MARGIN + reach;
 
-    // The fold annotation is hung off the pane's own edge rather than off a
-    // bar, so it is a floor under the whole gutter rather than a term in one
-    // block's reach. Read through the same [`PaneState::displayed_nyquist_ms`]
-    // the painter gates on, which answers `None` for anything but base velocity
-    // in a plan view — so today this reserves nothing on the 3D panes that ask,
-    // and it is here so that a widening of that gate cannot silently reopen
-    // this defect on the one line of the legend the blocks above cannot see.
-    if !horizontal && let Some(nyquist_ms) = pane.displayed_nyquist_ms() {
-        let line = fold_title_line(nyquist_ms, prefs);
+    // The legend's second line is hung off the pane's own edge rather than off
+    // a bar, so it is a floor under the whole gutter rather than a term in one
+    // block's reach. Read through `legend_second_line` — the same function the
+    // painter draws from, not a restatement of it, so the reservation cannot
+    // come to disagree with what is drawn.
+    //
+    // It matters more since storm-relative velocity started drawing its vector
+    // there. `folds \u{b1}229` is the widest the fold line ever got, at ten
+    // characters; `SRM 32 kt @ 240\u{b0} (mean wind)` is nearly three times as
+    // many, and the widest tag is the one the chain defaults to. The width is
+    // measured here rather than estimated, because a pane narrow enough for it
+    // to matter is exactly the pane whose floating chrome would otherwise print
+    // through it.
+    if !horizontal && let Some(line) = legend_second_line(pane, prefs) {
         gutter = gutter.max(FOLD_TITLE_INSET + laid_out_width(measure, &line, SCALE_FONT_SIZE));
     }
     gutter
@@ -1679,48 +1659,6 @@ pub(super) fn draw_melting_layer_notice(
     source: MeltingLayerSource,
 ) {
     draw_top_notice(painter, pane_rect, top_margin, melting_layer_notice(source));
-}
-
-/// Draw the storm-motion qualification across the top of the pane.
-///
-/// # Only the rungs that earn it
-///
-/// The caller filters on [`StormMotionSource::caption`] being `Some`, and that
-/// method — not this one, and not the call site — is where the rule lives. Two
-/// rungs earn no notice: the RPG's own vector, because it is the expected case
-/// and a notice on every SRV pane is a notice nobody reads, and a user
-/// override, because the user set it deliberately and the override widget
-/// already shows it. This function takes a source rather than a caption so the
-/// signature matches [`draw_melting_layer_notice`]'s, and it is a `let else`
-/// rather than an `expect` because a notice that cannot be worded is a notice
-/// that must not be drawn.
-///
-/// # Only ever one plate
-///
-/// Third occupant of the position the pending notice and the melting-layer
-/// caveat share, and it cannot collide with either. With the pending notice
-/// for [`draw_melting_layer_notice`]'s reason:
-/// [`PaneState::displayed_storm_motion_source`] is gated through
-/// `stale_image_on_screen`. With the melting-layer caveat by something
-/// stronger than ordering — that one is gated on
-/// `HydrometeorClassification` and this on `StormRelativeVelocity`, and a pane
-/// has one selected product.
-///
-/// Same plate, same quiet white, no icon, for every reason
-/// [`melting_layer_notice`] records. A field shifted by a Bunkers right-mover
-/// is a qualified answer, not a failed one — but it is a *different quantity*
-/// from the RPG's cell average, not a degraded version of it, so the pane says
-/// which one it is showing.
-pub(super) fn draw_storm_motion_notice(
-    painter: &egui::Painter,
-    pane_rect: egui::Rect,
-    top_margin: f32,
-    source: StormMotionSource,
-) {
-    let Some(caption) = source.caption() else {
-        return;
-    };
-    draw_top_notice(painter, pane_rect, top_margin, caption.to_owned());
 }
 
 /// The rounded plate every top-of-pane notice is drawn on.
@@ -2098,7 +2036,7 @@ pub(super) fn render_color_scale(
     // --- Title: unit label above the bar (desktop) or under it (mobile),
     //     with velocity's fold annotation on the line after it ---
     let unit = product.unit_label(prefs);
-    let fold_line = folds_at.map(|nyquist_ms| fold_title_line(nyquist_ms, prefs));
+    let fold_line = legend_second_line(pane, prefs);
     if horizontal {
         // Under the bar's left end, reading left to right: `mph  folds ±50`.
         //
@@ -2279,6 +2217,60 @@ fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<
 fn fold_title_line(nyquist_ms: f64, prefs: &UserPreferences) -> String {
     let converted = prefs.speed.convert_from_ms(nyquist_ms as f32);
     format!("folds \u{b1}{converted:.0}")
+}
+
+/// What this pane's storm-relative picture was shifted by: the vector, then one
+/// short word for where it came from — `SRM 32 kt @ 240\u{b0} (NWS)`.
+///
+/// **This is the legend line that replaced an apology.** The pane used to draw
+/// a wrapped two-line plate over the radar on the two derived rungs, saying
+/// which fallback it had used and how badly that fallback could differ from the
+/// reference — a warning with no number in it and nothing for the reader to do.
+/// Every gate on screen is a velocity with this vector's projection already
+/// added, so the vector is the fact a reader actually needs, and it is drawn on
+/// **every** rung: the ordinary case, where the plate said nothing at all, is
+/// the case a reader most often wants to read it in.
+///
+/// The source is a tag and not a sentence — see
+/// [`rustdar_radar::srv::StormMotionSource::tag`] — sized to sit after the
+/// numbers rather than under them.
+///
+/// Converted through `rustdar-units` like every other user-facing number, so
+/// switching the speed preference relabels this in the same frame it relabels
+/// the ticks. The direction is a compass bearing and stays in degrees in every
+/// unit system, three digits wide as a bearing conventionally is.
+fn srm_title_line(motion: rustdar_radar::srv::SrvMotion, prefs: &UserPreferences) -> String {
+    let speed = prefs.speed.convert_from_knots(motion.speed_kt);
+    format!(
+        "SRM {speed:.0} {} @ {:03.0}\u{b0} ({})",
+        prefs.speed.suffix(),
+        motion.direction_deg,
+        motion.source.tag(),
+    )
+}
+
+/// The legend's second line — the one under the unit title on a right-edge bar
+/// and after it on a bottom-edge one — or `None` for a pane whose product has
+/// nothing to say there.
+///
+/// Two products, one slot, and they **cannot** contend for it: base velocity is
+/// the only product [`PaneState::displayed_nyquist_ms`] answers for, and
+/// storm-relative velocity the only one
+/// [`PaneState::displayed_storm_motion`] answers for. That is the same
+/// mutual-exclusion-by-product argument the three top-of-pane notices used to
+/// rest on, and it is stronger here because a pane has exactly one selected
+/// product. Written as one function so the two can never be drawn stacked on
+/// each other by a caller that computed them separately.
+fn legend_second_line(pane: &PaneState, prefs: &UserPreferences) -> Option<String> {
+    if let Some(nyquist_ms) = pane
+        .displayed_nyquist_ms()
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+    {
+        return Some(fold_title_line(nyquist_ms, prefs));
+    }
+    pane.displayed_storm_motion()
+        .filter(|motion| motion.speed_kt.is_finite() && motion.direction_deg.is_finite())
+        .map(|motion| srm_title_line(motion, prefs))
 }
 
 /// Whether the purple [`rustdar_radar::RANGE_FOLDED`] can appear in this pane's

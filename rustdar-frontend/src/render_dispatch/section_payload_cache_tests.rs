@@ -39,7 +39,7 @@ fn target(site: &str, minute: u32, product: RadarProduct, ladder: u64) -> Sectio
 #[test]
 fn a_payload_is_reused_for_another_line_through_the_same_volume() {
     let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
-    let key = SectionInputKey::of(&base, None);
+    let key = SectionInputKey::of(&base, None, rustdar_radar::srv::SrvFallback::default());
 
     let mut elsewhere = base.clone();
     elsewhere.line = SectionLine::new(
@@ -55,7 +55,7 @@ fn a_payload_is_reused_for_another_line_through_the_same_volume() {
     .expect("a valid line");
     assert_ne!(elsewhere, base, "precondition: the line really moved");
     assert_eq!(
-        SectionInputKey::of(&elsewhere, None),
+        SectionInputKey::of(&elsewhere, None, rustdar_radar::srv::SrvFallback::default()),
         key,
         "a redrawn line re-extracted the whole volume"
     );
@@ -66,7 +66,7 @@ fn a_payload_is_reused_for_another_line_through_the_same_volume() {
 #[test]
 fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
     let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
-    let key = SectionInputKey::of(&base, None);
+    let key = SectionInputKey::of(&base, None, rustdar_radar::srv::SrvFallback::default());
 
     for (other, why) in [
         (
@@ -86,7 +86,11 @@ fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
             "the live-feed case: the same volume, one rung-choice ago",
         ),
     ] {
-        assert_ne!(SectionInputKey::of(&other, None), key, "{why}");
+        assert_ne!(
+            SectionInputKey::of(&other, None, rustdar_radar::srv::SrvFallback::default()),
+            key,
+            "{why}"
+        );
     }
 }
 
@@ -106,18 +110,30 @@ fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
 #[test]
 fn the_storm_motion_vector_is_part_of_a_storm_relative_payloads_identity() {
     let srv = target("KTLX", 30, RadarProduct::StormRelativeVelocity, 9);
-    let slow = SectionInputKey::of(&srv, Some((20.0, 240.0)));
-    let fast = SectionInputKey::of(&srv, Some((60.0, 90.0)));
+    let slow = SectionInputKey::of(
+        &srv,
+        Some((20.0, 240.0)),
+        rustdar_radar::srv::SrvFallback::default(),
+    );
+    let fast = SectionInputKey::of(
+        &srv,
+        Some((60.0, 90.0)),
+        rustdar_radar::srv::SrvFallback::default(),
+    );
     assert_ne!(slow, fast, "the section would ship the old vector's field");
     assert_ne!(
         slow,
-        SectionInputKey::of(&srv, None),
+        SectionInputKey::of(&srv, None, rustdar_radar::srv::SrvFallback::default()),
         "an override cleared back to the volume's own Bunkers fit is also \
              a different field",
     );
     assert_eq!(
         slow,
-        SectionInputKey::of(&srv, Some((20.0, 240.0))),
+        SectionInputKey::of(
+            &srv,
+            Some((20.0, 240.0)),
+            rustdar_radar::srv::SrvFallback::default()
+        ),
         "the same vector must reuse, or a section re-walks the volume on \
              every frame",
     );
@@ -125,14 +141,25 @@ fn the_storm_motion_vector_is_part_of_a_storm_relative_payloads_identity() {
     // Reflexive on a NaN vector: unequal-to-itself would not draw the
     // wrong picture, it would re-extract 15.6 MB every frame the section
     // stood.
-    let nan = SectionInputKey::of(&srv, Some((f32::NAN, f32::NAN)));
-    assert_eq!(nan, SectionInputKey::of(&srv, Some((f32::NAN, f32::NAN))));
+    let nan = SectionInputKey::of(
+        &srv,
+        Some((f32::NAN, f32::NAN)),
+        rustdar_radar::srv::SrvFallback::default(),
+    );
+    assert_eq!(
+        nan,
+        SectionInputKey::of(
+            &srv,
+            Some((f32::NAN, f32::NAN)),
+            rustdar_radar::srv::SrvFallback::default()
+        )
+    );
 
     // And the products that do not read a vector are not keyed on one —
     // which is why this belongs in the key and not in an eviction.
     let refl = target("KTLX", 30, RadarProduct::Reflectivity, 9);
     assert_eq!(
-        SectionInputKey::of(&refl, None),
-        SectionInputKey::of(&refl, None),
+        SectionInputKey::of(&refl, None, rustdar_radar::srv::SrvFallback::default()),
+        SectionInputKey::of(&refl, None, rustdar_radar::srv::SrvFallback::default()),
     );
 }

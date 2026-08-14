@@ -78,7 +78,7 @@ fn line() -> SectionLine {
 }
 
 fn key() -> SectionLoopKey {
-    SectionLoopKey::new(line(), None)
+    SectionLoopKey::new(line(), None, rustdar_radar::srv::SrvFallback::default())
 }
 
 /// A loop of `count` blank frames in the given view, already retargeted so
@@ -108,7 +108,7 @@ fn plan_view_picture(ctx: &egui::Context) -> LoopFrameImage {
         max_range_km: 230.0,
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
     })
 }
@@ -291,7 +291,15 @@ fn moving_the_line_discards_every_frame() {
     )
     .expect("two distinct points on Earth");
     assert!(
-        ls.retarget_renders_for(PRODUCT, TILT, Some(SectionLoopKey::new(elsewhere, None))),
+        ls.retarget_renders_for(
+            PRODUCT,
+            TILT,
+            Some(SectionLoopKey::new(
+                elsewhere,
+                None,
+                rustdar_radar::srv::SrvFallback::default()
+            ))
+        ),
         "a redrawn line did not invalidate the loop, so every frame would go \
          on animating a slice of the ground the user moved away from"
     );
@@ -324,7 +332,11 @@ fn editing_the_storm_motion_vector_discards_every_frame() {
     ls.retarget_renders_for(
         srv,
         TILT,
-        Some(SectionLoopKey::new(line(), Some((30.0, 240.0)))),
+        Some(SectionLoopKey::new(
+            line(),
+            Some((30.0, 240.0)),
+            rustdar_radar::srv::SrvFallback::default(),
+        )),
     );
     for frame in &mut ls.frames {
         frame.image = Some(section_picture(&ctx, 1));
@@ -334,7 +346,11 @@ fn editing_the_storm_motion_vector_discards_every_frame() {
         ls.retarget_renders_for(
             srv,
             TILT,
-            Some(SectionLoopKey::new(line(), Some((35.0, 240.0))))
+            Some(SectionLoopKey::new(
+                line(),
+                Some((35.0, 240.0)),
+                rustdar_radar::srv::SrvFallback::default()
+            ))
         ),
         "the storm motion vector moved and the loop kept every frame, so the \
          whole animation goes on showing the old vector's field with nothing \
@@ -443,9 +459,25 @@ fn rewriting_the_same_storm_motion_vector_invalidates_nothing() {
     let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
     let srv = RadarProduct::StormRelativeVelocity;
     let motion = Some((30.0, 240.0));
-    ls.retarget_renders_for(srv, TILT, Some(SectionLoopKey::new(line(), motion)));
+    ls.retarget_renders_for(
+        srv,
+        TILT,
+        Some(SectionLoopKey::new(
+            line(),
+            motion,
+            rustdar_radar::srv::SrvFallback::default(),
+        )),
+    );
     assert!(
-        !ls.retarget_renders_for(srv, TILT, Some(SectionLoopKey::new(line(), motion))),
+        !ls.retarget_renders_for(
+            srv,
+            TILT,
+            Some(SectionLoopKey::new(
+                line(),
+                motion,
+                rustdar_radar::srv::SrvFallback::default()
+            ))
+        ),
         "an unchanged vector counted as a change, so every frame is re-cut on \
          every dispatch pass with a hot CPU as the only symptom"
     );
@@ -501,6 +533,7 @@ fn a_broadcast_cut_along_another_line_is_refused() {
         )
         .expect("two distinct points on Earth"),
         None,
+        rustdar_radar::srv::SrvFallback::default(),
     );
     assert_eq!(
         ls.frame_accepting_section_broadcast(ts(1), &shared_target(), &elsewhere, 7, Some(7)),

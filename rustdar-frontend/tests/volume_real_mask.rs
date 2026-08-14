@@ -184,7 +184,7 @@ fn render_a_real_volume_mask() {
     // No RPG vector: this harness renders from a Level II file alone and
     // fetches no `N0S`, so the derivation resolves the rung it would have
     // resolved on any volume the app has no object for.
-    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion, None)
+    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion)
         .unwrap_or_else(|| {
             panic!(
                 "build_voxels refused: product {} at {:?}, base {} km, top {} km, \
@@ -590,7 +590,7 @@ fn measure_boundary_honesty_and_smoothness() {
     // No RPG vector: this harness renders from a Level II file alone and
     // fetches no `N0S`, so the derivation resolves the rung it would have
     // resolved on any volume the app has no object for.
-    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion, None)
+    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion)
         .unwrap_or_else(|| panic!("build_voxels refused {}", product.code()));
 
     let size = size_from_env();
@@ -1240,11 +1240,14 @@ fn the_harness_accepts_every_product_the_vertical_views_render() {
 /// `None` for every other product, and for SRV without the variable — which
 /// leaves the derivation on the volume's own Bunkers fit, exactly as the app
 /// does with the override switch off.
-fn motion_from_env(product: RadarProduct) -> Option<(f32, f32)> {
+fn motion_from_env(product: RadarProduct) -> rustdar_radar::srv::MotionInputs {
+    let none = rustdar_radar::srv::MotionInputs::default();
     if product != RadarProduct::StormRelativeVelocity {
-        return None;
+        return none;
     }
-    let raw = std::env::var("MOTION").ok()?;
+    let Some(raw) = std::env::var("MOTION").ok() else {
+        return none;
+    };
     let (speed, direction) = raw
         .trim()
         .split_once(',')
@@ -1260,7 +1263,10 @@ fn motion_from_env(product: RadarProduct) -> Option<(f32, f32)> {
         pair.0.is_finite() && pair.1.is_finite(),
         "MOTION={raw:?} is not a finite vector",
     );
-    Some(pair)
+    rustdar_radar::srv::MotionInputs {
+        user_override: Some(pair),
+        ..none
+    }
 }
 
 /// `SIZE`, as `WxH`.

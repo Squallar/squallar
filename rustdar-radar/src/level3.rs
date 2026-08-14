@@ -27,7 +27,7 @@
 //! `N0G`/`N1G`/`N2U`/`N3U` as tilts, itself a workaround for `N1S`/`N2S`/
 //! `N3S` having had nothing written since 2020 (NWS SCN 22-96) — and is now
 //! derived from the Level II volume already in hand, every velocity tilt,
-//! with a locally computed Bunkers right-mover as the default vector. See
+//! with a locally derived vector as the stand-in when none arrives. See
 //! [`crate::srv`] for the derivation and [`crate::srm`] for the Level III
 //! pipeline it replaced and the live harness that still measures it.
 

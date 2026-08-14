@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 6;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 6. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 7;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 7. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -577,8 +577,14 @@ fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
          shifted by: the RPG's own, or one of the local stand-ins that disagree \
          with it on 83 % of gates and on more than half of them by two display \
          levels or more. A reply that omits it is one whose storm-relative \
-         field cannot say which quantity it is showing. Changing the message \
-         shapes without changing this number is the whole failure it prevents.",
+         field cannot say which quantity it is showing. Version 7 added `sms` \
+         and `smd`, the speed and direction of that vector, when the pane \
+         stopped apologising for its storm motion and started reporting it: \
+         the legend draws the numbers, and the two derived rungs are fitted \
+         from a wind profile the page never sees, so a reply that omits them \
+         is one whose storm-relative field shows no vector at all. Changing \
+         the message shapes without changing this number is the whole failure \
+         it prevents.",
     );
 }
 

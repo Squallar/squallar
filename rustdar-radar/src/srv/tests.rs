@@ -445,19 +445,27 @@ fn compute_srv_derives_a_full_sweep() {
     );
 }
 
-/// The override is dominant and Bunkers is only a default — and a
+/// The override is dominant and a derived rung is only a default — and a
 /// non-override sample can never pose as one.
 #[test]
-fn the_user_override_dominates_bunkers() {
+fn the_user_override_dominates_a_derived_rung() {
     let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
     let over = SrvMotion::user_override(45.0, 210.0).expect("finite");
-    let picked = storm_motion(Some(&p), Some(over), None).expect("an override is a vector");
+    let picked = storm_motion(Some(&p), Some(over), None, SrvFallback::MeanWind)
+        .expect("an override is a vector");
     assert_eq!(picked.speed_kt, 45.0);
     assert_eq!(picked.direction_deg, 210.0);
     assert_eq!(picked.source, StormMotionSource::UserOverride);
 
-    let default = storm_motion(Some(&p), None, None).expect("Bunkers from the profile");
-    assert_eq!(default.source, StormMotionSource::BunkersRightMover);
+    // …under either preference, because the override outranks the choice
+    // rather than being one of its arms.
+    let picked = storm_motion(Some(&p), Some(over), None, SrvFallback::BunkersRightMover)
+        .expect("still the override");
+    assert_eq!(picked.source, StormMotionSource::UserOverride);
+
+    let default = storm_motion(Some(&p), None, None, SrvFallback::MeanWind)
+        .expect("the mean wind from the profile");
+    assert_eq!(default.source, StormMotionSource::MeanWind);
 
     // Mislabelled sample: claims Bunkers, arrives in the override slot.
     let poser = SrvMotion {
@@ -465,17 +473,83 @@ fn the_user_override_dominates_bunkers() {
         direction_deg: 2.0,
         source: StormMotionSource::BunkersRightMover,
     };
-    let picked = storm_motion(Some(&p), Some(poser), None).expect("falls through to Bunkers");
-    assert_eq!(picked.source, StormMotionSource::BunkersRightMover);
+    let picked = storm_motion(Some(&p), Some(poser), None, SrvFallback::MeanWind)
+        .expect("falls through to the derived rung");
+    assert_eq!(picked.source, StormMotionSource::MeanWind);
     assert_ne!(picked.speed_kt, 1.0);
 
-    assert_eq!(storm_motion(None, None, None), None, "no vector, no render");
+    assert_eq!(
+        storm_motion(None, None, None, SrvFallback::MeanWind),
+        None,
+        "no vector, no render",
+    );
     assert!(SrvMotion::user_override(f32::NAN, 90.0).is_none());
     assert!(SrvMotion::user_override(30.0, f32::INFINITY).is_none());
 }
 
-/// The whole chain, in order: an override beats the RPG, the RPG beats
-/// Bunkers, and a vector that only *claims* the RPG's provenance cannot
+/// **The derived default is the mean wind, and the right-mover is a choice.**
+///
+/// The chain used to fall to the Bunkers right-mover, and the pane apologised
+/// on the glass for it. Measured against the vector the RPG actually publishes
+/// the right-mover is not a stand-in for it at all — it is a supercell motion
+/// *prediction*, 7.5 m/s off the mean wind in whatever direction the shear
+/// happens to point, which in weak flow is most of the vector. The mean wind
+/// sits an order of magnitude closer. So the rung moved, and Bunkers stayed
+/// reachable: it is what a chaser wants and it is pinned against MetPy.
+#[test]
+fn the_derived_default_is_the_mean_wind_and_bunkers_is_a_choice() {
+    // Real shear, so the two rungs are genuinely different vectors.
+    let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
+
+    let default =
+        storm_motion(Some(&p), None, None, SrvFallback::default()).expect("the default renders");
+    assert_eq!(
+        default.source,
+        StormMotionSource::MeanWind,
+        "the shipped default fell to something other than the mean wind",
+    );
+
+    let asked = storm_motion(Some(&p), None, None, SrvFallback::BunkersRightMover)
+        .expect("the right-mover is still reachable");
+    assert_eq!(asked.source, StormMotionSource::BunkersRightMover);
+
+    // Same profile, genuinely different fields — the deviation is 7.5 m/s
+    // perpendicular to the shear, which on this profile is due south.
+    assert_ne!(default.speed_kt, asked.speed_kt);
+    assert_ne!(default.direction_deg, asked.direction_deg);
+
+    // The mean wind rung really is the plain mean, unchanged by the reorder:
+    // the same numbers `bunkers_right_mover_uv` starts from.
+    let (u, v) = mean_wind_uv(&p).expect("a full profile has a mean wind");
+    assert!((u - 29.0).abs() < 1e-9, "u = {u}");
+    assert!(v.abs() < 1e-9, "v = {v}");
+
+    // And the chain reaches volumes the right-mover refuses outright. Twelve
+    // fitted layers is the mean's floor; with only the lowest twelve present
+    // the 5.5–6 km shear band is empty, so Bunkers has no direction to deviate
+    // in — and before the reorder that was `None`, meaning no SRV at all.
+    let hollow = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 12);
+    assert_eq!(
+        bunkers_right_mover(&hollow),
+        None,
+        "the fixture must be one Bunkers cannot answer, or this proves nothing",
+    );
+    let picked = storm_motion(Some(&hollow), None, None, SrvFallback::MeanWind)
+        .expect("the mean wind still renders where the right-mover cannot");
+    assert_eq!(picked.source, StormMotionSource::MeanWind);
+
+    // Asking for Bunkers on such a volume is a refusal, not a silent swap to
+    // the other rung: the reader asked for a quantity this volume cannot
+    // support, and answering with a different one under no label is the
+    // failure the whole source enum exists to prevent.
+    assert_eq!(
+        storm_motion(Some(&hollow), None, None, SrvFallback::BunkersRightMover),
+        None,
+    );
+}
+
+/// The whole chain, in order: an override beats the RPG, the RPG beats every
+/// derived rung, and a vector that only *claims* the RPG's provenance cannot
 /// take its rung.
 #[test]
 fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
@@ -483,20 +557,28 @@ fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
     let rpg = SrvMotion::rpg_scit_average(31.0, 246.0).expect("finite");
 
     // Rung 2 beats rung 3.
-    let picked = storm_motion(Some(&p), None, Some(rpg)).expect("the RPG's vector");
-    assert_eq!(picked.source, StormMotionSource::RpgScitAverage);
-    assert_eq!(picked.speed_kt, 31.0);
-    assert_eq!(picked.direction_deg, 246.0);
+    for fallback in [SrvFallback::MeanWind, SrvFallback::BunkersRightMover] {
+        let picked = storm_motion(Some(&p), None, Some(rpg), fallback).expect("the RPG's vector");
+        assert_eq!(
+            picked.source,
+            StormMotionSource::RpgScitAverage,
+            "{fallback:?}"
+        );
+        assert_eq!(picked.speed_kt, 31.0);
+        assert_eq!(picked.direction_deg, 246.0);
+    }
 
     // Rung 1 beats rung 2.
     let over = SrvMotion::user_override(45.0, 210.0).expect("finite");
-    let picked = storm_motion(Some(&p), Some(over), Some(rpg)).expect("the override");
+    let picked =
+        storm_motion(Some(&p), Some(over), Some(rpg), SrvFallback::MeanWind).expect("the override");
     assert_eq!(picked.source, StormMotionSource::UserOverride);
     assert_eq!(picked.speed_kt, 45.0);
 
     // With no profile at all the RPG's vector still renders: the lower rungs
     // are what need a wind fit, not this one.
-    let picked = storm_motion(None, None, Some(rpg)).expect("no profile needed");
+    let picked =
+        storm_motion(None, None, Some(rpg), SrvFallback::MeanWind).expect("no profile needed");
     assert_eq!(picked.source, StormMotionSource::RpgScitAverage);
 
     // A derived vector posted into the RPG slot must not inherit the
@@ -506,8 +588,9 @@ fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
         direction_deg: 2.0,
         source: StormMotionSource::BunkersRightMover,
     };
-    let picked = storm_motion(Some(&p), None, Some(poser)).expect("falls through");
-    assert_eq!(picked.source, StormMotionSource::BunkersRightMover);
+    let picked =
+        storm_motion(Some(&p), None, Some(poser), SrvFallback::MeanWind).expect("falls through");
+    assert_eq!(picked.source, StormMotionSource::MeanWind);
     assert_ne!(picked.speed_kt, 1.0);
 
     assert!(SrvMotion::rpg_scit_average(f32::NAN, 90.0).is_none());
@@ -525,7 +608,8 @@ fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
 fn a_zero_rpg_vector_is_a_reading_and_not_a_gap() {
     let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
     let zero = SrvMotion::rpg_scit_average(0.0, 0.0).expect("zero is finite");
-    let picked = storm_motion(Some(&p), None, Some(zero)).expect("zero still renders");
+    let picked = storm_motion(Some(&p), None, Some(zero), SrvFallback::MeanWind)
+        .expect("zero still renders");
     assert_eq!(picked.source, StormMotionSource::RpgScitAverage);
     assert_eq!(picked.speed_kt, 0.0);
     assert_eq!(picked.direction_deg, 0.0);
@@ -566,41 +650,77 @@ fn a_mean_wind_fallback_does_not_claim_to_be_a_right_mover() {
     assert_eq!(m.source, StormMotionSource::BunkersRightMover);
 
     // And the chain propagates the honest label rather than flattening it.
-    let picked = storm_motion(Some(&uniform), None, None).expect("still a vector");
+    let picked = storm_motion(Some(&uniform), None, None, SrvFallback::BunkersRightMover)
+        .expect("still a vector");
     assert_eq!(picked.source, StormMotionSource::MeanWind);
 }
 
 /// The declaration order is the fallback order, so `<` reads as "nearer the
 /// top of the chain" — the convention `MeltingLayerSource` uses, and the
-/// reason `Ord` is derived at all. Only the rungs that are not the reference
-/// earn an on-pane notice.
+/// reason `Ord` is derived at all.
+///
+/// **The mean wind moved above the right-mover**, which is the whole of the
+/// reorder as far as this ordering is concerned: it is the derived rung the
+/// chain reaches by default, and the right-mover is the one below it that only
+/// a reader's choice reaches.
 #[test]
 fn the_storm_motion_chain_orders_itself_best_first() {
     use StormMotionSource::*;
     assert!(UserOverride < RpgScitAverage);
-    assert!(RpgScitAverage < BunkersRightMover);
-    assert!(BunkersRightMover < MeanWind);
+    assert!(RpgScitAverage < MeanWind);
+    assert!(MeanWind < BunkersRightMover);
 
     assert!(RpgScitAverage.is_rpg());
     for other in [UserOverride, BunkersRightMover, MeanWind] {
         assert!(!other.is_rpg(), "{other:?}");
     }
 
-    // The reference and a deliberate user choice draw nothing; the two
-    // derived stand-ins each say what they are.
-    assert_eq!(RpgScitAverage.caption(), None);
-    assert_eq!(UserOverride.caption(), None);
-    for fallback in [BunkersRightMover, MeanWind] {
-        let caption = fallback.caption().expect("a fallback names itself");
-        assert!(!caption.is_empty(), "{fallback:?}");
-    }
+    // The preference selects between exactly the derived rungs, and its
+    // default is the one the measurement chose.
+    assert_eq!(SrvFallback::default(), SrvFallback::MeanWind);
+    assert_eq!(SrvFallback::MeanWind.source(), MeanWind);
+    assert_eq!(SrvFallback::BunkersRightMover.source(), BunkersRightMover);
 
-    // Every rung has a distinct label, or the glass cannot distinguish them.
-    let labels =
-        [UserOverride, RpgScitAverage, BunkersRightMover, MeanWind].map(StormMotionSource::label);
-    for (i, a) in labels.iter().enumerate() {
-        for b in &labels[i + 1..] {
-            assert_ne!(a, b, "two rungs share a label");
+    // Every rung has a distinct label *and* a distinct tag, or the glass
+    // cannot distinguish them. The tag is what the legend draws beside the
+    // vector, so it is the one that has to survive being short.
+    for naming in [StormMotionSource::label, StormMotionSource::tag] {
+        let named = [UserOverride, RpgScitAverage, MeanWind, BunkersRightMover].map(naming);
+        for (i, a) in named.iter().enumerate() {
+            for b in &named[i + 1..] {
+                assert_ne!(a, b, "two rungs share a name");
+            }
         }
+    }
+}
+
+/// **Nothing on the glass says "RPG", "SCIT" or "cell average".**
+///
+/// Those are this codebase's words for the NWS product generator and its cell
+/// tracker. The pane used to put them in a paragraph over the radar — "showing
+/// the Bunkers right-mover, which can differ from the RPG's cell average by a
+/// large and unpredictable angle" — which a reader cannot weigh, cannot act on
+/// and did not ask for. The vocabulary is pinned here rather than left to
+/// review, because it came back once already.
+#[test]
+fn no_rung_names_itself_in_this_codebases_private_vocabulary() {
+    use StormMotionSource::*;
+    for rung in [UserOverride, RpgScitAverage, MeanWind, BunkersRightMover] {
+        for text in [rung.label(), rung.tag()] {
+            let lower = text.to_ascii_lowercase();
+            for jargon in ["rpg", "scit", "cell average"] {
+                assert!(
+                    !lower.contains(jargon),
+                    "{rung:?} says {text:?}, which names {jargon:?} at the reader",
+                );
+            }
+        }
+        // And a tag is a tag: short enough to sit after the numbers rather
+        // than wrap under them.
+        assert!(
+            rung.tag().len() <= 12 && !rung.tag().contains('.'),
+            "{rung:?}'s tag {:?} is a sentence, not a label",
+            rung.tag(),
+        );
     }
 }

@@ -4,7 +4,7 @@
 //! Three products read the whole velocity volume rather than one cut of it —
 //! NROT and SRV seed their dealiasers from a wind profile fitted across every
 //! tilt ([`crate::nrot::WindProfileBuilder`]), and SRV's default storm motion
-//! is the Bunkers right-mover off that same profile
+//! is a vector derived off that same profile
 //! ([`crate::srv::bunkers_right_mover`]). Each of them reached the volume
 //! through its own transcription of the same twenty lines: walk the sweeps,
 //! admit the ones carrying velocity, decode each into a dense grid, hand the

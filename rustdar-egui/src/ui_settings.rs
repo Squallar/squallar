@@ -12,12 +12,13 @@ const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
 /// The storm motion override switch's label.
 ///
-/// It read "Override average storm motion", which named the RPG's own SCIT
-/// average from the `N0S` Product Description Block — a source that left the
-/// app with the five Level III SRM fetches. There is no RPG average to
-/// override any more: with the switch off, storm-relative velocity is derived
-/// from the Bunkers right-mover fitted to the volume's own winds. Named here
-/// so the wording has one home and a test can pin it.
+/// It read "Override average storm motion", naming a source the app had lost
+/// at the time. It has both a better source and a better name now: with the
+/// switch off, storm-relative velocity uses the NWS's own vector for the volume
+/// where one arrived, and the derived rung beside this control where none did.
+/// So the label says what the switch *replaces* — the whole chain — rather than
+/// naming one rung of it. Named here so the wording has one home and a test can
+/// pin it.
 pub(crate) const STORM_MOTION_OVERRIDE_LABEL: &str = "Override the storm motion vector";
 
 /// What actually leaves the machine when the user says yes, in the pane that
@@ -111,6 +112,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "gps.baud",
     "gps.connect",
     "heading",
+    "storm.fallback",
     "storm.override",
     "storm.speed",
     "storm.direction",
@@ -439,28 +441,54 @@ impl super::Gui {
             }
             // --- Storm motion (storm-relative velocity) ---
             //
-            // Off by default, and what "off" means changed. The label
-            // read "Override average storm motion", naming the RPG's own
-            // SCIT average from the N0S Product Description Block — a
-            // source that left with the five Level III SRM fetches. With
-            // the switch off, storm-relative velocity now uses the
-            // Bunkers right-mover `rustdar_radar::velocity::volume_wind_profile`
-            // fits from the volume's own winds; there is no RPG vector to
-            // override any more. An override replaces it everywhere at
-            // once: every storm-relative tilt, the 3D volume and the
-            // cross-section are all derived from it.
-            "storm.override" => {
+            // Four rows for one chain, best rung first. The volume's own NWS
+            // vector outranks everything here whenever it arrives and needs no
+            // control — it is what the pane wants and what it says in the
+            // legend. These rows are the two things a reader can actually
+            // decide: which derived rung stands in when no NWS vector came,
+            // and whether to replace the lot with a vector of their own.
+            //
+            // This is also where the pane's old on-glass apology went. It told
+            // the reader the fallback was unreliable and offered them nothing;
+            // the recourse was always here, and now the wording points at it
+            // instead of lamenting.
+            "storm.fallback" => {
                 section_break(ui);
                 ui.heading("Storm motion");
                 ui.add_space(SETTINGS_SMALL_SPACING);
+                let fallback = &mut self.srv_fallback;
+                ui.horizontal(|ui| {
+                    ui.label("When none is published:");
+                    egui::ComboBox::from_id_salt("srv_fallback")
+                        .selected_text(fallback.source().label())
+                        .show_ui(ui, |ui| {
+                            for choice in [
+                                rustdar_radar::srv::SrvFallback::MeanWind,
+                                rustdar_radar::srv::SrvFallback::BunkersRightMover,
+                            ] {
+                                ui.selectable_value(fallback, choice, choice.source().label());
+                            }
+                        });
+                })
+                .response
+                .on_hover_text(
+                    "Most volumes carry the National Weather Service's own storm motion \
+                     and it is used whenever it does. This is what stands in when one \
+                     does not: the 0-6 km mean wind, which measures closest to it, or \
+                     the Bunkers right-mover, a supercell motion prediction that can \
+                     point somewhere quite different in weak flow.",
+                );
+                true
+            }
+            "storm.override" => {
                 ui.checkbox(
                     &mut self.storm_motion_override.enabled,
                     STORM_MOTION_OVERRIDE_LABEL,
                 )
                 .on_hover_text(
-                    "Off, storm-relative velocity uses the Bunkers right-mover fitted \
-                     from this volume's own winds. On, it uses the vector below \
-                     - in the plan view, the 3D volume and the cross-section alike.",
+                    "On, storm-relative velocity uses the vector below and nothing else \
+                     - in the plan view, the 3D volume and the cross-section alike, and \
+                     ahead of the National Weather Service's own.",
                 );
                 true
             }
@@ -591,6 +619,7 @@ impl super::Gui {
                     self.preferences = UserPreferences::default();
                     self.gps_config = rustdar_gps::GpsConfig::default();
                     self.storm_motion_override = crate::StormMotionOverride::default();
+                    self.srv_fallback = rustdar_radar::srv::SrvFallback::default();
                     // The location memo lives outside `Gui` — it is persisted
                     // under its own key by the frontend's gate, precisely so a
                     // 3 s autosave timer cannot lose it — so resetting it is an
@@ -836,13 +865,11 @@ mod label_tests {
 
     /// The storm motion switch must not name a source the app no longer has.
     ///
-    /// It read "Override **average** storm motion" — the RPG's own SCIT
-    /// average, carried in the `N0S` Product Description Block, which left
-    /// with the five Level III SRM fetches. With the switch off there is no
-    /// average to override: storm-relative velocity is derived from the
-    /// Bunkers right-mover fitted to the volume's own winds. A control that
-    /// names a vanished source tells the user their override is replacing
-    /// something the app is not using.
+    /// It read "Override **average** storm motion", naming one rung of a
+    /// chain — the SCIT cell average — as though it were the whole of what the
+    /// switch replaces. It is not: an override outranks the NWS's own vector,
+    /// the 0-6 km mean wind and the Bunkers right-mover alike. A control that
+    /// names one rung tells the reader their override replaces only that rung.
     #[test]
     fn the_storm_motion_switch_does_not_name_an_rpg_average() {
         let label = STORM_MOTION_OVERRIDE_LABEL.to_ascii_lowercase();

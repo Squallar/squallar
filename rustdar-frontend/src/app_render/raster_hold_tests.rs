@@ -81,7 +81,7 @@ fn render_of(image: Arc<egui::ColorImage>) -> crate::render_dispatch::CachedPane
         elevation: TILT,
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
     }
 }
 

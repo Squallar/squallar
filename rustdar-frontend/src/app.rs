@@ -1728,7 +1728,11 @@ impl App {
         // the worker, and a frame that arrived without this would fold around an
         // estimate while the still frame beside it folded around the RDA's
         // statement of the same cut.
-        .map(|input| input.with_declared_nyquist(&declared))
+        .map(|input| {
+            input
+                .with_declared_nyquist(&declared)
+                .with_srv_fallback(self.render.srv_fallback())
+        })
     }
 
     /// Take delivery of finished voxel builds.
@@ -1843,7 +1847,11 @@ impl App {
         // Dropping this line is not a compile error and not a visible one: the
         // worker would fall back to estimating, and the two threads would part
         // company on a band of borderline pairs with nothing to point at.
-        .map(|input| input.with_declared_nyquist(current.declared_nyquist()))
+        .map(|input| {
+            input
+                .with_declared_nyquist(current.declared_nyquist())
+                .with_srv_fallback(self.render.srv_fallback())
+        })
     }
 
     /// The re-cut key for `site`'s current merged volume under `product` —

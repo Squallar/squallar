@@ -356,7 +356,7 @@ impl super::App {
                 elevation: rr.elevation,
                 nyquist_ms: rendered.nyquist_ms,
                 melting_layer_source: rendered.melting_layer_source,
-                storm_motion_source: rendered.storm_motion_source,
+                storm_motion: rendered.storm_motion,
             };
 
             // Cache the render output for sharing with other panes on the same site
@@ -382,7 +382,7 @@ impl super::App {
                     hover: Arc::clone(&render_result.hover),
                     nyquist_ms: render_result.nyquist_ms,
                     melting_layer_source: render_result.melting_layer_source,
-                    storm_motion_source: render_result.storm_motion_source,
+                    storm_motion: render_result.storm_motion,
                 },
             );
 
@@ -651,7 +651,7 @@ impl super::App {
                 elevation: render.elevation,
                 nyquist_ms: render.nyquist_ms,
                 melting_layer_source: render.melting_layer_source,
-                storm_motion_source: render.storm_motion_source,
+                storm_motion: render.storm_motion,
             });
         }
 
@@ -697,7 +697,7 @@ impl super::App {
                 // same terms: it describes *this* image, and the `N0S` it was
                 // read from belongs to a volume that will have rolled by the
                 // time anything could look it up again.
-                storm_motion_source: render.storm_motion_source,
+                storm_motion: render.storm_motion,
                 // What these pixels are, travelling with them. Whichever
                 // datasource produced them: this is the one assignment behind
                 // `PaneState::stale_image_on_screen`, so a Level II and a
@@ -1274,7 +1274,10 @@ impl super::App {
         // Editing the vector changes nothing else about a pane, so the derived
         // storm-relative tilts have to be invalidated explicitly.
         let storm_motion = self.gui.storm_motion_override.sample();
-        if !self.render.set_storm_motion_override(storm_motion) {
+        if !self
+            .render
+            .set_storm_motion_choice(storm_motion, self.gui.srv_fallback)
+        {
             return false;
         }
         // The vertical views' counterpart of the plan-view invalidation the
@@ -1362,7 +1365,7 @@ impl super::App {
                             elevation,
                             nyquist_ms: cached.nyquist_ms,
                             melting_layer_source: cached.melting_layer_source,
-                            storm_motion_source: cached.storm_motion_source,
+                            storm_motion: cached.storm_motion,
                         };
                         log::info!(
                             "Reusing cached render for pane {}: {:?} at {:.1}°",
@@ -1585,6 +1588,10 @@ impl super::App {
             // for the worker-side SRV derivation. The extraction keeps it
             // only on an SRV payload.
             let motion = self.render.storm_motion_override_kt();
+            // Read here, on the frame thread, for the reason `motion` above it
+            // is: the closure runs later, and a rung read inside it could be a
+            // different one from the rung the key was built with.
+            let fallback = self.render.srv_fallback();
             let extract = move || {
                 let current = rustdar_radar::current::resolve(
                     base.as_ref().map(|(scan, declared)| {
@@ -1605,7 +1612,11 @@ impl super::App {
                 // The same stamp `App::extract_current_volume` applies, and for
                 // the same reason: without it this payload's worker estimates
                 // the velocity fold limits the merge just declared.
-                .map(|input| input.with_declared_nyquist(current.declared_nyquist()))
+                .map(|input| {
+                    input
+                        .with_declared_nyquist(current.declared_nyquist())
+                        .with_srv_fallback(fallback)
+                })
             };
             match self.render.spawn_section_render(
                 pane_idx,
@@ -1964,7 +1975,7 @@ impl super::App {
             let elevation = cached.elevation;
             let nyquist_ms = cached.nyquist_ms;
             let melting_layer_source = cached.melting_layer_source;
-            let storm_motion_source = cached.storm_motion_source;
+            let storm_motion = cached.storm_motion;
 
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 continue;
@@ -2037,7 +2048,7 @@ impl super::App {
                         // prediction with nothing saying so — a field shifted
                         // by a vector the RPG never applied, indistinguishable
                         // from the reference product.
-                        storm_motion_source,
+                        storm_motion,
                         product,
                         elevation,
                     }),
@@ -2978,6 +2989,7 @@ impl super::App {
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
                         .then_some(motion_override)
                         .flatten(),
+                    self.render.srv_fallback(),
                 )
             });
             // The volume half of the key, for a 3D loop: the ground the frames
@@ -2996,6 +3008,7 @@ impl super::App {
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
                         .then_some(motion_override)
                         .flatten(),
+                    self.render.srv_fallback(),
                 )
             });
             let ls = &mut pane.loop_state;
@@ -4028,7 +4041,7 @@ fn rendered_image(
         max_range_km: rr.max_range_km,
         nyquist_ms: rr.nyquist_ms,
         melting_layer_source: rr.melting_layer_source,
-        storm_motion_source: rr.storm_motion_source,
+        storm_motion: rr.storm_motion,
         // **This is what makes a hover work under a loop.** The field carries
         // this frame's wedges and no numbers — `deliver` stripped them — and
         // `gates` is an `Arc` on the volume it was drawn from, which the loop's

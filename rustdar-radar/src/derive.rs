@@ -19,8 +19,10 @@
 //! * **Storm-relative velocity** — per velocity sweep:
 //!   [`crate::srv::compute_srv_grid`] (dealias against the volume wind fit,
 //!   then subtract the storm motion). The motion vector is the user's
-//!   override where set, else Bunkers from the volume's own
-//!   [`crate::velocity::volume_wind_profile`]; with neither, the product
+//!   override where set, else the RPG's own vector for the volume, else a
+//!   rung derived from the volume's own
+//!   [`crate::velocity::volume_wind_profile`] — the 0–6 km mean wind unless the
+//!   reader asked for the Bunkers right-mover; with none of those, the product
 //!   refuses — painting base velocity under a storm-relative label is the
 //!   failure the whole arrangement exists to prevent. The derived field is
 //!   dealiased by construction, which is why the sampler's fold guard stays
@@ -200,16 +202,13 @@ fn codec(product: RadarProduct) -> (f32, f32) {
 pub fn prepare<'s>(
     volume: crate::nyquist::Volume<'s>,
     product: RadarProduct,
-    storm_motion_override: Option<(f32, f32)>,
-    rpg_storm_motion: Option<(f32, f32)>,
+    motion: crate::srv::MotionInputs,
 ) -> Option<Prepared<'s>> {
     if crate::sampler::samplable(product).is_some() {
         return Some(Prepared::Native(volume.scan()));
     }
     let derived = match product {
-        RadarProduct::StormRelativeVelocity => {
-            derive_srv(volume, storm_motion_override, rpg_storm_motion)?
-        }
+        RadarProduct::StormRelativeVelocity => derive_srv(volume, motion)?,
         RadarProduct::NormalizedRotation => derive_nrot(volume)?,
         RadarProduct::SpecificDifferentialPhase => derive_kdp(volume.scan())?,
         _ => return None,
@@ -241,26 +240,16 @@ fn velocity_tilts(
         .collect()
 }
 
-fn derive_srv(
-    volume: crate::nyquist::Volume<'_>,
-    storm_motion_override: Option<(f32, f32)>,
-    rpg_storm_motion: Option<(f32, f32)>,
-) -> Option<Scan> {
+fn derive_srv(volume: crate::nyquist::Volume<'_>, motion: srv::MotionInputs) -> Option<Scan> {
     let scan = volume.scan();
     let tilts = velocity_tilts(volume);
     let profile = crate::velocity::wind_profile_of(tilts.iter().map(|(tilt, _)| tilt));
-    let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
-        srv::SrvMotion::user_override(speed_kt, direction_deg)
-    });
-    let rpg = rpg_storm_motion.and_then(|(speed_kt, direction_deg)| {
-        srv::SrvMotion::rpg_scit_average(speed_kt, direction_deg)
-    });
     // No vector, no SRV: base velocity under a storm-relative label is the
     // failure this refusal exists to prevent.
-    let Some(motion) = srv::storm_motion(profile.as_ref(), user, rpg) else {
+    let Some(motion) = motion.resolve(profile.as_ref()) else {
         log::warn!(
             "SRV derivation refused: no storm motion vector — no user override, \
-             no RPG vector for this volume, and no Bunkers fit from the volume's \
+             no RPG vector for this volume, and no wind fit from the volume's \
              own winds"
         );
         return None;

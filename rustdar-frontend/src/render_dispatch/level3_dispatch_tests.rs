@@ -373,7 +373,7 @@ fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
         elevation,
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
     }
 }
 
@@ -503,12 +503,12 @@ fn the_override_routes_into_the_level2_render_params() {
     let mut d = RenderDispatcher::new();
     assert_eq!(d.storm_motion_override_kt(), None, "no override, Bunkers");
 
-    d.set_storm_motion_override(Some(
+    d.set_storm_motion_choice_default(Some(
         StormMotionSample::user_override(45.0, 210.0).expect("finite"),
     ));
     assert_eq!(d.storm_motion_override_kt(), Some((45.0, 210.0)));
 
-    d.set_storm_motion_override(None);
+    d.set_storm_motion_choice_default(None);
     assert_eq!(d.storm_motion_override_kt(), None);
 }
 
@@ -536,7 +536,7 @@ fn changing_the_override_invalidates_the_storm_relative_renders() {
         output(),
     );
 
-    assert!(d.set_storm_motion_override(Some(
+    assert!(d.set_storm_motion_choice_default(Some(
         StormMotionSample::user_override(30.0, 240.0).expect("finite")
     )));
     assert_eq!(d.pane_render[0].last_rendered, None);
@@ -575,15 +575,15 @@ fn an_unchanged_override_invalidates_nothing() {
     let mut d = RenderDispatcher::new();
     d.ensure_pane_count(1);
     let o = Some(StormMotionSample::user_override(30.0, 240.0).expect("finite"));
-    assert!(d.set_storm_motion_override(o));
+    assert!(d.set_storm_motion_choice_default(o));
     d.pane_render[0].last_rendered = Some((RadarProduct::StormRelativeVelocity, 1.3));
-    assert!(!d.set_storm_motion_override(o));
+    assert!(!d.set_storm_motion_choice_default(o));
     assert_eq!(
         d.pane_render[0].last_rendered,
         Some((RadarProduct::StormRelativeVelocity, 1.3))
     );
     // Turning it back off is a change again.
-    assert!(d.set_storm_motion_override(None));
+    assert!(d.set_storm_motion_choice_default(None));
     assert_eq!(d.pane_render[0].last_rendered, None);
 }
 
@@ -594,6 +594,6 @@ fn output() -> CachedRenderOutput {
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
         melting_layer_source: None,
-        storm_motion_source: None,
+        storm_motion: None,
     }
 }

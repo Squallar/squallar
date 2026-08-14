@@ -368,6 +368,79 @@ fn a_hidden_map_floor_survives_a_save_and_load() {
     );
 }
 
+/// The derived-rung choice survives a save and load, both directions.
+///
+/// Reopening is 1:1 with how the app was closed, and this setting is one of the
+/// least visible there is: it does nothing at all until a volume arrives with no
+/// NWS storm motion on it. A reader who chose the Bunkers right-mover, closed
+/// the app, and later found the mean wind would have no way to tell a lost
+/// setting from a setting that simply had not applied yet.
+#[test]
+fn the_storm_motion_fallback_survives_a_save_and_load() {
+    use rustdar_radar::srv::SrvFallback;
+
+    let store = MemoryConfigStore::default();
+    let mut gui = crate::Gui::new();
+    assert_eq!(
+        gui.srv_fallback,
+        SrvFallback::MeanWind,
+        "precondition: a fresh session falls to the mean wind",
+    );
+    gui.srv_fallback = SrvFallback::BunkersRightMover;
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(
+        restored.srv_fallback,
+        SrvFallback::BunkersRightMover,
+        "a reader who asked for the right-mover must come back to it",
+    );
+
+    // And back again, or the field is written once and pinned.
+    restored.srv_fallback = SrvFallback::MeanWind;
+    restored.save_ui_config(&store);
+    let mut again = crate::Gui::new();
+    assert!(again.load_ui_config(&store));
+    assert_eq!(again.srv_fallback, SrvFallback::MeanWind);
+}
+
+/// A config written before the choice existed comes back on the mean wind, and
+/// one naming a rung this build does not have does **not** cost the whole file.
+///
+/// The second half is `product_or_default`'s lesson applied here: a bare derived
+/// `Deserialize` fails the entire load on an unknown variant, the autosave then
+/// rewrites from defaults, and a reader who ran a newer build once loses their
+/// site, layout and curves permanently. A round trip can never see either case.
+#[test]
+fn a_config_from_another_build_still_loads_its_storm_motion_fallback() {
+    use rustdar_radar::srv::SrvFallback;
+
+    for (json, why) in [
+        (
+            r#"{"site": "KDMX"}"#,
+            "an absent key must mean the shipped default",
+        ),
+        (
+            r#"{"site": "KDMX", "srv_fallback": "LeftMover"}"#,
+            "a rung from a newer build must not cost the file",
+        ),
+    ] {
+        let store = MemoryConfigStore::default();
+        store
+            .store(UI_CONFIG_KEY, json)
+            .expect("the memory store accepts a write");
+        let mut gui = crate::Gui::new();
+        assert!(gui.load_ui_config(&store), "{why}");
+        assert_eq!(gui.srv_fallback, SrvFallback::MeanWind, "{why}");
+        assert_eq!(
+            gui.pane(0).map(|p| p.site.clone()),
+            Some("KDMX".to_owned()),
+            "{why}: the rest of the config was lost",
+        );
+    }
+}
+
 /// A config written before `hide_floor` existed comes back with the floor
 /// **showing**.
 ///

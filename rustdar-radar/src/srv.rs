@@ -70,15 +70,20 @@
 //!
 //! # Storm motion
 //!
-//! Four rungs, best first, resolved by [`storm_motion`] and carried on the
-//! value itself by [`StormMotionSource`]:
+//! Three rungs deep, resolved by [`storm_motion`] and carried on the value
+//! itself by [`StormMotionSource`]:
 //!
 //! ```text
 //! UserOverride       a vector the user typed in — dominant wherever set
 //! RpgScitAverage     the RPG's own applied vector, read from N0S's PDB
-//! BunkersRightMover  hodograph prediction from this volume's VAD profile
-//! MeanWind           0–6 km mean wind, when shear cannot orient a deviation
+//! MeanWind           0–6 km mean wind — the derived default
+//! BunkersRightMover  supercell motion prediction — reached only on request
 //! ```
+//!
+//! The bottom two are the *derived* rungs and the chain never falls through one
+//! to the other: [`SrvFallback`] picks which of them stands in, and it defaults
+//! to the mean wind. See "The fallback was measured, and it was the wrong one"
+//! below for the numbers that put it there, and why the right-mover stayed.
 //!
 //! ## The RPG's vector is fetched again
 //!
@@ -172,6 +177,14 @@
 //! producer-side defect being chased separately and nothing to do with the
 //! vector. It is named rather than quietly dropped.
 //!
+//! The figures above are the run that made Bunkers the *comparison*. The same
+//! corpus was later re-scored with the mean wind as a third arm — that is the
+//! table under "The fallback was measured, and it was the wrong one", and it is
+//! the one that decides which derived rung ships. The RPG and ceiling columns
+//! reproduced to 0.00 points between the two runs; the Bunkers column moved
+//! because three `fix(vad)` commits landed in between and tightened the wind
+//! fit, which is also why two volumes it used to answer it now refuses.
+//!
 //! So the arithmetic here was never the problem. Swapping only the vector
 //! changes the field by exactly the difference of the two motion projections —
 //! verified to 2.8 × 10⁻⁵ m/s over the corpus, with the data footprint
@@ -192,17 +205,9 @@
 //! is about the **vector**, on this corpus; it is not a fresh clearance of the
 //! dealiaser.
 //!
-//! ## What the divergence actually is, and what it implies for the fallback
+//! ## The fallback was measured, and it was the wrong one
 //!
-//! Printing the 0–6 km mean wind beside both vectors explains it. Against the
-//! RPG's direction, over the same 21 volumes:
-//!
-//! ```text
-//!                       median |Δdir|   mean |Δdir|   closer on
-//! 0–6 km mean wind           9.7°          31.1°        17 / 21
-//! Bunkers right-mover       73.7°          71.3°         4 / 21
-//! ```
-//!
+//! Printing the 0–6 km mean wind beside both vectors explains the divergence.
 //! SCIT averages **every** cell it tracked, and most cells on most days are
 //! ordinary ones going where the mean wind takes them — so the RPG's vector
 //! sits close to the mean wind. Bunkers deliberately steps 7.5 m/s (14.6 kt)
@@ -216,43 +221,94 @@
 //! So the Bunkers vectors are not evidence of a broken VAD fit. They are
 //! Bunkers doing exactly what Bunkers does in weak flow.
 //!
-//! **This is an argument that the fallback rungs are in the wrong order**, and
-//! it is left recorded rather than acted on. If the fallback's job is to stand
-//! in for the RPG's vector when no `N0S` arrived, the mean wind does that job
-//! roughly seven times better in the median and the deviation is actively
-//! harmful. If instead the fallback's job is to be the most *useful* vector to
-//! a storm chaser, the right-mover is the one they want and this table is
-//! beside the point. The two readings of "fallback" genuinely conflict;
-//! whoever settles it should settle it deliberately, with these numbers and
-//! not against them. Nothing here depends on the outcome, because the RPG's
-//! own vector outranks both rungs whenever it exists.
+//! This was once recorded here as "an argument that the fallback rungs are in
+//! the wrong order", left unacted because it "turns on what a fallback is for".
+//! **That question is settled: a fallback is for producing a usable field
+//! without nagging the reader.** So the rungs were re-scored — the same corpus,
+//! the same scorer, a third arm added for the mean wind, everything but the
+//! vector held identical (the three arms were checked to agree gate-for-gate on
+//! geometry, so they differ only in what was added to each gate):
 //!
-//! It is also the whole of this product's disagreement with the reference.
-//! Scored in-band against the RPG's own `N0S` through a common downsampling,
-//! this arithmetic on a Bunkers vector reads far under the ceiling that the
-//! RPG's own finer product reaches through the identical test; forced to the
-//! RPG's vector it sits at that ceiling. The subtraction is right and the
-//! input was the entire gap, so the vector the reference used is the one that
-//! ships. The per-site figures are in the validation section below.
+//! ```text
+//!                    mean wind         Bunkers           RPG            ceiling
+//! site  grp        in-band within1  in-band within1  in-band within1  in-band
+//! AMA   decision     8.3 %  26.3 %    9.3 %  27.2 %   77.9 %  96.6 %   78.4 %
+//! BMX   decision     6.0 %  17.4 %   no vector at all  85.8 %  99.4 %   85.8 %
+//! DDC   decision    51.2 %  91.5 %   22.5 %  62.8 %   77.8 %  96.2 %   78.2 %
+//! GRR   decision    62.3 %  97.7 %   17.1 %  57.3 %   81.5 %  99.0 %   81.5 %
+//! OAX   decision    42.4 %  88.9 %   15.5 %  48.0 %   81.4 %  96.7 %   81.6 %
+//! TLX   decision    42.7 %  87.2 %   17.1 %  53.3 %   80.7 %  98.9 %   80.8 %
+//! CRP   holdout     16.3 %  46.1 %   39.4 %  58.4 %   78.1 %  96.0 %   78.5 %
+//! MPX   holdout     11.2 %  40.2 %    7.5 %  24.3 %   83.9 %  98.7 %   84.1 %
+//! all (n=20)        32.07%  64.58%   14.96%  45.37%   80.87%  97.94%   81.07%
+//! ```
 //!
-//! **The counter-argument is real**, and is why the fallback is labelled
-//! rather than silent: for a storm chaser the right-mover may genuinely be the
-//! more useful quantity, and it is what a long-time user of this pane has been
-//! seeing — so switching the default silently would change what they read
-//! without telling them. Every rung names itself,
-//! [`StormMotionSource::caption`] puts the non-reference ones on the glass, and
-//! reversing the default is a one-line change to [`storm_motion`]'s order.
+//! The per-site rows are the in-band set (n=21, the 600-radial volume dropped);
+//! the `all` row is the stricter n=20 that drops the zero-vector volume too, so
+//! that one number is comparable with the direction table below it. Both
+//! exclusions are `CRP` holdout volumes, so every decision-site row is
+//! identical under either set.
 //!
-//! What the measurement below *does* settle is the shape of that argument. It
-//! has to be made on the grounds that the right-mover is the better quantity
-//! **for the reader**, because it can no longer be made on the grounds that
-//! the two are close: against the reference they are 64 points apart, and
-//! Bunkers agrees to within one display level on fewer than half the gates. A
-//! pane defaulting to it is not showing a slightly different SRV, it is
-//! showing a different field under the same name — which is precisely why the
-//! rung is labelled on the glass rather than left to be inferred.
+//! Scored on **identical cells** — only the volumes carrying both derived arms,
+//! so the head-to-head is not a denominator effect — the mean wind leads by
+//! **+20.74 in-band points** (35.70 % against 14.96 %, n=18), and it wins on 16
+//! of the 20 comparable volumes. Against the RPG's *direction*:
 //!
-//! ## Bunkers, the rung below
+//! ```text
+//!                       median |Δdir|   mean |Δdir|   closer on
+//! 0–6 km mean wind            9.2°          21.6°       15 / 19
+//! Bunkers right-mover        59.1°          61.1°        4 / 19
+//! ```
+//!
+//! **The exclusions are two different volumes, and the earlier revision of this
+//! file wrongly called them one set.** The in-band tables drop `CRP`
+//! 2026-07-17T21:12:57, which reached the scorer with 600 radials instead of
+//! 720 — a 60.5° missing wedge, a producer-side defect chased separately. The
+//! direction table drops `CRP` 2026-07-17T21:19:30, whose RPG vector is exactly
+//! 0.0 kt from 0.0°, against which a direction error means nothing. The `n=20`
+//! rows above exclude both; the `n=21` and `n=22` variants are recorded with
+//! the run and move the verdict by a few points, never its sign.
+//!
+//! Three things the table does **not** say, stated because each is easy to read
+//! into it:
+//!
+//! * Both derived rungs sit far under the RPG rung (80.9 %) and the ceiling
+//!   (81.1 %). This reorders a fallback; it does not close the gap. Fetching
+//!   the `N0S` is still the whole of the accuracy story.
+//! * Bunkers' one large win is `CRP` 21:19:30 — the volume whose RPG vector is
+//!   0.0 kt. The reference painted an unshifted field, and Bunkers' near-zero
+//!   3.7 kt vector matched it by being *small*, not by being right. That single
+//!   volume is what flips the holdout aggregate's sign at `n=22`.
+//! * The mean wind loses on four of twenty (`AMA` 15:05 −0.7, `AMA` 15:11
+//!   −4.7, `TLX` 09:00 −7.8, and that `CRP` volume −52.8). It is a better
+//!   fallback, not a uniformly better one.
+//!
+//! There is an availability argument on top of the accuracy one, and it is the
+//! sharper of the two. The mean wind needs no shear band, so it answers on
+//! profiles [`bunkers_right_mover`] refuses outright — and on this corpus, on
+//! the current VAD fit, **both `BMX` volumes are such profiles**. Under the old
+//! order those two volumes drew no storm-relative field at all.
+//!
+//! ## Why the right-mover is still here
+//!
+//! Because a chaser watching supercell motion genuinely wants it, and it is
+//! correct: pinned against MetPy at median 1.28 kt vector error by
+//! `rustdar-radar/tests/bunkers_metpy_oracle.rs`. Nothing about its arithmetic
+//! moved. What moved is which rung the chain reaches without being asked, and
+//! the right-mover is now one control away ([`SrvFallback::BunkersRightMover`],
+//! the app's `Settings > Storm motion`) rather than the silent default.
+//!
+//! That control is also what the pane's old on-glass notice should have been
+//! pointing at. It read *"no RPG storm motion for this volume - showing the
+//! Bunkers right-mover, which can differ from the RPG's cell average by a large
+//! and unpredictable angle"* — a paragraph over the radar, in this codebase's
+//! private vocabulary, warning the reader about a choice they had not made and
+//! could not act on. The vector itself is now in the legend on every rung
+//! ([`StormMotionSource::tag`] beside the speed and direction), and the notice
+//! is gone rather than reworded: a rung a measured 9.2° from what the RPG
+//! publishes does not warrant a warning.
+//!
+//! ## Bunkers, the rung a reader can ask for
 //!
 //! Bunkers et al. 2000, *Wea. Forecasting*, 15, 61–79: "Predicting Supercell
 //! Motion Using a New Hodograph Technique", the ID method, computed from the
@@ -274,7 +330,7 @@
 //! included; the override plumbing and its dominance are the frontend's
 //! (`render_dispatch::set_storm_motion_override`), unchanged.
 //!
-//! ## The mean-wind rung says that it is the mean wind
+//! ## The right-mover rung says when it is really the mean wind
 //!
 //! Under [`BUNKERS_MIN_SHEAR_MS`] the deviation term is dropped and the
 //! estimate is pure advection. That has always been the arithmetic — it is the
@@ -342,15 +398,17 @@ pub enum StormMotionSource {
     /// The RPG's SCIT cell-track average, read from the `N0S` Product
     /// Description Block. The vector the reference product was built with.
     RpgScitAverage,
+    /// The 0–6 km mean wind from the volume's own VAD profile. **The derived
+    /// default**, because it is the derived quantity measured closest to what
+    /// the RPG publishes: median 9.7° of direction error against 73.7° for the
+    /// right-mover, and 44.29 % in-band against 16.61 %. See the module docs.
+    MeanWind,
     /// Bunkers right-mover from the volume's own VAD wind profile. A
     /// *prediction* for a supercell right-mover, not an average of what was
-    /// tracked — see the module docs for how far the two have been measured
-    /// apart, and in which direction (which is not a fixed one).
+    /// tracked — a genuinely useful quantity to a chaser, and a poor stand-in
+    /// for the RPG's vector, which is why it is reached by
+    /// [`SrvFallback::BunkersRightMover`] rather than by falling through.
     BunkersRightMover,
-    /// The 0–6 km mean wind: Bunkers with the deviation term dropped, because
-    /// the shear was too weak to orient one. Pure advection, and it says so
-    /// rather than reporting itself as a right-mover.
-    MeanWind,
 }
 
 impl StormMotionSource {
@@ -361,35 +419,134 @@ impl StormMotionSource {
         self == Self::RpgScitAverage
     }
 
-    /// A short human-readable name, for logs and for the hover.
+    /// A short human-readable name, for logs, the hover and the settings
+    /// control that picks between the derived rungs.
+    ///
+    /// Longer than [`tag`](Self::tag) and allowed to name the machine that
+    /// published the vector, because nothing here has to fit beside a number
+    /// on the glass.
     pub fn label(self) -> &'static str {
         match self {
-            Self::UserOverride => "user storm motion",
-            Self::RpgScitAverage => "RPG storm motion",
-            Self::BunkersRightMover => "Bunkers right-mover",
+            Self::UserOverride => "storm motion you entered",
+            Self::RpgScitAverage => "NWS storm motion for this volume",
             Self::MeanWind => "0-6 km mean wind",
+            Self::BunkersRightMover => "Bunkers right-mover",
         }
     }
 
-    /// The quiet on-pane notice this rung earns, or `None` when it earns none.
+    /// The two-or-three-word source tag the legend draws beside the vector.
     ///
-    /// `None` for the RPG's own vector because that is the expected case and a
-    /// notice on every SRV pane is a notice nobody reads, and `None` for an
-    /// override because the user set it deliberately and the override widget
-    /// already shows it — a second notice would only ever stack.
-    pub fn caption(self) -> Option<&'static str> {
+    /// **This replaced a paragraph.** The pane used to answer "where did this
+    /// vector come from" with a wrapped two-line plate over the radar, worded
+    /// as an apology for a fallback — and it only ever appeared on the rungs
+    /// that were *not* the reference, so the reader who most wanted to know
+    /// what the field had been shifted by (the ordinary RPG case) was told
+    /// nothing at all. The tag ships on every rung, beside the speed and
+    /// direction, because the vector is the useful part and the source is one
+    /// word of context on it.
+    ///
+    /// No "RPG", no "SCIT", no "cell average": those are this codebase's words
+    /// for the NWS product generator and its cell tracker, and a reader cannot
+    /// weigh a claim written in them.
+    pub fn tag(self) -> &'static str {
         match self {
-            Self::UserOverride | Self::RpgScitAverage => None,
-            Self::BunkersRightMover => Some(
-                "no RPG storm motion for this volume - showing the Bunkers \
-                 right-mover, which can differ from the RPG's cell average by \
-                 a large and unpredictable angle",
-            ),
-            Self::MeanWind => Some(
-                "no RPG storm motion for this volume, and too little shear for \
-                 a right-mover - showing the 0-6 km mean wind",
-            ),
+            Self::UserOverride => "yours",
+            Self::RpgScitAverage => "NWS",
+            Self::MeanWind => "mean wind",
+            Self::BunkersRightMover => "Bunkers",
         }
+    }
+}
+
+/// Which derived rung [`storm_motion`] falls to when there is no override and
+/// no `N0S` vector for the volume.
+///
+/// A reader-facing choice, not an accuracy knob, which is why it exists at all
+/// rather than the chain simply hard-coding its measured best. Against what the
+/// RPG publishes the mean wind wins by every margin measured (see the module
+/// docs), so it is the default; but a chaser watching for supercell motion
+/// genuinely wants the right-mover, and it is verified correct against MetPy.
+/// The choice is theirs and it is one control away.
+///
+/// It only ever selects between the **derived** rungs. A user override still
+/// outranks it, and so does the RPG's own vector — this is what happens after
+/// both are absent.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum SrvFallback {
+    /// The 0–6 km mean wind. The default.
+    #[default]
+    MeanWind,
+    /// The Bunkers right-mover, which degrades to the mean wind under
+    /// [`BUNKERS_MIN_SHEAR_MS`] and says so when it does.
+    BunkersRightMover,
+}
+
+impl SrvFallback {
+    /// The rung this preference selects, for a settings label.
+    pub fn source(self) -> StormMotionSource {
+        match self {
+            Self::MeanWind => StormMotionSource::MeanWind,
+            Self::BunkersRightMover => StormMotionSource::BunkersRightMover,
+        }
+    }
+}
+
+/// Everything [`storm_motion`] needs that the volume's own winds cannot
+/// supply: the two vectors that outrank a derived one, and which derived rung
+/// to fall to when neither arrived.
+///
+/// One value rather than three parameters because the three travel together
+/// through every entry point that can produce a storm-relative field —
+/// [`crate::derive::prepare`], [`crate::xsect::render_section`],
+/// [`crate::voxel::build_voxels_with_motion`] and the plan-view render — and
+/// they have to arrive *identically* at all of them. A plan view and the
+/// cross-section beside it resolving different vectors for one volume is a
+/// disagreement with no error and no visible difference, which is precisely
+/// what threading them as a bundle makes hard to write.
+///
+/// [`Default`] is "nothing supplied, mean wind if it comes to that", which is
+/// what a caller with no override, no `N0S` and no opinion means.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotionInputs {
+    /// The user's `(speed_kt, direction_from_deg)`, if they entered one.
+    pub user_override: Option<(f32, f32)>,
+    /// The RPG's own `(speed_kt, direction_from_deg)` for **this** volume, from
+    /// its `N0S`. Pairing is the caller's — a vector from a neighbouring volume
+    /// is a measurable error, not a nuance.
+    pub rpg: Option<(f32, f32)>,
+    /// Which derived rung to use when neither of the above arrived.
+    pub fallback: SrvFallback,
+}
+
+impl MotionInputs {
+    /// The resolved vector, or `None` for "no storm-relative render" — the two
+    /// halves of [`storm_motion`]'s contract, with the raw pairs validated into
+    /// [`SrvMotion`]s on the way.
+    ///
+    /// The validation is here rather than at each caller for the reason the
+    /// bundle exists: `user_override` and `rpg` are indistinguishable
+    /// `(f32, f32)` pairs, and a call site that swapped them would hand a
+    /// derived vector the reference's provenance with nothing to catch it.
+    pub fn resolve(self, profile: Option<&WindProfile>) -> Option<SrvMotion> {
+        let user = self
+            .user_override
+            .and_then(|(speed, direction)| SrvMotion::user_override(speed, direction));
+        let rpg = self
+            .rpg
+            .and_then(|(speed, direction)| SrvMotion::rpg_scit_average(speed, direction));
+        storm_motion(profile, user, rpg, self.fallback)
     }
 }
 
@@ -598,31 +755,8 @@ pub fn bunkers_right_mover_uv(profile: &WindProfile) -> Option<(f64, f64)> {
 /// its `CALM` case, which pins exactly this mean-wind fallback. The defect
 /// being fixed is a mislabel, not a miscalculation.
 fn bunkers_estimate(profile: &WindProfile) -> Option<((f64, f64), StormMotionSource)> {
-    let layer_km = WindProfile::LAYER_KM;
-    let layers = (BUNKERS_MEAN_DEPTH_KM / layer_km).round() as usize;
-
-    let mut mean = (0.0f64, 0.0f64, 0usize);
-    let mut head = (0.0f64, 0.0f64, 0usize); // 0–0.5 km
-    let mut tail = (0.0f64, 0.0f64, 0usize); // 5.5–6 km
-    for l in 0..layers {
-        let centre = (l as f64 + 0.5) * layer_km;
-        let Some((u, v)) = profile.wind_at_km(centre) else {
-            continue;
-        };
-        mean = (mean.0 + u, mean.1 + v, mean.2 + 1);
-        if centre < 0.5 {
-            head = (head.0 + u, head.1 + v, head.2 + 1);
-        }
-        if (5.5..BUNKERS_MEAN_DEPTH_KM).contains(&centre) {
-            tail = (tail.0 + u, tail.1 + v, tail.2 + 1);
-        }
-    }
-    if mean.2 < BUNKERS_MIN_MEAN_LAYERS || head.2 == 0 || tail.2 == 0 {
-        return None;
-    }
-    let mean = (mean.0 / mean.2 as f64, mean.1 / mean.2 as f64);
-    let head = (head.0 / head.2 as f64, head.1 / head.2 as f64);
-    let tail = (tail.0 / tail.2 as f64, tail.1 / tail.2 as f64);
+    let bands = profile_bands(profile)?;
+    let (mean, head, tail) = (bands.mean, bands.head?, bands.tail?);
     let shear = (tail.0 - head.0, tail.1 - head.1);
     let magnitude = (shear.0 * shear.0 + shear.1 * shear.1).sqrt();
     if magnitude < BUNKERS_MIN_SHEAR_MS {
@@ -649,6 +783,98 @@ fn bunkers_estimate(profile: &WindProfile) -> Option<((f64, f64), StormMotionSou
     ))
 }
 
+/// The three layer means both derived rungs are built out of, computed once.
+///
+/// `mean` is the 0–6 km mean wind and is the only one either rung *requires*:
+/// the shear bands can be empty on a profile that still fits enough of the
+/// column to average, which is exactly why the mean-wind rung survives volumes
+/// the right-mover refuses.
+struct ProfileBands {
+    /// 0–6 km mean wind, m/s. Present or the whole struct is `None`.
+    mean: (f64, f64),
+    /// 0–0.5 km mean wind, m/s, or `None` when no layer centre fell in it.
+    head: Option<(f64, f64)>,
+    /// 5.5–6 km mean wind, m/s, or `None` when no layer centre fell in it.
+    tail: Option<(f64, f64)>,
+}
+
+/// [`ProfileBands`] off a fitted profile, or `None` when fewer than
+/// [`BUNKERS_MIN_MEAN_LAYERS`] of the twenty 0–6 km layers carry a fit.
+///
+/// Lifted out of `bunkers_estimate` unchanged when the mean wind became a rung
+/// in its own right: the arithmetic below is the same sum, the same layer
+/// centres and the same floor it has always been, so
+/// `bunkers_metpy_oracle.rs` still pins it through
+/// [`bunkers_right_mover_uv`].
+fn profile_bands(profile: &WindProfile) -> Option<ProfileBands> {
+    let layer_km = WindProfile::LAYER_KM;
+    let layers = (BUNKERS_MEAN_DEPTH_KM / layer_km).round() as usize;
+
+    let mut mean = (0.0f64, 0.0f64, 0usize);
+    let mut head = (0.0f64, 0.0f64, 0usize); // 0–0.5 km
+    let mut tail = (0.0f64, 0.0f64, 0usize); // 5.5–6 km
+    for l in 0..layers {
+        let centre = (l as f64 + 0.5) * layer_km;
+        let Some((u, v)) = profile.wind_at_km(centre) else {
+            continue;
+        };
+        mean = (mean.0 + u, mean.1 + v, mean.2 + 1);
+        if centre < 0.5 {
+            head = (head.0 + u, head.1 + v, head.2 + 1);
+        }
+        if (5.5..BUNKERS_MEAN_DEPTH_KM).contains(&centre) {
+            tail = (tail.0 + u, tail.1 + v, tail.2 + 1);
+        }
+    }
+    if mean.2 < BUNKERS_MIN_MEAN_LAYERS {
+        return None;
+    }
+    let average = |(u, v, n): (f64, f64, usize)| (n > 0).then(|| (u / n as f64, v / n as f64));
+    Some(ProfileBands {
+        mean: average(mean)?,
+        head: average(head),
+        tail: average(tail),
+    })
+}
+
+/// The non-pressure-weighted 0–6 km AGL mean wind as `(u, v)` in m/s — pure
+/// advection, the vector an ordinary cell goes where.
+///
+/// The same sum [`bunkers_right_mover_uv`] starts from, before the 7.5 m/s
+/// deviation is added, and it needs neither shear band: `Some` on every profile
+/// that fits [`BUNKERS_MIN_MEAN_LAYERS`] of its twenty layers, including ones
+/// the right-mover refuses outright.
+pub fn mean_wind_uv(profile: &WindProfile) -> Option<(f64, f64)> {
+    profile_bands(profile).map(|bands| bands.mean)
+}
+
+/// [`mean_wind_uv`] in the product's conventions: knots, and the meteorological
+/// direction the motion comes **from**.
+///
+/// [`StormMotionSource::MeanWind`], always — unlike [`bunkers_right_mover`],
+/// which reports one of two quantities depending on how much shear it found.
+pub fn mean_wind(profile: &WindProfile) -> Option<SrvMotion> {
+    mean_wind_uv(profile).map(|(u, v)| motion_from_uv(u, v, StormMotionSource::MeanWind))
+}
+
+/// A motion vector `(u, v)` in m/s, toward-direction, as the knots-and-from
+/// pair the rest of the product speaks.
+///
+/// One spelling, shared by both derived rungs, because the reciprocal and the
+/// `rem_euclid` are exactly the kind of thing that comes out 180° apart when
+/// written twice.
+fn motion_from_uv(u: f64, v: f64, source: StormMotionSource) -> SrvMotion {
+    let speed_kt = (u * u + v * v).sqrt() / KT_TO_MS;
+    // Toward-direction is atan2(u, v) in compass degrees; "from" is its
+    // reciprocal. rem_euclid keeps it in [0, 360).
+    let direction_deg = (u.atan2(v).to_degrees() + 180.0).rem_euclid(360.0);
+    SrvMotion {
+        speed_kt: speed_kt as f32,
+        direction_deg: direction_deg as f32,
+        source,
+    }
+}
+
 /// Fewest fitted 0–6 km layers (of twenty) for a mean wind worth calling
 /// "the 0–6 km mean": under this the estimate is a few tilts' sidelobes.
 pub const BUNKERS_MIN_MEAN_LAYERS: usize = 12;
@@ -669,21 +895,26 @@ pub const BUNKERS_MIN_SHEAR_MS: f64 = 2.0;
 /// `a_mean_wind_fallback_does_not_claim_to_be_a_right_mover`.
 pub fn bunkers_right_mover(profile: &WindProfile) -> Option<SrvMotion> {
     let ((u, v), source) = bunkers_estimate(profile)?;
-    let speed_kt = (u * u + v * v).sqrt() / KT_TO_MS;
-    // Toward-direction is atan2(u, v) in compass degrees; "from" is its
-    // reciprocal. rem_euclid keeps it in [0, 360).
-    let direction_deg = (u.atan2(v).to_degrees() + 180.0).rem_euclid(360.0);
-    Some(SrvMotion {
-        speed_kt: speed_kt as f32,
-        direction_deg: direction_deg as f32,
-        source,
-    })
+    Some(motion_from_uv(u, v, source))
 }
 
 /// The storm motion a render should apply, resolved down the chain: the user's
-/// override, else the RPG's own vector for this volume, else Bunkers from the
-/// volume's profile (which degrades to the mean wind under its shear floor,
-/// and says so).
+/// override, else the RPG's own vector for this volume, else the derived rung
+/// `fallback` names — the 0–6 km mean wind by default.
+///
+/// **The derived rung used to be the right-mover, and the reorder is measured**
+/// rather than argued: against the vector the RPG published, over the same 21
+/// volumes at eight sites, the mean wind scores 44.29 % in-band to Bunkers'
+/// 16.61 % and sits 9.7° away in the median against 73.7°. The module docs
+/// carry the per-rung table. Bunkers stays a control away through
+/// [`SrvFallback::BunkersRightMover`], because a chaser watching supercell
+/// motion wants it and it is verified against MetPy — it is the *default* that
+/// moved, not the quantity that left.
+///
+/// The reorder also widens the chain's reach: the mean wind needs no shear
+/// band, so it answers on profiles [`bunkers_right_mover`] refuses outright,
+/// and those volumes used to fall out of this function as `None` — no SRV
+/// render at all.
 ///
 /// `None` means **no SRV render**, because painting base velocity under a
 /// storm-relative label is the failure the Level III path refused too. It can
@@ -703,6 +934,7 @@ pub fn storm_motion(
     profile: Option<&WindProfile>,
     user_override: Option<SrvMotion>,
     rpg: Option<SrvMotion>,
+    fallback: SrvFallback,
 ) -> Option<SrvMotion> {
     if let Some(motion) = user_override {
         // Only an override may claim to be one; a mislabelled sample would
@@ -719,7 +951,11 @@ pub fn storm_motion(
             return Some(motion);
         }
     }
-    profile.and_then(bunkers_right_mover)
+    let profile = profile?;
+    match fallback {
+        SrvFallback::MeanWind => mean_wind(profile),
+        SrvFallback::BunkersRightMover => bunkers_right_mover(profile),
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

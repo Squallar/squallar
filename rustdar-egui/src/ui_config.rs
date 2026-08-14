@@ -498,6 +498,21 @@ struct UiConfig {
     /// "override off, default vector", which is what those sessions were.
     #[serde(default)]
     storm_motion_override: super::StormMotionOverride,
+    /// Which derived rung storm-relative velocity falls to when no override and
+    /// no NWS vector applies — the Storm motion section's first control.
+    ///
+    /// Persisted because reopening is 1:1 with how the app was closed, and this
+    /// one is invisible until a volume arrives without an NWS vector: a reader
+    /// who chose the right-mover and found the mean wind after a restart would
+    /// have no way to tell the setting had been lost from the setting having
+    /// never applied.
+    ///
+    /// `#[serde(default)]` loads an older config as the mean wind, which is
+    /// both the shipped default and what those sessions were getting once the
+    /// rungs were reordered. Read leniently for [`product_or_default`]'s
+    /// reason: a rung name from a newer build must not cost the whole file.
+    #[serde(default, deserialize_with = "srv_fallback_or_default")]
+    srv_fallback: rustdar_radar::srv::SrvFallback,
     /// Whether the pane pill rows render at full opacity unconditionally —
     /// the Interface section's "Pin pane controls". `#[serde(default)]`
     /// loads an older config as unpinned, which is what those sessions were.
@@ -587,6 +602,34 @@ where
                 RadarProduct::Reflectivity.name(),
             );
             Ok(RadarProduct::Reflectivity)
+        }
+    }
+}
+
+/// Deserialize the persisted derived-rung preference, falling back to the
+/// shipped default on a name this build does not know.
+///
+/// [`product_or_default`]'s reason exactly: a bare derived `Deserialize` fails
+/// the *entire* config load on an unknown variant, and a reader who ran a newer
+/// build once would lose their site, layout and curves permanently — the
+/// autosave rewrites the file from defaults straight afterwards.
+pub(crate) fn srv_fallback_or_default<'de, D>(
+    deserializer: D,
+) -> Result<rustdar_radar::srv::SrvFallback, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match rustdar_radar::srv::SrvFallback::deserialize(&value) {
+        Ok(fallback) => Ok(fallback),
+        Err(_) => {
+            let default = rustdar_radar::srv::SrvFallback::default();
+            log::warn!(
+                "config names a storm-motion fallback this build does not know \
+                 ({value}); falling back to {}",
+                default.source().label(),
+            );
+            Ok(default)
         }
     }
 }
@@ -733,6 +776,7 @@ impl Default for UiConfig {
             overlay_states: serde_json::Map::new(),
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: super::StormMotionOverride::default(),
+            srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
             presets: Vec::new(),
             volume_alpha: Vec::new(),
@@ -876,6 +920,7 @@ impl super::Gui {
                     },
                 }
             },
+            srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
             // The elevations go through the same finiteness door; the capture
             // path already filters, so this guards only hand-poked state.
@@ -1001,6 +1046,7 @@ impl super::Gui {
         self.preferences = config.preferences;
         self.gps_config = config.gps_config;
         self.storm_motion_override = config.storm_motion_override;
+        self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
         self.presets = config.presets;
 
