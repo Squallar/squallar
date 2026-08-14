@@ -134,6 +134,15 @@ fn post_result(
     proto::set_field(&message, proto::NYQUIST, &JsValue::NULL);
     proto::set_field(&message, proto::MELTING_LAYER, &JsValue::NULL);
     proto::set_field(&message, proto::STORM_MOTION, &JsValue::NULL);
+    // The other two thirds of that vector. They were written only inside the
+    // `Frame` arm's `if let`, so every other path out of this function left them
+    // *absent* while their companion `smv` sat here null — the one asymmetry in
+    // this block. Nothing reads differently for it today, because the page's
+    // trio is a `?`-chain that gives up on `smv` before it ever asks for these;
+    // but that is a property of the reader, not of the message, and the sentence
+    // above claims the message.
+    proto::set_field(&message, proto::STORM_MOTION_SPEED, &JsValue::NULL);
+    proto::set_field(&message, proto::STORM_MOTION_DIR, &JsValue::NULL);
     proto::set_field(&message, proto::OUT, &JsValue::NULL);
     proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
 
