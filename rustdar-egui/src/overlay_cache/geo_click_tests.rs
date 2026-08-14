@@ -198,3 +198,71 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
          is no longer exercising the case it exists for"
     );
 }
+
+// ── The dateline ─────────────────────────────────────────────────────────
+//
+// `Projector::unproject` is linear in pixel x and folds nothing, so a click
+// east of the antimeridian arrives as e.g. 185 while the zone it lands in is
+// stored at -175. These pin the hit test to the same frame the rasterizer
+// draws in — a Pacific zone that draws but cannot be clicked is the failure.
+
+/// A click written past +180 lands in the zone stored just west of it.
+#[test]
+fn a_click_east_of_the_dateline_hits_a_zone_stored_west_of_it() {
+    // Atka and Adak's real extent, squared off: -175.30..-174.01.
+    let f = feature(vec![vec![square(52.0, 52.5, -175.3, -174.0)]]);
+
+    // The same ground named the way an eastward pan names it: -174.5 + 360.
+    assert!(
+        geo_point_in_feature(52.2, 185.5, &f),
+        "a click at 185.5 is 5.5 deg past the seam and inside a zone stored at -174.5"
+    );
+    // And the control: the unshifted spelling still works, so this did not
+    // trade one frame for the other.
+    assert!(geo_point_in_feature(52.2, -174.5, &f));
+    // Non-triviality: a click that is genuinely outside stays outside in both
+    // spellings, so the shift is not simply reporting "inside" for everything.
+    assert!(!geo_point_in_feature(52.2, 170.0, &f));
+    assert!(!geo_point_in_feature(52.2, -160.0, &f));
+    assert!(
+        !geo_point_in_feature(60.0, 185.5, &f),
+        "right longitude, wrong latitude"
+    );
+}
+
+/// The mirror: a click written below -180 lands in a zone stored east of it.
+#[test]
+fn a_click_west_of_the_dateline_hits_a_zone_stored_east_of_it() {
+    // Shemya and Attu's real extent, squared off: 178.62..179.46.
+    let f = feature(vec![vec![square(51.3, 51.7, 178.62, 179.46)]]);
+
+    assert!(
+        geo_point_in_feature(51.5, -181.0, &f),
+        "a click at -181 is 1 deg past the seam and inside a zone stored at 179"
+    );
+    assert!(geo_point_in_feature(51.5, 179.0, &f));
+    assert!(!geo_point_in_feature(51.5, -170.0, &f));
+}
+
+/// A hole keeps cutting its ring after the shift.
+///
+/// The point is moved once, from the exterior's frame, and the holes are
+/// tested against that same moved point. Shifting each ring to its own frame
+/// instead would let a click fall inside an exterior and outside the hole that
+/// cuts it, opening a popup over a gap.
+#[test]
+fn a_hole_still_cuts_its_ring_when_the_click_is_shifted() {
+    let f = feature(vec![vec![
+        square(52.0, 53.0, -176.0, -174.0),
+        square(52.3, 52.7, -175.4, -174.6),
+    ]]);
+    // Inside the exterior, inside the hole: outside the feature, both spellings.
+    assert!(!geo_point_in_feature(52.5, -175.0, &f));
+    assert!(
+        !geo_point_in_feature(52.5, 185.0, &f),
+        "the hole must survive the shift"
+    );
+    // Inside the exterior, outside the hole: inside the feature, both spellings.
+    assert!(geo_point_in_feature(52.1, -175.0, &f));
+    assert!(geo_point_in_feature(52.1, 185.0, &f));
+}

@@ -210,16 +210,7 @@ impl MercatorBounds {
     /// `177.62..180.0` and `-180.0..-177.05` separately.
     #[inline]
     pub(crate) fn lon_shift(&self, min_lon: f64, max_lon: f64) -> f64 {
-        let span = max_lon - min_lon;
-        // A datum wider than a half-turn has no unambiguous "nearest"
-        // representation, and translating it would be a guess about which
-        // side of the seam it meant. Left alone, and measured never to occur.
-        if !span.is_finite() || !(0.0..180.0).contains(&span) {
-            return 0.0;
-        }
-        let datum_centre = (min_lon + max_lon) / 2.0;
-        let box_centre = (self.min_lon + self.max_lon) / 2.0;
-        360.0 * ((box_centre - datum_centre) / 360.0).round()
+        crate::render::geo::lon_shift(min_lon, max_lon, self.min_lon, self.max_lon)
     }
 
     /// A single point's representation nearest this box. See [`Self::lon_shift`].
@@ -1119,16 +1110,10 @@ pub(crate) struct ProjectedPolygon {
 /// The rigid longitude shift that carries `ring` into `mb`'s frame, from the
 /// ring's own longitude extent. Zero for an empty ring.
 fn ring_lon_shift(ring: &[(f64, f64)], mb: &MercatorBounds) -> f64 {
-    let mut min_lon = f64::INFINITY;
-    let mut max_lon = f64::NEG_INFINITY;
-    for &(_, lon) in ring {
-        min_lon = min_lon.min(lon);
-        max_lon = max_lon.max(lon);
+    match crate::render::geo::ring_lon_extent(ring) {
+        Some((min_lon, max_lon)) => mb.lon_shift(min_lon, max_lon),
+        None => 0.0,
     }
-    if !min_lon.is_finite() || !max_lon.is_finite() {
-        return 0.0;
-    }
-    mb.lon_shift(min_lon, max_lon)
 }
 
 /// `None` when the exterior ring is too short to enclose anything.

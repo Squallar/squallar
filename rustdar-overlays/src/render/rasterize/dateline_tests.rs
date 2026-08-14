@@ -197,10 +197,14 @@ fn a_zone_paints_the_same_pixels_whichever_way_the_viewport_is_written() {
     // Quadrupling the texture area must move it substantially, both sides of
     // the seam alike.
     let f = feature(&AKZ791);
-    let big_east = rasterize_spc_outlooks(&[f.clone()], &east, TEX * 2, TEX * 2, [0, 0, 0, 0], 1.0);
-    let big_west = rasterize_spc_outlooks(&[f], &west, TEX * 2, TEX * 2, [0, 0, 0, 0], 1.0);
+    let fs = std::slice::from_ref(&f);
+    let big_east = rasterize_spc_outlooks(fs, &east, TEX * 2, TEX * 2, [0, 0, 0, 0], 1.0);
+    let big_west = rasterize_spc_outlooks(fs, &west, TEX * 2, TEX * 2, [0, 0, 0, 0], 1.0);
     let (be, bw) = (painted(&big_east), painted(&big_west));
-    assert_eq!(be, bw, "growth must be identical either way the viewport is written");
+    assert_eq!(
+        be, bw,
+        "growth must be identical either way the viewport is written"
+    );
     assert!(
         be > n * 2,
         "quadrupling texture area must grow a real shape's pixel count well past {n}; got {be}"
@@ -226,7 +230,10 @@ fn a_polygon_across_the_western_edge_is_clipped_not_torn() {
     let rgba = draw(&[feature(&straddling)], &view);
     let (x0, _, x1, _) = painted_bbox(&rgba, TEX).expect("the visible half must paint");
 
-    assert_eq!(x0, 0, "the ring crosses the western edge, so it paints column 0");
+    assert_eq!(
+        x0, 0,
+        "the ring crosses the western edge, so it paints column 0"
+    );
     // The eastern half reaches 0.4558 deg past min_lon: 7.8 px of 512.
     assert!(
         x1 < TEX / 8,
@@ -252,15 +259,26 @@ fn stations_either_side_of_the_seam_all_draw() {
         is_current: false,
         is_loading: false,
     };
-    let one = |s: RadarSiteInfo| painted(&rasterize_radar_sites(&[s], &view, TEX, TEX, 6.0, true, 1.0).rgba);
+    let one = |s: RadarSiteInfo| {
+        painted(&rasterize_radar_sites(&[s], &view, TEX, TEX, 6.0, true, 1.0).rgba)
+    };
 
     let guam = one(site("PGUA", 13.4558, 144.8111));
     let nome = one(site("PAEC", 64.5114, -165.2950));
     let bethel = one(site("PABC", 60.7919, -161.8764));
 
-    assert!(guam > 0, "PGUA is already in frame and must draw regardless; got {guam} px");
-    assert!(nome > 0, "PAEC belongs at 194.71 in this view; got {nome} px");
-    assert!(bethel > 0, "PABC belongs at 198.12 in this view; got {bethel} px");
+    assert!(
+        guam > 0,
+        "PGUA is already in frame and must draw regardless; got {guam} px"
+    );
+    assert!(
+        nome > 0,
+        "PAEC belongs at 194.71 in this view; got {nome} px"
+    );
+    assert!(
+        bethel > 0,
+        "PABC belongs at 198.12 in this view; got {bethel} px"
+    );
 }
 
 /// A station a little *west* of the texture still contributes its label —
@@ -300,7 +318,11 @@ fn a_datum_already_in_frame_is_not_moved() {
     }
     // And just outside it, on both sides: still nearest, still not moved.
     for lon in [-110.0, -60.0] {
-        assert_eq!(mb.nearest_lon(lon), lon, "lon {lon} is nearer than its turn away");
+        assert_eq!(
+            mb.nearest_lon(lon),
+            lon,
+            "lon {lon} is nearer than its turn away"
+        );
     }
 }
 
@@ -323,6 +345,10 @@ fn every_shift_is_a_whole_turn() {
     let mb = MercatorBounds::from_geo(&bounds(50.0, 54.0, -195.0, -165.0));
     for lon in [-179.0, -90.0, 0.0, 90.0, 144.81, 178.62, 179.99] {
         let s = mb.lon_shift(lon, lon);
-        assert_eq!(s % 360.0, 0.0, "shift {s} for lon {lon} is not a whole turn");
+        assert_eq!(
+            s % 360.0,
+            0.0,
+            "shift {s} for lon {lon} is not a whole turn"
+        );
     }
 }
