@@ -1440,8 +1440,13 @@ pub fn cell_count(cells: [u32; 3]) -> Option<usize> {
 ///
 /// This is a **payload** size, not an allocation: it is how many bytes a caller
 /// has to hand `write_texture`, and what `staging::PlaneLayout` pads rows out
-/// of. What the device actually reserves is [`grid_bytes_at`], and on the
-/// desktop shape the two differ by 1.6%.
+/// of. What the device reserves is [`grid_bytes_at`], and on the desktop shape
+/// the two differ by **14.3%** — 33,554,432 B against 38,354,944 — because the
+/// allocation carries the mip pyramid a second named level buys and this does
+/// not. The 1.6% this used to quote is a different pair of numbers entirely: it
+/// is what the pyramid's *tail* is worth against the two levels the descriptor
+/// names, which is the correction `grid_bytes_at` documents, not the gap
+/// between these two functions.
 pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
     cell_count(cells)?.checked_mul(GRID_BYTES_PER_CELL as usize)
 }
@@ -1466,6 +1471,18 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
 /// The depth rule is the one that bites: `voxel::shape_for_budget` spends a
 /// tier's leftover cells on the vertical, and a `nz` of 34 is laid out as 48 —
 /// **+41% on mip 0**, for two layers of picture.
+///
+/// # One backend's, and kept because it is the larger
+///
+/// Read on the same rungs, Mesa's lavapipe **does not round at all**: a
+/// 64×64×34 grid reserves 557,056 B there, its packed payload, against the
+/// 786,432 B the rounding above produces. The table is not wrong — it is the
+/// layout of the device it names, and it is the *conservative* of the two, which
+/// is the direction [`grid_bytes_at`] is required to err in. A backend that
+/// tiled more coarsely than this is the case that would need re-measuring, and
+/// `the_charged_grid_bytes_are_never_under_what_the_device_reserved` is what
+/// would catch it — `#[ignore]`d behind a real adapter, so it does so only under
+/// `cargo test -p rustdar-frontend --test volume_gpu -- --ignored`.
 const TEXTURE_TILE_TEXELS_X: usize = 16;
 /// Rows a 3D texture's **height** is rounded up to. See [`TEXTURE_TILE_TEXELS_X`].
 const TEXTURE_TILE_ROWS_Y: usize = 8;
@@ -1505,8 +1522,37 @@ const TEXTURE_TILE_LAYERS_Z: usize = 16;
 /// **+3,584 B of genuine margin on every grid**, measured, and the charge has
 /// never gone under.
 ///
+/// # That 512 B is one vendor's, and so is the tiling above it
+///
+/// Everything in the section above is a reading from **one** driver, and the
+/// paragraph that said the term was "a property of the dimension" was reaching
+/// past what had been measured. Re-read on Mesa's lavapipe (Mesa 26.1.6, LLVM
+/// 22.1.8) — the backend CI's `gpu` job runs on, so it is the one every PR
+/// actually exercises:
+///
+/// * **There is no per-image constant at all.** A one-level 256×256×128 grid
+///   reserves 33,554,432 B there, its payload to the byte, against the RTX
+///   3090's 33,554,944.
+/// * **There is no tiling of the shipped shapes either.** [`level_bytes`]'
+///   16×8×16 rounding is NVIDIA's; lavapipe reserves the packed product. On the
+///   aligned rungs the two agree and nothing shows, but a 34-layer depth laid
+///   out as 48 is **+41% of mip 0 that lavapipe does not reserve** — 233,472 B
+///   on 64×64×34.
+/// * **A second named level does not buy the pyramid.** See [`grid_bytes_at`].
+///
+/// None of that makes the charge wrong: every one of these differences is the
+/// device reserving *less* than the model counts, which is the only direction
+/// this figure is allowed to be wrong in. What it does mean is that the page is
+/// the whole margin on a backend with no constant to absorb — the one-level
+/// surplus there is the full **4,096 B**, not 3,584 — and that the surplus on a
+/// two-level descriptor is the uncounted pyramid on top of it, 81,920 B to
+/// 606,208 B across the shipped rungs. `the_charged_grid_bytes_are_never_under_
+/// what_the_device_reserved` asserts both layouts separately for exactly this
+/// reason.
+///
 /// Naming the 512 B here and taking it out of the page would make the model
-/// exact, which is the better shape. It is deliberately not done in this change:
+/// exact **on the layout it was measured on** and would make it wrong on the
+/// other, since there is nothing there to subtract. It is deliberately not done:
 /// [`grid_bytes_at`] feeds `resident_grid_bytes`, which feeds the derived loop
 /// budget table on `constants::VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, and moving a
 /// residency figure is a change to the budget architecture rather than to this
@@ -1621,6 +1667,36 @@ pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
 /// full pyramid, `Omitted` means one level, and there is nothing in between to
 /// express.
 ///
+/// # Two layouts, and this charges for the larger on purpose
+///
+/// The paragraph above is one device's. **Not every backend lays the pyramid
+/// out**, and the one CI runs on does not. The same sweep on Mesa's lavapipe
+/// (Mesa 26.1.6, LLVM 22.1.8), same shape, `mip_level_count` 1 to 5:
+///
+/// | backend | 1 | 2 | 3 | 4 | 5 |
+/// |---|---:|---:|---:|---:|---:|
+/// | RTX 3090, Vulkan 610.57.04 | 33,555,168 | 38,351,584 | 38,351,584 | 38,351,584 | 38,351,584 |
+/// | lavapipe, Mesa 26.1.6 | 33,554,480 | 37,748,776 | 38,273,064 | 38,338,600 | 38,346,792 |
+///
+/// lavapipe reserves the levels it is told to and nothing under them, so on the
+/// shipped rungs its figure is exactly the packed payload of those levels:
+/// 37,748,736 B for a two-level 256×256×128, which is 33,554,432 + 4,194,304
+/// with no tiles and no constant.
+///
+/// The boolean stays, and it stays `full pyramid` rather than `named levels`,
+/// because **this figure may only ever err upwards**: it is a ceiling for the
+/// budget and an eviction figure for the store, and a device that reserves less
+/// than it says costs memory nobody spends, while one that reserves more costs
+/// correctness. Charging the pyramid is right on the layout that has one and
+/// safe on the layout that does not.
+///
+/// What it costs on the layout that does not is **1.6% to 2.3% of a shipped
+/// grid** — 606,208 B on the desktop shape, 359,424 B on mobile, 81,920 B on
+/// wasm — and that has been priced rather than waved at: it buys no loop frame
+/// at any shipped rung, because a lavapipe adapter classifies `Software` and
+/// takes the pool floor, where the counts are 11 / 17 / 14 under either figure.
+/// See `constants::VOLUME_LOOP_TEXTURE_BUDGET_BYTES`.
+///
 /// # It is derived, and where it is only conservative it says so
 ///
 /// The pyramid is exact arithmetic on the shape and holds on any backend — no
@@ -1640,12 +1716,19 @@ pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
 /// [`TEXTURE_ALLOCATION_SLACK_BYTES`], which is what covers it.
 ///
 /// So the figure this returns has never been under what the device reserved —
-/// it runs **+3,584 B over on every shape measured**, uniformly, rather than
-/// over by the 3,360–4,608 B range the old prose quoted. A backend tiling more
-/// coarsely than 16×8×16, or adding a larger constant than 512 B, would need
-/// this re-measured; `the_charged_grid_bytes_are_never_under_what_the_device_
-/// reserved` in `tests/volume_gpu.rs` is what re-measures it, and being
-/// `#[ignore]`d it does so only under `-- --ignored` against a real adapter.
+/// it runs **+3,584 B over on every shape measured on that layout**, uniformly,
+/// rather than over by the 3,360–4,608 B range the old prose quoted. On the
+/// named-levels layout it runs over by 4,096 B on a one-level descriptor and by
+/// the uncounted pyramid on a two-level one, and by the tiling wherever a shape
+/// is not aligned — 307,200 B on 64×64×34, whose depth this model lays out as 48
+/// and lavapipe as 34.
+///
+/// A backend tiling more coarsely than 16×8×16, or adding a larger constant than
+/// 512 B, would need this re-measured; `the_charged_grid_bytes_are_never_under_
+/// what_the_device_reserved` in `tests/volume_gpu.rs` is what re-measures it —
+/// it reads the layout off the device first and holds each to its own figure —
+/// and being `#[ignore]`d it does so only under `-- --ignored` against a real
+/// adapter.
 pub fn grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
     texture_allocation_bytes(
         cells,

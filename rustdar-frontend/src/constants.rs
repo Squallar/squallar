@@ -913,6 +913,39 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// difference between twelve frames and thirteen; see
 /// `volume::raymarch::grid_bytes_at`.
 ///
+/// ## What that column costs on a backend that does not lay the pyramid out
+///
+/// Not every backend does, and the one CI runs on does not: Mesa's lavapipe
+/// reserves the levels the descriptor names and nothing under them, so the
+/// column above over-states by **1.6% to 2.3%** there — 606,208 B on desktop,
+/// 359,424 B on mobile, 81,920 B on wasm, measured. It is a real over-charge and
+/// it is spent on nothing.
+///
+/// **It buys no frame back at any shipped rung.** Run through `LoopPool::plan`
+/// with the honest figure substituted, at every share count from one to six:
+///
+/// * **At the floor — every row of the table above — the count is identical.**
+///   11, 17 and 14 either way. The desktop row is the near miss and it is worth
+///   naming: 14.74 frames on the charge against **14.99** on the device's own
+///   figure, which is nine thousandths of a frame short of a fifteenth and does
+///   not get it. wasm 11.18 against 11.39, mobile 17.52 against 17.94.
+/// * **At `floor * 2`, which is what `Integrated` takes, also identical**, all
+///   three arms, all six share counts.
+/// * At [`LOOP_POOL_CEILING_BYTES`], which only `Discrete` takes, the honest
+///   figure buys one more frame at three or more concurrent loops — 26 → 27 on
+///   desktop, 12 → 13 on wasm and mobile.
+///
+/// The last row is the one that would matter and **it is not a configuration
+/// anything has been measured in**: a lavapipe adapter reports `DeviceType::Cpu`
+/// and classifies `Software`, which takes the *floor*, and the only discrete GPU
+/// this has been read on lays the whole pyramid out and is not over-charged at
+/// all. A discrete adapter using the named-levels layout is what would have to
+/// exist for the 1.6% to cost a user a frame; RADV is the obvious candidate and
+/// no AMD hardware was available to read it on. Charging what the device
+/// actually reserves rather than the worst case is the fix if one turns up, and
+/// it is a change to this budget's architecture rather than to the arithmetic —
+/// see `volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES`.
+///
 /// Every figure below is derived and checked — `the_loop_budget_table_is_the
 /// _one_the_constants_derive` reads these rows back out of this doc comment and
 /// fails if any of them has drifted from `resident_grid_bytes`. It is here
