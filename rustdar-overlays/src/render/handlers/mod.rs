@@ -1,12 +1,16 @@
-pub(crate) mod alert;
+// The three polygon-kind modules are `pub` because their fetch-result types
+// are: `rustdar-frontend`'s described-job dispatch tests seed a live registry
+// through `apply_fetch_result`, and the payload type has to be nameable where
+// the test constructs it. Everything else in them keeps its own visibility.
+pub mod alert;
 mod colorscale;
-pub(crate) mod discussion;
+pub mod discussion;
 mod glm;
 mod labels;
 mod location;
 mod metar;
 mod model;
-mod outlook;
+pub mod outlook;
 mod radar;
 mod reports;
 mod sites;
@@ -108,7 +112,11 @@ mod round_delivery_tests {
             .next()
             .expect("split always yields a first piece")
             .lines()
-            .filter(|line| line.starts_with("mod ") || line.starts_with("pub(crate) mod "))
+            .filter(|line| {
+                line.starts_with("mod ")
+                    || line.starts_with("pub(crate) mod ")
+                    || line.starts_with("pub mod ")
+            })
             .count();
         assert_eq!(
             declarations,

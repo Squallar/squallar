@@ -109,7 +109,11 @@ impl GeoBounds {
     }
 }
 
-#[derive(Debug, Clone)]
+/// `PartialEq` because features ride inside
+/// `rustdar_frontend::offload::JobRequest` (the described overlay jobs for the
+/// polygon kinds), whose wire round-trip tests compare whole requests; it is
+/// derived and carries [`GeoBounds`]'s own `f64` caveat that `NaN != NaN`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct OverlayFeature {
     /// One or more polygons (from GeoJSON MultiPolygon).
     pub polygons: Vec<GeoPolygon>,

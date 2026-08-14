@@ -113,7 +113,17 @@ fn painted_bbox(rgba: &[u8], w: u32) -> Option<(u32, u32, u32, u32)> {
 }
 
 fn draw(features: &[OverlayFeature], b: &GeoBounds) -> Vec<u8> {
-    rasterize_spc_outlooks(features, b, TEX, TEX, [0, 0, 0, 0], 1.0)
+    rasterize_spc_outlooks(
+        &OutlooksInput {
+            features: features.to_vec(),
+            hatch_color: [0, 0, 0, 0],
+            device_scale: 1.0,
+        },
+        b,
+        TEX,
+        TEX,
+    )
+    .rgba
 }
 
 // ── The polygon path ─────────────────────────────────────────────────────
@@ -196,11 +206,20 @@ fn a_zone_paints_the_same_pixels_whichever_way_the_viewport_is_written() {
     // count that is really zero — or really one stray pixel — does not.
     // Quadrupling the texture area must move it substantially, both sides of
     // the seam alike.
-    let f = feature(&AKZ791);
-    let fs = std::slice::from_ref(&f);
-    let big_east = rasterize_spc_outlooks(fs, &east, TEX * 2, TEX * 2, [0, 0, 0, 0], 1.0);
-    let big_west = rasterize_spc_outlooks(fs, &west, TEX * 2, TEX * 2, [0, 0, 0, 0], 1.0);
-    let (be, bw) = (painted(&big_east), painted(&big_west));
+    let big = |b: &GeoBounds| {
+        rasterize_spc_outlooks(
+            &OutlooksInput {
+                features: vec![feature(&AKZ791)],
+                hatch_color: [0, 0, 0, 0],
+                device_scale: 1.0,
+            },
+            b,
+            TEX * 2,
+            TEX * 2,
+        )
+        .rgba
+    };
+    let (be, bw) = (painted(&big(&east)), painted(&big(&west)));
     assert_eq!(
         be, bw,
         "growth must be identical either way the viewport is written"

@@ -206,7 +206,23 @@ pub const OUT_KIND: &str = "outkind";
 /// refuses tag 8) and a version 8 page would drop `OUT` code 5 as unknown:
 /// both halves degrade quietly, which is exactly the mismatch the token turns
 /// into a clean termination and a respawn.
-const PROTOCOL_VERSION: u32 = 9;
+///
+/// Version 10 widened the overlay job's **inner** code space: the three
+/// polygon overlay kinds — NWS alerts, SPC outlooks, SPC mesoscale
+/// discussions — travel under tag 8 as input codes 2, 3 and 4 beside the
+/// sites render's 1, so the layer set the frame-thread audit measured at
+/// 224 ms of inline gesture-end rasterization runs in the worker. Like
+/// versions 8 and 9 it changes **no field name** — the reply is still `OUT`
+/// code 5's unframed RGBA, accepted by the dispatching page's own length
+/// check — so the reply-shape scrape cannot see it and did not fire. What
+/// pins it is `rustdar_frontend`'s `offload::tests`: the framing digest
+/// gained an `overlay/alerts`, `overlay/outlooks` and `overlay/discussions`
+/// row and the overlay input-code table its three entries. A version 9
+/// worker answers the new codes with a failed job (its
+/// `decode_overlay_input` refuses them), which is a warning layer that
+/// silently never draws — the degradation the token turns into a clean
+/// termination and a respawn.
+const PROTOCOL_VERSION: u32 = 10;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

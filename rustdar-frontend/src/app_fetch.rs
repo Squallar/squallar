@@ -1076,6 +1076,60 @@ impl super::App {
         }
     }
 
+    /// The deliver every **described** overlay job shares — sites and the
+    /// three polygon kinds — built once so the four dispatches cannot drift.
+    ///
+    /// `response` arrives **image-less**, which is the failure shape: the
+    /// dispatch site fills in every field the poller reads, and this deliver
+    /// only ever installs a raster into it. It is sent on every arm, `None`
+    /// included, because this message is the only thing that clears the named
+    /// panes' in-flight marks — see `OverlayRenderResponse::image`.
+    ///
+    /// The dispatch's own `width` and `height` are the only statement of the
+    /// raster's shape — the reply's buffer carries none
+    /// (`offload::JobOutput::OverlayRaster`) — so the length check here is
+    /// what stands between a payload from another build and a texture of the
+    /// wrong shape.
+    ///
+    /// The pixels arrive premultiplied by `offload::execute`'s contract, so
+    /// the constructor below is the straight copy
+    /// [`Self::overlay_color_image`] performs for every tiny-skia rasterizer
+    /// — the one compute-nothing `from_rgba_premultiplied` read the
+    /// frame-thread conversion tests permit `app_fetch`.
+    fn overlay_job_deliver(
+        label: &'static str,
+        width: u32,
+        height: u32,
+        mut response: OverlayRenderResponse,
+        sender: Sender<OverlayRenderResponse>,
+        window: Option<crate::WindowRef>,
+    ) -> impl FnOnce(crate::offload::JobResult) + Send + 'static {
+        move |result| {
+            let expected = (width as usize) * (height as usize) * 4;
+            response.image = result
+                .and_then(crate::offload::JobOutput::overlay_raster)
+                .and_then(|rgba| {
+                    if rgba.len() == expected {
+                        Some(std::sync::Arc::new(
+                            egui::ColorImage::from_rgba_premultiplied(
+                                [width as usize, height as usize],
+                                &rgba,
+                            ),
+                        ))
+                    } else {
+                        log::error!(
+                            "{label} answered {} bytes where {width}x{height} \
+                             needs {expected}; treating it as a failed render",
+                            rgba.len(),
+                        );
+                        None
+                    }
+                });
+            let _ = sender.send(response);
+            super::notify_redraw(&window);
+        }
+    }
+
     /// Spawn a background thread to rasterize overlay polygons via tiny-skia.
     pub(super) fn spawn_overlay_render(
         &mut self,
@@ -1139,15 +1193,26 @@ impl super::App {
         let sender = self.channels.overlay_render_sender.clone();
         let window = self.window.clone();
 
-        // Clone the data needed for the render closure
+        // Clone the data needed for the render closure.
+        //
+        // **The split below is a decision per kind, spelled as a match and
+        // not as a capability probe**: a kind is on the described path
+        // because this list says so, and a kind added to `OverlayKind` does
+        // not silently pick a path by whether its handler happens to answer
+        // `prepare_job`. The described list and the handlers that implement
+        // `prepare_job` must be the same three kinds —
+        // `rustdar-overlays`' texture tests pin that set, and
+        // `app_fetch::polygon_wire_tests` pins this routing.
         match kind {
-            // Handler-backed texture overlays: use prepare_rasterize
-            OverlayKind::SpcOutlook
-            | OverlayKind::SpcDiscussions
-            | OverlayKind::NwsAlerts
-            | OverlayKind::StormReports
-            | OverlayKind::Lightning
-            | OverlayKind::ModelData => {
+            // The polygon-fill kinds without hit maps — NWS alerts, SPC
+            // outlooks, SPC mesoscale discussions — are **described jobs**
+            // (`JobRequest::Overlay`). On the web the job posts to the worker
+            // instead of running inline on the browser's one thread, which is
+            // where the frame-thread audit measured 224 ms of gesture-end
+            // stall for exactly this layer set; on native it rides the
+            // pool's interactive lane, the same lane the closures rode.
+            OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts => {
+                use rustdar_overlays::render::overlay_state::HandlerJobInput;
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
@@ -1155,6 +1220,67 @@ impl super::App {
                     // from the context: a rasterizer told a different density
                     // than the one its texture was sized at draws every marker
                     // at the wrong size. See `OverlayTexturePlan`.
+                    device_scale: texture.pixels_per_point,
+                };
+                let Some(input) = self.gui.overlays.prepare_job(kind, &rctx) else {
+                    // Nothing to render — clear in-flight. `prepare_job` and
+                    // `prepare_rasterize` answer `None` in exactly the same
+                    // states (both are built from one per-handler helper), so
+                    // this arm declines exactly where the closure arm did.
+                    self.clear_overlay_render_marks(&pane_indices, kind);
+                    return;
+                };
+                let (label, input) = match input {
+                    HandlerJobInput::Alerts(input) => (
+                        "alerts-render",
+                        crate::offload::OverlayJobInput::Alerts(Box::new(input)),
+                    ),
+                    HandlerJobInput::Outlooks(input) => (
+                        "outlooks-render",
+                        crate::offload::OverlayJobInput::Outlooks(input),
+                    ),
+                    HandlerJobInput::Discussions(input) => (
+                        "discussions-render",
+                        crate::offload::OverlayJobInput::Discussions(input),
+                    ),
+                };
+                let request = crate::offload::JobRequest::Overlay {
+                    width,
+                    height,
+                    bounds: render_bounds,
+                    input,
+                };
+                crate::offload::offload_job(
+                    label,
+                    crate::offload::Job::Described(request),
+                    Self::overlay_job_deliver(
+                        label,
+                        width,
+                        height,
+                        OverlayRenderResponse {
+                            image: None,
+                            geo_bounds: render_bounds,
+                            overlay_kind: kind,
+                            generation: data_generation,
+                            pane_indices,
+                            zoom,
+                            hit_map: None,
+                        },
+                        sender,
+                        window,
+                    ),
+                );
+            }
+            // The hit-map kinds and the model grid: still opaque closures
+            // through `prepare_rasterize`, because a hit map's
+            // `Arc<dyn OverlayItem>` id map cannot cross a message port and
+            // the model grid has no wire form yet — see `offload::offload`'s
+            // own note. On the web these still rasterize inline on the frame.
+            OverlayKind::StormReports | OverlayKind::Lightning | OverlayKind::ModelData => {
+                let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
+                    is_dark: self.cached_dark_theme.unwrap_or(false),
+                    zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
+                    // See the described arm's note on this field.
                     device_scale: texture.pixels_per_point,
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
@@ -1226,51 +1352,22 @@ impl super::App {
                 crate::offload::offload_job(
                     "sites-render",
                     crate::offload::Job::Described(request),
-                    move |result| {
-                        // The dispatch's own dimensions are the only statement
-                        // of the raster's shape — the reply's buffer carries
-                        // none (`JobOutput::OverlayRaster`) — so the length
-                        // check here is what stands between a payload from
-                        // another build and a texture of the wrong shape.
-                        //
-                        // The pixels arrive premultiplied by `execute`'s
-                        // contract, so the constructor below is the straight
-                        // copy `Self::overlay_color_image` performs for every
-                        // tiny-skia rasterizer.
-                        let expected = (width as usize) * (height as usize) * 4;
-                        let image = result
-                            .and_then(crate::offload::JobOutput::overlay_raster)
-                            .and_then(|rgba| {
-                                if rgba.len() == expected {
-                                    Some(std::sync::Arc::new(
-                                        egui::ColorImage::from_rgba_premultiplied(
-                                            [width as usize, height as usize],
-                                            &rgba,
-                                        ),
-                                    ))
-                                } else {
-                                    log::error!(
-                                        "sites-render answered {} bytes where {width}x{height} \
-                                         needs {expected}; treating it as a failed render",
-                                        rgba.len(),
-                                    );
-                                    None
-                                }
-                            });
-                        // Sent on every arm, `None` included: this message is
-                        // what clears the named panes' in-flight marks — see
-                        // `OverlayRenderResponse::image`.
-                        let _ = sender.send(OverlayRenderResponse {
-                            image,
+                    Self::overlay_job_deliver(
+                        "sites-render",
+                        width,
+                        height,
+                        OverlayRenderResponse {
+                            image: None,
                             geo_bounds: render_bounds,
                             overlay_kind: kind,
                             generation: data_generation,
                             pane_indices,
                             zoom,
                             hit_map: None,
-                        });
-                        super::notify_redraw(&window);
-                    },
+                        },
+                        sender,
+                        window,
+                    ),
                 );
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
@@ -2556,6 +2653,13 @@ mod melting_layer_dispatch_tests;
 #[cfg(test)]
 #[path = "app_fetch/sites_wire_tests.rs"]
 mod sites_wire_tests;
+
+/// The three polygon overlay dispatches are described jobs that reach the
+/// installed sink — each carrying its own kind's input — and a job the
+/// worker never answers still un-wedges the pane.
+#[cfg(test)]
+#[path = "app_fetch/polygon_wire_tests.rs"]
+mod polygon_wire_tests;
 
 #[path = "app_fetch/site_switch_tests.rs"]
 #[cfg(test)]

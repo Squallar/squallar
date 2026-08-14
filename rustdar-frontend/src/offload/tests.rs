@@ -303,6 +303,207 @@ pub(super) fn an_overlay_sites_job() -> JobRequest {
     }
 }
 
+/// The NWS-alert overlay job, on a fixture with real content — and with the
+/// geometry the encode is most likely to flatten: a **MultiPolygon** alert
+/// whose first polygon carries a **hole**. A codec that dropped a nesting
+/// level, a hole ring or the ring order would still produce plausible bytes,
+/// and the parity test over this fixture is what catches it.
+///
+/// Both filters are loaded too: two categories enabled out of the fixture's
+/// two, and one alert hidden by id — so the id set and the category codes are
+/// live inputs whose loss changes pixels, not dead fields a broken codec
+/// could zero.
+pub(super) fn an_overlay_alerts_job() -> JobRequest {
+    use rustdar_overlays::nws::alert::AlertCategory;
+    use rustdar_overlays::render::rasterize::{AlertPaint, AlertsInput};
+    use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+    // One alert, two polygons; the first has a hole in it. Translucent fill
+    // and an opaque stroke, so both colour fields put distinct ink down.
+    let warned = OverlayFeature::new(
+        vec![
+            vec![
+                vec![(34.2, -98.8), (34.2, -97.6), (35.6, -97.6), (35.6, -98.8)],
+                vec![(34.7, -98.5), (34.7, -98.0), (35.2, -98.0), (35.2, -98.5)],
+            ],
+            vec![vec![
+                (33.3, -97.4),
+                (33.3, -96.6),
+                (33.9, -96.6),
+                (33.9, -97.4),
+            ]],
+        ],
+        [255, 0, 0, 128],
+        [255, 255, 255, 255],
+        "Tornado Warning".into(),
+        "Tornado Warning until 9 PM CDT".into(),
+        HatchPattern::None,
+    );
+    let advised = OverlayFeature::new(
+        vec![vec![vec![
+            (36.0, -97.4),
+            (36.0, -96.4),
+            (36.8, -96.4),
+            (36.8, -97.4),
+        ]]],
+        [0, 128, 255, 96],
+        [0, 0, 0, 0],
+        "Wind Advisory".into(),
+        String::new(),
+        HatchPattern::None,
+    );
+    // Hidden by id below; its square sits in an otherwise-empty corner, so a
+    // hidden filter that stopped travelling would *add* painted pixels.
+    let hidden = OverlayFeature::new(
+        vec![vec![vec![
+            (33.2, -98.9),
+            (33.2, -98.4),
+            (33.6, -98.4),
+            (33.6, -98.9),
+        ]]],
+        [0, 255, 0, 200],
+        [0, 0, 0, 0],
+        "Flood Warning".into(),
+        String::new(),
+        HatchPattern::None,
+    );
+    JobRequest::Overlay {
+        width: 96,
+        height: 64,
+        bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        input: OverlayJobInput::Alerts(Box::new(AlertsInput {
+            alerts: vec![
+                AlertPaint {
+                    id: "urn:oid:2.49.0.1.840.0001".into(),
+                    category: AlertCategory::Warning,
+                    features: vec![warned],
+                },
+                AlertPaint {
+                    id: "urn:oid:2.49.0.1.840.0002".into(),
+                    category: AlertCategory::Advisory,
+                    features: vec![advised],
+                },
+                AlertPaint {
+                    id: "urn:oid:2.49.0.1.840.0003".into(),
+                    category: AlertCategory::Warning,
+                    features: vec![hidden],
+                },
+            ],
+            enabled_categories: vec![AlertCategory::Warning, AlertCategory::Advisory],
+            hidden_ids: std::collections::HashSet::from(["urn:oid:2.49.0.1.840.0003".to_owned()]),
+            device_scale: 1.0,
+        })),
+    }
+}
+
+/// The SPC-outlook overlay job, with the pass the other kinds do not have:
+/// **hatching**. Three features — a plain fill with a hole, a CIG1 area, and
+/// a CIG3 area nested inside it — drive the hatch pass's masks, exclusions
+/// and hole handling through the wire, and the hatch colour is the
+/// theme-resolved page-side input that travels *on the job* rather than
+/// being re-derived worker-side. Pure blue at full alpha, a colour no SPC
+/// fill uses, so hatch ink is countable in the parity test.
+pub(super) fn an_overlay_outlooks_job() -> JobRequest {
+    use rustdar_overlays::render::rasterize::OutlooksInput;
+    use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+    let categorical = OverlayFeature::new(
+        vec![vec![
+            vec![(33.4, -98.8), (33.4, -96.2), (36.8, -96.2), (36.8, -98.8)],
+            vec![(36.0, -96.8), (36.0, -96.5), (36.4, -96.5), (36.4, -96.8)],
+        ]],
+        [214, 195, 155, 100],
+        [180, 140, 80, 255],
+        "SLGT".into(),
+        "Slight Risk".into(),
+        HatchPattern::None,
+    );
+    let cig1 = OverlayFeature::new(
+        vec![vec![vec![
+            (34.0, -98.4),
+            (34.0, -96.8),
+            (36.2, -96.8),
+            (36.2, -98.4),
+        ]]],
+        [255, 200, 200, 40],
+        [200, 0, 0, 255],
+        "CIG1".into(),
+        "Conditional Intensity 1".into(),
+        HatchPattern::Cig1,
+    );
+    let cig3 = OverlayFeature::new(
+        vec![vec![vec![
+            (34.6, -98.0),
+            (34.6, -97.4),
+            (35.5, -97.4),
+            (35.5, -98.0),
+        ]]],
+        [255, 120, 120, 40],
+        [120, 0, 0, 255],
+        "CIG3".into(),
+        "Conditional Intensity 3".into(),
+        HatchPattern::Cig3,
+    );
+    JobRequest::Overlay {
+        width: 96,
+        height: 64,
+        bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        input: OverlayJobInput::Outlooks(OutlooksInput {
+            features: vec![categorical, cig1, cig3],
+            hatch_color: [0, 0, 255, 255],
+            device_scale: 1.0,
+        }),
+    }
+}
+
+/// The SPC-discussion overlay job: two MDs of different types — the type is
+/// what picks the fill and stroke, so a type byte misread as another decodes
+/// cleanly and paints the wrong colours, and byte-parity is what notices —
+/// one of them with two rings, each drawn as its own filled polygon.
+pub(super) fn an_overlay_discussions_job() -> JobRequest {
+    use rustdar_overlays::render::rasterize::{DiscussionPaint, DiscussionsInput};
+    use rustdar_overlays::spc::discussion::MdType;
+    JobRequest::Overlay {
+        width: 96,
+        height: 64,
+        bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        input: OverlayJobInput::Discussions(DiscussionsInput {
+            discussions: vec![
+                DiscussionPaint {
+                    md_type: MdType::Convective,
+                    polygon: vec![
+                        vec![(34.1, -98.7), (34.1, -97.9), (35.0, -97.9), (35.0, -98.7)],
+                        vec![(35.3, -97.7), (35.3, -97.0), (35.9, -97.0), (35.9, -97.7)],
+                    ],
+                },
+                DiscussionPaint {
+                    md_type: MdType::WinterWeather,
+                    polygon: vec![vec![
+                        (36.1, -98.6),
+                        (36.1, -97.8),
+                        (36.7, -97.8),
+                        (36.7, -98.6),
+                    ]],
+                },
+            ],
+            device_scale: 1.0,
+        }),
+    }
+}
+
 /// The voxel job a pane whose viewport is **not square** posts.
 ///
 /// The two axes are two `f64`s on the wire, adjacent and same-typed, so an
@@ -337,6 +538,9 @@ fn every_job_kind_survives_the_wire_format() {
         a_sourceless_voxel_job(),
         a_rectangular_voxel_job(),
         an_overlay_sites_job(),
+        an_overlay_alerts_job(),
+        an_overlay_outlooks_job(),
+        an_overlay_discussions_job(),
     ] {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),
@@ -394,7 +598,7 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // And the encoder really posts those bytes — the constant could be
     // right while the arm that writes it is not. Every constructible kind,
     // framed against its literal rather than against its own constant.
-    let framing: [(JobRequest, u8); 7] = [
+    let framing: [(JobRequest, u8); 10] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 4),
@@ -402,6 +606,9 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
         (a_voxel_job(), 6),
         (a_decode_job(), 7),
         (an_overlay_sites_job(), 8),
+        (an_overlay_alerts_job(), 8),
+        (an_overlay_outlooks_job(), 8),
+        (an_overlay_discussions_job(), 8),
     ];
     for (job, tag) in framing {
         let bytes = job.to_bytes();
@@ -436,6 +643,71 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
             None,
             "tag {unallocated} decodes, so the table above has stopped \
                  being the whole wire",
+        );
+    }
+}
+
+/// The overlay job's **inner** code space, pinned the way the outer tags are
+/// and for the same reason: the code is a contract between two builds, so
+/// the numbers are written out, not read back from the constants they check.
+///
+/// A renumbering here is quieter than one of the outer tags — every overlay
+/// input is length-counted and refuses trailing bytes, so a swapped pair of
+/// codes mostly fails to decode — but "mostly" is not a guard: two kinds
+/// whose leading fields happen to parse under each other's layout would
+/// rasterize the wrong layer, and the version 10 worker split exists
+/// precisely because a version 9 worker must refuse codes 2-4 rather than
+/// misread them.
+#[test]
+fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
+    // Deliberately spelled out. Do not regenerate this from the constants.
+    let table: [(&str, u8, u8); 4] = [
+        ("OVERLAY_INPUT_SITES", OVERLAY_INPUT_SITES, 1),
+        ("OVERLAY_INPUT_ALERTS", OVERLAY_INPUT_ALERTS, 2),
+        ("OVERLAY_INPUT_OUTLOOKS", OVERLAY_INPUT_OUTLOOKS, 3),
+        ("OVERLAY_INPUT_DISCUSSIONS", OVERLAY_INPUT_DISCUSSIONS, 4),
+    ];
+    for (name, actual, expected) in table {
+        assert_eq!(
+            actual, expected,
+            "{name} moved on the wire: it is {actual} now, not {expected}",
+        );
+    }
+
+    // And the encoder really writes those bytes where the decoder reads them:
+    // the input-kind byte sits after the fixed header — tag(1) + width(4) +
+    // height(4) + bounds(32) = offset 41 — for every overlay kind alike.
+    let by_fixture: [(JobRequest, u8); 4] = [
+        (an_overlay_sites_job(), 1),
+        (an_overlay_alerts_job(), 2),
+        (an_overlay_outlooks_job(), 3),
+        (an_overlay_discussions_job(), 4),
+    ];
+    for (job, code) in by_fixture {
+        let bytes = job.to_bytes();
+        assert_eq!(
+            bytes[41],
+            code,
+            "{:?} posts inner code {}, not {code} — a worker of another build \
+             rasterizes it as whatever {} names there, or refuses it",
+            job.kind(),
+            bytes[41],
+            bytes[41],
+        );
+    }
+
+    // The unallocated bytes on either end stay unallocated: 0 so a zeroed
+    // buffer never decodes, and 5 so a fifth kind cannot arrive without a
+    // line in the table above. **2 through 4 left this list when the polygon
+    // kinds took them.**
+    let mut bytes = an_overlay_sites_job().to_bytes();
+    for unallocated in [0u8, 5] {
+        bytes[41] = unallocated;
+        assert_eq!(
+            JobRequest::from_bytes(&bytes),
+            None,
+            "overlay input code {unallocated} decodes, so the table above has \
+             stopped being the whole inner wire",
         );
     }
 }
@@ -1222,6 +1494,9 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         a_sourceless_voxel_job(),
         a_decode_job(),
         an_overlay_sites_job(),
+        an_overlay_alerts_job(),
+        an_overlay_outlooks_job(),
+        an_overlay_discussions_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1247,10 +1522,13 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
             "voxels | 43 | 0xdbe9f7d560c79fd4",
             "decode | 30 | 0x2aad0634cde46e59",
             "overlay/sites | 131 | 0xf24942f4dd119e16",
+            "overlay/alerts | 760 | 0xa89f5057b3b51a4a",
+            "overlay/outlooks | 557 | 0x62486e4e14434bb0",
+            "overlay/discussions | 264 | 0x3d28f1976f832a20",
         ]
         .map(str::to_string),
         "the framing `JobRequest::to_bytes` writes is not the framing protocol \
-         version 9 shipped. Left is what this build posts; right is what this \
+         version 10 shipped. Left is what this build posts; right is what this \
          list was last told. Something about a request's layout moved — a \
          field added, removed, reordered, retyped, or written at a different \
          width, or a tag renumbered. This encoding carries no version of its \
@@ -1292,7 +1570,9 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
     else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Sites(sites) = input;
+    let OverlayJobInput::Sites(sites) = input else {
+        unreachable!("the fixture is a sites job");
+    };
 
     let direct =
         rustdar_overlays::render::rasterize::rasterize_radar_sites(&sites, &bounds, width, height);
@@ -1333,6 +1613,228 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
         via_wire, direct.rgba,
         "the sites raster differs between the direct call and the wire — the \
          two paths have stopped being one renderer",
+    );
+}
+
+/// Painted pixels — the non-vacuity floor every parity test below stands on:
+/// two identical all-zero buffers satisfy `assert_eq!` while proving only
+/// that nothing was drawn anywhere.
+fn painted(rgba: &[u8]) -> usize {
+    rgba.chunks_exact(4).filter(|px| px[3] != 0).count()
+}
+
+/// [`execute_bytes`] on an overlay job's own wire form, down to the raster.
+fn overlay_raster_via_wire(job: &JobRequest) -> Vec<u8> {
+    execute_bytes(&job.to_bytes())
+        .and_then(JobOutput::overlay_raster)
+        .expect("the described overlay job rasterizes")
+}
+
+/// **The parity gate for the alert render**, the sites gate's shape on the
+/// kind whose inline rasterization was the measured 224 ms gesture-end stall:
+/// direct call and via-wire execution are byte-identical, on the fixture
+/// whose alert is a MultiPolygon with a hole — the geometry an encoder
+/// flattens plausibly, and exactly what this comparison exists to catch.
+#[test]
+fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_alerts_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Alerts(alerts) = input else {
+        unreachable!("the fixture is an alerts job");
+    };
+
+    let direct =
+        rustdar_overlays::render::rasterize::rasterize_nws_alerts(&alerts, &bounds, width, height);
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the alert rasterizer changed its alpha convention; the parity claim \
+         below is now comparing across a conversion",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+
+    let via_wire = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Alerts(alerts.clone()),
+    });
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the alert raster differs between the direct call and the wire — the \
+         two paths have stopped being one renderer",
+    );
+
+    // The hidden-id set is a **live** input through the wire, not a field a
+    // broken codec could zero without anyone noticing: un-hiding the third
+    // alert must add painted pixels, since its square sits in an
+    // otherwise-empty corner of the fixture.
+    let unhidden = rustdar_overlays::render::rasterize::AlertsInput {
+        hidden_ids: std::collections::HashSet::new(),
+        ..*alerts
+    };
+    let more = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Alerts(Box::new(unhidden)),
+    });
+    assert!(
+        painted(&more) > painted(&via_wire),
+        "un-hiding an alert did not add pixels through the wire, so the \
+         hidden-id set is not reaching the rasterizer and the parity above \
+         says nothing about it",
+    );
+}
+
+/// **The parity gate for the outlook render** — the kind with the pass the
+/// others do not have: hatching. Byte-identity plus a floor of hatch-coloured
+/// ink, so the hatch inputs (each feature's own pattern, and the
+/// theme-resolved colour riding the job) are proven to travel rather than
+/// assumed to.
+#[test]
+fn the_outlooks_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_outlooks_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Outlooks(outlooks) = input else {
+        unreachable!("the fixture is an outlooks job");
+    };
+
+    let direct = rustdar_overlays::render::rasterize::rasterize_spc_outlooks(
+        &outlooks, &bounds, width, height,
+    );
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the outlook rasterizer changed its alpha convention; the parity \
+         claim below is now comparing across a conversion",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+    // The fixture's hatch colour is pure blue at full alpha, which no fill in
+    // it approaches: blue-dominant pixels are the hatch pass's own ink, and a
+    // wire that dropped the pattern bytes or the colour would zero this.
+    let hatch_ink = direct
+        .rgba
+        .chunks_exact(4)
+        .filter(|p| p[2] > 200 && p[0] < 60 && p[1] < 60)
+        .count();
+    assert!(
+        hatch_ink > 20,
+        "the direct outlook raster has {hatch_ink} hatch-coloured pixels; \
+         the hatch pass is not running on this fixture, so parity would say \
+         nothing about the hatch inputs travelling",
+    );
+
+    let via_wire = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Outlooks(outlooks),
+    });
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the outlook raster differs between the direct call and the wire — \
+         the two paths have stopped being one renderer",
+    );
+}
+
+/// **The parity gate for the discussion render.** Byte-identity, the painted
+/// floor, and a proof that *every row* travels: dropping the second MD from
+/// the described input must lose pixels through the wire.
+#[test]
+fn the_discussions_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input,
+    } = an_overlay_discussions_job()
+    else {
+        unreachable!("the fixture is an overlay job");
+    };
+    let OverlayJobInput::Discussions(discussions) = input else {
+        unreachable!("the fixture is a discussions job");
+    };
+
+    let direct = rustdar_overlays::render::rasterize::rasterize_spc_discussions(
+        &discussions,
+        &bounds,
+        width,
+        height,
+    );
+    assert_eq!(
+        direct.alpha,
+        rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the discussion rasterizer changed its alpha convention; the parity \
+         claim below is now comparing across a conversion",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+
+    let via_wire = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Discussions(discussions.clone()),
+    });
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the discussion raster differs between the direct call and the wire \
+         — the two paths have stopped being one renderer",
+    );
+
+    // Every row travels: the winter-weather MD sits apart from the
+    // convective one, so a wire that lost the second row loses its pixels.
+    let mut first_only = discussions;
+    first_only.discussions.truncate(1);
+    let fewer = overlay_raster_via_wire(&JobRequest::Overlay {
+        width,
+        height,
+        bounds,
+        input: OverlayJobInput::Discussions(first_only),
+    });
+    assert!(
+        painted(&fewer) < painted(&via_wire),
+        "dropping the second MD did not lose pixels through the wire, so the \
+         row list is not reaching the rasterizer whole and the parity above \
+         says nothing about it",
     );
 }
 
@@ -1479,6 +1981,210 @@ fn a_malformed_overlay_job_is_refused_rather_than_misread() {
     );
 }
 
+/// Every truncation of an overlay job refused, and a trailing byte refused:
+/// the shared half of the malformed suite, run per kind so a decoder arm
+/// that started tolerating short or long buffers is named by its kind.
+fn assert_refuses_cuts_and_trailing(job: &JobRequest) {
+    let bytes = job.to_bytes();
+    // Control first: untouched bytes decode to the job itself, so every
+    // refusal below is the mutation's doing.
+    assert_eq!(JobRequest::from_bytes(&bytes).as_ref(), Some(job));
+    for cut in 1..bytes.len() {
+        assert_eq!(
+            JobRequest::from_bytes(&bytes[..cut]),
+            None,
+            "{} truncated to {cut} bytes was accepted",
+            job.kind(),
+        );
+    }
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert_eq!(
+        JobRequest::from_bytes(&trailing),
+        None,
+        "{} with a trailing byte was accepted: the two builds' layouts \
+         disagree and the decoder did not say so",
+        job.kind(),
+    );
+}
+
+/// The alert job's malformed shapes. Truncations and trailing bytes through
+/// the shared walk; then the two byte positions this kind's own decoder
+/// judges — a category code and a hidden-id's UTF-8 — each mutated to a
+/// *valid different value* first, read back, and only then to the refused
+/// one, so the refusal is proven to be about the byte this test believes
+/// it is about.
+#[test]
+fn a_malformed_alerts_job_is_refused_rather_than_misread() {
+    use rustdar_overlays::nws::alert::AlertCategory;
+    let job = an_overlay_alerts_job();
+    assert_refuses_cuts_and_trailing(&job);
+    let bytes = job.to_bytes();
+
+    // Offsets, stated once: tag(1) + width(4) + height(4) + bounds(32) = 41
+    // is the input-kind byte; + 1 + device_scale(4) + category_count(4) = 50
+    // is the first enabled-category code; the two categories, the hidden
+    // count (4) and the first hidden id's length prefix (2) put the id's
+    // first byte at 58.
+    let first_category = 50;
+    let first_hidden_byte = 58;
+
+    // Positive control: a *different valid* category code decodes, and to the
+    // category that code names — so 50 really is the category byte.
+    let mut retagged = bytes.clone();
+    assert_eq!(
+        retagged[first_category], 0,
+        "the fixture leads with Warning"
+    );
+    retagged[first_category] = 1;
+    match JobRequest::from_bytes(&retagged) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Alerts(alerts),
+            ..
+        }) => assert_eq!(
+            alerts.enabled_categories[0],
+            AlertCategory::Watch,
+            "byte {first_category} is not the first category code; the \
+             refusal below would be about some other field",
+        ),
+        other => panic!("the retagged control failed to decode: {other:?}"),
+    }
+    retagged[first_category] = 4;
+    assert_eq!(
+        JobRequest::from_bytes(&retagged),
+        None,
+        "category code 4 is a build this one is not",
+    );
+
+    // Positive control at the hidden id, then a byte no UTF-8 string holds.
+    let mut renamed = bytes;
+    assert_eq!(renamed[first_hidden_byte], b'u', "the fixture id is a urn");
+    renamed[first_hidden_byte] = b'Q';
+    match JobRequest::from_bytes(&renamed) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Alerts(alerts),
+            ..
+        }) => assert!(
+            alerts.hidden_ids.iter().any(|id| id.starts_with('Q')),
+            "byte {first_hidden_byte} is not the first hidden-id byte; the \
+             refusal below would be about some other field",
+        ),
+        other => panic!("the renamed control failed to decode: {other:?}"),
+    }
+    renamed[first_hidden_byte] = 0xFF;
+    assert_eq!(
+        JobRequest::from_bytes(&renamed),
+        None,
+        "a hidden id that is not UTF-8 was accepted",
+    );
+}
+
+/// The outlook job's malformed shapes: the shared walk, then the two bytes
+/// this kind's own decoder judges — a feature's hatch code and its
+/// geo-bounds option tag — each with the read-back control the alert test
+/// describes.
+#[test]
+fn a_malformed_outlooks_job_is_refused_rather_than_misread() {
+    use rustdar_overlays::types::HatchPattern;
+    let job = an_overlay_outlooks_job();
+    assert_refuses_cuts_and_trailing(&job);
+    let bytes = job.to_bytes();
+
+    // Offsets, stated once: the fixed header and input-kind byte end at 42;
+    // + device_scale(4) + hatch_color(4) + feature_count(4) = 54 opens the
+    // first feature; its labels are "SLGT" (2+4) and "Slight Risk" (2+11),
+    // then fill(4) + stroke(4) put the hatch code at 81 and the geo-bounds
+    // option tag at 82.
+    let first_hatch = 54 + 2 + 4 + 2 + 11 + 4 + 4;
+    let bounds_tag = first_hatch + 1;
+
+    let mut rehatched = bytes.clone();
+    assert_eq!(
+        rehatched[first_hatch], 0,
+        "the fixture's first feature is unhatched"
+    );
+    rehatched[first_hatch] = 2;
+    match JobRequest::from_bytes(&rehatched) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Outlooks(outlooks),
+            ..
+        }) => assert_eq!(
+            outlooks.features[0].hatch,
+            HatchPattern::Cig2,
+            "byte {first_hatch} is not the first hatch code; the refusal \
+             below would be about some other field",
+        ),
+        other => panic!("the rehatched control failed to decode: {other:?}"),
+    }
+    rehatched[first_hatch] = 4;
+    assert_eq!(
+        JobRequest::from_bytes(&rehatched),
+        None,
+        "hatch code 4 is a build this one is not",
+    );
+
+    // The option tag: 1 on the fixture (`OverlayFeature::new` computes its
+    // AABB), read back as `Some` — then a tag outside {0, 1}.
+    let mut untagged = bytes;
+    assert_eq!(
+        untagged[bounds_tag], 1,
+        "the fixture's feature carries its AABB"
+    );
+    match JobRequest::from_bytes(&untagged) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Outlooks(outlooks),
+            ..
+        }) => assert!(
+            outlooks.features[0].geo_bounds.is_some(),
+            "byte {bounds_tag} is not the geo-bounds tag; the refusal below \
+             would be about some other field",
+        ),
+        other => panic!("the option-tag control failed to decode: {other:?}"),
+    }
+    untagged[bounds_tag] = 2;
+    assert_eq!(
+        JobRequest::from_bytes(&untagged),
+        None,
+        "a geo-bounds tag outside {{0, 1}} was accepted",
+    );
+}
+
+/// The discussion job's malformed shapes: the shared walk, then the one byte
+/// this kind's own decoder judges — the MD type — with its read-back control.
+#[test]
+fn a_malformed_discussions_job_is_refused_rather_than_misread() {
+    use rustdar_overlays::spc::discussion::MdType;
+    let job = an_overlay_discussions_job();
+    assert_refuses_cuts_and_trailing(&job);
+    let bytes = job.to_bytes();
+
+    // Offsets, stated once: the fixed header and input-kind byte end at 42;
+    // + device_scale(4) + md_count(4) = 50 is the first MD's type code.
+    let first_md_type = 50;
+
+    let mut retyped = bytes;
+    assert_eq!(retyped[first_md_type], 0, "the fixture leads Convective");
+    retyped[first_md_type] = 1;
+    match JobRequest::from_bytes(&retyped) {
+        Some(JobRequest::Overlay {
+            input: OverlayJobInput::Discussions(discussions),
+            ..
+        }) => assert_eq!(
+            discussions.discussions[0].md_type,
+            MdType::WinterWeather,
+            "byte {first_md_type} is not the first MD-type code; the refusal \
+             below would be about some other field",
+        ),
+        other => panic!("the retyped control failed to decode: {other:?}"),
+    }
+    retyped[first_md_type] = 3;
+    assert_eq!(
+        JobRequest::from_bytes(&retyped),
+        None,
+        "MD-type code 3 is a build this one is not",
+    );
+}
+
 /// On native, a described overlay job rides the pool's **interactive** lane —
 /// the one the overlay closures have always ridden — and a radar job rides the
 /// described lane, so an overlay can never queue behind a slate of radar
@@ -1512,6 +2218,15 @@ fn a_described_overlay_job_rides_the_interactive_lane() {
         overlay_lane.starts_with("rd-opaque"),
         "the sites job delivered on {overlay_lane}: it is queueing behind \
          radar renders, which is the stall the lane split exists to prevent",
+    );
+    // A polygon kind rides the same lane: the routing is by the `Overlay`
+    // request kind, not by which overlay is inside it, and this is what says
+    // the described polygon kinds kept the closures' scheduling on native.
+    let alerts_lane = lane_of(an_overlay_alerts_job());
+    assert!(
+        alerts_lane.starts_with("rd-opaque"),
+        "the alerts job delivered on {alerts_lane}: a described polygon \
+         overlay is queueing behind radar renders",
     );
     let radar_lane = lane_of(a_job());
     assert!(

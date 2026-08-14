@@ -561,8 +561,8 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 9;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 9. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 10;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 10. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
@@ -586,7 +586,11 @@ fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
          added the overlay job (page->worker tag 8) and its reply, `outkind` \
          code 5 — a version 8 pair mismatched with a 9 exchanges jobs one half \
          refuses and payloads the other drops, which is a site-marker layer \
-         that silently never draws. Changing \
+         that silently never draws. Version 10 widened tag 8's inner code \
+         space with the three polygon overlay kinds (alerts, outlooks, \
+         discussions, input codes 2-4): a version 9 worker refuses those \
+         codes and answers a failed job, which is a warning layer that \
+         silently never draws. Changing \
          the message shapes without changing this number is the whole failure \
          it prevents.",
     );
@@ -941,7 +945,7 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     assert_eq!(
         shape,
         [
-            "PROTOCOL_VERSION = 9",
+            "PROTOCOL_VERSION = 10",
             "frame | IMAGE | image",
             "frame | MAX_RANGE | range",
             "frame | MELTING_LAYER | mls",
