@@ -74,27 +74,89 @@ pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, TRANSPARENCY);
 type ColorThresholds = &'static [(f32, (u8, u8, u8))];
 type ColorScale = &'static (ColorThresholds, bool);
 
+/// The colour a scale gives `value`: the last stop at or below it, blended
+/// toward the next stop where the scale is a gradient.
+///
+/// # The stops are searched, not walked
+///
+/// This runs **once per painted pixel**, and there are millions of them:
+/// [`crate::render`]'s colour pass derives one colour per pixel and is the
+/// pass whose own doc calls it dominant when it runs serially, and
+/// [`crate::xsect`]'s fills are the same shape one pixel at a time. Placing a
+/// value used to walk the table from the bottom — up to twenty-four stops,
+/// [`PHI`] being that long, with [`REFLECTIVITY`] at twenty-two and the other
+/// fifteen tables between four and fifteen — and is a
+/// [`partition_point`](slice::partition_point) over the same table now.
+///
+/// **That is a bound on the work, not a measured speedup, and quite possibly
+/// not a speedup at all.** Nobody has measured it, and the arithmetic argues
+/// both ways: the walk exits early, and on most of these tables it exits soon.
+/// Twelve of the seventeen are twelve stops or shorter — a table that fits in
+/// one or two cache lines, where four data-dependent branches have no obvious
+/// edge on a sequential scan a predictor sees coming. Even on [`REFLECTIVITY`]
+/// the dBZ a radar image is mostly made of sit at stops three through nine,
+/// against five steps of binary search. Whatever is there is concentrated in
+/// [`PHI`] and the high-dBZ tail. What the rewrite buys unconditionally is
+/// that the per-pixel cost stops scaling with how far up its own table a value
+/// lands, and — through the tests below — the first check that the tables are
+/// ordered the way this module has always said they are.
+///
+/// **The answer is the same one, not a near one**, which is the only thing
+/// that makes the swap admissible in a crate whose products are pinned
+/// byte-for-byte:
+///
+/// * The predicate `threshold <= value` *is* the walk's acceptance test
+///   `value >= threshold`, so the index it returns is the index the walk broke
+///   out on.
+/// * [`ZDR`]'s `NEG_INFINITY` floor is accepted by every finite value, exactly
+///   as `value >= -inf` was. This one is load-bearing: it is the only stop in
+///   the module that is not a finite number, and it reaches here on live data.
+/// * Equal adjacent stops all sit in the accepted prefix, so the *later* one
+///   wins — as it did when each loop iteration overwrote the last.
+/// * `NaN` is accepted by no stop, so it lands on index 0 — the flat first
+///   colour the walk's first-iteration `break` yielded. No caller can observe
+///   this: [`get_color_for_value`] rejects non-finite input before any scale is
+///   consulted. It is pinned anyway because what is being replaced is this
+///   function, not its callers.
+///
+/// `the_binary_search_paints_what_the_linear_scan_painted` carries the deleted
+/// walk verbatim and diffs the two over every scale in this file. It is not a
+/// quantised RGBA lookup table, deliberately: that is faster still and moves
+/// gradient stops off the exact-digest pins.
+///
+/// The one thing a search needs that a walk did not is an **ascending** table.
+/// The type alias above has asserted that in prose for as long as it has
+/// existed, and nothing checked it; `every_scales_thresholds_ascend` does.
 fn scale_color(scale: ColorScale, value: f32) -> (u8, u8, u8) {
     let &(thresholds, gradient) = scale;
-    let mut color = thresholds[0].1;
-    let mut last_threshold = thresholds[0].0;
-    for (i, &(threshold, c)) in thresholds.iter().enumerate() {
-        if value >= threshold {
-            color = c;
-            last_threshold = threshold;
-        } else {
-            // A non-finite left stop (e.g. ZDR's NEG_INFINITY floor) would make
-            // `t` NaN; fall through to the flat color instead.
-            if gradient && i > 0 && threshold > last_threshold && last_threshold.is_finite() {
-                let t = (value - last_threshold) / (threshold - last_threshold);
-                return (
-                    (color.0 as f32 + (c.0 as f32 - color.0 as f32) * t) as u8,
-                    (color.1 as f32 + (c.1 as f32 - color.1 as f32) * t) as u8,
-                    (color.2 as f32 + (c.2 as f32 - color.2 as f32) * t) as u8,
-                );
-            }
-            break;
-        }
+    let i = thresholds.partition_point(|&(threshold, _)| threshold <= value);
+    if i == 0 {
+        // Below the first stop, or NaN: no stop took the value, which is where
+        // the walk broke out on its first iteration.
+        return thresholds[0].1;
+    }
+    let (last_threshold, color) = thresholds[i - 1];
+    if i == thresholds.len() {
+        // Every stop took it; the walk ran off the end holding this colour.
+        return color;
+    }
+    let (threshold, c) = thresholds[i];
+    // The walk's guard, carried over unchanged so this line still reads
+    // against the loop it replaces. Two of its four conjuncts are now dead:
+    // `i > 0` by the early return above, and `threshold > last_threshold`
+    // because reaching here means `threshold > value >= last_threshold` — the
+    // stop at `i` was the one the predicate rejected, and a rejected stop is
+    // strictly above the value once `every_scales_thresholds_ascend` rules out
+    // a NaN in the table. What is live is `last_threshold.is_finite()`: a
+    // non-finite left stop (ZDR's NEG_INFINITY floor) would make `t` NaN and
+    // cast every channel to 0, so those values take the flat color instead.
+    if gradient && i > 0 && threshold > last_threshold && last_threshold.is_finite() {
+        let t = (value - last_threshold) / (threshold - last_threshold);
+        return (
+            (color.0 as f32 + (c.0 as f32 - color.0 as f32) * t) as u8,
+            (color.1 as f32 + (c.1 as f32 - color.1 as f32) * t) as u8,
+            (color.2 as f32 + (c.2 as f32 - color.2 as f32) * t) as u8,
+        );
     }
     color
 }
@@ -806,6 +868,359 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every colour scale in this file, so the sweeps below can walk all of
+    /// them instead of whichever ones somebody remembered.
+    ///
+    /// A list is a snapshot and snapshots rot, so this one is not trusted on
+    /// its own: `every_colour_scale_static_is_registered` reads this file's own
+    /// [`ColorScale`] declarations back out of the source — at any visibility,
+    /// `static` or `const`, indented or not, see [`declared_scale_name`] — and
+    /// fails until every one of them appears here, and every row here names one
+    /// of them. Adding an eighteenth scale therefore breaks a test rather than
+    /// quietly escaping the sweeps.
+    const ALL_SCALES: &[(&str, ColorScale)] = &[
+        ("REFLECTIVITY", REFLECTIVITY),
+        ("VELOCITY_OUTBOUND", VELOCITY_OUTBOUND),
+        ("VELOCITY_INBOUND", VELOCITY_INBOUND),
+        ("SPECTRUM_WIDTH", SPECTRUM_WIDTH),
+        ("ZDR", ZDR),
+        ("RHO", RHO),
+        ("PHI", PHI),
+        ("KDP", KDP),
+        ("ECHO_TOPS", ECHO_TOPS),
+        ("VIL", VIL),
+        ("VIL_DENSITY", VIL_DENSITY),
+        ("POSH", POSH),
+        ("MEHS", MEHS),
+        ("HHC", HHC),
+        ("PRECIP_RATE", PRECIP_RATE),
+        ("NROT_CYCLONIC", NROT_CYCLONIC),
+        ("NROT_ANTICYCLONIC", NROT_ANTICYCLONIC),
+    ];
+
+    /// The number of colour scales this module documents, as a **literal**.
+    ///
+    /// Every sweep below checks itself against this rather than against
+    /// `ALL_SCALES.len()`, because a floor written in terms of the registry is
+    /// satisfied by an empty registry: `0 >= 0` passes, and the sweep that
+    /// covered nothing reads exactly like the sweep that covered everything.
+    const SCALE_COUNT: usize = 17;
+
+    /// The name a line declares a [`ColorScale`] under, if it declares one.
+    ///
+    /// **Deliberately loose about how it is declared**, because the strict
+    /// version of this had a hole a whole scale fits through. A scan keyed to
+    /// `static NAME:` at column zero misses `pub(crate) static`, `pub static`,
+    /// `const`, and anything indented — and the miss is silent in the worst
+    /// way: if the scale it missed is *also* missing from [`ALL_SCALES`], the
+    /// counts still agree, every assertion passes, and a live scale is swept
+    /// by nothing at all. That is not hypothetical. `nrot.rs`'s prose already
+    /// points at `palette::NROT_CYCLONIC`, so `pub(crate) static
+    /// NROT_CYCLONIC` is a plausible next edit to this file.
+    fn declared_scale_name(line: &str) -> Option<&str> {
+        let mut rest = line.trim_start();
+        if let Some(after_pub) = rest.strip_prefix("pub") {
+            // `pub`, or any restricted form: `pub(crate)`, `pub(super)`,
+            // `pub(in crate::foo)`.
+            rest = match after_pub.strip_prefix('(') {
+                Some(restriction) => restriction.split_once(')')?.1,
+                None => after_pub,
+            }
+            .trim_start();
+        }
+        let rest = rest
+            .strip_prefix("static ")
+            .or_else(|| rest.strip_prefix("const "))?;
+        let (name, ty) = rest.split_once(':')?;
+        if ty.trim_start().starts_with("ColorScale") {
+            Some(name.trim())
+        } else {
+            None
+        }
+    }
+
+    /// [`ALL_SCALES`] is this file's list of scales, not a copy of it that was
+    /// true once.
+    #[test]
+    fn every_colour_scale_static_is_registered() {
+        // The scanner is the part of this guard that can fail silently, so it
+        // is pinned first, on the spellings that used to slip past it and on
+        // the near-misses in this very file that must not be counted.
+        for (line, expected) in [
+            ("static X: ColorScale = &(", Some("X")),
+            ("pub static X: ColorScale = &(", Some("X")),
+            ("pub(crate) static X: ColorScale = &(", Some("X")),
+            ("pub(super) static X: ColorScale = &(", Some("X")),
+            ("pub(in crate::render) static X: ColorScale = &(", Some("X")),
+            ("    pub(crate) const X: ColorScale = &(", Some("X")),
+            ("static X : ColorScale = &(", Some("X")),
+            ("const TRANSPARENCY: u8 = 180;", None),
+            (
+                "pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, 180);",
+                None,
+            ),
+            ("type ColorScale = &'static (ColorThresholds, bool);", None),
+            ("const ALL_SCALES: &[(&str, ColorScale)] = &[", None),
+            ("/// static X: ColorScale is prose, not a declaration", None),
+        ] {
+            assert_eq!(
+                declared_scale_name(line),
+                expected,
+                "the declaration scanner misreads `{line}`",
+            );
+        }
+
+        let declared: Vec<&str> = include_str!("palette.rs")
+            .lines()
+            .filter_map(declared_scale_name)
+            .collect();
+
+        // precondition: a literal floor, not one derived from ALL_SCALES. The
+        // `> 10` this used to carry was satisfied by exactly the failure it
+        // was meant to catch — a scanner that missed the same scales the
+        // registry missed leaves the two counts agreeing at 16, or 12, or 11.
+        assert!(
+            declared.len() >= SCALE_COUNT,
+            "the source scan found only {} colour-scale declarations, and this \
+             module documents {SCALE_COUNT}. Suspect `declared_scale_name` — \
+             a visibility or keyword it does not know — and do NOT reconcile \
+             this by deleting rows from ALL_SCALES, which would leave a live \
+             scale swept by nothing.",
+            declared.len(),
+        );
+
+        for name in &declared {
+            assert!(
+                ALL_SCALES.iter().any(|&(n, _)| n == *name),
+                "colour scale `{name}` is declared in this file but is in no \
+                 sweep; add it to ALL_SCALES",
+            );
+        }
+        for &(name, _) in ALL_SCALES {
+            assert!(
+                declared.contains(&name),
+                "ALL_SCALES lists `{name}`, which this file does not declare",
+            );
+        }
+
+        // A registry row is a (name, scale) pair and only the name is checked
+        // above, so `("PHI", KDP)` would satisfy every assertion so far while
+        // leaving PHI unswept and sweeping KDP twice. Identity, not name.
+        for (i, &(name, scale)) in ALL_SCALES.iter().enumerate() {
+            for &(other_name, other) in &ALL_SCALES[..i] {
+                assert!(
+                    !std::ptr::eq(scale, other),
+                    "ALL_SCALES rows `{other_name}` and `{name}` are the same \
+                     table, so one of the two named scales is never swept",
+                );
+            }
+        }
+
+        assert_eq!(
+            declared.len(),
+            ALL_SCALES.len(),
+            "ALL_SCALES lists {} scales and the file declares {}",
+            ALL_SCALES.len(),
+            declared.len(),
+        );
+    }
+
+    /// Every scale's stops ascend — [`scale_color`]'s binary search needs it,
+    /// and until that search existed nothing checked it.
+    ///
+    /// The walk this file used to do tolerated a table out of order: it simply
+    /// stopped at the first stop above the value and painted whatever it had.
+    /// A search does not, so the property that was an unstated authoring habit
+    /// is now a pinned precondition. Non-decreasing is the real requirement —
+    /// equal adjacent stops sit together in the accepted prefix and resolve to
+    /// the later one, which is what the walk did too — so that, and not strict
+    /// ascent, is what this asserts.
+    #[test]
+    fn every_scales_thresholds_ascend() {
+        assert!(
+            ALL_SCALES.len() >= SCALE_COUNT,
+            "this checked {} scales, not the {SCALE_COUNT} the module has",
+            ALL_SCALES.len(),
+        );
+        for &(name, scale) in ALL_SCALES {
+            let &(thresholds, _) = scale;
+            assert!(
+                !thresholds.is_empty(),
+                "{name} has no stops, so `scale_color`'s `thresholds[0]` panics",
+            );
+            for (i, pair) in thresholds.windows(2).enumerate() {
+                let (lower, upper) = (pair[0].0, pair[1].0);
+                assert!(
+                    lower <= upper,
+                    "{name} stop {i} is {lower} and stop {} is {upper}: the \
+                     table is out of order, so the binary search and the walk \
+                     it replaced disagree about which stop owns a value",
+                    i + 1,
+                );
+            }
+        }
+    }
+
+    /// The binary search paints exactly what the linear scan painted, on every
+    /// scale in this file.
+    ///
+    /// **Non-circular by construction:** the expected colours are produced by
+    /// the deleted scan itself, carried verbatim below, not by a transcription
+    /// of what it used to return. This is the same shape as `nrot.rs`'s
+    /// `the_hoisted_beam_height_is_bit_identical_to_the_shared_one` — one
+    /// spelling checked against the other over a dense grid, with a
+    /// precondition on the grid so a bound narrowed to nothing cannot leave it
+    /// passing.
+    ///
+    /// The probes are the four places the two spellings could have parted:
+    /// every stop *exactly* (a `<` where the scan had `>=` would show here),
+    /// the two representable neighbours of every stop, the gradient interiors
+    /// between stops, and the non-finite inputs — `NaN` both signs, `±inf` —
+    /// plus values far below the first stop and far above the last.
+    #[test]
+    fn the_binary_search_paints_what_the_linear_scan_painted() {
+        /// [`scale_color`]'s body before it became a binary search, verbatim.
+        fn linear_scan(scale: ColorScale, value: f32) -> (u8, u8, u8) {
+            let &(thresholds, gradient) = scale;
+            let mut color = thresholds[0].1;
+            let mut last_threshold = thresholds[0].0;
+            for (i, &(threshold, c)) in thresholds.iter().enumerate() {
+                if value >= threshold {
+                    color = c;
+                    last_threshold = threshold;
+                } else {
+                    // A non-finite left stop (e.g. ZDR's NEG_INFINITY floor)
+                    // would make `t` NaN; fall through to the flat color.
+                    if gradient && i > 0 && threshold > last_threshold && last_threshold.is_finite()
+                    {
+                        let t = (value - last_threshold) / (threshold - last_threshold);
+                        return (
+                            (color.0 as f32 + (c.0 as f32 - color.0 as f32) * t) as u8,
+                            (color.1 as f32 + (c.1 as f32 - color.1 as f32) * t) as u8,
+                            (color.2 as f32 + (c.2 as f32 - color.2 as f32) * t) as u8,
+                        );
+                    }
+                    break;
+                }
+            }
+            color
+        }
+
+        /// The next representable `f32` toward `+inf` (`up`) or `-inf`, so a
+        /// stop is probed on its own two neighbours and not merely near them.
+        /// Spelled with `to_bits` rather than `f32::next_up` so the test
+        /// builds on the 1.85 floor `nexrad-level3` pins.
+        fn neighbour(x: f32, up: bool) -> f32 {
+            if x.is_nan() {
+                return x;
+            }
+            if x == 0.0 {
+                // Either zero's neighbours are the smallest subnormals.
+                return if up {
+                    f32::from_bits(1)
+                } else {
+                    -f32::from_bits(1)
+                };
+            }
+            let away_from_zero = up == (x > 0.0);
+            if x.is_infinite() && away_from_zero {
+                return x;
+            }
+            let bits = x.to_bits();
+            f32::from_bits(if away_from_zero { bits + 1 } else { bits - 1 })
+        }
+
+        /// Steps across each scale's own domain plus a half-span skirt at each
+        /// end, so the gradient interiors are sampled far more finely than the
+        /// stops are spaced.
+        const DENSE: usize = 6_000;
+
+        let mut checked = 0usize;
+        for &(name, scale) in ALL_SCALES {
+            let &(thresholds, _) = scale;
+
+            let mut probes: Vec<f32> = vec![
+                f32::NAN,
+                -f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                0.0,
+                -0.0,
+                -1e9,
+                1e9,
+            ];
+            for &(t, _) in thresholds {
+                // The stop itself, then its two representable neighbours.
+                probes.push(t);
+                probes.push(neighbour(t, true));
+                probes.push(neighbour(t, false));
+                for d in [
+                    -1e-6, 1e-6, -1e-3, 1e-3, -0.25, 0.25, -1.0, 1.0, -37.0, 37.0,
+                ] {
+                    probes.push(t + d);
+                }
+            }
+            for pair in thresholds.windows(2) {
+                let (lower, upper) = (pair[0].0, pair[1].0);
+                for f in [0.25, 0.5, 0.75] {
+                    probes.push(lower + f * (upper - lower));
+                }
+            }
+            // Every table has finite stops to span, even ZDR, whose first one
+            // is NEG_INFINITY.
+            let finite: Vec<f32> = thresholds
+                .iter()
+                .map(|&(t, _)| t)
+                .filter(|t| t.is_finite())
+                .collect();
+            let lo = *finite.first().expect("every scale has a finite stop");
+            let hi = *finite.last().expect("every scale has a finite stop");
+            let span = (hi - lo).max(1.0);
+            for k in 0..=DENSE {
+                probes.push(lo - span / 2.0 + 2.0 * span * (k as f32 / DENSE as f32));
+            }
+
+            // precondition, per scale and as a literal: this table really got
+            // the dense sweep and not a handful of stray stops.
+            assert!(
+                probes.len() >= 6_000,
+                "{name} was probed {} times, which is not a dense sweep",
+                probes.len(),
+            );
+
+            for &value in &probes {
+                let scanned = linear_scan(scale, value);
+                let searched = scale_color(scale, value);
+                assert_eq!(
+                    searched,
+                    scanned,
+                    "{name} paints {value} (bits {:#010x}) as {searched:?}, \
+                     the linear scan it replaced paints it {scanned:?}",
+                    value.to_bits(),
+                );
+                checked += 1;
+            }
+        }
+
+        // preconditions, both as literals. A `swept == ALL_SCALES.len()` count
+        // stood here and was true by construction — the loop has no `continue`
+        // and no `break`, so no edit to this file could have falsified it —
+        // and a `checked >= ALL_SCALES.len() * DENSE` floor passed vacuously
+        // over an emptied registry (`0 >= 0`) and over `DENSE` lowered to 1.
+        // Neither is worth more than the line it occupies unless the number it
+        // is compared against comes from outside the thing being guarded.
+        assert!(
+            ALL_SCALES.len() >= SCALE_COUNT,
+            "the sweep ran over {} scales, not the {SCALE_COUNT} the module has",
+            ALL_SCALES.len(),
+        );
+        assert!(
+            checked >= 100_000,
+            "{checked} probes is far short of a dense sweep of {SCALE_COUNT} \
+             scales; a narrowed bound, not a pass",
+        );
+    }
 
     /// Every visible spectrum-width band is the operational source's own.
     ///
