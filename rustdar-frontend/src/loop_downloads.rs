@@ -257,6 +257,22 @@ impl LoopDownloadManager {
         self.scan_cache.get(site)?.get(ts)
     }
 
+    /// How many volumes this site is holding.
+    #[cfg(test)]
+    pub fn cached_scan_count(&self, site: &str) -> usize {
+        self.scan_cache.get(site).map_or(0, |scans| scans.len())
+    }
+
+    /// Whether the map has an entry for this site at all.
+    ///
+    /// Separate from [`cached_scan_count`](Self::cached_scan_count) because that
+    /// answers `0` for a site whose inner map is empty *and* for one that was
+    /// pruned, and the pruning is the thing under test.
+    #[cfg(test)]
+    pub fn has_cached_site(&self, site: &str) -> bool {
+        self.scan_cache.contains_key(site)
+    }
+
     /// Store a downloaded volume in the cache under the site it was downloaded
     /// for, with what its cuts declared.
     pub fn cache_scan(&mut self, site: &str, ts: chrono::NaiveDateTime, volume: CachedVolume) {
@@ -264,6 +280,70 @@ impl LoopDownloadManager {
             .entry(site.to_string())
             .or_default()
             .insert(ts, volume);
+    }
+
+    /// Take out every cached volume whose `(site, timestamp)` fails `keep`, and
+    /// hand the removed values back **owned**.
+    ///
+    /// # Why it returns them rather than dropping them
+    ///
+    /// The mirror of [`RenderCache::retain`](crate::render_dispatch::RenderCache::retain)
+    /// in shape and its opposite in destination. `retain` frees in place, and in
+    /// place is the frame thread: an entry here is a whole decoded volume,
+    /// 47–69 MiB across thousands of per-radial buffers, and returning them is
+    /// what lets the caller hand them to
+    /// [`crate::offload::discard_each`](crate::offload::discard_each) instead.
+    /// Same reasoning, and the same helper's reasoning, as
+    /// [`crate::app::evicted`].
+    ///
+    /// # Until this, nothing evicted an entry
+    ///
+    /// [`clear_all`](Self::clear_all) emptied the map wholesale on a site
+    /// switch and nothing else ever removed one, while
+    /// [`cache_scan`](Self::cache_scan) is written on every auto-poll and every
+    /// completed live volume. A pane parked on a live radar therefore
+    /// accumulated one decoded volume per scan for the life of the process —
+    /// 0.4–1 GB an hour, outside every byte budget in the workspace, because
+    /// the loop pool's budget counts *texture* bytes and these are CPU-side.
+    ///
+    /// # The predicate is `(site, timestamp)`, both halves
+    ///
+    /// For the reason the cache is keyed that way (see this type's own doc):
+    /// two sites' volume times collide often enough, and a rule that answered
+    /// on the timestamp alone would evict one radar's entry because another
+    /// radar had stopped naming that second.
+    ///
+    /// An emptied site's inner map goes with its last entry. Left behind it is
+    /// a `String` key per radar a session ever looped, which is small — and is
+    /// also the difference between "this site holds nothing" and "this site is
+    /// not in the map", a distinction no caller should have to know does not
+    /// matter.
+    ///
+    /// # It does not touch the in-flight marks, deliberately
+    ///
+    /// [`in_flight_set`](Self::in_flight_set) and
+    /// [`in_flight_count`](Self::in_flight_count) mirror network operations
+    /// that are already under way and cannot be recalled. Clearing a mark here
+    /// would let the same file be requested twice; decrementing the count would
+    /// raise the concurrency cap above what is actually running, and the count
+    /// is `saturating_sub`bed on completion, so it would wedge low and starve
+    /// dispatch for the rest of the session. A download in flight for an entry
+    /// this pass evicted simply lands and is cached again — the loop that
+    /// wanted it is the only thing that would have asked.
+    pub fn retain_scans(
+        &mut self,
+        keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool,
+    ) -> Vec<CachedVolume> {
+        let mut removed = Vec::new();
+        self.scan_cache.retain(|site, scans| {
+            removed.extend(
+                scans
+                    .extract_if(|ts, _| !keep(site.as_str(), ts))
+                    .map(|(_, volume)| volume),
+            );
+            !scans.is_empty()
+        });
+        removed
     }
 
     /// Mark a site's timestamp as currently being downloaded.
@@ -781,6 +861,114 @@ mod tests {
             "with no queue entry left behind to be dispatched after the switch"
         );
         assert_eq!(mgr.available_slots(4), 4);
+    }
+
+    /// `retain_scans` hands the evicted volumes back rather than freeing them.
+    ///
+    /// The whole reason it is not a `retain`: the caller is the frame thread,
+    /// an entry is 47–69 MiB across thousands of per-radial buffers, and
+    /// returning the values is what lets `App::evict_unneeded_loop_scans` pass
+    /// them to `offload::discard_each`. Compared by pointer, so this cannot be
+    /// satisfied by handing back some other volume of the right shape.
+    #[test]
+    fn retain_scans_returns_the_volumes_it_removed() {
+        let mut mgr = LoopDownloadManager::new();
+        let doomed = volume();
+        let kept = volume();
+        mgr.cache_scan("KTLX", ts(0), doomed.clone());
+        mgr.cache_scan("KTLX", ts(1), kept.clone());
+
+        let removed = mgr.retain_scans(|_, stamp| *stamp == ts(1));
+
+        assert_eq!(removed.len(), 1, "one entry failed the predicate");
+        assert!(
+            Arc::ptr_eq(&removed[0].0, &doomed.0),
+            "the value handed back is not the one that was evicted, so the \
+             caller cannot hand the evicted volume over",
+        );
+        assert!(
+            Arc::ptr_eq(&mgr.get_cached("KTLX", &ts(1)).expect("kept").0, &kept.0),
+            "the surviving entry was replaced",
+        );
+    }
+
+    /// Both halves of the key reach the predicate.
+    ///
+    /// A rule that saw only the timestamp would evict one radar's entry because
+    /// another radar had stopped naming that second — the same collision the
+    /// cache is keyed on the site to avoid.
+    #[test]
+    fn retain_scans_judges_the_site_as_well_as_the_timestamp() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), volume());
+        mgr.cache_scan("KOUN", ts(0), volume());
+
+        let removed = mgr.retain_scans(|site, _| site == "KTLX");
+
+        assert_eq!(removed.len(), 1);
+        assert!(mgr.is_cached("KTLX", &ts(0)));
+        assert!(
+            !mgr.is_cached("KOUN", &ts(0)),
+            "KOUN's entry survived a predicate that named only KTLX",
+        );
+    }
+
+    /// A site that loses its last entry loses its inner map too.
+    ///
+    /// Otherwise a session's every looped radar leaves a `String` key behind —
+    /// small, but also the difference between "this site holds nothing" and
+    /// "this site is not in the map", which no caller should have to know does
+    /// not matter.
+    #[test]
+    fn retain_scans_prunes_a_site_it_emptied() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), volume());
+        mgr.cache_scan("KOUN", ts(0), volume());
+        mgr.cache_scan("KOUN", ts(1), volume());
+
+        let removed = mgr.retain_scans(|site, stamp| site == "KOUN" && *stamp == ts(1));
+
+        assert_eq!(removed.len(), 2);
+        assert!(
+            !mgr.has_cached_site("KTLX"),
+            "the emptied site's inner map was left behind",
+        );
+        assert!(
+            mgr.has_cached_site("KOUN"),
+            "a site that still holds an entry was pruned",
+        );
+        assert_eq!(mgr.cached_scan_count("KOUN"), 1);
+    }
+
+    /// The in-flight marks are not the sweep's to touch.
+    ///
+    /// They mirror network operations already under way and uncancellable.
+    /// Clearing a mark would let the same file be requested twice; the count is
+    /// `saturating_sub`bed on completion, so decrementing it here would wedge it
+    /// low and starve dispatch — the concurrency cap would report free slots
+    /// that do not exist and then never recover them.
+    #[test]
+    fn retain_scans_leaves_the_in_flight_marks_alone() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), volume());
+        mgr.mark_in_flight("KTLX", ts(5));
+        mgr.mark_in_flight("KOUN", ts(5));
+        mgr.add_spawned(2);
+
+        let removed = mgr.retain_scans(|_, _| false);
+
+        assert_eq!(removed.len(), 1, "precondition: the sweep did evict");
+        assert!(
+            mgr.is_in_flight("KTLX", &ts(5)),
+            "a download already on the wire lost its mark, so the same file is \
+             requested a second time",
+        );
+        assert!(mgr.is_in_flight("KOUN", &ts(5)));
+        assert_eq!(
+            mgr.available_slots(4),
+            2,
+            "the concurrency cap moved, so it no longer counts what is running",
+        );
     }
 
     /// An object, or the answer that there is none.

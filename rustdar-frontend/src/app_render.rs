@@ -4362,10 +4362,19 @@ fn frame_sweep(
 /// - If a re-download replaced that entry with one carrying no sweep for the
 ///   product, the sibling's own dispatch retires the frame (`render_failed`) rather
 ///   than waiting on a broadcast.
-/// - The one thing that empties the cache under a live loop is `clear_all`, reached
-///   only from `SwitchRadarSite`, which deactivates every affected loop in the same
-///   pass. **A second caller of `clear_all` would break that**, and would have to
-///   re-check this.
+/// - The cache is now swept every frame by `App::evict_unneeded_loop_scans`, and
+///   that sweep cannot reach this entry: what it keeps is the union of
+///   `(ls.site, frame.timestamp)` over every active pane loop, so **no entry a
+///   live loop frame names is ever evicted** and only unnamed ones go. This
+///   receiver's frame names this entry, which is what puts it in the set. **A
+///   retention rule not derived from the live frames — a wall-clock window, a
+///   byte-LRU — would break that**, and would have to re-check this. So would
+///   dropping the sweep's grace rule for a loop still fetching its listing: a
+///   loop whose frames are momentarily empty names nothing.
+/// - The one thing that empties the cache wholesale under a live loop is
+///   `clear_all`, reached only from `SwitchRadarSite`, which deactivates every
+///   affected loop in the same pass. **A second caller of `clear_all` would break
+///   that**, and would have to re-check this.
 fn own_sweep(
     loop_mgr: &crate::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LoopPlaybackState,
@@ -4877,6 +4886,13 @@ mod loop_interval_tests;
 #[path = "app_render/loop_level3_tests.rs"]
 #[cfg(test)]
 mod loop_level3_tests;
+
+/// What bounds the loop's cache of decoded volumes — the fourth holder of whole
+/// `Arc<Scan>`s, and the one nothing removed an entry from until
+/// `App::evict_unneeded_loop_scans`.
+#[path = "app_render/loop_scan_cache_tests.rs"]
+#[cfg(test)]
+mod loop_scan_cache_tests;
 
 /// The plan-view render pipeline against a pane that has no plan view.
 ///

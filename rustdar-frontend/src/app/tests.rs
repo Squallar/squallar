@@ -2380,6 +2380,41 @@ fn an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame() {
     );
 }
 
+/// **The loop cache's evictions are handed over too, and the sweep is wired in.**
+///
+/// The fourth holder of whole decoded volumes reached the same rule one commit
+/// later, and needs the same two probes for the same reason: `retain_scans`
+/// returning its values is only worth anything if the caller sends them
+/// somewhere, and a `for` loop over the returned `Vec` that dropped them would
+/// be indistinguishable at run time from one that handed them over.
+///
+/// The wiring half is not a source-probe nicety — `evict_unneeded_loop_scans`
+/// is called from exactly one place, and a sweep nobody calls is the shape this
+/// whole defect had.
+#[test]
+fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
+    assert!(
+        fn_body("fn evict_unshown_scans(").contains("self.evict_unneeded_loop_scans();"),
+        "the loop cache's sweep is no longer reached from the once-a-frame \
+         eviction, so nothing bounds it — which is the defect it closed",
+    );
+    let body = fn_body("fn evict_unneeded_loop_scans(");
+    assert_eq!(
+        body.matches("crate::offload::discard_each(").count(),
+        1,
+        "the loop cache's evictions are freed where they were evicted — on the \
+         frame thread, 47–69 MiB apiece: {body}"
+    );
+    // The grace rule, named rather than described: without it a loop whose
+    // listing is in flight names no frame, and the sweep takes its whole
+    // window one frame before the listing would have saved it.
+    assert!(
+        body.contains("is_fetching()"),
+        "the grace rule for a loop still fetching its scan listing is gone, so \
+         every product switch and loop re-init re-downloads its window: {body}"
+    );
+}
+
 /// A pane is under two site names and eviction has to honour both.
 ///
 /// `pane.site` is the radar the pane is aimed at; `scan_info.site.name` is the
