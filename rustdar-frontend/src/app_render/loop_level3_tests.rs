@@ -592,31 +592,63 @@ fn an_empty_key_listing_is_cached_as_the_answer() {
     assert!(!mgr.claim_l3_listing(SITE, code));
 }
 
-/// Switching site drops every trace of the Level III half too. A pairing left
-/// behind would land against a loop that no longer exists, and a key listing
-/// left behind would be re-used for a site it was never made for — which
-/// `clear_all`'s whole job is to prevent.
+/// **A departed site's Level III state is collected by site, not by pane.**
+///
+/// The successor to `clear_all_empties_the_level3_state_as_well`, which pinned
+/// the wholesale clear the site switch used to make. That clear had to go: it
+/// emptied every *other* site's Level III state too, so a second pane looping a
+/// different site lost its objects and its listings with the departing pane's.
+///
+/// Split in two, along the line the keys themselves draw. The **pane-keyed**
+/// half — the pairing queue and the frame plan a queue is re-derived from —
+/// goes with `remove_pending`, which the switch calls for the departing pane and
+/// for no other; that half is pinned by
+/// `removing_a_panes_pending_work_takes_both_queues_and_the_plan` above. The
+/// **site-keyed** half is what this asserts: the objects and the day listings go
+/// when nothing names the site, and stay when something does.
+///
+/// The pairing left in flight stays marked either way, which is the one
+/// assertion carried over unchanged: it is an uncancellable round-trip, and
+/// clearing its mark fetches the same object twice.
 #[test]
-fn clear_all_empties_the_level3_state_as_well() {
+fn a_departed_sites_level3_state_goes_and_a_live_sites_stays() {
     let mut mgr = LoopDownloadManager::new();
     let code = codes(L3)[0];
-    mgr.set_plan(0, plan(2));
-    mgr.plan_downloads_for(0, L3);
     mgr.cache_l3_keys(SITE, code, vec!["TLX_EET_2024_01_01_00_01_30".to_string()]);
+    mgr.cache_l3_keys(
+        "KOUN",
+        code,
+        vec!["OUN_EET_2024_01_01_00_01_30".to_string()],
+    );
     mgr.cache_l3_product(SITE, code, ts(0), Some(object(0)));
+    mgr.cache_l3_product("KOUN", code, ts(0), Some(object(0)));
     mgr.mark_l3_in_flight(SITE, code, ts(1));
-    assert!(!mgr.is_pane_done(0), "precondition: pairings are owed");
+    assert!(
+        mgr.l3_is_resolved(SITE, code, &ts(0)) && mgr.l3_is_resolved("KOUN", code, &ts(0)),
+        "precondition: both sites have an answer for the sweep to judge",
+    );
 
-    mgr.clear_all();
+    // The sweep's two predicates, as `App::evict_unneeded_loop_scans` derives
+    // them from one pair of sets: `SITE` has been departed, `KOUN` has not.
+    mgr.retain_l3(|site, _| site == "KOUN");
+    mgr.retain_l3_keys(|site| site == "KOUN");
 
-    assert!(mgr.is_pane_done(0));
-    assert!(mgr.pending_l3_pane_indices().is_empty());
-    assert!(mgr.l3_keys(SITE, code).is_none());
     assert!(!mgr.l3_is_resolved(SITE, code, &ts(0)));
-    assert!(!mgr.l3_is_in_flight(SITE, code, &ts(1)));
-    // And the plan is gone, so nothing can re-derive a queue from the site the
-    // pane has just left.
-    assert!(!mgr.plan_downloads_for(0, L3));
+    assert!(mgr.l3_keys(SITE, code).is_none());
+    assert!(
+        mgr.l3_is_resolved("KOUN", code, &ts(0)),
+        "the site still being looped lost the object it had already paired",
+    );
+    assert!(
+        mgr.l3_keys("KOUN", code).is_some(),
+        "the site still being looped lost the day listing its pairings are \
+         ranked against, so every one of them re-lists",
+    );
+    assert!(
+        mgr.l3_is_in_flight(SITE, code, &ts(1)),
+        "a pairing already on the wire lost its mark, so the same object is \
+         fetched a second time",
+    );
 }
 
 /// The two queues are reported by two separate index lists, which is why a

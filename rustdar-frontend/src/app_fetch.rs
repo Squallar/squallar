@@ -857,16 +857,40 @@ impl super::App {
                         pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
                     }
                 }
-                // Gated for the same reason, and it is the other half of the same
-                // fix: `clear_all` empties the shared scan cache, every pane's
-                // download queue and every frame plan. Running it while the loops
-                // above survive leaves them holding frames whose scans have been
-                // dropped and whose plans are gone — a loop that plays blank and
-                // has nothing left to re-request, which is worse than the teardown
-                // it replaced. It runs when a pane really left a radar and not
-                // otherwise.
-                if !left_a_radar.is_empty() {
-                    self.loop_mgr.clear_all();
+                // The host-side half of the loop teardown, and it is **per
+                // pane**, behind the same guard.
+                //
+                // This used to be `LoopDownloadManager::clear_all`, which emptied
+                // the shared volume cache, the shared Level III cache, every
+                // pane's download queue and every frame plan whenever *any* pane
+                // left a radar. A second pane looping a different site was not
+                // in `moving`, so it kept a `LoopPlaybackState` whose frames
+                // named volumes that had just been dropped and whose plan was
+                // gone: a loop that plays blank, has nothing queued to fill
+                // itself, and raises neither of the actions that rebuild one —
+                // exactly the dead loop the `pane.site != site` guard above
+                // exists to prevent, arriving on the pane the user was not
+                // looking at.
+                //
+                // `remove_pending` is the whole of what this call has to do
+                // itself: it takes both of the departing pane's queues and the
+                // plan they derive from, which is the state keyed by *pane
+                // index* and therefore the state nothing else can attribute. The
+                // caches are keyed by site and are collected by
+                // `App::evict_unneeded_loop_scans` on the next frame, because
+                // the pane has just lost both of its claims on that site — its
+                // `scan_info` was cleared above and its `loop_state` reset — and
+                // that sweep keeps exactly what live loop frames and pane
+                // targets name. Doing it here as well would be a second rule for
+                // one question.
+                //
+                // The queues are still taken *now* rather than left to the
+                // sweep's predicate, which would also empty them: the sweep runs
+                // in `handle_redraw`, this runs in an action, and a dispatch
+                // between the two would spend the shared download budget on the
+                // radar the pane just left.
+                for idx in &left_a_radar {
+                    self.loop_mgr.remove_pending(*idx);
                 }
 
                 // The third way a 3D pane stops needing its volume, beside the

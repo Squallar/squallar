@@ -2,17 +2,18 @@
 //!
 //! The volume cache holds one whole `Arc<Scan>` — 47–69 MiB — per
 //! `(site, timestamp)`, and until `App::evict_unneeded_loop_scans` nothing ever
-//! removed one: a frame eviction retires a pane's *frame*, `clear_all` fires
-//! only when a pane leaves a radar, and the loop pool's byte budget counts
-//! texture bytes rather than these CPU-side volumes. A pane parked on a live
-//! radar accumulated one per polled scan for the life of the process.
+//! removed one: a frame eviction retires a pane's *frame*, the site switch's
+//! wholesale clear was the only other remover and has since gone, and the loop
+//! pool's byte budget counts texture bytes rather than these CPU-side volumes.
+//! A pane parked on a live radar accumulated one per polled scan for the life
+//! of the process.
 //!
 //! `l3_cache` is the same defect on the other datasource, and the tests for it
 //! live here rather than beside the Level III dispatch because it is the *same*
 //! sweep and the *same* predicate that bounds them: one `Level3Product` per
 //! `(site, AWIPS code, volume start)`, carrying the decoded message and the
 //! bytes it was decoded from, written for every frame of every Level III loop
-//! and removed by nothing but that same `clear_all`.
+//! and removed by nothing but that same site switch.
 //!
 //! Every test here drives the real writers — `append_scan_to_active_loops` for
 //! the poll path, `accept_scan_listing` for the listing, `cache_l3_product` for
@@ -578,8 +579,8 @@ fn a_retired_frame_is_not_re_queued_after_the_window_moves() {
 ///
 /// `cache_l3_product` writes one entry per frame per AWIPS code — the gaps
 /// deliberately included, so a frame is retired once instead of re-paired every
-/// pass — and until this sweep only `clear_all` ever took one out, which fires
-/// when a pane leaves a radar and never otherwise. Every re-listing leaves the
+/// pass — and until this sweep only the site switch's wholesale clear ever took
+/// one out, and never otherwise. Every re-listing leaves the
 /// previous window behind: a product switch, a time navigation,
 /// `reinit_active_loops`.
 ///
@@ -616,6 +617,56 @@ fn paired_objects_no_live_frame_names_are_not_kept() {
         0,
         "the objects of a window nothing is playing are still resident; \
          nothing else in this crate ever removes one",
+    );
+}
+
+/// **The day listings are swept by site**, which is the resolution their key
+/// has.
+///
+/// `l3_keys` holds the bucket keys a site's objects are ranked against —
+/// `(site, AWIPS code)`, no volume in it — so the sweep can only ask whether
+/// anything still needs the site. Nothing removed one before: the site switch's
+/// wholesale clear did it, and that clear had to go because it took every other
+/// site's state with it.
+///
+/// Worse than the bytes if it is missed: `claim_l3_listing` refuses to re-list a
+/// `(site, code)` this map already holds, and the days a listing covers come
+/// from the frames that asked for it — so a listing kept past its loop is re-used
+/// for a window it does not cover and every frame outside it reads as a gap.
+///
+/// Asserted with a **shown** site alongside the departed one, so it cannot pass
+/// against a sweep that simply empties the map.
+#[test]
+fn a_departed_sites_day_listings_go_and_a_shown_sites_stay() {
+    let mut app = app_on_site();
+    let info = rustdar_radar::types::ScanInfo::from_scan(&empty_scan(), SITE, at(0), None);
+    app.gui.set_scan_info_for_pane(0, info);
+    app.loop_mgr
+        .cache_l3_keys(SITE, "EET", vec!["TLX_EET_2024_01_01_00_00_30".to_string()]);
+    app.loop_mgr.cache_l3_keys(
+        "KOUN",
+        "EET",
+        vec!["OUN_EET_2024_01_01_00_00_30".to_string()],
+    );
+    assert!(
+        app.loop_mgr.l3_keys(SITE, "EET").is_some()
+            && app.loop_mgr.l3_keys("KOUN", "EET").is_some(),
+        "precondition: both listings are in hand, so the sweep has something to \
+         remove and something to keep",
+    );
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.loop_mgr.l3_keys(SITE, "EET").is_some(),
+        "the listing for the site this pane is showing went, so every pairing \
+         it makes re-lists the days first",
+    );
+    assert!(
+        app.loop_mgr.l3_keys("KOUN", "EET").is_none(),
+        "a site no pane names kept its day listing; nothing else removes one, \
+         and `claim_l3_listing` will refuse to re-make it for a window whose \
+         days it does not cover",
     );
 }
 

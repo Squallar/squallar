@@ -357,6 +357,28 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          so the overlap cannot recur. The note names what covers the bar's \
          other strings instead.",
     ),
+    (
+        "rustdar-frontend/src/loop_downloads.rs",
+        "clear_all_empties_every_sites_state",
+        "\"The successor to …, extended rather than deleted, and inverted \
+         where its premise was the defect.\" It pinned \
+         `LoopDownloadManager::clear_all`, which a site switch called for every \
+         pane and which therefore emptied the loops of panes that had not \
+         switched at all. That method is gone; the successor keeps its \
+         assertions aimed at the per-pane call and adds the complement it \
+         lacked. The paragraph is about which of the predecessor's claims \
+         survived and which one *was* the bug, and it cannot make that \
+         distinction without naming it.",
+    ),
+    (
+        "rustdar-frontend/src/app_render/loop_level3_tests.rs",
+        "clear_all_empties_the_level3_state_as_well",
+        "The Level III half of the same replacement, split along the line the \
+         keys draw: the pane-keyed queues go with `remove_pending`, the \
+         site-keyed caches and day listings go on the eviction sweep. Naming \
+         the predecessor is how a reader sees that one pin became two rather \
+         than that a guard was dropped.",
+    ),
 ];
 
 /// Directory names the walk never descends into.
