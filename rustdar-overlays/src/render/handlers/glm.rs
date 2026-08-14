@@ -450,7 +450,11 @@ impl GlmHandler {
     /// would let one condition clear the other's notice.
     fn report_window_gaps(&mut self, queried: &[GlmSatellite], current: Vec<WindowGap>) {
         for gap in &current {
-            if !self.window_gaps.iter().any(|g| g.satellite == gap.satellite) {
+            if !self
+                .window_gaps
+                .iter()
+                .any(|g| g.satellite == gap.satellite)
+            {
                 log::warn!(
                     "GLM: {} published no granule covering the window - its S3 listing is \
                      healthy ({} objects under the queried prefixes), so the files are not \

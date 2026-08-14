@@ -11,8 +11,6 @@ mod cf;
 pub mod fetch;
 mod h5;
 #[cfg(test)]
-mod measure_tmp;
-#[cfg(test)]
 mod tests;
 
 /// Which GOES orbital slot to fetch GLM data from.
@@ -167,9 +165,18 @@ pub struct WindowGap {
 /// # Why this is reported at all, at a measured rate of zero
 ///
 /// Measured over 105 granules from 7 cases across both satellites, two years and
-/// a 3.4x activity range: **0 drops in 1584507 records** (315 level-instances),
-/// and 0 in 76003 on a held-out eighth case. Both counters were proven able to
-/// fire on that same corpus before the zero was believed.
+/// a 3.4x activity range: **0 drops in 1584507 records**, and 0 in 76003 on a
+/// held-out eighth case.
+///
+/// What that zero is worth differs by counter, and the difference is not a
+/// detail. `off_globe` is backed by a control that re-runs its predicate against
+/// an impossible band and fires on all 1584507 records, so the loop demonstrably
+/// runs. `fill_values` is **not** so backed: `_FillValue` reaches the corpus 3
+/// times in 1584507 and 0 times in the holdout, because real GLM LCFA data
+/// essentially never marks a value missing. That branch is pinned by a synthetic
+/// fixture instead - see
+/// `fetch::tests::a_dropped_record_reaches_the_caller_and_says_which_kind` - and
+/// its zero here is an observation about the corpus rather than a demonstration.
 ///
 /// It is reported because of what a non-zero means. The drops are not a property
 /// of the weather - they are a disagreement between the product and this reader,
