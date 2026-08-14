@@ -1101,3 +1101,54 @@ fn parse_grib2_refuses_a_domain_outside_the_validated_envelope() {
          the decision; it said:\n{err}"
     );
 }
+
+/// A domain refusal is `Permanent`; every other parse failure stays
+/// `Transient`.
+///
+/// The retry ladder's default for a parse error is `Transient`, which is right
+/// for a truncated or mis-ranged record and wrong for this: a domain is exactly
+/// as unplaceable on the next attempt, so retrying it burns the backoff ladder
+/// and presents a configuration mistake as though the network were at fault.
+///
+/// This also pins the `DOMAIN_REFUSAL_MARK` coupling from both ends — the
+/// message that carries it and the classifier that reads it — so neither can
+/// be reworded alone.
+#[test]
+fn the_domain_refusal_is_classified_permanent() {
+    let refusal = check_domain_longitude(&GeoBounds {
+        min_lat: 50.0,
+        max_lat: 55.0,
+        min_lon: 170.0,
+        max_lon: 178.0,
+    })
+    .expect_err("must refuse");
+    assert!(
+        refusal.contains(DOMAIN_REFUSAL_MARK),
+        "the refusal must carry the mark the classifier reads; it said:\n{refusal}"
+    );
+    assert_eq!(
+        classify_parse_error(refusal).failure,
+        FetchFailure::Permanent,
+        "a domain does not become placeable by being asked for again"
+    );
+
+    // The control: an ordinary decode failure must stay retryable, or this
+    // classifier would have turned every transient fault permanent.
+    assert_eq!(
+        classify_parse_error("Lambert grid point count mismatch: 7 declared".to_string()).failure,
+        FetchFailure::Transient,
+    );
+    // ...including the other refusal `check_domain_longitude` can produce,
+    // which is a decode problem and not a domain one.
+    let unwalkable = check_domain_longitude(&GeoBounds {
+        min_lat: 0.0,
+        max_lat: 0.0,
+        min_lon: f64::MAX,
+        max_lon: f64::MIN,
+    })
+    .expect_err("must refuse");
+    assert_eq!(
+        classify_parse_error(unwalkable).failure,
+        FetchFailure::Transient,
+    );
+}
