@@ -797,6 +797,35 @@ fn fix_is_accurate_enough_to_relocate(accuracy_m: Option<f64>) -> bool {
     accuracy_m.is_none_or(|m| m <= MAX_RELOCATION_ACCURACY_M)
 }
 
+/// Take out of `map` every value whose key `doomed` names, and hand them back
+/// **owned**.
+///
+/// This is `retain`'s inverse and exists because `retain` gives the caller no
+/// chance to say where the dropped values die: it frees them in place, on
+/// whatever thread called it, which for [`App::evict_unshown_scans`] is the
+/// frame. Returning them is what lets the caller pass them to
+/// `offload::discard_each` instead.
+///
+/// `extract_if` rather than collecting the keys and removing them one by one:
+/// it is one pass over the map, it hands back the values already moved out, and
+/// the predicate sees the same `(&K, &mut V)` a `retain` predicate would — so
+/// converting a call site is a change of destination and not of rule.
+///
+/// `pub(crate)` for the second holder of whole volumes that has to make the
+/// same move: [`crate::chunk_feed::ChunkFeedManager::retain_live`] drops a
+/// departing site's assembler, which is the *other* full copy of a live
+/// volume. One helper rather than the same three lines in two modules, so a
+/// change to how an eviction hands its values over cannot reach one caller and
+/// miss the other.
+pub(crate) fn evicted<V>(
+    map: &mut HashMap<String, V>,
+    doomed: &impl Fn(&String) -> bool,
+) -> Vec<V> {
+    map.extract_if(|site, _| doomed(site))
+        .map(|(_, value)| value)
+        .collect()
+}
+
 impl App {
     /// Build the application around a caller-supplied platform bridge.
     ///
@@ -1125,6 +1154,15 @@ impl App {
         self.poll_platform_state();
         self.poll_data_channels();
         self.evict_unshown_scans();
+        // The frame's teardown allowance, right behind the eviction pass that
+        // feeds it: free what this frame can afford of whatever
+        // `offload::discard` deferred. The budget is what keeps a multi-volume
+        // teardown from spending the frame — see
+        // `DEFERRED_DROP_BUDGET_PER_FRAME` — and the wake-up term below is
+        // what keeps the rest of the queue from waiting on the user. Natively
+        // this is usually an empty-queue check: `discard` hands the pool's free
+        // lane the payload, and only a lane with no worker lands here.
+        crate::offload::drain_deferred_drops(crate::constants::DEFERRED_DROP_BUDGET_PER_FRAME);
         // Ahead of the minimized and zero-area early returns below: a window
         // that is minimized or still sizing is exactly one whose session might
         // be about to end, and skipping the save there is how the last change
@@ -1205,6 +1243,15 @@ impl App {
             // whole session. It is scheduled instead, through
             // `ChunkNotifier::next_retry_delay`.
             || self.chunk_notify.handshake_pending()
+            // Memory this application has already decided it does not want,
+            // waiting for a frame to free it. It finishes — the drain takes at
+            // least one payload per call — and until it does, nothing else here
+            // is necessarily true: an eviction is exactly the moment when no
+            // render is in flight and no loop is running, so without this term
+            // a teardown would stop after one frame and the remainder would
+            // stay resident until the user next touched the app. See
+            // `offload::drain_deferred_drops`, where the invariant is written.
+            || crate::offload::has_deferred_drops()
         {
             notify_redraw(&self.window);
         }
@@ -2494,15 +2541,34 @@ impl App {
                 shown.push(info.site.name);
             }
         }
-        self.scan_data
-            .retain(|site, _| shown.iter().any(|shown| *shown == site));
+        // **Handed over, not dropped here.** `retain` frees in place, and in
+        // place is this frame: an entry is a whole decoded volume, 47–69 MiB
+        // across thousands of per-radial buffers, and the walk that returns
+        // them is the frame-thread cost `offload::discard` exists to move. Each
+        // map's evictions go over individually, because the drain's budget is
+        // spent *between* payloads — see `offload::discard_each`.
+        //
+        // # What the hand-over buys, given that these maps share allocations
+        //
+        // A `scan_data` entry and a `base_scans` entry are often the same
+        // `Arc<Scan>` (see the field docs), so two of the three hand-overs will
+        // be refcount decrements that free nothing. That does not weaken the
+        // move, it is the reason all three have to make it: whichever handle
+        // turns out to be the last one is the one that pays the deep free, and
+        // it can only be paid off-frame if *every* holder hands its handle
+        // over. A site still shown by some other holder frees nothing at all
+        // this pass, which is the same answer `retain` gave.
+        let unshown = |site: &String| !shown.iter().any(|shown| *shown == site);
+        crate::offload::discard_each("evicted-scan", evicted(&mut self.scan_data, &unshown));
         // The same bound, for the same reason: an entry is a whole decoded
         // volume, and a session that visits ten sites would otherwise keep all
         // ten resident. `shown` already covers a pane's live site *and* the site
         // of the scan it is drawing, which is what stops a switch evicting the
         // volume a 3D pane is still building from.
-        self.base_scans
-            .retain(|site, _| shown.iter().any(|shown| *shown == site));
+        crate::offload::discard_each(
+            "evicted-base-volume",
+            evicted(&mut self.base_scans, &unshown),
+        );
         // And the third holder of whole volumes, which used to be exempt and
         // simply grew: an entry is written for every site whose panes are all
         // historic when its feed delivers, it was removed only by
@@ -2511,8 +2577,10 @@ impl App {
         // every one of their latest volumes for the life of the process. The
         // entry exists to serve `JumpToLive`, which is a per-pane action, so a
         // site no pane shows cannot be jumped to and holds nothing here.
-        self.latest_cached_scans
-            .retain(|site, _| shown.iter().any(|shown| *shown == site));
+        crate::offload::discard_each(
+            "evicted-cached-volume",
+            evicted(&mut self.latest_cached_scans, &unshown),
+        );
     }
 
     /// Persist the config if it has changed and the interval has elapsed.

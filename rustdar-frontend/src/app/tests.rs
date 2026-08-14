@@ -1533,6 +1533,15 @@ fn the_frame_re_arm_holds_only_work_that_finishes() {
         // `a_down_socket_is_retried_regardless_of_other_activity` holds that
         // distinction and the schedule the other half moved to.
         "chunk_notify.handshake_pending",
+        // Memory the app has already decided it does not want, waiting for a
+        // frame to free it. It finishes — `drain_deferred_drops` takes at least
+        // one payload per call — and it is the term with the least else to fall
+        // back on: an eviction is exactly the moment when no render is in
+        // flight and no loop is running, so without it a teardown drains once
+        // and the rest waits on the user. No behavioural test can stand in for
+        // this line: every harness that drives `handle_redraw` is windowless
+        // and returns before the re-arm is reached.
+        "has_deferred_drops",
     ] {
         assert!(
             arm.contains(kept),
@@ -1965,6 +1974,53 @@ fn the_platforms_sensors_reach_the_map() {
     );
 }
 
+/// **The frame loop frees what the application discarded.**
+///
+/// Driven through `handle_redraw` rather than by calling the drain directly,
+/// for the reason `the_platforms_sensors_reach_the_map` gives: calling it by
+/// hand would leave the one line that schedules it — in the frame loop, right
+/// behind the eviction pass that fills the queue — free to be deleted with
+/// every test in `offload::discard_tests` still green. With no window,
+/// `handle_redraw` reaches the drain and returns before it needs a renderer.
+///
+/// **It proves the drain runs, and deliberately claims nothing about the
+/// re-arm.** `headless` leaves `window` and `state` `None`, so `handle_redraw`
+/// returns well before the end-of-frame re-arm; a name promising the loop stays
+/// awake would be a name this harness cannot keep. That half is
+/// `the_frame_re_arm_holds_only_work_that_finishes`, which reads the source of
+/// the re-arm itself and is where `has_deferred_drops` is pinned.
+#[test]
+fn a_deferred_teardown_is_freed_by_the_frame_loop() {
+    let mut app = headless(TestBridge::android());
+    // Emptied first: the queue is thread-local and the harness reuses threads.
+    while crate::offload::drain_deferred_drops(std::time::Duration::from_secs(30)) > 0 {}
+
+    let held: Vec<std::sync::Arc<()>> = (0..3).map(|_| std::sync::Arc::new(())).collect();
+    let watched: Vec<std::sync::Arc<()>> = held.iter().map(std::sync::Arc::clone).collect();
+    // Straight onto the queue, which is where a browser's `discard` puts every
+    // payload — the native routing would hand these to the pool instead, and
+    // the frame loop is what this test is about.
+    for payload in held {
+        crate::offload::defer_drop("test-teardown", Box::new(payload));
+    }
+    assert!(crate::offload::has_deferred_drops());
+
+    for _ in 0..3 {
+        app.handle_redraw();
+    }
+    assert!(
+        watched
+            .iter()
+            .all(|item| std::sync::Arc::strong_count(item) == 1),
+        "the frame loop never freed what was discarded, so the line that \
+         drains the queue is not being reached",
+    );
+    assert!(
+        !crate::offload::has_deferred_drops(),
+        "the queue outlived the frames that were supposed to empty it",
+    );
+}
+
 /// A theme change has to invalidate the site labels, and only a *change*
 /// may.
 ///
@@ -2266,6 +2322,61 @@ fn a_volume_no_pane_is_showing_is_dropped() {
         "a radar no pane is on is still holding its cached latest volume; \
              only JumpToLive ever removed one, and it cannot fire for a site \
              no pane shows",
+    );
+}
+
+/// **An evicted volume is handed to `offload::discard`, not freed on the frame
+/// that evicted it.**
+///
+/// This is the claim the whole deferred-drop mechanism was built for, and
+/// nothing else asserts it: `evict_unshown_scans` used three `HashMap::retain`
+/// calls, which free in place — on the frame thread, tens of megabytes across
+/// thousands of per-radial buffers — and reverting to them leaves every test in
+/// `offload::discard_tests` green, because those exercise the queue and the
+/// pool without caring who fills them.
+///
+/// **A source probe, because the behaviour is genuinely indistinguishable.**
+/// A `retain` frees the volume on this thread and a `discard` sends it to the
+/// pool's free lane, and both leave the caller holding no reference a moment
+/// later — an `Arc::strong_count` assertion would pass on either and prove
+/// nothing. What separates them is *where the walk happens*, which no
+/// observation available to this thread can name. So the probe reads the
+/// eviction's own source, the way
+/// `the_frame_re_arm_holds_only_work_that_finishes` reads the re-arm's.
+#[test]
+fn an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame() {
+    let body = fn_body("fn evict_unshown_scans(");
+    assert!(
+        !body.contains(".retain("),
+        "eviction is back to `retain`, which frees every evicted volume in \
+         place — on the frame thread, tens of megabytes across thousands of \
+         per-radial buffers, which is the cost `offload::discard` exists to \
+         move: {body}"
+    );
+    // All three holders, named individually: a hand-over that covered
+    // `scan_data` and left the other two on `retain` would look closed here
+    // while leaving most of the teardown on the frame.
+    //
+    // The whole call expression rather than the map name alone — the name also
+    // appears in this function's prose, and `rustfmt` reflows the calls
+    // themselves (one of the three fits on a line and two do not), so the
+    // extraction is the only part stable enough to assert on.
+    for map in ["scan_data", "base_scans", "latest_cached_scans"] {
+        assert!(
+            body.contains(&format!("evicted(&mut self.{map}, &unshown)")),
+            "{map}'s evictions are not handed over, so that map's volumes are \
+             still freed on the frame: {body}"
+        );
+    }
+    // The extractions above prove the values come out owned; this proves where
+    // they go. The fully-qualified call, not the bare name, because this
+    // function's own prose mentions `offload::discard_each` and a substring
+    // count would have counted the sentence.
+    assert_eq!(
+        body.matches("crate::offload::discard_each(").count(),
+        3,
+        "one of the three volume holders stopped handing its evictions over \
+         to the deferred-drop path: {body}"
     );
 }
 
