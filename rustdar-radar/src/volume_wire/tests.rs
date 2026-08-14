@@ -401,3 +401,68 @@ fn a_moment_mask_bit_this_build_does_not_have_is_refused() {
     bytes[MINIMAL_MASK_OFFSET] |= 1 << 7;
     assert!(DecodedScan::from_bytes(&bytes).is_none());
 }
+
+/// The bytes this version ships are **these** bytes.
+///
+/// # What was blind, exactly
+///
+/// [`a_foreign_magic_or_version_is_refused`] flips the version byte and checks
+/// that a decoder refuses it. That shows *a* check exists; it says nothing
+/// about what the number means. Nothing above fires for the developer who
+/// changes what [`DecodedScan::to_bytes`] writes and leaves [`VERSION`] alone —
+/// and every round-trip test here is written against `to_bytes` and
+/// `from_bytes` **together**, so a change made to both in step passes all of
+/// them. That is the whole of the danger: a same-width reorder, or a field
+/// appended with `byte_len` updated to match, leaves this file green while a
+/// page and a worker from opposite sides of a deploy read each other's volumes
+/// with the fields shifted.
+///
+/// A version bump is the safe act, and forgetting one is what ships that pair.
+/// This fails for the person who forgets, which is the direction the constant
+/// exists to cover and the direction nothing here covered.
+///
+/// # Why [`a_volume`] and not a fixture of its own
+///
+/// The three codecs beside this one keep a dedicated `layout_fixture` because
+/// their other fixtures go through beam geometry, and a digest of one of those
+/// would be a digest of whichever libm ran it. Nothing in [`a_volume`] is
+/// computed: every field is a literal, and the two arithmetic expressions in it
+/// (`f32::from(i) * 0.5` and `0.5 + elevation_number as f32`) are exact in
+/// binary at these magnitudes on every target. So the libm argument does not
+/// apply, and a second fixture would be strictly worse — [`a_volume`] already
+/// exercises every branch this encoder has (site present, all seven moment
+/// slots, both mask states for the clutter-filter moment, all four radial
+/// statuses, every coverage-pattern field, and a Nyquist table with a
+/// contradiction in it), and a smaller dedicated one would pin fewer of them.
+///
+/// The cost is that an edit to [`a_volume`] for some other test's sake moves
+/// this digest. That is a re-pin without a version bump, and the message below
+/// says so; it is the one case where writing the numbers alone is right.
+///
+/// # What travels inside this that has no pin of its own
+///
+/// [`crate::nyquist::DeclaredNyquist::to_bytes`] is written into the middle of
+/// this payload and carries no version — it borrows this one. Its two halves
+/// are both exercised by [`a_volume`]'s table, so a change to *its* layout
+/// moves this digest, which is the pin it would otherwise need.
+#[test]
+fn the_volume_wire_layout_is_the_one_this_version_ships() {
+    let bytes = a_volume().to_bytes();
+    assert_eq!(
+        (VERSION, bytes.len(), crate::wire::layout_digest(&bytes)),
+        (2, 1203, 0x4908_5ffd_c20a_bccc),
+        "the bytes `DecodedScan::to_bytes` writes are not the bytes version 2 \
+         shipped. Something about this payload's layout moved — a field added, \
+         removed, reordered, retyped, or written at a different width, here or \
+         in the `DeclaredNyquist` table nested inside it. That is the change \
+         `VERSION` exists to announce, and a stale worker that shares a build \
+         token with a fresh page (locally it always does: `GITHUB_SHA` is \
+         absent outside CI, so the token degrades to `.../dev`) will decode a \
+         60 MiB volume into the old field order and draw weather that is not \
+         there, with no error anywhere. Bump `VERSION`, then write the new \
+         length and digest here — in that order, and never the numbers alone. \
+         The one exception is an edit to `a_volume` itself: that moves these \
+         numbers without moving the layout, and then the re-pin is the whole \
+         of the work.",
+    );
+}
