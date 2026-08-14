@@ -2048,6 +2048,27 @@ fn volume_grid_shape(rows: usize, range_bins: usize) -> polar::PolarShape {
 /// The factor between the slant range a sweep's gates are measured at and the
 /// ground range they sit over: `cos e` of the sweep's **median** elevation.
 ///
+/// # This is an approximation of [`crate::beam::ground_range_km`], not a call
+/// to it
+///
+/// The ground range a gate sits over is the spherical arc
+/// `Rₑ·asin(r·cos e/(Rₑ + h))`, and `cos e` is its small-angle limit with the
+/// curvature term dropped. The gap is outward — a gate drawn further from the
+/// radar than the ground it fell on — and at each tilt's own reach it is 666 m
+/// at 460.125 km on 0.5° (2.97 cells of the 4.4522 px/km plan view), 1227 m at
+/// 460.125 km on 1.8°, and 182 m at 70 km on 19.5°. It passes one 224.61 m cell
+/// at 304 km on the 0.5° cut. `beam`'s "What still spells the tangent plane"
+/// carries the table; `crate::sampler` inverts the arc, so this is a real
+/// registration difference between a section and the plan view above it.
+///
+/// It is still a scalar because it has to be one *here*. The arc is not linear
+/// in `r`, so it does not survive being folded into a [`FieldRadial`]'s uniform
+/// `sample_km` and `first_gate_km` — the fill walks `first_gate_km +
+/// j·sample_km` and every path below hoists this factor into both. Closing the
+/// gap means giving those paths a per-gate arc, which is a change to that
+/// contract and to the third of a million iterations a sweep's gate loop runs,
+/// not a substitution at this line.
+///
 /// The median and not the first radial's, and not the tilt label either,
 /// because that is the angle [`crate::sampler`] keys its rungs on
 /// ([`crate::volumetric::sweep_elevation_deg`]) — a section and a plan view

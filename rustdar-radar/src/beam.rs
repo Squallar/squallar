@@ -143,12 +143,12 @@
 //! small-angle limit of that arc, with the curvature term dropped. The tangent
 //! plane erred **outward**, placing every echo further from the radar than the
 //! ground it fell on. Measured at each tilt's own reach rather than at an
-//! arithmetic ceiling, in metres and in cells of the 4.4512 px/km plan view
-//! (224.66 m to a cell):
+//! arithmetic ceiling, in metres and in cells of the plan view's
+//! `IMAGE_SIZE/(2·BASE_EXTENT_KM)` = 4.4522 px/km (224.61 m to a cell):
 //!
 //! | tilt | reach | outward error | cells |
 //! |---|---:|---:|---:|
-//! | 0.5°  | 460.125 km | 666 m  | 2.96 |
+//! | 0.5°  | 460.125 km | 666 m  | 2.97 |
 //! | 1.8°  | 460.125 km | 1227 m | 5.46 |
 //! | 19.5° | 70 km      | 182 m  | 0.81 |
 //!
@@ -314,7 +314,8 @@ fn spherical_height_km(slant_range_km: f64, elev_rad: f64) -> f64 {
 /// `Rₑ·asin(r·cos e/(Rₑ + h))` with `h` from [`spherical_height_km`] — the
 /// exact great-circle arc on the effective sphere, derived in the module doc
 /// along with the table of what the tangent-plane `r·cos e` this replaced was
-/// worth (666 m outward at the 0.5° cut's reach, ~3 plan-view cells).
+/// worth (666 m outward at the 0.5° cut's 460.125 km reach, 2.97 plan-view
+/// cells).
 ///
 /// The shortening against the slant range is 0.5178 km at 230 km / 2.4° and
 /// 4.1974 km at 70 km / 19.5°; at the 60° a TDWR's VCP 80 climbs to, an 88.8 km
