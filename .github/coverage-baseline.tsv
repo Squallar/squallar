@@ -45,8 +45,8 @@ rustdar-egui/src/volume_alpha.rs	166	164
 rustdar-egui/src/volume_iso.rs	75	60
 rustdar-egui/src/volume_view.rs	266	259
 rustdar-frontend/src/app.rs	1230	883
-rustdar-frontend/src/app_chunks.rs	230	145
-rustdar-frontend/src/app_fetch.rs	1227	812
+rustdar-frontend/src/app_chunks.rs	230	136
+rustdar-frontend/src/app_fetch.rs	1227	832
 rustdar-frontend/src/app_render.rs	2142	1497
 rustdar-frontend/src/app_state.rs	194	108
 rustdar-frontend/src/budget.rs	237	199
@@ -138,8 +138,8 @@ rustdar-platform/src/run.rs	31	0
 rustdar-radar/src/archive.rs	249	222
 rustdar-radar/src/azimuth.rs	191	191
 rustdar-radar/src/beam.rs	80	80
-rustdar-radar/src/catalogue.rs	137	122
-rustdar-radar/src/chunks.rs	985	718
+rustdar-radar/src/catalogue.rs	137	125
+rustdar-radar/src/chunks.rs	985	710
 rustdar-radar/src/current.rs	120	119
 rustdar-radar/src/derive.rs	210	196
 rustdar-radar/src/dpprep.rs	1022	956
@@ -150,7 +150,7 @@ rustdar-radar/src/hhc.rs	411	380
 rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	115
+rustdar-radar/src/level3.rs	188	134
 rustdar-radar/src/nrot.rs	3228	3169
 rustdar-radar/src/nyquist.rs	126	107
 rustdar-radar/src/palette.rs	400	390
