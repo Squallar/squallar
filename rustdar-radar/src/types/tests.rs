@@ -1,5 +1,8 @@
 use super::*;
 use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+// Explicit rather than through `super::*`: `types.rs` itself stopped naming
+// the type when `unit_label`'s MEHS arm moved to `Quantity::suffix` at M4.
+use rustdar_units::HailSizeUnit;
 
 /// **Both** arms of the [`IMAGE_SIZE`] cascade, unconditionally.
 ///

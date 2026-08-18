@@ -18,6 +18,7 @@ pub mod nrot;
 pub mod nyquist;
 mod palette;
 pub(crate) mod par;
+pub(crate) mod product_spec;
 pub mod render;
 pub mod render_input;
 pub mod sampler;
