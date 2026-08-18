@@ -958,7 +958,7 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = area.response.rect;
-            self.last_pills.push(probe);
+            self.probes.last_pills.push(probe);
         }
         #[cfg(not(test))]
         let _ = area;
@@ -988,7 +988,7 @@ impl super::Gui {
                 let outcome = site_list_ui(ui, &query, current, self.catalogue_pending);
                 #[cfg(test)]
                 {
-                    self.last_pill_popover = Some(PillPopoverProbe {
+                    self.probes.last_pill_popover = Some(PillPopoverProbe {
                         pane_idx: idx,
                         pill: PillKind::Site,
                         rect: egui::Rect::NOTHING,
@@ -1037,7 +1037,7 @@ impl super::Gui {
                 };
                 #[cfg(test)]
                 {
-                    self.last_pill_popover = Some(PillPopoverProbe {
+                    self.probes.last_pill_popover = Some(PillPopoverProbe {
                         pane_idx: idx,
                         pill: PillKind::Product,
                         rect: egui::Rect::NOTHING,
@@ -1078,7 +1078,7 @@ impl super::Gui {
                 };
                 #[cfg(test)]
                 {
-                    self.last_pill_popover = Some(PillPopoverProbe {
+                    self.probes.last_pill_popover = Some(PillPopoverProbe {
                         pane_idx: idx,
                         pill: PillKind::Tilt,
                         rect: egui::Rect::NOTHING,
@@ -1130,7 +1130,7 @@ impl super::Gui {
 
                 #[cfg(test)]
                 {
-                    self.last_pill_popover = Some(PillPopoverProbe {
+                    self.probes.last_pill_popover = Some(PillPopoverProbe {
                         pane_idx: idx,
                         pill: PillKind::Link,
                         rect: egui::Rect::NOTHING,
@@ -1159,7 +1159,7 @@ impl super::Gui {
                 let outcome = kind_list_ui(ui, current);
                 #[cfg(test)]
                 {
-                    self.last_pill_popover = Some(PillPopoverProbe {
+                    self.probes.last_pill_popover = Some(PillPopoverProbe {
                         pane_idx: idx,
                         pill: PillKind::Kind,
                         rect: egui::Rect::NOTHING,
@@ -1182,7 +1182,7 @@ impl super::Gui {
     fn record_popover_rect(&mut self, _shown: &Option<egui::InnerResponse<()>>) {
         #[cfg(test)]
         if let Some(inner) = _shown
-            && let Some(probe) = self.last_pill_popover.as_mut()
+            && let Some(probe) = self.probes.last_pill_popover.as_mut()
         {
             probe.rect = inner.response.rect;
         }

@@ -226,7 +226,9 @@ impl super::Gui {
                     });
 
                     #[cfg(test)]
-                    self.widget_id_probes.push(("inspector_scroll", scroll.id));
+                    self.probes
+                        .widget_id_probes
+                        .push(("inspector_scroll", scroll.id));
                     #[cfg(not(test))]
                     let _ = scroll;
                 });
@@ -235,7 +237,7 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = area.response.rect;
-            self.last_inspector = probe;
+            self.probes.last_inspector = probe;
         }
         #[cfg(not(test))]
         let _ = area;

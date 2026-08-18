@@ -90,7 +90,7 @@ impl super::Gui {
         // `PaneRenderCtx::excluded_rects` below.
         #[cfg(test)]
         {
-            self.last_map_excluded_rects = excluded_rects.to_vec();
+            self.probes.last_map_excluded_rects = excluded_rects.to_vec();
         }
 
         // Detect current theme from egui context
@@ -151,7 +151,7 @@ impl super::Gui {
                 let panel_rect = ui.max_rect();
                 #[cfg(test)]
                 {
-                    self.last_map_panel_rect = panel_rect;
+                    self.probes.last_map_panel_rect = panel_rect;
                 }
 
                 // One color-scale orientation for the whole grid, resolved from
@@ -479,7 +479,8 @@ impl super::Gui {
                     // never running. Pinned by
                     // `every_pane_reports_a_pointer_frame_whatever_its_kind`.
                     #[cfg(test)]
-                    self.last_pane_pointers
+                    self.probes
+                        .last_pane_pointers
                         .push(crate::ui_input::PanePointerProbe {
                             pane_idx,
                             is_active,
@@ -656,7 +657,7 @@ impl super::Gui {
                                             // content pass so it reports what this
                                             // frame really dispatched.
                                             #[cfg(test)]
-                                            self.last_paint_order.push((
+                                            self.probes.last_paint_order.push((
                                                 pane_idx,
                                                 std::mem::take(&mut render_ctx.paint_order),
                                             ));
@@ -860,7 +861,7 @@ impl super::Gui {
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
                                 #[cfg(test)]
-                                &mut self.last_alpha_buttons,
+                                &mut self.probes.last_alpha_buttons,
                             );
                             // What this pane actually drew, for the sidebar that
                             // has to explain it — see `Gui::volume_empty_states`.
@@ -871,7 +872,8 @@ impl super::Gui {
                                 self.volume_empty_states.insert(pane_idx, why);
                             }
                             #[cfg(test)]
-                            self.last_volume_arms
+                            self.probes
+                                .last_volume_arms
                                 .push(VolumeArmProbe { pane_idx, outcome });
                             #[cfg(not(test))]
                             let _ = outcome;
@@ -925,7 +927,9 @@ impl super::Gui {
                     if pane_count > 1 {
                         let painted = draw_pane_border(ui, pane_rect, is_active);
                         #[cfg(test)]
-                        self.last_pane_borders.push((pane_idx, painted, is_active));
+                        self.probes
+                            .last_pane_borders
+                            .push((pane_idx, painted, is_active));
                         #[cfg(not(test))]
                         let _ = painted;
                     }
@@ -1498,7 +1502,7 @@ impl super::Gui {
         }
 
         #[cfg(test)]
-        self.last_section_tracks.extend(painted);
+        self.probes.last_section_tracks.extend(painted);
     }
 
     /// Draw the region boxes that belong to pane `pane_idx`: every committed
@@ -1581,7 +1585,7 @@ impl super::Gui {
         }
 
         #[cfg(test)]
-        self.last_region_boxes.extend(painted);
+        self.probes.last_region_boxes.extend(painted);
     }
 
     /// Detect which pane was clicked and make it the active pane.

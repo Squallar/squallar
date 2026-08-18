@@ -199,7 +199,7 @@ impl super::Gui {
             // row's widget ids for the probe's convenience.
             #[cfg(test)]
             if drawn {
-                self.last_settings_rows.push(DrawnSettingsRow {
+                self.probes.last_settings_rows.push(DrawnSettingsRow {
                     id: row,
                     rect: egui::Rect::from_x_y_ranges(
                         ui.max_rect().x_range(),

@@ -122,7 +122,7 @@ const RADAR_PATH: &str = concat!("rustdar_", "radar::");
 // Presence anchors (the positive half of each check; definition anchors are
 // split so a future absence-grep for a deleted definition stays clean).
 const APP_ANCHOR: &str = concat!("pub struct ", "App");
-const GUI_STRUCT_ANCHOR: &str = concat!("pub struct ", "Gui");
+const GUI_IMPL_ANCHOR: &str = concat!("impl ", "Gui");
 const UI_MOD_ANCHOR: &str = concat!("mod ", "ui;");
 const HUB_ANCHOR: &str = concat!("struct ", "ChannelHub");
 const OFFLOAD_ANCHOR: &str = concat!("pub fn ", "offload_job(");
@@ -301,12 +301,13 @@ fn the_app_pokes_gui_coupling_never_grows() {
 }
 
 /// Row 2 — setter fns on the Gui shell. WO-E2 Land 2 leaves 3 (the
-/// chunk-settings setters); WO-E8b reaches 0. WO-E1 splits ui.rs and updates
-/// this presence control to a split-surviving anchor in the same land.
+/// chunk-settings setters); WO-E8b reaches 0. WO-E1 split ui.rs (the struct
+/// now lives in gui/state.rs) and re-anchored this presence control, in the
+/// same land, on the `impl` block over `Gui` that still hosts every setter.
 #[test]
 fn the_gui_setter_surface_never_grows() {
     let ui_rs = Path::new(ROOT).join("rustdar-egui/src/ui.rs");
-    let text = anchored_file(&ui_rs, GUI_STRUCT_ANCHOR);
+    let text = anchored_file(&ui_rs, GUI_IMPL_ANCHOR);
     let n = text.matches(PUB_FN_SET).count();
     assert!(
         n <= UI_SETTER_MAX,

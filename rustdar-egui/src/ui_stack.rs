@@ -327,7 +327,9 @@ impl super::Gui {
                     // reconstructing it — the breakpoint tests must be
                     // reading the same id the scroll state is stored under.
                     #[cfg(test)]
-                    self.widget_id_probes.push(("layers_scroll", scroll.id));
+                    self.probes
+                        .widget_id_probes
+                        .push(("layers_scroll", scroll.id));
                     #[cfg(not(test))]
                     let _ = scroll;
                 });
@@ -336,7 +338,7 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = area.response.rect;
-            self.last_stack = probe;
+            self.probes.last_stack = probe;
         }
         #[cfg(not(test))]
         let _ = area;

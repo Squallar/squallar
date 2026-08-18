@@ -266,13 +266,13 @@ impl super::Gui {
     ) {
         #[cfg(test)]
         {
-            self.last_popup_triggered = triggered.to_vec();
+            self.probes.last_popup_triggered = triggered.to_vec();
         }
         if let Some(&action_idx) = triggered.first()
             && let Some(action) = content.actions.get(action_idx)
         {
             #[cfg(test)]
-            self.last_popup_handled.push(action_idx);
+            self.probes.last_popup_handled.push(action_idx);
             let should_remove = self.overlays.handle_popup_action(action);
             if should_remove {
                 self.overlays.selected_overlays.remove(page);

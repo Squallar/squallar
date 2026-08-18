@@ -134,6 +134,24 @@ pub(crate) use settings::LOCATION_DENIED_NOTE;
 #[cfg(test)]
 pub(crate) use settings::{DrawnSettingsRow, SETTINGS_ROWS};
 
+// The Gui shell's own split (WO-E1): the struct and its state types in
+// `state`, the test-only frame probes in `probes`, the per-frame drive in
+// `frame`, the pane-link fan-outs in `sync`, and the registry/config swap
+// sites in `layer_glue`. Everything else about the shell still lives here.
+#[path = "gui/probes.rs"]
+mod probes;
+pub(crate) use probes::ControlProbe;
+#[path = "gui/state.rs"]
+mod state;
+pub(super) use state::AutoPollState;
+pub use state::{ChunkFeedStatus, CurrentVolumeStamp, Gui, StormMotionOverride, TiltFreshness};
+#[path = "gui/frame.rs"]
+mod frame;
+#[path = "gui/layer_glue.rs"]
+mod layer_glue;
+#[path = "gui/sync.rs"]
+mod sync;
+
 use crate::ui_input::InteractionState;
 
 /// One pane-count button the picker drew, as it was drawn. See
@@ -297,154 +315,6 @@ pub(super) struct RadarState {
     pub error_message: Option<String>,
 }
 
-/// Auto-polling timer state.
-pub(super) struct AutoPollState {
-    last_fetch_time: Option<web_time::Instant>,
-    pub enabled: bool,
-    initial_fetch_done: bool,
-    interval_secs: u64,
-}
-
-impl AutoPollState {
-    /// Record that a fetch was just dispatched.
-    pub fn record_fetch(&mut self) {
-        self.last_fetch_time = Some(web_time::Instant::now());
-    }
-
-    /// Call when a scan loads successfully — resets backoff to the base interval.
-    pub fn on_success(&mut self) {
-        self.interval_secs = 60;
-    }
-
-    /// Call on fetch failure — exponential backoff capped at 5 minutes.
-    pub fn on_error(&mut self) {
-        self.interval_secs = (self.interval_secs * 2).min(300);
-    }
-
-    /// Whether the poll timer has elapsed and a new check should fire.
-    pub fn should_poll(&self) -> bool {
-        self.enabled
-            && self
-                .last_fetch_time
-                .is_some_and(|t| t.elapsed().as_secs() >= self.interval_secs)
-    }
-
-    /// Seconds remaining until the next poll, if a timer is running.
-    pub fn time_until_next(&self) -> Option<u64> {
-        self.last_fetch_time
-            .map(|t| self.interval_secs.saturating_sub(t.elapsed().as_secs()))
-    }
-
-    /// How long the event loop may sleep before [`should_poll`] would answer
-    /// yes, or `None` when there is no timer to run out.
-    ///
-    /// The scheduling half of [`should_poll`], and it must agree with it
-    /// exactly or the wake it grants is spent on a frame that polls nothing.
-    /// `should_poll` compares whole seconds — `elapsed().as_secs() >=
-    /// interval_secs` — which for an integer interval is the same test as
-    /// `elapsed >= interval`, so this subtraction is neither early nor late.
-    ///
-    /// [`should_poll`]: Self::should_poll
-    pub fn poll_delay(&self) -> Option<std::time::Duration> {
-        if !self.enabled {
-            return None;
-        }
-        let elapsed = self.last_fetch_time?.elapsed();
-        Some(std::time::Duration::from_secs(self.interval_secs).saturating_sub(elapsed))
-    }
-
-    /// How long until the countdown the status bar prints changes, or `None`
-    /// when the number on screen has stopped moving.
-    ///
-    /// The status bar renders `time_until_next` as `archive {n}s`, which is a
-    /// whole second of `elapsed` — so the frame it needs is not "soon", it is
-    /// the instant `elapsed` crosses the next second boundary. Anything faster
-    /// redraws the same string; anything slower drops a number out of the
-    /// count.
-    ///
-    /// `None` once the count bottoms out at zero. `time_until_next` saturates,
-    /// so a poll that cannot fire — no pane viewing live — leaves `archive 0s`
-    /// on screen indefinitely, and a tick scheduled for a string that will
-    /// never change again is exactly the repaint this whole path exists to
-    /// stop.
-    ///
-    /// [`time_until_next`]: Self::time_until_next
-    pub fn countdown_tick_delay(&self) -> Option<std::time::Duration> {
-        if !self.enabled {
-            return None;
-        }
-        let elapsed = self.last_fetch_time?.elapsed();
-        if elapsed.as_secs() >= self.interval_secs {
-            return None;
-        }
-        // Strictly positive by construction — `subsec_nanos` is below a
-        // second — so this term can never schedule a zero-length sleep.
-        Some(std::time::Duration::from_nanos(u64::from(
-            NANOS_PER_SEC - elapsed.subsec_nanos(),
-        )))
-    }
-}
-
-/// One second, for [`AutoPollState::countdown_tick_delay`]'s remainder.
-const NANOS_PER_SEC: u32 = 1_000_000_000;
-
-/// How fresh the tilt on screen is.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct TiltFreshness {
-    /// The elevation the active pane is actually rendering — the snapped angle,
-    /// not the one the user selected.
-    pub elevation: f32,
-    /// Seconds since the radar collected the newest radial in that sweep.
-    ///
-    /// Counts up between cuts and drops back when the beam returns, so it reads
-    /// as the real cadence of the tilt rather than as a countdown to a poll.
-    /// This is the number the feature exists to make small.
-    pub data_age_secs: u64,
-}
-
-/// One site's current-volume stamp, as the App publishes it each frame.
-///
-/// Two times because a merged volume makes two distinct truthful claims and a
-/// caption must not fuse them: `newest` says when the radar last looked
-/// *anywhere* in the volume, and `base_started` says which complete volume
-/// the un-refreshed tilts still come from. Stating only the first would imply
-/// the whole volume is that fresh, which is exactly the impression the
-/// honesty devices exist to refuse.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CurrentVolumeStamp {
-    /// Collection time of the newest data in the merged volume — the identity
-    /// a 3D pane names its build by. Every sealed sweep advances it, which is
-    /// what makes the 3D view rebuild in step with the map beside it.
-    pub newest: NaiveDateTime,
-    /// When the complete base volume under the merge began, where one
-    /// contributes at all. `None` while the site's first volume is still
-    /// filling: there is no complete volume yet and the caption says so.
-    pub base_started: Option<NaiveDateTime>,
-}
-
-/// What the real-time chunk feed is doing for the pane on screen.
-///
-/// Deliberately about *the tilt being shown* rather than about the feed's
-/// progress through the volume. A count of completed cuts is operator jargon and
-/// answers the wrong question: what a user needs to know is whether the image in
-/// front of them is current, and a volume can be most of the way assembled while
-/// their own tilt is still minutes old.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ChunkFeedStatus {
-    /// Some live site is being fed from the real-time bucket.
-    pub feeding: bool,
-    /// A live site had its feed retired and fell back to the archive. Worth
-    /// saying out loud: it is a silent drop from seconds of latency to minutes.
-    pub retired: bool,
-    /// The feed's own poll cadence, in seconds.
-    pub interval_secs: u64,
-    /// A push-notification socket is open, so chunks are fetched on arrival
-    /// rather than on the next tick.
-    pub pushed: bool,
-    /// The active pane's tilt, once the feed has delivered it at least once.
-    pub tilt: Option<TiltFreshness>,
-}
-
 /// Time editing dialog state.
 pub(super) struct TimeDialogState {
     pub date_string: String,
@@ -518,805 +388,6 @@ pub(crate) fn push_user_overlay_fetch(
         .any(|a| matches!(a, GuiAction::FetchOverlay { kind: k, .. } if *k == kind))
     {
         actions.push(GuiAction::FetchOverlay { kind, pane_idx });
-    }
-}
-
-pub struct Gui {
-    radar: RadarState,
-    auto_poll: AutoPollState,
-    /// See [`Gui::live_chunks_enabled`].
-    live_chunks: bool,
-    /// See [`Gui::chunk_notifications_enabled`].
-    chunk_notifications: bool,
-    /// See [`Gui::notifier_endpoint`].
-    notifier_endpoint: String,
-    /// What the real-time feed is doing, refreshed each frame by the App.
-    chunk_status: ChunkFeedStatus,
-    /// Each site's current-volume stamp, refreshed each frame by the App and
-    /// advanced by every sealed sweep. A 3D pane names the volume it wants by
-    /// [`CurrentVolumeStamp::newest`], which is what makes its rebuilds follow
-    /// the live feed — see `App::base_scans` and `rustdar_radar::current` for
-    /// what the stamp is a stamp *of*.
-    current_volumes: HashMap<String, CurrentVolumeStamp>,
-    time_dialog: TimeDialogState,
-    initial_zoom_set: bool,
-    // --- Map tiles (shared across panes) ---
-    map_tiles: MapTileState,
-    // User's GPS fix (full data from GPS receiver or Android LocationManager)
-    user_fix: Option<rustdar_gps::GpsFix>,
-    /// When [`user_fix`](Self::user_fix) arrived.
-    ///
-    /// Not `user_fix.timestamp`: that is the *receiver's* clock, it is absent
-    /// on every source but serial NMEA, and it says when the position was
-    /// measured rather than when this app last heard anything. The question the
-    /// settings pane asks — "is location on but not producing?" — is about the
-    /// second one.
-    user_fix_at: Option<web_time::Instant>,
-    /// What the OS last said about this app's access to the user's location,
-    /// pushed in by the frontend's location gate.
-    ///
-    /// Cached rather than queried because this crate cannot see a
-    /// `PlatformBridge` — it is the crate the bridge's trait depends *on* — so
-    /// a copy is the only thing available here. How fresh the copy is is the
-    /// gate's poll cadence, which tightens while [`Gui::settings_visible`]
-    /// answers true for exactly this reason.
-    location_permission: rustdar_gps::LocationPermission,
-    /// Whether the platform is currently delivering location fixes. A different
-    /// question from the permission: every desktop process starts granted and
-    /// silent.
-    location_active: bool,
-    /// Whether this platform has a location settings page to offer.
-    ///
-    /// Pushed once at startup rather than with the two fields above, because it
-    /// is a property of the build and not of the permission — it cannot change
-    /// while the app runs, and nothing is served by re-asking it at the gate's
-    /// cadence. `false` by default, so a bridge that has not been asked renders
-    /// no button rather than one that does nothing.
-    location_settings_available: bool,
-    /// Whether the site list is still only what this install has decoded,
-    /// rather than the network.
-    ///
-    /// The site list reads the process-wide table, and the table cannot tell
-    /// the two apart: two rows learned off two volumes look exactly like a
-    /// network with two radars in it. That is what made the regression this
-    /// exists for invisible — the caption read `2 shown - 2 sites` with a
-    /// confidence it had not earned, while 203 radars sat in the cache
-    /// unapplied. `false` by default, so a bridge that has not been asked
-    /// states nothing rather than crying wolf.
-    catalogue_pending: bool,
-    // Compass heading in degrees (0–360), from device compass sensor
-    user_heading: Option<f32>,
-    // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
-    pub overlays: OverlayRegistry,
-    // Multi-pane state
-    panes: Vec<PaneState>,
-    active_pane: PaneId,
-    pane_layout: PaneLayout,
-    /// Remembered color-scale bar orientation for the map panel (hysteresis, so
-    /// a resize near the boundary cannot make the bars hop).
-    color_scale_orientation: ColorScaleOrientation,
-    /// Each 3D pane's own map strip: the Mercator affine it drew that map
-    /// through, and the off-screen rect it drew it *into*. This is both the
-    /// registration the pane's floor is reprojected by and the rect the
-    /// frontend clips its mirror pass to.
-    ///
-    /// Recorded inside `Map::show`, because that is the only place a
-    /// `walkers::Projector` exists. Kept across frames rather than cleared,
-    /// deliberately: a pane that is momentarily not drawn (a collapsed
-    /// divider, a hidden tab) should leave its floor where it was rather than
-    /// dropping it, and a stale entry costs six words of state.
-    ///
-    /// **The invariant is that a key here is a pane showing a floor right
-    /// now**, not merely a pane that was one when the affine was taken.
-    /// Entries are pruned at the top of the pane loop against the live pane
-    /// count, the live [`crate::pane::PaneKind`] and the live floor toggle, so
-    /// neither a layout that sheds panes — indices are reused, and a stale
-    /// entry would read as *some other pane's* map rather than as absent — nor
-    /// a pane converted back to a map can leave the mirror copying geography
-    /// nothing on screen still has.
-    map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
-    /// Why each 3D pane drew **no picture** on the last frame, by pane index.
-    /// A pane that drew a volume has no entry.
-    ///
-    /// Not a test probe (`last_volume_arms` is that): the pane-properties
-    /// sidebar reads this to explain its Map floor checkbox. The floor is drawn
-    /// *by the raymarch*, inside the very callback an empty state means was
-    /// never pushed — so in every one of those states the checkbox is a control
-    /// that produces nothing, and a control that produces nothing has to say
-    /// why.
-    ///
-    /// Recorded by the arm rather than re-derived in the sidebar. The arm's
-    /// answer has five independent reasons in it — no painter, no published
-    /// volume, a product with no vertical structure, a grid not built yet, a
-    /// pane that is not 3D at all — and a second copy of them in the sidebar
-    /// would drift from this one silently, in the direction of a checkbox that
-    /// looks fine.
-    ///
-    /// **Last frame's, by construction.** The shell's sidebar pass runs before
-    /// `render_panes` in [`Gui::ui`], so this frame's arm has not run when the
-    /// checkbox is drawn. That is the right staleness rather than a tolerated
-    /// one: the sidebar is describing the picture the user is looking at, and
-    /// the picture the user is looking at is the one the last frame drew.
-    ///
-    /// Cleared and refilled by the pane loop each frame, so a pane that stops
-    /// being 3D — or starts drawing — cannot leave an explanation behind.
-    volume_empty_states: HashMap<usize, String>,
-    /// How much of egui's coordinate space the pane mirror has to cover, in
-    /// points, as of the last frame: the frame itself, plus however far below
-    /// it this frame's off-screen map strips reach. See
-    /// [`Gui::mirror_size_points`].
-    mirror_size_points: egui::Vec2,
-    /// How many slippy zoom levels deeper a **floor-source** map pane should
-    /// fetch its raster tiles, from the renderer's last mirror plan.
-    ///
-    /// Set by the frontend, which is the only side that knows how much the 3D
-    /// camera is magnifying the ground and how many texels the mirror could
-    /// afford — see `egui_renderer::mirror`. Zero for every pane nothing is
-    /// standing on, so a layout with no 3D view fetches exactly the tiles it
-    /// always did.
-    floor_tile_zoom_bias: u8,
-    /// The map panel rect the last frame laid its pane grid out in. Only read
-    /// by tests, which need the same rects `render_panes` used.
-    #[cfg(test)]
-    last_map_panel_rect: egui::Rect,
-    /// egui `Id`s the last frame's layers panel actually resolved, in render
-    /// order. Only read by tests, which compare them either side of a resize:
-    /// an `Id` that moved with the layout silently discards the widget memory
-    /// egui keyed on it.
-    #[cfg(test)]
-    widget_id_probes: Vec<(&'static str, egui::Id)>,
-    /// Every menu leaf the last frame actually drew — whichever of the two
-    /// presentations was on screen — with the bool each checkbox was really
-    /// handed and the rect it landed in. Only read by tests, which need the
-    /// state the *renderer* saw rather than the model a test rebuilt.
-    #[cfg(test)]
-    last_menu_leaves: Vec<ui_menu::DrawnMenuLeaf>,
-    /// The pointer state `render_panes` resolved for each pane on the last frame,
-    /// in pane order. Only read by tests — and the *only* honest way for one to
-    /// observe the modality gate, since resolving it a second time alongside
-    /// `Gui::ui` would assert on a replica.
-    #[cfg(test)]
-    last_pane_pointers: Vec<crate::ui_input::PanePointerProbe>,
-    /// Which render arm ran for each pane on the last frame, in the order the
-    /// pane loop reached them. Only read by tests — see [`PaneContentProbe`] for
-    /// why this is written inside the arms rather than derived from
-    /// `panes[i].kind()`.
-    #[cfg(test)]
-    last_pane_content: Vec<PaneContentProbe>,
-    /// What the 3D arm decided for each volume pane on the last frame. Only read
-    /// by tests, and it is the only thing that can tell "drew a volume" from
-    /// "drew nothing" — see [`map::VolumeArmProbe`].
-    #[cfg(test)]
-    pub(crate) last_volume_arms: Vec<map::VolumeArmProbe>,
-    /// The pane-count buttons the picker actually drew last frame. Only read by
-    /// tests, which check the picker narrows on a phone while the config clamp
-    /// does not, and that clicking one takes effect.
-    #[cfg(test)]
-    last_pane_options: Vec<PaneOptionProbe>,
-    /// The excluded rects `render_panes` was actually handed. Only read by tests,
-    /// which check the chrome's rects reach the map's click filter rather than
-    /// stopping at the call site.
-    #[cfg(test)]
-    last_map_excluded_rects: Vec<egui::Rect>,
-    /// The pane borders the last frame painted: pane index, the stroke's
-    /// painted bounds, and whether it was the active highlight. Only read by
-    /// tests — the M8 pin that every border lies inside its pane, at every
-    /// grid position (the outside-stroke bug clipped the outer edges away).
-    #[cfg(test)]
-    last_pane_borders: Vec<(usize, egui::Rect, bool)>,
-    /// The section tracks the last frame painted over map panes: map pane,
-    /// section pane, and the painted A and B endpoints. Only read by tests —
-    /// the M8 pin that the release frame of a handle drag paints the dropped
-    /// geometry, never the stale pre-drag line.
-    #[cfg(test)]
-    last_section_tracks: Vec<(usize, usize, egui::Pos2, egui::Pos2)>,
-    /// The committed region boxes the last frame painted over map panes: map
-    /// pane, 3D pane, and the painted rect. Only read by tests — the pin that a
-    /// box is drawn on the map it was picked on and on no other, which is the
-    /// only on-screen answer to "where is that volume from".
-    #[cfg(test)]
-    last_region_boxes: Vec<(usize, usize, egui::Rect)>,
-    /// The Volume Alpha corner buttons the last frame drew, per pane. Only
-    /// read by tests — the M8 pin that the fade hides pane-borne chrome too.
-    #[cfg(test)]
-    last_alpha_buttons: Vec<(usize, egui::Rect)>,
-    /// Each map pane's dispatched kinds in paint order, with the layer each
-    /// painted into. Only read by tests — the draw-order pin; see
-    /// `PaneRenderCtx::paint_order` for why the layer is the honest half.
-    #[cfg(test)]
-    last_paint_order: Vec<(usize, Vec<(OverlayKind, egui::LayerId)>)>,
-    /// What the last frame's status bar actually drew. Only read by tests.
-    #[cfg(test)]
-    last_status_bar: StatusBarProbe,
-    /// What the last frame's timeline transport actually drew. Only read by
-    /// tests.
-    #[cfg(test)]
-    last_timeline: TimelineProbe,
-    /// What the last frame's top bar actually drew. Only read by tests.
-    #[cfg(test)]
-    last_top_bar: TopBarProbe,
-    /// What the last frame's layer stack actually drew. Only read by tests.
-    #[cfg(test)]
-    last_stack: StackProbe,
-    /// What the last frame's inspector actually drew. Only read by tests —
-    /// see [`InspectorProbe`] for why `mode` is written inside the body arms.
-    #[cfg(test)]
-    last_inspector: InspectorProbe,
-    /// What the last frame's Add-layer catalog actually drew. Only read by
-    /// tests.
-    #[cfg(test)]
-    last_catalog: CatalogProbe,
-    /// What the last frame's pill rows actually drew, in pane order. Only
-    /// read by tests.
-    #[cfg(test)]
-    last_pills: Vec<pills::PillRowProbe>,
-    /// The pill popover the last frame drew, if one was open. Only read by
-    /// tests.
-    #[cfg(test)]
-    last_pill_popover: Option<pills::PillPopoverProbe>,
-    /// Whether some feature consumed this frame's map click — written by the
-    /// pane loop, read by [`Self::apply_fade_toggle`] (a consumed click while
-    /// faded unfades; see `ui_fade.rs`) and by the harness's probe.
-    click_consumed_frame: bool,
-    /// How many times handler `ControlItem`s were rendered this frame.
-    ///
-    /// The double-render guard: each render is a load→mutate→save round trip
-    /// over the active pane's `overlay_configs`, so two passes in one frame
-    /// fight over the handlers' state — the entanglement the plan's §3.8
-    /// makes `render_overlay_controls_one` the only host to prevent. The
-    /// harness asserts ≤ 1 after every frame.
-    #[cfg(test)]
-    control_render_passes: u32,
-    /// Every handler dropdown the last frame drew, with the text its collapsed
-    /// box showed. Only read by tests — see [`DrawnDropdown`].
-    #[cfg(test)]
-    last_dropdowns: Vec<DrawnDropdown>,
-    /// Every control item the last frame's layers panel drew, whatever its
-    /// shape — the generalisation of the field above. Only read by tests; see
-    /// [`DrawnControlItem`].
-    #[cfg(test)]
-    last_control_items: Vec<DrawnControlItem>,
-    /// Every settings row the last frame's settings window drew. Only read by
-    /// tests — see [`settings::DrawnSettingsRow`].
-    #[cfg(test)]
-    last_settings_rows: Vec<settings::DrawnSettingsRow>,
-    /// The action-button indices the last frame's detail popup reported as
-    /// triggered, and the ones it actually handled. Only read by tests, which
-    /// hold the second to at most one entry per frame — see the note on the
-    /// handling in `ui_popups.rs`.
-    #[cfg(test)]
-    last_popup_triggered: Vec<usize>,
-    /// See [`last_popup_triggered`](Self::last_popup_triggered).
-    #[cfg(test)]
-    last_popup_handled: Vec<usize>,
-    /// A pane the user has asked to convert, applied once the UI pass is over.
-    ///
-    /// # Why the write is deferred, and what that is and is not protecting
-    ///
-    /// Two production paths hold a `PaneState` out of `Gui::panes` with
-    /// `std::mem::take` for the whole of a pass — the shell's stack+inspector
-    /// pass takes the active pane (`ui_shell.rs`), and `render_panes` takes
-    /// each pane in turn — leaving a default `PaneState` in the slot. A
-    /// `self.panes[idx].set_kind(..)` inside either window writes the
-    /// **placeholder**, and the real pane going back afterwards discards it:
-    /// no panic, no warning, and a control that will not stay set.
-    ///
-    /// **The menu dispatcher is not inside either window** — `render_top_bar`
-    /// takes no pane at all, so a direct write from the volume toggle would in
-    /// fact work today. The inspector's kind segmented control, though, runs
-    /// from *inside* the shell's take, where the same direct write is
-    /// silently discarded — which is why every kind writer goes through
-    /// [`Self::request_pane_view`], one rule for all of them.
-    ///
-    /// It is the right shape for one reason more. The writers WP-G adds — an
-    /// armed section drag resolving to a line, and the retarget rule that
-    /// follows from it — run from **inside** `render_panes`' per-pane take,
-    /// where the hazard is live and silent. And the ordering an interaction
-    /// needs is the same one the pane count needs: growing it mid-loop moves
-    /// the rects of panes the loop has not reached, desynchronising them from
-    /// the ones `detect_active_pane_click` hit-tested this frame. One
-    /// deferral point, applied at [`Self::apply_pending_pane_view`] after the
-    /// pane loop, serves both.
-    ///
-    /// The cost is one frame of latency in the current path: the dispatcher records
-    /// during chrome, and the conversion lands after `render_panes` — the same
-    /// frame, but the panes were already drawn from the old kind.
-    ///
-    /// One request at a time, not a queue. The requests are per pane and
-    /// idempotent, they can only come from a single click, and a queue would let
-    /// one frame convert a pane twice — which would throw away the per-kind state
-    /// the intermediate kind had just been given.
-    ///
-    /// The deferral's *mechanism* is pinned by
-    /// `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`, which
-    /// builds the take window by hand precisely because no production caller
-    /// currently provides one.
-    ///
-    /// A [`RenderView`](rustdar_radar::types::RenderView) rather than a
-    /// `PaneKind`, because what the user picks from the pane menu is a
-    /// *picture*: plan view, 3D volume, cross-section. Two of those three are
-    /// the same kind of pane in different render modes, so a kind alone could
-    /// not carry the request — and a pair of `(kind, Option<render>)` would make
-    /// "cross-section in the volume render mode" expressible for no reason.
-    pending_pane_view: Option<(PaneId, rustdar_radar::types::RenderView)>,
-    /// Whether the cross-section draw is **armed**: the next drag on a map pane
-    /// is a section line rather than a pan.
-    ///
-    /// # Why armed-modal and not a modifier-drag
-    ///
-    /// A shift-drag is the obvious desktop spelling and it has no touch
-    /// equivalent at all. This binary ships to phones, from one wasm build that
-    /// also serves desktop browsers, so a gesture only a keyboard can express is
-    /// a feature only half the users have.
-    ///
-    /// A mode has its own failure — the user forgets they are in it — and the
-    /// answers to that are both here: the arming control is a **checkbox**, so
-    /// the state is visible and turning it off is discoverable in the place it
-    /// was turned on; and [`Self::dismiss_top_layer`] cancels it, so Escape and
-    /// Android's back button both mean what they mean everywhere else.
-    ///
-    /// One of the two armed modal drags on a map pane; the other is
-    /// [`region_pick_armed`](Self::region_pick_armed). They are held mutually
-    /// exclusive by their setters, because one press cannot be two gestures,
-    /// and they share one detector for the same reason — see
-    /// [`crate::ui_input::ArmedDragGesture`].
-    section_draw_armed: bool,
-    /// The in-flight draw: where it started, on which pane, and where the
-    /// pointer is now.
-    section_anchor: Option<SectionAnchor>,
-    /// A finished line and the map pane it was drawn on, applied **after** the
-    /// pane loop.
-    ///
-    /// Deferred for the reason [`pending_pane_view`](Self::pending_pane_view) is,
-    /// and one reason more that is specific to this writer. Applying a line can
-    /// *grow the pane count*, and `PaneLayout::pane_rect` is a function of it —
-    /// so a mid-loop growth silently moves the rects of every pane the loop has
-    /// not reached yet, away from the ones `detect_active_pane_click`
-    /// hit-tested at the top of this same frame. The panes drawn after the growth
-    /// would be drawn in the right place and clicked in the wrong one, for one
-    /// frame, with nothing to say so.
-    pending_section_line: Option<(PaneId, crate::pane::SectionLine)>,
-    /// Whether the 3D region pick is **armed**: the next drag on a map pane
-    /// draws the square of ground a 3D view will resample, rather than panning.
-    ///
-    /// Armed-modal rather than a modifier-drag, for the reason
-    /// [`section_draw_armed`](Self::section_draw_armed) is — a shift-drag has
-    /// no touch equivalent and one wasm binary serves phones and desktop
-    /// browsers alike — and cancellable the same three ways: the toggle it was
-    /// armed from, Escape, and Android's back button through
-    /// [`Self::dismiss_top_layer`].
-    ///
-    /// # Why this mode exists at all
-    ///
-    /// The grid is a fixed cell count, so a picked region is not a crop — it is
-    /// the **only** control that buys resolution. At the shipped 512 cells a
-    /// 920 km ring is 1.80 km per cell; a 230 km region over the same cells is
-    /// 0.45, and a 100 km one is 0.20. Zoom moves the eye and cannot do this,
-    /// deliberately (see `ui_region`), which leaves this drag as the whole of
-    /// the answer to "show me that storm in detail".
-    ///
-    /// Global rather than per-pane, like the section arm and for its reason:
-    /// the pane it applies to is not knowable when it is ticked. The user arms
-    /// the mode and *then* chooses a map to drag on, and choosing it is the
-    /// same press that starts the box.
-    region_pick_armed: bool,
-    /// The in-flight box: which pane it is being dragged on, where its centre
-    /// was fixed, and how wide it currently stands. See
-    /// [`crate::ui_region::RegionDrag`].
-    region_drag: Option<crate::ui_region::RegionDrag>,
-    /// A finished region and the map pane it was dragged on, applied **after**
-    /// the pane loop.
-    ///
-    /// Deferred for [`pending_section_line`](Self::pending_section_line)'s
-    /// second reason exactly: applying one can *grow the pane count*, and
-    /// `PaneLayout::pane_rect` is a function of it — so a mid-loop growth moves
-    /// the rects of every pane the loop has not reached yet away from the ones
-    /// `detect_active_pane_click` hit-tested at the top of this same frame.
-    pending_region: Option<(PaneId, crate::pane::VolumeRegion)>,
-    /// An endpoint drag in flight on a committed section's ground track, or
-    /// `None`.
-    ///
-    /// **Unarmed on purpose** — see `ui_section_edit`'s module doc: a handle is
-    /// a visible target and proximity is the disambiguation, so an existing
-    /// line's ends are always grabbable on the map pane that owns it. Advanced
-    /// only from inside that pane's `Map::show` ([`map`]'s
-    /// `track_section_edit`), where the projector is; cleared by both armed-drag
-    /// setters, because one drag on one map pane cannot be two gestures, and by
-    /// [`Self::dismiss_top_layer`], so Escape mid-drag means what it means
-    /// everywhere else.
-    section_edit_drag: Option<crate::ui_section_edit::SectionEditDrag>,
-    /// Where every committed line's grabbable geometry was drawn **last
-    /// frame**, in screen points — endpoints and body track alike.
-    ///
-    /// Written from inside `Map::show`, read by `render_panes`' pan-suppression
-    /// decision *before* it — the press frame has to suppress the pan, and the
-    /// press frame is the one frame that cannot yet ask the projector. One
-    /// frame stale by construction, which for a press is harmless: a pointer
-    /// about to press is not also flinging the viewport. Both readers go
-    /// through [`SectionGrabZone::grab_at`], so the suppression and the
-    /// authoritative in-show hit test cannot drift apart.
-    ///
-    /// [`SectionGrabZone::grab_at`]: crate::ui_section_edit::SectionGrabZone::grab_at
-    section_handles: Vec<crate::ui_section_edit::SectionGrabZone>,
-    /// A dropped handle's line and the section pane it belongs to, applied
-    /// **after** the pane loop.
-    ///
-    /// Deferred for the reason every pending is
-    /// ([`pending_pane_view`](Self::pending_pane_view)): the drop is recorded
-    /// from inside `Map::show`, in the window where the map pane is
-    /// `mem::take`n out of the vector. Unlike
-    /// [`pending_section_line`](Self::pending_section_line) this can never grow
-    /// the layout — it re-aims a section pane that already exists — and its
-    /// applier writes the line and nothing else, so the ordinary staleness
-    /// poll is what re-cuts. One deferral shape for every writer, rather than
-    /// one careful exception.
-    pending_section_edit: Option<(PaneId, crate::pane::SectionLine)>,
-    // The Gui-global `viewport_sync` / `sync_layers` toggles were retired in
-    // M11: sync is per pane now — `PaneState::viewport_link`,
-    // `PaneState::layer_link`, `PaneState::time_link` — and the old globals
-    // survive only as read-only legacy fields on `UiConfig`, which seed the
-    // per-pane links once on load (see `load_ui_config`).
-    // --- Radar loop settings ---
-    /// How far back (in seconds) to fetch historical scans for the loop.
-    pub loop_lookback_secs: u64,
-    /// Animation speed in frames per second.
-    pub loop_speed_fps: f32,
-    /// Whether the slide-out layers drawer is open. Only consulted when the
-    /// layout has no persistent sidebar.
-    drawer_open: bool,
-    /// The user's explicit say over the Expanded layers sidebar, from the top
-    /// bar's Layers toggle. `None` is the shell default — open where the
-    /// sidebar is persistent — and, like `drawer_open`, it is deliberately
-    /// session-only: how a session left its panels is not a preference.
-    ///
-    /// A separate field rather than a widened `drawer_open` because the two
-    /// answer at different widths and remember independently: closing the
-    /// sidebar on a desktop must not also close the drawer the same window
-    /// gets when it narrows past the breakpoint.
-    stack_open: Option<bool>,
-    /// Whether the inspector panel is open. Session-only, on the same
-    /// precedent as `drawer_open`: closed by default at every width, opened
-    /// by the top bar's ⚙ toggle, a stack row click ([`Self::select_layer`]),
-    /// or the menu's Settings… entry.
-    insp_open: bool,
-    /// One-shot: the next inspector frame starts its body scrolled to the
-    /// top. Set by every selection change, because the three bodies share one
-    /// scroll area — its offset is the *panel's* memory, and carrying a deep
-    /// settings scroll into a freshly selected layer's options would open
-    /// them somewhere in the middle.
-    insp_scroll_reset: bool,
-    /// What the inspector's body is about while it is open — and what it will
-    /// be about when next opened. Session-only, defaults to
-    /// [`InspectorSelection::AppSettings`]; a dismissal resets it there (see
-    /// [`Self::dismiss_top_layer`]), while the ⟩ collapse deliberately keeps
-    /// it, because a collapse is not a deselection.
-    inspector_sel: InspectorSelection,
-    /// Whether the floating timeline transport is collapsed to its 🕐 chip.
-    /// Session-only, like `drawer_open`: how a session left its chrome is not
-    /// a preference.
-    timeline_collapsed: bool,
-    /// Whether the transport's second row — the loop tuning — is shown.
-    /// Session-only, on the same precedent.
-    timeline_row2: bool,
-    /// The archive scrubber's in-flight drag position, as a fraction of the
-    /// lookback window, or `None` when no drag is in flight. Remembered
-    /// across frames so the handle follows the pointer instead of snapping
-    /// back to the resting position every frame; the commit happens once, on
-    /// release — see `render_timeline_scrubber`.
-    timeline_scrub: Option<f32>,
-    /// Whether the floating status bar is collapsed to its ⏵ restore button.
-    /// Session-only, on the same precedent as the timeline's collapse.
-    statusbar_collapsed: bool,
-    /// The floating status bar's rect as drawn this frame, `None` while no
-    /// bar is on screen (Compact, or fully faded). Written by
-    /// `render_status_bar` before the timeline pass reads it: the collapsed
-    /// time chip anchors above the bar's real top edge rather than a guessed
-    /// constant (the M8 chip-overlap fix) — and only when it would otherwise
-    /// land on the bar, since a bar collapsed to its restore button leaves
-    /// the corner open map (M8.1).
-    statusbar_rect: Option<egui::Rect>,
-    /// How long until the text the status bar's auto-poll chip drew this frame
-    /// would read differently, or `None` when nothing it drew restates the
-    /// clock.
-    ///
-    /// That chip is the only thing in the app that changes with no input
-    /// behind it — the `archive {n}s` countdown, and the age of the tilt a
-    /// live feed last delivered — so it is the only thing that can oblige an
-    /// otherwise idle app to draw again. The interval is decided by the code
-    /// that writes the string, which is the only place that knows *which*
-    /// string it wrote: a second for a count of seconds, a minute for a count
-    /// of minutes, nothing at all for a number that has stopped moving.
-    ///
-    /// Written by `render_status_bar` for every outcome including the absences
-    /// — Compact, faded out, collapsed, or a spinner in the chip's place — and
-    /// read by [`Self::status_tick_delay`].
-    status_bar_tick: Option<std::time::Duration>,
-    /// Whether the Add-layer catalog is open. Session-only, like every other
-    /// open-surface flag; opened by the stack's two `+ Add layer` buttons and
-    /// closed by applying a tile, the `✕`, the backdrop, or
-    /// [`Self::dismiss_top_layer`].
-    catalog_open: bool,
-    /// The catalog's search text. Session-only: a filter is a gesture in
-    /// progress, not a preference.
-    catalog_query: String,
-    /// The name being typed into the catalog's "Save current view…" tile,
-    /// and whether that inline editor is showing. Session-only, same terms.
-    catalog_save_name: String,
-    /// See [`Self::catalog_save_name`].
-    catalog_saving: bool,
-    /// The site list's search text — the inspector body and the site pill's
-    /// popover filter through the one field, as they render the one list.
-    /// Session-only, same terms as [`Self::catalog_query`].
-    site_query: String,
-    /// The stack row being drag-reordered by its grip, if one is in flight.
-    /// Session-only: a drag is a gesture, not a preference. The permute
-    /// happens once, on release — see `ui_stack.rs`'s reorder note.
-    stack_drag: Option<OverlayKind>,
-    /// The pane whose pill row a first touch tap revealed, if any.
-    /// Session-only: a reveal is a gesture in progress, not a preference.
-    /// Cleared where the gestures that end it are resolved — a map click
-    /// that switches panes, or a confirmed map tap (`ui_map.rs`).
-    pill_revealed: Option<PaneId>,
-    /// How many pill rows the previous pills pass drew. The rows' areas are
-    /// keyed on contiguous `0..pane_count`, so this count *is* the set of
-    /// rows on screen last frame — and a pass drawing past it is a debut,
-    /// which egui auto-tops. Session-only bookkeeping.
-    pills_drawn_last_frame: usize,
-    /// A panel raise owed to the next pills pass — armed by every rows'
-    /// debut (startup, and any mid-session pane growth), performed one frame
-    /// later; see `ui_pills.rs`'s module note on stacking for why the raise
-    /// cannot happen on the debut frame itself. Session-only bookkeeping.
-    pills_raise_pending: bool,
-    /// Whether the pane pill rows render at full opacity unconditionally.
-    /// Persisted (`UiConfig::pin_pane_controls`); the settings body's
-    /// Interface section is the one writer.
-    pin_pane_controls: bool,
-    /// Whether the floating chrome is faded away (plan §1.8) — the map-first
-    /// state one qualifying click enters and the next one leaves. Session-only
-    /// like every open-surface flag: hiding the UI is a gesture, not a
-    /// preference. Everything about it lives in `ui_fade.rs`.
-    ui_faded: bool,
-    /// The pane loop's verdict that this frame's click qualifies as the fade
-    /// gesture — recorded in `render_panes` (which alone knows the click's
-    /// pane, kind and consumption), resolved by [`Self::apply_fade_toggle`]
-    /// after the pending appliers. One-shot per frame.
-    fade_candidate: bool,
-    /// Whether the most recent primary press was the one that switched the
-    /// active pane — written by `detect_active_pane_click` on every press,
-    /// read by the fade trigger so a first click on an inactive pane only
-    /// activates it (§1.8). Session-only bookkeeping.
-    press_switched_pane: bool,
-    /// Whether an egui popup — a pill popover, the ☰ dropdown, an open combo
-    /// — was open when the most recent primary press landed. Written beside
-    /// [`Self::press_switched_pane`], read by the fade trigger: a click
-    /// whose press found a popup open is that popup's dismissal (egui closes
-    /// it on the click outside), not a fade gesture. Recorded at press time
-    /// because by the time the click confirms — the release, or a touch
-    /// tap's deferral later — the popup has already closed and the frame
-    /// can no longer see what the press was aimed at.
-    press_popup_open: bool,
-    /// This frame's shared chrome opacity, resolved once at frame top by
-    /// [`Self::enforce_fade_invariants`] from the fade animation: `1.0` fully
-    /// present, `0.0` fully faded (surfaces skip rendering), in between a
-    /// non-interactive transition. See `ui_fade.rs`.
-    fade_factor: f32,
-    /// The page the sheet last showed — what the sheet's fall animation
-    /// renders after the flags have already closed (`ui_sheet.rs`); never
-    /// read while a page is open. Session-only bookkeeping.
-    sheet_last_page: Option<sheet::SheetPage>,
-    /// The message the error toast last showed — what the toast's fade-out
-    /// renders after the error has already cleared (`ui_sheet.rs`), on the
-    /// same terms as [`Self::sheet_last_page`]; never read while an error is
-    /// up. Session-only bookkeeping.
-    toast_last_error: Option<String>,
-    /// The user's saved presets (§3.11). Persisted; the built-ins are
-    /// compiled in beside them (`catalog::builtin_presets`) and never saved.
-    presets: Vec<PresetConfig>,
-    /// This build's loop frame cap, pushed in by the frontend from
-    /// `constants::MAX_LOOP_FRAMES` — this crate cannot read that table (the
-    /// dependency points the other way), and the timeline's row-2 caption
-    /// wants to state the platform's real budget rather than a guess.
-    /// Defaults to the desktop arm's value, which is what every headless
-    /// test is.
-    loop_frame_budget: usize,
-    /// Whether the top bar's ☰ dropdown was open on the last frame it drew.
-    ///
-    /// The dropdown's real state is egui popup memory, which this crate only
-    /// touches mid-frame — but [`Self::dismiss_top_layer`] runs *between*
-    /// frames, from the frontend's input handling, so it needs last frame's
-    /// answer mirrored somewhere it can reach. Written every frame by
-    /// `render_top_bar`, from the popup's own id.
-    menu_popup_open: bool,
-    /// A dismiss was consumed against the open dropdown; the top bar honours
-    /// this (and clears it) by force-closing the popup before next showing it.
-    ///
-    /// A request rather than a direct write because the popup's memory is
-    /// keyed on a widget id that only exists mid-frame — see
-    /// `render_top_bar_run`, where the two dismissal routes (Escape, which
-    /// egui also sees and closes on itself, and Android's back, which never
-    /// enters egui's queue) converge on this one flag.
-    menu_popup_close_requested: bool,
-    /// Whether the phone sheet's Menu page is open. Session-only, on the
-    /// `drawer_open` precedent — and Compact-only chrome: the ☰ Popup keeps
-    /// its own egui-managed state on the wider widths (its dismiss handling
-    /// is the pair of fields above, and the M1 fix depends on it), so this
-    /// flag drives the sheet page alone. `Gui::ui` clears it whenever the
-    /// width is not Compact, so a resize with the page open cannot strand a
-    /// flag no surface renders consuming a back press.
-    menu_open: bool,
-    /// The phone sheet's snap position. Session-only: how a session left
-    /// its sheet is not a preference.
-    sheet_extent: SheetExtent,
-    /// The sheet handle's in-flight drag travel in points, or `None` when no
-    /// drag is running — the timeline scrubber's own shape, for the same
-    /// reason: the commit happens once, on release.
-    sheet_drag: Option<f32>,
-    /// How tall the phone shell's bottom bar drew **last** frame, in points, and
-    /// `0.0` on any frame that drew none — a wider width class, or the chrome
-    /// fully faded.
-    ///
-    /// # Why a frame late, and why that is the right answer
-    ///
-    /// The bar is opaque, full-bleed and drawn on `Order::Middle`, over a map
-    /// that is deliberately full-bleed under it: `ui_shell` gives the map
-    /// everything below the top bar and floats all other chrome on top. That is
-    /// the design and it stays. But the *legend* is not map — it is chrome
-    /// painted into the map's own layer during the pane loop, which runs before
-    /// `render_bottom_bar`, so it cannot ask how much of the bottom edge is
-    /// about to be covered.
-    ///
-    /// It asks what was covered last frame instead. A one-frame lag on a chrome
-    /// inset is invisible: the bar's height changes only when the width class
-    /// or the font metrics change, both of which already cost a relayout, and
-    /// the frame that changes them draws the legend at the previous inset and
-    /// every frame after it at the new one. The alternative — re-deriving the
-    /// bar's height from `BAR_ITEM_PADDING`, `BAR_ITEM_GAP` and two font
-    /// galleys before the pane loop — is a second copy of a layout egui already
-    /// does, and it would drift silently the first time an item changed.
-    phone_bar_height: f32,
-    /// What the last frame's bottom bar drew. Only read by tests.
-    #[cfg(test)]
-    last_bottom_bar: BottomBarProbe,
-    /// What the last frame's sheet drew. Only read by tests.
-    #[cfg(test)]
-    last_sheet: SheetProbe,
-    /// What the last frame's phone error toast drew. Only read by tests.
-    #[cfg(test)]
-    last_error_toast: Option<ErrorToastProbe>,
-    // Safe area insets in logical pixels (top, bottom, left, right)
-    // Used on Android to avoid drawing under system bars.
-    safe_area_insets: (f32, f32, f32, f32),
-    /// Whether this platform can quit at all. Pushed in by the frontend from
-    /// the bridge, which this crate cannot see. `false` hides the menu's Exit.
-    supports_exit: bool,
-    /// Remembers whether a mouse or a finger is driving, across frames.
-    modality: ModalityLatch,
-    /// This frame's resolved layout. Written once at the top of [`Gui::ui`] and
-    /// read by everything below it; never recomputed further down.
-    layout: LayoutCtx,
-    /// Pointer/gesture resolution for the map, gated on the modality.
-    interaction: InteractionState,
-    /// User unit and timezone preferences.
-    pub preferences: UserPreferences,
-    /// GPS configuration (port, baud, heading source).
-    pub gps_config: rustdar_gps::GpsConfig,
-    /// Storm motion the user typed in, overriding the RPG's SCIT average on
-    /// every storm-relative velocity tilt — all four are derived, so all four
-    /// take it. `None` means "use the vector the `N0S` product carries", which
-    /// is the default and is what AWIPS calls the average storm motion.
-    pub storm_motion_override: StormMotionOverride,
-    /// Which derived rung storm-relative velocity falls to when the reader has
-    /// entered no override and the volume brought no NWS vector.
-    ///
-    /// The default is the 0-6 km mean wind, which is the derived quantity
-    /// measured closest to what the NWS publishes. The Bunkers right-mover is
-    /// the other choice and it is a genuinely different thing to want — a
-    /// supercell motion prediction rather than a stand-in for the average of
-    /// the cells that were tracked — so it is a reader's setting and not an
-    /// accuracy knob. See `rustdar_radar::srv::SrvFallback`.
-    ///
-    /// `pub` for the reason [`Self::storm_motion_override`] beside it is: the
-    /// crate that owns the commit rule is `rustdar_frontend`.
-    pub srv_fallback: rustdar_radar::srv::SrvFallback,
-    /// Whether one of the storm-motion `DragValue`s is under the pointer or
-    /// holding the keyboard *right now*. See [`Self::storm_motion_mid_edit`].
-    ///
-    /// Session-only and never persisted: it describes a widget's state this
-    /// frame, not a setting. Written in two places, both in the frame path and
-    /// both clearing it: `render_settings_body`, which clears it before every
-    /// pass over the rows, and [`Self::ui`], which clears it for a frame where
-    /// those rows do not draw at all. A latch with neither would stick the
-    /// first time the panel closed mid-drag and the vector would never be
-    /// applied again.
-    ///
-    /// `pub` for the reason [`Self::storm_motion_override`] beside it is: the
-    /// crate that owns the commit rule is `rustdar_frontend`, and it has to be
-    /// able to drive both halves of it in a test.
-    pub storm_motion_editing: bool,
-    /// Whatever can actually draw a 3D pane, or `None` on a machine or a frame
-    /// where nothing can.
-    ///
-    /// `None` is the state **every headless test sees**, and the state after
-    /// every suspend and surface loss (`clear_graphics_state` drops it), so the
-    /// empty path is the ordinary path rather than the exceptional one.
-    ///
-    /// Not a constructor argument: the painter owns GPU handles, and those
-    /// arrive with the renderer several frames after the `Gui` exists — on the
-    /// web, asynchronously. A `Gui` that could not be built until a device
-    /// existed would be a `Gui` no test could build at all.
-    volume_painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
-    /// The user's Volume Alpha curves, one per edited product. See
-    /// [`crate::volume_alpha`]: absence means "render through the palette's
-    /// own alpha, bit-exactly", which is why this is a store of exceptions
-    /// rather than a curve per product.
-    pub(crate) volume_alpha: crate::volume_alpha::AlphaCurves,
-    /// The user's isosurface thresholds, one per edited product. See
-    /// [`crate::volume_iso`]: absence means the argued per-product default,
-    /// so this too is a store of exceptions.
-    pub(crate) volume_iso: crate::volume_iso::IsoThresholds,
-    /// Top-level config keys the loaded file carried that this build cannot
-    /// name, verbatim — the file-scope half of
-    /// [`crate::pane::PaneConfigBaggage`]'s story. Written by
-    /// `load_ui_config`, handed back untouched by `ui_config_json`, and
-    /// never acted on in between: preserving what a newer build wrote is
-    /// what makes running this build against its file safe.
-    config_unknown_fields: serde_json::Map<String, serde_json::Value>,
-    /// `overlay_states` entries the loaded file carried for handlers this
-    /// build does not have. The save writes the live handlers' state *over*
-    /// these, so a kind this build serves is described by its handler and
-    /// one it does not is handed back exactly as it arrived.
-    overlay_states_baggage: serde_json::Map<String, serde_json::Value>,
-}
-
-/// A storm motion vector the user may substitute for the RPG's.
-///
-/// The two numbers persist while the override is switched off so that toggling
-/// it does not lose what was typed — and they persist across sessions too
-/// (`UiConfig`), which closed the audit's known gap. `#[serde(default)]` on
-/// the struct keeps a config written before any one field existed loading;
-/// the writer guards the floats finite (see `ui_config_json`).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct StormMotionOverride {
-    pub enabled: bool,
-    /// Knots.
-    pub speed_kt: f32,
-    /// Degrees, meteorological convention — the direction the storm is coming
-    /// *from*, matching halfword 52 of the RPG's own product.
-    pub direction_deg: f32,
-}
-
-impl Default for StormMotionOverride {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            speed_kt: 30.0,
-            direction_deg: 240.0,
-        }
-    }
-}
-
-impl StormMotionOverride {
-    /// The vector to apply, or `None` to use the one the `N0S` product carries.
-    ///
-    /// Rejects non-finite values rather than passing them on. `DragValue`
-    /// parses `"nan"` and `"inf"`, and `f32::clamp` propagates NaN, so a typed
-    /// `nan` reaches the renderer as a whole field of NaN — and, because
-    /// `NaN != NaN`, makes the change detector in `set_storm_motion_override`
-    /// fire on every frame, re-rendering every storm-relative pane forever.
-    pub fn sample(&self) -> Option<rustdar_radar::srm::StormMotionSample> {
-        if !self.enabled {
-            return None;
-        }
-        // The constructor rejects non-finite values too; this is the boundary,
-        // that is the invariant.
-        rustdar_radar::srm::StormMotionSample::user_override(self.speed_kt, self.direction_deg)
-    }
-}
-
-impl Default for Gui {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1405,55 +476,6 @@ pub(crate) struct DrawnControlItem {
     pub label: String,
     pub kind: DrawnControlKind,
     pub rect: egui::Rect,
-}
-
-/// What one pass over a control tree drew. A no-op outside tests, like
-/// [`ui_menu::MenuFrame`].
-#[derive(Default)]
-pub(crate) struct ControlProbe {
-    #[cfg(test)]
-    pub drawn: Vec<DrawnDropdown>,
-    /// Every item drawn, whatever its shape. See [`DrawnControlItem`].
-    #[cfg(test)]
-    pub items: Vec<DrawnControlItem>,
-}
-
-impl ControlProbe {
-    #[inline]
-    fn record_dropdown(
-        &mut self,
-        _id: &'static str,
-        _label: &str,
-        _selected_text: &str,
-        _rect: egui::Rect,
-    ) {
-        #[cfg(test)]
-        self.drawn.push(DrawnDropdown {
-            id: _id,
-            label: _label.to_owned(),
-            selected_text: _selected_text.to_owned(),
-            rect: _rect,
-        });
-    }
-
-    /// Record one drawn item. Test-only, so the call sites are gated too —
-    /// unlike [`Self::record_dropdown`] this takes a test-only type.
-    #[cfg(test)]
-    #[inline]
-    fn record_item(
-        &mut self,
-        handler: OverlayKind,
-        kind: DrawnControlKind,
-        label: &str,
-        rect: egui::Rect,
-    ) {
-        self.items.push(DrawnControlItem {
-            handler: Some(handler),
-            label: label.to_owned(),
-            kind,
-            rect,
-        });
-    }
 }
 
 /// The line a **cross-section** pane's sidebar shows where a map pane's layer
@@ -1700,441 +722,6 @@ pub(crate) fn is_master_control(item: &ControlItem) -> bool {
 }
 
 impl Gui {
-    pub fn new() -> Self {
-        let radar_config = RadarConfig::default();
-        let date_string = radar_config.timestamp.format("%Y-%m-%d").to_string();
-        let time_string = radar_config.timestamp.format("%H:%M:%S").to_string();
-
-        let mut gui = Self {
-            radar: RadarState {
-                config: radar_config,
-                fetching: false,
-                error_message: None,
-            },
-            live_chunks: true,
-            chunk_notifications: true,
-            notifier_endpoint: crate::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
-            chunk_status: ChunkFeedStatus::default(),
-            current_volumes: HashMap::new(),
-            auto_poll: AutoPollState {
-                last_fetch_time: None,
-                enabled: true,
-                initial_fetch_done: false,
-                interval_secs: 60,
-            },
-            time_dialog: TimeDialogState {
-                date_string,
-                time_string,
-                show: false,
-            },
-            initial_zoom_set: false,
-            map_tiles: MapTileState::default(),
-            user_fix: None,
-            user_fix_at: None,
-            location_permission: rustdar_gps::LocationPermission::default(),
-            location_active: false,
-            location_settings_available: false,
-            catalogue_pending: false,
-            user_heading: None,
-            overlays: OverlayRegistry::default(),
-            panes: vec![PaneState::new()],
-            active_pane: 0,
-            pane_layout: PaneLayout::default(),
-            color_scale_orientation: ColorScaleOrientation::default(),
-            map_pane_geo: HashMap::new(),
-            volume_empty_states: HashMap::new(),
-            mirror_size_points: egui::Vec2::ZERO,
-            floor_tile_zoom_bias: 0,
-            #[cfg(test)]
-            last_map_panel_rect: egui::Rect::ZERO,
-            #[cfg(test)]
-            widget_id_probes: Vec::new(),
-            #[cfg(test)]
-            last_menu_leaves: Vec::new(),
-            #[cfg(test)]
-            last_pane_pointers: Vec::new(),
-            #[cfg(test)]
-            last_pane_content: Vec::new(),
-            #[cfg(test)]
-            last_volume_arms: Vec::new(),
-            #[cfg(test)]
-            last_pane_options: Vec::new(),
-            #[cfg(test)]
-            last_map_excluded_rects: Vec::new(),
-            #[cfg(test)]
-            last_pane_borders: Vec::new(),
-            #[cfg(test)]
-            last_section_tracks: Vec::new(),
-            #[cfg(test)]
-            last_region_boxes: Vec::new(),
-            #[cfg(test)]
-            last_alpha_buttons: Vec::new(),
-            #[cfg(test)]
-            last_paint_order: Vec::new(),
-            #[cfg(test)]
-            last_status_bar: StatusBarProbe::default(),
-            #[cfg(test)]
-            last_timeline: TimelineProbe::default(),
-            #[cfg(test)]
-            last_top_bar: TopBarProbe::default(),
-            #[cfg(test)]
-            last_stack: StackProbe::default(),
-            #[cfg(test)]
-            last_inspector: InspectorProbe::default(),
-            #[cfg(test)]
-            last_catalog: CatalogProbe::default(),
-            #[cfg(test)]
-            last_pills: Vec::new(),
-            #[cfg(test)]
-            last_pill_popover: None,
-            click_consumed_frame: false,
-            #[cfg(test)]
-            control_render_passes: 0,
-            #[cfg(test)]
-            last_dropdowns: Vec::new(),
-            #[cfg(test)]
-            last_control_items: Vec::new(),
-            #[cfg(test)]
-            last_settings_rows: Vec::new(),
-            #[cfg(test)]
-            last_popup_triggered: Vec::new(),
-            #[cfg(test)]
-            last_popup_handled: Vec::new(),
-            pending_pane_view: None,
-            section_draw_armed: false,
-            section_anchor: None,
-            pending_section_line: None,
-            region_pick_armed: false,
-            region_drag: None,
-            pending_region: None,
-            section_edit_drag: None,
-            section_handles: Vec::new(),
-            pending_section_edit: None,
-            loop_lookback_secs: 3600, // default 1 hour
-            loop_speed_fps: 5.0,      // default 5 fps
-            drawer_open: false,
-            stack_open: None,
-            insp_open: false,
-            insp_scroll_reset: false,
-            inspector_sel: InspectorSelection::AppSettings,
-            timeline_collapsed: false,
-            timeline_row2: false,
-            timeline_scrub: None,
-            statusbar_collapsed: false,
-            statusbar_rect: None,
-            status_bar_tick: None,
-            catalog_open: false,
-            catalog_query: String::new(),
-            catalog_save_name: String::new(),
-            catalog_saving: false,
-            site_query: String::new(),
-            stack_drag: None,
-            pill_revealed: None,
-            pills_drawn_last_frame: 0,
-            pills_raise_pending: false,
-            pin_pane_controls: false,
-            ui_faded: false,
-            fade_candidate: false,
-            press_switched_pane: false,
-            press_popup_open: false,
-            fade_factor: 1.0,
-            sheet_last_page: None,
-            toast_last_error: None,
-            presets: Vec::new(),
-            // The desktop arm of `constants::MAX_LOOP_FRAMES`; the frontend
-            // pushes the real target's value at startup.
-            loop_frame_budget: 60,
-            menu_popup_open: false,
-            menu_popup_close_requested: false,
-            menu_open: false,
-            sheet_extent: SheetExtent::Half,
-            sheet_drag: None,
-            phone_bar_height: 0.0,
-            #[cfg(test)]
-            last_bottom_bar: BottomBarProbe::default(),
-            #[cfg(test)]
-            last_sheet: SheetProbe::default(),
-            #[cfg(test)]
-            last_error_toast: None,
-            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
-            supports_exit: true,
-            modality: ModalityLatch::default(),
-            layout: LayoutCtx::default(),
-            interaction: InteractionState::default(),
-            preferences: UserPreferences::default(),
-            gps_config: rustdar_gps::GpsConfig::default(),
-            storm_motion_override: StormMotionOverride::default(),
-            srv_fallback: rustdar_radar::srv::SrvFallback::default(),
-            storm_motion_editing: false,
-            volume_painter: None,
-            volume_alpha: crate::volume_alpha::AlphaCurves::default(),
-            volume_iso: crate::volume_iso::IsoThresholds::default(),
-            config_unknown_fields: serde_json::Map::new(),
-            overlay_states_baggage: serde_json::Map::new(),
-        };
-        gui.initialize_pane_enabled();
-        gui
-    }
-
-    /// Create the UI using egui.
-    pub fn ui(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
-        let mut actions = Vec::new();
-
-        // The second writer of `storm_motion_editing`, and the reason a latch
-        // here cannot stick: the rows that clear it only run while the
-        // settings body is drawn, so a panel closed mid-drag would leave the
-        // commit deferred for ever. Cleared *before* the body draws, so a body
-        // that does draw this frame still gets the last word.
-        if !self.settings_visible() {
-            self.storm_motion_editing = false;
-        }
-
-        self.check_auto_polls(&mut actions);
-
-        // Resolve the frame's layout exactly once, before anything draws. Every
-        // responsive decision below reads `self.layout`; nothing recomputes a
-        // width or a modality of its own.
-        self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
-        #[cfg(test)]
-        {
-            self.widget_id_probes.clear();
-            self.last_menu_leaves.clear();
-            self.last_pane_pointers.clear();
-            // Cleared beside the pointer probes, and for the same reason: both
-            // are per-pane records of one frame's pane loop, so a leftover entry
-            // would report an arm that did not run this frame.
-            self.last_pane_content.clear();
-            // Same reason as the line above: a per-frame record of the pane
-            // loop, so a leftover entry would report a 3D arm that did not run.
-            self.last_volume_arms.clear();
-            // Per-frame paint records of the pane loop, on the same terms:
-            // the borders, the section tracks, the region boxes and the Volume
-            // Alpha corner buttons are all re-painted (or legitimately absent)
-            // each frame.
-            self.last_pane_borders.clear();
-            self.last_section_tracks.clear();
-            self.last_region_boxes.clear();
-            self.last_alpha_buttons.clear();
-            self.last_paint_order.clear();
-            // Cleared like the rest: the picker redraws from the top bar every
-            // frame, and appending over a stale list would report every button
-            // twice.
-            self.last_pane_options.clear();
-            // The handler dropdowns only exist while the layers panel is on
-            // screen, so a stale entry would report widgets that are not there.
-            self.last_dropdowns.clear();
-            // And its generalisation, for the same reason.
-            self.last_control_items.clear();
-            // Likewise: the settings rows only exist while the window is open.
-            self.last_settings_rows.clear();
-            // Per-frame records of the popup's action handling; a leftover
-            // entry would report a button press that did not happen this frame.
-            self.last_popup_triggered.clear();
-            self.last_popup_handled.clear();
-            // Per-frame records of the stack and inspector; a stale probe
-            // would report a panel that is no longer on screen. Reset rather
-            // than cleared, like the timeline's — `open: false` is a report,
-            // not an absence.
-            self.last_stack = StackProbe::default();
-            self.last_inspector = InspectorProbe::default();
-            self.last_catalog = CatalogProbe::default();
-            // Per-frame records of the pill rows and their popover; a stale
-            // entry would report a row for a pane no longer on screen.
-            self.last_pills.clear();
-            self.last_pill_popover = None;
-            // The double-render guard's counter; see the field.
-            self.control_render_passes = 0;
-            // Per-frame records of the phone shell's bottom cluster; reset
-            // like the stack's — `page: None` is a report, not an absence.
-            self.last_bottom_bar = BottomBarProbe::default();
-            self.last_sheet = SheetProbe::default();
-            // And of its error toast — `None` is "no toast drew".
-            self.last_error_toast = None;
-        }
-
-        // The sheet's Menu page is Compact chrome; on the wider widths the ☰
-        // Popup owns the menu with its own egui-managed state. Clearing the
-        // flag whenever the width says so is what keeps a resize with the
-        // page open from stranding a flag no surface renders — which
-        // `dismiss_top_layer` would then consume a back press against,
-        // invisibly.
-        if self.layout.width != crate::ui_layout::WidthClass::Compact {
-            self.menu_open = false;
-        }
-
-        // The fade's frame-top pass: while faded nothing may be open — a
-        // surface found open means the user acted through a route the
-        // pointer guards cannot see, and the repair is to unfade — and the
-        // frame's shared chrome opacity resolves here, once. See `ui_fade.rs`.
-        self.enforce_fade_invariants(ctx);
-
-        // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
-        // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is
-        // the only way in.
-        //
-        // The root rect is the *content* rect, so every `Panel` nested inside it
-        // is inset from the system bars and the notch for free. That is what
-        // replaced the hand-rolled `add_space(top_inset)` calls the mobile UI
-        // used to carry at each panel's top edge.
-        let mut root_ui = egui::Ui::new(
-            ctx.clone(),
-            egui::Id::new("rustdar_root"),
-            egui::UiBuilder::new()
-                .layer_id(egui::LayerId::background())
-                .max_rect(self.layout.content_rect),
-        );
-
-        // The shell first: the docked top bar claims its space, the floating
-        // surfaces — status bar, layer stack, inspector — position themselves
-        // in what it left, and that remainder — `shell.map_rect` — is the
-        // map's. See `ui_shell.rs`.
-        let shell = self.render_shell(&mut root_ui);
-        actions.extend(shell.actions);
-
-        if let Some(action) = self.render_time_dialog(ctx) {
-            actions.push(action);
-        }
-
-        actions.extend(self.render_panes(&mut root_ui, &shell.excluded_rects));
-
-        // After the pane loop, and therefore after every `mem::take` window in
-        // the frame has closed. See the `pending_pane_view` field for why
-        // converting a pane cannot be a direct write from the dispatcher that
-        // asked for it.
-        self.apply_pending_pane_view(&mut actions);
-        // Same window, and one thing more: this can grow `pane_count`, which
-        // moves `pane_rect` for every pane. Inside the loop that would leave the
-        // panes drawn after it hit-tested against rects they are no longer in.
-        self.apply_pending_section_line();
-        // The other modal drag's applier, on the same footing: it grows the
-        // layout through the same `grown_pane`, so it must be outside the loop
-        // for the same reason. Never both in one frame — the two modes are held
-        // mutually exclusive by their setters and share one detector — so the
-        // order between these two is unobservable, and they are adjacent so
-        // that the growth argument is read once for both.
-        self.apply_pending_region();
-        // After the modal-draw applier, so if both somehow fired in one frame
-        // the dropped edit — the later write — would win. The case is
-        // unreachable: an armed draw makes the handles inert, and beginning a
-        // handle drag requires no mode to be armed, so the two cannot both
-        // have a gesture to commit. This one can never grow the layout, so it
-        // takes no part in the ordering argument below.
-        self.apply_pending_section_edit();
-        // After the kind conversion, so a region that lands on a pane the same
-        // frame converted it finds a 3D pane rather than the map it used to be.
-        //
-        // # Two appliers, and why their order is not a design decision
-        //
-        // Both of these can grow the layout, and running two growths in one frame
-        // would be a case neither was written for: the second one's target rule
-        // would run against a layout the first had already changed, and in a full
-        // layout each rule's last resort is *the same pane* — so the second would
-        // convert the pane the first had just filled, and the user would see one
-        // of two completed gestures produce nothing.
-        //
-        // It cannot happen, and the reason is upstream of here: the two modes are
-        // mutually exclusive (see [`Self::set_section_draw_armed`]), only an armed
-        // mode can record a pending, and each pending is recorded and consumed
-        // inside a single frame. So at most one of these two lines does anything
-        // on any frame. The exclusivity that argument rests on is pinned by
-        // `arming_the_section_draw_clears_a_handle_drag_in_flight`, which is
-        // where the invariant lives — arming one mode clears the other's
-        // gesture, so two pendings cannot both be recorded. Be aware that the
-        // conclusion *about this call order* is not itself under test: the test
-        // that used to be cited here drove both toggles, and went with the
-        // render-mode split without a successor.
-
-        // The fade toggle, after the appliers like every other loop-recorded
-        // intent: it needs the pane loop's final consumption verdict, and the
-        // surfaces drawn below read the state it settles. See `ui_fade.rs`.
-        self.apply_fade_toggle(ctx);
-
-        // The pill rows, after the pane loop and the appliers: outside every
-        // `mem::take` window, so a popover pick writes real panes, and after
-        // the kind appliers so a row states the kind its pane ended the
-        // frame as. See `ui_pills.rs`.
-        self.render_pane_pills(ctx, shell.map_rect, &mut actions);
-
-        // The phone shell's bottom bar, before the timeline so the inline
-        // transport can position itself above the bar it just drew. Only on
-        // Compact — the wider widths keep the floating bottom-centred
-        // transport and no bar.
-        let phone_bar_top = (self.layout.width == crate::ui_layout::WidthClass::Compact)
-            .then(|| self.render_bottom_bar(ctx, shell.map_rect));
-        // Measured here and read by *next* frame's pane loop, which is the only
-        // order available: the loop paints the colour-scale legend into the
-        // map's own layer, and this bar is drawn opaque over that layer
-        // afterwards. Written on every frame including the ones that draw no
-        // bar, so a resize out of Compact — or the chrome fading out, which
-        // returns the map's own bottom edge and therefore a height of zero —
-        // hands the edge straight back to the legend instead of stranding an
-        // inset nothing is covering. See the field.
-        self.phone_bar_height =
-            phone_bar_top.map_or(0.0, |top| (shell.map_rect.bottom() - top).max(0.0));
-
-        // The timeline transport, after the pane loop and the appliers: every
-        // `mem::take` window in the frame has closed, so it reads and writes
-        // `self.panes[self.active_pane]` directly — the real pane, not a
-        // placeholder. See `ui_timeline.rs`.
-        self.render_timeline(ctx, shell.map_rect, phone_bar_top, &mut actions);
-
-        // The sheet, above everything the phone shell floats: the Layers and
-        // Inspector pages open their take window in here, so it must run
-        // after the pane loop and the appliers on the same terms as the
-        // shell's own pass — and the Catalog page's apply paths take panes
-        // themselves, so no window may already be open. See `ui_sheet.rs`.
-        if let Some(bar_top) = phone_bar_top {
-            self.render_phone_error_toast(ctx, shell.map_rect, true);
-            self.render_phone_sheet(ctx, shell.map_rect, bar_top, &mut actions);
-        } else {
-            // The error surface outranks the fade (the deliberate §1.8
-            // refinement in `ui_fade.rs`): the wide widths normally carry the
-            // error inside the status bar, which is faded — so while faded
-            // the phone's own toast presentation carries it instead. Called
-            // unconditionally so its rise and fall animate through the
-            // fade/unfade handoff; unfaded it presents nothing.
-            self.render_phone_error_toast(ctx, shell.map_rect, self.ui_faded);
-        }
-
-        // Floating windows last, so they layer above the chrome and the map.
-        // (Settings are no longer a window of their own: they are the
-        // inspector's App › Settings body, drawn by the shell above.) On
-        // Compact both return without drawing — the sheet pages above are
-        // their presentation there (plan §1.9).
-        self.render_overlay_popup(ctx);
-
-        // The Add-layer catalog, after the feature popup so it stacks above
-        // one left open — matching `dismiss_top_layer`, which closes the
-        // catalog first. Also after the appliers on its own account: applying
-        // a preset writes pane kinds directly and can grow the pane count,
-        // both of which are only safe once every take window has closed.
-        self.render_catalog(ctx, &mut actions);
-
-        // Ensure the handler state reflects the active pane's config at frame
-        // end, so any deferred actions (FetchOverlay, etc.) processed after the
-        // frame use the correct per-pane state.
-        let active = &self.panes[self.active_pane];
-        if !active.overlay_configs.is_empty() {
-            let configs = active.overlay_configs.clone();
-            self.overlays.load_pane_configs(&configs);
-        }
-
-        actions
-    }
-
-    /// The read-side context handlers are asked for their controls with, aimed
-    /// at the active pane.
-    ///
-    /// One constructor for the renderer and the test accessors alike, so the
-    /// model a test asks a handler for is built exactly as the renderer builds
-    /// it — the two diverging is how an inventory drifts from the glass.
-    fn active_pane_control_context(&self) -> PaneControlContext<'_> {
-        PaneControlContext {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        }
-    }
-
     /// The config a radar fetch on the active pane's behalf must use: the
     /// shared `radar.config` with the active pane's site substituted in.
     ///
@@ -2148,64 +735,6 @@ impl Gui {
         let mut config = self.radar.config.clone();
         config.site = self.active_pane().site.clone();
         config
-    }
-
-    /// Check timers and emit fetch actions for auto-polling radar scans,
-    /// NWS alerts, and SPC discussions.
-    fn check_auto_polls(&mut self, actions: &mut Vec<GuiAction>) {
-        // Auto-fetch on first load
-        if !self.auto_poll.initial_fetch_done && !self.radar.fetching {
-            self.radar.fetching = true;
-            self.auto_poll.initial_fetch_done = true;
-            self.auto_poll.record_fetch();
-            actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
-        }
-
-        // Poll for new scans at the current poll interval (only when any pane is viewing live)
-        if self.is_any_pane_live() && self.auto_poll.should_poll() && !self.radar.fetching {
-            // Check for new files without downloading — emit one check per unique live site
-            let now = chrono::Local::now().naive_local();
-            let current_scan_time = now
-                .with_second(0)
-                .and_then(|t| t.with_nanosecond(0))
-                .unwrap_or(now);
-
-            let mut seen_sites: Vec<&str> = Vec::with_capacity(self.pane_layout.pane_count);
-            for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-                if pane.viewing_live && !seen_sites.contains(&pane.site.as_str()) {
-                    seen_sites.push(&pane.site);
-                    let config = RadarConfig {
-                        site: pane.site.clone(),
-                        timestamp: current_scan_time,
-                    };
-                    actions.push(GuiAction::CheckForNewScans(config));
-                }
-            }
-
-            // Reset timer to avoid spamming checks
-            self.auto_poll.record_fetch();
-        }
-
-        // Auto-refresh overlay data when a layer is on screen and its own gate
-        // says a fetch may start. The gate is `OverlayHandler::auto_fetch_delay`
-        // and nothing here second-guesses it: it folds the poll clock, the fetch
-        // in flight, and the retry ladder into one duration, and this is the
-        // only place that reads it as "now".
-        //
-        // It used to be spelled out here as `fetch_time.is_none_or(elapsed >=
-        // interval)`. `fetch_time` is stamped only on success, so a failing
-        // layer answered "due" on every frame — 3089 SPC MD requests in 105 s
-        // in the browser. See `rustdar_overlays::fetch_policy`.
-        for &kind in OverlayKind::all() {
-            if self
-                .overlays
-                .auto_fetch_delay(kind)
-                .is_some_and(|d| d.is_zero())
-                && let Some(pane_idx) = self.first_pane_with_overlay_enabled(kind)
-            {
-                actions.push(GuiAction::FetchOverlay { kind, pane_idx });
-            }
-        }
     }
 
     /// Update the scan info for all panes viewing the given site.
@@ -2225,36 +754,6 @@ impl Gui {
         // let alone move every other pane's map.
         if any_pane_took_it {
             self.claim_initial_zoom();
-        }
-    }
-
-    /// Zoom to the radar on the first scan of a session and never again, so a
-    /// later load does not throw away the user's navigation.
-    ///
-    /// Factored out of [`Self::set_scan_info_for_site`] because
-    /// [`Self::apply_chunk_scan_info`] shares this one behaviour and none of the
-    /// others — and with chunks feeding live mode, the first data of a session
-    /// can arrive through either.
-    ///
-    /// # `load_ui_config` is the other writer of the latch
-    ///
-    /// This predates viewport persistence, when "the first scan of a session"
-    /// really did mean "the first data a default `Gui` ever saw". It no longer
-    /// does: a restored config sets every pane's zoom *before* any scan arrives,
-    /// so `Gui::load_ui_config` claims the latch itself when it restored one —
-    /// otherwise the first scan seconds later overwrites the user's zoom and the
-    /// next autosave persists the overwrite.
-    ///
-    /// What is left is the two cases where nothing was restored and a pane is
-    /// still sitting at the roughly continental `DEFAULT_PANE_ZOOM`: a first run
-    /// with no config, and a config written before the viewport was persisted.
-    /// Those are the reason this is still here.
-    fn claim_initial_zoom(&mut self) {
-        if !self.initial_zoom_set {
-            for pane in &mut self.panes {
-                let _ = pane.map_memory.set_zoom(DEFAULT_INITIAL_ZOOM);
-            }
-            self.initial_zoom_set = true;
         }
     }
 
@@ -2425,181 +924,6 @@ impl Gui {
         }
     }
 
-    /// Close the topmost thing the user has open, and say whether there was
-    /// one.
-    ///
-    /// What Escape and Android's back both mean: back out of the thing I am
-    /// in. Only when this returns `false` is the press a request to leave the
-    /// app — which is why a stray press with something open used to cost a
-    /// whole relaunch on a phone, back going straight to minimise.
-    ///
-    /// Ordered topmost first — whatever is painted over everything else is
-    /// what a press is aimed at — and exactly one layer closes per press.
-    /// The full order (contract 65): the in-flight handle drag → the fade →
-    /// the ☰ dropdown → catalog → feature → time → menu → inspector → the
-    /// stack's drawer form → the armed drags.
-    ///
-    /// Not derived from the order `ui` calls them in, which is shell (stack
-    /// and inspector included), then time dialog, then popup. The popup is
-    /// `Order::Foreground`, so egui stacks it above the `Order::Middle`
-    /// panels whatever the call order, and the time dialog sits between. This
-    /// order is asserted rather than computed; see
-    /// `a_back_press_closes_one_open_layer_at_a_time`.
-    ///
-    /// Below the Compact breakpoint the asserted chain gives way to the
-    /// sheet's projection: every page flag presents as one sheet there, so
-    /// the press pops exactly the page [`Gui::top_sheet_page`] reports on
-    /// top, and only the non-page layers (the in-flight drag, the armed
-    /// modes) keep their fixed places around it. See
-    /// `a_back_press_walks_the_phone_sheet_pages_top_down`.
-    ///
-    /// Deliberately not reachable from `request_exit`: the window's close
-    /// button and the menu's Exit item are unambiguous, and dismissing a dialog
-    /// instead of honouring them would strand the user — the Exit item lives
-    /// *inside* the ☰ dropdown this function closes first.
-    pub fn dismiss_top_layer(&mut self) -> bool {
-        // First, above everything painted: a handle drag in flight owns the
-        // pointer right now, which makes it the most immediate thing a "back
-        // out" gesture can be aimed at. Cancelling restores the line the drag
-        // started from — the preview was never written anywhere.
-        if self.section_edit_drag.is_some() {
-            self.section_edit_drag = None;
-            return true;
-        }
-        // The fade, next: while faded the invariant holds nothing else open
-        // (`enforce_fade_invariants`), so a back press can only mean "restore
-        // my UI" — the same reading every top-bar interaction gives it
-        // (§3.6's unfade-before-acting), and consistent with the chain's
-        // rule: the press is aimed at the most immediate state the user is
-        // in. Only the handle drag outranks it, because a drag in flight can
-        // exist *while* faded — the map stays interactive — and it owns the
-        // pointer right now. The armed modes cannot coexist with the fade
-        // (arming routes unfade first; an armed click never fades), so their
-        // place below is never contested.
-        if self.ui_faded {
-            self.ui_faded = false;
-            return true;
-        }
-        // The ☰ dropdown, above every dialog: it is `Order::Foreground` and
-        // opened last, and it is the head of the plan's Esc chain (§3.4).
-        //
-        // egui's `Popup` closes itself on the Escape *it* sees, but that
-        // covers one of this function's three routes. The frontend resolves
-        // the same Escape press here independently, and without this layer
-        // that resolution fell through to whatever sat beneath the popup —
-        // two layers on one press. Android's back is worse: a logical event
-        // that never enters egui's queue at all, so the popup would have
-        // stayed open over a drawer this function closed behind it. Consuming
-        // the press here and letting `render_top_bar_run` honour the request
-        // makes all three routes close the popup, and the popup only — the
-        // Escape egui also saw closes it twice over, idempotently.
-        if self.menu_popup_open {
-            self.menu_popup_open = false;
-            self.menu_popup_close_requested = true;
-            return true;
-        }
-        // On Compact every page flag presents as the sheet, so dismissal
-        // reads the same projection the renderer does: pop exactly the page
-        // `top_sheet_page` says is visibly on top. The fixed chain below
-        // cannot serve here, because flags can stack out of its order —
-        // flags set on a wider width and carried through a resize (the bar's
-        // own pages are exclusive since contract 64's revision, but a
-        // resize is not the bar) — and the chain would then pop a layer the
-        // projection never shows, consuming a press invisibly. One rule
-        // either side of the breakpoint: dismissal pops what is painted on
-        // top.
-        if self.layout.width == crate::ui_layout::WidthClass::Compact {
-            if let Some(page) = self.top_sheet_page() {
-                match page {
-                    sheet::SheetPage::Feature => {
-                        self.overlays.selected_overlays.clear();
-                        self.overlays.selected_overlay_page = 0;
-                    }
-                    sheet::SheetPage::Time => self.time_dialog.show = false,
-                    sheet::SheetPage::Catalog => self.catalog_open = false,
-                    sheet::SheetPage::Menu => self.menu_open = false,
-                    sheet::SheetPage::Inspector => {
-                        // The same reset the wide arm below makes: a
-                        // dismissal is a "back out", and what was backed out
-                        // of should not lie in wait for the next open.
-                        self.insp_open = false;
-                        self.inspector_sel = InspectorSelection::AppSettings;
-                    }
-                    sheet::SheetPage::Layers => self.drawer_open = false,
-                }
-                return true;
-            }
-        } else {
-            // The catalog, above the feature and time dialogs (plan §3.4 as
-            // amended): it is the modal opened last when it is open at all,
-            // and the frame draws it above a feature popup left open for the
-            // same reason.
-            if self.catalog_open {
-                self.catalog_open = false;
-                return true;
-            }
-            if !self.overlays.selected_overlays.is_empty() {
-                self.overlays.selected_overlays.clear();
-                self.overlays.selected_overlay_page = 0;
-                return true;
-            }
-            if self.time_dialog.show {
-                self.time_dialog.show = false;
-                return true;
-            }
-            // The phone sheet's Menu page has no presentation up here, and
-            // `Gui::ui` clears its flag on every wider frame — this arm only
-            // covers a press landing between a resize and the frame that
-            // normalises it.
-            if self.menu_open {
-                self.menu_open = false;
-                return true;
-            }
-            // The inspector, below the dialogs: it is a side panel, not a
-            // modal, so anything modal over the map outranks it. Closing
-            // resets the selection to App › Settings (plan §3.4) — a
-            // dismissal is a "back out", and what the user backed out of
-            // should not lie in wait for the next open.
-            if self.insp_open {
-                self.insp_open = false;
-                self.inspector_sel = InspectorSelection::AppSettings;
-                return true;
-            }
-            // The stack, in its drawer form only — the presentation that
-            // covers the map. The Expanded sidebar is deliberately not a
-            // dismissal target: it is open by default, and an Escape with
-            // nothing else open closing it would put the sidebar between
-            // every desktop user and "Escape means leave".
-            if self.drawer_open {
-                self.drawer_open = false;
-                return true;
-            }
-        }
-        // Last, below every painted layer, because an armed drag is a *mode*
-        // rather than something on screen: whatever is drawn over the map is
-        // what a press is aimed at, and the ☰ dropdown in particular is one of
-        // the two places the mode is armed from.
-        //
-        // Being here at all is what makes an armed drag cancellable by the two
-        // gestures that mean "back out" everywhere else — and on Android it is
-        // what stops the back button from exiting the app while a mode is on,
-        // which is the reading of a back press least likely to be what was meant.
-        //
-        if self.section_draw_armed {
-            self.set_section_draw_armed(false);
-            return true;
-        }
-        // The second armed mode, on the same footing and for the same reasons.
-        // Never both — the setters hold them exclusive — so the order between
-        // these two arms is unobservable, and they are adjacent so that a third
-        // mode is added here rather than somewhere it would be missed.
-        if self.region_pick_armed {
-            self.set_region_pick_armed(false);
-            return true;
-        }
-        false
-    }
-
     /// Whether a fetch someone is waiting on is in flight.
     ///
     /// Global rather than per-site, and it gates `check_auto_polls` — so any
@@ -2618,28 +942,6 @@ impl Gui {
         self.radar.error_message = Some(error);
         self.radar.fetching = false;
         self.auto_poll.on_error();
-    }
-
-    fn render_time_dialog(&mut self, ctx: &Context) -> Option<GuiAction> {
-        // On Compact the sheet's Time page is the presentation (plan §1.9) —
-        // the phone never draws this window.
-        if !self.time_dialog.show || self.layout.width == crate::ui_layout::WidthClass::Compact {
-            return None;
-        }
-
-        let mut action = None;
-        egui::Window::new("Set Time")
-            .collapsible(false)
-            .resizable(false)
-            .pivot(egui::Align2::CENTER_CENTER)
-            // Centred in the content rect, not the viewport: on a device
-            // with a notch or a nav bar those differ, and centring on the
-            // viewport puts the dialog partly underneath them.
-            .default_pos(self.layout.dialog_center())
-            .show(ctx, |ui| {
-                action = self.render_time_dialog_body(ui);
-            });
-        action
     }
 
     /// The Set Time dialog's body, host-free: the window above wraps it on
@@ -2806,7 +1108,7 @@ impl Gui {
         // sees the product picker survive a conversion while the tilt picker does
         // not.
         #[cfg(test)]
-        let probes = &mut self.widget_id_probes;
+        let probes = &mut self.probes.widget_id_probes;
         {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
                 if let Some(scan_info) = &pane.scan_info {
@@ -2898,143 +1200,6 @@ impl Gui {
         }
     }
 
-    /// Render **one** handler's controls — the only place handler
-    /// [`ControlItem`]s render, hosted by the inspector's layer body.
-    ///
-    /// The round trip is the old 12-kind loop's, for one kind: load the
-    /// active pane's config snapshot into the handlers, render the tree,
-    /// apply updates, honour Fetch effects, then save the (possibly mutated)
-    /// handler state back to the pane. This is what makes every sub-control
-    /// (categories, day, products, etc.) per-pane when Sync Layers is off —
-    /// and why there must be exactly one such pass per frame: each pass ends
-    /// by overwriting the pane's configs with the handlers' state, so a
-    /// second pass would save over the first's writes with whatever it had
-    /// loaded before them. The `control_render_passes` counter holds the
-    /// suite to that.
-    ///
-    /// The handler's own [`is_master_control`] items — its heading and its
-    /// master `enabled` toggle — are skipped: the inspector's crumb names the
-    /// layer and its "Show <layer>" toggle is the master, so rendering the
-    /// handler's copies would put two of each on screen with only one wired
-    /// to [`Self::select_layer`]'s discipline. The parity walk excludes them
-    /// through the same predicate, so the two cannot drift.
-    pub(super) fn render_overlay_controls_one(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-        kind: OverlayKind,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        #[cfg(test)]
-        {
-            self.control_render_passes += 1;
-        }
-
-        // Load this pane's config snapshot into the handlers.
-        if !pane.overlay_configs.is_empty() {
-            self.overlays.load_pane_configs(&pane.overlay_configs);
-        }
-
-        let ctx = self.active_pane_control_context();
-
-        // Render controls and collect updates.
-        let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
-        let mut probe = ControlProbe::default();
-
-        let controls = self.overlays.controls(kind, &ctx);
-        for item in controls.iter().filter(|item| !is_master_control(item)) {
-            render_control_item(ui, kind, item, &mut updates, &mut probe);
-        }
-
-        #[cfg(test)]
-        {
-            self.last_dropdowns.extend(probe.drawn.iter().cloned());
-            self.last_control_items.extend(probe.items.iter().cloned());
-        }
-        #[cfg(not(test))]
-        let _ = probe;
-
-        // Apply updates and handle effects.
-        let mut pane_ctx = PaneControlContextMut {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        };
-
-        let active_pane = self.active_pane;
-        for (kind, update) in updates {
-            let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
-            if matches!(effect, ControlEffect::Fetch) {
-                // Refresh, and every option change that implies one. A user
-                // pressing Refresh on a layer that has been backing off — or
-                // one given up on entirely — must be answered now.
-                push_user_overlay_fetch(&mut self.overlays, actions, kind, active_pane);
-            }
-        }
-
-        // Save the (possibly mutated) handler state back to the pane.
-        pane.overlay_configs = self.overlays.save_pane_configs();
-        pane.enabled_overlays = self.overlays.save_enabled_map();
-    }
-
-    /// The pane indices shared time fans out over: the active pane, plus —
-    /// with more than one pane — every visible pane whose
-    /// [`PaneState::time_link`] is still on (plan §3.7). The retired
-    /// `sync_layers` global no longer gates this: the per-pane link is the
-    /// whole model, and a migrated old config with the global off arrives
-    /// with every pane's link seeded off (see `load_ui_config`), which is
-    /// the same fan-out it had.
-    ///
-    /// The active pane is a target unconditionally, its own flag unread: it
-    /// is the pane whose control was operated, and "the pane I am driving
-    /// does not respond" is not a reading of unlink anyone means. Unlink says
-    /// *don't drag me along* — the exclusion is from the fan-out, not from
-    /// being driven directly.
-    fn time_sync_targets(&self) -> Vec<usize> {
-        if self.pane_layout.pane_count > 1 {
-            (0..self.pane_layout.pane_count)
-                .filter(|&idx| {
-                    idx == self.active_pane || self.panes.get(idx).is_none_or(|pane| pane.time_link)
-                })
-                .collect()
-        } else {
-            vec![self.active_pane]
-        }
-    }
-
-    /// [`Self::time_sync_targets`] narrowed to the panes a loop can feed —
-    /// the fan-out for every loop action.
-    ///
-    /// Panes that cannot loop are left out ([`PaneKind::can_loop`]), which today
-    /// means 3D volume panes. A loop is a sequence of rendered pictures and
-    /// `dispatch_loop_renders` feeds only the kinds that have one — so enabling
-    /// the loop with sync on would otherwise put every volume pane into
-    /// `is_active()` with a frame list nothing ever fills, which is a spinner in
-    /// the loop transport that never finishes and a download queue serving
-    /// nobody.
-    ///
-    /// It was `is_map` until cross-sections learned to loop, and widening it was
-    /// the *whole* of the change here: the narrowing has always been about which
-    /// panes something renders frames for, never about which panes draw a map.
-    ///
-    /// The active pane is a target unconditionally and is deliberately **never
-    /// tested**. The caller is now the floating timeline, which runs after
-    /// every `mem::take` window has closed, so the slot could safely be asked —
-    /// but the unconditional include stays correct and stays put: it is the
-    /// pane whose own toggle was clicked, and the timeline disables that
-    /// toggle for an active pane that cannot loop, which is the same guarantee the old
-    /// layers-panel host expressed by omitting the control. (When this ran
-    /// from inside the panel's take window, asking the slot would have read a
-    /// default `PaneState` — a *map* pane whatever the real one was — which is
-    /// why the rule was born this way round.)
-    fn loop_sync_targets(&self) -> Vec<usize> {
-        self.time_sync_targets()
-            .into_iter()
-            .filter(|&idx| {
-                idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::can_loop)
-            })
-            .collect()
-    }
-
     /// Turn an overlay on or off for `pane` — **both halves**, which is the
     /// whole discipline.
     ///
@@ -3093,57 +1258,6 @@ impl Gui {
         pane.release_disabled_overlay_textures();
     }
 
-    /// [`Self::write_pane_overlay`] plus the enable-fetch rule, in one place
-    /// for its three callers — the stack's eye, the inspector's Show toggle
-    /// and the catalog's tiles.
-    ///
-    /// The rule: a layer turned on with **nothing to draw, or nothing worth
-    /// trusting**, fetches now rather than waiting out an auto-poll interval —
-    /// the same effect its own sub-toggles ask for, and the only route for a
-    /// layer (SPC outlooks) that never auto-polls. `pane` is the caller's —
-    /// taken or not — and `pane_idx` is the index the fetch is attributed to,
-    /// because two of the callers hold the pane out of the vector where
-    /// `active_pane` cannot be assumed to be it (the preset applier walks every
-    /// pane).
-    ///
-    /// The health half of that condition is the fix for the recovery that did
-    /// not recover. The guard was `!has_data(kind)` alone, and `has_data` is
-    /// `!data.is_empty()` — so a layer that had worked, then started failing,
-    /// was *holding* data and therefore did not re-ask. Toggling it off and on
-    /// did nothing at all, which is the one case where the user is most likely
-    /// to try it: an alerts layer painting a warning set that stopped updating
-    /// an hour ago looks exactly like one that is current. "Off and on again"
-    /// has to mean something, and now it means "re-ask".
-    ///
-    /// What the original guard was for still holds: a layer with fresh, healthy
-    /// data does not spend a request on being switched on. That is what keeps a
-    /// preset that enables eight layers on four panes from becoming thirty-two
-    /// requests, and it is why this is not simply the guard deleted.
-    ///
-    /// One fetch per kind per frame: a second enable of the same kind in the
-    /// same batch (a preset enabling it on every pane) finds the first's
-    /// action already queued and does not queue another — the handlers are
-    /// global, so one fetch serves every pane.
-    pub(super) fn set_pane_overlay_with_fetch(
-        &mut self,
-        pane: &mut PaneState,
-        pane_idx: usize,
-        kind: OverlayKind,
-        on: bool,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        Self::write_pane_overlay(&mut self.overlays, pane, kind, on);
-        let stale = self
-            .overlays
-            .fetch_health(kind)
-            .is_some_and(FetchHealth::is_unhealthy);
-        if on && (!self.overlays.has_data(kind) || stale) && !self.overlays.is_fetching(kind) {
-            // Switching a layer on is a user action, so it clears whatever the
-            // ladder had accumulated — see `push_user_overlay_fetch`.
-            push_user_overlay_fetch(&mut self.overlays, actions, kind, pane_idx);
-        }
-    }
-
     /// [`Self::write_pane_overlay`] aimed at the active pane, for callers
     /// outside every `mem::take` window — the menu dispatcher, today.
     fn set_active_pane_overlay(&mut self, kind: OverlayKind, on: bool) {
@@ -3189,121 +1303,6 @@ impl Gui {
     /// fresh copy of it.
     pub fn settings_visible(&self) -> bool {
         self.insp_open && self.inspector_sel == InspectorSelection::AppSettings
-    }
-
-    /// Propagate layer settings from a layer-linked active pane to the other
-    /// layer-linked panes. Also converges site and scan_info so the linked
-    /// group displays the same radar site.
-    ///
-    /// # Per-pane gating (M11)
-    ///
-    /// [`PaneState::layer_link`] replaces the retired `sync_layers` global on
-    /// **both ends**. An unlinked *source* — the active pane with its link
-    /// off — propagates nothing: its edits are its own. An unlinked *target*
-    /// is never written: the group's edits leave it alone. Every call site
-    /// (the shell and sheet panel passes, the menu dispatcher, the pill
-    /// popovers, the catalog appliers) inherits the gate from here, which is
-    /// what makes it one rule instead of eight.
-    ///
-    /// # `content` is deliberately not one of the fields
-    ///
-    /// `PaneContent` derives `Clone`, so copying it costs nothing and the
-    /// omission is a decision rather than a limitation. What sync means here is
-    /// *what every pane is looking at* — the same radar, the same volume, the
-    /// same moment, the same time — and a pane's **kind** is not that. It is how
-    /// this pane presents it.
-    ///
-    /// Copying it would defeat the feature outright: a user splits the screen and
-    /// converts pane 2 to a 3D view precisely in order to see the volume
-    /// *alongside* the plan view on pane 1. Propagating the kind would convert
-    /// pane 1 as well, leaving two identical 3D panes and no map — from a
-    /// setting called "Sync Layers", with nothing to say what happened.
-    ///
-    /// The consequence, accepted: synced panes disagree about kind, and
-    /// per-kind state (a section's line, a volume's camera) is per pane. That is
-    /// the intended reading. Each still converges on site, scan, product,
-    /// elevation, live-or-parked, step and overlays, so the *subject* is shared
-    /// and only the presentation differs.
-    ///
-    /// `selected_elevation` is propagated to non-map panes too, even though a
-    /// whole-volume pane has no tilt. It is inert there rather than wrong, and
-    /// keeping it means a pane converted back to a map lands on the tilt its
-    /// siblings are showing instead of on whatever it held before.
-    ///
-    /// # `viewing_live` and `time_step_secs` honour the pane's time-link
-    ///
-    /// The two time fields fan out only to panes whose
-    /// [`PaneState::time_link`] is on (plan §3.7): unlink means *frozen*, and
-    /// a sync pass that dragged an unlinked pane back to live would undo the
-    /// freeze from a setting that is about layers. Every other field still
-    /// converges unconditionally — an unlinked pane is parked in time, not
-    /// exempt from the layout.
-    fn propagate_layer_sync(&mut self) {
-        if self.pane_layout.pane_count <= 1 || !self.panes[self.active_pane].layer_link {
-            return;
-        }
-        let src = &self.panes[self.active_pane];
-        let active_site = src.site.clone();
-        let active_scan_info = src.scan_info.clone();
-        let active_viewing_live = src.viewing_live;
-        let active_time_step_secs = src.time_step_secs;
-        let active_draw_order = src.draw_order.clone();
-        let active_enabled_overlays = src.enabled_overlays.clone();
-        let active_overlay_configs = src.overlay_configs.clone();
-        let active_selected_product = src.selected_product;
-        let active_selected_elevation = src.selected_elevation;
-
-        // Sync per-pane fields including enabled overlays, configs, and radar
-        // product/elevation. Not `content`: see the note on this function for
-        // why the pane's kind is the one field sync deliberately leaves alone.
-        // Hidden panes past the layout's count still converge when linked —
-        // the pre-M11 behaviour, kept so a re-split restores a pane that was
-        // moving with the group rather than one parked months in the past.
-        for (idx, p) in self.panes.iter_mut().enumerate() {
-            if idx == self.active_pane || !p.layer_link {
-                continue;
-            }
-            p.site = active_site.clone();
-            p.scan_info = active_scan_info.clone();
-            // The one gated pair — see the method note.
-            if p.time_link {
-                p.viewing_live = active_viewing_live;
-                p.time_step_secs = active_time_step_secs;
-            }
-            p.draw_order = active_draw_order.clone();
-            p.enabled_overlays = active_enabled_overlays.clone();
-            p.overlay_configs = active_overlay_configs.clone();
-            p.selected_product = active_selected_product;
-            p.selected_elevation = active_selected_elevation;
-            // This is the second way a pane's enabled map changes, and it is the
-            // one that bypasses `write_pane_overlay` entirely: the map arrives
-            // wholesale, with no kind named and no `on` to read. Without this
-            // line the release would have a hole exactly the shape of a split —
-            // the pane the user clicked lets its textures go and its linked
-            // siblings, which just adopted the same off-switch, keep theirs.
-            // Worse for the hidden ones, which nothing else would ever clear.
-            p.release_disabled_overlay_textures();
-        }
-    }
-
-    /// Initialize per-pane `enabled_overlays` from the current handler states.
-    ///
-    /// Called after `new()`, after `load_ui_config()` (backward compatibility
-    /// for configs without per-pane maps), and when the pane-count picker
-    /// grows the vector — anywhere a pane could otherwise be left with an
-    /// empty map that `is_overlay_enabled` reads as everything-off.
-    pub fn initialize_pane_enabled(&mut self) {
-        let defaults = self.overlays.build_enabled_map();
-        let default_configs = self.overlays.save_pane_configs();
-        for pane in &mut self.panes {
-            for (&kind, &enabled) in &defaults {
-                pane.enabled_overlays.entry(kind).or_insert(enabled);
-            }
-            // Seed overlay configs from handler defaults for panes with empty configs.
-            if pane.overlay_configs.is_empty() {
-                pane.overlay_configs = default_configs.clone();
-            }
-        }
     }
 
     /// Returns `true` if any pane has the given overlay kind enabled.
@@ -3639,45 +1638,6 @@ impl Gui {
         self.section_edit_drag
     }
 
-    /// Apply the view change the frame asked for, if any.
-    ///
-    /// Called from [`Self::ui`] after the pane loop, where every pane is back in
-    /// the vector. Changing what a pane draws keeps everything about what it is
-    /// looking *at* — see `PaneState::set_view` — so there is nothing else to
-    /// carry across.
-    fn apply_pending_pane_view(&mut self, actions: &mut Vec<GuiAction>) {
-        let Some((pane_idx, view)) = self.pending_pane_view.take() else {
-            return;
-        };
-        match self.panes.get_mut(pane_idx) {
-            Some(pane) => {
-                // Before the change, because after it the pane no longer
-                // remembers it was drawing a volume. A voxel grid is 1–8 MiB of
-                // host memory plus a GPU texture, refcounted by the volume it was
-                // built from, and this is the only moment a pane can stop
-                // needing one without anything else noticing: the pane is still
-                // on screen, still on the same site, still live. Nothing else in
-                // the frame is going to come back and ask.
-                //
-                // Keyed on the render *view* rather than the pane kind, because
-                // leaving 3D for the plan view no longer changes the kind — and
-                // a pane that quietly kept an 8 MiB grid it had stopped drawing
-                // is exactly the leak this call exists to close.
-                if pane.render_view() == rustdar_radar::types::RenderView::Volume
-                    && view != rustdar_radar::types::RenderView::Volume
-                {
-                    actions.push(GuiAction::ReleaseVolume { pane_idx });
-                }
-                pane.set_view(view);
-            }
-            // A pane the layout no longer holds, which a pane-count change in the
-            // same frame can produce. Dropped rather than clamped to another
-            // index: changing a pane the user did not point at is worse than
-            // changing none.
-            None => log::warn!("pane {pane_idx} is gone; not switching it to {view:?}"),
-        }
-    }
-
     /// Whether the cross-section draw is armed.
     pub fn section_draw_armed(&self) -> bool {
         self.section_draw_armed
@@ -3759,199 +1719,6 @@ impl Gui {
         (anchor.pane_idx == pane_idx).then_some((anchor.screen, anchor.current))
     }
 
-    /// Give the line this frame drew to a pane, converting or creating one if
-    /// need be.
-    ///
-    /// Called from [`Self::ui`] after the pane loop, where every pane is back in
-    /// the vector and growing the count can no longer desynchronise a rect from
-    /// the click that was hit-tested against it.
-    ///
-    /// # The target rule is total
-    ///
-    /// A drawn line always lands somewhere. Four steps, in order, and the order
-    /// is the whole design:
-    ///
-    /// 1. **A section pane already sourced from this map.** Drawing a second
-    ///    line on a map the user has already sectioned means "cut *there*
-    ///    instead", not "give me another section pane" — otherwise three lines
-    ///    fill the screen with panes nobody asked for.
-    /// 2. **Grow the layout.** A section beside the map it was cut from is the
-    ///    picture the feature is for, and it costs the user nothing they had.
-    /// 3. **The lowest-indexed section pane.** The layout is full; re-aiming an
-    ///    existing section is the cheapest thing that can still answer.
-    /// 4. **The highest-indexed pane that is not the one drawn on.** Converting
-    ///    a map is a real loss, so it is last — but it is *there*, because the
-    ///    alternative is a drag that silently does nothing. The pane drawn on is
-    ///    excluded because taking away the map under the line, while other panes
-    ///    exist to take instead, is the one conversion that is certainly wrong.
-    /// 5. **The pane drawn on.** Reachable only in a one-pane layout that cannot
-    ///    grow — a phone in portrait — and right there: on a screen with room
-    ///    for one thing, asking for a section is asking to look at a section.
-    ///    The pane's site, product and viewport all survive the conversion, so
-    ///    turning the checkbox back off restores the map it was.
-    fn apply_pending_section_line(&mut self) {
-        let Some((source, line)) = self.pending_section_line.take() else {
-            return;
-        };
-
-        // Whatever the source map is looking at, so a line drawn on a
-        // reflectivity map cuts reflectivity. A product with no vertical
-        // structure is carried across too, rather than quietly swapped: the
-        // pane says which product it cannot slice and offers the picker to
-        // change it, where a silent substitution would leave the user reading a
-        // moment they did not ask for.
-        let (source_product, source_site, source_scan) = match self.panes.get(source) {
-            Some(pane) => (
-                pane.selected_product,
-                pane.site.clone(),
-                pane.scan_info.clone(),
-            ),
-            None => {
-                log::warn!("pane {source} drew a section line and is already gone");
-                return;
-            }
-        };
-
-        let target = self
-            .section_pane_sourced_from(source)
-            .or_else(|| self.grown_pane())
-            .or_else(|| self.lowest_section_pane())
-            .or_else(|| self.highest_pane_other_than(source))
-            // Total by construction: `highest_pane_other_than` only answers
-            // `None` in a one-pane layout, and in one the source *is* the only
-            // pane there is. A drawn line is never silently dropped.
-            .unwrap_or(source);
-
-        let Some(pane) = self.panes.get_mut(target) else {
-            log::warn!("no pane could hold the section drawn on pane {source}");
-            return;
-        };
-        pane.set_kind(crate::pane::PaneKind::CrossSection);
-        pane.selected_product = source_product;
-        pane.site = source_site;
-        pane.scan_info = source_scan;
-        if let Some(section) = pane.cross_section_mut() {
-            section.line = Some(line);
-            section.source_pane = Some(source);
-            // The picture on screen is of the old line. Cleared rather than
-            // left to the staleness comparison, because a section pane whose
-            // texture outlives its line shows a cut through ground the user is
-            // no longer pointing at, for as long as the re-cut takes.
-            section.section = None;
-            section.texture = None;
-            section.unavailable = None;
-            section.rendered_for = None;
-        }
-        self.active_pane = target;
-    }
-
-    /// Give the region this frame dragged to a pane, converting or creating one
-    /// if need be.
-    ///
-    /// Called from [`Self::ui`] after the pane loop, beside
-    /// [`Self::apply_pending_section_line`] and for its reason: this can grow
-    /// the pane count, and a mid-loop growth moves the rects of every pane the
-    /// loop has not reached yet away from the ones `detect_active_pane_click`
-    /// hit-tested at the top of this same frame.
-    ///
-    /// # The target rule is total, and it is the section rule's shape
-    ///
-    /// A dragged region always lands somewhere. Five steps, in order:
-    ///
-    /// 1. **A 3D pane already sourced from this map.** A second drag on a map
-    ///    the user has already aimed a 3D view from means "look *there*
-    ///    instead", not "give me another 3D view" — otherwise adjusting a box
-    ///    three times fills the screen with panes nobody asked for. This is the
-    ///    common case after the first drag, and it is why
-    ///    [`VolumePane::source_pane`](crate::pane::VolumePane::source_pane)
-    ///    exists.
-    /// 2. **Grow the layout.** A 3D view beside the map it was picked from is
-    ///    the picture the feature is for, and it costs the user nothing they
-    ///    had — in particular it does not cost them the map they just dragged
-    ///    on, which they will want again to adjust the box.
-    /// 3. **The lowest-indexed 3D pane**, whatever map aimed it. The layout is
-    ///    full; re-aiming an existing 3D view is the cheapest thing that can
-    ///    still answer, and it beats converting because converting destroys a
-    ///    pane the user set up.
-    /// 4. **The highest-indexed pane that is not the one dragged on.** A real
-    ///    loss, so it is last but one — and it is *there*, because the
-    ///    alternative is a drag that silently does nothing, which is
-    ///    indistinguishable from one the app failed to receive. The pane
-    ///    dragged on is excluded because taking the map out from under the box
-    ///    the user just drew, while other panes exist to spend, is the one
-    ///    conversion that is certainly wrong.
-    /// 5. **The pane dragged on.** Reachable only in a one-pane layout that
-    ///    cannot grow — a phone in portrait — and right there: on a screen with
-    ///    room for one thing, asking for a 3D region is asking to look at it.
-    ///    Nothing is lost that a plan view cannot restore, because 3D is a
-    ///    *render mode* of the same map pane: the site, the product, the
-    ///    viewport and the plan view itself all survive, and the mode toggle is
-    ///    the way back.
-    ///
-    /// # Why the target takes the source map's site and moment
-    ///
-    /// The region names **ground**, and a 3D pane left on another site would
-    /// resample its own radar over it — a box drawn on an Oklahoma map filled
-    /// with a Florida volume, registered to the wrong place and captioned as if
-    /// it were right. So the site, the product and the scan follow the region,
-    /// exactly as they follow a section line.
-    fn apply_pending_region(&mut self) {
-        let Some((source, region)) = self.pending_region.take() else {
-            return;
-        };
-
-        let (source_product, source_site, source_scan) = match self.panes.get(source) {
-            Some(pane) => (
-                pane.selected_product,
-                pane.site.clone(),
-                pane.scan_info.clone(),
-            ),
-            None => {
-                log::warn!("pane {source} picked a 3D region and is already gone");
-                return;
-            }
-        };
-
-        let target = self
-            .volume_pane_sourced_from(source)
-            .or_else(|| self.grown_pane())
-            .or_else(|| self.lowest_volume_pane())
-            .or_else(|| self.highest_pane_other_than(source))
-            // Total by construction: `highest_pane_other_than` only answers
-            // `None` in a one-pane layout, and in one the source *is* the only
-            // pane there is. A dragged region is never silently dropped.
-            .unwrap_or(source);
-
-        let Some(pane) = self.panes.get_mut(target) else {
-            log::warn!("no pane could hold the region picked on pane {source}");
-            return;
-        };
-        // A cross-section pane has no render mode, so the kind comes first.
-        // `set_kind` keeps everything about what the pane is looking at, and
-        // `set_map_render` does nothing at all for a pane already in 3D — which
-        // is step 1's whole case, and is what keeps a re-aim from throwing away
-        // the camera the user spent a while aiming.
-        pane.set_kind(crate::pane::PaneKind::Map);
-        pane.set_map_render(crate::pane::MapRender::Volume);
-        pane.selected_product = source_product;
-        pane.site = source_site;
-        pane.scan_info = source_scan;
-        if let Some(volume) = pane.volume_mut() {
-            volume.region = Some(region);
-            volume.source_pane = Some(source);
-            // The picture on screen is of the old box, which a fresh drag can
-            // put across the state from. Blanked rather than left to the
-            // staleness key — which would notice, `region` being part of
-            // `VolumeTarget` — because a volume of somewhere else entirely is
-            // wrong for as long as it stands, and the rebuild is not instant.
-            // This is `apply_pending_section_line`'s judgement, and the
-            // handle-drop's opposite one does not apply: a picked region is a
-            // new aim, not the repeating step of walking a box through a storm.
-            volume.rendered_for = None;
-        }
-        self.active_pane = target;
-    }
-
     /// The first 3D pane whose region was dragged on `source`.
     fn volume_pane_sourced_from(&self, source: PaneId) -> Option<PaneId> {
         (0..self.visible_pane_count()).find(|&idx| {
@@ -3970,45 +1737,6 @@ impl Gui {
     /// silently flip a map the user is reading.
     fn lowest_volume_pane(&self) -> Option<PaneId> {
         (0..self.visible_pane_count()).find(|&idx| self.panes[idx].volume().is_some())
-    }
-
-    /// Write a dropped handle's line onto the section pane it belongs to.
-    ///
-    /// Called from [`Self::ui`] after the pane loop, where every pane is back
-    /// in the vector. The write is the line and **nothing else** — no target
-    /// rule (the drop already names its pane), no growth, and deliberately no
-    /// clearing of the picture on screen:
-    ///
-    /// # Why the old picture stands until the new cut lands
-    ///
-    /// [`Self::apply_pending_section_line`] blanks the pane, because a freshly
-    /// drawn line can be across the state from the old one and a picture of
-    /// somewhere else entirely is wrong for as long as it stands. A handle
-    /// drop is an *adjustment*: the new line overlaps the old one's ground,
-    /// the user's eyes are on the track they just moved, and this drop is the
-    /// repeating step of walking a line through a storm — blanking to
-    /// "Cutting the cross-section…" on every drop would strobe the pane
-    /// exactly when the user is using it most. The stale picture stands for
-    /// the fraction of a second the re-cut takes, the same way a section of
-    /// the previous *volume* stands while its successor is cut, and the
-    /// staleness key — which carries the line — is what notices and re-cuts
-    /// without any help from here.
-    fn apply_pending_section_edit(&mut self) {
-        let Some((pane_idx, line)) = self.pending_section_edit.take() else {
-            return;
-        };
-        let Some(section) = self
-            .panes
-            .get_mut(pane_idx)
-            .and_then(|p| p.cross_section_mut())
-        else {
-            // A pane-count change or a conversion in the same frame. Dropped
-            // rather than retargeted: re-aiming a pane the user did not drag
-            // on is worse than losing an adjustment they can repeat.
-            log::warn!("pane {pane_idx} is no longer a section pane; dropping the edited line");
-            return;
-        };
-        section.line = Some(line);
     }
 
     /// The first section pane whose line was drawn on `source`.
@@ -4061,35 +1789,36 @@ impl Gui {
     /// What the 3D arm decided for each volume pane on the last frame.
     #[cfg(test)]
     pub(crate) fn volume_arms_for_test(&self) -> &[VolumeArmProbe] {
-        &self.last_volume_arms
+        &self.probes.last_volume_arms
     }
 
     /// The pane borders the last frame painted: pane index, the stroke's
     /// painted bounds, and whether it was the active highlight.
     #[cfg(test)]
     pub(crate) fn pane_borders_for_test(&self) -> &[(usize, egui::Rect, bool)] {
-        &self.last_pane_borders
+        &self.probes.last_pane_borders
     }
 
     /// The section tracks the last frame painted: map pane, section pane,
     /// and the painted A and B endpoints.
     #[cfg(test)]
     pub(crate) fn section_tracks_for_test(&self) -> &[(usize, usize, egui::Pos2, egui::Pos2)] {
-        &self.last_section_tracks
+        &self.probes.last_section_tracks
     }
 
     /// The committed region boxes the last frame painted: map pane, 3D pane,
     /// and the painted rect.
     #[cfg(test)]
     pub(crate) fn region_boxes_for_test(&self) -> &[(usize, usize, egui::Rect)] {
-        &self.last_region_boxes
+        &self.probes.last_region_boxes
     }
 
     /// Pane `idx`'s dispatched kinds in paint order, with the layer each
     /// painted into — the draw-order pin's read side.
     #[cfg(test)]
     pub(crate) fn paint_order_for_test(&self, idx: usize) -> Vec<(OverlayKind, egui::LayerId)> {
-        self.last_paint_order
+        self.probes
+            .last_paint_order
             .iter()
             .find(|(pane, _)| *pane == idx)
             .map(|(_, order)| order.clone())
@@ -4099,7 +1828,7 @@ impl Gui {
     /// The Volume Alpha corner buttons the last frame drew, per pane.
     #[cfg(test)]
     pub(crate) fn alpha_buttons_for_test(&self) -> &[(usize, egui::Rect)] {
-        &self.last_alpha_buttons
+        &self.probes.last_alpha_buttons
     }
 
     /// Whether pane `idx` is a pane the **plan-view** pipeline must skip: it
@@ -4222,32 +1951,32 @@ impl Gui {
     /// The rect the pane grid was laid out in on the last frame.
     #[cfg(test)]
     pub(crate) fn map_panel_rect_for_test(&self) -> egui::Rect {
-        self.last_map_panel_rect
+        self.probes.last_map_panel_rect
     }
 
     /// The egui `Id`s the last frame's layers panel resolved.
     #[cfg(test)]
     pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
-        &self.widget_id_probes
+        &self.probes.widget_id_probes
     }
 
     /// Every menu leaf the last frame actually drew, as the renderer reported
     /// it — see [`ui_menu::DrawnMenuLeaf`].
     #[cfg(test)]
     pub(crate) fn menu_leaves_for_test(&self) -> &[ui_menu::DrawnMenuLeaf] {
-        &self.last_menu_leaves
+        &self.probes.last_menu_leaves
     }
 
     /// The pointer state `render_panes` resolved for each pane last frame.
     #[cfg(test)]
     pub(crate) fn pane_pointers_for_test(&self) -> &[crate::ui_input::PanePointerProbe] {
-        &self.last_pane_pointers
+        &self.probes.last_pane_pointers
     }
 
     /// Which render arm ran for each pane last frame. See [`PaneContentProbe`].
     #[cfg(test)]
     pub(crate) fn pane_content_for_test(&self) -> &[PaneContentProbe] {
-        &self.last_pane_content
+        &self.probes.last_pane_content
     }
 
     /// Whether a label-tile source has been created, which is the observable half
@@ -4274,7 +2003,7 @@ impl Gui {
         _rect: egui::Rect,
     ) {
         #[cfg(test)]
-        self.last_pane_content.push(PaneContentProbe {
+        self.probes.last_pane_content.push(PaneContentProbe {
             pane_idx: _pane_idx,
             view: _view,
             rect: _rect,
@@ -4284,49 +2013,49 @@ impl Gui {
     /// The pane-count buttons the picker drew on the last frame.
     #[cfg(test)]
     pub(crate) fn pane_options_for_test(&self) -> &[PaneOptionProbe] {
-        &self.last_pane_options
+        &self.probes.last_pane_options
     }
 
     /// The excluded rects `render_panes` was handed on the last frame.
     #[cfg(test)]
     pub(crate) fn map_excluded_rects_for_test(&self) -> &[egui::Rect] {
-        &self.last_map_excluded_rects
+        &self.probes.last_map_excluded_rects
     }
 
     /// What the last frame's status bar drew.
     #[cfg(test)]
     pub(crate) fn status_bar_for_test(&self) -> &StatusBarProbe {
-        &self.last_status_bar
+        &self.probes.last_status_bar
     }
 
     /// What the last frame's timeline transport drew.
     #[cfg(test)]
     pub(crate) fn timeline_for_test(&self) -> &TimelineProbe {
-        &self.last_timeline
+        &self.probes.last_timeline
     }
 
     /// What the last frame's top bar drew.
     #[cfg(test)]
     pub(crate) fn top_bar_for_test(&self) -> &TopBarProbe {
-        &self.last_top_bar
+        &self.probes.last_top_bar
     }
 
     /// What the last frame's bottom bar drew.
     #[cfg(test)]
     pub(crate) fn bottom_bar_for_test(&self) -> &BottomBarProbe {
-        &self.last_bottom_bar
+        &self.probes.last_bottom_bar
     }
 
     /// What the last frame's phone sheet drew.
     #[cfg(test)]
     pub(crate) fn sheet_for_test(&self) -> &SheetProbe {
-        &self.last_sheet
+        &self.probes.last_sheet
     }
 
     /// What the last frame's phone error toast drew, if it drew.
     #[cfg(test)]
     pub(crate) fn error_toast_for_test(&self) -> Option<ErrorToastProbe> {
-        self.last_error_toast
+        self.probes.last_error_toast
     }
 
     /// Open or close the sheet's Menu page directly, for the chain tests
@@ -4339,31 +2068,31 @@ impl Gui {
     /// What the last frame's layer stack drew.
     #[cfg(test)]
     pub(crate) fn stack_for_test(&self) -> &StackProbe {
-        &self.last_stack
+        &self.probes.last_stack
     }
 
     /// What the last frame's inspector drew.
     #[cfg(test)]
     pub(crate) fn inspector_for_test(&self) -> &InspectorProbe {
-        &self.last_inspector
+        &self.probes.last_inspector
     }
 
     /// What the last frame's Add-layer catalog drew.
     #[cfg(test)]
     pub(crate) fn catalog_for_test(&self) -> &CatalogProbe {
-        &self.last_catalog
+        &self.probes.last_catalog
     }
 
     /// What the last frame's pill rows drew, in pane order.
     #[cfg(test)]
     pub(crate) fn pill_rows_for_test(&self) -> &[pills::PillRowProbe] {
-        &self.last_pills
+        &self.probes.last_pills
     }
 
     /// The pill popover the last frame drew, if one was open.
     #[cfg(test)]
     pub(crate) fn pill_popover_for_test(&self) -> Option<&pills::PillPopoverProbe> {
-        self.last_pill_popover.as_ref()
+        self.probes.last_pill_popover.as_ref()
     }
 
     /// Whether some feature consumed the last frame's map click — see the
@@ -4383,7 +2112,7 @@ impl Gui {
     /// this to at most one after every frame — see the field.
     #[cfg(test)]
     pub(crate) fn control_render_passes_for_test(&self) -> u32 {
-        self.control_render_passes
+        self.probes.control_render_passes
     }
 
     /// Open or close the Set Time dialog directly, for fixtures that need a
@@ -4426,23 +2155,6 @@ impl Gui {
         self.panes.iter().all(|pane| pane.layer_link)
     }
 
-    /// Set one pane's overlay state, writing the config as well as the enabled
-    /// map — `render_overlay_controls_one` reloads the handlers from the config
-    /// every frame it runs, so a write to `enabled_overlays` alone is undone.
-    #[cfg(test)]
-    pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: OverlayKind, on: bool) {
-        let configs = self.panes[idx].overlay_configs.clone();
-        if !configs.is_empty() {
-            self.overlays.load_pane_configs(&configs);
-        }
-        self.overlays.set_enabled(kind, on);
-        let configs = self.overlays.save_pane_configs();
-        let enabled = self.overlays.save_enabled_map();
-        let pane = &mut self.panes[idx];
-        pane.overlay_configs = configs;
-        pane.enabled_overlays = enabled;
-    }
-
     /// Open or close the layers drawer, as the top bar's Layers toggle does
     /// below the sidebar breakpoint.
     #[cfg(test)]
@@ -4453,31 +2165,21 @@ impl Gui {
     /// Every handler dropdown the last frame drew. See [`DrawnDropdown`].
     #[cfg(test)]
     pub(crate) fn dropdowns_for_test(&self) -> &[DrawnDropdown] {
-        &self.last_dropdowns
+        &self.probes.last_dropdowns
     }
 
     /// Every control item the last frame drew, whatever its shape. See
     /// [`DrawnControlItem`].
     #[cfg(test)]
     pub(crate) fn control_items_for_test(&self) -> &[DrawnControlItem] {
-        &self.last_control_items
-    }
-
-    /// The [`ControlItem`] tree `kind`'s handler is currently offering — the
-    /// *model* behind the [`DrawnControlItem`]s, asked of the handler rather
-    /// than of the renderer, exactly as [`Self::dropdown_model_for_test`] asks
-    /// for one dropdown.
-    #[cfg(test)]
-    pub(crate) fn control_item_model_for_test(&self, kind: OverlayKind) -> Vec<ControlItem> {
-        let ctx = self.active_pane_control_context();
-        self.overlays.controls(kind, &ctx)
+        &self.probes.last_control_items
     }
 
     /// Every settings row the last frame drew. See
     /// [`settings::DrawnSettingsRow`].
     #[cfg(test)]
     pub(crate) fn settings_rows_for_test(&self) -> &[settings::DrawnSettingsRow] {
-        &self.last_settings_rows
+        &self.probes.last_settings_rows
     }
 
     /// What the last frame's detail popup did with its action buttons:
@@ -4486,44 +2188,9 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn popup_actions_for_test(&self) -> (Vec<usize>, Vec<usize>) {
         (
-            self.last_popup_triggered.clone(),
-            self.last_popup_handled.clone(),
+            self.probes.last_popup_triggered.clone(),
+            self.probes.last_popup_handled.clone(),
         )
-    }
-
-    /// The `(options, selected)` a handler is currently offering under `label`
-    /// — the *model* behind a [`DrawnDropdown`], asked of the handler rather
-    /// than of the renderer.
-    #[cfg(test)]
-    pub(crate) fn dropdown_model_for_test(
-        &self,
-        label: &str,
-    ) -> Option<(Vec<(String, String)>, String)> {
-        let ctx = self.active_pane_control_context();
-        fn find(items: &[ControlItem], label: &str) -> Option<(Vec<(String, String)>, String)> {
-            for item in items {
-                match item {
-                    ControlItem::Dropdown {
-                        label: l,
-                        options,
-                        selected,
-                        ..
-                    } if l == label => {
-                        return Some((options.clone(), selected.clone()));
-                    }
-                    ControlItem::Section { items, .. } => {
-                        if let Some(found) = find(items, label) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        OVERLAY_CONTROL_ORDER
-            .iter()
-            .find_map(|&kind| find(&self.overlays.controls(kind, &ctx), label))
     }
 
     /// This frame's resolved layout, for tests asserting on the breakpoint.
@@ -4541,7 +2208,7 @@ impl Gui {
     /// clicked one would be asserting about a pane the app does not have.
     #[cfg(test)]
     pub(crate) fn pane_rects_for_test(&self) -> Vec<egui::Rect> {
-        let panel = self.last_map_panel_rect;
+        let panel = self.probes.last_map_panel_rect;
         (0..self.visible_pane_count())
             .map(|idx| self.pane_layout.pane_rect(idx, panel))
             .collect()
@@ -4556,23 +2223,6 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn claim_pane_count_for_test(&mut self, count: usize) {
         self.pane_layout = PaneLayout::for_count(count);
-    }
-
-    /// Turn a texture overlay on for every pane, as ticking its layer toggle does.
-    ///
-    /// The handler's own state has to be written back into each pane's
-    /// `overlay_configs`, not just into `enabled_overlays`: every frame reloads the
-    /// registry from the pane's configs and then saves the enabled map back out, so
-    /// a pane whose config still says "off" turns itself off again on the next frame.
-    #[cfg(test)]
-    pub(crate) fn enable_overlay_for_test(&mut self, kind: OverlayKind) {
-        self.overlays.set_enabled(kind, true);
-        let configs = self.overlays.save_pane_configs();
-        let enabled = self.overlays.save_enabled_map();
-        for pane in &mut self.panes {
-            pane.overlay_configs = configs.clone();
-            pane.enabled_overlays = enabled.clone();
-        }
     }
 
     /// Whether pane `idx`'s layer state belongs to the linked group — the
@@ -4855,21 +2505,6 @@ impl Gui {
         [radar, overlays].into_iter().flatten().min()
     }
 
-    /// When one overlay's auto-refresh is next due, on the same terms as
-    /// [`Self::auto_poll_delay`]. `None` when this layer does not auto-poll,
-    /// when no pane on screen can draw it, or when its fetch is already in
-    /// flight.
-    fn overlay_poll_delay(&self, kind: OverlayKind) -> Option<std::time::Duration> {
-        if !self.any_pane_has_overlay_enabled(kind) {
-            return None;
-        }
-        // The same reading `check_auto_polls` fires on, not a second derivation
-        // of it. These were two spellings of one rule — one in whole seconds,
-        // one in durations — and a wake spent on a frame that polls nothing is
-        // the busy loop with extra steps.
-        self.overlays.auto_fetch_delay(kind)
-    }
-
     /// How long until the status bar's own text would read differently, or
     /// `None` when nothing on screen is restating the clock.
     ///
@@ -5018,177 +2653,6 @@ impl Gui {
         &self,
     ) -> Option<&std::sync::Arc<dyn crate::volume_view::VolumePainter>> {
         self.volume_painter.as_ref()
-    }
-
-    /// Propagate the interacted pane's viewport (zoom + position) to the
-    /// linked group.
-    ///
-    /// Bounded by [`Self::visible_pane_count`], not the layout's raw count:
-    /// hidden panes are neither read as a sync source nor written to, and a
-    /// count that ran ahead of the vector cannot index past its end.
-    ///
-    /// # The group is per-pane now (M11)
-    ///
-    /// The linked group is the visible map panes with
-    /// [`PaneState::viewport_link`] on — the retired `viewport_sync` global's
-    /// successor. Three rules, each pinned:
-    ///
-    /// * a change on a **linked** pane drives the group — the interacted pane
-    ///   must be linked to be the source;
-    /// * a change on an **unlinked** pane moves only itself — the scan still
-    ///   spots it first, and returning there (rather than falling through to
-    ///   the active-pane hold) is what keeps its local move local;
-    /// * an unlinked pane is never a **target** — the group's convergence
-    ///   writes the linked panes and no one else.
-    ///
-    /// # Why panes that do not share a viewport are excluded from both ends
-    ///
-    /// The membership test is [`PaneState::shares_viewport`], which is where
-    /// the decision and its reasons are written down — including why a 3D pane
-    /// is out of the group even though it has a viewport of its own, and why
-    /// `draws_ground` is the wrong question to ask here. What follows is the
-    /// older half of it, about panes with no viewport at all.
-    ///
-    /// This is the all-panes site a non-map pane breaks the moment one can
-    /// exist, and it breaks it in the direction that looks like a bug in the
-    /// *other* panes. Every pane carries a `map_memory` whatever its kind —
-    /// they are flat fields, deliberately — and `render_panes` resolves the
-    /// active pane's pointer through `InteractionState::resolve_active`, which
-    /// on the touch path hands that `map_memory` to `TouchGestures::update` and
-    /// lets it write a zoom. So a double-tap-drag on a section pane moves a
-    /// viewport nothing is drawing, this function then picks that pane as the
-    /// **source** because it is the first whose zoom changed, and every map pane
-    /// on screen is re-centred and re-zoomed to it. `viewport_link` defaults
-    /// **on**, so that is the shipped default behaviour, not an opt-in.
-    ///
-    /// Excluded as a *target* as well, for a quieter reason: a converted pane's
-    /// viewport is what it comes back to when it is converted back to a map, and
-    /// it is persisted per pane. Overwriting it would silently move a map the
-    /// user is not looking at yet.
-    fn sync_viewports(&mut self, pre_zooms: &[f64], pre_positions: &[Option<walkers::Position>]) {
-        let pane_count = self.visible_pane_count();
-        if pane_count <= 1 {
-            return;
-        }
-        let mut source_idx = None;
-        for idx in 0..pane_count {
-            if !self.panes[idx].shares_viewport() {
-                continue;
-            }
-            if idx < pre_zooms.len() {
-                let zoom_diff = (self.panes[idx].map_memory.zoom() - pre_zooms[idx]).abs();
-                if zoom_diff > 0.0001 {
-                    source_idx = Some(idx);
-                    break;
-                }
-                let prev_pos = &pre_positions[idx];
-                let curr_pos = self.panes[idx].map_memory.detached();
-                let pos_changed = match (prev_pos, &curr_pos) {
-                    (Some(p1), Some(p2)) => {
-                        (p1.x() - p2.x()).abs() > 0.00001 || (p1.y() - p2.y()).abs() > 0.00001
-                    }
-                    (None, Some(_)) | (Some(_), None) => true,
-                    _ => false,
-                };
-                if pos_changed {
-                    source_idx = Some(idx);
-                    break;
-                }
-            }
-        }
-        // A move on an unlinked pane is the pane's own: neither drive the
-        // group from it nor fall through to the active-pane hold, which would
-        // spend the frame fighting nobody on the linked panes while the local
-        // move stays local anyway — returning says what happened.
-        if let Some(idx) = source_idx
-            && !self.panes[idx].viewport_link
-        {
-            return;
-        }
-        // Nothing moved, so the active pane holds the others where they are —
-        // unless it has no map, in which case its `map_memory` is not a viewport
-        // anyone is looking at and there is nothing to propagate; or its link
-        // is off, in which case its viewport is its own and holding the group
-        // to it would be the unlinked pane driving after all. Returning is
-        // the whole point: `unwrap_or(self.active_pane)` on its own would make a
-        // non-map active pane the source on every frame, which is the same
-        // failure as the source scan above with no interaction needed at all.
-        let Some(src) = source_idx.or_else(|| {
-            let active = &self.panes[self.active_pane];
-            (active.shares_viewport() && active.viewport_link).then_some(self.active_pane)
-        }) else {
-            return;
-        };
-        let zoom = self.panes[src].map_memory.zoom();
-        let pos = self.panes[src].map_memory.detached();
-        for idx in 0..pane_count {
-            if idx != src && self.panes[idx].shares_viewport() && self.panes[idx].viewport_link {
-                let _ = self.panes[idx].map_memory.set_zoom(zoom);
-                if let Some(p) = pos {
-                    self.panes[idx].map_memory.center_at(p);
-                }
-            }
-        }
-    }
-
-    /// Apply a sync section's action rows (`pills::sync_section_ui`), with
-    /// `pane` as the section's own pane — held **out of the vector** by both
-    /// callers (the pill popover takes it for the section's duration, the
-    /// inspector's pass holds it throughout), so `self.panes[idx]` is a
-    /// placeholder this function must never read; it skips `idx` everywhere
-    /// and writes the source's own fields through `pane`.
-    ///
-    /// **Match all panes to this view**: copy `pane`'s zoom — and its centre,
-    /// when it has panned off its site — to every visible pane that shares a
-    /// viewport ([`PaneState::shares_viewport`]), links untouched. The one-shot
-    /// alignment: a following source hands out its zoom and leaves each
-    /// target's centre alone, exactly as [`Self::sync_viewports`] would, and it
-    /// skips the same panes for the same written-down reasons.
-    ///
-    /// **Re-link all here**: that copy, plus all three links turned on for
-    /// `pane` and every visible pane — and this pane made active, so the
-    /// standard convergence that follows (`propagate_layer_sync`, the
-    /// viewport hold) reads *this* pane as the group's reference. "Here" is a
-    /// place: everything comes home to it. `viewport_link` is written on a 3D
-    /// pane too, where it is inert until the pane shows the map again: the
-    /// field is the pane's stored intent, and leaving it off would mean
-    /// "re-link all" quietly excepted a pane that is going to rejoin the group
-    /// the moment it is switched back.
-    pub(super) fn apply_sync_outcome(
-        &mut self,
-        outcome: &pills::SyncSectionOutcome,
-        pane: &mut PaneState,
-        idx: PaneId,
-    ) {
-        let count = self.visible_pane_count();
-        if outcome.match_all || outcome.relink_all {
-            let zoom = pane.map_memory.zoom();
-            let pos = pane.map_memory.detached();
-            for target in 0..count {
-                if target == idx || !self.panes[target].shares_viewport() {
-                    continue;
-                }
-                let _ = self.panes[target].map_memory.set_zoom(zoom);
-                if let Some(p) = pos {
-                    self.panes[target].map_memory.center_at(p);
-                }
-            }
-        }
-        if outcome.relink_all {
-            pane.viewport_link = true;
-            pane.layer_link = true;
-            pane.time_link = true;
-            for target in 0..count {
-                if target == idx {
-                    continue;
-                }
-                let target = &mut self.panes[target];
-                target.viewport_link = true;
-                target.layer_link = true;
-                target.time_link = true;
-            }
-            self.active_pane = idx;
-        }
     }
 }
 

@@ -77,7 +77,7 @@ impl super::Gui {
             // a wider frame would claim a bar that is not on screen.
             #[cfg(test)]
             {
-                self.last_status_bar = super::StatusBarProbe::default();
+                self.probes.last_status_bar = super::StatusBarProbe::default();
             }
             return;
         }
@@ -89,7 +89,7 @@ impl super::Gui {
         let Some(fade) = self.chrome_fade() else {
             #[cfg(test)]
             {
-                self.last_status_bar = super::StatusBarProbe::default();
+                self.probes.last_status_bar = super::StatusBarProbe::default();
             }
             return;
         };
@@ -288,7 +288,7 @@ impl super::Gui {
         {
             probe.rect = area.response.rect;
             probe.collapsed = self.statusbar_collapsed;
-            self.last_status_bar = probe;
+            self.probes.last_status_bar = probe;
         }
         #[cfg(not(test))]
         let _ = area;

@@ -399,7 +399,7 @@ impl super::Gui {
     ) {
         #[cfg(test)]
         {
-            self.last_timeline = TimelineProbe::default();
+            self.probes.last_timeline = TimelineProbe::default();
         }
 
         // The fade (§1.8): fully faded, neither form renders — the absence is
@@ -476,7 +476,7 @@ impl super::Gui {
 
         #[cfg(test)]
         {
-            self.last_timeline.rect = area.response.rect;
+            self.probes.last_timeline.rect = area.response.rect;
         }
         #[cfg(not(test))]
         let _ = area;
@@ -559,8 +559,8 @@ impl super::Gui {
 
         #[cfg(test)]
         {
-            self.last_timeline.collapsed = true;
-            self.last_timeline.chip = area.response.rect;
+            self.probes.last_timeline.collapsed = true;
+            self.probes.last_timeline.chip = area.response.rect;
         }
         #[cfg(not(test))]
         let _ = area;
@@ -647,7 +647,7 @@ impl super::Gui {
                 let collapse = ui.button("\u{23f7}").on_hover_text("Collapse the timeline");
                 #[cfg(test)]
                 {
-                    self.last_timeline.collapse = collapse.rect;
+                    self.probes.last_timeline.collapse = collapse.rect;
                 }
                 if collapse.clicked() {
                     self.timeline_collapsed = true;
@@ -658,7 +658,7 @@ impl super::Gui {
                     .on_hover_text("Loop settings");
                 #[cfg(test)]
                 {
-                    self.last_timeline.expander = expander.rect;
+                    self.probes.last_timeline.expander = expander.rect;
                 }
                 if expander.clicked() {
                     self.timeline_row2 = !self.timeline_row2;
@@ -674,7 +674,8 @@ impl super::Gui {
                 }
                 #[cfg(test)]
                 {
-                    self.last_timeline.age_text = if narrow { String::new() } else { age_text };
+                    self.probes.last_timeline.age_text =
+                        if narrow { String::new() } else { age_text };
                 }
                 #[cfg(not(test))]
                 let _ = age_text;
@@ -684,7 +685,7 @@ impl super::Gui {
                     .on_hover_text("Set the time to view");
                 #[cfg(test)]
                 {
-                    self.last_timeline.timestamp = (stamp.rect, stamp_text);
+                    self.probes.last_timeline.timestamp = (stamp.rect, stamp_text);
                 }
                 if stamp.clicked() {
                     // The same flag the menu's Time... entry raises; the
@@ -782,7 +783,7 @@ impl super::Gui {
         let live = ui.add(live_button);
         #[cfg(test)]
         {
-            self.last_timeline.live = (live.rect, !viewing_live);
+            self.probes.last_timeline.live = (live.rect, !viewing_live);
         }
         if live.clicked() && !viewing_live {
             actions.push(GuiAction::JumpToLive { pane_idx });
@@ -794,7 +795,7 @@ impl super::Gui {
         let back = ui.button("\u{23f4}").on_hover_text("Back one step");
         #[cfg(test)]
         {
-            self.last_timeline.back = back.rect;
+            self.probes.last_timeline.back = back.rect;
         }
         if back.clicked() {
             self.panes[pane_idx].viewing_live = false;
@@ -817,7 +818,7 @@ impl super::Gui {
             .on_hover_text("Forward one step");
         #[cfg(test)]
         {
-            self.last_timeline.fwd = (fwd.rect, !viewing_live);
+            self.probes.last_timeline.fwd = (fwd.rect, !viewing_live);
         }
         if fwd.clicked() {
             if step_secs == 0 {
@@ -856,9 +857,10 @@ impl super::Gui {
         // prove nothing about the state egui actually keyed on.
         #[cfg(test)]
         {
-            self.widget_id_probes
+            self.probes
+                .widget_id_probes
                 .push(("time_step_sel", combo.response.id));
-            self.last_timeline.step_dropdown = combo.response.rect;
+            self.probes.last_timeline.step_dropdown = combo.response.rect;
         }
         #[cfg(not(test))]
         let _ = combo;
@@ -894,7 +896,7 @@ impl super::Gui {
             .on_hover_text("Radar loop");
         #[cfg(test)]
         {
-            self.last_timeline.loop_toggle = (loop_toggle.rect, loop_active);
+            self.probes.last_timeline.loop_toggle = (loop_toggle.rect, loop_active);
         }
         if loop_toggle.clicked() {
             if loop_active {
@@ -971,9 +973,10 @@ impl super::Gui {
             {
                 // Reported beside the archive form's, so the distinct-id
                 // claim is a comparison of the ids egui really used.
-                self.widget_id_probes
+                self.probes
+                    .widget_id_probes
                     .push(("timeline_scrubber_loop", seek.id));
-                self.last_timeline.scrubber = seek.rect;
+                self.probes.last_timeline.scrubber = seek.rect;
             }
             #[cfg(not(test))]
             let _ = seek;
@@ -1010,8 +1013,10 @@ impl super::Gui {
         {
             // Reported like `time_step_sel`, so the keyboard test can put
             // real focus behind the id egui actually keyed the slider on.
-            self.widget_id_probes.push(("timeline_scrubber", scrub.id));
-            self.last_timeline.scrubber = scrub.rect;
+            self.probes
+                .widget_id_probes
+                .push(("timeline_scrubber", scrub.id));
+            self.probes.last_timeline.scrubber = scrub.rect;
         }
         if scrub.drag_stopped() {
             // A release commits once — checked first, because the release
@@ -1311,7 +1316,7 @@ impl super::Gui {
 
         #[cfg(test)]
         {
-            self.last_timeline.row2 = Some(row2);
+            self.probes.last_timeline.row2 = Some(row2);
         }
     }
 }

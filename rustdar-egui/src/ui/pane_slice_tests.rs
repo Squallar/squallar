@@ -54,7 +54,8 @@ fn the_pane_slices_never_outrun_the_vector() {
 fn the_pane_rects_a_test_sees_are_only_the_ones_a_frame_drew() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.last_map_panel_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    gui.probes.last_map_panel_rect =
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
     assert_eq!(
         gui.pane_rects_for_test().len(),
         2,
