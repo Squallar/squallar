@@ -218,8 +218,9 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = panel.response.rect;
-            self.last_top_bar = probe;
-            self.last_menu_leaves
+            self.probes.last_top_bar = probe;
+            self.probes
+                .last_menu_leaves
                 .extend(menu_frame.drawn.iter().copied());
         }
 
@@ -469,7 +470,9 @@ impl super::Gui {
                         probe.layers_toggle = (layers.rect, layers_open);
                         // The toggle's real egui id, so the keyboard tests can
                         // focus the widget egui keyed rather than a guess.
-                        self.widget_id_probes.push(("layers_toggle", layers.id));
+                        self.probes
+                            .widget_id_probes
+                            .push(("layers_toggle", layers.id));
                     }
                     if layers.clicked() {
                         // On Expanded the toggle writes the explicit choice over
@@ -530,7 +533,7 @@ impl super::Gui {
             // it. A probe built from `offered` instead would be a restatement
             // of the line above and could not see the loop at all.
             #[cfg(test)]
-            self.last_pane_options.push(super::PaneOptionProbe {
+            self.probes.last_pane_options.push(super::PaneOptionProbe {
                 count,
                 selected,
                 enabled,

@@ -294,7 +294,7 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = modal.response.rect;
-            self.last_catalog = probe;
+            self.probes.last_catalog = probe;
         }
         #[cfg(not(test))]
         let _ = modal;

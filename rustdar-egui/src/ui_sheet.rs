@@ -385,7 +385,7 @@ impl super::Gui {
         let Some(fade) = self.chrome_fade() else {
             #[cfg(test)]
             {
-                self.last_bottom_bar = probe;
+                self.probes.last_bottom_bar = probe;
             }
             return map_rect.bottom();
         };
@@ -531,7 +531,7 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = area.response.rect;
-            self.last_bottom_bar = probe;
+            self.probes.last_bottom_bar = probe;
         }
         #[cfg(not(test))]
         let _ = area;
@@ -816,7 +816,7 @@ impl super::Gui {
                             #[cfg(test)]
                             {
                                 catalog_probe.rect = ui.min_rect();
-                                self.last_catalog = catalog_probe;
+                                self.probes.last_catalog = catalog_probe;
                             }
                         }
                         SheetPage::Time => {
@@ -855,7 +855,7 @@ impl super::Gui {
         #[cfg(test)]
         {
             probe.rect = area.response.rect;
-            self.last_sheet = probe;
+            self.probes.last_sheet = probe;
         }
         #[cfg(not(test))]
         let _ = area;
@@ -909,7 +909,8 @@ impl super::Gui {
             .show(ui, |ui| ui_menu::render_menu_drawer(ui, &model))
             .inner;
         #[cfg(test)]
-        self.last_menu_leaves
+        self.probes
+            .last_menu_leaves
             .extend(menu_frame.drawn.iter().copied());
 
         let mut close = false;
@@ -1031,7 +1032,7 @@ impl super::Gui {
         }
         #[cfg(test)]
         {
-            self.last_error_toast = area.inner.map(|close| ErrorToastProbe {
+            self.probes.last_error_toast = area.inner.map(|close| ErrorToastProbe {
                 rect: area.response.rect,
                 close,
             });
