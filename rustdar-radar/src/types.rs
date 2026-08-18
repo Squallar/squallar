@@ -4,7 +4,7 @@ use crate::sites::get_radar_site;
 use chrono::NaiveDateTime;
 use nexrad_model::data::Radial;
 use nexrad_model::data::Scan;
-use rustdar_units::{HailSizeUnit, UserPreferences};
+use rustdar_units::{Quantity, UserPreferences};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
@@ -1220,47 +1220,11 @@ pub enum RadarProduct {
 
 impl RadarProduct {
     pub fn code(&self) -> &'static str {
-        match self {
-            RadarProduct::Reflectivity => "ref",
-            RadarProduct::Velocity => "vel",
-            RadarProduct::SpectrumWidth => "sw",
-            RadarProduct::DifferentialPhase => "phi",
-            RadarProduct::CorrelationCoefficient => "rho",
-            RadarProduct::DifferentialReflectivity => "zdr",
-            RadarProduct::StormRelativeVelocity => "srv",
-            RadarProduct::SpecificDifferentialPhase => "kdp",
-            RadarProduct::EchoTops => "eet",
-            RadarProduct::EchoTopsInterpolated => "eti",
-            RadarProduct::VerticallyIntegratedLiquid => "vil",
-            RadarProduct::VilDensity => "vild",
-            RadarProduct::ProbabilityOfSevereHail => "posh",
-            RadarProduct::MaxExpectedHailSize => "mehs",
-            RadarProduct::HydrometeorClassification => "hhc",
-            RadarProduct::PrecipitationRate => "dpr",
-            RadarProduct::NormalizedRotation => "nrot",
-        }
+        crate::product_spec::spec(*self).code
     }
 
     pub fn name(&self) -> &'static str {
-        match self {
-            RadarProduct::Reflectivity => "Reflectivity",
-            RadarProduct::Velocity => "Velocity",
-            RadarProduct::SpectrumWidth => "Spectrum Width",
-            RadarProduct::DifferentialPhase => "Differential Phase",
-            RadarProduct::CorrelationCoefficient => "Correlation Coefficient",
-            RadarProduct::DifferentialReflectivity => "Differential Reflectivity",
-            RadarProduct::StormRelativeVelocity => "Storm-Relative Velocity",
-            RadarProduct::SpecificDifferentialPhase => "Specific Differential Phase",
-            RadarProduct::EchoTops => "Echo Tops",
-            RadarProduct::EchoTopsInterpolated => "Echo Tops (Interp)",
-            RadarProduct::VerticallyIntegratedLiquid => "Vertically Integrated Liquid",
-            RadarProduct::VilDensity => "VIL Density",
-            RadarProduct::ProbabilityOfSevereHail => "Prob. of Severe Hail",
-            RadarProduct::MaxExpectedHailSize => "Max Expected Hail Size",
-            RadarProduct::HydrometeorClassification => "Hydrometeor Classification",
-            RadarProduct::PrecipitationRate => "Precipitation Rate",
-            RadarProduct::NormalizedRotation => "Normalized Rotation",
-        }
+        crate::product_spec::spec(*self).name
     }
 
     pub fn all() -> &'static [RadarProduct] {
@@ -1287,36 +1251,11 @@ impl RadarProduct {
 
     /// Order products are listed in the UI.
     pub fn sort_order(&self) -> u8 {
-        match self {
-            RadarProduct::Reflectivity => 0,
-            RadarProduct::Velocity => 1,
-            RadarProduct::SpectrumWidth => 2,
-            RadarProduct::DifferentialReflectivity => 3,
-            RadarProduct::CorrelationCoefficient => 4,
-            RadarProduct::DifferentialPhase => 5,
-            RadarProduct::NormalizedRotation => 6,
-            RadarProduct::StormRelativeVelocity => 7,
-            RadarProduct::SpecificDifferentialPhase => 8,
-            RadarProduct::EchoTops => 9,
-            RadarProduct::EchoTopsInterpolated => 10,
-            RadarProduct::VerticallyIntegratedLiquid => 11,
-            RadarProduct::VilDensity => 12,
-            RadarProduct::ProbabilityOfSevereHail => 13,
-            RadarProduct::MaxExpectedHailSize => 14,
-            RadarProduct::HydrometeorClassification => 15,
-            RadarProduct::PrecipitationRate => 16,
-        }
+        crate::product_spec::spec(*self).sort_order
     }
 
     pub fn is_level3(&self) -> bool {
-        matches!(
-            self,
-            RadarProduct::SpecificDifferentialPhase
-                | RadarProduct::EchoTops
-                | RadarProduct::VerticallyIntegratedLiquid
-                | RadarProduct::VilDensity
-                | RadarProduct::PrecipitationRate
-        )
+        crate::product_spec::spec(*self).is_level3
     }
 
     /// The AWIPS product IDs to fetch for this product. These key the
@@ -1336,14 +1275,7 @@ impl RadarProduct {
     /// [`crate::srv::storm_motion`]'s chain — which still reads an `N0S` for
     /// the RPG's own vector, on the Level III round the app already makes.
     pub fn level3_products(&self) -> Option<&'static [&'static str]> {
-        match self {
-            RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
-            RadarProduct::EchoTops => Some(&["EET"]),
-            RadarProduct::VerticallyIntegratedLiquid => Some(&["DVL"]),
-            RadarProduct::VilDensity => Some(&["DVL", "EET"]),
-            RadarProduct::PrecipitationRate => Some(&["DPR"]),
-            _ => None,
-        }
+        crate::product_spec::spec(*self).level3_codes
     }
 
     /// Every product whose [`level3_products`](Self::level3_products) names
@@ -1418,13 +1350,7 @@ impl RadarProduct {
     /// `every_shared_level3_code_agrees_on_its_volume_pick` in
     /// [`crate::level3`] holds that.
     pub fn level3_volume_pick(&self) -> Option<crate::level3::VolumePick> {
-        if !self.is_level3() {
-            return None;
-        }
-        Some(match self {
-            RadarProduct::PrecipitationRate => crate::level3::VolumePick::Latest,
-            _ => crate::level3::VolumePick::NEAREST,
-        })
+        crate::product_spec::spec(*self).level3_volume_pick
     }
 
     /// A stable identifier for this product on a wire.
@@ -1435,56 +1361,21 @@ impl RadarProduct {
     /// cross the browser's worker boundary — [`crate::render_input`]'s payload
     /// and `rustdar_frontend::offload`'s job framing — read this one table.
     ///
-    /// The match is exhaustive, so a new variant fails to compile until it is
+    /// The registration in [`crate::product_spec::spec`] is exhaustive with
+    /// every field explicit, so a new variant fails to compile until it is
     /// given a code.
     pub fn wire_code(&self) -> u16 {
-        match self {
-            RadarProduct::Reflectivity => 1,
-            RadarProduct::Velocity => 2,
-            RadarProduct::SpectrumWidth => 3,
-            RadarProduct::DifferentialPhase => 4,
-            RadarProduct::CorrelationCoefficient => 5,
-            RadarProduct::DifferentialReflectivity => 6,
-            RadarProduct::StormRelativeVelocity => 7,
-            RadarProduct::SpecificDifferentialPhase => 8,
-            RadarProduct::EchoTops => 9,
-            RadarProduct::EchoTopsInterpolated => 10,
-            RadarProduct::VerticallyIntegratedLiquid => 11,
-            RadarProduct::HydrometeorClassification => 12,
-            RadarProduct::PrecipitationRate => 13,
-            RadarProduct::NormalizedRotation => 14,
-            RadarProduct::VilDensity => 15,
-            RadarProduct::ProbabilityOfSevereHail => 16,
-            RadarProduct::MaxExpectedHailSize => 17,
-        }
+        crate::product_spec::spec(*self).wire_code
     }
 
     /// The inverse of [`wire_code`](Self::wire_code). `None` for a code this
     /// build does not know, which is a message from another build rather than a
     /// bug to panic on.
     pub fn from_wire_code(code: u16) -> Option<Self> {
-        let product = match code {
-            1 => RadarProduct::Reflectivity,
-            2 => RadarProduct::Velocity,
-            3 => RadarProduct::SpectrumWidth,
-            4 => RadarProduct::DifferentialPhase,
-            5 => RadarProduct::CorrelationCoefficient,
-            6 => RadarProduct::DifferentialReflectivity,
-            7 => RadarProduct::StormRelativeVelocity,
-            8 => RadarProduct::SpecificDifferentialPhase,
-            9 => RadarProduct::EchoTops,
-            10 => RadarProduct::EchoTopsInterpolated,
-            11 => RadarProduct::VerticallyIntegratedLiquid,
-            12 => RadarProduct::HydrometeorClassification,
-            13 => RadarProduct::PrecipitationRate,
-            14 => RadarProduct::NormalizedRotation,
-            15 => RadarProduct::VilDensity,
-            16 => RadarProduct::ProbabilityOfSevereHail,
-            17 => RadarProduct::MaxExpectedHailSize,
-            _ => return None,
-        };
-        debug_assert_eq!(product.wire_code(), code);
-        Some(product)
+        Self::all()
+            .iter()
+            .copied()
+            .find(|p| crate::product_spec::spec(*p).wire_code == code)
     }
 
     /// Which of a radial's moment fields this product reads.
@@ -1495,49 +1386,7 @@ impl RadarProduct {
     /// moment back on a reconstructed radial — cannot come to disagree with the
     /// consumer that reads it.
     pub fn moment_slot(&self) -> Option<MomentSlot> {
-        match self {
-            RadarProduct::Reflectivity => Some(MomentSlot::Reflectivity),
-            RadarProduct::Velocity => Some(MomentSlot::Velocity),
-            RadarProduct::SpectrumWidth => Some(MomentSlot::SpectrumWidth),
-            RadarProduct::DifferentialReflectivity => Some(MomentSlot::DifferentialReflectivity),
-            RadarProduct::CorrelationCoefficient => Some(MomentSlot::CorrelationCoefficient),
-            RadarProduct::DifferentialPhase => Some(MomentSlot::DifferentialPhase),
-            // NROT is derived from velocity
-            RadarProduct::NormalizedRotation => Some(MomentSlot::Velocity),
-            // Storm-relative velocity is derived from velocity too — every
-            // velocity tilt lists, an upgrade over the four fixed Level III
-            // tilts the product used to fetch. See `crate::srv`.
-            RadarProduct::StormRelativeVelocity => Some(MomentSlot::Velocity),
-            // Interpolated echo tops integrate the whole reflectivity volume;
-            // tying availability to the reflectivity moment lists it alongside
-            // the reflectivity tilts (the rendered field is tilt-independent).
-            RadarProduct::EchoTopsInterpolated => Some(MomentSlot::Reflectivity),
-            // The hail pair integrates the whole reflectivity volume too
-            // (`crate::hail`); the environmental heights it also needs ride
-            // the render parameters, not a moment.
-            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => {
-                Some(MomentSlot::Reflectivity)
-            }
-            // The hybrid hydrometeor classification composites every dual-pol
-            // tilt of the volume (crate::hhc); listing on reflectivity puts
-            // the tilt-independent volume product alongside the reflectivity
-            // tilts, the same convention as ETI and VIL density. The render
-            // payload carries the rest of the moments (crate::render_input's
-            // extras).
-            RadarProduct::HydrometeorClassification => Some(MomentSlot::Reflectivity),
-            // Level III products. No Level II moment stands behind them.
-            //
-            // VIL density is here rather than on reflectivity: it used to be a
-            // local quotient of two whole-volume integrals, and is now the
-            // RPG's own `DVL` over its own `EET` ([`crate::vild`]) because the
-            // local version was measured mute at the thresholds it is read for
-            // (see [`crate::vil`]'s validation section).
-            RadarProduct::SpecificDifferentialPhase
-            | RadarProduct::EchoTops
-            | RadarProduct::VerticallyIntegratedLiquid
-            | RadarProduct::VilDensity
-            | RadarProduct::PrecipitationRate => None,
-        }
+        crate::product_spec::spec(*self).moment_slot
     }
 
     /// The moment data for this product on a radial.
@@ -1597,52 +1446,10 @@ impl RadarProduct {
     /// error and no NaN to notice.
     ///
     /// Exhaustive, like [`wire_code`](Self::wire_code): a new variant fails to
-    /// compile until it has been classified here.
+    /// compile until it has been classified in its
+    /// [`crate::product_spec::spec`] registration.
     pub fn reads_whole_volume(&self) -> bool {
-        match self {
-            // `volumetric::compute_echo_tops` integrates the whole
-            // reflectivity volume. `VolumeCube::build` dedups same-elevation
-            // cuts in encounter order, so the tilts have to arrive in scan
-            // order as well as all arrive.
-            RadarProduct::EchoTopsInterpolated => true,
-            // The SHI column integral reads every reflectivity tilt, over the
-            // same local VIL machinery echo tops uses (`crate::hail`).
-            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
-            // The selected sweep is what rasterizes, but
-            // `crate::velocity::volume_wind_profile` fits the dealias-seeding
-            // profile from every velocity tilt of the volume — the only wind
-            // source since the NVW fetch left (`crate::nrot`).
-            //
-            // Storm-relative velocity has the same shape and one more reason:
-            // the profile is also where its default Bunkers vector comes from
-            // (`crate::srv`). A user's override does not shrink this —
-            // dealias seeding still wants the profile, or render quality would
-            // silently vary with whether a vector was typed in.
-            RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => true,
-            // The hybrid classification composites every dual-pol tilt down
-            // the hybrid scan, and reads every *moment* of them too
-            // (`crate::hhc`).
-            RadarProduct::HydrometeorClassification => true,
-            // One sweep: the rasterizer touches this product's own moment on
-            // the sweep `find_sweep` chose and nothing else in the volume.
-            RadarProduct::Reflectivity
-            | RadarProduct::Velocity
-            | RadarProduct::SpectrumWidth
-            | RadarProduct::DifferentialPhase
-            | RadarProduct::CorrelationCoefficient
-            | RadarProduct::DifferentialReflectivity => false,
-            // Level III products read no Level II tilt at all — their pixels
-            // come from the RPG's own object, which is what
-            // `is_level3` covers. `VilDensity` was in the
-            // set above when it was a local quotient of two whole-volume
-            // integrals, and left it along with the integrals
-            // (`crate::vild`).
-            RadarProduct::SpecificDifferentialPhase
-            | RadarProduct::EchoTops
-            | RadarProduct::VerticallyIntegratedLiquid
-            | RadarProduct::VilDensity
-            | RadarProduct::PrecipitationRate => false,
-        }
+        crate::product_spec::spec(*self).reads_whole_volume
     }
 
     /// Whether a **plan view** of this product draws the same picture whatever
@@ -1706,50 +1513,22 @@ impl RadarProduct {
     /// and the reason this is a method rather than three `matches!`.
     ///
     /// Exhaustive, like [`reads_whole_volume`](Self::reads_whole_volume): a
-    /// new variant fails to compile until it has been classified here, which
-    /// is the only way the three agree by construction rather than by review.
+    /// new variant fails to compile until it has been classified in its
+    /// [`crate::product_spec::spec`] registration, which is the only way the
+    /// three agree by construction rather than by review.
     pub fn reads_env_heights(&self) -> bool {
-        match self {
-            // The SHI-to-size mapping has no field at all without the pair:
-            // the warning-threshold integral starts at the 0 °C height and
-            // is fully weighted above −20 °C, so without them `crate::hail`
-            // renders nothing rather than guessing.
-            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
-            // The hybrid classification picks `HsdaHeights::from_env_heights`
-            // over `operational_defaults`, and the pair's 0 °C height is the
-            // third rung of `crate::hca::resolve_melting_layer`, so every
-            // class code downstream of the layer moves with it
-            // (`crate::render::render_hhc_to_image`). Absent a sounding it
-            // falls back to the adaptation defaults, exactly as the RPG runs
-            // without environmental data — which is why the stale case looked
-            // plausible instead of empty, and why the picture now says which
-            // melting layer it stood on.
-            //
-            // The RPG's own melting layer object rides
-            // `RenderInput::with_melting_layer_product` rather than this
-            // predicate: it is per *volume*, not per site, so it cannot live
-            // in a site-keyed cache the way the sounding does.
-            RadarProduct::HydrometeorClassification => true,
-            // Every other product must never carry the pair, or the byte
-            // identity of its payload would depend on an unrelated cache.
-            RadarProduct::Reflectivity
-            | RadarProduct::Velocity
-            | RadarProduct::SpectrumWidth
-            | RadarProduct::DifferentialPhase
-            | RadarProduct::CorrelationCoefficient
-            | RadarProduct::DifferentialReflectivity
-            | RadarProduct::StormRelativeVelocity
-            | RadarProduct::SpecificDifferentialPhase
-            | RadarProduct::EchoTops
-            | RadarProduct::EchoTopsInterpolated
-            | RadarProduct::VerticallyIntegratedLiquid
-            | RadarProduct::VilDensity
-            | RadarProduct::PrecipitationRate
-            | RadarProduct::NormalizedRotation => false,
-        }
+        crate::product_spec::spec(*self).reads_env_heights
     }
 
     /// Format a radar product value for display (e.g. in a hover tooltip).
+    ///
+    /// Deliberately **not** collapsed into the [`crate::product_spec::spec`]
+    /// registration or `Measured::display` at M4: the string shapes vary per
+    /// product — decimals of 0, 1, 2 and 4; spaced, glued and absent suffixes
+    /// (CC prints no unit while `unit_label` returns `"CC"`; ΦDP glues its
+    /// degree sign); HCA prints a categorical class, not a number — and
+    /// forcing them through one display shape would change pinned UI strings.
+    /// It migrates at E9 with FieldFacts.
     pub fn format_value(&self, value: f32, prefs: &UserPreferences) -> String {
         match self {
             RadarProduct::Reflectivity => format!("Reflectivity: {:.1} dBZ", value),
@@ -1824,36 +1603,21 @@ impl RadarProduct {
     }
 
     /// Short unit label for this product (used in the color scale legend).
+    ///
+    /// Derived from the registration's [`Quantity`]: a `Unitless` label
+    /// prints as itself, every other quantity takes the preferred unit's
+    /// suffix — including MEHS's Inches→`"in"` colour-bar rule, which lives
+    /// on [`Quantity::suffix`] now.
     pub fn unit_label(&self, prefs: &UserPreferences) -> &'static str {
-        match self {
-            RadarProduct::Reflectivity => "dBZ",
-            RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => prefs.speed.suffix(),
-            RadarProduct::SpectrumWidth => prefs.speed.suffix(),
-            RadarProduct::DifferentialReflectivity => "dB",
-            RadarProduct::CorrelationCoefficient => "CC",
-            RadarProduct::DifferentialPhase => "\u{00b0}",
-            RadarProduct::SpecificDifferentialPhase => "\u{00b0}/km",
-            RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
-                prefs.height.kilo_suffix()
-            }
-            RadarProduct::VerticallyIntegratedLiquid => "kg/m\u{00b2}",
-            RadarProduct::VilDensity => "g/m\u{00b3}",
-            RadarProduct::ProbabilityOfSevereHail => "%",
-            // `HailSizeUnit::suffix()` is the inch *mark*, which reads well
-            // pressed against a bare number (`1.75"`, as the storm-report popup
-            // writes it) but not as a colour-bar title, and not after the space
-            // this crate's readouts put before their unit. `in` is also what
-            // MEHS has printed since it shipped, so the default reading is
-            // character for character what it was. Every other unit takes its
-            // own suffix.
-            RadarProduct::MaxExpectedHailSize => match prefs.hail_size {
-                HailSizeUnit::Inches => "in",
-                unit => unit.suffix(),
-            },
-            RadarProduct::HydrometeorClassification => "HHC",
-            RadarProduct::PrecipitationRate => prefs.precip_rate.suffix(),
-            RadarProduct::NormalizedRotation => "NROT",
+        match self.quantity() {
+            Quantity::Unitless { label } => label,
+            q => q.suffix(prefs),
         }
+    }
+
+    /// The unit domain this product's values live in, from the registration.
+    pub(crate) fn quantity(&self) -> Quantity {
+        crate::product_spec::spec(*self).quantity
     }
 }
 
