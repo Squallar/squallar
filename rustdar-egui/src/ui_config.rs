@@ -1644,6 +1644,10 @@ mod storm_motion_config_tests;
 #[cfg(test)]
 mod presets_config_tests;
 
+#[path = "ui_config/fixture_tests.rs"]
+#[cfg(test)]
+mod fixture_tests;
+
 #[path = "ui_config/tests.rs"]
 #[cfg(test)]
 mod tests;
