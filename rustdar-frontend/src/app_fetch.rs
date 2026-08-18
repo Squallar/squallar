@@ -1235,7 +1235,9 @@ impl super::App {
             // (`JobRequest::Overlay`). On the web the job posts to the worker
             // instead of running inline on the browser's one thread, which is
             // where the frame-thread audit measured 224 ms of gesture-end
-            // stall for the polygon layer set alone; on native it rides the
+            // stall for the polygon layer set alone (measured at
+            // main@ebe0ad3b, 2026-08-12 web-baseline campaign;
+            // instrumentation 3673d316); on native it rides the
             // pool's interactive lane, the same lane the closures rode. There
             // is no other path: the opaque closure arm this match used to
             // have is deleted, with the trait method that fed it.

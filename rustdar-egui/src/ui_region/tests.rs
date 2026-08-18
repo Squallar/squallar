@@ -299,8 +299,10 @@ fn plan_view_notch_levels(dt: f64) -> f64 {
 }
 
 /// **The reported bug on the surface it was reported from.** The plan view is
-/// the main map, it is where the overlays that make a frame take 289 ms are
-/// drawn, and it is the arm that reaches walkers' multiplier rather than this
+/// the main map, it is where the overlays that make a frame take 289 ms
+/// (measured at main@ebe0ad3b, 2026-08-12 web-baseline campaign;
+/// instrumentation 3673d316) are drawn, and it is the arm that reaches
+/// walkers' multiplier rather than this
 /// module's.
 ///
 /// Fixing [`zoom_step`] alone would have left this one at the 4× spread *and*

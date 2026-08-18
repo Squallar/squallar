@@ -1856,7 +1856,9 @@ impl RenderDispatcher {
     /// set — so the pane asks again on the very next frame, and pays again, for
     /// as long as the budget stays full. Measured on this volume corpus at
     /// 0.1–1.0 ms a pane for a single tilt and 0.7–2.4 ms for a four-pane split
-    /// of storm-relative velocity, *per frame*. It matters most on wasm, where
+    /// of storm-relative velocity, *per frame* (measured at main@ebe0ad3b,
+    /// 2026-08-12 web-baseline campaign; instrumentation 3673d316). It
+    /// matters most on wasm, where
     /// The web arm's budget is 1 and so any second render at all is a
     /// starved frame for as long as the first one runs.
     ///

@@ -436,7 +436,9 @@ pub enum JobRequest {
     /// Rasterize an overlay layer — the frame-following work that used to
     /// ride the opaque closure funnel, whose wasm arm ran it **inline on the
     /// browser's one thread** (a measured 224 ms against a 290 ms p50
-    /// gesture frame for the layer set that prompted this). That funnel is
+    /// gesture frame for the layer set that prompted this; measured at
+    /// main@ebe0ad3b, 2026-08-12 web-baseline campaign; instrumentation
+    /// 3673d316). That funnel is
     /// deleted; this variant is how every overlay rasterizes now.
     ///
     /// The raster's geometry travels on this variant — one statement of the
@@ -512,8 +514,10 @@ pub enum OverlayJobInput {
     Sites(rustdar_overlays::render::rasterize::SitesInput),
     /// NWS alerts: the paint rows, the category and hidden-id filters, and
     /// the texel density. The gesture-end stall the frame-thread audit
-    /// measured at 224 ms on the web was exactly this kind's raster running
-    /// inline; describing it is what moved that off the browser's one thread.
+    /// measured at 224 ms on the web (measured at main@ebe0ad3b, 2026-08-12
+    /// web-baseline campaign; instrumentation 3673d316) was exactly this
+    /// kind's raster running inline; describing it is what moved that off
+    /// the browser's one thread.
     ///
     /// Boxed for [`JobRequest::Radar`]'s reason at this enum's scale: the
     /// input's inline size (three owned collections) is what pushed

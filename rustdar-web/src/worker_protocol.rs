@@ -211,7 +211,9 @@ pub const OUT_KIND: &str = "outkind";
 /// polygon overlay kinds — NWS alerts, SPC outlooks, SPC mesoscale
 /// discussions — travel under tag 8 as input codes 2, 3 and 4 beside the
 /// sites render's 1, so the layer set the frame-thread audit measured at
-/// 224 ms of inline gesture-end rasterization runs in the worker. Like
+/// 224 ms of inline gesture-end rasterization (measured at main@ebe0ad3b,
+/// 2026-08-12 web-baseline campaign; instrumentation 3673d316) runs in the
+/// worker. Like
 /// versions 8 and 9 it changes **no field name** — the reply is still `OUT`
 /// code 5's unframed RGBA, accepted by the dispatching page's own length
 /// check — so the reply-shape scrape cannot see it and did not fire. What

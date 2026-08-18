@@ -90,7 +90,9 @@ fn quantize_zoom(zoom: f64) -> i32 {
 /// `Queue::write_texture` back on the frame thread on every frame of every zoom
 /// for anyone with the layer on — 8.7 ms a render at 1920×1080 natively, and on
 /// wasm the whole inline raster, measured at 224 ms against a p50 frame of
-/// 289.5 ms. That is precisely the stutter this constant exists to remove, so
+/// 289.5 ms (measured at main@ebe0ad3b, 2026-08-12 web-baseline campaign;
+/// instrumentation 3673d316). That is precisely the stutter this constant
+/// exists to remove, so
 /// the plate stretches for a tenth of a second instead.
 pub const ZOOM_REBUILD_BAND: f64 = 1.0;
 
@@ -187,7 +189,9 @@ pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_
 /// adapter's limit, i.e. a web pane no wider than 1365 points, where the
 /// absolute textures are small. A browser measurement on real hardware puts the
 /// inline overlay path at 224 ms per raster against a p50 frame duration of
-/// 289.5 ms during a gesture, so the web win from *not* re-rasterising per
+/// 289.5 ms during a gesture (measured at main@ebe0ad3b, 2026-08-12
+/// web-baseline campaign; instrumentation 3673d316), so the web win from
+/// *not* re-rasterising per
 /// frame dwarfs this — but anything that multiplies web pan cost is worth
 /// writing down rather than leaving to be rediscovered.
 ///
@@ -882,7 +886,9 @@ impl OverlayTextureCache {
 /// wasm: no — the settle render is the only zoom-driven dispatch. `offload`
 /// has no thread to give on that target, so the whole raster runs **inline on
 /// the frame thread** — measured in-browser at 224 ms against a p50 gesture
-/// frame of 289.5 ms — which makes a mid-gesture render, by construction, a
+/// frame of 289.5 ms (measured at main@ebe0ad3b, 2026-08-12 web-baseline
+/// campaign; instrumentation 3673d316) — which makes a mid-gesture render,
+/// by construction, a
 /// purchase of texture resolution with interaction latency. Interaction wins:
 /// the texture is drawn through the current projector wherever the zoom goes
 /// ([`draw_overlay_texture`]), so unlimited drift costs sharpness, never

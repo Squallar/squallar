@@ -1898,8 +1898,10 @@ fn overlay_reply_via_wire(
 }
 
 /// **The parity gate for the alert render**, the sites gate's shape on the
-/// kind whose inline rasterization was the measured 224 ms gesture-end stall:
-/// direct call and via-wire execution are byte-identical, on the fixture
+/// kind whose inline rasterization was the measured 224 ms gesture-end stall
+/// (measured at main@ebe0ad3b, 2026-08-12 web-baseline campaign;
+/// instrumentation 3673d316): direct call and via-wire execution are
+/// byte-identical, on the fixture
 /// whose alert is a MultiPolygon with a hole — the geometry an encoder
 /// flattens plausibly, and exactly what this comparison exists to catch.
 #[test]

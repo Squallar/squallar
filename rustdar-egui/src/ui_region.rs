@@ -548,7 +548,9 @@ pub(crate) fn steady_wheel<R>(ctx: &egui::Context, map: impl FnOnce() -> R) -> R
     }
 
     // Nesting would apply `wheel_rate_correction` twice and square it — a 289 ms
-    // frame would come out 300× over rather than right. Unreachable today (the
+    // frame (measured at main@ebe0ad3b, 2026-08-12 web-baseline campaign;
+    // instrumentation 3673d316) would come out 300× over rather than right.
+    // Unreachable today (the
     // one call site is a leaf), so this is a `debug_assert` guarding a future
     // caller rather than a condition anyone has hit. Single-threaded on every
     // target: wasm32 has no threads and egui's UI pass is one thread anyway.
