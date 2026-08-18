@@ -4193,6 +4193,7 @@ dependencies = [
  "log",
  "lru",
  "reqwest 0.13.4",
+ "rustdar-geo",
  "rustdar-gps",
  "rustdar-overlays",
  "rustdar-radar",

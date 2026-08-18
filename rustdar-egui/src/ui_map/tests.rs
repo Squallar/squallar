@@ -19,7 +19,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     // 229 km due east at 41 °N, the orientation where a rhumb line and a
     // great circle are furthest apart.
     let lat = 41.0_f64;
-    let dlon = 229.0 / (rustdar_radar::types::KM_PER_DEGREE_LAT * lat.to_radians().cos());
+    let dlon = 229.0 / (rustdar_geo::KM_PER_DEGREE_LAT * lat.to_radians().cos());
     let line = crate::pane::SectionLine::new(
         crate::pane::GeoPoint { lat, lon: -97.0 },
         crate::pane::GeoPoint {
@@ -33,7 +33,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     // metre of *ground* at this latitude — Mercator's local scale factor is
     // `1/cos(lat)`, so the `cos` is what makes the assertion below readable
     // in metres rather than in projected units.
-    let scale = rustdar_radar::types::EARTH_RADIUS_KM * 1000.0 * lat.to_radians().cos();
+    let scale = rustdar_geo::EARTH_RADIUS_KM * 1000.0 * lat.to_radians().cos();
     let project = |p: crate::pane::GeoPoint| {
         let y = (std::f64::consts::FRAC_PI_4 + p.lat.to_radians() / 2.0)
             .tan()
@@ -82,7 +82,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
         .map(|i| {
             let (p, q) = (track[i], track[i + 1]);
             let half = (i as f64 + 0.5) / SECTION_TRACK_SAMPLES as f64;
-            let (lat, lon) = rustdar_radar::beam::great_circle_point(
+            let (lat, lon) = rustdar_geo::great_circle_point(
                 (line.a().lat, line.a().lon),
                 (line.b().lat, line.b().lon),
                 half,
@@ -434,7 +434,7 @@ fn the_hover_readouts_digits_do_not_move() {
         let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, None, GATES);
         let mut values = vec![f32::NAN; GATES];
         if let Some(v) = value {
-            let (azimuth, ground_km) = rustdar_radar::beam::site_bearing_range_km(
+            let (azimuth, ground_km) = rustdar_geo::site_bearing_range_km(
                 input.site_lat,
                 input.site_lon,
                 input.hover_lat,

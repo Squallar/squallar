@@ -79,105 +79,36 @@ impl TileSource for CartoDb {
     }
 }
 
-// Slippy-map tile coordinate helpers (standard OSM / Web Mercator formulas)
+// Slippy-map tile coordinates (standard OSM / Web Mercator formulas), from
+// the workspace's geodesy floor.
 
-/// The latitude Web Mercator ends at — [`rustdar_radar::types`]' constant, not
-/// a second copy of it.
+/// The latitude Web Mercator ends at — [`rustdar_geo`]'s constant, not a
+/// second copy of it, and no longer a chain of them: this crate used to reach
+/// it through `rustdar-radar`'s re-export of the substrate's re-export, and
+/// now reads the floor directly.
 ///
-/// Re-exported under this path because that is where it was defined when the
+/// Re-exported under this path because that is where it was named when the
 /// tile helpers, `overlay_cache` and `rustdar-overlays`'s rasterizer were each
-/// given their own spelling of it; it now lives one crate down, which is the
-/// lowest point all three can reach. The constant's own doc carries the
+/// given their own spelling of it. The constant's own doc carries the
 /// projection's reasoning and what the truncated copies cost.
 ///
 /// Not applied as a clamp by [`lat_to_tile_y`], which needs no branch: the
-/// index clamp below already carries every latitude past this to the edge row.
-pub use rustdar_radar::types::MERCATOR_LAT_LIMIT_DEG;
+/// index clamp inside it already carries every latitude past this to the edge
+/// row.
+pub use rustdar_geo::MERCATOR_LAT_LIMIT_DEG;
 
-/// Carry a fractional tile coordinate to an index on `0..2^zoom`.
+/// The tile transforms themselves, moved verbatim to the geodesy floor —
+/// where the projection they quantize lives, so the grid and the projection
+/// cannot drift apart ([`tile_to_lat`] now routes through
+/// `rustdar_geo::mercator_y_to_lat_rad`, the workspace's one inverse, with
+/// bit-identical arithmetic).
 ///
-/// **Both ends, which is the whole reason this is a function.** These helpers
-/// clamped only at zero, so every input past the far edge — a longitude at or
-/// east of +180, a latitude at or south of [`MERCATOR_LAT_LIMIT_DEG`] — handed
-/// the caller an index of `2^zoom` or more, for a grid whose last tile is
-/// `2^zoom − 1`. `mercantile`, the reference implementation this is checked
-/// against, clamps at both ends (`mercantile/__init__.py::tile`), and
-/// `tests::no_input_produces_an_index_off_the_grid` now holds us to that.
-///
-/// The saturating `as` conversion is load-bearing on the way in as well as the
-/// way out. `lat_to_tile_y` fed −90° through the old `ln(tan φ + sec φ)` and
-/// got `u32::MAX`; `ui_map_overlays::draw_tile_layer` then computes
-/// `lat_to_tile_y(min_lat) + 1`, which is an **overflow panic in a debug
-/// build**. Nothing reaches −90° from `walkers::Projector::unproject` — it
-/// would take a pane ~113 world-heights tall — so this was latent rather than
-/// live, but it was one arithmetic hop from a caller that already exists.
-#[inline]
-fn tile_index(coord: f64, zoom: u8) -> u32 {
-    // NaN floors to NaN and `NaN as u32` is 0, which is the low edge — the same
-    // place an unrepresentable coordinate would land if it had a sign.
-    let last = 2u32.saturating_pow(u32::from(zoom)).saturating_sub(1);
-    (coord.floor().max(0.0) as u32).min(last)
-}
-
-/// Convert longitude to tile X index at the given zoom level.
-///
-/// Clamped to the grid at both ends — see [`tile_index`]. Longitudes outside
-/// ±180 are **clamped, not wrapped**: a viewport straddling the antimeridian
-/// gets the tiles on its own side of the seam and nothing for the far side.
-/// See `ui_map_overlays::draw_tile_layer` for what that costs.
-pub fn lon_to_tile_x(lon: f64, zoom: u8) -> u32 {
-    let n = 2f64.powi(zoom as i32);
-    tile_index((lon + 180.0) / 360.0 * n, zoom)
-}
-
-/// Convert latitude to tile Y index at the given zoom level.
-///
-/// # `asinh(tan φ)`, not `ln(tan φ + sec φ)`
-///
-/// The same function — `asinh t ≡ ln(t + √(t²+1))` and `√(tan²φ + 1)` is
-/// `sec φ` on this domain — and the identity is exact, so this is not a change
-/// of convention. It is a change of *spelling*, and the spelling matters
-/// because the sum cancels: south of the equator `tan φ` is negative and
-/// `sec φ` is positive, and near the pole the two are the same enormous number
-/// with opposite signs. Measured, against `asinh(tan φ)` evaluated in the same
-/// `f64`:
-///
-/// | latitude | old form's error |
-/// |---|---|
-/// | anywhere north | 0 ulp, at every latitude tested |
-/// | −89.99° | 0.065 px at zoom 18 |
-/// | −89.999° | 1.15 px at zoom 18 |
-/// | −89.9999° | 188 px at zoom 18 |
-/// | −89.99999° | 80 279 px at zoom 18 |
-/// | −90° | no digits left — `u32::MAX` here, `NaN` in CPython's libm |
-///
-/// The asymmetry is why this was never going to show up in use: the northern
-/// hemisphere, where this application's radars are, is exact in both forms.
-///
-/// Both independent implementations checked against use a stable form —
-/// `walkers-0.56.0/src/mercator.rs` writes `tan().asinh()`, `mercantile` writes
-/// `log((1+sin φ)/(1−sin φ))/4` — and this now agrees with the first bit for
-/// bit over the whole sweep.
-pub fn lat_to_tile_y(lat: f64, zoom: u8) -> u32 {
-    let n = 2f64.powi(zoom as i32);
-    let y = lat.to_radians().tan().asinh();
-    tile_index((1.0 - y / std::f64::consts::PI) / 2.0 * n, zoom)
-}
-
-/// Convert tile X index back to the western longitude of the tile.
-pub fn tile_to_lon(x: u32, zoom: u8) -> f64 {
-    let n = 2f64.powi(zoom as i32);
-    x as f64 / n * 360.0 - 180.0
-}
-
-/// Convert tile Y index back to the northern latitude of the tile.
-pub fn tile_to_lat(y: u32, zoom: u8) -> f64 {
-    let n = 2f64.powi(zoom as i32);
-    (std::f64::consts::PI * (1.0 - 2.0 * y as f64 / n))
-        .sinh()
-        .atan()
-        .to_degrees()
-}
+/// Re-exported here because this is the path the tile grid's consumers have
+/// always named. The mercantile reference vectors in `tiles/tests.rs` pin
+/// these exact bits through this re-export — their passing unedited is the
+/// proof the move was a move. The private index clamp (`tile_index` — both
+/// ends, see `no_input_produces_an_index_off_the_grid`) moved with them.
+pub use rustdar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 
 // ---------------------------------------------------------------------------
 // MapTileState — shared map tile management

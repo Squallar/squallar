@@ -1094,14 +1094,16 @@ pub fn draw_overlay_texture(
 
 /// Convert latitude (radians) to Web Mercator Y.
 ///
-/// [`crate::volume_view::mercator_y_of_lat`], which that module's doc names as
-/// *the* spelling of this in this crate — "a second spelling of it there is
-/// precisely the drift this seam exists to prevent". This was that second
-/// spelling: byte-identical arithmetic, written out again forty lines from a
-/// hit test that has to agree with what the renderer drew.
+/// [`rustdar_geo::lat_rad_to_mercator_y`] — the workspace's one spelling of
+/// the forward projection, which `volume_view::mercator_y` also delegates to —
+/// reached directly rather than through that delegate: one hop, same bits.
+/// This hit test has to agree with what the renderer drew or a click misses
+/// the shape under it, and the two now agree by being the same function. It
+/// was once a byte-identical second spelling written out forty lines from the
+/// hit test, then a delegate to `volume_view`'s copy.
 #[inline]
 fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
-    crate::volume_view::mercator_y(lat_rad)
+    rustdar_geo::lat_rad_to_mercator_y(lat_rad)
 }
 
 /// Test whether a geographic point (lat, lon) falls inside any polygon of an

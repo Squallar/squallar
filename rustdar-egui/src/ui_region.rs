@@ -211,7 +211,7 @@ impl RegionDrag {
         // The codebase's real geodesy, and the same function the resampler
         // places the box's own corners with — not a flat approximation, which
         // is what `corners_for` is allowed to use because it only ever draws.
-        let (bearing_deg, range_km) = rustdar_radar::beam::site_bearing_range_km(
+        let (bearing_deg, range_km) = rustdar_geo::site_bearing_range_km(
             self.centre.lat,
             self.centre.lon,
             corner.lat,
@@ -282,14 +282,14 @@ impl RegionDrag {
 /// rather than two `f64`s.
 ///
 /// The latitude conversion is the flat approximation named on
-/// [`KM_PER_DEGREE_LAT`](rustdar_radar::types::KM_PER_DEGREE_LAT); the longitude
+/// [`KM_PER_DEGREE_LAT`](rustdar_geo::KM_PER_DEGREE_LAT); the longitude
 /// one divides by `cos(lat)` so the box is sized in *kilometres* rather than in
 /// degrees, which is the whole point — a degree-square box drawn at 35°N would
 /// be 22% wider than it is tall and would not be the box that gets resampled.
 ///
 /// The approximation is worth at most a pixel of drawn edge and never a
 /// kilometre of grid: [`RegionDrag::extend_to`] measures the drag itself with
-/// [`rustdar_radar::beam::site_bearing_range_km`], the codebase's real geodesy,
+/// [`rustdar_geo::site_bearing_range_km`], the codebase's real geodesy,
 /// and this is only ever asked where the resulting box goes on screen.
 ///
 /// `None` at the poles, where `cos(lat)` is zero and every longitude is the same
@@ -299,12 +299,12 @@ pub(crate) fn corners_for(
     centre: crate::pane::GeoPoint,
     half: rustdar_radar::voxel::HalfExtentKm,
 ) -> Option<(crate::pane::GeoPoint, crate::pane::GeoPoint)> {
-    let d_lat = half.north_km / rustdar_radar::types::KM_PER_DEGREE_LAT;
+    let d_lat = half.north_km / rustdar_geo::KM_PER_DEGREE_LAT;
     let cos_lat = centre.lat.to_radians().cos();
     if !(cos_lat.is_finite() && cos_lat.abs() > 1e-6) {
         return None;
     }
-    let d_lon = half.east_km / (rustdar_radar::types::KM_PER_DEGREE_LAT * cos_lat);
+    let d_lon = half.east_km / (rustdar_geo::KM_PER_DEGREE_LAT * cos_lat);
     let nw = crate::pane::GeoPoint {
         lat: centre.lat + d_lat,
         lon: centre.lon - d_lon,
@@ -1071,7 +1071,7 @@ fn solve_viewport(
 /// near edge is the binding one for *coverage*, because a box that reaches past
 /// it is a box with a transparent strip along that side.
 ///
-/// [`rustdar_radar::beam::site_bearing_range_km`] rather than a flat
+/// [`rustdar_geo::site_bearing_range_km`] rather than a flat
 /// approximation, because it is the codebase's real geodesy and the same
 /// function the resampler places the box's own corners with.
 ///
@@ -1126,7 +1126,7 @@ pub(crate) fn ground_half_extent(
         // folds back towards zero past a half-turn, and this saturates instead.
         let lon = centre.x() + (point.x() - centre.x()).clamp(-HALF_TURN_DEG, HALF_TURN_DEG);
         let (_, range_km) =
-            rustdar_radar::beam::site_bearing_range_km(centre.y(), centre.x(), point.y(), lon);
+            rustdar_geo::site_bearing_range_km(centre.y(), centre.x(), point.y(), lon);
         (range_km.is_finite() && range_km > 0.0).then_some(range_km)
     };
     Some(rustdar_radar::voxel::HalfExtentKm {

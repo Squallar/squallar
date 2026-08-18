@@ -12,10 +12,11 @@ use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
+use rustdar_geo::KM_PER_DEGREE_LAT;
 use rustdar_radar::hca::MeltingLayerSource;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, RadarProduct};
+use rustdar_radar::types::{ImageBounds, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
@@ -790,7 +791,7 @@ fn render_radar_overlay(
 /// The northward offset is [`KM_PER_DEGREE_LAT`], the same sphere `render_gate`
 /// places the gates on and [`ImageBounds`] frames them with. It read `111.32`
 /// until those were unified, which drew the ring ~258 m *outside* the coverage
-/// the data actually reached — see `rustdar_radar::types::KM_PER_DEGREE_LAT`.
+/// the data actually reached — see `rustdar_geo::KM_PER_DEGREE_LAT`.
 /// The extent is the multiplier and the sphere is the divisor, so the two
 /// changes are independent: a wider frame moves the ring, not the planet.
 fn render_radar_range_ring(
@@ -2675,7 +2676,7 @@ fn draw_long_press_tooltip(
     // one spot could disagree, and only one of them was ever looked at.
     let map_pos = projector.unproject(egui::vec2(touch_pos.x, touch_pos.y));
     let (azimuth, ground_km) =
-        rustdar_radar::beam::site_bearing_range_km(lat, lon, map_pos.y(), map_pos.x());
+        rustdar_geo::site_bearing_range_km(lat, lon, map_pos.y(), map_pos.x());
 
     let text = match hover.read(azimuth, ground_km) {
         Reading::Value(value) => pane.selected_product.format_value(value, prefs),

@@ -1095,7 +1095,7 @@ impl Gui {
                     // hover readout uses rather than a second copy of it.
                     // ASCII prose throughout — the M8 glyph rules in
                     // `ui_glyphs.rs`.
-                    let (_, km) = rustdar_radar::beam::site_bearing_range_km(
+                    let (_, km) = rustdar_geo::site_bearing_range_km(
                         line.a().lat,
                         line.a().lon,
                         line.b().lat,
