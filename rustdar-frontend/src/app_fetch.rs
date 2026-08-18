@@ -4,6 +4,7 @@ use crate::render_dispatch::RenderGuard;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use rustdar_egui::actions::GuiAction;
+use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use rustdar_radar::types::RadarProduct;
 use std::sync::atomic::Ordering;
@@ -627,13 +628,15 @@ impl super::App {
             }
             GuiAction::StopLocation => {
                 self.location.disable(self.platform.as_mut());
-                self.gui
-                    .set_location_state(self.location.permission(), self.location.active());
+                // The location facts reach the UI through the per-frame
+                // compose (`push_frame_inputs`), which reads the gate this
+                // click just changed.
+                //
                 // The dot is fed by whatever was delivering. Nothing else will
                 // clear it — the gate has already stopped polling — so it goes
                 // here, and only when a serial dongle is not also feeding it.
                 if !self.platform.gps_active() {
-                    self.gui.clear_gps_fix();
+                    self.user_gps = None;
                 }
             }
             // Straight at the bridge, and this is the one location action that
@@ -727,7 +730,7 @@ impl super::App {
 
                 let mut new_config = self.gui.get_radar_config().clone();
                 new_config.site = site.clone();
-                self.gui.set_radar_config(new_config.clone());
+                self.gui.apply(GuiEvent::RadarConfig(new_config.clone()));
 
                 // The linked group moves together; an unlinked pane moves
                 // alone. `layer_sync_targets` is `propagate_layer_sync`'s
@@ -1507,15 +1510,18 @@ impl super::App {
             (target, false)
         };
 
-        self.gui.set_viewing_live_for_pane(pane_idx, is_live);
+        self.gui.apply(GuiEvent::ViewingLiveForPane {
+            pane_idx,
+            live: is_live,
+        });
         self.manual_nav_pending = true;
 
         // Update the UI config timestamp (local time for display)
         let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &target).naive_local();
         let mut config = self.gui.get_radar_config().clone();
         config.timestamp = local_ts;
-        self.gui.set_radar_config(config);
-        self.gui.set_fetching(true);
+        self.gui.apply(GuiEvent::RadarConfig(config));
+        self.gui.apply(GuiEvent::Fetching(true));
 
         self.spawn_fetch(site, target);
     }
@@ -1529,7 +1535,7 @@ impl super::App {
         let current_utc = scan_info.timestamp;
 
         self.manual_nav_pending = true;
-        self.gui.set_fetching(true);
+        self.gui.apply(GuiEvent::Fetching(true));
 
         let generation = self.render.next_fetch_generation(&site);
 
@@ -1587,7 +1593,10 @@ impl super::App {
             return;
         };
 
-        self.gui.set_viewing_live_for_pane(pane_idx, true);
+        self.gui.apply(GuiEvent::ViewingLiveForPane {
+            pane_idx,
+            live: true,
+        });
         self.manual_nav_pending = true;
 
         if let Some((scan_arc, declared, scan_info, timestamp)) =
@@ -1605,8 +1614,11 @@ impl super::App {
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
             let mut config = self.gui.get_radar_config().clone();
             config.timestamp = local_ts;
-            self.gui.set_radar_config(config);
-            self.gui.set_scan_info_for_site(&pane_site, scan_info);
+            self.gui.apply(GuiEvent::RadarConfig(config));
+            self.gui.apply(GuiEvent::ScanInfoForSite {
+                site: pane_site.clone(),
+                info: scan_info,
+            });
             self.gui.clear_loading_site_for_site(&pane_site);
             self.render.reset_panes_for_site(&pane_site, &self.gui);
             self.spawn_level3_fetches(&pane_site);
@@ -1638,8 +1650,8 @@ impl super::App {
         let now = chrono::Local::now().naive_local();
         let mut config = self.gui.get_radar_config().clone();
         config.timestamp = now;
-        self.gui.set_radar_config(config);
-        self.gui.set_fetching(true);
+        self.gui.apply(GuiEvent::RadarConfig(config));
+        self.gui.apply(GuiEvent::Fetching(true));
 
         let utc_timestamp = Self::local_to_utc(now);
         self.spawn_fetch(pane_site, utc_timestamp);

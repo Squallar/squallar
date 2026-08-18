@@ -161,6 +161,22 @@ impl Default for FrameProbes {
     }
 }
 
+/// Test-only readbacks for the two frame-input fields no production getter
+/// exists for. WO-E2's sentinel contract test asserts every `FrameInputs`
+/// field surfaces after `Gui::apply_frame_inputs`; every other field has a
+/// production getter to read it back through, these two do not — the UI
+/// consumes them internally — so the readback lives here with the probes.
+#[cfg(test)]
+impl Gui {
+    pub(crate) fn loop_frame_budget_for_test(&self) -> usize {
+        self.loop_frame_budget
+    }
+
+    pub(crate) fn floor_tile_zoom_bias_for_test(&self) -> u8 {
+        self.floor_tile_zoom_bias
+    }
+}
+
 /// What one pass over a control tree drew. A no-op outside tests, like
 /// [`ui_menu::MenuFrame`].
 #[derive(Default)]

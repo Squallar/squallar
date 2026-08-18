@@ -765,6 +765,9 @@ fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
 
     send_archive_scan(&app, at(5), stamped_scan(5));
     app.poll_data_channels();
+    // The stamps cross to the UI on the frame's compose, which no renderer
+    // exists here to run.
+    app.push_frame_inputs();
 
     let stamp = app
         .gui

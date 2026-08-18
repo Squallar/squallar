@@ -1029,6 +1029,9 @@ fn what_the_platform_says_about_location_reaches_the_settings_pane() {
     );
 
     app.poll_platform_state();
+    // What the gate observed reaches the UI on the frame's compose; no
+    // renderer exists here, so the test drives the compose itself.
+    app.push_frame_inputs();
 
     assert_eq!(
         app.gui.location_permission(),
@@ -1050,8 +1053,13 @@ fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
     let location = bridge.location_record();
     let mut app = headless(bridge);
     app.poll_platform_state();
-    app.gui
-        .set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+    // A delivered fix lands in the App's own field, stamped at arrival, and
+    // reaches the UI on the next compose — the same route production takes.
+    app.user_gps = Some((
+        rustdar_gps::GpsFix::from_device_position(35.25, -97.5),
+        web_time::Instant::now(),
+    ));
+    app.push_frame_inputs();
     assert!(app.gui.gps_fix().is_some());
 
     // Revoked in system settings, with no process restart — which is what
@@ -1061,6 +1069,7 @@ fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
         .set(rustdar_gps::LocationPermission::Denied);
     app.location.resumed();
     app.poll_platform_state();
+    app.push_frame_inputs();
 
     assert!(!location.active.get(), "the stream was left running");
     assert!(
@@ -1079,14 +1088,17 @@ fn a_revoked_permission_leaves_a_serial_dongles_dot_alone() {
     let mut app = headless(bridge);
     app.poll_platform_state();
     app.platform.start_gps(&rustdar_gps::GpsConfig::default());
-    app.gui
-        .set_gps_fix(rustdar_gps::GpsFix::from_lat_lon(35.25, -97.5));
+    app.user_gps = Some((
+        rustdar_gps::GpsFix::from_lat_lon(35.25, -97.5),
+        web_time::Instant::now(),
+    ));
 
     location
         .permission
         .set(rustdar_gps::LocationPermission::Denied);
     app.location.resumed();
     app.poll_platform_state();
+    app.push_frame_inputs();
 
     assert!(
         app.gui.gps_fix().is_some(),
@@ -1124,11 +1136,16 @@ fn turning_location_off_stops_the_stream_and_clears_the_dot() {
     let location = bridge.location_record();
     let mut app = headless(bridge);
     app.poll_platform_state();
-    app.gui
-        .set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+    app.user_gps = Some((
+        rustdar_gps::GpsFix::from_device_position(35.25, -97.5),
+        web_time::Instant::now(),
+    ));
+    app.push_frame_inputs();
     assert!(location.active.get());
 
     app.handle_gui_action(GuiAction::StopLocation, None);
+    // The click's effect crosses to the UI on the frame it triggers.
+    app.push_frame_inputs();
 
     assert!(!location.active.get(), "the off switch did not switch off");
     assert!(app.gui.gps_fix().is_none(), "the dot outlived the stream");
@@ -1963,6 +1980,10 @@ fn the_platforms_sensors_reach_the_map() {
     heading_tx.send(214.5).unwrap();
 
     app.handle_redraw();
+    // `handle_redraw` polls the producers and then returns before it needs a
+    // renderer; the compose that carries the polled facts to the UI lives on
+    // the renderer's side of that return, so the test drives it itself.
+    app.push_frame_inputs();
 
     let fix = app.gui.gps_fix().expect("no position reached the UI");
     assert_eq!((fix.latitude, fix.longitude), (35.3331, -97.2778));
@@ -2648,6 +2669,7 @@ fn a_rotation_re_queries_the_insets_rather_than_keeping_the_old_edge() {
 
     // What `resumed` does once the window exists.
     app.refresh_safe_area_insets();
+    app.push_frame_inputs();
     assert_eq!(
         app.gui.safe_area_insets(),
         (96.0, 0.0, 0.0, 0.0),
@@ -2656,6 +2678,7 @@ fn a_rotation_re_queries_the_insets_rather_than_keeping_the_old_edge() {
 
     ROTATED.store(true, Ordering::Relaxed);
     app.handle_resized(2400, 1080);
+    app.push_frame_inputs();
 
     assert_eq!(
         app.gui.safe_area_insets(),
