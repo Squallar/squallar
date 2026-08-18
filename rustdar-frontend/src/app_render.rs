@@ -688,12 +688,7 @@ impl super::App {
         // onto, whether that is a TDWR Doppler cut's 88.8 km or the same
         // radar's 417 km long-range reflectivity.
         let bounds = ImageBounds::from_radar_site(lat, lon, render.max_range_km);
-        let geo_bounds = GeoBounds {
-            min_lat: bounds.min_lat,
-            max_lat: bounds.max_lat,
-            min_lon: bounds.min_lon,
-            max_lon: bounds.max_lon,
-        };
+        let geo_bounds = GeoBounds::from(bounds);
         let pane = self.gui.pane_mut(pane_idx).unwrap();
         // Dropping this call is silent: the pane simply keeps whatever time it
         // was last stamped with, which reads as a current image of another
@@ -2121,12 +2116,7 @@ impl super::App {
             // anything else would put a restored long-range image back at the
             // wrong size, which reads as a pane that moved while suspended.
             let bounds = ImageBounds::from_radar_site(lat, lon, max_range_km);
-            let geo_bounds = GeoBounds {
-                min_lat: bounds.min_lat,
-                max_lat: bounds.max_lat,
-                min_lon: bounds.min_lon,
-                max_lon: bounds.max_lon,
-            };
+            let geo_bounds = GeoBounds::from(bounds);
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
                 let cache = pane.overlay_cache_mut(OverlayKind::Radar);
                 // Showing retires whatever the pane was showing; see the note

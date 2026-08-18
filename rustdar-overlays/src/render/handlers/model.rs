@@ -342,11 +342,7 @@ impl OverlayHandler for ModelDataHandler {
 
     fn hover_value_at(&self, lat: f64, lon: f64) -> Option<String> {
         let grid = self.cached_grids.get(self.selected_param)?;
-        if lat < grid.bounds.min_lat
-            || lat > grid.bounds.max_lat
-            || lon < grid.bounds.min_lon
-            || lon > grid.bounds.max_lon
-        {
+        if !grid.bounds.contains_point(lat, lon) {
             return None;
         }
         // Nearest neighbour, not interpolation: the HRRR grid is ~3 km, finer

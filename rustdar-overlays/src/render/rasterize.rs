@@ -4,8 +4,8 @@
 //! the same way a radar image is.
 
 use std::collections::{HashMap, HashSet};
-use std::f64::consts::PI;
 
+use rustdar_source::geo::lat_rad_to_mercator_y;
 use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use std::sync::Arc;
@@ -180,11 +180,6 @@ pub struct RasterizeOutput {
 }
 
 // ── Mercator projection helpers ──────────────────────────────────────────
-
-#[inline]
-fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
-    (PI / 4.0 + lat_rad / 2.0).tan().ln()
-}
 
 /// Web Mercator's own limit, from [`rustdar_source::geo`] rather than spelled
 /// again here.
@@ -1575,7 +1570,7 @@ use crate::hrrr::HrrrGridData;
 
 /// Returns degrees.
 fn merc_y_to_lat(merc_y: f64) -> f64 {
-    (2.0 * merc_y.exp().atan() - PI / 2.0).to_degrees()
+    rustdar_source::geo::mercator_y_to_lat_rad(merc_y).to_degrees()
 }
 
 // ── Model data (HRRR) rasterization ──────────────────────────────────────

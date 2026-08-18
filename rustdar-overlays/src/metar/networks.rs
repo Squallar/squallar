@@ -22,13 +22,20 @@ pub struct StateNetwork {
 }
 
 impl StateNetwork {
+    /// The station extent as the shared bounds type.
+    fn bounds(&self) -> GeoBounds {
+        GeoBounds {
+            min_lat: self.min_lat,
+            max_lat: self.max_lat,
+            min_lon: self.min_lon,
+            max_lon: self.max_lon,
+        }
+    }
+
     /// Inclusive on purpose: a false positive costs one 72 KB request, a false
     /// negative silently drops every station in a state.
     pub fn intersects(&self, view: &GeoBounds) -> bool {
-        self.min_lat <= view.max_lat
-            && self.max_lat >= view.min_lat
-            && self.min_lon <= view.max_lon
-            && self.max_lon >= view.min_lon
+        self.bounds().intersects(view)
     }
 
     /// Degrees, not km. Ranks networks; never decides membership.

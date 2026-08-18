@@ -445,6 +445,20 @@ impl ImageBounds {
     }
 }
 
+/// The geographic half of an [`ImageBounds`]: the four lat/lon edges, copied.
+/// The mercator pair is placement arithmetic, re-derivable through
+/// `lat_rad_to_mercator_y`, so nothing is lost that cannot be recomputed.
+impl From<ImageBounds> for rustdar_source::geo::GeoBounds {
+    fn from(bounds: ImageBounds) -> Self {
+        Self {
+            min_lat: bounds.min_lat,
+            max_lat: bounds.max_lat,
+            min_lon: bounds.min_lon,
+            max_lon: bounds.max_lon,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
     /// Where this volume's radar is, and how high.
