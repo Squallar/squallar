@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -376,7 +377,11 @@ pub async fn resolve_zone_geometries(
         for url in &alert.affected_zones {
             if let Some(polys) = zone_cache.get(url) {
                 placed += 1;
-                alert.features.push(OverlayFeature::new(
+                // The alerts of this round are not yet published, so this is
+                // the parse-time build finishing, not a copy-on-write: the
+                // `Arc` is still uniquely held and `make_mut` mutates in
+                // place.
+                Arc::make_mut(&mut alert.features).push(OverlayFeature::new(
                     polys.clone(),
                     fill_rgba,
                     stroke_rgba,
@@ -698,7 +703,7 @@ mod tests {
             onset: None,
             ends: None,
             affected_zones: zones,
-            features: Vec::new(),
+            features: Arc::new(Vec::new()),
         }
     }
 
@@ -902,7 +907,7 @@ mod tests {
     fn an_alert_that_brought_its_own_geometry_is_not_counted_as_a_zone_alert() {
         let base = serve(HashMap::new());
         let mut inline = zone_alert("a", vec![format!("{base}/zones/county/OKC000")]);
-        inline.features.push(OverlayFeature::new(
+        Arc::make_mut(&mut inline.features).push(OverlayFeature::new(
             vec![vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]]],
             [0, 0, 0, 0],
             [0, 0, 0, 0],
@@ -954,7 +959,7 @@ mod tests {
     #[test]
     fn the_zone_list_is_first_seen_order_with_no_repeats() {
         let mut carries_geometry = zone_alert("has-own", vec!["z/never".to_string()]);
-        carries_geometry.features.push(OverlayFeature::new(
+        Arc::make_mut(&mut carries_geometry.features).push(OverlayFeature::new(
             Vec::new(),
             [0; 4],
             [0; 4],

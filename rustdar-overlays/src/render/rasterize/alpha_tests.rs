@@ -15,6 +15,7 @@
 //! has channels far above it. One buffer cannot satisfy both.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::{AlertPaint, AlertsInput, AlphaMode, rasterize_model_data, rasterize_nws_alerts};
 use crate::hrrr::{HrrrGridData, ModelParameter};
@@ -52,14 +53,14 @@ fn alert_fixture() -> AlertPaint {
     AlertPaint {
         id: "urn:test".into(),
         category: AlertCategory::Warning,
-        features: vec![OverlayFeature::new(
+        features: Arc::new(vec![OverlayFeature::new(
             vec![vec![ring]],
             [255, 0, 0, 128],
             [0, 0, 0, 0],
             "T".into(),
             String::new(),
             HatchPattern::None,
-        )],
+        )]),
     }
 }
 

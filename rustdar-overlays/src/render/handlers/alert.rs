@@ -224,6 +224,11 @@ impl NwsAlertHandler {
     /// id, the category and the geometry are everything the raster reads, and
     /// the described job serialises this struct onto a message port — prose
     /// fields the raster never draws would be bytes on the wire per raster.
+    ///
+    /// The geometry rides an `Arc` from parse time, so the features column of
+    /// a row is a refcount bump — this method runs per raster dispatch on the
+    /// frame thread, and the national feed is thousands of rings on an active
+    /// day.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::AlertsInput> {
         if self.state.data.is_empty() {
             return None;
@@ -236,7 +241,7 @@ impl NwsAlertHandler {
                 .map(|i| rasterize::AlertPaint {
                     id: i.alert.id.clone(),
                     category: i.alert.category,
-                    features: i.alert.features.clone(),
+                    features: Arc::clone(&i.alert.features),
                 })
                 .collect(),
             enabled_categories: self.enabled_categories.iter().copied().collect(),
@@ -690,14 +695,14 @@ mod tests {
             onset: None,
             ends: None,
             affected_zones: Vec::new(),
-            features: vec![OverlayFeature::new(
+            features: Arc::new(vec![OverlayFeature::new(
                 polygons,
                 fill,
                 stroke,
                 event.to_string(),
                 String::new(),
                 HatchPattern::None,
-            )],
+            )]),
         }
     }
 
@@ -729,23 +734,25 @@ mod tests {
             .map(|i| format!("https://api.weather.gov/zones/county/OKC{i:03}"))
             .collect();
         let (fill, stroke) = crate::nws::colors::alert_color(event);
-        alert.features = (0..zone_count)
-            .map(|i| {
-                let lat = 35.0 + i as f64;
-                OverlayFeature::new(
-                    vec![vec![vec![
-                        (lat, -97.0),
-                        (lat + 0.5, -97.0),
-                        (lat + 0.5, -96.5),
-                    ]]],
-                    fill,
-                    stroke,
-                    event.to_string(),
-                    String::new(),
-                    HatchPattern::None,
-                )
-            })
-            .collect();
+        alert.features = Arc::new(
+            (0..zone_count)
+                .map(|i| {
+                    let lat = 35.0 + i as f64;
+                    OverlayFeature::new(
+                        vec![vec![vec![
+                            (lat, -97.0),
+                            (lat + 0.5, -97.0),
+                            (lat + 0.5, -96.5),
+                        ]]],
+                        fill,
+                        stroke,
+                        event.to_string(),
+                        String::new(),
+                        HatchPattern::None,
+                    )
+                })
+                .collect(),
+        );
         alert
     }
 

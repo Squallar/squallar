@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::colors::alert_color;
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 
@@ -163,7 +165,14 @@ pub struct NwsAlert {
     pub ends: Option<String>,
     pub affected_zones: Vec<String>,
     /// Empty until `zones::resolve_zone_geometries` runs, for zone-based alerts.
-    pub features: Vec<OverlayFeature>,
+    ///
+    /// Behind an `Arc` so a paint snapshot
+    /// ([`AlertPaint`](crate::render::rasterize::AlertPaint)) is a refcount
+    /// bump, not a copy of the geometry — the national feed is thousands of
+    /// rings on an active day, and the snapshot is taken per raster dispatch
+    /// on the frame thread. Comparison stays value-based: `Arc` derefs
+    /// through `==`.
+    pub features: Arc<Vec<OverlayFeature>>,
 }
 
 /// A GeoJSON `FeatureCollection` from `api.weather.gov/alerts/active`. Many
@@ -203,16 +212,16 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
         let category = AlertCategory::from_event(&event);
 
         let features = if has_geometry {
-            vec![OverlayFeature::new(
+            Arc::new(vec![OverlayFeature::new(
                 polygons,
                 fill_rgba,
                 stroke_rgba,
                 event.clone(),
                 opt_str_field(props, "headline").unwrap_or_default(),
                 HatchPattern::None,
-            )]
+            )])
         } else {
-            Vec::new() // Filled in by zone geometry resolution.
+            Arc::new(Vec::new()) // Filled in by zone geometry resolution.
         };
 
         alerts.push(NwsAlert {

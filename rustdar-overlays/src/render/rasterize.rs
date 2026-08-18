@@ -497,7 +497,14 @@ pub struct AlertPaint {
     /// Tested against [`AlertsInput::enabled_categories`].
     pub category: AlertCategory,
     /// The geometry, colours and (unused here) hatch of the alert's area.
-    pub features: Vec<OverlayFeature>,
+    ///
+    /// Shared with the owning
+    /// [`NwsAlert`](crate::nws::alert::NwsAlert) — building a row refcounts
+    /// the parse-time `Arc` instead of deep-cloning the national feed's
+    /// geometry per raster dispatch. `PartialEq` stays value-based (`Arc`
+    /// derefs through `==`): the wire round-trip compares a decoded copy in a
+    /// fresh `Arc` against this one, and pointer identity would fail it.
+    pub features: Arc<Vec<OverlayFeature>>,
 }
 
 /// Everything [`rasterize_nws_alerts`] reads besides the raster's own
@@ -554,7 +561,7 @@ pub fn rasterize_nws_alerts(
         if !enabled_categories.contains(&alert.category) || hidden_ids.contains(&alert.id) {
             continue;
         }
-        for feature in &alert.features {
+        for feature in alert.features.iter() {
             draw_feature(&mut pixmap, feature, &mb, w, h, scale);
         }
     }
