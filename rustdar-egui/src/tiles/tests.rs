@@ -512,13 +512,12 @@ fn the_clamp_latitude_is_the_one_whose_mercator_y_is_pi() {
         "MERCATOR_LAT_LIMIT_DEG projects to {y}, not pi"
     );
     // And the truncated figure does not, by a margin a metre-scale reader
-    // would notice. The degrees-to-ground conversion is the radar crate's
+    // would notice. The degrees-to-ground conversion is the geodesy floor's
     // one — `tests::geodesy_one_definition` is why, and it is right to be:
     // this sentence says "125.51 m" and a second earth would make it say
     // something else.
     let truncated = 85.05f64.to_radians().tan().asinh();
-    let short_m =
-        (MERCATOR_LAT_LIMIT_DEG - 85.05) * rustdar_radar::types::KM_PER_DEGREE_LAT * 1000.0;
+    let short_m = (MERCATOR_LAT_LIMIT_DEG - 85.05) * rustdar_geo::KM_PER_DEGREE_LAT * 1000.0;
     assert!(
         (truncated - std::f64::consts::PI).abs() > 1e-6,
         "85.05 was expected to be measurably short of the limit"

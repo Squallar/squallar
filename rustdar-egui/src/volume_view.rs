@@ -155,16 +155,25 @@ const MIN_BASIS_LENGTH: f32 = 1e-6;
 /// the columns go out in order with no transpose.
 pub type Mat4 = [[f32; 4]; 4];
 
-/// Web Mercator's `y` for a latitude in radians: `ln(tan(π/4 + φ/2))`.
+/// Web Mercator's `y` for a latitude in radians: `ln(tan(π/4 + φ/2))` —
+/// [`rustdar_geo::lat_rad_to_mercator_y`], whose one definition is now the one
+/// spelling workspace-wide, not just in this crate.
 ///
 /// Public alongside [`mercator_y_of_lat`], for the same reason that one is: a
 /// caller holding radians would otherwise write the formula out again or route
 /// through degrees and back, and `to_degrees().to_radians()` is not the
-/// identity in `f64`. `overlay_cache`'s geographic hit test is that caller, and
-/// it has to reach the same Mercator `y` the renderer drew with or a click
-/// misses the shape under it.
+/// identity in `f64`. `overlay_cache`'s geographic hit test is that caller,
+/// and it has to reach the same Mercator `y` the renderer drew with or a click
+/// misses the shape under it — which both now do by calling the same function
+/// this delegates to.
 pub fn mercator_y(lat_rad: f64) -> f64 {
-    (std::f64::consts::FRAC_PI_4 + lat_rad * 0.5).tan().ln()
+    // Bit-identical to the body this delegation replaced, which spelled the
+    // constant term as libstd's quarter-π and the half as `lat_rad * 0.5`:
+    // dividing correctly rounded π by 4 is exact (a power-of-two scaling), so
+    // the pre-divided constant and the canonical's `PI / 4.0` are the same
+    // bits, and `x * 0.5` and `x / 2.0` are the same power-of-two scaling of
+    // the same `x` — so the sum, and the `tan().ln()` of it, cannot differ.
+    rustdar_geo::lat_rad_to_mercator_y(lat_rad)
 }
 
 /// Web Mercator's `y` for a latitude in **degrees**.
@@ -174,7 +183,7 @@ pub fn mercator_y(lat_rad: f64) -> f64 {
 /// and a second spelling of it there is precisely the drift this seam exists
 /// to prevent.
 pub fn mercator_y_of_lat(lat_deg: f64) -> f64 {
-    mercator_y(lat_deg.to_radians())
+    rustdar_geo::lat_rad_to_mercator_y(lat_deg.to_radians())
 }
 
 /// How a map render maps geography onto egui's coordinate space — the affine a
@@ -689,7 +698,7 @@ fn half_diagonal(box_size_km: [f32; 3]) -> f32 {
 ///
 /// On a sphere a degree of longitude at the equator and a degree of latitude
 /// anywhere are the same arc, so this is
-/// [`rustdar_radar::types::KM_PER_DEGREE_LAT`] rather than a figure of its
+/// [`rustdar_geo::KM_PER_DEGREE_LAT`] rather than a figure of its
 /// own. It spelled `111.319_49` — the WGS-84 *equatorial* radius — which made
 /// it a third planet in a workspace that only ever wanted one; see that
 /// constant.
@@ -697,7 +706,7 @@ fn half_diagonal(box_size_km: [f32; 3]) -> f32 {
 /// Only ever divided by, and only ever with `cos(latitude)` beside it, so it is
 /// a scale rather than a distance: [`floor_magnification`] wants the pane's
 /// points-per-kilometre and the pane's affine is expressed per *degree*.
-const KM_PER_DEGREE_LON_AT_EQUATOR: f64 = rustdar_radar::types::KM_PER_DEGREE_LAT;
+const KM_PER_DEGREE_LON_AT_EQUATOR: f64 = rustdar_geo::KM_PER_DEGREE_LAT;
 
 /// How much the 3D view magnifies the ground it samples out of the pane mirror,
 /// at the pivot's own depth. Dimensionless; 1.0 means one mirror texel per
@@ -925,7 +934,7 @@ fn build_view(
 /// due north of the box looking south, 90° due east. That is what makes
 /// [`OrbitCamera`]'s default of 225° the south-west view its documentation
 /// claims, and it is the same sense as every other azimuth in this codebase
-/// (`beam::site_bearing_range_km`, the sampler's `azimuth_deg`), which is worth
+/// (`rustdar_geo::site_bearing_range_km`, the sampler's `azimuth_deg`), which is worth
 /// more than the alternative convention's slightly tidier trigonometry.
 pub fn orbit_eye_km(camera: OrbitCamera, distance: f32) -> [f32; 3] {
     let yaw = camera.yaw_deg().to_radians();

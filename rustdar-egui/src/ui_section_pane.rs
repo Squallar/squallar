@@ -907,8 +907,8 @@ fn tilt_curves(
     let ranges: Vec<(f32, f64)> = (0..=TILT_CURVE_SAMPLES)
         .map(|i| {
             let t = i as f64 / TILT_CURVE_SAMPLES as f64;
-            let (lat, lon) = beam::great_circle_point(a, b, t);
-            let (_, ground_km) = beam::site_bearing_range_km(site_lat, site_lon, lat, lon);
+            let (lat, lon) = rustdar_geo::great_circle_point(a, b, t);
+            let (_, ground_km) = rustdar_geo::site_bearing_range_km(site_lat, site_lon, lat, lon);
             (layout.x_of_distance(axes, t * axes.length_km), ground_km)
         })
         .collect();
@@ -1476,8 +1476,9 @@ fn describe_source(
     }
     let a = (source.line.a().lat, source.line.a().lon);
     let b = (source.line.b().lat, source.line.b().lon);
-    let (lat, lon) = beam::great_circle_point(a, b, t);
-    let (_, ground_km) = beam::site_bearing_range_km(source.site_lat, source.site_lon, lat, lon);
+    let (lat, lon) = rustdar_geo::great_circle_point(a, b, t);
+    let (_, ground_km) =
+        rustdar_geo::site_bearing_range_km(source.site_lat, source.site_lon, lat, lon);
     // The beam model measures above the antenna; the axis is MSL.
     let query_arl_km = height_km_msl - axes.base_km_msl;
 

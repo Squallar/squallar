@@ -1012,8 +1012,7 @@ fn a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole() {
                     // Where the box's poleward edge sits. A bound rather than a
                     // position, so the codebase's one degrees-to-kilometres
                     // figure is exactly the right instrument for it.
-                    let edge_deg =
-                        lat.abs() + box_half.north_km / rustdar_radar::types::KM_PER_DEGREE_LAT;
+                    let edge_deg = lat.abs() + box_half.north_km / rustdar_geo::KM_PER_DEGREE_LAT;
                     nearest_edge_to_pole = nearest_edge_to_pole.min(90.0 - edge_deg);
                     let what = format!("a {w}x{h} strip at {lat}N framed on {box_half:?}");
                     if delivered < worst_covered {
@@ -1112,12 +1111,8 @@ fn a_strip_wider_than_the_world_measures_the_world_rather_than_the_fold() {
 
     // Half the world either side of the centre: the most ground an east-west
     // axis has, and what every wider strip has to answer.
-    let (_, half_circumference_km) = rustdar_radar::beam::site_bearing_range_km(
-        centre.y(),
-        centre.x(),
-        centre.y(),
-        centre.x() + 180.0,
-    );
+    let (_, half_circumference_km) =
+        rustdar_geo::site_bearing_range_km(centre.y(), centre.x(), centre.y(), centre.x() + 180.0);
 
     let mut previous = 0.0_f64;
     let mut previous_width = 0.0_f32;
@@ -1291,7 +1286,7 @@ fn a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows() {
     let projector = walkers::Projector::new(rect, &framed, centre);
     let middle = projector.unproject(rect.center().to_vec2());
     let (_, off_km) =
-        rustdar_radar::beam::site_bearing_range_km(centre.y(), centre.x(), middle.y(), middle.x());
+        rustdar_geo::site_bearing_range_km(centre.y(), centre.x(), middle.y(), middle.x());
     assert!(
         off_km < 0.001,
         "the clamped strip's middle is {off_km} km from the box's centre",
@@ -1324,7 +1319,7 @@ fn a_framed_strip_is_centred_on_the_box() {
     let projector = walkers::Projector::new(rect, &memory, centre);
     let middle = projector.unproject(rect.center().to_vec2());
     let (_, off_km) =
-        rustdar_radar::beam::site_bearing_range_km(centre.y(), centre.x(), middle.y(), middle.x());
+        rustdar_geo::site_bearing_range_km(centre.y(), centre.x(), middle.y(), middle.x());
     assert!(
         off_km < 0.001,
         "the strip's middle is {off_km} km from the box's centre",
@@ -1349,7 +1344,7 @@ fn ktlx() -> crate::pane::GeoPoint {
 ///
 /// The offsets are built with the **flat** approximation
 /// ([`OFFSET_TOLERANCE_KM`]'s companion, `corners_for`'s own arithmetic) while
-/// the drag measures with [`rustdar_radar::beam::site_bearing_range_km`], the
+/// the drag measures with [`rustdar_geo::site_bearing_range_km`], the
 /// real geodesy. The two disagree by a fraction of a percent, so an exact
 /// assertion would be an assertion about which approximation the fixture used
 /// rather than about the drag. 1.5 km on a 100 km offset is 1.5% — an order of
@@ -1359,12 +1354,13 @@ const OFFSET_TOLERANCE_KM: f64 = 1.5;
 
 /// A point `east_km` east and `north_km` north of `from`.
 ///
-/// The flat approximation, because there is no forward geodesy in `beam` to
-/// invert `site_bearing_range_km` with and inverting it numerically here would
-/// be more arithmetic than the tests contain. See [`OFFSET_TOLERANCE_KM`] for
-/// what that costs and why it costs nothing that matters.
+/// The flat approximation, deliberately independent of the geodesy the drag
+/// measures with: the exact inverse exists
+/// (`rustdar_geo::great_circle_destination`), but a fixture built on it would
+/// share its arithmetic with the code under test. See [`OFFSET_TOLERANCE_KM`]
+/// for what the independence costs and why it costs nothing that matters.
 fn offset(from: crate::pane::GeoPoint, east_km: f64, north_km: f64) -> crate::pane::GeoPoint {
-    let per_deg = rustdar_radar::types::KM_PER_DEGREE_LAT;
+    let per_deg = rustdar_geo::KM_PER_DEGREE_LAT;
     crate::pane::GeoPoint {
         lat: from.lat + north_km / per_deg,
         lon: from.lon + east_km / (per_deg * from.lat.to_radians().cos()),
@@ -1563,9 +1559,9 @@ fn the_drawn_box_is_square_in_kilometres_rather_than_degrees() {
         let half = rustdar_radar::voxel::HalfExtentKm::square(100.0);
         let (nw, se) = corners_for(centre, half).expect("a box away from the poles");
         let (_, north_km) =
-            rustdar_radar::beam::site_bearing_range_km(centre.lat, centre.lon, nw.lat, centre.lon);
+            rustdar_geo::site_bearing_range_km(centre.lat, centre.lon, nw.lat, centre.lon);
         let (_, east_km) =
-            rustdar_radar::beam::site_bearing_range_km(centre.lat, centre.lon, centre.lat, se.lon);
+            rustdar_geo::site_bearing_range_km(centre.lat, centre.lon, centre.lat, se.lon);
         // The two are compared against *each other*, not against 100, so the
         // flat approximation cancels: what is asserted is that the box is as
         // wide as it is tall in kilometres, which is the claim that matters.

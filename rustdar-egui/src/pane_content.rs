@@ -310,32 +310,10 @@ pub struct MapPane {
     pub volume: VolumePane,
 }
 
-/// A point on the ground, in degrees.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GeoPoint {
-    pub lat: f64,
-    pub lon: f64,
-}
-
-impl GeoPoint {
-    /// Whether this names a point that exists: latitude in `[-90, 90]`,
-    /// longitude in `[-180, 180]`.
-    ///
-    /// Range rather than `is_finite`, and it subsumes it — NaN compares false
-    /// against everything and the infinities fall outside the bounds — so one
-    /// pair of comparisons rules out both a non-finite coordinate and a finite
-    /// one that is nonsense. `lat: 1e9` is finite, walks a perfectly
-    /// well-defined great circle, and describes nowhere.
-    ///
-    /// Not a restriction on where a line may be drawn: a section crossing the
-    /// antimeridian is two in-range endpoints, and the great-circle walk between
-    /// them handles the wrap. `walkers::Projector::unproject` already answers in
-    /// this range, so an out-of-range point means something upstream is wrong
-    /// rather than that the user drew somewhere unusual.
-    pub fn is_on_earth(self) -> bool {
-        (-90.0..=90.0).contains(&self.lat) && (-180.0..=180.0).contains(&self.lon)
-    }
-}
+/// A point on the ground, in degrees — [`rustdar_geo::GeoPoint`], moved
+/// verbatim to the geodesy floor with its `is_on_earth` validity test, and
+/// re-exported at its old spot so `crate::pane::GeoPoint` keeps naming it.
+pub use rustdar_geo::GeoPoint;
 
 /// The line a cross-section is cut along, stored **geographically**.
 ///

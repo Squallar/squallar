@@ -9240,7 +9240,7 @@ fn a_shift_body_drag_sweeps_about_the_midpoint() {
     // Press three quarters of the way along, where a bearing about the
     // midpoint is well defined.
     let (press_lat, press_lon) =
-        rustdar_radar::beam::great_circle_point((a.lat, a.lon), (b.lat, b.lon), 0.75);
+        rustdar_geo::great_circle_point((a.lat, a.lon), (b.lat, b.lon), 0.75);
     let press_px = h.screen_of(
         0,
         GeoPoint {
@@ -9254,7 +9254,7 @@ fn a_shift_body_drag_sweeps_about_the_midpoint() {
     // side, so the committed line's bearing must land where the *pointer*
     // is about the pivot — not merely differ from the old bearing.
     let release_ground = h.ground_at(0, press_px + egui::vec2(-40.0, -48.0));
-    let (want_bearing, _) = rustdar_radar::beam::site_bearing_range_km(
+    let (want_bearing, _) = rustdar_geo::site_bearing_range_km(
         mid_before.lat,
         mid_before.lon,
         release_ground.y(),
@@ -9397,7 +9397,7 @@ fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
     // Perpendicular, to the left of A→B, by exactly one step.
     let mid_before = crate::ui_section_edit::midpoint(line_before);
     let mid_after = crate::ui_section_edit::midpoint(line);
-    let (moved_bearing, moved_km) = rustdar_radar::beam::site_bearing_range_km(
+    let (moved_bearing, moved_km) = rustdar_geo::site_bearing_range_km(
         mid_before.lat,
         mid_before.lon,
         mid_after.lat,

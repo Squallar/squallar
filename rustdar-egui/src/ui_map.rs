@@ -1,7 +1,6 @@
 use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_radar::beam;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::types::{RadarProduct, RenderView};
 use rustdar_units::UserPreferences;
@@ -1389,12 +1388,12 @@ impl super::Gui {
     /// circle with `230 / 111.32` degrees of latitude, and 111.32 km per degree
     /// is a sphere of 6378.1 km — the WGS84 equatorial radius — while the
     /// section's geometry, and this track with it, walks
-    /// [`rustdar_radar::types::EARTH_RADIUS_KM`], which is 6371. A track drawn
+    /// [`rustdar_geo::EARTH_RADIUS_KM`], which is 6371. A track drawn
     /// all the way to the edge of coverage therefore landed
     /// `230 × (1 − 6371/6378.1)` ≈ 0.26 km inside the ring, 1.15 px at the zoom
     /// where the whole ring fits a 2048-pixel pane.
     ///
-    /// The ring now divides by [`rustdar_radar::types::KM_PER_DEGREE_LAT`],
+    /// The ring now divides by [`rustdar_geo::KM_PER_DEGREE_LAT`],
     /// which *is* `EARTH_RADIUS_KM · π/180`, so the two are on one sphere and
     /// the gap is gone; `rustdar_radar`'s
     /// `the_ground_track_and_the_range_ring_are_the_same_sphere` measures the
@@ -1409,7 +1408,7 @@ impl super::Gui {
     /// A straight segment between the two projected endpoints is a **rhumb
     /// line**: straight in Web Mercator is constant bearing, not shortest path.
     /// The section is cut along a great circle
-    /// ([`rustdar_radar::beam::great_circle_point`], the same walk
+    /// ([`rustdar_geo::great_circle_point`], the same walk
     /// `tilt_curves` samples), and the two part company in the middle. Measured
     /// on a 229 km line at 41 °N — a full-range line at the latitude of the
     /// northern-tier sites — the peak separation is **894 m** running east-west
@@ -3465,7 +3464,7 @@ fn great_circle_track(
     (0..=SECTION_TRACK_SAMPLES)
         .map(|i| {
             let t = i as f64 / SECTION_TRACK_SAMPLES as f64;
-            let (lat, lon) = rustdar_radar::beam::great_circle_point(a, b, t);
+            let (lat, lon) = rustdar_geo::great_circle_point(a, b, t);
             project(crate::pane::GeoPoint { lat, lon })
         })
         .collect()
@@ -3619,10 +3618,10 @@ const NOT_RESIDENT: &str = "| no value held for this frame";
 /// Compute hover info string from the picture's own gates and site coordinates.
 ///
 /// The radar-relative half of the readout comes from
-/// [`beam::site_bearing_range_km`], the crate's one spelling of "where is this
+/// [`rustdar_geo::site_bearing_range_km`], the workspace's one spelling of "where is this
 /// point, from the radar" — it used to be a second copy of that haversine and
 /// forward azimuth inline here. Both spellings measure on
-/// [`rustdar_radar::types::EARTH_RADIUS_KM`], and
+/// [`rustdar_geo::EARTH_RADIUS_KM`], and
 /// `the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
 /// pins that the readout's digits did not move.
 ///
@@ -3639,7 +3638,7 @@ pub(super) fn compute_hover_info_raw(
     product: RadarProduct,
     prefs: &UserPreferences,
 ) -> String {
-    let (azimuth, distance_km) = beam::site_bearing_range_km(
+    let (azimuth, distance_km) = rustdar_geo::site_bearing_range_km(
         input.site_lat,
         input.site_lon,
         input.hover_lat,

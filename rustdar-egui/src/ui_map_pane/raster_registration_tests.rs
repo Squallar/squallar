@@ -32,7 +32,8 @@
 //! believed otherwise. This is that statement, in a form that fails if anyone
 //! ever rebuilds the rows on latitude.
 
-use rustdar_radar::types::{EARTH_RADIUS_KM, ImageBounds};
+use rustdar_geo::EARTH_RADIUS_KM;
+use rustdar_radar::types::ImageBounds;
 
 /// Sites spanning the fleet's latitude range, which is the axis the error
 /// would live on: a Mercator-vs-latitude bow is zero at the equator and grows

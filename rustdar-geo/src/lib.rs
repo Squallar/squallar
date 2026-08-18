@@ -6,10 +6,12 @@
 //! the workspace answers it exactly once. [`EARTH_RADIUS_KM`] and the
 //! [`KM_PER_DEGREE_LAT`] derived from it are the only sphere anything above
 //! may convert between degrees and ground kilometres on;
-//! [`MERCATOR_LAT_LIMIT_DEG`] with [`lat_rad_to_mercator_y`] and
-//! [`mercator_y_from_sin_lat`] are its one Web Mercator; [`GeoBounds`] and
-//! the polygon aliases are the shapes overlay features and viewport culling
-//! speak in. `rustdar-radar/tests/geodesy_one_definition.rs` scans the whole
+//! [`MERCATOR_LAT_LIMIT_DEG`] with [`lat_rad_to_mercator_y`],
+//! [`mercator_y_from_sin_lat`] and the one inverse [`mercator_y_to_lat_rad`]
+//! are its one Web Mercator, and the slippy-tile transforms (from
+//! [`lon_to_tile_x`] to [`tile_to_lat`]) are that projection quantized to the
+//! OSM tile grid; [`GeoPoint`], [`GeoBounds`] and the polygon aliases are the
+//! shapes overlay features and viewport culling speak in. `rustdar-radar/tests/geodesy_one_definition.rs` scans the whole
 //! workspace to keep it that way — this file holds the two licensed defining
 //! literals, and every other crate reaches them by re-export.
 //!
@@ -288,6 +290,33 @@ pub fn great_circle_point(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
     (z.atan2(x.hypot(y)).to_degrees(), y.atan2(x).to_degrees())
 }
 
+/// A point on the ground, in degrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeoPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl GeoPoint {
+    /// Whether this names a point that exists: latitude in `[-90, 90]`,
+    /// longitude in `[-180, 180]`.
+    ///
+    /// Range rather than `is_finite`, and it subsumes it — NaN compares false
+    /// against everything and the infinities fall outside the bounds — so one
+    /// pair of comparisons rules out both a non-finite coordinate and a finite
+    /// one that is nonsense. `lat: 1e9` is finite, walks a perfectly
+    /// well-defined great circle, and describes nowhere.
+    ///
+    /// Not a restriction on where a line may be drawn: a section crossing the
+    /// antimeridian is two in-range endpoints, and the great-circle walk between
+    /// them handles the wrap. `walkers::Projector::unproject` already answers in
+    /// this range, so an out-of-range point means something upstream is wrong
+    /// rather than that the user drew somewhere unusual.
+    pub fn is_on_earth(self) -> bool {
+        (-90.0..=90.0).contains(&self.lat) && (-180.0..=180.0).contains(&self.lon)
+    }
+}
+
 /// Ring of (latitude, longitude) points. First ring is exterior, rest are holes.
 pub type GeoPolygonRing = Vec<(f64, f64)>;
 
@@ -397,16 +426,16 @@ pub fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
 /// [`lat_rad_to_mercator_y`] and [`mercator_y_from_sin_lat`] are below it and
 /// `rustdar-radar`'s `ImageBounds` is documented in terms of it. It is also
 /// the lowest crate every caller can reach — `rustdar-egui`'s tile grid reads
-/// it through `rustdar-radar`'s re-export while `rustdar-overlays`'s
-/// rasterizer, which no longer depends on that crate at all, reads it through
-/// `rustdar_source::geo`'s. Two of the three copies this replaced existed
+/// it directly, one hop, while `rustdar-overlays`'s rasterizer, which depends
+/// on neither UI crate, reads it through `rustdar_source::geo`'s re-export.
+/// Two of the three copies this replaced existed
 /// *because* there was no such place; it lived in `rustdar-radar`'s `types`
 /// until the substrate became the floor both sides share, and moved one crate
 /// further down when the floor itself became this crate.
 ///
 /// # It is a domain bound, not a clamp every caller must apply
 ///
-/// `tiles::lat_to_tile_y` needs no branch on it — its index clamp already
+/// [`lat_to_tile_y`] needs no branch on it — its index clamp already
 /// carries every latitude past this to the edge row — and
 /// `render::rasterize`'s `MercatorBounds::from_geo` needs none either, because
 /// `overlay_cache::OverlayTexturePlan::coverage` has already clamped the same
@@ -482,6 +511,104 @@ pub fn mercator_y_from_sin_lat(sin_lat: f64) -> f64 {
 /// radians.
 pub fn mercator_y_to_lat_rad(merc_y: f64) -> f64 {
     merc_y.sinh().atan()
+}
+
+// ── Slippy tiles ─────────────────────────────────────────────────────────
+//
+// The OSM tile grid is this same Web Mercator quantized: the world square cut
+// into `2^zoom × 2^zoom` tiles. The four transforms live beside the projection
+// they quantize — the inverse goes through `mercator_y_to_lat_rad` above, so
+// the grid and the projection cannot drift apart — and `rustdar-egui`'s
+// `tiles` module re-exports them; the mercantile reference vectors in that
+// crate's `tiles/tests.rs` pin these exact bits through the re-export.
+
+/// Carry a fractional tile coordinate to an index on `0..2^zoom`.
+///
+/// **Both ends, which is the whole reason this is a function.** These helpers
+/// clamped only at zero, so every input past the far edge — a longitude at or
+/// east of +180, a latitude at or south of [`MERCATOR_LAT_LIMIT_DEG`] — handed
+/// the caller an index of `2^zoom` or more, for a grid whose last tile is
+/// `2^zoom − 1`. `mercantile`, the reference implementation this is checked
+/// against, clamps at both ends (`mercantile/__init__.py::tile`), and
+/// `rustdar-egui`'s `tiles::tests::no_input_produces_an_index_off_the_grid`
+/// now holds us to that.
+///
+/// The saturating `as` conversion is load-bearing on the way in as well as the
+/// way out. `lat_to_tile_y` fed −90° through the old `ln(tan φ + sec φ)` and
+/// got `u32::MAX`; `rustdar-egui`'s `ui_map_overlays::draw_tile_layer` then
+/// computes `lat_to_tile_y(min_lat) + 1`, which is an **overflow panic in a
+/// debug build**. Nothing reaches −90° from `walkers::Projector::unproject` —
+/// it would take a pane ~113 world-heights tall — so this was latent rather
+/// than live, but it was one arithmetic hop from a caller that already exists.
+#[inline]
+fn tile_index(coord: f64, zoom: u8) -> u32 {
+    // NaN floors to NaN and `NaN as u32` is 0, which is the low edge — the same
+    // place an unrepresentable coordinate would land if it had a sign.
+    let last = 2u32.saturating_pow(u32::from(zoom)).saturating_sub(1);
+    (coord.floor().max(0.0) as u32).min(last)
+}
+
+/// Convert longitude to tile X index at the given zoom level.
+///
+/// Clamped to the grid at both ends — see `tile_index` above. Longitudes outside
+/// ±180 are **clamped, not wrapped**: a viewport straddling the antimeridian
+/// gets the tiles on its own side of the seam and nothing for the far side.
+/// See `rustdar-egui`'s `ui_map_overlays::draw_tile_layer` for what that
+/// costs.
+pub fn lon_to_tile_x(lon: f64, zoom: u8) -> u32 {
+    let n = 2f64.powi(zoom as i32);
+    tile_index((lon + 180.0) / 360.0 * n, zoom)
+}
+
+/// Convert latitude to tile Y index at the given zoom level.
+///
+/// # `asinh(tan φ)`, not `ln(tan φ + sec φ)`
+///
+/// The same function — `asinh t ≡ ln(t + √(t²+1))` and `√(tan²φ + 1)` is
+/// `sec φ` on this domain — and the identity is exact, so this is not a change
+/// of convention. It is a change of *spelling*, and the spelling matters
+/// because the sum cancels: south of the equator `tan φ` is negative and
+/// `sec φ` is positive, and near the pole the two are the same enormous number
+/// with opposite signs. Measured, against `asinh(tan φ)` evaluated in the same
+/// `f64`:
+///
+/// | latitude | old form's error |
+/// |---|---|
+/// | anywhere north | 0 ulp, at every latitude tested |
+/// | −89.99° | 0.065 px at zoom 18 |
+/// | −89.999° | 1.15 px at zoom 18 |
+/// | −89.9999° | 188 px at zoom 18 |
+/// | −89.99999° | 80 279 px at zoom 18 |
+/// | −90° | no digits left — `u32::MAX` here, `NaN` in CPython's libm |
+///
+/// The asymmetry is why this was never going to show up in use: the northern
+/// hemisphere, where this application's radars are, is exact in both forms.
+///
+/// Both independent implementations checked against use a stable form —
+/// `walkers-0.56.0/src/mercator.rs` writes `tan().asinh()`, `mercantile` writes
+/// `log((1+sin φ)/(1−sin φ))/4` — and this now agrees with the first bit for
+/// bit over the whole sweep.
+pub fn lat_to_tile_y(lat: f64, zoom: u8) -> u32 {
+    let n = 2f64.powi(zoom as i32);
+    let y = lat.to_radians().tan().asinh();
+    tile_index((1.0 - y / std::f64::consts::PI) / 2.0 * n, zoom)
+}
+
+/// Convert tile X index back to the western longitude of the tile.
+pub fn tile_to_lon(x: u32, zoom: u8) -> f64 {
+    let n = 2f64.powi(zoom as i32);
+    x as f64 / n * 360.0 - 180.0
+}
+
+/// Convert tile Y index back to the northern latitude of the tile.
+///
+/// Routed through [`mercator_y_to_lat_rad`] — the same `sinh` then `atan` this
+/// body spelled inline before it moved here, the same two libm calls in the
+/// same order, so the delegation is bit-identical and the inverse projection
+/// has exactly one home.
+pub fn tile_to_lat(y: u32, zoom: u8) -> f64 {
+    let n = 2f64.powi(zoom as i32);
+    mercator_y_to_lat_rad(PI * (1.0 - 2.0 * y as f64 / n)).to_degrees()
 }
 
 #[cfg(test)]

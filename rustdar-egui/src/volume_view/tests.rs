@@ -654,7 +654,7 @@ fn a_fresh_pane_asks_the_mirror_for_one_texel_a_pixel() {
         // A plan pane 900 points tall showing the box's north extent over that
         // height, expressed the way `MapPaneGeo` carries it.
         let points_per_degree_lon =
-            (900.0 / 460.0) * rustdar_radar::types::KM_PER_DEGREE_LAT * lat.to_radians().cos();
+            (900.0 / 460.0) * rustdar_geo::KM_PER_DEGREE_LAT * lat.to_radians().cos();
         let magnification = floor_magnification(
             OrbitCamera::default(),
             box_km,
@@ -1038,7 +1038,7 @@ fn the_reported_framing_asks_for_more_than_one_mirror_texel_a_pixel() {
     // the way `MapPaneGeo` carries it: points per degree of longitude at 34.635.
     let points_per_km = 900.0 / 460.0;
     let points_per_degree_lon =
-        points_per_km * rustdar_radar::types::KM_PER_DEGREE_LAT * 34.635_f64.to_radians().cos();
+        points_per_km * rustdar_geo::KM_PER_DEGREE_LAT * 34.635_f64.to_radians().cos();
 
     let magnification = floor_magnification(
         camera,

@@ -251,15 +251,14 @@ impl SectionEditDrag {
             SectionGrab::A | SectionGrab::B => with_endpoint(self.preview, self.grab, ground),
             SectionGrab::Body if self.sweep => {
                 let mid = midpoint(self.original);
-                let (from_bearing, from_km) = rustdar_radar::beam::site_bearing_range_km(
+                let (from_bearing, from_km) = rustdar_geo::site_bearing_range_km(
                     mid.lat,
                     mid.lon,
                     self.press_ground.lat,
                     self.press_ground.lon,
                 );
-                let (to_bearing, to_km) = rustdar_radar::beam::site_bearing_range_km(
-                    mid.lat, mid.lon, ground.lat, ground.lon,
-                );
+                let (to_bearing, to_km) =
+                    rustdar_geo::site_bearing_range_km(mid.lat, mid.lon, ground.lat, ground.lon);
                 // Within a fifth of a kilometre of the midpoint neither
                 // bearing means anything — the press was effectively *on* the
                 // pivot — and a rotation computed from noise would spin the
@@ -311,21 +310,17 @@ pub(crate) fn with_endpoint(
 
 /// The line's ground length, in kilometres.
 pub(crate) fn length_km(line: SectionLine) -> f64 {
-    let (_, km) = rustdar_radar::beam::site_bearing_range_km(
-        line.a().lat,
-        line.a().lon,
-        line.b().lat,
-        line.b().lon,
-    );
+    let (_, km) =
+        rustdar_geo::site_bearing_range_km(line.a().lat, line.a().lon, line.b().lat, line.b().lon);
     km
 }
 
 /// The line's midpoint on the ground — halfway along the great circle the cut
-/// follows, from the same walk (`beam::great_circle_point`) the sampler and
+/// follows, from the same walk (`rustdar_geo::great_circle_point`) the sampler and
 /// the drawn track both use, so "the middle of the line" is one place in every
 /// part of the app.
 pub(crate) fn midpoint(line: SectionLine) -> GeoPoint {
-    let (lat, lon) = rustdar_radar::beam::great_circle_point(
+    let (lat, lon) = rustdar_geo::great_circle_point(
         (line.a().lat, line.a().lon),
         (line.b().lat, line.b().lon),
         0.5,
@@ -343,12 +338,12 @@ pub(crate) fn midpoint(line: SectionLine) -> GeoPoint {
 pub(crate) fn bearing_deg(line: SectionLine) -> f64 {
     let mid = midpoint(line);
     let (bearing, _) =
-        rustdar_radar::beam::site_bearing_range_km(mid.lat, mid.lon, line.b().lat, line.b().lon);
+        rustdar_geo::site_bearing_range_km(mid.lat, mid.lon, line.b().lat, line.b().lon);
     bearing
 }
 
 /// The point `distance_km` from `from` along `bearing_deg`, on the sphere the
-/// rest of the crate's geodesy walks ([`rustdar_radar::types::EARTH_RADIUS_KM`]).
+/// rest of the crate's geodesy walks ([`rustdar_geo::EARTH_RADIUS_KM`]).
 ///
 /// The longitude is wrapped into `[-180, 180]` because
 /// [`GeoPoint::is_on_earth`] — and therefore `SectionLine::new` — refuses
@@ -356,7 +351,7 @@ pub(crate) fn bearing_deg(line: SectionLine) -> f64 {
 /// section can legitimately go.
 fn destination(from: GeoPoint, bearing_deg: f64, distance_km: f64) -> GeoPoint {
     let (lat, lon_raw) =
-        rustdar_radar::beam::great_circle_destination(from.lat, from.lon, bearing_deg, distance_km);
+        rustdar_geo::great_circle_destination(from.lat, from.lon, bearing_deg, distance_km);
     let mut lon = lon_raw;
     if lon > 180.0 {
         lon -= 360.0;
@@ -388,7 +383,7 @@ fn rebuilt(mid: GeoPoint, bearing: f64, half_km: f64) -> Option<SectionLine> {
 /// quietly grow as it walked toward the equator.
 pub(crate) fn translated(line: SectionLine, from: GeoPoint, to: GeoPoint) -> Option<SectionLine> {
     let (motion_bearing, motion_km) =
-        rustdar_radar::beam::site_bearing_range_km(from.lat, from.lon, to.lat, to.lon);
+        rustdar_geo::site_bearing_range_km(from.lat, from.lon, to.lat, to.lon);
     if !motion_km.is_finite() {
         return None;
     }
@@ -601,10 +596,10 @@ mod tests {
             bearing_deg(slid)
         );
         let (want_bearing, want_km) =
-            rustdar_radar::beam::site_bearing_range_km(from.lat, from.lon, to.lat, to.lon);
+            rustdar_geo::site_bearing_range_km(from.lat, from.lon, to.lat, to.lon);
         let new_mid = midpoint(slid);
         let (got_bearing, got_km) =
-            rustdar_radar::beam::site_bearing_range_km(mid.lat, mid.lon, new_mid.lat, new_mid.lon);
+            rustdar_geo::site_bearing_range_km(mid.lat, mid.lon, new_mid.lat, new_mid.lon);
         assert!(
             (got_km - want_km).abs() < 0.05,
             "the midpoint moved {got_km} km for a {want_km} km drag"
@@ -635,12 +630,8 @@ mod tests {
         assert!((length_km(stepped) - len).abs() < 0.01);
         assert!((bearing_deg(stepped) - bearing).abs() < 0.01);
         let stepped_mid = midpoint(stepped);
-        let (step_bearing, step_km) = rustdar_radar::beam::site_bearing_range_km(
-            mid.lat,
-            mid.lon,
-            stepped_mid.lat,
-            stepped_mid.lon,
-        );
+        let (step_bearing, step_km) =
+            rustdar_geo::site_bearing_range_km(mid.lat, mid.lon, stepped_mid.lat, stepped_mid.lon);
         assert!(
             (step_km - 15.0).abs() < 0.01,
             "a 15 km step moved the line {step_km} km"
@@ -727,9 +718,8 @@ mod tests {
         // misses this by roughly twice the swing — ~100° here — while every
         // magnitude-only assertion above still passes.
         let to = point(mid.lat + 0.4, mid.lon);
-        let (to_bearing, _) =
-            rustdar_radar::beam::site_bearing_range_km(mid.lat, mid.lon, to.lat, to.lon);
-        let (from_bearing, _) = rustdar_radar::beam::site_bearing_range_km(
+        let (to_bearing, _) = rustdar_geo::site_bearing_range_km(mid.lat, mid.lon, to.lat, to.lon);
+        let (from_bearing, _) = rustdar_geo::site_bearing_range_km(
             mid.lat,
             mid.lon,
             press_on_line.lat,
