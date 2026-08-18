@@ -1,22 +1,3 @@
-/// Run an `async fn`'s synchronous prologue without completing it. Merely
-/// *creating* the future runs nothing, so a test that did that would pass
-/// with the prologue deleted.
-///
-/// The poll is expected to panic — hyper's resolver needs a tokio reactor
-/// this crate does not depend on — which happens after the `tls::init()`
-/// being probed for. No request is issued.
-fn poll_once<F: Future>(fut: F) {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut fut = Box::pin(fut);
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        let _ = fut.as_mut().poll(&mut cx);
-    }));
-    std::panic::set_hook(previous);
-}
-
 /// Names the backend rather than asserting "a provider is installed", so
 /// that a dependency re-enabling `reqwest/rustls` — which brings back
 /// `aws-lc-rs` and the silent fallback — fails here.
@@ -330,7 +311,7 @@ fn the_browser_clients_attach_no_user_agent() {
 /// shape rustls-platform-verifier issue #221 trips over — Let's Encrypt R13,
 /// no OCSP responder, cleartext `http://` CRL distribution point.
 ///
-/// `cargo test -p rustdar-radar --lib -- --ignored --nocapture live_`
+/// `cargo test -p rustdar-source --lib -- --ignored --nocapture live_`
 #[ignore = "hits the live api.weather.gov endpoint"]
 #[tokio::test]
 async fn live_https_fetch_against_weather_gov() {
@@ -388,20 +369,12 @@ fn client_installs_provider_in_a_fresh_process() {
     run_probe("tls::tests::probe_client_installs_ring");
 }
 
-#[test]
-fn nexrad_wrappers_install_provider_in_a_fresh_process() {
-    run_probe("tls::tests::probe_list_files_installs_ring");
-}
-
-#[test]
-fn archive_installs_provider_in_a_fresh_process() {
-    run_probe("tls::tests::probe_archive_list_files_installs_ring");
-}
-
-#[test]
-fn chunk_polling_installs_provider_in_a_fresh_process() {
-    run_probe("tls::tests::probe_chunk_poll_installs_ring");
-}
+// The three fresh-process pins on `rustdar-radar`'s own network entry points —
+// `scan::list_files`, `archive::list_files` and `ChunkPoller::poll` — live in
+// that crate's `tls_pins` module, not here: they call radar modules, and
+// moving them down with the rest of this file would recreate the exact
+// reverse dependency this crate exists to kill. A spawned probe must live in
+// the same test binary as its spawner, so the pair travels together.
 
 /// Fails if the `init()` call is removed from [`super::client`].
 #[test]
@@ -416,71 +389,5 @@ fn probe_client_installs_ring() {
     assert!(
         super::default_is_ring(),
         "tls::client() did not install ring"
-    );
-}
-
-/// The client the `nexrad-data` wrapper reaches is built inside a `Lazy`, so
-/// the provider must be installed before the first `.await`. Fails if
-/// `tls::init()` is removed from `scan::list_files`.
-#[test]
-#[ignore = "spawned by nexrad_wrappers_install_provider_in_a_fresh_process"]
-fn probe_list_files_installs_ring() {
-    assert!(
-        !super::default_is_ring(),
-        "a provider was already installed before the probe ran; \
-             this probe is only meaningful in a fresh process"
-    );
-    let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
-    // One poll: stops at the first `.await`, so the probe stays offline.
-    poll_once(crate::scan::list_files("KTLX", &date));
-    assert!(
-        super::default_is_ring(),
-        "scan::list_files did not install ring before its first await"
-    );
-}
-
-/// The probe that pins `crate::archive` to [`super::client`].
-/// `probe_list_files_installs_ring` — `#[ignore]`d, it needs the network —
-/// goes through `scan::list_files`, which
-/// calls `init()` itself, so it would still pass with `archive` on a bare
-/// `reqwest::Client::builder()` — which panics "No provider set" for anyone
-/// reaching `archive` directly. Fails if `archive::shared_client` stops
-/// going through [`super::client`].
-#[test]
-#[ignore = "spawned by archive_installs_provider_in_a_fresh_process"]
-fn probe_archive_list_files_installs_ring() {
-    assert!(
-        !super::default_is_ring(),
-        "a provider was already installed before the probe ran; \
-             this probe is only meaningful in a fresh process"
-    );
-    let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
-    let sources = crate::sources::DataSources::production();
-    poll_once(crate::archive::list_files(&sources, "KTLX", &date));
-    assert!(
-        super::default_is_ring(),
-        "archive::list_files did not install ring before its first await"
-    );
-}
-
-/// The same pin for the real-time chunk feed. `ChunkPoller::poll` reaches
-/// `archive::shared_client()` in its synchronous prologue for exactly this
-/// reason; move that call after the first `.await` and merely polling the
-/// future stops installing a provider, which is a panic for anyone who
-/// reaches the poller without going through `scan::poll_chunks`.
-#[test]
-#[ignore = "spawned by chunk_polling_installs_provider_in_a_fresh_process"]
-fn probe_chunk_poll_installs_ring() {
-    assert!(
-        !super::default_is_ring(),
-        "a provider was already installed before the probe ran; \
-             this probe is only meaningful in a fresh process"
-    );
-    let sources = crate::sources::DataSources::production();
-    let mut poller = crate::chunks::ChunkPoller::new("KTLX");
-    poll_once(poller.poll(&sources));
-    assert!(
-        super::default_is_ring(),
-        "ChunkPoller::poll did not install ring before its first await"
     );
 }

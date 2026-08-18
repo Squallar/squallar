@@ -27,7 +27,7 @@
 //! ```
 //!
 //! Open-Meteo verified 2026-07-28 against the exact `/v1/forecast` query
-//! [`Self::sounding_url`] builds: plain `GET` 200, `GET` with an `Origin:`
+//! [`DataSources::sounding_url`] builds: plain `GET` 200, `GET` with an `Origin:`
 //! header 200 with `access-control-allow-origin: *` and
 //! `access-control-max-age: 600`, `OPTIONS` preflight 200 with the same. So a
 //! `User-Agent` *would* survive — but nothing there requires one (unlike
@@ -52,9 +52,10 @@
 //! cross-origin request *can* succeed from that page.
 //!
 //! So METAR and SPC requests must stay **simple**: no `User-Agent`, no custom
-//! headers. [`Self::metar_sends_user_agent`] and [`Self::spc_sends_user_agent`]
-//! record that per origin; [`Self::metar_client`] and [`Self::spc_client`] read
-//! it. A new origin belongs in both tables above or in neither.
+//! headers. [`DataSources::metar_sends_user_agent`] and
+//! [`DataSources::spc_sends_user_agent`] record that per origin;
+//! [`DataSources::metar_client`] and [`DataSources::spc_client`] read it. A new
+//! origin belongs in both tables above or in neither.
 
 use std::borrow::Cow;
 
@@ -71,7 +72,7 @@ pub struct DataSources {
     /// NEXRAD Level II real-time chunks. Keys are `SITE/VOLUME/NAME`, a live
     /// rotation rather than a dated archive.
     ///
-    /// [`crate::chunks`] reads it: `list_volume_indices` and `list_chunks`
+    /// `rustdar_radar::chunks` reads it: `list_volume_indices` and `list_chunks`
     /// walk the rotation and `download_chunk` fetches a piece, all taking the
     /// bucket from this field rather than naming it, so the derived
     /// validations (the Android network-security-config, the web
@@ -115,8 +116,8 @@ pub struct DataSources {
     pub s3_base: Source,
     /// Open-Meteo forecast API: environmental sounding heights (0 °C and
     /// −20 °C levels) per radar site, for the products
-    /// [`crate::types::RadarProduct::reads_env_heights`] names. See
-    /// [`crate::sounding`].
+    /// `rustdar_radar::types::RadarProduct::reads_env_heights` names. See
+    /// `rustdar_radar::sounding`.
     pub sounding_base: Source,
     /// `false` in production: IEM answers `OPTIONS` with `405`, so a
     /// `User-Agent` makes the request preflighted and it never happens.
@@ -195,7 +196,7 @@ impl DataSources {
     /// The bucket has **no directory structure and no `sn.last`**: keys are
     /// `TLX_N0S_2026_07_25_01_20_27`, so "the latest product" is the last key of
     /// a prefix listing. `site3` is the **three**-letter code — `TLX`, not
-    /// `KTLX`. See [`crate::level3::site_code`].
+    /// `KTLX`. See `rustdar_radar::level3::site_code`.
     pub fn level3_day_prefix(site3: &str, product: &str, date: &chrono::NaiveDate) -> String {
         format!("{site3}_{product}_{}", date.format("%Y_%m_%d"))
     }
@@ -250,7 +251,7 @@ impl DataSources {
     ///
     /// `freezing_level_height` is the 0 °C height directly; the four
     /// temperature/geopotential-height pressure-level pairs (600–300 hPa) are
-    /// what [`crate::sounding::parse_env_heights`] interpolates the −20 °C
+    /// what `rustdar_radar::sounding::parse_env_heights` interpolates the −20 °C
     /// height from — that span brackets the −20 °C surface in every ordinary
     /// atmosphere (~−13 °C climatological mean at 600 hPa, ~−45 °C at 300).
     ///

@@ -32,14 +32,15 @@
 //!
 //! * `reqwest::ClientBuilder::build` reads `CryptoProvider::get_default()` and
 //!   `panic!("No provider set")` if it is absent. The panic lands wherever the
-//!   *first* client is built, which for [`crate::archive`] is inside a `OnceLock`
-//!   on the first S3 request. Any test that does not open a socket passes.
+//!   *first* client is built, which for `rustdar_radar::archive` is inside a
+//!   `OnceLock` on the first S3 request. Any test that does not open a socket
+//!   passes.
 //! * Installing late is as bad as not installing: the first installer wins and
 //!   every later client silently keeps that provider.
 //!
 //! So every path that can reach a client construction calls it first. [`client`]
-//! is the only constructor the application uses, and [`crate::scan`] also calls
-//! [`init`] at the top of its two network wrappers.
+//! is the only constructor the application uses, and `rustdar_radar::scan` also
+//! calls [`init`] at the top of its two network wrappers.
 //!
 //! This only became load-bearing when the archive moved off `nexrad-data`'s
 //! `aws` feature: that feature compiled `aws-lc-rs` in, so a client built without
@@ -111,7 +112,7 @@ pub fn client(_user_agent: &str, _timeout: std::time::Duration) -> reqwest::Clie
 /// preflight, so those feeds break silently, on wasm only.
 ///
 /// Prefer [`client_for`]; the per-origin rule lives in
-/// [`crate::sources::DataSources`].
+/// [`crate::origins::DataSources`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn simple_client(timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();
@@ -127,7 +128,7 @@ pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {
 
 /// Pick between [`client`] and [`simple_client`] from an origin's preflight
 /// rule. The only place that choice is made; the boolean comes from
-/// [`crate::sources::DataSources`].
+/// [`crate::origins::DataSources`].
 ///
 /// The wasm builds of the two are currently byte-identical — a page cannot set
 /// `User-Agent` either way — so picking wrong breaks nothing *today*. That is a
