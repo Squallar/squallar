@@ -8,6 +8,7 @@ members = [
     "rustdar-egui",
     "rustdar-radar",
     "rustdar-overlays",
+    "rustdar-source",
     "rustdar-units",
     "rustdar-gps",
     "nexrad-level3",
@@ -45,6 +46,7 @@ rustdar-frontend = { path = "rustdar-frontend" }
 rustdar-overlays = { path = "rustdar-overlays" }
 rustdar-platform = { path = "rustdar-platform" }
 rustdar-radar = { path = "rustdar-radar" }
+rustdar-source = { path = "rustdar-source" }
 rustdar-units = { path = "rustdar-units" }
 rustdar-web = { path = "rustdar-web" }
 rustdar-gps = { path = "rustdar-gps", default-features = false }

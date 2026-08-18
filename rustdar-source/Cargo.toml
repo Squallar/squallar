@@ -1,0 +1,27 @@
+[package]
+name = "rustdar-source"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+reqwest = { workspace = true }
+
+# `tls` installs the process-wide *ring* provider here: this is the lowest crate
+# in the graph that reaches a TLS handshake.
+#
+# Off on wasm32: reqwest goes through the browser's `fetch()` there, so pulling
+# rustls in would add `ring` -- the workspace's one C dependency -- for nothing.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { workspace = true }
+
+# Gated, not plain `[dev-dependencies]`: `rt-multi-thread` is not one of the
+# features tokio accepts on wasm, and `--all-targets` builds dev-deps too, so an
+# ungated entry breaks `cargo check --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+# `tests/charter.rs` parses `cargo metadata` output to pin this crate's
+# dependency ceiling and the overlays->radar edge cut.
+serde_json = { workspace = true }

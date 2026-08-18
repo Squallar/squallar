@@ -1,56 +1,56 @@
-//! The crate's one bounds-checked cursor.
+//! The substrate's one bounds-checked cursor.
 //!
-//! Three payload types are read back off a message port here — a
-//! [`crate::render_input::RenderInput`], the [`crate::nyquist::DeclaredNyquist`]
-//! that rides beside every volume, and the [`crate::scan::DecodedScan`] a
-//! decode job hands back — and all three are reading bytes they did not write.
-//! The other end of the port can be a different build, so every accessor
-//! answers `None` rather than panicking: a browser tab that panicked here would
-//! take the whole page down where nobody would see it.
+//! Three payload types are read back off a message port with it — a
+//! `RenderInput`, the `DeclaredNyquist` that rides beside every volume, and
+//! the `DecodedScan` a decode job hands back, all defined in `rustdar-radar` —
+//! and all three are reading bytes they did not write. The other end of the
+//! port can be a different build, so every accessor answers `None` rather than
+//! panicking: a browser tab that panicked here would take the whole page down
+//! where nobody would see it.
 //!
 //! One cursor rather than one per payload, because the three codecs are read
 //! together and a `u32` that meant a different width in one of them would be a
 //! silent misparse rather than a compile error.
 
 /// A bounds-checked cursor over untrusted bytes.
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
 
-    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.at.checked_add(n)?;
         let slice = self.bytes.get(self.at..end)?;
         self.at = end;
         Some(slice)
     }
 
-    pub(crate) fn u8(&mut self) -> Option<u8> {
+    pub fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|b| b[0])
     }
 
-    pub(crate) fn u16(&mut self) -> Option<u16> {
+    pub fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
 
-    pub(crate) fn u32(&mut self) -> Option<u32> {
+    pub fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
-    pub(crate) fn f32(&mut self) -> Option<f32> {
+    pub fn f32(&mut self) -> Option<f32> {
         Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
-    pub(crate) fn f64(&mut self) -> Option<f64> {
+    pub fn f64(&mut self) -> Option<f64> {
         Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
-    pub(crate) fn i64(&mut self) -> Option<i64> {
+    pub fn i64(&mut self) -> Option<i64> {
         Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
@@ -62,12 +62,12 @@ impl<'a> Reader<'a> {
     /// three counted lists — sweeps, then radials, then gates — so an
     /// unchecked count at the outer level would reserve against a length the
     /// inner levels have not been measured against yet.
-    pub(crate) fn bounded(&self, count: u32, min_size: usize) -> Option<usize> {
+    pub fn bounded(&self, count: u32, min_size: usize) -> Option<usize> {
         let count = count as usize;
         (count.checked_mul(min_size)? <= self.bytes.len() - self.at).then_some(count)
     }
 
-    pub(crate) fn at_end(&self) -> bool {
+    pub fn at_end(&self) -> bool {
         self.at == self.bytes.len()
     }
 }
@@ -90,15 +90,21 @@ impl<'a> Reader<'a> {
 ///
 /// **Why the fixtures it is used on are built from literals.** A digest is
 /// only a guard if it never fires for a reason other than the layout. Every
-/// grid, section and tilt this crate builds for its other tests goes through
-/// beam geometry, and `sin`/`cos`/`atan2` are the platform's libm rather than
-/// anything IEEE 754 pins — so a digest of one of those would be a digest of
-/// whichever libm ran it, and would go red on a target nobody changed. The
-/// `layout_fixture` beside each of these tests is therefore assembled by hand
-/// from exactly-representable numbers, and carries no value that anything
-/// computes.
-#[cfg(test)]
-pub(crate) fn layout_digest(bytes: &[u8]) -> u64 {
+/// grid, section and tilt `rustdar-radar` builds for its other tests goes
+/// through beam geometry, and `sin`/`cos`/`atan2` are the platform's libm
+/// rather than anything IEEE 754 pins — so a digest of one of those would be
+/// a digest of whichever libm ran it, and would go red on a target nobody
+/// changed. The `layout_fixture` beside each of these tests is therefore
+/// assembled by hand from exactly-representable numbers, and carries no value
+/// that anything computes.
+///
+/// **Why it is not `#[cfg(test)]`.** In `rustdar-radar` it was, because a
+/// crate's own tests see its `cfg(test)` items. A dependent crate's tests do
+/// not — `cfg(test)` is per-crate, so gating it here would erase it from
+/// every digest suite that reaches it through a re-export. It is ordinary
+/// code now: eight lines, no dependency, dead in any build that does not
+/// call it.
+pub fn layout_digest(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= u64::from(byte);

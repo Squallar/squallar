@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 chrono = { workspace = true }
 log = { workspace = true }
+rustdar-source = { workspace = true }
 rustdar-units = { workspace = true }
 serde = { workspace = true }
 # Open-Meteo sounding responses in `sounding`.
