@@ -1564,8 +1564,8 @@ fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
 // the next autosave then wrote back to disk.
 
 /// A minimal `ScanInfo`. Only its arrival matters here, not its contents; the
-/// site the delivery is *addressed to* is the `set_scan_info_for_site`
-/// argument, not this.
+/// site the delivery is *addressed to* is the `ScanInfoForSite` event's
+/// site field, not this.
 fn a_scan() -> rustdar_radar::types::ScanInfo {
     rustdar_radar::types::ScanInfo {
         site: rustdar_radar::sites::RadarSite {
@@ -1615,7 +1615,10 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
         "precondition: the load itself must put the zoom back"
     );
 
-    restored.set_scan_info_for_site(&site, a_scan());
+    restored.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+        site: site.clone(),
+        info: a_scan(),
+    });
 
     assert_eq!(
         restored.pane(0).unwrap().map_memory.zoom(),
@@ -1637,7 +1640,7 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
 }
 
 /// The chunk-path twin. With live mode fed by the real-time chunk bucket, the
-/// first data of a session arrives through `apply_chunk_scan_info` instead, and
+/// first data of a session arrives through `ChunkScanInfo` instead, and
 /// it claims the same latch.
 #[test]
 fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
@@ -1652,7 +1655,10 @@ fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
     assert!(restored.load_ui_config(&store));
     assert_eq!(restored.pane(0).unwrap().map_memory.zoom(), 9.0);
 
-    restored.apply_chunk_scan_info(&site, a_scan());
+    restored.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: site.clone(),
+        info: a_scan(),
+    });
 
     assert_eq!(
         restored.pane(0).unwrap().map_memory.zoom(),
@@ -1682,7 +1688,10 @@ fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
          this test cannot tell the latch from a default"
     );
 
-    gui.set_scan_info_for_site(&site, a_scan());
+    gui.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+        site: site.clone(),
+        info: a_scan(),
+    });
 
     assert_eq!(
         gui.pane(0).unwrap().map_memory.zoom(),
@@ -1713,7 +1722,10 @@ fn a_config_without_a_saved_zoom_still_zooms_to_the_radar_on_its_first_scan() {
         "precondition: a legacy config restores no zoom"
     );
 
-    gui.set_scan_info_for_site("KMPX", a_scan());
+    gui.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+        site: "KMPX".to_owned(),
+        info: a_scan(),
+    });
 
     assert_eq!(
         gui.pane(0).unwrap().map_memory.zoom(),
@@ -1735,14 +1747,20 @@ fn a_scan_no_pane_is_watching_neither_moves_a_map_nor_spends_the_latch() {
     let before = gui.pane(0).unwrap().map_memory.zoom();
     assert_ne!(site, "KABX", "precondition: the stray site must be a stray");
 
-    gui.set_scan_info_for_site("KABX", a_scan());
+    gui.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+        site: "KABX".to_owned(),
+        info: a_scan(),
+    });
     assert_eq!(
         gui.pane(0).unwrap().map_memory.zoom(),
         before,
         "a scan no pane is viewing moved the map anyway"
     );
 
-    gui.set_scan_info_for_site(&site, a_scan());
+    gui.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+        site: site.clone(),
+        info: a_scan(),
+    });
     assert_eq!(
         gui.pane(0).unwrap().map_memory.zoom(),
         crate::ui::DEFAULT_INITIAL_ZOOM,

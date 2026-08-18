@@ -325,10 +325,10 @@ impl Gui {
     /// Zoom to the radar on the first scan of a session and never again, so a
     /// later load does not throw away the user's navigation.
     ///
-    /// Factored out of [`Self::set_scan_info_for_site`] because
-    /// [`Self::apply_chunk_scan_info`] shares this one behaviour and none of the
-    /// others — and with chunks feeding live mode, the first data of a session
-    /// can arrive through either.
+    /// Factored out of [`Gui::apply`](Self::apply)'s `ScanInfoForSite` arm
+    /// because the `ChunkScanInfo` arm shares this one behaviour and none of
+    /// the others — and with chunks feeding live mode, the first data of a
+    /// session can arrive through either.
     ///
     /// # `load_ui_config` is the other writer of the latch
     ///

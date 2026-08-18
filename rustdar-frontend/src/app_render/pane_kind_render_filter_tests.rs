@@ -38,19 +38,20 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
     pane.site = SITE.to_string();
     pane.selected_product = PRODUCT;
     pane.selected_elevation = TILT;
-    app.gui.set_scan_info_for_pane(
-        pane_idx,
-        rustdar_radar::types::ScanInfo {
-            site,
-            site_source: rustdar_radar::site_position::SitePositionSource::Table,
-            site_position: None,
-            timestamp: volume_time(),
-            vcp_number: 212,
-            available_products: vec![PRODUCT],
-            product_elevations,
-            status: String::new(),
-        },
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx,
+            info: rustdar_radar::types::ScanInfo {
+                site,
+                site_source: rustdar_radar::site_position::SitePositionSource::Table,
+                site_position: None,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![PRODUCT],
+                product_elevations,
+                status: String::new(),
+            },
+        });
 }
 
 /// The line an aimed section pane is cut along. Two distinct points on Earth is

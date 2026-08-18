@@ -154,6 +154,52 @@ pub(crate) struct InputHarness {
     /// The previous pass's widget bookkeeping, diffed against each new pass by
     /// [`id_changes_between`] to feed [`InputHarness::id_changes`].
     prev_widgets: egui::WidgetRects,
+    /// The frame-input facts this harness owns, mirroring the `App`'s own
+    /// fields (WO-E2). See [`FrameFactsForTest`].
+    facts: FrameFactsForTest,
+}
+
+/// The harness's copy of the App-owned frame-input facts.
+///
+/// Helpers mutate one fact and re-apply the whole set through
+/// `Gui::apply_frame_inputs` — exactly how the App composes every frame — so
+/// the harness can never half-update the snapshot-shaped state. Defaults
+/// mirror `Gui::new`, so the first re-apply changes nothing a test did not
+/// ask for. Every frame-input-shaped write in this file and its tests must go
+/// through these facts: a direct `Gui` write would be silently overwritten by
+/// the next helper's re-apply.
+struct FrameFactsForTest {
+    safe_area_insets: (f32, f32, f32, f32),
+    supports_exit: bool,
+    loop_frame_budget: usize,
+    location_settings_available: bool,
+    location: (rustdar_gps::LocationPermission, bool),
+    gps: Option<(rustdar_gps::GpsFix, web_time::Instant)>,
+    user_heading: Option<f32>,
+    catalogue_pending: bool,
+    chunk_status: crate::ui::ChunkFeedStatus,
+    current_volumes: std::collections::HashMap<String, crate::ui::CurrentVolumeStamp>,
+    floor_tile_zoom_bias: u8,
+}
+
+impl Default for FrameFactsForTest {
+    fn default() -> Self {
+        Self {
+            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            // `Gui::new`'s own answers, so default-facts over a fresh `Gui`
+            // is the identity.
+            supports_exit: true,
+            loop_frame_budget: 60,
+            location_settings_available: false,
+            location: (rustdar_gps::LocationPermission::default(), false),
+            gps: None,
+            user_heading: None,
+            catalogue_pending: false,
+            chunk_status: crate::ui::ChunkFeedStatus::default(),
+            current_volumes: Default::default(),
+            floor_tile_zoom_bias: 0,
+        }
+    }
 }
 
 /// A textured quad the last frame painted: where it went, and **which way up**
@@ -394,6 +440,7 @@ impl InputHarness {
             last_repaint_delay: std::time::Duration::MAX,
             id_changes: Vec::new(),
             prev_widgets: egui::WidgetRects::default(),
+            facts: FrameFactsForTest::default(),
         };
         harness.warm_up();
         // The first frame's `check_auto_polls` starts the initial fetch and
@@ -403,7 +450,9 @@ impl InputHarness {
         // instead of the auto-poll checkbox, and `FetchRadarScan`'s click path
         // is unreachable. Settling it puts the harness in the steady state the
         // app spends its life in rather than a transient no test intended.
-        harness.gui.set_fetching(false);
+        harness
+            .gui
+            .apply(crate::shell_api::GuiEvent::Fetching(false));
         harness.warm_up();
         harness
     }
@@ -428,11 +477,31 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Re-apply the whole fact set, as the App's per-frame compose
+    /// (`push_frame_inputs`) does. Every fact-mutating helper funnels
+    /// through here, so the `Gui` can never see half an update.
+    fn apply_facts(&mut self) {
+        self.gui.apply_frame_inputs(crate::shell_api::FrameInputs {
+            safe_area_insets: self.facts.safe_area_insets,
+            supports_exit: self.facts.supports_exit,
+            loop_frame_budget: self.facts.loop_frame_budget,
+            location_settings_available: self.facts.location_settings_available,
+            location: self.facts.location,
+            gps: self.facts.gps.clone(),
+            user_heading: self.facts.user_heading,
+            catalogue_pending: self.facts.catalogue_pending,
+            chunk_status: self.facts.chunk_status,
+            current_volumes: &self.facts.current_volumes,
+            floor_tile_zoom_bias: self.facts.floor_tile_zoom_bias,
+        });
+    }
+
     /// State that the site list is still short of the network, as `App::new`
-    /// and `App::adopt_the_first_catalogue` do. See
-    /// [`Gui::set_catalogue_pending`](crate::Gui::set_catalogue_pending).
+    /// and `App::adopt_the_first_catalogue` do — through the frame-input
+    /// facts, the route the App's own compose takes.
     pub(crate) fn set_catalogue_pending(&mut self, pending: bool) {
-        self.gui.set_catalogue_pending(pending);
+        self.facts.catalogue_pending = pending;
+        self.apply_facts();
         self.warm_up();
     }
 
@@ -440,10 +509,44 @@ impl InputHarness {
     ///
     /// `egui-winit` fills `RawInput::safe_area_insets` only under
     /// `cfg(target_os = "ios")`, so Android pushes its `WindowInsets` through
-    /// `Gui::set_safe_area_insets` instead. This is that route.
+    /// the frame-input compose instead. This is that route.
     pub(crate) fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
-        self.gui.set_safe_area_insets(top, bottom, left, right);
+        self.facts.safe_area_insets = (top, bottom, left, right);
+        self.apply_facts();
         self.warm_up();
+    }
+
+    /// State what the platform location service is doing, as the App's
+    /// per-frame compose reads it off the location gate.
+    pub(crate) fn set_location_state(
+        &mut self,
+        permission: rustdar_gps::LocationPermission,
+        active: bool,
+    ) {
+        self.facts.location = (permission, active);
+        self.apply_facts();
+    }
+
+    /// State whether this platform has a location settings page, as `App::new`
+    /// captures it once at startup.
+    pub(crate) fn set_location_settings_available(&mut self, available: bool) {
+        self.facts.location_settings_available = available;
+        self.apply_facts();
+    }
+
+    /// Deliver a GPS fix, stamped at arrival exactly as `poll_platform_state`
+    /// stamps one — the instant travels with the fix through every re-apply,
+    /// so the settings pane's staleness question stays honest in tests too.
+    pub(crate) fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
+        self.facts.gps = Some((fix, web_time::Instant::now()));
+        self.apply_facts();
+    }
+
+    /// State this build's loop frame cap, as `App::new` captures it from the
+    /// resolved budgets.
+    pub(crate) fn set_loop_frame_budget(&mut self, frames: usize) {
+        self.facts.loop_frame_budget = frames;
+        self.apply_facts();
     }
 
     /// Whether egui has a real widget registered under `id` from the last
@@ -1390,7 +1493,7 @@ impl InputHarness {
 
     /// Deliver a scan for `site`, through the host's own delivery path.
     ///
-    /// `Gui::set_scan_info_for_site` is what the app calls when a fetch
+    /// The `ScanInfoForSite` event is what the app applies when a fetch
     /// completes: it fills the matching panes, clears `fetching` *and* calls
     /// `auto_poll.on_success()`. Hand-rolling those would leave the harness in
     /// a state the app never reaches.
@@ -1417,9 +1520,12 @@ impl InputHarness {
             pane.site = site.to_owned();
         }
         let collected = info.timestamp;
-        self.gui.set_scan_info_for_site(site, info);
+        self.gui.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+            site: site.to_owned(),
+            info,
+        });
         // And the substrate half, because that is what a volume arrival does:
-        // `App` writes its base holder and `set_scan_info_for_site` from the
+        // `App` writes its base holder and applies `ScanInfoForSite` from the
         // same arm and publishes the current-volume stamp each frame. A harness
         // that filled only the plan view's half would leave a 3D pane waiting
         // for a volume that, in production, had already landed.
@@ -1449,12 +1555,13 @@ impl InputHarness {
                     newest: collected,
                     // A pure base volume: what an archive arrival publishes.
                     // Tests staging a merged or still-filling state build the
-                    // stamp themselves through `Gui::set_current_volumes`.
+                    // stamp themselves and stage it through these facts.
                     base_started: Some(collected),
                 },
             );
         }
-        self.gui.set_current_volumes(volumes);
+        self.facts.current_volumes = volumes;
+        self.apply_facts();
         self.warm_up();
     }
 

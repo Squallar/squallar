@@ -912,26 +912,6 @@ impl Gui {
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
     }
 
-    /// Update the scan info for all panes viewing the given site.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_scan_info_for_site(&mut self, site: &str, info: ScanInfo) {
-        self.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
-            site: site.to_owned(),
-            info,
-        });
-    }
-
-    /// Apply scan info for a volume still being assembled from the real-time
-    /// chunk feed. Merge semantics — see the `ChunkScanInfo` arm of
-    /// [`Gui::apply`], where the body and its reasons moved.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn apply_chunk_scan_info(&mut self, site: &str, fresh: ScanInfo) {
-        self.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
-            site: site.to_owned(),
-            info: fresh,
-        });
-    }
-
     /// Whether live panes should be fed from the real-time chunk bucket.
     ///
     /// Persisted as `UiConfig::live_chunks`, default on. Turning it off leaves
@@ -981,30 +961,8 @@ impl Gui {
         self.notifier_endpoint = endpoint.into();
     }
 
-    /// Publish what the real-time feed is doing, so the status bar can say so.
-    ///
-    /// Pushed in by the App each frame rather than pulled: the feeds live there,
-    /// and this crate has no business reaching into them.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_chunk_status(&mut self, status: ChunkFeedStatus) {
-        self.chunk_status = status;
-    }
-
     pub fn chunk_status(&self) -> &ChunkFeedStatus {
         &self.chunk_status
-    }
-
-    /// Publish each site's current-volume stamp — the identity and freshness
-    /// of the merged volume a whole-volume pane may build from, advanced by
-    /// every sealed sweep.
-    ///
-    /// Pushed in by the App each frame, the same arrangement as
-    /// [`FrameInputs::chunk_status`](crate::shell_api::FrameInputs::chunk_status)
-    /// and for the same reason: the decoded volumes live there, and this crate
-    /// holds only their names.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_current_volumes(&mut self, volumes: HashMap<String, CurrentVolumeStamp>) {
-        self.current_volumes = volumes;
     }
 
     /// The stamp of `site`'s current volume, if this build holds one at all.
@@ -1028,30 +986,12 @@ impl Gui {
         sites
     }
 
-    /// Update the scan info for a specific pane.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_scan_info_for_pane(&mut self, pane_idx: usize, info: ScanInfo) {
-        self.apply(crate::shell_api::GuiEvent::ScanInfoForPane { pane_idx, info });
-    }
-
     /// Whether a fetch someone is waiting on is in flight.
     ///
     /// Global rather than per-site, and it gates `check_auto_polls` — so any
     /// path that raises it has to lower it on every exit.
     pub fn fetching(&self) -> bool {
         self.radar.fetching
-    }
-
-    /// Set fetching status
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_fetching(&mut self, fetching: bool) {
-        self.apply(crate::shell_api::GuiEvent::Fetching(fetching));
-    }
-
-    /// Set an error message
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_error(&mut self, error: String) {
-        self.apply(crate::shell_api::GuiEvent::Error(error));
     }
 
     /// The Set Time dialog's body, host-free: the window above wraps it on
@@ -1565,17 +1505,6 @@ impl Gui {
         self.mirror_size_points
     }
 
-    /// Tell the UI how much extra tile detail the 3D floor can actually show.
-    ///
-    /// The renderer's side of the same decision that sizes the pane mirror: a
-    /// rung with no matching tile bias buys interpolation rather than detail,
-    /// and a bias with no rung buys four times the fetches for nothing. Both
-    /// come off one `MirrorPlan`, so they cannot disagree.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_floor_tile_zoom_bias(&mut self, bias: u8) {
-        self.floor_tile_zoom_bias = bias;
-    }
-
     /// The tile zoom bias for one pane: the frame's bias if this pane is
     /// drawing a floor strip, zero otherwise.
     ///
@@ -1766,7 +1695,7 @@ impl Gui {
     /// detector, so a frame with both armed would hand one gesture to two
     /// interpreters. The mode asked for last wins, which is the only reading a
     /// user can predict from a control they just operated.
-    pub fn set_section_draw_armed(&mut self, armed: bool) {
+    pub(crate) fn set_section_draw_armed(&mut self, armed: bool) {
         self.section_draw_armed = armed;
         if armed {
             // An endpoint drag cannot share a map with an armed draw, and the
@@ -1790,7 +1719,7 @@ impl Gui {
     /// same shape: disarming drops a half-dragged box for the reason that one
     /// drops a half-drawn line, and arming clears the section mode and any
     /// section drag in flight, because one press cannot be two gestures.
-    pub fn set_region_pick_armed(&mut self, armed: bool) {
+    pub(crate) fn set_region_pick_armed(&mut self, armed: bool) {
         self.region_pick_armed = armed;
         if armed {
             self.section_edit_drag = None;
@@ -2392,12 +2321,6 @@ impl Gui {
         &self.radar.config
     }
 
-    /// Set the radar config
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_radar_config(&mut self, config: RadarConfig) {
-        self.apply(crate::shell_api::GuiEvent::RadarConfig(config));
-    }
-
     /// Clear loading_site on all panes viewing the given site.
     pub fn clear_loading_site_for_site(&mut self, site: &str) {
         for pane in &mut self.panes {
@@ -2415,134 +2338,51 @@ impl Gui {
         }
     }
 
-    /// Set safe area insets in logical pixels (top, bottom, left, right).
-    /// On Android, this compensates for the status bar and navigation bar.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
-        self.safe_area_insets = (top, bottom, left, right);
-    }
-
-    /// The insets currently in force, in the same order they are set in.
+    /// The insets currently in force, in the same order the frame composes
+    /// them in.
     ///
-    /// This and the three getters below it are the read half of the setters
-    /// they sit beside, and they exist for one reason: all four values are
-    /// pushed in from the host through a platform bridge this crate cannot
-    /// see, and the frontend's tests need somewhere to observe that the
-    /// hand-off happened at all. What the UI then *does* with them is covered
-    /// here, against the drawn chrome (see `input_harness`), never against
-    /// these.
+    /// This and the getters below it are the read half of the frame-input
+    /// facts ([`FrameInputs`](crate::shell_api::FrameInputs)), and they exist
+    /// for one reason: every one of these values is pushed in from the host
+    /// through a platform bridge this crate cannot see, and the frontend's
+    /// tests need somewhere to observe that the hand-off happened at all.
+    /// What the UI then *does* with them is covered here, against the drawn
+    /// chrome (see `input_harness`), never against these.
     pub fn safe_area_insets(&self) -> (f32, f32, f32, f32) {
         self.safe_area_insets
     }
 
-    /// Tell the UI whether this platform can quit. `false` drops Exit from the
-    /// menu; on iOS the action is a no-op, so rendering it is a dead button.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_supports_exit(&mut self, supported: bool) {
-        self.supports_exit = supported;
-    }
-
-    /// See [`set_supports_exit`](Self::set_supports_exit).
+    /// See [`FrameInputs::supports_exit`](crate::shell_api::FrameInputs::supports_exit).
     pub fn supports_exit(&self) -> bool {
         self.supports_exit
     }
 
-    /// Tell the UI this build's loop frame cap (`constants::MAX_LOOP_FRAMES`),
-    /// so the timeline's row-2 caption states the platform's real budget.
-    /// Pushed in like [`set_supports_exit`](Self::set_supports_exit) and for
-    /// the same reason: the constant lives in a crate that depends on this
-    /// one.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_loop_frame_budget(&mut self, frames: usize) {
-        self.loop_frame_budget = frames;
-    }
-
-    /// Set the user's GPS location for the blue dot indicator.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
-        self.user_fix = Some(fix);
-        self.user_fix_at = Some(web_time::Instant::now());
-    }
-
-    /// See [`set_gps_fix`](Self::set_gps_fix).
+    /// See [`FrameInputs::gps`](crate::shell_api::FrameInputs::gps).
     pub fn gps_fix(&self) -> Option<&rustdar_gps::GpsFix> {
         self.user_fix.as_ref()
     }
 
-    /// Take the blue dot off the map.
-    ///
-    /// For the case the dot has no other answer to: the user has withdrawn
-    /// consent, or turned location off, and the last position delivered under
-    /// the old permission is still on screen. Leaving it there is worse than a
-    /// stale label — it is the app showing a position it has just been told it
-    /// may not know.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn clear_gps_fix(&mut self) {
-        self.user_fix = None;
-        self.user_fix_at = None;
-    }
-
-    /// Cache what the platform location service is doing, for the settings
-    /// pane to render.
-    ///
-    /// Pushed in rather than queried: this crate cannot name a
-    /// `PlatformBridge`. See the fields.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_location_state(
-        &mut self,
-        permission: rustdar_gps::LocationPermission,
-        active: bool,
-    ) {
-        self.location_permission = permission;
-        self.location_active = active;
-    }
-
-    /// See [`set_location_state`](Self::set_location_state).
+    /// See [`FrameInputs::location`](crate::shell_api::FrameInputs::location).
     pub fn location_permission(&self) -> rustdar_gps::LocationPermission {
         self.location_permission
     }
 
-    /// See [`set_location_state`](Self::set_location_state).
+    /// See [`FrameInputs::location`](crate::shell_api::FrameInputs::location).
     pub fn location_active(&self) -> bool {
         self.location_active
     }
 
-    /// Cache whether this platform has a location settings page to offer.
-    ///
-    /// Separate from [`set_location_state`](Self::set_location_state) because
-    /// it is answered once, at startup: the permission changes, the platform
-    /// does not.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_location_settings_available(&mut self, available: bool) {
-        self.location_settings_available = available;
-    }
-
-    /// See [`set_location_settings_available`](Self::set_location_settings_available).
+    /// See [`FrameInputs::location_settings_available`](crate::shell_api::FrameInputs::location_settings_available).
     pub fn location_settings_available(&self) -> bool {
         self.location_settings_available
     }
 
-    /// State whether the site list is still short of the network.
-    ///
-    /// Pushed at startup and again the moment the first catalogue is applied,
-    /// because unlike the flag above this one *does* change while the app runs
-    /// — that is the entire point of it. See [`Gui::catalogue_pending`].
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_catalogue_pending(&mut self, pending: bool) {
-        self.catalogue_pending = pending;
-    }
-
-    /// See [`set_catalogue_pending`](Self::set_catalogue_pending).
+    /// See [`FrameInputs::catalogue_pending`](crate::shell_api::FrameInputs::catalogue_pending).
     pub fn catalogue_pending(&self) -> bool {
         self.catalogue_pending
     }
 
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_user_heading(&mut self, heading: f32) {
-        self.user_heading = Some(heading);
-    }
-
-    /// See [`set_user_heading`](Self::set_user_heading).
+    /// See [`FrameInputs::user_heading`](crate::shell_api::FrameInputs::user_heading).
     pub fn user_heading(&self) -> Option<f32> {
         self.user_heading
     }
@@ -2560,12 +2400,6 @@ impl Gui {
             .iter()
             .take(self.pane_layout.pane_count)
             .any(|p| p.viewing_live)
-    }
-
-    /// Set live/historic viewing mode for a specific pane.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_viewing_live_for_pane(&mut self, pane_idx: usize, live: bool) {
-        self.apply(crate::shell_api::GuiEvent::ViewingLiveForPane { pane_idx, live });
     }
 
     /// Get the scan info for the active pane.
@@ -2749,20 +2583,6 @@ impl Gui {
         // dangling handle. This is the surface-loss and suspend/resume half of
         // `ReleaseVolume`.
         self.volume_painter = None;
-    }
-
-    /// Install what can draw 3D panes, or take it away.
-    ///
-    /// Called by the frontend when a renderer is created and, with `None`, when
-    /// one is lost. Every 3D pane on screen picks the change up on the next
-    /// frame with no other bookkeeping, because the painter is consulted afresh
-    /// inside each pane's arm rather than cached anywhere.
-    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
-    pub fn set_volume_painter(
-        &mut self,
-        painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
-    ) {
-        self.apply(crate::shell_api::GuiEvent::VolumePainter(painter));
     }
 
     /// Whatever can draw 3D panes this frame.

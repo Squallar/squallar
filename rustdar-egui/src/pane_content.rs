@@ -469,7 +469,7 @@ pub struct VolumeStamp {
 /// The obvious alternative — the number of distinct elevation angles the UI
 /// knows about, from `ScanInfo::product_elevations` — was tried before either
 /// and is **wrong, for a reason that only shows up on the second volume of a
-/// session**: `Gui::apply_chunk_scan_info` merges angles and never removes
+/// session**: the `ChunkScanInfo` event merges angles and never removes
 /// one, so after the first complete volume the count is a constant for the
 /// rest of the session. Verified live: it grew 1 → 2 → 3 on a cold start and
 /// then sat at 16 for every volume after. The fingerprint is computed off the

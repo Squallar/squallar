@@ -130,7 +130,8 @@ fn an_archive_volume_older_than_the_feed_does_not_replace_it() {
 fn a_skipped_archive_volume_still_ends_the_wait_it_belonged_to() {
     let mut app = app_showing(at(10));
     app.chunk_feeds.ensure("KTLX");
-    app.gui.set_fetching(true);
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::Fetching(true));
     app.gui.pane_mut(0).unwrap().loading_site = Some("KTLX".to_string());
 
     send_archive(&app, at(5));

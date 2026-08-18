@@ -200,19 +200,20 @@ fn point_at(
         pane.selected_product = product;
         pane.selected_elevation = elevation;
     }
-    app.gui.set_scan_info_for_pane(
-        idx,
-        rustdar_radar::types::ScanInfo {
-            site: radar,
-            site_source: rustdar_radar::site_position::SitePositionSource::Table,
-            site_position: None,
-            timestamp: volume_time(),
-            vcp_number: 212,
-            available_products: vec![product],
-            product_elevations,
-            status: String::new(),
-        },
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx: idx,
+            info: rustdar_radar::types::ScanInfo {
+                site: radar,
+                site_source: rustdar_radar::site_position::SitePositionSource::Table,
+                site_position: None,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![product],
+                product_elevations,
+                status: String::new(),
+            },
+        });
     app.scan_data.insert(
         site.to_string(),
         (

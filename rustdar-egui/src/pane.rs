@@ -814,8 +814,8 @@ pub struct PaneState {
     /// [`Gui::time_sync_targets`](crate::Gui), so the loop fan-out skips it
     /// and `propagate_layer_sync` leaves its `viewing_live`/`time_step_secs`
     /// alone. It is deliberately *not* consulted by the site-wide scan
-    /// delivery (`set_scan_info_for_site`): the volume a site holds is shared
-    /// state, and what this flag freezes is the pane's own time posture.
+    /// delivery (the `ScanInfoForSite` event): the volume a site holds is
+    /// shared state, and what this flag freezes is the pane's own time posture.
     pub time_link: bool,
     /// Whether this pane's viewport belongs to the linked group (M11's
     /// per-pane sync model — the successor to the retired `Gui`-global

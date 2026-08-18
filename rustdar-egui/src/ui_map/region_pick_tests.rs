@@ -38,7 +38,10 @@ fn pick_harness() -> (InputHarness, Arc<StubVolumePainter>) {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.load_scan("KTLX");
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.frames_for(2, FRAME_DT);
     (h, painter)
 }

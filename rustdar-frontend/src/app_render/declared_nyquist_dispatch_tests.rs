@@ -163,19 +163,20 @@ fn app_showing_site() -> crate::app::App {
         pane.selected_product = RadarProduct::NormalizedRotation;
         pane.selected_elevation = 0.5;
     }
-    app.gui.set_scan_info_for_pane(
-        0,
-        rustdar_radar::types::ScanInfo {
-            site,
-            site_source: rustdar_radar::site_position::SitePositionSource::Table,
-            site_position: None,
-            timestamp: volume_time(),
-            vcp_number: 212,
-            available_products: vec![RadarProduct::NormalizedRotation],
-            product_elevations,
-            status: String::new(),
-        },
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx: 0,
+            info: rustdar_radar::types::ScanInfo {
+                site,
+                site_source: rustdar_radar::site_position::SitePositionSource::Table,
+                site_position: None,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![RadarProduct::NormalizedRotation],
+                product_elevations,
+                status: String::new(),
+            },
+        });
     app.render.ensure_pane_count(1);
     app.scan_data
         .insert(SITE.to_string(), (sample_scan(), declared()));
