@@ -1254,6 +1254,18 @@ pub struct Gui {
     /// [`crate::volume_iso`]: absence means the argued per-product default,
     /// so this too is a store of exceptions.
     pub(crate) volume_iso: crate::volume_iso::IsoThresholds,
+    /// Top-level config keys the loaded file carried that this build cannot
+    /// name, verbatim — the file-scope half of
+    /// [`crate::pane::PaneConfigBaggage`]'s story. Written by
+    /// `load_ui_config`, handed back untouched by `ui_config_json`, and
+    /// never acted on in between: preserving what a newer build wrote is
+    /// what makes running this build against its file safe.
+    config_unknown_fields: serde_json::Map<String, serde_json::Value>,
+    /// `overlay_states` entries the loaded file carried for handlers this
+    /// build does not have. The save writes the live handlers' state *over*
+    /// these, so a kind this build serves is described by its handler and
+    /// one it does not is handed back exactly as it arrived.
+    overlay_states_baggage: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A storm motion vector the user may substitute for the RPG's.
@@ -1857,6 +1869,8 @@ impl Gui {
             volume_painter: None,
             volume_alpha: crate::volume_alpha::AlphaCurves::default(),
             volume_iso: crate::volume_iso::IsoThresholds::default(),
+            config_unknown_fields: serde_json::Map::new(),
+            overlay_states_baggage: serde_json::Map::new(),
         };
         gui.initialize_pane_enabled();
         gui

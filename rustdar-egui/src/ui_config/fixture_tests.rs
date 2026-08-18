@@ -11,6 +11,7 @@
 use crate::Gui;
 use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
 use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_radar::types::RadarProduct;
 
 /// A store holding exactly one era's file, as the disk would.
 fn store_with(fixture: &str) -> MemoryConfigStore {
@@ -66,4 +67,199 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
     // these, so they double as proof the `true` above was honest.
     assert_eq!(pane.site, "KMPX");
     assert_eq!(gui.loop_lookback_secs, 7200);
+}
+
+/// The full shape this build writes, loaded and saved twice: **save₁ must
+/// equal save₂**. This is the reopen-1:1 rule as a test — a load followed by
+/// a save is a fixpoint, so reopening the app cannot drift the file, and the
+/// autosave's has-anything-changed string comparison cannot oscillate.
+///
+/// Compared as parsed JSON values, which is exactly the equality the rule
+/// needs: key order is a serializer artifact, content is the contract.
+#[test]
+fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
+    let store = store_with(include_str!("fixtures/current_full.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store));
+
+    // Spot checks that the file was applied, not defaults: every value here
+    // differs from what a fresh `Gui` starts with.
+    assert_eq!(gui.pane(0).expect("pane 0").site, "KTLX");
+    let pane1 = gui.pane(1).expect("pane 1");
+    assert_eq!(pane1.site, "KOUN");
+    assert_eq!(pane1.selected_product, RadarProduct::Velocity);
+    assert!(!pane1.time_link, "pane 1 saved its time link off");
+    assert_eq!(gui.presets.len(), 1, "the user preset arrived");
+
+    let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
+    let store2 = store_with(&save1);
+    let mut gui2 = Gui::new();
+    assert!(gui2.load_ui_config(&store2));
+    let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
+
+    let v1: serde_json::Value = serde_json::from_str(&save1).expect("save1 is JSON");
+    let v2: serde_json::Value = serde_json::from_str(&save2).expect("save2 is JSON");
+    assert_eq!(
+        v1, v2,
+        "save-load-save moved the file: reopening the app would not be 1:1"
+    );
+}
+
+/// A file written by a **newer build** — greater version, an overlay kind,
+/// a product, pane fields and top-level fields this build has never heard
+/// of — loads what it can and, on save, hands back every unknown byte.
+///
+/// The assertions are on the **saved JSON**, because that is where the
+/// guarantee lives: preserving unknowns in memory and dropping them on the
+/// way out would still strand the user's newer config after one session
+/// under this build.
+#[test]
+fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
+    let store = store_with(include_str!("fixtures/future_build.json"));
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "a greater config_version is not an error — the tolerant load proceeds",
+    );
+
+    // The known half applied.
+    let pane = gui.pane(0).expect("pane 0");
+    assert_eq!(pane.site, "KTLX");
+    assert_eq!(
+        pane.selected_product,
+        RadarProduct::Reflectivity,
+        "the unknown product falls back to the default, as ever",
+    );
+    assert_eq!(
+        pane.enabled_overlays.get(&OverlayKind::Radar),
+        Some(&true),
+        "the known overlay keys beside the unknown one still applied",
+    );
+    let order = &pane.draw_order;
+    let radar = order.iter().position(|&k| k == OverlayKind::Radar);
+    let alerts = order.iter().position(|&k| k == OverlayKind::NwsAlerts);
+    assert!(
+        radar < alerts,
+        "the known draw-order names keep their saved relative order",
+    );
+
+    // The downgrade-safe round trip: the save carries every unknown.
+    let saved = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    assert_eq!(
+        v["config_version"], 1,
+        "the save describes itself as this build's format",
+    );
+    assert_eq!(
+        v["hologram_mode"],
+        serde_json::json!({ "depth": 3 }),
+        "an unknown top-level field survives to the file",
+    );
+    assert_eq!(
+        v["panes"][0]["particle_engine"], "on",
+        "an unknown pane-level field survives to the file",
+    );
+    assert!(
+        v["panes"][0]["draw_order"]
+            .as_array()
+            .expect("draw_order is a list")
+            .iter()
+            .any(|e| e == "FutureSatellite"),
+        "an unknown overlay kind survives in the draw order",
+    );
+    assert_eq!(
+        v["panes"][0]["enabled_overlays"]["FutureSatellite"], true,
+        "an unknown overlay kind survives in the enabled map",
+    );
+    assert_eq!(
+        v["panes"][0]["overlay_configs"]["FutureSatellite"],
+        serde_json::json!({ "band": "infrared" }),
+        "an unknown overlay kind survives in the config map",
+    );
+    assert_eq!(
+        v["overlay_states"]["FutureSatellite"],
+        serde_json::json!({ "opacity": 0.5 }),
+        "an unknown handler's saved state survives in overlay_states",
+    );
+    assert!(
+        v["presets"][0]["overlays"]
+            .as_array()
+            .expect("preset overlays is a list")
+            .iter()
+            .any(|e| e == "FutureSatellite"),
+        "an unknown overlay kind survives in a preset",
+    );
+}
+
+/// One unreadable pane costs exactly that pane, restored to defaults **in
+/// its own position** — never dropped, because a pane is a position in a
+/// layout and dropping one renumbers every pane after it.
+#[test]
+fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
+    let store = store_with(include_str!("fixtures/corrupt_pane.json"));
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "one corrupt pane must not fail the whole config",
+    );
+
+    let p0 = gui.pane(0).expect("pane 0");
+    assert_eq!(p0.site, "KTLX");
+    assert_eq!(p0.time_step_secs, 300, "pane 0 arrived intact");
+
+    let p1 = gui.pane(1).expect("pane 1");
+    assert_eq!(
+        p1.time_step_secs, 600,
+        "the corrupt pane is at defaults, not at its unreadable values",
+    );
+    assert_eq!(
+        p1.site, "KTLX",
+        "the corrupt pane's site is the global fallback, as a default pane's is",
+    );
+
+    let p2 = gui.pane(2).expect("pane 2");
+    assert_eq!(
+        p2.site, "KDMX",
+        "the pane AFTER the corrupt one kept its own position — salvage is \
+         defaults-in-place, never removal",
+    );
+    assert_eq!(p2.selected_product, RadarProduct::Velocity);
+    assert_eq!(p2.time_step_secs, 900);
+}
+
+/// A corrupt top-level container costs its own settings and nothing else:
+/// `preferences: 5` resets the preferences, while the site, the panes and
+/// the lookback all arrive.
+#[test]
+fn a_corrupt_top_level_field_resets_to_its_default_and_the_rest_loads() {
+    let store = store_with(include_str!("fixtures/corrupt_top_field.json"));
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "one corrupt field must not fail the whole config",
+    );
+    assert_eq!(
+        serde_json::to_value(&gui.preferences).expect("serializable"),
+        serde_json::to_value(rustdar_units::UserPreferences::default()).expect("serializable"),
+        "the unreadable preferences reset to defaults",
+    );
+    assert_eq!(gui.pane(0).expect("pane 0").site, "KDMX");
+    assert_eq!(gui.loop_lookback_secs, 7200, "the rest of the file arrived");
+}
+
+/// A file that is not JSON at all is the one whole-file refusal left: there
+/// are no units inside it to salvage, and the honest answer is that nothing
+/// was applied — the caller keeps its defaults and reports a first run.
+#[test]
+fn a_truncated_file_is_the_one_remaining_whole_file_refusal() {
+    let store = store_with(include_str!("fixtures/truncated.json"));
+    let mut gui = Gui::new();
+    assert!(
+        !gui.load_ui_config(&store),
+        "a file that does not parse as JSON has nothing to salvage",
+    );
+    assert_eq!(
+        gui.loop_lookback_secs, 3600,
+        "the refused load left the defaults untouched",
+    );
 }

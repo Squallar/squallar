@@ -18,7 +18,7 @@ fn preset() -> super::super::PresetConfig {
                 elevation: 1.5,
             },
         ],
-        overlays: vec![OverlayKind::Radar, OverlayKind::StormReports],
+        overlays: vec![OverlayKind::Radar, OverlayKind::StormReports].into(),
     }
 }
 

@@ -1,0 +1,78 @@
+{
+  "config_version": 1,
+  "pane_count": 2,
+  "active_pane": 1,
+  "auto_poll": true,
+  "live_chunks": true,
+  "chunk_notifications": true,
+  "notifier_endpoint": "",
+  "site": "KTLX",
+  "loop_lookback_secs": 3600,
+  "loop_speed_fps": 5.0,
+  "time_step_secs": 600,
+  "panes": [
+    {
+      "selected_product": "Reflectivity",
+      "selected_elevation": 0.5,
+      "site": "KTLX",
+      "time_step_secs": 600,
+      "draw_order": [
+        "ModelData",
+        "SpcOutlook",
+        "Radar",
+        "SpcDiscussions",
+        "NwsAlerts",
+        "StormReports",
+        "Lightning",
+        "Metar",
+        "CityLabels",
+        "RadarSites",
+        "UserLocation",
+        "ColorScale"
+      ],
+      "enabled_overlays": {
+        "Radar": true,
+        "NwsAlerts": true,
+        "Metar": false
+      },
+      "overlay_configs": {
+        "NwsAlerts": { "show_warnings": true }
+      }
+    },
+    {
+      "selected_product": "Velocity",
+      "selected_elevation": 0.9,
+      "site": "KOUN",
+      "time_link": false,
+      "draw_order": [
+        "ModelData",
+        "SpcOutlook",
+        "Radar",
+        "SpcDiscussions",
+        "NwsAlerts",
+        "StormReports",
+        "Lightning",
+        "Metar",
+        "CityLabels",
+        "RadarSites",
+        "UserLocation",
+        "ColorScale"
+      ],
+      "enabled_overlays": {
+        "Radar": true,
+        "StormReports": true
+      }
+    }
+  ],
+  "presets": [
+    {
+      "name": "Chase day",
+      "pane_count": 2,
+      "panes": [
+        { "product": "Velocity", "elevation": 0.5 },
+        { "product": "Reflectivity", "elevation": 1.5 }
+      ],
+      "overlays": ["Radar", "StormReports"]
+    }
+  ]
+}

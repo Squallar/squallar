@@ -1019,9 +1019,18 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn serialize_state(&self) -> serde_json::Value {
+        // Declaration order, never the `HashSet`'s: a set's iteration order
+        // is per-instance noise, so writing it raw makes save→load→save
+        // produce a different file every reopen — the instability the config
+        // fixpoint test pins, and the same jitter `round_verdict` already
+        // avoids by walking the day's publication order. Sorted by
+        // discriminant rather than through a literal list, so a new variant
+        // cannot be silently dropped from saves.
+        let mut enabled: Vec<OutlookProduct> = self.enabled_products.iter().copied().collect();
+        enabled.sort_by_key(|product| *product as u8);
         serde_json::json!({
             "selected_day": self.selected_day,
-            "enabled_products": self.enabled_products,
+            "enabled_products": enabled,
         })
     }
 
