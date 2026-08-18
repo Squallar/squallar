@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::config_store::{ConfigStore, UI_CONFIG_KEY};
 
-use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
@@ -31,8 +30,15 @@ struct PaneConfig {
     #[serde(deserialize_with = "product_or_default")]
     selected_product: RadarProduct,
     selected_elevation: f32,
-    /// Layer kind → enabled flag.
-    layers: BTreeMap<LayerKind, bool>,
+    /// **Legacy, read-only**: the retired per-pane layer toggles, keyed by
+    /// the serde spellings of the layer-kind enum that used to type this
+    /// map. The enum itself is gone; the wire format never changes shape by
+    /// that (its keys were always strings on the wire), and the one fact
+    /// still read out of it is the first pane's `"Radar"` entry, which
+    /// seeds the global handler when a pre-`overlay_states` file is
+    /// migrated. Saves write it empty, as they have since the overlay
+    /// registry took over.
+    layers: BTreeMap<String, bool>,
     spc_day: OutlookDay,
     /// Radar site code for this pane (e.g. "KTLX").
     #[serde(default = "default_site", deserialize_with = "site_or_default")]
@@ -515,25 +521,16 @@ fn default_true() -> bool {
 
 impl Default for PaneConfig {
     fn default() -> Self {
-        let layers = LayerKind::all()
-            .iter()
-            .map(|&k| {
-                let enabled = matches!(
-                    k,
-                    LayerKind::Radar
-                        | LayerKind::SpcMesoscaleDiscussions
-                        | LayerKind::NwsWarnings
-                        | LayerKind::NwsWatches
-                        | LayerKind::NwsAdvisories
-                        | LayerKind::CityLabels
-                );
-                (k, enabled)
-            })
-            .collect();
         Self {
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
-            layers,
+            // Empty, not the all-layer-kinds population the retired enum
+            // used to seed here — behavior identical: every real file
+            // carries its own map (or, since the overlay registry,
+            // `overlay_states` instead), the save has written it empty for
+            // as long, and the only reader is the legacy `"Radar"` capture,
+            // which treats absent as "nothing to migrate" either way.
+            layers: BTreeMap::new(),
             spc_day: OutlookDay::Day1,
             site: String::new(),
             time_step_secs: 600,
@@ -1425,7 +1422,7 @@ impl super::Gui {
             pane.layer_link = pc.layer_link && config.sync_layers;
             // Capture the first pane's legacy Radar toggle for migration.
             if legacy_radar_enabled.is_none()
-                && let Some(&enabled) = pc.layers.get(&LayerKind::Radar)
+                && let Some(&enabled) = pc.layers.get("Radar")
             {
                 legacy_radar_enabled = Some(enabled);
             }
