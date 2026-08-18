@@ -26,11 +26,12 @@ use std::time::{Duration, Instant};
 
 use egui::Context;
 use walkers::sources::{Attribution, TileSource};
-use walkers::{Tile, TileId, TilePiece, Tiles};
+use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
 use super::{
-    DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles, MAX_PARALLEL_DOWNLOADS, MOBILE_TILE_CACHE_ENTRIES,
-    TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES, interpolate_from_lower_zoom, tile_client,
+    DESKTOP_TILE_CACHE_ENTRIES, DecodeBudget, HttpsTiles, MAX_PARALLEL_DOWNLOADS,
+    MOBILE_TILE_CACHE_ENTRIES, TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
+    WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom, tile_client,
     tile_id_is_valid,
 };
 use crate::tiles::CartoDb;
@@ -105,6 +106,7 @@ const EXPECTED_CACHE_ENTRIES: usize = 256;
 const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 128;
 const EXPECTED_WASM_CACHE_ENTRIES: usize = 64;
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
+const EXPECTED_WASM_DECODES_PER_PUMP: usize = 2;
 
 // ---------------------------------------------------------------------------
 // A loopback tile server
@@ -1118,6 +1120,10 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
         EXPECTED_WASM_CACHE_ENTRIES,
         "the wasm arm is a quarter of the desktop figure"
     );
+    assert_eq!(
+        WASM_TILE_DECODES_PER_PUMP, EXPECTED_WASM_DECODES_PER_PUMP,
+        "the decode allowance is two tiles per source per pass"
+    );
 
     #[cfg(all(
         not(target_arch = "wasm32"),
@@ -1262,6 +1268,124 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
             "an id younger than the victim must survive at {capacity}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The wasm frame pump's decode budget
+// ---------------------------------------------------------------------------
+
+/// One pump decodes at most the budget; the rest wait their turn, in order.
+///
+/// This is the host-run half of the wasm pan fix: there is no web behavioural
+/// gate in this workspace, so what can be pinned is the mechanism the wasm
+/// pump is wired through — [`drain_up_to`] over the fetched-tile channel, fed
+/// real PNG bytes and decoding each taken item exactly as
+/// `receive_fetched_tiles` does. Every count below is derived from the decode
+/// sink itself (`decoded` grows only when a PNG actually became a [`Tile`]),
+/// and the queue's `N - 2` remainder is read back by draining it: the second
+/// pump's take *is* the proof of what the first pump left behind.
+#[test]
+fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
+    let ctx = Context::default();
+    let png = fixture_png();
+    let id = |x: u32| TileId { x, y: 0, zoom: 3 };
+
+    // More completed fetches than one pump may take, or the cap is untested.
+    let queued: u32 = 5;
+    assert!(
+        (queued as usize) > WASM_TILE_DECODES_PER_PUMP,
+        "the backlog must exceed the budget for the cap to be observable"
+    );
+
+    let (mut tx, mut rx) = futures::channel::mpsc::channel::<(TileId, Vec<u8>)>(queued as usize);
+    for x in 0..queued {
+        tx.try_send((id(x), png.clone()))
+            .expect("the test channel should hold the whole backlog");
+    }
+
+    // The sink is the decode path: an item only counts once its bytes have
+    // been decoded, so the counts cannot be satisfied by mere dequeueing.
+    let mut decoded: Vec<TileId> = Vec::new();
+    let pump = |rx: &mut futures::channel::mpsc::Receiver<(TileId, Vec<u8>)>,
+                decoded: &mut Vec<TileId>| {
+        drain_up_to(rx, WASM_TILE_DECODES_PER_PUMP, |(tile_id, bytes)| {
+            // `Style::default()` for the reason `fetch_one` gives.
+            #[allow(
+                clippy::default_constructed_unit_structs,
+                reason = "keeps compiling if walkers/mvt is ever enabled"
+            )]
+            let tile = Tile::new(&bytes, &Style::default(), tile_id.zoom, &ctx)
+                .expect("the fixture PNG should decode");
+            drop(tile);
+            decoded.push(tile_id);
+        })
+    };
+
+    let first = pump(&mut rx, &mut decoded);
+    assert_eq!(
+        first,
+        decoded.len(),
+        "the reported take and the decode count are the same events"
+    );
+    assert_eq!(
+        decoded,
+        [id(0), id(1)],
+        "one pump decodes exactly the budget, in arrival order"
+    );
+
+    let second = pump(&mut rx, &mut decoded);
+    assert_eq!(second, 2, "a second pump takes the next two");
+    assert_eq!(
+        decoded,
+        [id(0), id(1), id(2), id(3)],
+        "the first pump left N - 2 queued, and nothing was lost or reordered"
+    );
+
+    let third = pump(&mut rx, &mut decoded);
+    assert_eq!(third, 1, "the tail is one tile, not a refilled budget");
+    let fourth = pump(&mut rx, &mut decoded);
+    assert_eq!(fourth, 0, "an empty queue yields nothing");
+    assert_eq!(
+        decoded,
+        [id(0), id(1), id(2), id(3), id(4)],
+        "every queued tile was decoded exactly once"
+    );
+}
+
+/// The allowance is per pass, not per call, and a new pass restores it.
+///
+/// [`Tiles::at`] runs once per visible tile, so the pump runs many times in
+/// one pass; if each call carried its own budget the cap would bound nothing.
+/// This drives [`DecodeBudget`] exactly as `receive_fetched_tiles` does —
+/// `remaining` with the pass number, `record` with the take — and pins that
+/// the second call of a pass gets only what the first left.
+#[test]
+fn the_decode_allowance_is_per_pass_and_a_new_pass_restores_it() {
+    let mut budget = DecodeBudget::new();
+
+    assert_eq!(
+        budget.remaining(1),
+        WASM_TILE_DECODES_PER_PUMP,
+        "a fresh pass starts with the whole allowance"
+    );
+    budget.record(WASM_TILE_DECODES_PER_PUMP);
+    assert_eq!(
+        budget.remaining(1),
+        0,
+        "a later call in the same pass gets nothing once the allowance is spent"
+    );
+
+    assert_eq!(
+        budget.remaining(2),
+        WASM_TILE_DECODES_PER_PUMP,
+        "the next pass restores the full allowance"
+    );
+    budget.record(1);
+    assert_eq!(
+        budget.remaining(2),
+        WASM_TILE_DECODES_PER_PUMP - 1,
+        "a partial spend leaves exactly the difference for the same pass"
+    );
 }
 
 // ---------------------------------------------------------------------------
