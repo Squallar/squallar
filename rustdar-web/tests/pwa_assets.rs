@@ -545,66 +545,53 @@ fn the_rasterization_worker_uses_only_relative_paths() {
     }
 }
 
-/// The protocol version is a **number**, and this is the only instrument that
-/// can check it.
+/// The protocol is versionless, and the **build token** names the build.
 ///
 /// `worker_protocol` is `#[cfg(target_arch = "wasm32")]`, so nothing a host
-/// `cargo test` compiles can name `PROTOCOL_VERSION` at all — and the wasm rows
-/// are `cargo check`, which runs no tests. A source scrape is therefore the
-/// only place the value can be pinned, and it has to be pinned somewhere: every
-/// other version-adjacent test in this workspace flips bytes and asserts a
-/// refusal, which shows that *a* check exists, not what it says. A version that
-/// silently failed to bump when the message shapes changed would leave a page
-/// and a worker from opposite sides of a deploy exchanging replies one of them
-/// cannot read — the failure `build_token` exists to convert into a clean
-/// termination.
+/// `cargo test` compiles can call `build_token` at all — a source scrape is
+/// the only instrument here, as for every guard in this block. What it pins:
+/// the hand-kept protocol version was deleted at M5 and must stay deleted,
+/// and the token that replaced it still reads both of its halves. What
+/// distinguishes two builds is the token itself — `GITHUB_SHA` in CI, finer
+/// than any hand-kept number and impossible to forget, and
+/// `wire_identity::wire_digest()` locally, a fold over the pinned framing
+/// rows, so two local builds whose wire rows differ refuse each other where
+/// the hand-kept number matched any two local builds alike.
 #[test]
-fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
+fn the_worker_protocol_is_versionless_and_the_token_names_the_build() {
+    // Split literal (the arch_ratchets needle discipline): this file must not
+    // itself hit the campaign's zero-grep for the deleted constant.
+    let version_const = concat!("PROTOCOL_", "VERSION");
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 12;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 12. Version 3 \
-         added the `nyq` field, where a plan-view reply began reporting the \
-         fold limit of the sweep it drew; version 4 added `mls`, where it \
-         began reporting which melting layer the classification stood on — a \
-         reply that omits it is a reply whose classification cannot say \
-         whether it was measured or guessed; version 5 widened `outkind` past \
-         `RenderView`'s three codes, when a decoded Level II volume became an \
-         output a worker could answer with. A version 4 worker has no encoder \
-         for that and a version 4 page no decoder, and either mismatch is a \
-         decode that silently produces nothing — the browser's whole radar \
-         picture missing, with no error. Version 6 added `smv`, where a \
-         storm-relative reply began reporting which storm motion vector it was \
-         shifted by: the RPG's own, or one of the local stand-ins that disagree \
-         with it on 83 % of gates and on more than half of them by two display \
-         levels or more. A reply that omits it is one whose storm-relative \
-         field cannot say which quantity it is showing. Version 7 added `sms` \
-         and `smd`, the speed and direction of that vector, when the pane \
-         stopped apologising for its storm motion and started reporting it: \
-         the legend draws the numbers, and the two derived rungs are fitted \
-         from a wind profile the page never sees, so a reply that omits them \
-         is one whose storm-relative field shows no vector at all. Version 9 \
-         added the overlay job (page->worker tag 8) and its reply, `outkind` \
-         code 5 — a version 8 pair mismatched with a 9 exchanges jobs one half \
-         refuses and payloads the other drops, which is a site-marker layer \
-         that silently never draws. Version 10 widened tag 8's inner code \
-         space with the three polygon overlay kinds (alerts, outlooks, \
-         discussions, input codes 2-4): a version 9 worker refuses those \
-         codes and answers a failed job, which is a warning layer that \
-         silently never draws. Version 11 added the two hit-map kinds (storm \
-         reports code 5, lightning code 6) and reframed `outkind` code 5's \
-         payload: a hit-cells block now precedes the raw RGBA, and the GLM \
-         input carries the page's clock so a worker never ages a flash \
-         against its own. A version 10 pairing exchanges inner codes one \
-         half refuses and reply payloads whose length check the other half \
-         fails — a storm-reports layer that silently never draws. Version 12 \
-         completed that inner code space with the HRRR model grid (input code \
-         7, the grid's Lambert constants plus its projection window's \
-         values), the last overlay kind that still rasterized inline on the \
-         page: a version 11 worker refuses code 7 and answers a failed job, \
-         which is a model layer that silently never draws. Changing \
-         the message shapes without changing this number is the whole failure \
-         it prevents.",
+        !WORKER_PROTOCOL.contains(version_const),
+        "worker_protocol.rs names {version_const} again. The hand-versioned \
+         protocol was deleted at M5: the build token carries GITHUB_SHA in CI \
+         and the wire-identity digest locally, so a reintroduced version \
+         constant is dead weight that will drift — nothing compares it any \
+         more, and a number nobody compares reads like a guard while \
+         guarding nothing."
     );
+
+    let body = without_line_comments(WORKER_PROTOCOL);
+    let body = body
+        .split_once("pub fn build_token")
+        .expect("worker_protocol.rs no longer declares build_token")
+        .1;
+    let body = body
+        .split_once("\n}")
+        .expect("build_token no longer ends with a column-0 closing brace")
+        .0;
+    for needle in ["GITHUB_SHA", "wire_identity::wire_digest"] {
+        assert!(
+            body.contains(needle),
+            "build_token no longer reads {needle}. The token is the whole \
+             deploy-skew protection now: GITHUB_SHA distinguishes deploys in \
+             CI, and the wire-identity digest distinguishes local builds \
+             whose pinned framing rows differ. Losing either half reopens \
+             the silent mismatch the token exists to convert into a clean \
+             termination and a respawn."
+        );
+    }
 }
 
 /// Every arm of the worker's reply writes every field.
@@ -760,20 +747,6 @@ fn worker_protocol_vocabulary() -> BTreeMap<String, String> {
     out
 }
 
-/// The `PROTOCOL_VERSION` literal, as a number.
-fn declared_protocol_version() -> u32 {
-    let src = without_line_comments(WORKER_PROTOCOL);
-    let rest = src
-        .split_once("const PROTOCOL_VERSION: u32 = ")
-        .expect("worker_protocol.rs no longer declares PROTOCOL_VERSION: u32")
-        .1;
-    rest.chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .expect("PROTOCOL_VERSION is not a plain decimal literal")
-}
-
 /// `post_result`'s body, cut at the `post_message` that ends it so the only
 /// `&message` left in it belongs to a `set_field`.
 fn post_result_body() -> String {
@@ -793,7 +766,7 @@ fn post_result_body() -> String {
 /// The same three slices the tests above take, by the same markers. The `None`
 /// arm falls in no slice because it writes nothing; if it ever writes something
 /// the call-site count in
-/// [`the_worker_reply_shape_is_the_one_this_protocol_version_declares`] is what
+/// [`the_worker_reply_shape_is_the_one_this_build_ships`] is what
 /// notices, which is the point of counting.
 fn post_result_arms() -> Vec<(&'static str, String)> {
     let body = post_result_body();
@@ -832,35 +805,34 @@ fn message_field_idents(arm: &str) -> Vec<String> {
         .collect()
 }
 
-/// The shape of a `done` reply, whole, pinned against the version that declares
-/// it.
+/// The shape of a `done` reply, whole, pinned against the build that ships
+/// it: a within-build shape pin and refactor gate.
 ///
-/// # What was blind, exactly
+/// # What this is for
 ///
-/// `the_worker_protocol_version_is_the_one_these_shapes_ship` asserts the
-/// `PROTOCOL_VERSION` literal. It fires for someone who bumps the number and
-/// forgets this file — the harmless direction. The direction that ships a
-/// defect is the inverse: change what a reply carries, leave the number alone,
-/// and a page from one side of a deploy and a worker from the other exchange a
-/// message one of them cannot read, with `build_token` reporting a match. That
-/// is the failure the number exists to prevent, and nothing checked it. The
-/// three enumerations above are no help: each is a list of names it expects to
-/// *find*, so a reply that grows a field passes all of them.
+/// The three enumerations above are lists of names they expect to *find*, so
+/// a reply that grows a field passes all of them; this extracts the whole
+/// set, so a field nobody added to a list is a field that fails, and the
+/// person who changes the reply's shape is stopped here and told what they
+/// owe. Deploy-skew protection is NOT this test's job and not any hand-kept
+/// number's: it is the build token's — `GITHUB_SHA` in CI, the
+/// `wire_identity::wire_digest()` fold locally — which refuses a mismatched
+/// page/worker pair at the handshake, so the wire below this pin is
+/// same-build-only by construction.
 ///
-/// # What this still cannot see, and what now sees it instead
+/// # What this still cannot see, and what sees it instead
 ///
 /// It watches the reply's **field set**, so it catches a field added, removed
-/// or renamed. It cannot catch a change to the *bytes inside* a field, because
-/// the field set is identical either side of one. `POLAR` carries
+/// or renamed. It cannot catch a change to the *bytes inside* a field,
+/// because the field set is identical either side of one. `POLAR` carries
 /// `rustdar_radar::render::polar::PolarField::to_bytes`, a hand-rolled layout
-/// whose header grew an `f64` at protocol version 8 without a single name here
-/// changing — this test passed, unmodified, across that change, and the bump
-/// was made by hand.
+/// whose header once grew an `f64` without a single name here changing —
+/// this test passed, unmodified, across that change.
 ///
-/// That gap is now covered by a digest rather than by this test, because a
+/// That gap is covered by digests rather than by this test, because a
 /// buffer's layout is not visible from a crate that cannot link the encoder.
-/// Each of the three codecs that crosses this port inside a buffer pins the
-/// bytes it produces over a fixture built from literals:
+/// Each of the codecs that crosses this port inside a buffer pins the bytes
+/// it produces over a fixture built from literals:
 ///
 ///   * `rustdar_radar::render::polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships`
 ///     for `POLAR`;
@@ -869,45 +841,41 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///     payloads, a section and a voxel grid, were already pinned by their own
 ///     crates);
 ///   * `rustdar_frontend::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
-///     for the page->worker direction named below.
+///     for the page->worker direction named below, and
+///     `..._the_overlay_reply_framing_is_the_one_this_protocol_ships` for the
+///     overlay payload `OUT` carries under code 5, whose hit-map cells ride
+///     ahead of the raw RGBA (the RGBA tail has no layout to digest, and its
+///     guard is the dispatching page's own `width × height × 4` length
+///     check).
 ///
-/// The overlay payload `OUT` carries under code 5 was raw premultiplied RGBA
-/// with no layout at all until protocol version 11, when the hit-map kinds'
-/// cells started riding ahead of the pixels — the first reply-shape change
-/// since these guards landed, and one this test sees not at all, since no
-/// field name moved. It is digested now like the other three codecs:
-/// `rustdar_frontend::offload::tests::the_overlay_reply_framing_is_the_one_this_protocol_ships`
-/// pins `encode_overlay_out`'s bytes over a literal fixture. The RGBA tail
-/// inside that framing still has no layout to digest, and its guard is still
-/// the dispatching page's own `width × height × 4` length check — which is
-/// also what fails, on either side, when a version 10 half meets a version 11
-/// half over this code.
+/// Those framing rows do double duty since M5: they live in
+/// `rustdar_frontend::wire_identity` as production consts, and the local
+/// build token digests them — so the layout change this field-set pin cannot
+/// see is exactly the change that now diverges two local builds' tokens.
 ///
-/// Each was measured against an uncooperative regressor: a same-width field
-/// reorder made to encoder and decoder in step left every other test in its
-/// crate green (890 of 891 in `rustdar-radar`, 807 of 808 in
-/// `rustdar-frontend`) and these two guards here green as well, and only the
-/// digest fell over. None of them can check that `PROTOCOL_VERSION` was
-/// *raised* — it is `wasm32`-only and downstream of both crates — so what they
-/// buy is that the person who changes a layout is stopped and told what they
-/// owe, which is the direction that was missing.
+/// Each digest was measured against an uncooperative regressor: a same-width
+/// field reorder made to encoder and decoder in step left every other test
+/// in its crate green (890 of 891 in `rustdar-radar`, 807 of 808 in
+/// `rustdar-frontend`) and the guards here green as well, and only the
+/// digest fell over.
 ///
 /// # Why a list and not a digest
 ///
-/// A hash of the shape would be exactly as binding and would say nothing. This
-/// list makes the diff of a shape change read `+ "frame | HAIL_SIZE | hsz"`
-/// beside `- "PROTOCOL_VERSION = 7"`, which is the sentence the author needs to
-/// see, and it stays greppable: the wire key of any field is findable from
-/// here.
+/// A hash of the shape would be exactly as binding and would say nothing.
+/// This list makes the diff of a shape change read
+/// `+ "frame | HAIL_SIZE | hsz"` beside the row it displaced, which is the
+/// sentence the author needs to see, and it stays greppable: the wire key of
+/// any field is findable from here.
 ///
 /// # Why a source scrape
 ///
-/// `worker_protocol` and `worker` are both `#[cfg(target_arch = "wasm32")]`, so
-/// nothing a host `cargo test` compiles can name `post_result` or
-/// `PROTOCOL_VERSION`, and the wasm CI rows are `wasm-pack build` and
-/// `cargo check` — neither runs a test. There is no `wasm-bindgen-test` in this
-/// workspace. Reading the source is the only instrument available, and the
-/// tests above already do it.
+/// `worker_protocol` and `worker` are both `#[cfg(target_arch = "wasm32")]`,
+/// so nothing a host `cargo test` compiles can name `post_result` or
+/// `build_token`, and the wasm CI rows are `wasm-pack build` and
+/// `cargo check` — neither runs a test. (The Tier-1 browser gate runs four
+/// wasm tests, but a browser harness is no place to pin source text.)
+/// Reading the source is the only instrument available, and the tests above
+/// already do it.
 ///
 /// # What this does not cover
 ///
@@ -917,14 +885,10 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 /// above. `hello` and `fatal` are still built elsewhere and are as unbound as
 /// this one was.
 #[test]
-fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
+fn the_worker_reply_shape_is_the_one_this_build_ships() {
     let vocabulary = worker_protocol_vocabulary();
     let arms = post_result_arms();
 
-    let mut shape = vec![format!(
-        "PROTOCOL_VERSION = {}",
-        declared_protocol_version()
-    )];
     let mut written = Vec::new();
     for (arm, slice) in &arms {
         for ident in message_field_idents(slice) {
@@ -940,7 +904,6 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
         }
     }
     written.sort();
-    shape.extend(written.iter().cloned());
 
     // A `set_field` the extractor above did not recognise — a different target
     // than `&message`, a key that is not a `proto::` path — would otherwise be
@@ -958,9 +921,8 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
     );
 
     assert_eq!(
-        shape,
+        written,
         [
-            "PROTOCOL_VERSION = 12",
             "frame | IMAGE | image",
             "frame | MAX_RANGE | range",
             "frame | MELTING_LAYER | mls",
@@ -985,19 +947,19 @@ fn the_worker_reply_shape_is_the_one_this_protocol_version_declares() {
             "out | OUT_KIND | outkind",
         ]
         .map(str::to_string),
-        "the shape of a `done` reply is not the shape PROTOCOL_VERSION says it \
-         is. Left is what worker.rs and worker_protocol.rs say today; right is \
-         what this list was last told.\n\n\
-         If a wire key appeared or disappeared: bump PROTOCOL_VERSION in \
-         worker_protocol.rs FIRST, then update this list to match — in that \
-         order, because the number is the thing a page and a worker from \
-         opposite sides of a deploy actually compare, and a list brought into \
-         line without it leaves this test green over exactly the mismatch it \
-         exists to catch.\n\n\
+        "the shape of a `done` reply is not the shape this list was last \
+         told. Left is what worker.rs and worker_protocol.rs say today; right \
+         is the pinned shape.\n\n\
+         This is a within-build shape pin and refactor gate: update the list \
+         to what the reply really carries, deliberately. Deploy-skew \
+         protection is not this list's job and not any hand-kept number's — \
+         it is the build token's (GITHUB_SHA in CI, the wire_identity digest \
+         locally), which refuses a mismatched page/worker pair at the \
+         handshake before either half reads a reply.\n\n\
          If the wire keys are unchanged and only an arm moved — a field \
          defaulted before the match that used to be written inside one arm — \
-         then both halves still read the same message, the version stands, and \
-         only this list moves."
+         then both halves still read the same message and only this list \
+         moves."
     );
 }
 
