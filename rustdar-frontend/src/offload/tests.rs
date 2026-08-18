@@ -1690,40 +1690,43 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
     bytes[..bytes.len() - nested].to_vec()
 }
 
-/// The framing this protocol version ships is **this** framing.
+/// The framing this build ships is **this** framing — the rows of
+/// [`crate::wire_identity::WIRE_FRAMING_ROWS`], which this test asserts and
+/// the build token digests.
 ///
-/// # What was blind, exactly
+/// # What stands over this wire
 ///
 /// This encoding has no version and no magic — one tag byte and then the
-/// variant's own fields. The number that governs it is `rustdar_web`'s
-/// `PROTOCOL_VERSION`, through `build_token`, and the two guards standing over
-/// that number both watch the *reply* direction: one asserts the literal in the
-/// source (which fires only for the person who raises it), the other scrapes
-/// the field names of a `done` message. `pwa_assets.rs` says so itself, in as
-/// many words — "What this does not cover: the page->worker `job` direction".
-/// This is that direction.
+/// variant's own fields. What stands over it is the page/worker build token
+/// (`rustdar_web`'s `build_token`): in CI it carries `GITHUB_SHA`, and
+/// locally it carries `wire_identity::wire_digest()`, a fold over the tag
+/// table and these very rows. Two halves of one build are equal by
+/// construction — same module, same constants — and two local builds whose
+/// rows disagree refuse each other at the handshake and respawn. These rows
+/// are within-build native->web parity pins and refactor gates, not
+/// cross-version contracts: the wire is same-build-only by construction.
 ///
-/// [`every_job_tag_is_the_literal_byte_it_ships_as`] pins the six tag bytes,
+/// [`every_job_tag_is_the_literal_byte_it_ships_as`] pins the tag bytes,
 /// which is the first byte of each of these. Everything
 /// after it — the two `f64` coordinates, the `u32` ceiling, the section's four
 /// corners and its optional top, the voxel request's tagged half-extent and its
-/// three axes — was unpinned, and every round-trip test in this file is written
-/// against `to_bytes` and `from_bytes` together, so a same-width reorder made to
-/// both in step passes all of them.
+/// three axes — is what these rows pin: every round-trip test in this file is
+/// written against `to_bytes` and `from_bytes` together, so a same-width
+/// reorder made to both in step passes all of them and only a digest sees it.
 ///
 /// # A list and not one digest
 ///
-/// Six rows rather than one hash of all of them, so the failure names the
+/// Fourteen rows rather than one hash of all of them, so the failure names the
 /// variant. The diff then reads `- "voxels | 47 | 0x..."` beside the row that
 /// moved, which is the sentence the author needs; a single number would say
 /// only that something, somewhere, is different.
 ///
 /// # What this cannot check
 ///
-/// That `PROTOCOL_VERSION` was bumped. It is `#[cfg(target_arch = "wasm32")]`
-/// in `rustdar-web`, which depends on this crate, so nothing here can name it.
-/// What this can do is fail for the person who changes the framing, and say
-/// what they owe.
+/// The nested payload layouts — `RenderInput`, the polar field, the decoded
+/// volume — which have digest pins of their own in `rustdar-radar` and
+/// deliberately do not feed the token. See `wire_identity`'s module doc for
+/// that accepted residual.
 #[test]
 fn the_job_framing_is_the_one_this_protocol_ships() {
     let requests = [
@@ -1761,37 +1764,21 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 
     assert_eq!(
         rows,
-        [
-            "radar | 6 | 0x7d65cbf16a7b2ab7",
-            "level3 | 28 | 0xff9d9dbb7736ea4e",
-            "level3/vild | 34 | 0x4f9fb6a0901a3704",
-            "section | 44 | 0x4fe286e53034800e",
-            "voxels | 59 | 0x625ac8a3330ec11f",
-            "voxels | 43 | 0xdbe9f7d560c79fd4",
-            "decode | 30 | 0x2aad0634cde46e59",
-            "overlay/sites | 131 | 0xf24942f4dd119e16",
-            "overlay/alerts | 760 | 0xa89f5057b3b51a4a",
-            "overlay/outlooks | 557 | 0x62486e4e14434bb0",
-            "overlay/discussions | 264 | 0x3d28f1976f832a20",
-            "overlay/reports | 127 | 0x533f15051c5cc607",
-            "overlay/glm | 240 | 0xca1519d51136a8ef",
-            "overlay/model | 262 | 0x0133cf4f818a1a23",
-        ]
-        .map(str::to_string),
-        "the framing `JobRequest::to_bytes` writes is not the framing protocol \
-         version 12 shipped. Left is what this build posts; right is what this \
-         list was last told. Something about a request's layout moved — a \
-         field added, removed, reordered, retyped, or written at a different \
-         width, or a tag renumbered. This encoding carries no version of its \
-         own: the number that governs it is `PROTOCOL_VERSION` in \
-         `rustdar-web/src/worker_protocol.rs`, folded into `build_token`. If \
-         the change was deliberate, bump it there FIRST and then re-pin the \
-         row here, in that order and never the numbers alone. A page and a \
-         worker on opposite sides of a deploy share a build token whenever \
-         `GITHUB_SHA` is absent (which it always is outside CI), and the \
-         worker will read the new bytes in the old order: a job framed one way \
-         and read another renders the wrong region, or the wrong product, or \
-         fails to decode and strands the pane that posted it."
+        crate::wire_identity::WIRE_FRAMING_ROWS,
+        "the framing `JobRequest::to_bytes` writes is not the framing \
+         `wire_identity::WIRE_FRAMING_ROWS` pins. Left is what this build \
+         posts; right is what that list was last told. Something about a \
+         request's layout moved — a field added, removed, reordered, retyped, \
+         or written at a different width, or a tag renumbered. If the change \
+         was deliberate, re-pin the row in `wire_identity.rs`: the row feeds \
+         the local build token, so two local builds with different rows \
+         refuse each other and respawn, and in CI the `GITHUB_SHA` does the \
+         same for every change. These rows are within-build native->web \
+         parity pins and refactor gates, not cross-version contracts — the \
+         wire is same-build-only by construction, and a mispaired job would \
+         render the wrong region, or the wrong product, or fail to decode \
+         and strand the pane that posted it; the token is what keeps that \
+         pair from ever exchanging bytes."
     );
 }
 
@@ -2632,18 +2619,20 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
     );
 }
 
-/// The framing the overlay reply ships is **this** framing — the digest the
-/// `OUT` code 5 payload never needed while it was raw RGBA with no layout at
-/// all. It has one since protocol version 11, and no guard over the reply
-/// direction can see it otherwise: the reply-shape scrape in
-/// `rustdar-web/tests/pwa_assets.rs` watches field names, and no field name
-/// moved.
+/// The framing the overlay reply ships is **this** framing — the rows of
+/// [`crate::wire_identity::WIRE_REPLY_ROWS`], the digest the `OUT` code 5
+/// payload never needed while it was raw RGBA with no layout at all. It has
+/// one since the hit-map kinds' cells started riding ahead of the pixels,
+/// and no guard over the reply direction can see it otherwise: the
+/// reply-shape scrape in `rustdar-web/tests/pwa_assets.rs` watches field
+/// names, and no field name moves when this layout does. The rows feed the
+/// build token beside the request rows — same suite, same mechanism.
 #[test]
 fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     let rgba: Vec<u8> = (0..16).collect();
     let bare = encode_overlay_out(&rgba, None);
     let with_cells = encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()));
-    let rows = [
+    let rows = vec![
         format!("bare | {} | {:#018x}", bare.len(), layout_digest(&bare)),
         format!(
             "cells | {} | {:#018x}",
@@ -2653,19 +2642,19 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     ];
     assert_eq!(
         rows,
-        [
-            "bare | 17 | 0x770d1b313226dd5f".to_string(),
-            "cells | 69 | 0x6637c90fa10e397a".to_string(),
-        ],
-        "the framing `encode_overlay_out` writes is not the framing protocol \
-         version 11 shipped. Left is what this build posts; right is what \
-         this list was last told. If the change was deliberate, bump \
-         `PROTOCOL_VERSION` in `rustdar-web/src/worker_protocol.rs` FIRST and \
-         then re-pin the rows here, in that order and never the numbers \
-         alone: a page and a worker on opposite sides of a deploy share a \
-         build token whenever `GITHUB_SHA` is absent, and the older half \
-         reads the newer bytes in the old order — a payload whose length \
-         check fails, which is a hit-map layer that silently never draws.",
+        crate::wire_identity::WIRE_REPLY_ROWS,
+        "the framing `encode_overlay_out` writes is not the framing \
+         `wire_identity::WIRE_REPLY_ROWS` pins. Left is what this build \
+         posts; right is what that list was last told. If the change was \
+         deliberate, re-pin the row in `wire_identity.rs`: the row feeds the \
+         local build token, so two local builds with different rows refuse \
+         each other and respawn, and in CI the `GITHUB_SHA` does the same for \
+         every change. These rows are within-build parity pins and refactor \
+         gates, not cross-version contracts — the wire is same-build-only by \
+         construction, and a mispaired reply framing would fail the page's \
+         `width x height x 4` length check whichever side were older, which \
+         is a hit-map layer that silently never draws; the token is what \
+         keeps that pair from ever exchanging bytes.",
     );
 }
 
