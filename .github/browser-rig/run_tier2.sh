@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
 #
 # run_tier2.sh -- the Tier-2 browser gate: serve the built rustdar-web bundle
-# on a fresh port, drive Chromium then Firefox against the full PWA, write
-# out/<browser>.json + screenshots, clean up every process via traps (no
-# orphan servers/drivers even on ^C).
+# on a fresh port and drive the full PWA in Chromium and Firefox. Two passes
+# per browser:
+#
+#   live      the app against LIVE network; asserts boot, canvas non-blank,
+#             rAF sane, zero panics/errors, AND the worker wire: >=1
+#             "rasterization worker attached" plus >=1 "took N ms off the
+#             frame" job reply within 180 s (m4 -- a booted page with a dead
+#             wire passes every weaker check).
+#   doctored  serve.py --doctor-first-worker hands the FIRST /worker.js
+#             request a stub posting a doctored build token; asserts the page
+#             logs "rasterization worker is a different build", terminates,
+#             and >=1000 ms later (first backoff rung) attaches the REAL
+#             refetched worker (m5), and then the m4 round-trip on top.
+#
+# Network posture (campaign-resolved): LIVE network, one auto-retry per pass
+# as the flake-quarantine policy -- the app's own backoff machinery is part of
+# what is exercised. A pass that fails twice fails the leg.
+#
+# The scene is pinned by seeding localStorage with site KTLX BEFORE any app
+# script runs (browsers would otherwise pick different default sites).
 #
 # Adapted from the 2026-08-18 measurement rig's run_smoke.sh; this copy is the
-# permanent CI gate. Paths are derived from the script location (this file
-# lives at .github/browser-rig/ inside the repo), never from any scratchpad.
+# permanent CI gate. Paths derive from the script location (this file lives at
+# .github/browser-rig/ inside the repo), never from any scratchpad.
 #
 # Usage: run_tier2.sh [--skip-build]
 #   --skip-build      serve rustdar-web as-is (CI builds in its own step; the
@@ -16,22 +33,29 @@
 # Environment knobs (all optional):
 #   RUSTDAR_WEB_DIR   dir to serve   (default <repo>/rustdar-web)
 #   RIG_OUT_DIR       output dir     (default <rig>/out)
-#   RIG_CHROMEDRIVER  chromedriver   (default /usr/bin/chromedriver)
+#   RIG_CHROMEDRIVER  chromedriver   (default: chromedriver on PATH, else
+#                                     /usr/bin/chromedriver)
 #   RIG_GECKODRIVER   geckodriver    (default: $(ensure-geckodriver.sh))
 #   RIG_FRAMES        rAF deltas per sample (default 120)
 #   RIG_BROWSERS      "chromium firefox" (default), or a subset
+#   RIG_EXPECT_TIMEOUT  seconds for the worker-wire assertions (default 180)
 #   RIG_DRIVE_EXTRA   extra args appended to every drive.py call
 
-set -u -o pipefail   # not -e: attempt BOTH browsers and still summarise
+set -u -o pipefail   # not -e: attempt every leg and still summarise
 
 RIG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$RIG_DIR/../.." && pwd)"
 WEB_DIR="${RUSTDAR_WEB_DIR:-$REPO_ROOT/rustdar-web}"
 OUT_DIR="${RIG_OUT_DIR:-$RIG_DIR/out}"
-CHROMEDRIVER="${RIG_CHROMEDRIVER:-/usr/bin/chromedriver}"
+CHROMEDRIVER="${RIG_CHROMEDRIVER:-$(command -v chromedriver || echo /usr/bin/chromedriver)}"
 FRAMES="${RIG_FRAMES:-120}"
 BROWSERS="${RIG_BROWSERS:-chromium firefox}"
+EXPECT_TIMEOUT="${RIG_EXPECT_TIMEOUT:-180}"
 PY=python3
+
+# UiConfig is #[serde(default)], so a site-only config parses; the value is
+# the app's own persisted shape under its real localStorage key.
+SEED_LS='{"rustdar.ui": "{\"site\":\"KTLX\"}"}'
 
 SKIP_BUILD=0
 for arg in "$@"; do
@@ -66,15 +90,20 @@ if [ ! -f "$WEB_DIR/pkg/rustdar_web_bg.wasm" ]; then
 fi
 
 SERVER_PID=""
+stop_server() {
+  if [ -n "$SERVER_PID" ]; then
+    kill "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null
+    SERVER_PID=""
+  fi
+}
+
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
-  # 1. the static server
-  if [ -n "$SERVER_PID" ]; then
-    kill "$SERVER_PID" 2>/dev/null
-  fi
-  # 2. any driver process group drive.py did not get to tear down
-  #    (drive.py removes its pgid file on a clean stop)
+  stop_server
+  # any driver process group drive.py did not get to tear down
+  # (drive.py removes its pgid file on a clean stop)
   local f pgid
   for f in "$OUT_DIR"/*.driver.pgid; do
     [ -f "$f" ] || continue
@@ -86,7 +115,6 @@ cleanup() {
     rm -f "$f"
   done
   sleep 0.5
-  [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
   for f in "$OUT_DIR"/*.driver.pgid; do
     [ -f "$f" ] || continue
     pgid="$(cat "$f" 2>/dev/null)"
@@ -98,33 +126,39 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------- serve ----
-# Fresh (kernel-chosen) port every run: no stale service-worker scope, no
-# cross-run cache identity. serve.py prints one ready line to stdout.
-READY_FILE="$OUT_DIR/serve.ready"
-: > "$READY_FILE"
-"$PY" "$RIG_DIR/serve.py" --dir "$WEB_DIR" --port 0 \
-    --log "$OUT_DIR/serve.log" > "$READY_FILE" 2>> "$OUT_DIR/serve.stderr" &
-SERVER_PID=$!
-
-PORT=""
-for _ in $(seq 1 100); do
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "FATAL: serve.py exited early:" >&2
-    cat "$OUT_DIR/serve.stderr" >&2
-    exit 1
+# Fresh (kernel-chosen) port every pass: no stale service-worker scope, no
+# cross-run cache identity, and a fresh --doctor-first-worker arm each time.
+# Sets PORT and URL; returns non-zero on failure.
+start_server() {
+  local ready_file="$OUT_DIR/serve.ready"
+  : > "$ready_file"
+  "$PY" "$RIG_DIR/serve.py" --dir "$WEB_DIR" --port 0 \
+      --log "$OUT_DIR/serve.log" \
+      --seed-local-storage "$SEED_LS" \
+      "$@" > "$ready_file" 2>> "$OUT_DIR/serve.stderr" &
+  SERVER_PID=$!
+  PORT=""
+  local _tag _base
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "FATAL: serve.py exited early:" >&2
+      cat "$OUT_DIR/serve.stderr" >&2
+      return 1
+    fi
+    if [ -s "$ready_file" ]; then
+      read -r _tag PORT _base < "$ready_file"
+      break
+    fi
+    sleep 0.1
+  done
+  if [ -z "$PORT" ]; then
+    echo "FATAL: serve.py never printed its ready line" >&2
+    return 1
   fi
-  if [ -s "$READY_FILE" ]; then
-    read -r _tag PORT _base < "$READY_FILE"
-    break
-  fi
-  sleep 0.1
-done
-if [ -z "$PORT" ]; then
-  echo "FATAL: serve.py never printed its ready line" >&2
-  exit 1
-fi
-URL="http://127.0.0.1:$PORT/index-rig.html"
-echo "serving $WEB_DIR on port $PORT (pid $SERVER_PID) -> $URL"
+  URL="http://127.0.0.1:$PORT/index-rig.html"
+  echo "serving $WEB_DIR on port $PORT (pid $SERVER_PID) -> $URL"
+  return 0
+}
 
 # ---------------------------------------------------------------- drive ----
 EXTRA=()
@@ -133,60 +167,99 @@ if [ -n "${RIG_DRIVE_EXTRA:-}" ]; then
   EXTRA+=($RIG_DRIVE_EXTRA)
 fi
 
-overall=0
-for browser in $BROWSERS; do
-  echo
-  echo "================ $browser ================"
+# run_pass <browser> <tag> <doctored 0|1>: one server + one drive.py run.
+run_pass() {
+  local browser="$1" tag="$2" doctored="$3"
+  local driver server_args=() drive_args=()
   case "$browser" in
-    chromium) DRIVER="$CHROMEDRIVER" ;;
-    firefox)  DRIVER="$GECKODRIVER" ;;
-    *) echo "unknown browser: $browser" >&2; overall=1; continue ;;
+    chromium) driver="$CHROMEDRIVER" ;;
+    firefox)  driver="$GECKODRIVER" ;;
+    *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
+  drive_args+=(--expect-worker-round-trip --expect-timeout "$EXPECT_TIMEOUT")
+  if [ "$doctored" -eq 1 ]; then
+    server_args+=(--doctor-first-worker)
+    drive_args+=(--expect-doctored-respawn)
+  fi
+  start_server ${server_args[@]+"${server_args[@]}"} || return 1
   "$PY" "$RIG_DIR/drive.py" \
       --browser "$browser" --url "$URL" \
-      --out-dir "$OUT_DIR" --tag "$browser" \
-      --driver "$DRIVER" --frames "$FRAMES" \
+      --out-dir "$OUT_DIR" --tag "$tag" \
+      --driver "$driver" --frames "$FRAMES" \
+      "${drive_args[@]}" \
       ${EXTRA[@]+"${EXTRA[@]}"}
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "$browser leg exited rc=$rc" >&2
-    overall=1
-  fi
+  local rc=$?
+  stop_server
+  return "$rc"
+}
+
+overall=0
+TAGS=""
+for browser in $BROWSERS; do
+  for leg in live doctored; do
+    if [ "$leg" = doctored ]; then
+      tag="$browser.doctored"; doctored=1
+    else
+      tag="$browser"; doctored=0
+    fi
+    TAGS="$TAGS $tag"
+    echo
+    echo "================ $tag ================"
+    if run_pass "$browser" "$tag" "$doctored"; then
+      continue
+    fi
+    # Retry-once quarantine (live-network flake policy): a fresh server, a
+    # fresh port, a fresh browser profile. A second failure fails the leg.
+    echo "$tag FAILED; one quarantine retry (live-network flake policy)" >&2
+    echo "================ $tag (retry) ================"
+    if ! run_pass "$browser" "$tag" "$doctored"; then
+      echo "$tag failed twice" >&2
+      overall=1
+    fi
+  done
 done
 
 # -------------------------------------------------------------- summary ----
 echo
 echo "================ tier2 summary ================"
-"$PY" - "$OUT_DIR" $BROWSERS <<'EOF'
+"$PY" - "$OUT_DIR" $TAGS <<'EOF'
 import json, os, sys
 out = sys.argv[1]
 for tag in sys.argv[2:]:
     p = os.path.join(out, tag + ".json")
     if not os.path.isfile(p):
-        print("%-9s NO RESULT (%s missing)" % (tag, p)); continue
+        print("%-18s NO RESULT (%s missing)" % (tag, p)); continue
     r = json.load(open(p))
     v = r.get("verdict") or {}
     env = r.get("env") or {}
     b = r.get("canvas_final") or (r.get("boot") or {}).get("probe") or {}
     rw = r.get("raf_warm") or {}
-    rl = r.get("raf_later") or {}
     def raf(d):
-        return ("p50=%.2f p95=%.2f max=%.2f" % (d["p50"], d["p95"], d["max"])
+        return ("p50=%.2f p95=%.2f" % (d["p50"], d["p95"])
                 if d.get("ok") else "FAILED")
     sh = r.get("screenshots") or {}
-    print("%-9s %s  boot=%s canvas=%sx%s raf_warm[%s] raf_later[%s] "
-          "page_blank=%s canvas_blank=%s errors=%s panics=%s gl=%s"
+    wrt = r.get("worker_round_trip")
+    dr = r.get("doctored_respawn")
+    def tri(x):
+        return "-" if x is None else ("ok" if x.get("ok") else "FAIL")
+    print("%-18s %s  boot=%s canvas=%sx%s raf[%s] canvas_blank=%s "
+          "errors=%s panics=%s round_trip=%s respawn=%s"
           % (tag, "PASS" if r.get("pass") else "FAIL",
              v.get("booted"), b.get("clientWidth"), b.get("clientHeight"),
-             raf(rw), raf(rl) if rl else "-",
-             (sh.get("page") or {}).get("blank"),
+             raf(rw),
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
-             (env.get("gl_renderer") or env.get("webgl") or "?")))
+             tri(wrt), tri(dr)))
+    if dr and dr.get("ok"):
+        print("%-18s   respawn attach %.0f ms after the doctored refusal"
+              % ("", dr.get("delta_ms", -1)))
+    for d in (wrt, dr):
+        if d and not d.get("ok"):
+            print("%-18s   %s" % ("", d.get("error")))
     if v.get("first_panic"):
-        print("%-9s first panic: %s" % ("", v["first_panic"][:180]))
+        print("%-18s first panic: %s" % ("", v["first_panic"][:180]))
     if r.get("exception"):
-        print("%-9s failed at stage %r: %s"
+        print("%-18s failed at stage %r: %s"
               % ("", r.get("failed_stage"), r.get("exception")))
 EOF
 

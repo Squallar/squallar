@@ -17,6 +17,11 @@ into it on failure), then measures and records:
   * error signal: injected window.__rig_errors / __rig_console (both
     browsers, provided by serve.py's /index-rig.html) plus chromedriver's
     non-standard browser-log endpoint (chromium only; geckodriver has none)
+  * Tier-2 worker-wire assertions (opt-in): --expect-worker-round-trip fails
+    the run unless the console ring shows a worker attach AND a "took N ms
+    off the frame" job reply; --expect-doctored-respawn fails it unless the
+    doctored-token refusal is followed >=1000 ms later by a clean attach
+    (pair with serve.py --doctor-first-worker)
 
 Timing primitive for the instrumented app: poll_global_json() polls a window
 global (dot-path) until it holds a JSON-serialisable value -- the future
@@ -668,6 +673,29 @@ return {
 };
 """
 
+# The Tier-2 worker-wire signals, scanned from the console ring the serve.py
+# prelude keeps. Timestamps are page-side Date.now() at log time.
+#   attached  -- worker_port::handle_message's "rasterization worker attached"
+#                (log::info!, HELLO with a matching build token)
+#   different -- "rasterization worker is a different build" (log::warn!, the
+#                token-mismatch branch that terminates and respawns)
+#   off_frame -- offload::deliver_job_reply's "<kind> took <N> ms off the
+#                frame" (log::info!): a reply actually crossed the wire.
+WORKER_SIGNAL_PROBE = r"""
+var C = window.__rig_console || [];
+var attached = [], different = [], off_frame = [];
+var off_re = /took \d+ ms off the frame/;
+for (var i = 0; i < C.length; i++) {
+  var m = String(C[i].msg || "");
+  if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
+  if (m.indexOf("rasterization worker is a different build") !== -1)
+    different.push(C[i].t);
+  if (off_re.test(m)) off_frame.push(C[i].t);
+}
+return { attached: attached, different: different, off_frame: off_frame,
+         console_total: C.length };
+"""
+
 GLOBAL_PROBE = """
 var parts = String(arguments[0]).split('.');
 var o = window;
@@ -717,6 +745,79 @@ def wait_boot(session, timeout=90.0, interval=0.4):
             return probe, time.monotonic() - t0, False
         time.sleep(interval)
     return probe, time.monotonic() - t0, True
+
+
+def wait_worker_round_trip(session, timeout=180.0, interval=2.0):
+    """m4: the worker attach AND a real job reply, within `timeout`.
+
+    Both signals must appear: >=1 "rasterization worker attached" (the HELLO
+    handshake passed the build-token compare) and >=1 "took <N> ms off the
+    frame" (offload::deliver_job_reply -- a real job crossed the wire and came
+    back). A booted page with a dead wire shows the first and never the
+    second; canvas-non-blank alone is weaker than either. First-seen
+    timestamps are accumulated across polls so ring eviction between polls
+    cannot lose an event."""
+    t0 = time.monotonic()
+    first_attached = first_off_frame = None
+    while time.monotonic() - t0 < timeout:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        if first_attached is None and sig.get("attached"):
+            first_attached = min(sig["attached"])
+        if first_off_frame is None and sig.get("off_frame"):
+            first_off_frame = min(sig["off_frame"])
+        if first_attached is not None and first_off_frame is not None:
+            return {"ok": True, "waited_s": round(time.monotonic() - t0, 2),
+                    "attached_t": first_attached,
+                    "off_frame_t": first_off_frame}
+        time.sleep(interval)
+    return {"ok": False, "waited_s": round(time.monotonic() - t0, 2),
+            "attached_t": first_attached, "off_frame_t": first_off_frame,
+            "error": "no worker attach + job reply within %.0fs "
+                     "(attached=%s, off_frame=%s)"
+                     % (timeout, first_attached is not None,
+                        first_off_frame is not None)}
+
+
+def wait_doctored_respawn(session, timeout=180.0, respawn_grace=30.0,
+                          interval=1.0):
+    """m5: the doctored-token detection and the clean respawn.
+
+    Phase 1 (up to `timeout`): "rasterization worker is a different build" --
+    the page read the stub's HELLO and refused the token. Phase 2 (up to
+    `respawn_grace` from that observation): a "rasterization worker attached"
+    stamped >= 1000 ms after the refusal -- the first backoff rung is 1000 ms
+    (worker_retry::RESPAWN_BACKOFF_MS), so a qualifying attach proves the
+    ladder ran and the REFETCHED worker (the real file; the stub is served
+    exactly once) passed the compare. Earlier attaches never qualify: the
+    timestamp filter is what makes a pre-doctor attach unable to satisfy the
+    respawn assertion."""
+    t0 = time.monotonic()
+    different_t = None
+    while time.monotonic() - t0 < timeout:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        if sig.get("different"):
+            different_t = min(sig["different"])
+            break
+        time.sleep(interval)
+    if different_t is None:
+        return {"ok": False, "waited_s": round(time.monotonic() - t0, 2),
+                "error": "the doctored token was never refused: no "
+                         "'different build' line within %.0fs" % timeout}
+    t1 = time.monotonic()
+    while time.monotonic() - t1 < respawn_grace:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        qualifying = [t for t in (sig.get("attached") or [])
+                      if t >= different_t + 1000]
+        if qualifying:
+            attached_t = min(qualifying)
+            return {"ok": True, "waited_s": round(time.monotonic() - t0, 2),
+                    "different_t": different_t, "attached_t": attached_t,
+                    "delta_ms": attached_t - different_t}
+        time.sleep(interval)
+    return {"ok": False, "waited_s": round(time.monotonic() - t0, 2),
+            "different_t": different_t,
+            "error": "detected the doctored token but no attach >=1000 ms "
+                     "later within %.0fs of it" % respawn_grace}
 
 
 def raf_sample(session, frames):
@@ -1074,6 +1175,20 @@ def run_smoke(args):
             except (WebDriverError, ValueError) as e:
                 result["polled_global"] = {"error": str(e)}
 
+        # Tier-2 worker-wire assertions (serve.py's console ring carries the
+        # signals). Doctored-respawn first when both are on: its events
+        # (refusal, backoff, re-attach) precede the first job reply.
+        if args.expect_doctored_respawn:
+            stage("doctored-respawn-wait", timeout=args.expect_timeout)
+            result["doctored_respawn"] = wait_doctored_respawn(
+                session, timeout=args.expect_timeout)
+            stage("doctored-respawn-done", **result["doctored_respawn"])
+        if args.expect_worker_round_trip:
+            stage("worker-round-trip-wait", timeout=args.expect_timeout)
+            result["worker_round_trip"] = wait_worker_round_trip(
+                session, timeout=args.expect_timeout)
+            stage("worker-round-trip-done", **result["worker_round_trip"])
+
         stage("settle", seconds=args.settle)
         time.sleep(args.settle)
 
@@ -1146,8 +1261,16 @@ def run_smoke(args):
         # failure even when data has not arrived: the basemap always draws
         # (index.html documents exactly that). blank=None (decode issue)
         # does not fail the run, it is reported.
+        #
+        # The worker-wire assertions fail the run when requested and unmet: a
+        # booted page with a dead wire passes every weaker check.
+        wrt = result.get("worker_round_trip")
+        dr = result.get("doctored_respawn")
+        worker_ok = ((wrt is None or bool(wrt.get("ok")))
+                     and (dr is None or bool(dr.get("ok"))))
         result["pass"] = (booted and canvas_ok and raf_ok
-                          and canvas_blank is not True and not panics)
+                          and canvas_blank is not True and not panics
+                          and worker_ok)
         result["verdict"] = {
             "booted": booted, "canvas_ok": canvas_ok, "raf_ok": raf_ok,
             "rig_error_count": len(rig_errors),
@@ -1155,6 +1278,10 @@ def run_smoke(args):
             "first_panic": (str(panics[0].get("msg"))[:300] if panics else None),
             "page_blank": shots["page"].get("blank"),
             "canvas_blank": canvas_blank,
+            "worker_round_trip_ok": (None if wrt is None
+                                     else bool(wrt.get("ok"))),
+            "doctored_respawn_ok": (None if dr is None
+                                    else bool(dr.get("ok"))),
         }
         exit_code = 0 if result["pass"] else 2
 
@@ -1231,6 +1358,18 @@ def run_smoke(args):
           % (tag, v.get("rig_error_count"),
              len(((result.get("driver_browser_log") or {}).get("entries"))
                  or [])))
+    wrt = result.get("worker_round_trip")
+    if wrt is not None:
+        print("[%s] SUMMARY worker round-trip: %s (attach + off-the-frame "
+              "reply%s)"
+              % (tag, "OK" if wrt.get("ok") else "FAILED",
+                 "" if wrt.get("ok") else "; " + str(wrt.get("error"))))
+    dr = result.get("doctored_respawn")
+    if dr is not None:
+        print("[%s] SUMMARY doctored respawn: %s%s"
+              % (tag, "OK" if dr.get("ok") else "FAILED",
+                 (" (attach %.0f ms after the refusal)" % dr["delta_ms"])
+                 if dr.get("ok") else "; " + str(dr.get("error"))))
     return exit_code
 
 
@@ -1260,6 +1399,18 @@ def main(argv=None):
                     help="after boot, poll this window global (dot-path) for "
                          "JSON stats (the instrumented app's hook)")
     ap.add_argument("--poll-timeout", type=float, default=120.0)
+    ap.add_argument("--expect-worker-round-trip", action="store_true",
+                    help="fail unless the console shows a worker attach AND a "
+                         "'took N ms off the frame' job reply within "
+                         "--expect-timeout (Tier-2 m4)")
+    ap.add_argument("--expect-doctored-respawn", action="store_true",
+                    help="fail unless the console shows the doctored-token "
+                         "refusal and then, >=1000 ms later, a clean attach "
+                         "(Tier-2 m5; pair with serve.py --doctor-first-worker)")
+    ap.add_argument("--expect-timeout", type=float, default=180.0,
+                    help="seconds for the worker-wire assertions (default "
+                         "180; Tier 2 runs against LIVE network, so the first "
+                         "job reply waits on a real volume fetch)")
     ap.add_argument("--no-second-raf", action="store_true")
     ap.add_argument("--headed", action="store_true",
                     help="disable headless flags (debugging only)")
