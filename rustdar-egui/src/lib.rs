@@ -3,6 +3,7 @@ pub mod config_store;
 pub mod overlay_cache;
 pub mod pane;
 pub(crate) mod point_painter;
+pub mod shell_api;
 pub mod tile_source;
 pub mod tiles;
 mod ui;
