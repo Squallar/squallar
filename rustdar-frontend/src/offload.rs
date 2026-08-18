@@ -1419,7 +1419,11 @@ const TAG_LEVEL3_PAIR: u8 = 4;
 /// one that looks free. Posted as tag 4 a section lands in the
 /// [`TAG_LEVEL3_PAIR`] arm, which reads two `f64`s and a `u32` length and takes
 /// the rest: on a section's plausible bytes that *succeeds*, and renders a
-/// VIL-density product out of cross-section geometry.
+/// VIL-density product out of cross-section geometry. The number is pinned as
+/// a literal in `offload::tests`, and the pin feeds the build token — a
+/// renumbered tag re-pins the test and changes the token, so two builds that
+/// disagree refuse each other at the handshake instead of decoding each
+/// other's bytes.
 const TAG_SECTION: u8 = 5;
 /// A Cartesian voxel grid.
 const TAG_VOXELS: u8 = 6;
@@ -1436,22 +1440,48 @@ const TAG_OVERLAY: u8 = 8;
 /// tag space leaves it: a zeroed buffer must never decode.
 const OVERLAY_INPUT_SITES: u8 = 1;
 /// [`OverlayJobInput::Alerts`]'s code. The next free number after the sites
-/// code, and — like every code on this wire — a contract between two builds:
-/// pinned as a literal in `offload::tests`, never renumbered.
+/// code, and — like every code on this wire — a pinned literal in
+/// `offload::tests`, which the build token digests. Renumbering is no longer
+/// forbidden by cross-build compatibility — the wire is same-build-only by
+/// construction — but it re-pins the literal test and thereby changes the
+/// token, which is the correct consequence: two builds that disagree refuse
+/// each other and respawn rather than misread a byte.
 const OVERLAY_INPUT_ALERTS: u8 = 2;
 /// [`OverlayJobInput::Outlooks`]'s code.
 const OVERLAY_INPUT_OUTLOOKS: u8 = 3;
 /// [`OverlayJobInput::Discussions`]'s code.
 const OVERLAY_INPUT_DISCUSSIONS: u8 = 4;
 /// [`OverlayJobInput::Reports`]'s code — the next free number after the
-/// discussions code, and the first hit-map kind on this inner wire.
+/// discussions code, and the first hit-map kind on this inner wire. Pinned
+/// like the rest: the literal in `offload::tests` feeds the build token.
 const OVERLAY_INPUT_REPORTS: u8 = 5;
 /// [`OverlayJobInput::Glm`]'s code.
 const OVERLAY_INPUT_GLM: u8 = 6;
 /// [`OverlayJobInput::ModelData`]'s code — the next free number after the GLM
 /// code, and the last overlay kind through this wire: nothing rasterizes
-/// opaquely behind it.
+/// opaquely behind it. Pinned like the rest: the literal in `offload::tests`
+/// feeds the build token.
 const OVERLAY_INPUT_MODEL: u8 = 7;
+
+/// The job-tag table as data, for [`crate::wire_identity::wire_digest`].
+///
+/// Built FROM the constants — the single statement of the numbers stays the
+/// `TAG_*` block above, and `offload::tests` still pins their values as
+/// literals. This is how a renumbered tag reaches the build token: the
+/// literal test goes red, the re-pin changes this table's fold, and two
+/// builds that disagree refuse each other at the handshake.
+pub(crate) fn wire_tags() -> [(&'static str, u8); 8] {
+    [
+        ("TAG_RADAR", TAG_RADAR),
+        ("TAG_LEVEL3", TAG_LEVEL3),
+        ("TAG_SRM_RETIRED", TAG_SRM_RETIRED),
+        ("TAG_LEVEL3_PAIR", TAG_LEVEL3_PAIR),
+        ("TAG_SECTION", TAG_SECTION),
+        ("TAG_VOXELS", TAG_VOXELS),
+        ("TAG_DECODE", TAG_DECODE),
+        ("TAG_OVERLAY", TAG_OVERLAY),
+    ]
+}
 
 /// The variant's own bytes after [`JobRequest::Overlay`]'s fixed header:
 /// one input-kind byte, then the kind's fields — scalars first, then the

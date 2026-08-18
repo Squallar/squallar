@@ -54,3 +54,4 @@ pub mod staging_ring;
 #[cfg(test)]
 pub(crate) mod test_sites;
 pub mod volume;
+pub mod wire_identity;
