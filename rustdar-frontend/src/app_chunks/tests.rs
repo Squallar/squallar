@@ -1,13 +1,15 @@
-/// The chunk drain and driver must run inside `poll_data_channels`, which
-/// `handle_redraw` calls before `evict_unshown_scans` and before
-/// `setup_egui_frame` lays the frame out.
+/// The chunk drain and driver must run in the pump phase
+/// `poll_data_channels` runs, which `handle_redraw` calls before
+/// `evict_unshown_scans` and before `setup_egui_frame` lays the frame out.
 ///
 /// A source probe because no type system expresses it: the drain is what
 /// makes a newly assembled volume the one `dispatch_pane_renders` reads, and
-/// `evict_unshown_scans` would drop a volume stored after it ran. The
-/// sibling guarantee for the pollers inside `setup_egui_frame` is pinned by
-/// `app_render::tests::every_poller_runs_before_the_frame_is_laid_out`; this
-/// is the half that lives outside it.
+/// `evict_unshown_scans` would drop a volume stored after it ran. Since
+/// WO-E3 the drain and driver are `FRAME_PUMP` rows, so their presence and
+/// order are read off the table's source. The sibling guarantee for the
+/// pollers `setup_egui_frame` runs is pinned by
+/// `app_render::frame_build_order_tests::every_poller_runs_before_the_frame_is_laid_out`;
+/// this is the half that lives outside it.
 #[test]
 fn the_chunk_drain_runs_before_the_frame_is_laid_out() {
     let source = include_str!("../app.rs");
@@ -33,14 +35,27 @@ fn the_chunk_drain_runs_before_the_frame_is_laid_out() {
         panic!("unbalanced braces in {name}");
     };
 
+    // `poll_data_channels`' body is the `Ingest` runner, so the drain's run
+    // moment is still that call's — and the rows themselves are read off
+    // the pump table.
     let poll = body("fn poll_data_channels(");
-    let drain = poll.find("self.poll_chunk_results(").expect(
-        "the chunk drain left poll_data_channels, so a volume it \
+    assert!(
+        poll.contains("run_frame_pump") && poll.contains("PumpPhase::Ingest"),
+        "poll_data_channels no longer runs the pump's Ingest phase, so the \
+             chunk drain's run moment is not the one this test pins"
+    );
+    let table = include_str!("../frame_pump.rs");
+    let pump = table
+        .split_once("const FRAME_PUMP")
+        .map(|(_, rest)| rest)
+        .expect("FRAME_PUMP is gone from frame_pump.rs");
+    let drain = pump.find("\"poll_chunk_results\"").expect(
+        "the chunk drain left the frame pump, so a volume it \
                      assembles can be evicted before anything draws it",
     );
-    let drive = poll
-        .find("self.drive_chunk_feeds(")
-        .expect("the chunk driver left poll_data_channels");
+    let drive = pump
+        .find("\"drive_chunk_feeds\"")
+        .expect("the chunk driver left the frame pump");
     assert!(
         drain < drive,
         "a round is dispatched before the finished one is applied, so every \

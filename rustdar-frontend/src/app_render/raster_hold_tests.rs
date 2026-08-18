@@ -337,8 +337,8 @@ fn a_delivered_raster_is_promoted_before_the_frame_is_laid_out() {
         .find("self.promote_uploaded_rasters(")
         .expect("setup_egui_frame no longer promotes delivered rasters");
     let poll = body
-        .find("self.poll_render_results(")
-        .expect("setup_egui_frame no longer polls renders");
+        .find("self.run_frame_pump(PumpPhase::Apply")
+        .expect("setup_egui_frame no longer runs the pump's results-apply phase");
     let laid_out = body
         .find("self.gui.ui(")
         .expect("setup_egui_frame no longer lays out a frame");
@@ -349,8 +349,9 @@ fn a_delivered_raster_is_promoted_before_the_frame_is_laid_out() {
     );
     assert!(
         promote < poll,
-        "the promotion runs after the poller that stages holds, so a hold is \
-         asked about on the frame it was staged, when the answer can only be no",
+        "the promotion runs after the results-apply phase whose poller stages \
+         holds, so a hold is asked about on the frame it was staged, when the \
+         answer can only be no",
     );
 }
 

@@ -35,6 +35,9 @@ mod render;
 #[path = "app_chunks.rs"]
 mod chunks;
 
+#[path = "frame_pump.rs"]
+mod frame_pump;
+
 /// Whether this build is the browser build. See `app_state::WEB`, which is the
 /// same value for the same reason: a `cfg!` forks a function both of whose arms
 /// still compile, so a host `cargo test` can call either one.
@@ -2275,8 +2278,13 @@ impl App {
         }
     }
 
-    /// Poll all data channels for completed async results (scan, overlays).
-    fn poll_data_channels(&mut self) {
+    /// Drain the archive scan channel and apply every queued volume.
+    ///
+    /// FRAME_PUMP row 1 (`Ingest`) — see `frame_pump::FRAME_PUMP` for the
+    /// order it runs in. Extracted verbatim, comments included, from the
+    /// inline drain that used to open `poll_data_channels` (WO-E3); it
+    /// stays in this file so the drain reads beside the state it applies.
+    fn poll_scan_results(&mut self) {
         // Every queued scan result, not one per frame (with generation check).
         //
         // Responses arrive in batches — auto-poll sends one `CheckForNewScans`
@@ -2513,24 +2521,21 @@ impl App {
                 }
             }
         }
+    }
 
-        // Real-time chunks, drained beside the scan results and for the same
-        // reason: this is where a new volume becomes the one the panes draw
-        // from, and it has to happen before `evict_unshown_scans` and before the
-        // frame is laid out.
-        self.poll_chunk_results();
-        self.drive_chunk_feeds();
+    /// Poll all data channels for completed async results (scan, overlays).
+    ///
+    /// The body is the pump's `Ingest` phase: the rows, their order, and
+    /// the arguments for that order live in `frame_pump::FRAME_PUMP`.
+    fn poll_data_channels(&mut self) {
+        self.run_frame_pump(frame_pump::PumpPhase::Ingest, None);
+    }
 
-        // Finished voxel builds land before the stamps are published, so a
-        // build and its announcement cannot straddle a frame.
-        self.poll_voxel_results();
-
-        // After both drains, so the UI is told about a volume on the frame it
-        // arrived rather than the frame after. A 3D pane reads this to decide
-        // which volume to ask for, so a frame's delay here is a frame's delay on
-        // every build.
-        self.publish_base_volumes();
-
+    /// Drain the unified overlay fetch channel.
+    ///
+    /// FRAME_PUMP row 6 (`Ingest`) — extracted verbatim from the inline
+    /// drain that used to close `poll_data_channels` (WO-E3).
+    fn poll_overlay_fetch_results(&mut self) {
         // Check for received overlay fetch results (unified channel)
         while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
             self.gui.overlays.apply_fetch_result(result);

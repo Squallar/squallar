@@ -1,3 +1,4 @@
+use super::frame_pump::PumpPhase;
 use crate::constants::{
     DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
     MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MIN_LOOP_SPEED_FPS,
@@ -257,21 +258,9 @@ impl super::App {
         // *this* frame's paint list rather than the next one. See the callee.
         self.promote_uploaded_rasters();
 
-        self.poll_render_results(&ctx);
-        self.poll_section_results(&ctx);
-        self.poll_level3_results();
-        self.poll_site_catalogue();
-        self.poll_overlay_render_results(&ctx);
-        self.poll_loop_scan_list_results();
-        self.poll_loop_scan_download_results();
-        self.poll_loop_l3_list_results();
-        self.poll_loop_l3_fetch_results();
-        self.poll_loop_render_results(&ctx);
-        self.poll_loop_section_results(&ctx);
-        self.advance_loop_playback();
-        self.dispatch_pane_renders(&ctx);
-        self.dispatch_section_renders();
-        self.dispatch_loop_renders();
+        self.run_frame_pump(PumpPhase::Apply, Some(&ctx));
+        self.run_frame_pump(PumpPhase::Advance, Some(&ctx));
+        self.run_frame_pump(PumpPhase::Dispatch, Some(&ctx));
         // After the dispatch, which is the only thing that grows the store,
         // and before the GUI pass that paints from it — so a grid that has
         // just been evicted is never one a callback is about to march. The
@@ -5130,3 +5119,75 @@ mod overlay_disable_race_tests;
 #[path = "app_render/overlay_hold_tests.rs"]
 #[cfg(test)]
 mod overlay_hold_tests;
+
+// ---- FRAME_PUMP wrappers (WO-E3) ----
+//
+// The pump table (`super::frame_pump::FRAME_PUMP`) points at these. The
+// pollers and dispatchers they call are private to this module, so the thin
+// wrappers the table needs are defined beside them rather than beside the
+// table. They are the whole indirection: the methods stay methods, with
+// names, signatures and visibility unchanged, and the frame test suites
+// keep calling them directly.
+
+pub(super) fn pump_poll_render_results(app: &mut super::App, ctx: Option<&egui::Context>) {
+    app.poll_render_results(ctx.expect("Apply rows run from setup_egui_frame"));
+}
+
+pub(super) fn pump_poll_section_results(app: &mut super::App, ctx: Option<&egui::Context>) {
+    app.poll_section_results(ctx.expect("Apply rows run from setup_egui_frame"));
+}
+
+pub(super) fn pump_poll_level3_results(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.poll_level3_results();
+}
+
+pub(super) fn pump_poll_site_catalogue(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.poll_site_catalogue();
+}
+
+pub(super) fn pump_poll_overlay_render_results(app: &mut super::App, ctx: Option<&egui::Context>) {
+    app.poll_overlay_render_results(ctx.expect("Apply rows run from setup_egui_frame"));
+}
+
+pub(super) fn pump_poll_loop_scan_list_results(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.poll_loop_scan_list_results();
+}
+
+pub(super) fn pump_poll_loop_scan_download_results(
+    app: &mut super::App,
+    _ctx: Option<&egui::Context>,
+) {
+    app.poll_loop_scan_download_results();
+}
+
+pub(super) fn pump_poll_loop_l3_list_results(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.poll_loop_l3_list_results();
+}
+
+pub(super) fn pump_poll_loop_l3_fetch_results(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.poll_loop_l3_fetch_results();
+}
+
+pub(super) fn pump_poll_loop_render_results(app: &mut super::App, ctx: Option<&egui::Context>) {
+    app.poll_loop_render_results(ctx.expect("Apply rows run from setup_egui_frame"));
+}
+
+pub(super) fn pump_poll_loop_section_results(app: &mut super::App, ctx: Option<&egui::Context>) {
+    app.poll_loop_section_results(ctx.expect("Apply rows run from setup_egui_frame"));
+}
+
+pub(super) fn pump_advance_loop_playback(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.advance_loop_playback();
+}
+
+pub(super) fn pump_dispatch_pane_renders(app: &mut super::App, ctx: Option<&egui::Context>) {
+    app.dispatch_pane_renders(ctx.expect("Dispatch rows run from setup_egui_frame"));
+}
+
+pub(super) fn pump_dispatch_section_renders(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.dispatch_section_renders();
+}
+
+pub(super) fn pump_dispatch_loop_renders(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.dispatch_loop_renders();
+}
