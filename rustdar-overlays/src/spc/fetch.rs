@@ -11,7 +11,7 @@
 //! outlooks, MDs and storm reports go silently missing on web only. Use
 //! [`spc_client`], never `ctx.client`.
 
-use rustdar_radar::sources::DataSources;
+use rustdar_source::origins::DataSources;
 
 use super::discussion::{SpcDiscussion, parse_md_rss};
 use super::outlook::{OutlookDay, OutlookProduct, SpcOutlook, outlook_url, parse_geojson};
@@ -111,7 +111,7 @@ mod tests {
     fn the_spc_client_sends_no_user_agent() {
         let client = spc_client(&DataSources::production()).expect("the SPC client must build");
         assert!(
-            !rustdar_radar::tls::sends_user_agent(&client),
+            !rustdar_source::tls::sends_user_agent(&client),
             "the SPC client carries a User-Agent, so the browser preflights \
              the GET and SPC answers OPTIONS with 403 — outlooks, MDs and \
              storm reports silently never arrive, and only on web",
@@ -127,7 +127,7 @@ mod tests {
         };
         let client = spc_client(&sources).expect("the SPC client must build");
         assert!(
-            rustdar_radar::tls::sends_user_agent(&client),
+            rustdar_source::tls::sends_user_agent(&client),
             "spc_client ignores DataSources::spc_sends_user_agent",
         );
     }

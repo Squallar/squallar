@@ -796,7 +796,7 @@ pub struct FetchConfig {
     pub client: reqwest::Client,
     pub zone_cache_dir: Option<std::path::PathBuf>,
     /// Every origin a fetch may reach is declared here, not inline in URLs.
-    pub sources: rustdar_radar::sources::DataSources,
+    pub sources: rustdar_source::origins::DataSources,
     /// `None` before the first frame is rendered. METAR must scope to this —
     /// the whole-country IEM form is 54 MB ungzipped; see
     /// [`crate::metar::networks`] for the no-viewport fallback.

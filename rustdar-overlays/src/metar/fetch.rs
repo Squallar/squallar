@@ -11,8 +11,8 @@
 //! with `405 Method Not Allowed`, but answers the plain `GET` with
 //! `Access-Control-Allow-Origin: *`. Any non-safelisted request header —
 //! `User-Agent` included — makes the browser preflight, and the request then
-//! never happens. Hence [`rustdar_radar::tls::simple_client`] and
-//! [`rustdar_radar::sources::DataSources::metar_sends_user_agent`] `== false`.
+//! never happens. Hence [`rustdar_source::tls::simple_client`] and
+//! [`rustdar_source::origins::DataSources::metar_sends_user_agent`] `== false`.
 //!
 //! Requests are viewport-scoped (see [`super::networks`]) because the
 //! whole-network form is 54 MB ungzipped.
@@ -244,7 +244,7 @@ impl MetarRound {
 /// reported, see [`MetarRound`].
 pub async fn fetch_current_metars(
     client: &reqwest::Client,
-    sources: &rustdar_radar::sources::DataSources,
+    sources: &rustdar_source::origins::DataSources,
     viewport: &GeoBounds,
 ) -> Result<MetarRound, FetchError> {
     let states = networks::networks_for_viewport(viewport);

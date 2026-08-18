@@ -1128,7 +1128,7 @@ mod tests {
     /// so asking for it would paint a months-old hazard area as current.
     #[test]
     fn day_3_asks_for_the_conditional_intensity_endpoint_not_the_frozen_one() {
-        let sources = rustdar_radar::sources::DataSources::default();
+        let sources = rustdar_source::origins::DataSources::default();
         let url = crate::spc::outlook::outlook_url(
             &sources,
             OutlookDay::Day3,
@@ -1192,7 +1192,7 @@ mod tests {
         let ctx = FetchConfig {
             client: Default::default(),
             zone_cache_dir: None,
-            sources: rustdar_radar::sources::DataSources::default(),
+            sources: rustdar_source::origins::DataSources::default(),
             viewport: None,
         };
         assert_eq!(
@@ -2062,13 +2062,13 @@ mod tests {
     #[test]
     fn the_outstanding_count_is_the_number_of_tasks_actually_built() {
         use crate::render::overlay_state::FetchConfig;
-        rustdar_radar::tls::init();
+        rustdar_source::tls::init();
         let ctx = FetchConfig {
             client: reqwest::Client::builder()
                 .build()
                 .expect("a client with no options set"),
             zone_cache_dir: None,
-            sources: rustdar_radar::sources::DataSources::production(),
+            sources: rustdar_source::origins::DataSources::production(),
             viewport: None,
         };
         for products in 1..=OutlookDay::Day1.products().len() {

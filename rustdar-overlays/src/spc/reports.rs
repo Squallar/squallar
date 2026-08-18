@@ -38,10 +38,10 @@ pub struct StormReport {
 }
 
 /// Origin must come from
-/// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base),
+/// [`DataSources::spc_base`](rustdar_source::origins::DataSources::spc_base),
 /// never a literal, or these three escape the origin table.
 pub(crate) fn report_url(
-    sources: &rustdar_radar::sources::DataSources,
+    sources: &rustdar_source::origins::DataSources,
     kind: StormReportKind,
 ) -> String {
     let name = match kind {
@@ -124,7 +124,7 @@ impl StormReportRound {
 /// A partial round now says which kind is absent — see [`StormReportRound`].
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
-    sources: &rustdar_radar::sources::DataSources,
+    sources: &rustdar_source::origins::DataSources,
 ) -> Result<StormReportRound, FetchError> {
     log::info!("Fetching SPC storm reports");
 

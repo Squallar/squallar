@@ -1,7 +1,12 @@
 //! Geometry utilities. GUI-framework-agnostic: `rustdar-egui` bridges
 //! `egui::Pos2` ↔ [`ScreenPoint`].
 
-use crate::types::{GeoBounds, GeoPolygon, GeoPolygonRing, ScreenPoint};
+use crate::types::{GeoPolygon, GeoPolygonRing, ScreenPoint};
+
+// Defined in `rustdar-source` beside the `GeoBounds` it returns (inherent
+// impls live in the defining crate; `OverlayFeature::new` calls it there);
+// re-exported so this module's callers keep their path.
+pub use rustdar_source::geo::compute_geo_bounds;
 
 /// The whole multiple of 360° that carries the datum spanning
 /// `[datum_min, datum_max]` to its representation nearest the target spanning
@@ -187,36 +192,4 @@ pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
         polygon.retain(|r| r.len() >= 3);
     }
     polygons.retain(|p| !p.is_empty());
-}
-
-/// `None` when there is not a single vertex.
-pub fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
-    let mut any = false;
-
-    for polygon in polygons {
-        for ring in polygon {
-            for &(lat, lon) in ring {
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                any = true;
-            }
-        }
-    }
-
-    if any {
-        Some(GeoBounds {
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
-        })
-    } else {
-        None
-    }
 }
