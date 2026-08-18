@@ -635,12 +635,11 @@ mod tests {
 
     /// Serve canned responses by path from a loopback socket, forever.
     ///
-    /// Routed rather than one-shot ([`archive`]'s `serve_once` is the
-    /// single-response shape): the whole point here is a round of many requests
-    /// where *some* succeed, which one response cannot express. An unrouted path
-    /// answers 500, so a test states only what it wants to succeed.
-    ///
-    /// [`archive`]: rustdar_radar::archive
+    /// Routed rather than one-shot (`rustdar_radar::archive`'s `serve_once` is
+    /// the single-response shape): the whole point here is a round of many
+    /// requests where *some* succeed, which one response cannot express. An
+    /// unrouted path answers 500, so a test states only what it wants to
+    /// succeed.
     fn serve(routes: HashMap<String, (u16, String)>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
@@ -672,7 +671,7 @@ mod tests {
     /// `rustls-no-provider` and `aws-lc-rs` out of the graph, `build()` panics
     /// without a provider whatever scheme is used.
     fn loopback_client() -> reqwest::Client {
-        rustdar_radar::tls::init();
+        rustdar_source::tls::init();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()

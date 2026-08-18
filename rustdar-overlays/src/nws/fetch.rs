@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rustdar_radar::sources::DataSources;
+use rustdar_source::origins::DataSources;
 
 use super::alert::{NwsAlert, parse_alerts};
 use super::zones::{ZoneResolution, resolve_zone_geometries};

@@ -26,19 +26,12 @@ pub const REGULAR_FILL_ALPHA: u8 = 100;
 pub const NWS_FILL_ALPHA: u8 = 80;
 pub const STROKE_ALPHA: u8 = 255;
 
-/// Ring of (latitude, longitude) points. First ring is exterior, rest are holes.
-pub type GeoPolygonRing = Vec<(f64, f64)>;
-
-pub type GeoPolygon = Vec<GeoPolygonRing>;
-
-/// A map label to be drawn at a geographic position.
-#[derive(Debug, Clone)]
-pub struct OverlayLabel {
-    pub lat: f64,
-    pub lon: f64,
-    pub text: String,
-    pub color: [u8; 4],
-}
+// The geo/feature vocabulary is defined in `rustdar-source` — the shared floor
+// under this crate and `rustdar-radar` — and re-exported here under the paths
+// this crate always published it at, so every `crate::types::X` and
+// `rustdar_overlays::types::X` user compiles unchanged.
+pub use rustdar_source::feature::{HatchPattern, OverlayFeature, OverlayLabel};
+pub use rustdar_source::geo::{GeoBounds, GeoPolygon, GeoPolygonRing};
 
 /// GeoJSON is `[[[lon, lat], ...], ...]`; output is `(lat, lon)`. Order swaps.
 /// Rings with fewer than 3 points are dropped.
@@ -66,88 +59,5 @@ pub fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
         None
     } else {
         Some(geo_rings)
-    }
-}
-
-/// Hatching for SPC's significant-severe area.
-///
-/// The three levels are SPC's Conditional Intensity Groups, which NWS Service
-/// Change Notice 26-11 introduced on 2026-03-02 to replace the single `SIGN`
-/// area with three intensity distributions. Higher levels hatch over lower
-/// ones; see [`crate::render::hatch::draw_hatch_pass`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HatchPattern {
-    None,
-    /// Dotted, 45° (forward slash).
-    Cig1,
-    /// Solid, 135° (backslash).
-    Cig2,
-    /// Solid, both directions (cross-hatch).
-    Cig3,
-}
-
-/// Geographic bounding box for viewport culling.
-///
-/// `PartialEq` because the box rides inside
-/// `rustdar_frontend::offload::JobRequest`, whose wire round-trip tests compare
-/// whole requests; it is derived — four `f64` comparisons — and carries the
-/// usual `f64` caveat that `NaN != NaN`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GeoBounds {
-    pub min_lat: f64,
-    pub max_lat: f64,
-    pub min_lon: f64,
-    pub max_lon: f64,
-}
-
-impl GeoBounds {
-    pub fn intersects(&self, other: &GeoBounds) -> bool {
-        self.min_lat <= other.max_lat
-            && self.max_lat >= other.min_lat
-            && self.min_lon <= other.max_lon
-            && self.max_lon >= other.min_lon
-    }
-}
-
-/// `PartialEq` because features ride inside
-/// `rustdar_frontend::offload::JobRequest` (the described overlay jobs for the
-/// polygon kinds), whose wire round-trip tests compare whole requests; it is
-/// derived and carries [`GeoBounds`]'s own `f64` caveat that `NaN != NaN`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct OverlayFeature {
-    /// One or more polygons (from GeoJSON MultiPolygon).
-    pub polygons: Vec<GeoPolygon>,
-    pub fill_rgba: [u8; 4],
-    pub stroke_rgba: [u8; 4],
-    /// Short label, e.g. "SLGT", "0.05", "CIG1".
-    pub label: String,
-    /// Long label, e.g. "Slight Risk", "5% Tornado Risk".
-    pub label2: String,
-    pub hatch: HatchPattern,
-    pub geo_bounds: Option<GeoBounds>,
-}
-
-impl OverlayFeature {
-    /// Bounds are taken in geo-coordinates, so they survive projection: the
-    /// viewport cull compares them against a projected viewport's own
-    /// lat/lon box.
-    pub fn new(
-        polygons: Vec<GeoPolygon>,
-        fill_rgba: [u8; 4],
-        stroke_rgba: [u8; 4],
-        label: String,
-        label2: String,
-        hatch: HatchPattern,
-    ) -> Self {
-        let geo_bounds = crate::render::geo::compute_geo_bounds(&polygons);
-        Self {
-            polygons,
-            fill_rgba,
-            stroke_rgba,
-            label,
-            label2,
-            hatch,
-            geo_bounds,
-        }
     }
 }

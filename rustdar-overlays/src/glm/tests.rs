@@ -1366,7 +1366,7 @@ fn a_real_granule_parses_into_plottable_lightning() {
 /// GOES-16's rotation out of the East slot.
 #[test]
 fn the_glm_buckets_come_from_the_declared_origins() {
-    use rustdar_radar::sources::DataSources;
+    use rustdar_source::origins::DataSources;
 
     let s = DataSources::production();
     assert_eq!(GlmSatellite::GoesEast.bucket(&s), "noaa-goes19");

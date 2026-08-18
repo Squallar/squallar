@@ -34,7 +34,7 @@
 
 use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
 use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, LatLons, SubMessage};
-use rustdar_radar::sources::DataSources;
+use rustdar_source::origins::DataSources;
 
 use super::{GridCoords, HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::fetch_policy::{FetchError, FetchFailure, NotFound};
@@ -733,10 +733,10 @@ async fn try_fetch_composite(
 ///
 /// A `User-Agent` is fine on this origin, unlike IEM and SPC: S3 answers the
 /// preflight `200` with `Access-Control-Allow-Headers: user-agent`. See
-/// `rustdar_radar::sources`.
+/// `rustdar_source::origins`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 fn hrrr_client() -> Result<reqwest::Client, String> {
-    rustdar_radar::tls::client(rustdar_radar::tls::USER_AGENT, HRRR_TIMEOUT)
+    rustdar_source::tls::client(rustdar_source::tls::USER_AGENT, HRRR_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the HRRR client: {e}"))
 }

@@ -36,9 +36,11 @@ log = { workspace = true }
 # aws-lc-rs, pulling `aws-lc-sys` in. TLS backend comes from the workspace pin.
 reqwest = { workspace = true, features = ["json"] }
 roxmltree = "=0.21.1"
-# For `sources::DataSources` and `tls` (incl. the no-User-Agent client METAR/SPC
-# need -- see `metar::fetch`). No cycle: `rustdar-radar` does not depend on this.
-rustdar-radar = { workspace = true }
+# For `origins::DataSources`, `tls` (incl. the no-User-Agent client METAR/SPC
+# need -- see `metar::fetch`), and the geo/feature vocabulary this crate
+# re-exports from `types`. The substrate under this crate AND `rustdar-radar`;
+# `tests/charter.rs` there pins that this crate depends on no radar code.
+rustdar-source = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"

@@ -186,7 +186,7 @@ fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
     (PI / 4.0 + lat_rad / 2.0).tan().ln()
 }
 
-/// Web Mercator's own limit, from [`rustdar_radar::types`] rather than spelled
+/// Web Mercator's own limit, from [`rustdar_source::geo`] rather than spelled
 /// again here.
 ///
 /// It read `85.05`, under a comment claiming that was where the projection
@@ -201,7 +201,7 @@ fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
 /// picture drawn for one rectangle and pinned to another. Sub-pixel at CONUS
 /// latitudes in a whole-world texture, and zero once the two agree, which is
 /// the point of their being one constant.
-const MAX_MERCATOR_LAT: f64 = rustdar_radar::types::MERCATOR_LAT_LIMIT_DEG;
+const MAX_MERCATOR_LAT: f64 = rustdar_source::geo::MERCATOR_LAT_LIMIT_DEG;
 
 /// Mercator Y for both edges is precomputed once per texture.
 #[derive(Debug, Clone, Copy)]

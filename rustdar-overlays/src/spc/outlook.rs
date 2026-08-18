@@ -181,7 +181,7 @@ pub struct SpcOutlook {
 }
 
 /// Origin must come from
-/// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base),
+/// [`DataSources::spc_base`](rustdar_source::origins::DataSources::spc_base),
 /// never a literal, or SPC escapes the origin table's browser-reachability check.
 ///
 /// # Why `.lyr.geojson`, and what it costs
@@ -201,7 +201,7 @@ pub struct SpcOutlook {
 /// rings, `.nolyr`'s donuts would have rendered as solid overlapping blobs
 /// anyway. That blocker is gone now; the tradeoff is not.
 pub fn outlook_url(
-    sources: &rustdar_radar::sources::DataSources,
+    sources: &rustdar_source::origins::DataSources,
     day: OutlookDay,
     product: OutlookProduct,
 ) -> String {

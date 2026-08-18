@@ -1,7 +1,68 @@
 //! Shared horizontal geodesy: the Web Mercator projection's limit and its two
-//! y-conversions.
+//! y-conversions, and the polygon/bounds vocabulary overlay features are
+//! built from.
 
 use std::f64::consts::PI;
+
+/// Ring of (latitude, longitude) points. First ring is exterior, rest are holes.
+pub type GeoPolygonRing = Vec<(f64, f64)>;
+
+pub type GeoPolygon = Vec<GeoPolygonRing>;
+
+/// Geographic bounding box for viewport culling.
+///
+/// `PartialEq` because the box rides inside
+/// `rustdar_frontend::offload::JobRequest`, whose wire round-trip tests compare
+/// whole requests; it is derived — four `f64` comparisons — and carries the
+/// usual `f64` caveat that `NaN != NaN`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeoBounds {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lon: f64,
+    pub max_lon: f64,
+}
+
+impl GeoBounds {
+    pub fn intersects(&self, other: &GeoBounds) -> bool {
+        self.min_lat <= other.max_lat
+            && self.max_lat >= other.min_lat
+            && self.min_lon <= other.max_lon
+            && self.max_lon >= other.min_lon
+    }
+}
+
+/// `None` when there is not a single vertex.
+pub fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut any = false;
+
+    for polygon in polygons {
+        for ring in polygon {
+            for &(lat, lon) in ring {
+                min_lat = min_lat.min(lat);
+                max_lat = max_lat.max(lat);
+                min_lon = min_lon.min(lon);
+                max_lon = max_lon.max(lon);
+                any = true;
+            }
+        }
+    }
+
+    if any {
+        Some(GeoBounds {
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+        })
+    } else {
+        None
+    }
+}
 
 /// The latitude Web Mercator ends at: the one whose projected `y` is exactly
 /// `π`, so the world is the square the tile grid needs it to be.

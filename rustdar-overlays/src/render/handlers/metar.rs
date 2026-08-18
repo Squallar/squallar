@@ -37,9 +37,9 @@ const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// the request non-simple; the browser then preflights and IEM answers
 /// `OPTIONS` with `405`, so the GET is never issued. Native and `curl` see
 /// none of this. The rule is read from
-/// [`DataSources::metar_sends_user_agent`](rustdar_radar::sources::DataSources::metar_sends_user_agent),
+/// [`DataSources::metar_sends_user_agent`](rustdar_source::origins::DataSources::metar_sends_user_agent),
 /// not restated here.
-fn metar_client(sources: &rustdar_radar::sources::DataSources) -> Result<reqwest::Client, String> {
+fn metar_client(sources: &rustdar_source::origins::DataSources) -> Result<reqwest::Client, String> {
     sources
         .metar_client(METAR_TIMEOUT)
         .build()
@@ -479,10 +479,10 @@ mod tests {
     /// drops it, so a wasm-only check passes on a broken native client.
     #[test]
     fn the_metar_client_sends_no_user_agent() {
-        let client = metar_client(&rustdar_radar::sources::DataSources::production())
+        let client = metar_client(&rustdar_source::origins::DataSources::production())
             .expect("the METAR client must build");
         assert!(
-            !rustdar_radar::tls::sends_user_agent(&client),
+            !rustdar_source::tls::sends_user_agent(&client),
             "the METAR client carries a User-Agent, so the browser preflights \
              the GET and IEM answers OPTIONS with 405 — the observations \
              silently never arrive, and only on web",
@@ -493,13 +493,13 @@ mod tests {
     /// the test above while `metar_sends_user_agent` is read by nothing.
     #[test]
     fn the_metar_client_follows_the_origins_recorded_rule() {
-        let sources = rustdar_radar::sources::DataSources {
+        let sources = rustdar_source::origins::DataSources {
             metar_sends_user_agent: true,
-            ..rustdar_radar::sources::DataSources::production()
+            ..rustdar_source::origins::DataSources::production()
         };
         let client = metar_client(&sources).expect("the METAR client must build");
         assert!(
-            rustdar_radar::tls::sends_user_agent(&client),
+            rustdar_source::tls::sends_user_agent(&client),
             "metar_client ignores DataSources::metar_sends_user_agent",
         );
     }
@@ -616,7 +616,7 @@ mod round_tests {
     }
 
     /// Serve `currents.json` from loopback, refusing exactly one state network.
-    fn iem_refusing(dead: Option<&'static str>) -> rustdar_radar::sources::DataSources {
+    fn iem_refusing(dead: Option<&'static str>) -> rustdar_source::origins::DataSources {
         use std::io::{Read, Write};
         fn http(status_line: &str, body: &str) -> String {
             format!(
@@ -643,16 +643,16 @@ mod round_tests {
                 let _ = stream.flush();
             }
         });
-        rustdar_radar::sources::DataSources {
+        rustdar_source::origins::DataSources {
             iem_base: format!("http://127.0.0.1:{port}").into(),
-            ..rustdar_radar::sources::DataSources::production()
+            ..rustdar_source::origins::DataSources::production()
         }
     }
 
     /// Fetch over the socket and push the result through the production ingest
     /// path, returning the row and the options note a user would see.
     fn round(dead: Option<&'static str>) -> (Option<String>, Option<String>) {
-        rustdar_radar::tls::init();
+        rustdar_source::tls::init();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()

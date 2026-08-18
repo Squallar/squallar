@@ -597,7 +597,7 @@ mod round_tests {
     /// Serve the three `today_*.csv` from loopback, so the round under test is
     /// driven over a real socket rather than around it. The origin comes from
     /// `DataSources::spc_base`, which the fetch never spells.
-    fn spc_serving(responses: Vec<(&'static str, String)>) -> rustdar_radar::sources::DataSources {
+    fn spc_serving(responses: Vec<(&'static str, String)>) -> rustdar_source::origins::DataSources {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
@@ -616,9 +616,9 @@ mod round_tests {
                 let _ = stream.flush();
             }
         });
-        rustdar_radar::sources::DataSources {
+        rustdar_source::origins::DataSources {
             spc_base: format!("http://127.0.0.1:{port}").into(),
-            ..rustdar_radar::sources::DataSources::production()
+            ..rustdar_source::origins::DataSources::production()
         }
     }
 
@@ -632,7 +632,7 @@ mod round_tests {
     /// Fetch over the socket and push the result through the production ingest
     /// path, returning the row and the options note a user would see.
     fn round(responses: Vec<(&'static str, String)>) -> (Option<String>, Option<String>) {
-        rustdar_radar::tls::init();
+        rustdar_source::tls::init();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()

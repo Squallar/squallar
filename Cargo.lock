@@ -4259,7 +4259,7 @@ dependencies = [
  "log",
  "reqwest 0.13.4",
  "roxmltree 0.21.1",
- "rustdar-radar",
+ "rustdar-source",
  "rustdar-units",
  "serde",
  "serde_json",

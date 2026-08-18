@@ -424,10 +424,10 @@ fn a_malformed_body_is_an_error() {
 #[ignore = "hits the live mesonet.agron.iastate.edu API"]
 #[tokio::test]
 async fn live_metar_fetch_carries_every_mapped_field() {
-    let client = rustdar_radar::tls::simple_client(std::time::Duration::from_secs(60))
+    let client = rustdar_source::tls::simple_client(std::time::Duration::from_secs(60))
         .build()
         .expect("client");
-    let sources = rustdar_radar::sources::DataSources::production();
+    let sources = rustdar_source::origins::DataSources::production();
     // Central Oklahoma — KTLX's neighbourhood.
     let view = GeoBounds {
         min_lat: 34.3,
@@ -487,7 +487,7 @@ async fn live_metar_fetch_carries_every_mapped_field() {
 #[ignore = "hits the live mesonet.agron.iastate.edu API"]
 #[tokio::test]
 async fn live_networks_table_matches_iems_own_extents() {
-    let client = rustdar_radar::tls::simple_client(std::time::Duration::from_secs(60))
+    let client = rustdar_source::tls::simple_client(std::time::Duration::from_secs(60))
         .build()
         .expect("client");
     let body = client

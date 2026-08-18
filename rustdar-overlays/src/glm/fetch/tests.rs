@@ -1197,7 +1197,7 @@ fn an_unreachable_host_is_a_transport_failure() {
     // "No provider set" unless a crypto provider is installed first.
     // `tls::client` is not used because it sets `https_only`, and the
     // cleartext loopback URL below is the point of the test.
-    rustdar_radar::tls::init();
+    rustdar_source::tls::init();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1430,7 +1430,7 @@ fn s3_serving(responses: Vec<(&'static str, String)>) -> DataSources {
 /// loopback URL cannot satisfy, and `tls::init` is still required because
 /// `reqwest` is pinned to `rustls-no-provider`.
 fn loopback_client() -> reqwest::Client {
-    rustdar_radar::tls::init();
+    rustdar_source::tls::init();
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()

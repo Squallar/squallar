@@ -1,11 +1,11 @@
 //! GOES GLM (Geostationary Lightning Mapper) data types and fetch logic.
 //!
 //! Level 2 LCFA (Lightning Cluster-Filter Algorithm) data from the public GOES
-//! S3 buckets declared in [`rustdar_radar::sources::DataSources`]. Each NetCDF4
+//! S3 buckets declared in [`rustdar_source::origins::DataSources`]. Each NetCDF4
 //! granule covers ~20 s; flashes are aggregated over a configurable window
 //! (default 5 minutes).
 
-use rustdar_radar::sources::DataSources;
+use rustdar_source::origins::DataSources;
 
 mod cf;
 pub mod fetch;
