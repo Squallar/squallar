@@ -336,29 +336,34 @@ fn layout_fixture() -> PolarField {
     }
 }
 
-/// The bytes this protocol version ships are **these** bytes.
+/// The bytes this protocol ships are **these** bytes.
 ///
 /// # What was blind, exactly
 ///
-/// This encoding has no version of its own. The number that governs it is
-/// `rustdar_web`'s `PROTOCOL_VERSION`, which rides in `build_token` and is what
-/// a page and a worker from opposite sides of a deploy actually compare — and
-/// the two guards standing over that number are both blind here:
+/// This encoding has no version of its own. What a page and a worker from
+/// opposite sides of a deploy actually compare is `rustdar_web`'s
+/// `build_token` — `GITHUB_SHA` in CI, the `rustdar_frontend::wire_identity`
+/// framing-rows digest locally — and the guards standing over that boundary
+/// are all blind here:
 ///
-///   * `the_worker_protocol_version_is_the_one_these_shapes_ship` asserts the
-///     literal `PROTOCOL_VERSION` in the source. It is our value compared
-///     against our value, so it fires for exactly one person: the one who
-///     *raises* the number. Raising it is the safe act.
-///   * `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
+///   * `the_worker_protocol_is_versionless_and_the_token_names_the_build`
+///     pins that the deleted hand-kept version stays deleted and that
+///     `build_token` reads both of its halves; it says nothing about any
+///     payload's bytes.
+///   * `the_worker_reply_shape_is_the_one_this_build_ships`
 ///     scrapes the reply's **field names**. These bytes travel inside one of
 ///     those fields (`polar`), so the field set is identical either side of a
 ///     change here and that guard cannot see one.
+///   * The local token digests the *framing rows* — the request and reply
+///     layouts `rustdar_frontend`'s own tests pin — and deliberately not the
+///     nested payloads inside the reply's fields, so a change here moves no
+///     token either.
 ///
-/// Measured, not argued: `PROTOCOL_VERSION` went 7 -> 8 when this header grew
-/// an `f64` (the elevation) and restated its two ranges as slant rather than
-/// ground, and **neither guard fired**. The bump was made by hand, and the
-/// second guard's own doc records the gap. A buffer-valued field was where the
-/// author was entirely on their own; this is the instrument that ends that.
+/// Measured, not argued: this header once grew an `f64` (the elevation) and
+/// restated its two ranges as slant rather than ground, and **no guard
+/// fired** — the hand-kept protocol number of that era was bumped by hand. A
+/// buffer-valued field was where the author was entirely on their own; this
+/// is the instrument that ends that.
 ///
 /// # What this fails for
 ///
@@ -371,11 +376,13 @@ fn layout_fixture() -> PolarField {
 ///
 /// # What it still cannot do
 ///
-/// It cannot check that `PROTOCOL_VERSION` *was* bumped: that constant is
-/// `#[cfg(target_arch = "wasm32")]` in a crate that depends on this one, so
-/// nothing here can name it and a dependency the other way would be an
-/// inversion. What it can do is fail for the person who changes the layout, and
-/// say in the message what they owe. That is the direction that was missing.
+/// It cannot make a **local** page/worker pair differing only in these bytes
+/// refuse each other: the local token deliberately folds the framing rows
+/// and not the nested payloads — `rustdar_frontend::wire_identity` records
+/// that accepted residual, and deployed pairs always differ by `GITHUB_SHA`
+/// and refuse at the handshake. What it can do is fail for the person who
+/// changes the layout, and say in the message what they owe. That is the
+/// direction that was missing.
 ///
 /// A digest is opaque about *what* moved, deliberately: the two assertions are
 /// one tuple so the failure reads as one fact, and what to do about it does not
@@ -386,21 +393,20 @@ fn the_polar_wire_layout_is_the_one_this_protocol_ships() {
     assert_eq!(
         (bytes.len(), crate::wire::layout_digest(&bytes)),
         (112, 0x986a_92ef_b56e_c209),
-        "the bytes `PolarField::to_bytes` writes are not the bytes protocol \
-         version 8 shipped. Something about this payload's layout moved — a \
+        "the bytes `PolarField::to_bytes` writes are not the bytes this pin \
+         was last told. Something about this payload's layout moved — a \
          field added, removed, reordered, retyped, or written at a different \
-         width. This encoding carries no version of its own: the number that \
-         governs it is `PROTOCOL_VERSION` in \
-         `rustdar-web/src/worker_protocol.rs`, and nothing else in the \
-         workspace can see a change to these bytes — the reply-shape guard \
-         watches field names and these travel inside one of them. If the \
-         change was deliberate, bump `PROTOCOL_VERSION` there FIRST and then \
-         re-pin the length and digest here, in that order and never the \
-         numbers alone. A page and a worker on opposite sides of a deploy \
-         share a build token whenever `GITHUB_SHA` is absent (which it always \
-         is outside CI), and they will hand each other a buffer they lay out \
-         differently: `from_bytes`'s length checks turn most such pairs into \
-         `None` and a readout that goes quiet, which is the silent degradation \
-         the version number exists to convert into a clean termination.",
+         width. This encoding carries no version of its own, and nothing \
+         else in the workspace can see a change to these bytes — the \
+         reply-shape guard watches field names and these travel inside one \
+         of them, and the build token's local digest folds the framing rows \
+         and not this nested payload. If the change was deliberate, re-pin \
+         the length and digest here, deliberately. Deployed pages and \
+         workers from opposite sides of a deploy refuse each other by \
+         GITHUB_SHA at the HELLO handshake; a LOCAL pair differing only \
+         here still attaches, and `from_bytes`'s length checks turn most \
+         such pairs into `None` and a readout that goes quiet — the \
+         accepted residual `rustdar_frontend::wire_identity` records, until \
+         full layout identity joins the token.",
     );
 }
