@@ -2288,3 +2288,72 @@ mod retry_ledger_tests {
         assert!(!state.enable_should_refetch(false));
     }
 }
+
+#[cfg(test)]
+mod state_key_tests {
+    use crate::render::handlers::create_handlers;
+
+    /// Every name saved handler state has ever been filed under, as a
+    /// **literal** list — the self-verifying-inventory discipline: the live
+    /// set is checked against it below, so neither side can rot alone.
+    const STATE_KEYS: [&str; 12] = [
+        "ModelData",
+        "SpcOutlook",
+        "SpcDiscussions",
+        "NwsAlerts",
+        "StormReports",
+        "Lightning",
+        "Metar",
+        "Radar",
+        "CityLabels",
+        "RadarSites",
+        "UserLocation",
+        "ColorScale",
+    ];
+
+    /// **The tripwire for the day `OverlayKind` stops being a plain enum.**
+    ///
+    /// `serialize_handler_states` and `deserialize_handler_states` key the
+    /// saved handler state by `format!("{:?}", kind)`. Today that is safe only
+    /// because the `Debug` spelling of every variant happens to equal its
+    /// serde spelling, which is the name already sitting in every user's
+    /// config file. The moment the type changes shape — M8 replaces the enum
+    /// with a `LayerId` newtype, whose derived `Debug` prints
+    /// `LayerId("NwsAlerts")` — the `{:?}` key silently stops matching the
+    /// file, and every user's saved handler state is orphaned without a
+    /// single error. This test is what fails instead.
+    ///
+    /// New persistence code must key by the **serde** spelling, never by a
+    /// new `{:?}` site; the two existing sites stay only because this pin
+    /// holds the spellings equal.
+    #[test]
+    fn handler_state_keys_are_the_twelve_debug_spellings_and_serde_agrees() {
+        let handlers = create_handlers();
+        assert_eq!(
+            handlers.len(),
+            STATE_KEYS.len(),
+            "a handler was registered or retired without updating the literal \
+             key list; saved state for it has no pinned spelling",
+        );
+        for h in &handlers {
+            let kind = h.kind();
+            let debug_spelling = format!("{kind:?}");
+            let serde_spelling = serde_json::to_value(kind)
+                .expect("a fieldless enum serializes to its variant name");
+            let serde_spelling = serde_spelling
+                .as_str()
+                .expect("a unit variant is a JSON string on the wire");
+            assert_eq!(
+                debug_spelling, serde_spelling,
+                "the Debug and serde spellings of this kind disagree — the \
+                 {{:?}}-keyed handler-state maps just orphaned its saved state",
+            );
+            assert!(
+                STATE_KEYS.contains(&debug_spelling.as_str()),
+                "{debug_spelling} is not one of the twelve names saved configs \
+                 file handler state under — a renamed variant orphans the \
+                 user's saved state for it",
+            );
+        }
+    }
+}

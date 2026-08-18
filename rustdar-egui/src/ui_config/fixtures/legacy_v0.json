@@ -1,0 +1,25 @@
+{
+  "pane_count": 1,
+  "active_pane": 0,
+  "viewport_sync": false,
+  "sync_layers": false,
+  "auto_poll": true,
+  "site": "KMPX",
+  "loop_lookback_secs": 7200,
+  "loop_speed_fps": 5.0,
+  "time_step_secs": 600,
+  "panes": [
+    {
+      "selected_product": "Reflectivity",
+      "selected_elevation": 0.5,
+      "layers": {
+        "Radar": false,
+        "SpcMesoscaleDiscussions": true,
+        "NwsWarnings": true,
+        "CityLabels": true
+      },
+      "spc_day": "Day1",
+      "site": "KMPX"
+    }
+  ]
+}
