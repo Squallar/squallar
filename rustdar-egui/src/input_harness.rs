@@ -1804,6 +1804,11 @@ impl InputHarness {
         self.screen_rect
     }
 
+    /// Read access to the UI under test (e.g. to assert what a frame left).
+    pub(crate) fn gui(&self) -> &Gui {
+        &self.gui
+    }
+
     /// Mutable access to the UI under test (e.g. to open a dialog).
     pub(crate) fn gui_mut(&mut self) -> &mut Gui {
         &mut self.gui

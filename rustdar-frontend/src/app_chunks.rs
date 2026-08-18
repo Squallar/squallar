@@ -37,7 +37,7 @@ impl super::App {
             && showing
                 .as_ref()
                 .is_some_and(|(site, _)| self.chunk_notify.chunk_link_open(site));
-        self.gui.set_chunk_status(status);
+        self.chunk_feed_status = status;
         // Ahead of the `enabled` gate on purpose, for two reasons. Archive
         // pushes are worth having precisely when the chunk feed is off — they
         // are what takes the path that is then carrying the site from "up to a
@@ -411,7 +411,11 @@ impl super::App {
             // The volume is now exactly what the archive would have published,
             // so the steady state matches it — including the Level III refetch
             // that re-registers the tilts a merge preserved mid-volume.
-            self.gui.set_scan_info_for_site(site, info);
+            self.gui
+                .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForSite {
+                    site: site.to_owned(),
+                    info,
+                });
             self.gui.clear_loading_site_for_site(site);
             // Every pane on the site, whatever its product, and deliberately not
             // a narrower reset of the whole-volume readers alone. This is a volume
@@ -459,7 +463,11 @@ impl super::App {
                 );
             }
         } else {
-            self.gui.apply_chunk_scan_info(site, info);
+            self.gui
+                .apply(rustdar_egui::shell_api::GuiEvent::ChunkScanInfo {
+                    site: site.to_owned(),
+                    info,
+                });
             self.gui.clear_loading_site_for_site(site);
             self.record_tilt_freshness(site, &scan, sealed);
             let hit = self

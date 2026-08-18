@@ -45,8 +45,11 @@
 //!
 //! ```text
 //!  #   metric                                        value  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-frontend     204  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' | wc -l
-//!  1b  ... excluding test-named paths                  198  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' -g '!*tests*' | wc -l
+//!  1a  App-pokes-Gui occurrences, rustdar-frontend     192  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' | wc -l
+//!      (204 at E0c; lowered at WO-E2 Land 1, which converted every setter
+//!      push to Gui::apply / the per-frame FrameInputs compose)
+//!  1b  ... excluding test-named paths                  186  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' -g '!*tests*' | wc -l
+//!      (198 at E0c; same land)
 //!  2   Gui setter fns in rustdar-egui/src/ui.rs         23  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
 //!  3   wasm-cfg lines per crate                          -  for c in rustdar-frontend rustdar-radar rustdar-egui rustdar-web rustdar-overlays; do
 //!      [RECORDED, NOT ASSERTED]                             printf '%s ' "$c"; rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs' \
@@ -135,10 +138,12 @@ const KIND_DEF_ANCHOR: &str = concat!("enum Overlay", "Kind");
 // ---------------------------------------------------------------------------
 
 /// Row 1a. Transitional scaffolding: WO-E2/WO-E8 drive it to 0 via GuiEvent;
-/// the metric is deleted at campaign close.
-const SELF_GUI_MAX: usize = 204;
-/// Row 1b — the same needle outside test-named paths.
-const SELF_GUI_NON_TEST_MAX: usize = 198;
+/// the metric is deleted at campaign close. Lowered 204 -> 192 at WO-E2
+/// Land 1 (the setter pushes became Gui::apply / the FrameInputs compose).
+const SELF_GUI_MAX: usize = 192;
+/// Row 1b — the same needle outside test-named paths. 198 -> 186 at WO-E2
+/// Land 1.
+const SELF_GUI_NON_TEST_MAX: usize = 186;
 /// Row 2. WO-E2 Land 2 leaves 3; WO-E8b reaches 0.
 const UI_SETTER_MAX: usize = 23;
 /// Row 4a. WO-E9 (FieldId adoption) reaches 0.

@@ -737,91 +737,199 @@ impl Gui {
         config
     }
 
-    /// Update the scan info for all panes viewing the given site.
-    pub fn set_scan_info_for_site(&mut self, site: &str, info: ScanInfo) {
-        let mut any_pane_took_it = false;
-        for pane in &mut self.panes {
-            if pane.site == site {
-                pane.scan_info = Some(info.clone());
-                any_pane_took_it = true;
+    /// Apply one event-shaped push from the App (WO-E2's seam).
+    ///
+    /// Each arm holds the body of the setter it replaced, compound effects
+    /// included, moved verbatim — the spinner/backoff/zoom-latch couplings are
+    /// load-bearing and documented on the arms. Events are applied at the call
+    /// site's existing control-flow position, exactly where the setter call
+    /// sat.
+    pub fn apply(&mut self, event: crate::shell_api::GuiEvent) {
+        use crate::shell_api::GuiEvent;
+        match event {
+            // Update the scan info for all panes viewing the given site.
+            GuiEvent::ScanInfoForSite { site, info } => {
+                let mut any_pane_took_it = false;
+                for pane in &mut self.panes {
+                    if pane.site == site {
+                        pane.scan_info = Some(info.clone());
+                        any_pane_took_it = true;
+                    }
+                }
+                self.radar.fetching = false;
+                self.auto_poll.on_success();
+                // Only a scan someone is actually looking at is a reason to zoom to
+                // radar scale. A volume for a site no pane is on — a fetch that landed
+                // after the pane switched away — must not spend the one-shot latch,
+                // let alone move every other pane's map.
+                if any_pane_took_it {
+                    self.claim_initial_zoom();
+                }
             }
-        }
-        self.radar.fetching = false;
-        self.auto_poll.on_success();
-        // Only a scan someone is actually looking at is a reason to zoom to
-        // radar scale. A volume for a site no pane is on — a fetch that landed
-        // after the pane switched away — must not spend the one-shot latch,
-        // let alone move every other pane's map.
-        if any_pane_took_it {
-            self.claim_initial_zoom();
+            // Apply scan info for a volume still being assembled from the real-time
+            // chunk feed.
+            //
+            // Two differences from `ScanInfoForSite`, both deliberate.
+            //
+            // **It does not take the spinner down or reset the archive backoff.** Those
+            // belong to a fetch someone is waiting on; this happens on its own every
+            // few seconds. Clearing `fetching` here would cancel the spinner of a manual
+            // Refresh still in flight and unblock the auto-poll queued behind it, and
+            // `auto_poll.on_success()` would undo exactly the retreat the archive
+            // fallback depends on.
+            //
+            // **It merges the product and elevation lists rather than replacing them.**
+            // A partial volume knows only the cuts that have completed, so replacing
+            // would shrink the tilt picker every few seconds and let it regrow — and
+            // `PaneState::get_rendering_params` snaps to the nearest *listed* angle, so
+            // every pane would walk up the VCP once per volume. It would also wipe the
+            // Level III products and elevations that `poll_level3_results` accumulates
+            // into `ScanInfo` in place, freezing every L3 pane until the volume closed.
+            // The union keeps both and still gains a tilt the moment one first appears.
+            //
+            // At volume completion the caller uses `ScanInfoForSite` with a
+            // plain `from_scan` instead, so the steady state after every volume is
+            // exactly what the archive path produces — which is what makes a fallback
+            // invisible.
+            GuiEvent::ChunkScanInfo { site, info: fresh } => {
+                let mut any_pane_took_it = false;
+                for pane in &mut self.panes {
+                    if pane.site != site {
+                        continue;
+                    }
+                    any_pane_took_it = true;
+                    let merged = match pane.scan_info.take() {
+                        None => fresh.clone(),
+                        Some(mut existing) => {
+                            existing.timestamp = fresh.timestamp;
+                            existing.vcp_number = fresh.vcp_number;
+                            existing.status = fresh.status.clone();
+                            for product in &fresh.available_products {
+                                if !existing.available_products.contains(product) {
+                                    existing.available_products.push(*product);
+                                }
+                            }
+                            existing.available_products.sort_by_key(|p| p.sort_order());
+                            for (product, angles) in &fresh.product_elevations {
+                                let known =
+                                    existing.product_elevations.entry(*product).or_default();
+                                for angle in angles {
+                                    if !known.iter().any(|k| (k - angle).abs() < 0.05) {
+                                        known.push(*angle);
+                                    }
+                                }
+                                known.sort_by(|a, b| a.total_cmp(b));
+                            }
+                            existing
+                        }
+                    };
+                    pane.scan_info = Some(merged);
+                }
+                // Same guard as `ScanInfoForSite`, for the same reason: the
+                // chunk feed keeps delivering a site's volume for a round or two after
+                // the last pane on it switched away, and that data nobody is looking at
+                // must not spend the one-shot latch.
+                if any_pane_took_it {
+                    self.claim_initial_zoom();
+                }
+            }
+            // Update the scan info for a specific pane.
+            GuiEvent::ScanInfoForPane { pane_idx, info } => {
+                if let Some(pane) = self.panes.get_mut(pane_idx) {
+                    pane.scan_info = Some(info);
+                }
+            }
+            // Set fetching status.
+            GuiEvent::Fetching(fetching) => {
+                self.radar.fetching = fetching;
+            }
+            // Set an error message. The spinner comes down and the archive
+            // backoff advances with it — an error ends the wait it belonged to.
+            GuiEvent::Error(error) => {
+                self.radar.error_message = Some(error);
+                self.radar.fetching = false;
+                self.auto_poll.on_error();
+            }
+            // Set the radar config, keeping the Set Time dialog's strings in
+            // sync with it.
+            GuiEvent::RadarConfig(config) => {
+                let date = config.timestamp.format("%Y-%m-%d").to_string();
+                let time = config.timestamp.format("%H:%M:%S").to_string();
+                self.radar.config = config;
+                self.time_dialog.date_string = date;
+                self.time_dialog.time_string = time;
+            }
+            // Set live/historic viewing mode for a specific pane.
+            GuiEvent::ViewingLiveForPane { pane_idx, live } => {
+                if let Some(pane) = self.panes.get_mut(pane_idx) {
+                    pane.viewing_live = live;
+                }
+            }
+            // Install what can draw 3D panes, or take it away.
+            //
+            // Sent by the frontend when a renderer is created and, with `None`,
+            // when one is lost. Every 3D pane on screen picks the change up on
+            // the next frame with no other bookkeeping, because the painter is
+            // consulted afresh inside each pane's arm rather than cached
+            // anywhere.
+            GuiEvent::VolumePainter(painter) => {
+                self.volume_painter = painter;
+            }
         }
     }
 
-    /// Apply scan info for a volume still being assembled from the real-time
-    /// chunk feed.
-    ///
-    /// Two differences from [`Self::set_scan_info_for_site`], both deliberate.
-    ///
-    /// **It does not take the spinner down or reset the archive backoff.** Those
-    /// belong to a fetch someone is waiting on; this happens on its own every
-    /// few seconds. Clearing `fetching` here would cancel the spinner of a manual
-    /// Refresh still in flight and unblock the auto-poll queued behind it, and
-    /// `auto_poll.on_success()` would undo exactly the retreat the archive
-    /// fallback depends on.
-    ///
-    /// **It merges the product and elevation lists rather than replacing them.**
-    /// A partial volume knows only the cuts that have completed, so replacing
-    /// would shrink the tilt picker every few seconds and let it regrow — and
-    /// `PaneState::get_rendering_params` snaps to the nearest *listed* angle, so
-    /// every pane would walk up the VCP once per volume. It would also wipe the
-    /// Level III products and elevations that `poll_level3_results` accumulates
-    /// into `ScanInfo` in place, freezing every L3 pane until the volume closed.
-    /// The union keeps both and still gains a tilt the moment one first appears.
-    ///
-    /// At volume completion the caller uses `set_scan_info_for_site` with a
-    /// plain `from_scan` instead, so the steady state after every volume is
-    /// exactly what the archive path produces — which is what makes a fallback
-    /// invisible.
-    pub fn apply_chunk_scan_info(&mut self, site: &str, fresh: ScanInfo) {
-        let mut any_pane_took_it = false;
-        for pane in &mut self.panes {
-            if pane.site != site {
-                continue;
+    /// Apply one frame's facts, composed by the App from state it already
+    /// owns, once per frame immediately before [`Gui::ui`]. Plain stores —
+    /// every compound, event-shaped effect goes through [`Gui::apply`].
+    pub fn apply_frame_inputs(&mut self, inputs: crate::shell_api::FrameInputs<'_>) {
+        self.safe_area_insets = inputs.safe_area_insets;
+        self.supports_exit = inputs.supports_exit;
+        self.loop_frame_budget = inputs.loop_frame_budget;
+        self.location_settings_available = inputs.location_settings_available;
+        let (permission, active) = inputs.location;
+        self.location_permission = permission;
+        self.location_active = active;
+        // The instant travels WITH the fix: `user_fix_at` answers "when did
+        // this app last hear anything", stamped once at arrival (see the
+        // field). Re-stamping it per frame would hold the settings pane's
+        // staleness question at zero forever. `None` clears both halves —
+        // consent for the position on screen has gone away, and the last
+        // position delivered under the old permission must go with it.
+        match inputs.gps {
+            Some((fix, at)) => {
+                self.user_fix = Some(fix);
+                self.user_fix_at = Some(at);
             }
-            any_pane_took_it = true;
-            let merged = match pane.scan_info.take() {
-                None => fresh.clone(),
-                Some(mut existing) => {
-                    existing.timestamp = fresh.timestamp;
-                    existing.vcp_number = fresh.vcp_number;
-                    existing.status = fresh.status.clone();
-                    for product in &fresh.available_products {
-                        if !existing.available_products.contains(product) {
-                            existing.available_products.push(*product);
-                        }
-                    }
-                    existing.available_products.sort_by_key(|p| p.sort_order());
-                    for (product, angles) in &fresh.product_elevations {
-                        let known = existing.product_elevations.entry(*product).or_default();
-                        for angle in angles {
-                            if !known.iter().any(|k| (k - angle).abs() < 0.05) {
-                                known.push(*angle);
-                            }
-                        }
-                        known.sort_by(|a, b| a.total_cmp(b));
-                    }
-                    existing
-                }
-            };
-            pane.scan_info = Some(merged);
+            None => {
+                self.user_fix = None;
+                self.user_fix_at = None;
+            }
         }
-        // Same guard as `set_scan_info_for_site`, for the same reason: the
-        // chunk feed keeps delivering a site's volume for a round or two after
-        // the last pane on it switched away, and that data nobody is looking at
-        // must not spend the one-shot latch.
-        if any_pane_took_it {
-            self.claim_initial_zoom();
-        }
+        self.user_heading = inputs.user_heading;
+        self.catalogue_pending = inputs.catalogue_pending;
+        self.chunk_status = inputs.chunk_status;
+        self.current_volumes = inputs.current_volumes.clone();
+        self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
+    }
+
+    /// Update the scan info for all panes viewing the given site.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
+    pub fn set_scan_info_for_site(&mut self, site: &str, info: ScanInfo) {
+        self.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
+            site: site.to_owned(),
+            info,
+        });
+    }
+
+    /// Apply scan info for a volume still being assembled from the real-time
+    /// chunk feed. Merge semantics — see the `ChunkScanInfo` arm of
+    /// [`Gui::apply`], where the body and its reasons moved.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
+    pub fn apply_chunk_scan_info(&mut self, site: &str, fresh: ScanInfo) {
+        self.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+            site: site.to_owned(),
+            info: fresh,
+        });
     }
 
     /// Whether live panes should be fed from the real-time chunk bucket.
@@ -877,6 +985,7 @@ impl Gui {
     ///
     /// Pushed in by the App each frame rather than pulled: the feeds live there,
     /// and this crate has no business reaching into them.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_chunk_status(&mut self, status: ChunkFeedStatus) {
         self.chunk_status = status;
     }
@@ -890,8 +999,10 @@ impl Gui {
     /// every sealed sweep.
     ///
     /// Pushed in by the App each frame, the same arrangement as
-    /// [`Self::set_chunk_status`] and for the same reason: the decoded volumes
-    /// live there, and this crate holds only their names.
+    /// [`FrameInputs::chunk_status`](crate::shell_api::FrameInputs::chunk_status)
+    /// and for the same reason: the decoded volumes live there, and this crate
+    /// holds only their names.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_current_volumes(&mut self, volumes: HashMap<String, CurrentVolumeStamp>) {
         self.current_volumes = volumes;
     }
@@ -918,10 +1029,9 @@ impl Gui {
     }
 
     /// Update the scan info for a specific pane.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_scan_info_for_pane(&mut self, pane_idx: usize, info: ScanInfo) {
-        if let Some(pane) = self.panes.get_mut(pane_idx) {
-            pane.scan_info = Some(info);
-        }
+        self.apply(crate::shell_api::GuiEvent::ScanInfoForPane { pane_idx, info });
     }
 
     /// Whether a fetch someone is waiting on is in flight.
@@ -933,15 +1043,15 @@ impl Gui {
     }
 
     /// Set fetching status
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_fetching(&mut self, fetching: bool) {
-        self.radar.fetching = fetching;
+        self.apply(crate::shell_api::GuiEvent::Fetching(fetching));
     }
 
     /// Set an error message
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_error(&mut self, error: String) {
-        self.radar.error_message = Some(error);
-        self.radar.fetching = false;
-        self.auto_poll.on_error();
+        self.apply(crate::shell_api::GuiEvent::Error(error));
     }
 
     /// The Set Time dialog's body, host-free: the window above wraps it on
@@ -1461,6 +1571,7 @@ impl Gui {
     /// rung with no matching tile bias buys interpolation rather than detail,
     /// and a bias with no rung buys four times the fetches for nothing. Both
     /// come off one `MirrorPlan`, so they cannot disagree.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_floor_tile_zoom_bias(&mut self, bias: u8) {
         self.floor_tile_zoom_bias = bias;
     }
@@ -2282,12 +2393,9 @@ impl Gui {
     }
 
     /// Set the radar config
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_radar_config(&mut self, config: RadarConfig) {
-        let date = config.timestamp.format("%Y-%m-%d").to_string();
-        let time = config.timestamp.format("%H:%M:%S").to_string();
-        self.radar.config = config;
-        self.time_dialog.date_string = date;
-        self.time_dialog.time_string = time;
+        self.apply(crate::shell_api::GuiEvent::RadarConfig(config));
     }
 
     /// Clear loading_site on all panes viewing the given site.
@@ -2309,6 +2417,7 @@ impl Gui {
 
     /// Set safe area insets in logical pixels (top, bottom, left, right).
     /// On Android, this compensates for the status bar and navigation bar.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
         self.safe_area_insets = (top, bottom, left, right);
     }
@@ -2328,6 +2437,7 @@ impl Gui {
 
     /// Tell the UI whether this platform can quit. `false` drops Exit from the
     /// menu; on iOS the action is a no-op, so rendering it is a dead button.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_supports_exit(&mut self, supported: bool) {
         self.supports_exit = supported;
     }
@@ -2342,11 +2452,13 @@ impl Gui {
     /// Pushed in like [`set_supports_exit`](Self::set_supports_exit) and for
     /// the same reason: the constant lives in a crate that depends on this
     /// one.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_loop_frame_budget(&mut self, frames: usize) {
         self.loop_frame_budget = frames;
     }
 
     /// Set the user's GPS location for the blue dot indicator.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
         self.user_fix = Some(fix);
         self.user_fix_at = Some(web_time::Instant::now());
@@ -2364,6 +2476,7 @@ impl Gui {
     /// the old permission is still on screen. Leaving it there is worse than a
     /// stale label — it is the app showing a position it has just been told it
     /// may not know.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn clear_gps_fix(&mut self) {
         self.user_fix = None;
         self.user_fix_at = None;
@@ -2374,6 +2487,7 @@ impl Gui {
     ///
     /// Pushed in rather than queried: this crate cannot name a
     /// `PlatformBridge`. See the fields.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_location_state(
         &mut self,
         permission: rustdar_gps::LocationPermission,
@@ -2398,6 +2512,7 @@ impl Gui {
     /// Separate from [`set_location_state`](Self::set_location_state) because
     /// it is answered once, at startup: the permission changes, the platform
     /// does not.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_location_settings_available(&mut self, available: bool) {
         self.location_settings_available = available;
     }
@@ -2412,6 +2527,7 @@ impl Gui {
     /// Pushed at startup and again the moment the first catalogue is applied,
     /// because unlike the flag above this one *does* change while the app runs
     /// — that is the entire point of it. See [`Gui::catalogue_pending`].
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_catalogue_pending(&mut self, pending: bool) {
         self.catalogue_pending = pending;
     }
@@ -2421,6 +2537,7 @@ impl Gui {
         self.catalogue_pending
     }
 
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_user_heading(&mut self, heading: f32) {
         self.user_heading = Some(heading);
     }
@@ -2446,10 +2563,9 @@ impl Gui {
     }
 
     /// Set live/historic viewing mode for a specific pane.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_viewing_live_for_pane(&mut self, pane_idx: usize, live: bool) {
-        if let Some(pane) = self.panes.get_mut(pane_idx) {
-            pane.viewing_live = live;
-        }
+        self.apply(crate::shell_api::GuiEvent::ViewingLiveForPane { pane_idx, live });
     }
 
     /// Get the scan info for the active pane.
@@ -2641,11 +2757,12 @@ impl Gui {
     /// one is lost. Every 3D pane on screen picks the change up on the next
     /// frame with no other bookkeeping, because the painter is consulted afresh
     /// inside each pane's arm rather than cached anywhere.
+    #[deprecated(note = "E2: use Gui::apply / Gui::apply_frame_inputs")]
     pub fn set_volume_painter(
         &mut self,
         painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
     ) {
-        self.volume_painter = painter;
+        self.apply(crate::shell_api::GuiEvent::VolumePainter(painter));
     }
 
     /// Whatever can draw 3D panes this frame.

@@ -297,10 +297,48 @@ impl super::App {
         }
         self.update_loop_readiness();
 
+        // The frame's facts, composed after every drain above so each one
+        // reflects this frame's arrivals, and applied in one call so the UI
+        // can never see half a frame's worth.
+        self.push_frame_inputs();
+
         // Last, so this frame is laid out over everything applied above.
         let gui_action = self.gui.ui(&ctx);
 
         (size_in_pixels, gui_action)
+    }
+
+    /// Compose this frame's [`rustdar_egui::shell_api::FrameInputs`] from the
+    /// state the App owns and apply it — the one place the snapshot-shaped
+    /// facts cross the Gui↔App seam (WO-E2).
+    ///
+    /// Runs once per frame from [`setup_egui_frame`](Self::setup_egui_frame),
+    /// immediately before `Gui::ui`, and once at construction so the
+    /// startup-constant facts are in force from the first read. Tests drive it
+    /// directly where no renderer exists to run a frame.
+    pub(super) fn push_frame_inputs(&mut self) {
+        self.gui
+            .apply_frame_inputs(rustdar_egui::shell_api::FrameInputs {
+                safe_area_insets: self.safe_area_insets,
+                supports_exit: self.supports_exit,
+                loop_frame_budget: self.loop_frame_budget,
+                location_settings_available: self.location_settings_available,
+                // Read off the gate each frame; the gate is the owner and
+                // `poll_platform_state` already redraws on a change.
+                location: (self.location.permission(), self.location.active()),
+                // The arrival instant travels with the fix — see the field.
+                gps: self.user_gps.clone(),
+                user_heading: self.user_heading,
+                catalogue_pending: self.catalogue_pending,
+                chunk_status: self.chunk_feed_status,
+                current_volumes: &self.current_volume_stamps,
+                // The rung the mirror was last sized to. Under the setter
+                // regime this was pushed from `present_frame`, *after*
+                // `Gui::ui`, so the UI always read it one frame late;
+                // composing it here reads the same value on the same frame
+                // it used to become visible. Do not "fix" the latency.
+                floor_tile_zoom_bias: self.mirror_rungs.tile_zoom_bias(),
+            });
     }
 
     /// Poll for completed background render results and upload textures.
@@ -895,8 +933,8 @@ impl super::App {
     /// Spends [`App::catalogue_pending`], so every later catalogue takes the
     /// ordinary next-launch path.
     fn adopt_the_first_catalogue(&mut self) {
+        // The picker learns the list is whole through the per-frame compose.
         self.catalogue_pending = false;
-        self.gui.set_catalogue_pending(false);
         let table = rustdar_radar::sites::resolve(
             self.site_positions
                 .fixes()
@@ -1172,7 +1210,11 @@ impl super::App {
                     }
                 }
                 if changed {
-                    self.gui.set_scan_info_for_pane(pane_idx, info);
+                    self.gui
+                        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+                            pane_idx,
+                            info,
+                        });
                 }
             }
         }
@@ -2251,13 +2293,14 @@ impl super::App {
                     )
                 })
         };
-        // Next frame's tiles, from the rung this frame's mirror was actually
-        // sized to — the ordering `MirrorRungs::tile_zoom_bias` documents. A
-        // rung with no matching tile bias buys interpolation rather than
-        // detail, and a bias with no rung buys four times the fetches for
-        // nothing, so the two are set from the same plan or not at all.
-        self.gui
-            .set_floor_tile_zoom_bias(self.mirror_rungs.tile_zoom_bias());
+        // Next frame's tiles come from the rung this frame's mirror was
+        // actually sized to — the ordering `MirrorRungs::tile_zoom_bias`
+        // documents. A rung with no matching tile bias buys interpolation
+        // rather than detail, and a bias with no rung buys four times the
+        // fetches for nothing, so both read off one `MirrorPlan`: the
+        // per-frame compose (`push_frame_inputs`) reads `mirror_rungs`
+        // directly at the top of the next frame, which is the same frame the
+        // old post-`Gui::ui` push became visible on. Nothing is pushed here.
         let mirror =
             mirror_target
                 .as_ref()

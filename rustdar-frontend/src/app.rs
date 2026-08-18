@@ -21,6 +21,7 @@ use crate::location_permission::LocationGate;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
+use rustdar_egui::shell_api::GuiEvent;
 use rustdar_egui::{Gui, actions::GuiAction};
 use rustdar_radar::site_position::SitePositionSource;
 use rustdar_radar::types::ScanInfo;
@@ -195,6 +196,40 @@ pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
+    // ── Frame-input facts (WO-E2) ───────────────────────────────────
+    //
+    // The snapshot-shaped state the `Gui` renders from but the App owns.
+    // Each field is written where the fact arrives; all of them reach the
+    // `Gui` together, once per frame, through `push_frame_inputs` — the one
+    // compose site, immediately before `Gui::ui`.
+    /// Whether this platform can quit, answered once at startup —
+    /// `PlatformBridge::supports_exit` is a property of the build.
+    supports_exit: bool,
+    /// This build's loop frame cap (`budgets.loop_frames_held`), so the
+    /// timeline's caption states the platform's real budget — the budget
+    /// lives in this crate and the UI crate cannot see it.
+    loop_frame_budget: usize,
+    /// Whether this platform has a location settings page to offer, answered
+    /// once at startup: the permission changes, the platform does not.
+    location_settings_available: bool,
+    /// Safe-area insets in logical pixels, from the last successful
+    /// [`PlatformBridge::query_insets`] — see `refresh_safe_area_insets` for
+    /// when that is allowed to be asked.
+    safe_area_insets: (f32, f32, f32, f32),
+    /// The user's GPS fix and when this app heard it. The instant is stamped
+    /// once, at arrival, and travels with the fix from then on — `Gui`'s
+    /// `user_fix_at` answers "when did we last hear anything", and a per-frame
+    /// re-stamp would hold that staleness question at zero forever. `None`
+    /// when consent went away or nothing has been delivered.
+    user_gps: Option<(rustdar_gps::GpsFix, web_time::Instant)>,
+    /// Compass heading in degrees, once a platform has delivered one.
+    user_heading: Option<f32>,
+    /// What the real-time chunk feed is doing, restated by `drive_chunk_feeds`
+    /// every frame so the status bar never shows a stale claim.
+    chunk_feed_status: rustdar_egui::ChunkFeedStatus,
+    /// Each site's current-volume stamp, rebuilt by `publish_base_volumes`
+    /// every frame. The decoded `Scan`s stay here; the UI holds only names.
+    current_volume_stamps: HashMap<String, rustdar_egui::CurrentVolumeStamp>,
     /// The same painter [`Gui`] was handed, kept so the frame path can take its
     /// floor-magnification demand.
     ///
@@ -892,15 +927,13 @@ impl App {
         .expect("Failed to build HTTP client");
 
         let mut gui = Gui::new();
-        gui.set_supports_exit(platform.supports_exit());
-        // This build's loop frame cap, so the timeline's caption states the
-        // platform's real budget — the budget lives in this crate and the
-        // UI crate cannot see it.
-        gui.set_loop_frame_budget(budgets.loop_frames_held);
-        // Once, here, and not at the gate's cadence: whether a platform has a
-        // location settings page is a property of the build. The permission it
-        // sits beside changes; this does not.
-        gui.set_location_settings_available(platform.location_settings_available());
+        // The three startup-constant frame-input facts, captured here so they
+        // are in force from the first compose (`push_frame_inputs` at the end
+        // of this constructor). Once, and not at any poll's cadence: each is a
+        // property of the build, not of anything that changes while it runs.
+        let supports_exit = platform.supports_exit();
+        let loop_frame_budget = budgets.loop_frames_held;
+        let location_settings_available = platform.location_settings_available();
         let restored = platform
             .config_store()
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));
@@ -956,10 +989,11 @@ impl App {
         // move them off it; a first run does not, and at startup there was
         // nothing for the hint to resolve against.
         let site_hint_pending = !restored && table.rows().is_empty();
-        // So the picker can say the list is short of the network. It cannot
-        // work this out for itself: two rows learned off two volumes look
-        // exactly like a two-radar network from the table alone.
-        gui.set_catalogue_pending(catalogue_pending);
+        // So the picker can say the list is short of the network — the
+        // `catalogue_pending` App field reaches it through the frame-input
+        // compose below. It cannot work this out for itself: two rows learned
+        // off two volumes look exactly like a two-radar network from the
+        // table alone.
         if catalogue_pending {
             log::info!(
                 "no radars are known yet; the site list holds only what this \
@@ -994,6 +1028,14 @@ impl App {
             state: None,
             window: None,
             gui,
+            supports_exit,
+            loop_frame_budget,
+            location_settings_available,
+            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            user_gps: None,
+            user_heading: None,
+            chunk_feed_status: rustdar_egui::ChunkFeedStatus::default(),
+            current_volume_stamps: HashMap::new(),
             volume_painter: None,
             mirror_rungs: crate::egui_renderer::MirrorRungs::default(),
             budgets,
@@ -1064,6 +1106,12 @@ impl App {
         // menu toggle reaches it. Both are before any window, which is the
         // situation `RedrawWaker`'s slot exists for.
         app.platform.set_redraw_waker(app.redraw_waker.clone());
+        // The first compose, so the startup-constant facts — supports_exit,
+        // the loop frame budget, the settings-page offer, catalogue_pending —
+        // are in the `Gui` from the first read, exactly as the setter pushes
+        // above used to leave them. Every later frame re-composes in
+        // `setup_egui_frame`, immediately before `Gui::ui`.
+        app.push_frame_inputs();
         app
     }
 
@@ -1147,7 +1195,7 @@ impl App {
     /// `InsetsChanged` forwarded upstream is the fix.
     fn refresh_safe_area_insets(&mut self) {
         if let Some((top, bottom, left, right)) = self.platform.query_insets() {
-            self.gui.set_safe_area_insets(top, bottom, left, right);
+            self.safe_area_insets = (top, bottom, left, right);
         }
     }
 
@@ -1348,22 +1396,24 @@ impl App {
             .location
             .step(self.platform.as_mut(), self.gui.settings_visible());
         if step.changed {
-            self.gui
-                .set_location_state(self.location.permission(), self.location.active());
+            // The location facts themselves are composed from the gate every
+            // frame (`push_frame_inputs`); what a *change* still owes is the
+            // frame that will carry it to the screen.
             notify_redraw(&self.window);
         }
         // Consent for the position on screen has gone away. The serial reader
         // is deliberately exempt: a dongle the user plugged in is not covered
         // by this permission and its dot must survive a location denial.
         if step.revoked && !self.platform.gps_active() {
-            self.gui.clear_gps_fix();
+            self.user_gps = None;
         }
         if let Some(fix) = self.platform.poll_gps_fix() {
             self.upgrade_provisional_site(&fix);
-            self.gui.set_gps_fix(fix);
+            // Stamped once, at arrival — the instant travels with the fix.
+            self.user_gps = Some((fix, web_time::Instant::now()));
         }
         if let Some(heading) = self.platform.poll_heading() {
-            self.gui.set_user_heading(heading);
+            self.user_heading = Some(heading);
         }
     }
 
@@ -1639,7 +1689,7 @@ impl App {
             state.volume_support.clone(),
         ));
         self.volume_painter = Some(painter.clone());
-        self.gui.set_volume_painter(Some(painter));
+        self.gui.apply(GuiEvent::VolumePainter(Some(painter)));
     }
 
     /// Dispatch the voxel build a 3D pane asked for, unless the volume is
@@ -2263,9 +2313,9 @@ impl App {
                 // That is a frame or two of understatement against a wait
                 // indicator nothing ever takes down, and the newer result still
                 // arrives and repaints the pane. The flag is global rather than
-                // per-site, which is the same coarseness `set_error` has on the
-                // error arm below.
-                self.gui.set_fetching(false);
+                // per-site, which is the same coarseness the `Error` event has
+                // on the error arm below.
+                self.gui.apply(GuiEvent::Fetching(false));
                 self.gui.clear_loading_site_for_site(&scan_resp.site);
             } else {
                 match scan_resp.result {
@@ -2420,9 +2470,9 @@ impl App {
                             // The wait this fetch belonged to still has to end.
                             // A Refresh raises `fetching`, and `check_auto_polls`
                             // refuses to poll while it is set — so skipping
-                            // `set_scan_info_for_site` without this leaves the
+                            // `ScanInfoForSite` without this leaves the
                             // spinner up and the archive poll wedged behind it.
-                            self.gui.set_fetching(false);
+                            self.gui.apply(GuiEvent::Fetching(false));
                             self.gui.clear_loading_site_for_site(&site);
                         } else {
                             log::info!("Received scan data from background thread");
@@ -2430,7 +2480,10 @@ impl App {
                                 site.clone(),
                                 (Arc::clone(&scan_arc), Arc::clone(&declared_nyquist)),
                             );
-                            self.gui.set_scan_info_for_site(&site, scan_info);
+                            self.gui.apply(GuiEvent::ScanInfoForSite {
+                                site: site.clone(),
+                                info: scan_info,
+                            });
                             self.gui.clear_loading_site_for_site(&site);
                             self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
@@ -2454,7 +2507,7 @@ impl App {
                     }
                     Err(error_msg) => {
                         log::error!("Received error from background thread: {}", error_msg);
-                        self.gui.set_error(error_msg);
+                        self.gui.apply(GuiEvent::Error(error_msg));
                         self.gui.clear_loading_site_for_site(&scan_resp.site);
                     }
                 }
@@ -2510,7 +2563,7 @@ impl App {
                 stamps.insert(site, stamp);
             }
         }
-        self.gui.set_current_volumes(stamps);
+        self.current_volume_stamps = stamps;
     }
 
     /// Drop the decoded volumes no pane is showing.
@@ -3302,7 +3355,6 @@ impl App {
             // the timezone hint and moved them off it. The mirror image of the
             // web bug, from the same fused flag.
             self.catalogue_pending = self.site_catalogue.is_empty();
-            self.gui.set_catalogue_pending(self.catalogue_pending);
             if self.gui.load_ui_config(store.as_ref()) {
                 // A returning user on Android reaches the timezone guess before
                 // their stored site is readable, so the guess has to be undone
@@ -3739,6 +3791,12 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod chunk_feed_precedence_tests;
+
+#[cfg(test)]
+mod gui_action_replay_tests;
+
+#[cfg(test)]
+mod gui_seam_ratchet_tests;
 
 #[cfg(test)]
 mod tests;
