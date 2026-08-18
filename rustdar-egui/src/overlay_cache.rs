@@ -456,8 +456,11 @@ pub struct OverlayTextureData {
     ///
     /// Whatever `ui_map_pane::overlay_cache_token` answered at the time — the
     /// handler's content signature for a fetched overlay, the pane's own
-    /// counter for the radar sites. Not the fetch counter: see that function
-    /// for why the distinction is worth ~47 ms of frame thread per poll.
+    /// counter for the radar sites, each mixed with the theme the raster was
+    /// asked in (handlers rasterize in the theme, so the same content in the
+    /// other theme is a different picture). Not the fetch counter: see that
+    /// function for why the distinction is worth ~47 ms of frame thread per
+    /// poll.
     pub data_generation: u64,
     /// Quantised zoom at render time (`zoom * 32`).
     pub render_zoom: i32,
@@ -718,8 +721,10 @@ impl OverlayTextureCache {
     /// [`mid_gesture_rerender_allowed`] — not on wasm), the zoom having
     /// *settled* anywhere other than the texture's own, or pan exceeding the
     /// overdraw margin. `token` is `ui_map_pane::overlay_cache_token`'s answer
-    /// — see [`OverlayTextureData::data_generation`]. `now` is the frame's
-    /// `egui::InputState::time`, the clock the settle is measured on.
+    /// — content signature (or pane counter) mixed with the live theme, so a
+    /// theme flip moves it — see [`OverlayTextureData::data_generation`].
+    /// `now` is the frame's `egui::InputState::time`, the clock the settle is
+    /// measured on.
     ///
     /// # It judges the newest picture this cache has, held or shown
     ///

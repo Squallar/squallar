@@ -3742,3 +3742,6 @@ mod chunk_feed_precedence_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod theme_flip_tests;
