@@ -1,0 +1,140 @@
+name: Web
+
+# THE [WEB] GATE RULE (campaign-binding). Every [WEB]-marked plan step requires
+# the LOCAL invocations of both tiers green BEFORE landing on local main:
+#
+#   Tier 1: wasm-pack test --headless --firefox --geckodriver \
+#             "$(bash .github/browser-rig/ensure-geckodriver.sh)" \
+#             rustdar-web --test tier1_wasm          # test result: ok. 4 passed
+#           wasm-pack test --headless --chrome rustdar-web --test tier1_wasm
+#   Tier 2: wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+#           bash .github/browser-rig/run_tier2.sh --skip-build
+#           # both browsers, both passes: worker attach + "took N ms off the
+#           # frame" reply, and the doctored-token -> respawn leg
+#
+# CI enforces the same on every push to main and every PR. Required-green
+# scope: any change under rustdar-frontend/src/offload* or pump/renderer
+# surfaces, rustdar-web/src/worker_*, or rustdar-web at all.
+#
+# Tier 2 runs against LIVE network (campaign-resolved posture): 180 s poll for
+# the first job reply, one auto-retry per pass as the flake-quarantine policy
+# -- the app's own backoff machinery is part of what is exercised.
+#
+# Tier 1 runs headless in both browsers (none of the four tests needs WebGL).
+# Tier 2's Firefox leg runs under a rig-owned Xvfb (drive.py): headless
+# Firefox can create NO WebGL context on CI-class boxes, and under Xvfb it
+# gets Mesa llvmpipe WebGL2 -- the same determinism class as Chromium's
+# SwiftShader (which needs --enable-unsafe-swiftshader; drive.py passes it).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.ref }}'
+  # Never cancel on main, matching the other workflows: a superseded run
+  # concludes `cancelled`, and required checks must conclude on every commit.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  tier1:
+    name: 'Tier 1: wasm tests (${{ matrix.browser }})'
+    runs-on: ubuntu-24.04
+    strategy:
+      # One red browser must not cancel the evidence from the other.
+      fail-fast: false
+      matrix:
+        browser: [firefox, chrome]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system deps
+        # libudev-dev for the same reason the test workflow needs it:
+        # rustdar-platform enables rustdar-gps/serial unconditionally off
+        # Android and iOS, and host-side builds of the workspace graph want it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+      - name: Install the wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: web-tier1-${{ matrix.browser }}
+      - name: Install wasm-pack (pinned)
+        # Pinned to the version the gate was proven with; rust-cache restores
+        # ~/.cargo/bin, so the install is a no-op on warm runs.
+        run: |
+          if [ "$(command -v wasm-pack >/dev/null 2>&1 && wasm-pack --version)" != "wasm-pack 0.15.0" ]; then
+            cargo install wasm-pack --version 0.15.0 --locked
+          fi
+          wasm-pack --version
+      - name: Provision geckodriver (pinned + sha256-verified)
+        if: matrix.browser == 'firefox'
+        run: |
+          GECKODRIVER="$(bash .github/browser-rig/ensure-geckodriver.sh)"
+          echo "geckodriver at $GECKODRIVER"
+          echo "RIG_GECKODRIVER=$GECKODRIVER" >> "$GITHUB_ENV"
+      - name: Run the Tier-1 wasm tests (${{ matrix.browser }})
+        # The harness exits 0 on zero tests, so the count is asserted rather
+        # than assumed: exactly `4 passed` or this step is red. The
+        # --geckodriver flag pins the sha-verified binary -- wasm-pack ignores
+        # a GECKODRIVER env var and downloads its own otherwise. (Cargo args
+        # ride beside the path per wasm-pack's cargo-CLI pass-through; after
+        # `--` they would go to the test harness instead.)
+        run: |
+          if [ "${{ matrix.browser }}" = firefox ]; then
+            wasm-pack test --headless --firefox --geckodriver "$RIG_GECKODRIVER" \
+              rustdar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
+          else
+            wasm-pack test --headless --chrome \
+              rustdar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
+          fi
+          grep -q 'test result: ok\. 4 passed' "$RUNNER_TEMP/tier1.log"
+
+  tier2:
+    name: 'Tier 2: full PWA (${{ matrix.browser }})'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [firefox, chromium]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system deps
+        # xvfb for the Firefox leg (see the header). Browsers only as
+        # missing: the runner image ships firefox and a chrome-family binary
+        # with a matching chromedriver, and drive.py picks a binary whose
+        # major version matches the driver's.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev xvfb
+          command -v firefox >/dev/null || sudo apt-get install -y firefox
+          if ! command -v chromedriver >/dev/null; then
+            sudo apt-get install -y chromium-driver chromium
+          fi
+      - name: Install the wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: web-tier2
+      - name: Install wasm-pack (pinned)
+        run: |
+          if [ "$(command -v wasm-pack >/dev/null 2>&1 && wasm-pack --version)" != "wasm-pack 0.15.0" ]; then
+            cargo install wasm-pack --version 0.15.0 --locked
+          fi
+          wasm-pack --version
+      - name: Build the web bundle
+        run: wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+      - name: Run the Tier-2 gate (${{ matrix.browser }})
+        # run_tier2.sh asserts its own outcomes per pass (worker round-trip,
+        # doctored respawn) and exits non-zero on any leg failing twice.
+        run: RIG_BROWSERS=${{ matrix.browser }} bash .github/browser-rig/run_tier2.sh --skip-build
+      - name: Upload rig artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tier2-${{ matrix.browser }}
+          path: .github/browser-rig/out/
