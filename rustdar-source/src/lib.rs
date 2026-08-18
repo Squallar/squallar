@@ -3,6 +3,7 @@
 //! `rustdar-radar` AND `rustdar-overlays`; ceiling + graph shape pinned by
 //! `tests/charter.rs`.
 
+pub mod geo;
 pub mod origins;
 pub mod tls;
 pub mod wire;

@@ -112,13 +112,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          expression over it.",
     ),
     (
-        "rustdar-radar/src/types.rs",
+        "rustdar-source/src/geo.rs",
         "pub const MERCATOR_LAT_LIMIT_DEG: f64 = 85.051_128_779_806_6;",
         "THE definition of the Web Mercator latitude limit, for the same \
          reason and after the same three-copy history. `rustdar-egui`'s \
-         `tiles` re-exports this rather than restating it, and \
-         `render::rasterize` reads it through `rustdar_radar::types`, so this \
-         is the only literal spelling in non-test code.",
+         `tiles` re-exports this rather than restating it (through \
+         `rustdar_radar::types`' re-export), and `rustdar-overlays`'s \
+         `render::rasterize` reads it from `rustdar_source::geo`, so this is \
+         the only literal spelling in non-test code.",
     ),
     // ── Atmospheric refraction: a different physical quantity ───────────
     (
