@@ -139,7 +139,7 @@ fn alert_fixture() -> crate::nws::alert::NwsAlert {
         onset: None,
         ends: None,
         affected_zones: Vec::new(),
-        features: vec![feature()],
+        features: std::sync::Arc::new(vec![feature()]),
     }
 }
 

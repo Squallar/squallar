@@ -1542,7 +1542,10 @@ fn encode_overlay_input(
                 encode_str(out, &alert.id);
                 out.push(AlertCategoryWire(alert.category).wire_code());
                 out.extend_from_slice(&(alert.features.len() as u32).to_le_bytes());
-                for feature in &alert.features {
+                // `features` rides an `Arc` since parse time; iteration derefs
+                // to the same rows in the same order — the bytes are those of
+                // the plain `Vec` this field used to be.
+                for feature in alert.features.iter() {
                     encode_feature(out, feature);
                 }
             }
@@ -1834,7 +1837,10 @@ fn decode_overlay_input(r: &mut Reader) -> Option<OverlayJobInput> {
                 alerts.push(rustdar_overlays::render::rasterize::AlertPaint {
                     id,
                     category,
-                    features,
+                    // A fresh `Arc` per decode: equality with the encoded side
+                    // is value equality through the deref, never pointer
+                    // identity.
+                    features: std::sync::Arc::new(features),
                 });
             }
             Some(OverlayJobInput::Alerts(Box::new(

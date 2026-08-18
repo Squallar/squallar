@@ -14402,14 +14402,14 @@ fn alert_over(id: &str, event: &str, lat: f64, lon: f64) -> rustdar_overlays::nw
         onset: None,
         ends: None,
         affected_zones: Vec::new(),
-        features: vec![rustdar_overlays::types::OverlayFeature::new(
+        features: std::sync::Arc::new(vec![rustdar_overlays::types::OverlayFeature::new(
             vec![vec![ring_about(lat, lon, 0.25)]],
             fill,
             stroke,
             event.to_string(),
             String::new(),
             rustdar_overlays::types::HatchPattern::None,
-        )],
+        )]),
     }
 }
 
@@ -14429,18 +14429,20 @@ fn zone_alert_over(
         .map(|i| format!("https://api.weather.gov/zones/county/OKC{i:03}"))
         .collect();
     let (fill, stroke) = rustdar_overlays::nws::colors::alert_color(event);
-    alert.features = (0..zones_resolved)
-        .map(|i| {
-            rustdar_overlays::types::OverlayFeature::new(
-                vec![vec![ring_about(lat + 0.1 * i as f64, lon, 0.25)]],
-                fill,
-                stroke,
-                event.to_string(),
-                String::new(),
-                rustdar_overlays::types::HatchPattern::None,
-            )
-        })
-        .collect();
+    alert.features = std::sync::Arc::new(
+        (0..zones_resolved)
+            .map(|i| {
+                rustdar_overlays::types::OverlayFeature::new(
+                    vec![vec![ring_about(lat + 0.1 * i as f64, lon, 0.25)]],
+                    fill,
+                    stroke,
+                    event.to_string(),
+                    String::new(),
+                    rustdar_overlays::types::HatchPattern::None,
+                )
+            })
+            .collect(),
+    );
     alert
 }
 

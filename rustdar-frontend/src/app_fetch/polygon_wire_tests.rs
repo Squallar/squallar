@@ -107,7 +107,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 onset: None,
                 ends: None,
                 affected_zones: Vec::new(),
-                features: vec![a_feature()],
+                features: Arc::new(vec![a_feature()]),
             };
             Box::new(alert::NwsAlertFetchResult(Ok(
                 rustdar_overlays::nws::fetch::ActiveAlerts::whole(vec![alert]),

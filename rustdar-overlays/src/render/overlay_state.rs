@@ -2010,7 +2010,7 @@ mod retry_ledger_tests {
                 onset: None,
                 ends: None,
                 affected_zones: vec!["https://api.weather.gov/zones/county/OKC001".to_string()],
-                features: if i < placed {
+                features: std::sync::Arc::new(if i < placed {
                     vec![OverlayFeature::new(
                         vec![vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]]],
                         [0, 0, 0, 0],
@@ -2021,7 +2021,7 @@ mod retry_ledger_tests {
                     )]
                 } else {
                     Vec::new()
-                },
+                }),
             })
             .collect()
     }

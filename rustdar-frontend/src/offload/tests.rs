@@ -380,17 +380,17 @@ pub(super) fn an_overlay_alerts_job() -> JobRequest {
                 AlertPaint {
                     id: "urn:oid:2.49.0.1.840.0001".into(),
                     category: AlertCategory::Warning,
-                    features: vec![warned],
+                    features: Arc::new(vec![warned]),
                 },
                 AlertPaint {
                     id: "urn:oid:2.49.0.1.840.0002".into(),
                     category: AlertCategory::Advisory,
-                    features: vec![advised],
+                    features: Arc::new(vec![advised]),
                 },
                 AlertPaint {
                     id: "urn:oid:2.49.0.1.840.0003".into(),
                     category: AlertCategory::Warning,
-                    features: vec![hidden],
+                    features: Arc::new(vec![hidden]),
                 },
             ],
             enabled_categories: vec![AlertCategory::Warning, AlertCategory::Advisory],
