@@ -4306,6 +4306,7 @@ dependencies = [
  "nexrad-model",
  "rayon",
  "reqwest 0.13.4",
+ "rustdar-source",
  "rustdar-units",
  "rustls",
  "serde",
@@ -4313,6 +4314,17 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "xml",
+]
+
+[[package]]
+name = "rustdar-source"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
