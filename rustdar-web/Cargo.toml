@@ -110,3 +110,23 @@ features = [
 # derives the service worker's never-cache hostnames from it.
 rustdar-radar = { workspace = true }
 serde_json = { workspace = true }
+
+# For `tests/tier1_wasm.rs` -- the Tier-1 browser gate, run in a real browser
+# by `wasm-pack test --headless --firefox|--chrome`. The mirror image of the
+# section above: gated to wasm32 so a host `cargo test` and `cargo clippy
+# --all-targets` never build it.
+#
+# wasm-bindgen-test releases in lockstep with wasm-bindgen; the resolver picks
+# the train that satisfies the `=0.2.126` pin above, and the workflow's
+# `cargo tree -i wasm-bindgen` gate is what keeps that single-versioned.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+# For the first-egui-frame test; same pinned copy the app links.
+egui = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies.web-sys]
+version = "=0.3.103"
+# Additive on top of the [dependencies] list (web-sys features unify across
+# the graph): only what the Tier-1 tests need beyond the app itself -- a real
+# `MessageChannel` transfer.
+features = ["MessageChannel", "MessagePort"]
