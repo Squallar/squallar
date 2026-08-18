@@ -1,0 +1,35 @@
+{
+  "config_version": 99,
+  "pane_count": 1,
+  "active_pane": 0,
+  "site": "KTLX",
+  "loop_lookback_secs": 3600,
+  "hologram_mode": { "depth": 3 },
+  "panes": [
+    {
+      "selected_product": "FutureProduct",
+      "selected_elevation": 0.5,
+      "site": "KTLX",
+      "particle_engine": "on",
+      "draw_order": ["Radar", "FutureSatellite", "NwsAlerts"],
+      "enabled_overlays": {
+        "Radar": true,
+        "FutureSatellite": true
+      },
+      "overlay_configs": {
+        "FutureSatellite": { "band": "infrared" }
+      }
+    }
+  ],
+  "overlay_states": {
+    "FutureSatellite": { "opacity": 0.5 }
+  },
+  "presets": [
+    {
+      "name": "Sat combo",
+      "pane_count": 1,
+      "panes": [{ "product": "Reflectivity", "elevation": 0.5 }],
+      "overlays": ["Radar", "FutureSatellite"]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "pane_count": 3,
+  "active_pane": 0,
+  "site": "KTLX",
+  "panes": [
+    {
+      "site": "KTLX",
+      "selected_product": "Reflectivity",
+      "time_step_secs": 300
+    },
+    {
+      "site": "KOUN",
+      "time_step_secs": "not-a-number"
+    },
+    {
+      "site": "KDMX",
+      "selected_product": "Velocity",
+      "time_step_secs": 900
+    }
+  ]
+}

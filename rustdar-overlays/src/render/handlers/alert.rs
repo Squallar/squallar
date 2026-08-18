@@ -612,8 +612,19 @@ impl OverlayHandler for NwsAlertHandler {
     ///
     /// [`deserialize_state`]: OverlayHandler::deserialize_state
     fn serialize_state(&self) -> serde_json::Value {
+        // In `ALL`'s declaration order, never the `HashSet`'s: a set's
+        // iteration order is per-instance noise, so writing it raw makes
+        // save→load→save produce a *different file* every reopen — the
+        // instability the config fixpoint test
+        // (`a_current_config_reaches_its_save_fixpoint_in_one_round_trip`)
+        // exists to catch. The value is a set either way; only the wire
+        // order is pinned here.
+        let enabled: Vec<AlertCategory> = AlertCategory::ALL
+            .into_iter()
+            .filter(|category| self.enabled_categories.contains(category))
+            .collect();
         serde_json::json!({
-            "enabled_categories": self.enabled_categories,
+            "enabled_categories": enabled,
             "known_categories": AlertCategory::ALL,
         })
     }

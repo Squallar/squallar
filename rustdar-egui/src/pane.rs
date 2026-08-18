@@ -742,6 +742,30 @@ pub struct LoopPlaybackState {
     pub view_key: Option<LoopViewKey>,
 }
 
+/// Config-file content addressed to a build that is not this one, carried
+/// between load and save so the file survives a session under this build.
+///
+/// Populated by `load_ui_config` from the parts of a pane's config this
+/// build cannot name — overlay kinds from a newer build, whole fields it
+/// has never heard of — and drained by `ui_config_json`, which writes each
+/// piece back exactly where it came from. Never consulted in between: the
+/// pane cannot act on state it cannot name, and inventing behavior for it
+/// would be worse than carrying it. What this buys is the downgrade
+/// guarantee: run an older build once and your newer config comes through,
+/// not silently stripped by the first autosave.
+#[derive(Clone, Debug, Default)]
+pub struct PaneConfigBaggage {
+    /// `draw_order` entries naming kinds this build does not know, verbatim,
+    /// re-appended after the known order on save.
+    pub draw_order: Vec<serde_json::Value>,
+    /// `enabled_overlays` entries under keys this build does not know.
+    pub enabled: serde_json::Map<String, serde_json::Value>,
+    /// `overlay_configs` entries under keys this build does not know.
+    pub configs: serde_json::Map<String, serde_json::Value>,
+    /// Whole pane-level fields this build does not know.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
 ///
@@ -831,6 +855,10 @@ pub struct PaneState {
     /// Swapped into/out of the global OverlayRegistry around access points so each
     /// pane can independently configure overlay sub-controls (categories, day, etc.).
     pub overlay_configs: HashMap<OverlayKind, serde_json::Value>,
+    /// Config-file content addressed to a build that is not this one — see
+    /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
+    /// `ui_config_json`, and never acted on in between.
+    pub config_baggage: PaneConfigBaggage,
     /// Radar display state. Always present; in single-frame mode holds at most
     /// one frame (the current static radar image). In multi-frame mode holds
     /// the full animated loop.
@@ -1545,6 +1573,7 @@ impl PaneState {
             draw_order: OverlayKind::default_draw_order(),
             enabled_overlays: HashMap::new(),
             overlay_configs: HashMap::new(),
+            config_baggage: PaneConfigBaggage::default(),
             loop_state: LoopPlaybackState::new(),
             loading_site: None,
             radar_sites_render_gen: 0,

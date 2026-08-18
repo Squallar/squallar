@@ -11,6 +11,9 @@ use rustdar_units::UserPreferences;
 
 use super::PaneLayout;
 use super::PaneState;
+
+#[path = "ui_config/migrate.rs"]
+mod migrate;
 use crate::pane::{
     CrossSectionPane, GeoPoint, MapPane, MapRender, OrbitCamera, PaneContent, SectionLine,
     VolumePane, VolumeRegion,
@@ -55,14 +58,27 @@ struct PaneConfig {
     #[serde(default = "default_true")]
     layer_link: bool,
     /// Visual stacking order for all map layers (bottom to top).
-    #[serde(default = "OverlayKind::default_draw_order")]
-    draw_order: Vec<OverlayKind>,
+    ///
+    /// A [`KindList`], not a `Vec<OverlayKind>`: one kind name from a newer
+    /// build used to fail this list, and with it the whole file. The unknown
+    /// names ride in [`KindList::unknown`] and are written back on save.
+    #[serde(default = "KindList::default_draw_order")]
+    draw_order: KindList,
     /// Per-pane overlay enabled state (master visibility per overlay kind).
+    ///
+    /// String-keyed on the wire: a `HashMap<OverlayKind, bool>` fails the
+    /// *whole map* on one key it cannot name, which fails the whole file.
+    /// Known keys are parsed on load; unknown ones ride in the pane's
+    /// [`crate::pane::PaneConfigBaggage`] and are merged back on save. A
+    /// `BTreeMap` rather than a `HashMap` so the save is byte-stable — the
+    /// autosave's has-anything-changed comparison is a string compare, and a
+    /// freshly built `HashMap`'s iteration order differs per instance.
     #[serde(default)]
-    enabled_overlays: HashMap<OverlayKind, bool>,
-    /// Per-pane overlay handler config snapshots.
+    enabled_overlays: BTreeMap<String, bool>,
+    /// Per-pane overlay handler config snapshots — string-keyed and
+    /// `BTreeMap`-ordered for exactly [`Self::enabled_overlays`]' reasons.
     #[serde(default)]
-    overlay_configs: HashMap<OverlayKind, serde_json::Value>,
+    overlay_configs: BTreeMap<String, serde_json::Value>,
     /// Map zoom level, as `walkers::MapMemory` reports it.
     ///
     /// `Option` rather than a defaulted `f64` so a config written before the
@@ -118,6 +134,99 @@ struct PaneConfig {
     /// which is what a pane that has never been in 3D has.
     #[serde(default)]
     volume: Option<VolumeConfig>,
+    /// Every pane-level key this build does not know, verbatim.
+    ///
+    /// Carried through [`crate::pane::PaneConfigBaggage::fields`] between
+    /// load and save, so a file written by a newer build survives a session
+    /// under this one — the same downgrade safety the unknown overlay kinds
+    /// get. Without this, serde silently *drops* unrecognized keys, and the
+    /// next autosave makes the loss permanent.
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A list of overlay kinds as it appears on the wire: the names this build
+/// can speak, plus — verbatim — the ones it cannot.
+///
+/// A bare `Vec<OverlayKind>` refuses the whole list on the first name it
+/// does not know, and because `load_ui_config` used to have one `Result` for
+/// the whole file, one overlay kind from a newer build cost the user their
+/// entire configuration, permanently. Element-wise reading closes that: each
+/// name is tried alone, failures land in [`Self::unknown`] instead of in an
+/// error, and serialization writes the known names **through serde** — never
+/// `format!("{:?}")`, whose agreement with the wire spelling is a
+/// coincidence the spelling-pin test in rustdar-overlays merely holds in
+/// place — followed by the unknown values exactly as they arrived. A newer
+/// build reading the file back finds its kinds where it left them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct KindList {
+    /// The kinds this build can name, in wire order.
+    pub(crate) known: Vec<OverlayKind>,
+    /// The list elements it cannot, verbatim and in wire order, appended
+    /// after the known ones on the way back out. (Interleaved positions are
+    /// not retained — M8's refinement; preservation is this type's bar.)
+    pub(crate) unknown: Vec<serde_json::Value>,
+}
+
+impl KindList {
+    /// The default draw order, wrapped — what a config with no `draw_order`
+    /// key reads as, exactly as before the wrapper existed.
+    fn default_draw_order() -> Self {
+        Self::from(OverlayKind::default_draw_order())
+    }
+}
+
+impl From<Vec<OverlayKind>> for KindList {
+    fn from(known: Vec<OverlayKind>) -> Self {
+        Self {
+            known,
+            unknown: Vec::new(),
+        }
+    }
+}
+
+impl Serialize for KindList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.known.len() + self.unknown.len()))?;
+        for kind in &self.known {
+            seq.serialize_element(kind)?;
+        }
+        for value in &self.unknown {
+            seq.serialize_element(value)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for KindList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+        let mut known = Vec::new();
+        let mut unknown = Vec::new();
+        for value in raw {
+            match OverlayKind::deserialize(&value) {
+                Ok(kind) => known.push(kind),
+                Err(_) => unknown.push(value),
+            }
+        }
+        if !unknown.is_empty() {
+            let names: Vec<String> = unknown.iter().map(ToString::to_string).collect();
+            log::warn!(
+                "config names {} overlay kind(s) this build does not know ({}); \
+                 keeping them for the build that does",
+                unknown.len(),
+                names.join(", "),
+            );
+        }
+        Ok(Self { known, unknown })
+    }
 }
 
 /// A pane kind, as it appears on the wire.
@@ -431,15 +540,16 @@ impl Default for PaneConfig {
             time_link: true,
             viewport_link: true,
             layer_link: true,
-            draw_order: OverlayKind::default_draw_order(),
-            enabled_overlays: HashMap::new(),
-            overlay_configs: HashMap::new(),
+            draw_order: KindList::default_draw_order(),
+            enabled_overlays: BTreeMap::new(),
+            overlay_configs: BTreeMap::new(),
             zoom: None,
             center: None,
             kind: PaneKindConfig::Map,
             render: MapRender::Plan,
             cross_section: None,
             volume: None,
+            unknown: serde_json::Map::new(),
         }
     }
 }
@@ -447,6 +557,16 @@ impl Default for PaneConfig {
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct UiConfig {
+    /// The config format this file speaks — see [`migrate`]. Absent reads as
+    /// version 1 (every file written before the field existed), through the
+    /// field-level default rather than [`migrate::CONFIG_VERSION`], because
+    /// "what an old file means" is a fact about history and must not move
+    /// when the current version does. A version greater than this build's is
+    /// not an error: the tolerant load proceeds, preservation carries what
+    /// this build cannot read, and the next save writes this build's own
+    /// version over a file it can honestly describe.
+    #[serde(default = "migrate::first_version")]
+    config_version: u32,
     pane_count: usize,
     active_pane: usize,
     /// **Read-only legacy** (M11): the retired global viewport-sync toggle.
@@ -485,18 +605,23 @@ struct UiConfig {
     time_step_secs: i64,
     /// Per-pane persistent state (product, elevation, layers).
     panes: Vec<PaneConfig>,
-    /// User unit/timezone preferences.
+    /// User unit/timezone preferences. Read leniently: one field of a
+    /// container this rich going unreadable must cost the preferences their
+    /// customization, not the user the whole file.
+    #[serde(deserialize_with = "lenient_or_default")]
     preferences: UserPreferences,
     /// Handler-owned config state (overlay kind name → serialized state).
     #[serde(default)]
     overlay_states: serde_json::Map<String, serde_json::Value>,
-    /// GPS configuration (serial port, baud, heading source).
-    #[serde(default)]
+    /// GPS configuration (serial port, baud, heading source). Lenient for
+    /// [`Self::preferences`]' reason.
+    #[serde(default, deserialize_with = "lenient_or_default")]
     gps_config: rustdar_gps::GpsConfig,
     /// The user's storm-motion override — the audit's known persistence gap,
     /// closed here. `#[serde(default)]` makes an older config load as
     /// "override off, default vector", which is what those sessions were.
-    #[serde(default)]
+    /// Lenient for [`Self::preferences`]' reason.
+    #[serde(default, deserialize_with = "lenient_or_default")]
     storm_motion_override: super::StormMotionOverride,
     /// Which derived rung storm-relative velocity falls to when no override and
     /// no NWS vector applies — the Storm motion section's first control.
@@ -536,6 +661,13 @@ struct UiConfig {
     /// config without this field loads as "nothing edited".
     #[serde(default)]
     volume_iso: Vec<VolumeIsoConfig>,
+    /// Every top-level key this build does not know, verbatim — the
+    /// [`PaneConfig::unknown`] arrangement at file scope, carried in
+    /// `Gui::config_unknown_fields` between load and save. What makes a
+    /// downgrade safe: a newer build's settings survive a session under this
+    /// one instead of being silently dropped on the first autosave.
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One product's persisted isosurface threshold.
@@ -584,10 +716,14 @@ struct VolumeAlphaConfig {
 /// from a newer build would cost the user their site, layout and curves,
 /// permanently, because the autosave then rewrites the file from defaults.
 ///
-/// See [`kind_or_default`] for the other half of the same story: unknown
-/// `OverlayKind`s are filtered out and the worker wire's `from_wire_code`
-/// returns `None`, so these two are the whole of the enum tolerance the config
-/// wire needs.
+/// See [`kind_or_default`] for the same fallback on pane kinds, and
+/// [`KindList`] for the overlay kinds. (An earlier version of this comment
+/// claimed unknown `OverlayKind`s were "filtered out" — false: serde failed
+/// the containing list or map before any filter downstream could run, and
+/// one unknown kind cost the whole file. The tolerance has to live in the
+/// deserializer itself, which is where `KindList` and the string-keyed
+/// overlay maps put it.) The worker wire's `from_wire_code` returning `None`
+/// covers that boundary on its own.
 pub(crate) fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -756,9 +892,78 @@ where
     }
 }
 
+/// Deserialize any of the rich top-level containers, falling back to its
+/// default when the stored shape cannot be read — [`product_or_default`]'s
+/// shape, generalised. One corrupt container must cost its own settings,
+/// never the whole file.
+fn lenient_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match T::deserialize(&value) {
+        Ok(parsed) => Ok(parsed),
+        Err(e) => {
+            log::warn!(
+                "a saved setting cannot be read and is reset to its default \
+                 ({e}); the rest of the file is kept"
+            );
+            Ok(T::default())
+        }
+    }
+}
+
+/// The serde spelling of an `OverlayKind` — the name pane state and handler
+/// state are filed under on the wire.
+///
+/// Never `format!("{:?}")`: the `Debug` spelling only *happens* to agree
+/// with the wire today, and the spelling-pin test in rustdar-overlays
+/// (`handler_state_keys_are_the_twelve_debug_spellings_and_serde_agrees`) is
+/// what holds the two equal until the last `{:?}`-keyed site is gone. New
+/// code keys by this.
+fn overlay_kind_key(kind: OverlayKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(name)) => name,
+        // A fieldless enum variant serializes as its name, as a string, and
+        // serde_json has no I/O to fail on — nothing else can come back.
+        // Inventing a fallback spelling here would be a second copy free to
+        // disagree with the one already in the user's file.
+        _ => unreachable!("a fieldless OverlayKind variant serializes as a JSON string"),
+    }
+}
+
+/// The `OverlayKind` a wire key names, or `None` for one this build does
+/// not know — the caller carries those verbatim rather than dropping them.
+fn overlay_kind_from_key(name: &str) -> Option<OverlayKind> {
+    OverlayKind::deserialize(serde_json::Value::String(name.to_owned())).ok()
+}
+
+/// Merge entries carried for another build under the live ones: a name this
+/// build can serve is its live state's to describe, so a carried copy under
+/// the same name is stale by definition and is dropped with a warning rather
+/// than silently shadowing what the user is looking at.
+fn merge_carried<V>(
+    map: &mut BTreeMap<String, V>,
+    carried: &serde_json::Map<String, serde_json::Value>,
+    convert: impl Fn(&serde_json::Value) -> V,
+) {
+    for (name, value) in carried {
+        if map.contains_key(name) {
+            log::warn!(
+                "config carries \"{name}\" both as live state and as another \
+                 build's leftover; the live state wins"
+            );
+            continue;
+        }
+        map.insert(name.clone(), convert(value));
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            config_version: migrate::CONFIG_VERSION,
             pane_count: 1,
             active_pane: 0,
             viewport_sync: true,
@@ -781,6 +986,7 @@ impl Default for UiConfig {
             presets: Vec::new(),
             volume_alpha: Vec::new(),
             volume_iso: Vec::new(),
+            unknown: serde_json::Map::new(),
         }
     }
 }
@@ -836,10 +1042,13 @@ impl super::Gui {
         //
         // Not because `serde_json` fails on them — it does not, which is the
         // correction to what this comment used to say. It writes `null`, the save
-        // succeeds, and it is the *next load* that fails, because `null` will not
-        // deserialize back into a number. So one bad float takes the whole file
-        // with it, one run later, and permanently: the next autosave rewrites it
-        // from defaults. Pinned by
+        // succeeds, and it is the *next load* that chokes, because `null` will
+        // not deserialize back into a number. The per-unit salvage in
+        // `load_ui_config` has since shrunk the blast radius from the whole
+        // file to the unit carrying the `null` — a pane resets to defaults in
+        // place, a top-level number still refuses the file — but "the user's
+        // pane silently reset, one run later, with nothing to connect the two"
+        // is still a loss worth four comparisons at the source. Pinned by
         // `a_non_finite_float_would_poison_the_config_file_permanently`.
         let fps = if self.loop_speed_fps.is_finite() {
             self.loop_speed_fps
@@ -870,9 +1079,36 @@ impl super::Gui {
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
-                    draw_order: pane.draw_order.clone(),
-                    enabled_overlays: pane.enabled_overlays.clone(),
-                    overlay_configs: pane.overlay_configs.clone(),
+                    // The live state plus whatever the load could not name,
+                    // in that precedence — see `PaneConfigBaggage`.
+                    draw_order: KindList {
+                        known: pane.draw_order.clone(),
+                        unknown: pane.config_baggage.draw_order.clone(),
+                    },
+                    enabled_overlays: {
+                        let mut map: BTreeMap<String, bool> = pane
+                            .enabled_overlays
+                            .iter()
+                            .map(|(&kind, &on)| (overlay_kind_key(kind), on))
+                            .collect();
+                        // By construction every carried value is a bool —
+                        // the load's partition only files bools here — so
+                        // the coercion cannot invent state.
+                        merge_carried(&mut map, &pane.config_baggage.enabled, |v| {
+                            v.as_bool().unwrap_or(false)
+                        });
+                        map
+                    },
+                    overlay_configs: {
+                        let mut map: BTreeMap<String, serde_json::Value> = pane
+                            .overlay_configs
+                            .iter()
+                            .map(|(&kind, val)| (overlay_kind_key(kind), val.clone()))
+                            .collect();
+                        merge_carried(&mut map, &pane.config_baggage.configs, Clone::clone);
+                        map
+                    },
+                    unknown: pane.config_baggage.fields.clone(),
                     // Same NaN guard as `loop_speed_fps` above, and for the same
                     // reason, stated there.
                     zoom: pane
@@ -889,6 +1125,11 @@ impl super::Gui {
             })
             .collect();
         let config = UiConfig {
+            // Always this build's own version, whatever the loaded file
+            // said: with the unknown-field and unknown-kind preservation
+            // above and below, this build's version is the honest
+            // description of the file it writes — see `migrate`.
+            config_version: migrate::CONFIG_VERSION,
             pane_count: self.pane_layout.pane_count,
             active_pane: self.active_pane,
             // Dead values behind `skip_serializing`: the legacy globals are
@@ -905,7 +1146,18 @@ impl super::Gui {
             time_step_secs: self.panes.first().map(|p| p.time_step_secs).unwrap_or(600),
             panes: pane_configs,
             preferences: self.preferences.clone(),
-            overlay_states: self.overlays.serialize_handler_states(),
+            // The handlers' live state written OVER the carried entries no
+            // handler consumed at load: a kind this build serves is its
+            // handler's to describe, and one it does not is handed back
+            // exactly as it arrived — the overlay_states half of the
+            // downgrade-safety story.
+            overlay_states: {
+                let mut states = self.overlay_states_baggage.clone();
+                for (name, state) in self.overlays.serialize_handler_states() {
+                    states.insert(name, state);
+                }
+                states
+            },
             gps_config: self.gps_config.clone(),
             // The same NaN guard every persisted float gets (see the note on
             // this function): `DragValue` parses "nan", and one non-finite
@@ -982,6 +1234,7 @@ impl super::Gui {
                 thresholds.sort_by_key(|c| c.product.map(|p| p.code()));
                 thresholds
             },
+            unknown: self.config_unknown_fields.clone(),
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => Some(json),
@@ -1009,10 +1262,29 @@ impl super::Gui {
         let Some(content) = store.load(UI_CONFIG_KEY) else {
             return false;
         };
-        let config = match serde_json::from_str::<UiConfig>(&content) {
-            Ok(c) => c,
+        // Stage one: the raw JSON tree. This parse is the one remaining
+        // whole-file refusal — a file that is not JSON at all has no units
+        // to salvage. Everything past this point fails *per unit*: a corrupt
+        // pane costs that pane, a corrupt preset costs that preset, a corrupt
+        // container costs its own settings, and nothing costs the file.
+        let mut value = match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) => v,
             Err(e) => {
                 log::warn!("Failed to parse config: {}", e);
+                return false;
+            }
+        };
+        migrate::migrate_to_current(&mut value);
+        sanitize_config_tree(&mut value);
+        let config = match UiConfig::deserialize(&value) {
+            Ok(c) => c,
+            Err(e) => {
+                // Structurally unreachable for an object-rooted file — the
+                // sanitize pass above repaired or shed every unit that could
+                // fail — so what lands here is a file whose *root* is not a
+                // config at all (a bare array, a string), and nothing in it
+                // can be honestly applied.
+                log::warn!("Failed to read config: {}", e);
                 return false;
             }
         };
@@ -1125,6 +1397,8 @@ impl super::Gui {
                 pane.viewport_link = config.viewport_sync;
                 pane.layer_link = config.sync_layers;
                 pane.time_link = config.sync_layers;
+                // A pane the config never described carries nothing for it.
+                pane.config_baggage = crate::pane::PaneConfigBaggage::default();
                 continue;
             };
             pane.selected_product = pc.selected_product;
@@ -1163,14 +1437,62 @@ impl super::Gui {
             // the UI pass; `Gui::request_pane_view` exists for the writers *inside*
             // it, where the pane may be `mem::take`n.
             pane.set_content(restore_content(i, pc, count));
-            pane.draw_order = reconcile_draw_order(&pc.draw_order);
-            // Restore per-pane overlay enabled state.
-            if !pc.enabled_overlays.is_empty() {
-                pane.enabled_overlays = pc.enabled_overlays.clone();
+            pane.draw_order = reconcile_draw_order(&pc.draw_order.known);
+            // Partition the string-keyed overlay maps into what this build
+            // can name — applied below — and what it cannot, which rides in
+            // the pane's baggage until the save writes it back. An unknown
+            // key used to fail the whole map, and with it the whole file.
+            let mut baggage = crate::pane::PaneConfigBaggage {
+                draw_order: pc.draw_order.unknown.clone(),
+                enabled: serde_json::Map::new(),
+                configs: serde_json::Map::new(),
+                fields: pc.unknown.clone(),
+            };
+            let mut enabled_known: HashMap<OverlayKind, bool> = HashMap::new();
+            let mut configs_known: HashMap<OverlayKind, serde_json::Value> = HashMap::new();
+            let mut unknown_names: Vec<&str> = Vec::new();
+            for (name, &on) in &pc.enabled_overlays {
+                match overlay_kind_from_key(name) {
+                    Some(kind) => {
+                        enabled_known.insert(kind, on);
+                    }
+                    None => {
+                        unknown_names.push(name);
+                        baggage
+                            .enabled
+                            .insert(name.clone(), serde_json::Value::Bool(on));
+                    }
+                }
             }
-            // Restore per-pane overlay handler configs.
-            if !pc.overlay_configs.is_empty() {
-                pane.overlay_configs = pc.overlay_configs.clone();
+            for (name, state) in &pc.overlay_configs {
+                match overlay_kind_from_key(name) {
+                    Some(kind) => {
+                        configs_known.insert(kind, state.clone());
+                    }
+                    None => {
+                        unknown_names.push(name);
+                        baggage.configs.insert(name.clone(), state.clone());
+                    }
+                }
+            }
+            if !unknown_names.is_empty() {
+                log::warn!(
+                    "pane {i}'s config names overlay kind(s) this build does \
+                     not know ({}); keeping them for the build that does",
+                    unknown_names.join(", "),
+                );
+            }
+            pane.config_baggage = baggage;
+            // Restore per-pane overlay enabled state. Gated on the *known*
+            // half: a map that names only kinds this build cannot serve says
+            // nothing about the ones it can, and must not blank their
+            // defaults.
+            if !enabled_known.is_empty() {
+                pane.enabled_overlays = enabled_known;
+            }
+            // Restore per-pane overlay handler configs, on the same gate.
+            if !configs_known.is_empty() {
+                pane.overlay_configs = configs_known;
             }
             zoom_restored |= restore_viewport(pane, pc);
         }
@@ -1186,6 +1508,26 @@ impl super::Gui {
         if zoom_restored {
             self.initial_zoom_set = true;
         }
+
+        // Every top-level key this build could not name, kept verbatim for
+        // the save to hand back — the downgrade half of the version story.
+        self.config_unknown_fields = config.unknown;
+
+        // The `overlay_states` entries no handler will consume, likewise.
+        // Filed by the serde spelling — the same name the handlers' own
+        // `{:?}` keys spell today, which the spelling-pin test in
+        // rustdar-overlays holds equal.
+        let handler_keys: std::collections::HashSet<String> = self
+            .overlays
+            .handlers()
+            .map(|h| overlay_kind_key(h.kind()))
+            .collect();
+        self.overlay_states_baggage = config
+            .overlay_states
+            .iter()
+            .filter(|(name, _)| !handler_keys.contains(name.as_str()))
+            .map(|(name, state)| (name.clone(), state.clone()))
+            .collect();
 
         // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
         if !config.overlay_states.is_empty() {
@@ -1600,6 +1942,75 @@ fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
         pane.map_memory.center_at(walkers::lat_lon(lat, lon));
     }
     zoom_restored
+}
+
+/// Repair the raw config tree unit by unit, so `UiConfig::deserialize`
+/// cannot fail on anything short of a root that is not a config at all.
+///
+/// The salvage rules, unit by unit:
+/// - a **pane** that cannot be read is replaced with `{}` — the defaults —
+///   **in place**, never removed: a pane is a position in a layout, and
+///   dropping one renumbers every pane after it and silently moves the
+///   user's windows around (the argument at [`kind_or_default`]);
+/// - a **preset** that cannot be read is dropped with a warning: presets are
+///   a named list, not positions, so removal moves nothing;
+/// - a container that is not even the right JSON *shape* (a `panes` that is
+///   not an array, an `overlay_states` that is not an object, a
+///   `config_version` that is not a number) is shed so its absence reads as
+///   the default, rather than left to fail the whole file.
+///
+/// The rich top-level containers (`preferences`, `gps_config`,
+/// `storm_motion_override`) are not probed here — their fields carry
+/// [`lenient_or_default`], which is the same salvage applied at the same
+/// granularity by the deserializer itself.
+fn sanitize_config_tree(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        // Not an object: nothing here is a config unit to salvage, and
+        // `UiConfig::deserialize` will refuse the root honestly.
+        return;
+    };
+    if root.get("config_version").is_some_and(|v| !v.is_u64()) {
+        log::warn!("the saved config_version is not a version; reading the file as the oldest");
+        root.remove("config_version");
+    }
+    match root.get_mut("panes") {
+        None => {}
+        Some(serde_json::Value::Array(panes)) => {
+            for (i, pane) in panes.iter_mut().enumerate() {
+                if let Err(e) = PaneConfig::deserialize(&*pane) {
+                    log::warn!(
+                        "pane {i}'s saved config cannot be read ({e}); \
+                         restoring that pane to defaults in place"
+                    );
+                    *pane = serde_json::Value::Object(serde_json::Map::new());
+                }
+            }
+        }
+        Some(_) => {
+            log::warn!("the saved pane list is not a list; dropping it");
+            root.remove("panes");
+        }
+    }
+    match root.get_mut("presets") {
+        None => {}
+        Some(serde_json::Value::Array(presets)) => {
+            presets.retain(|preset| match super::PresetConfig::deserialize(preset) {
+                Ok(_) => true,
+                Err(e) => {
+                    log::warn!("dropping a saved preset that cannot be read: {e}");
+                    false
+                }
+            });
+        }
+        Some(_) => {
+            log::warn!("the saved preset list is not a list; dropping it");
+            root.remove("presets");
+        }
+    }
+    if root.get("overlay_states").is_some_and(|v| !v.is_object()) {
+        log::warn!("the saved overlay states are not a map; dropping them");
+        root.remove("overlay_states");
+    }
 }
 
 /// Reconcile a saved draw order with the current set of known `OverlayKind` variants.

@@ -1,0 +1,7 @@
+{
+  "pane_count": 1,
+  "site": "KDMX",
+  "loop_lookback_secs": 7200,
+  "preferences": 5,
+  "panes": [{ "site": "KDMX" }]
+}

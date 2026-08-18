@@ -68,8 +68,12 @@ pub(crate) struct PresetConfig {
     pub pane_count: usize,
     /// Per-pane product and tilt, index-aligned with the layout.
     pub panes: Vec<PresetPane>,
-    /// The enabled-overlay set, applied to every pane.
-    pub overlays: Vec<OverlayKind>,
+    /// The enabled-overlay set, applied to every pane. A
+    /// [`KindList`](super::config::KindList) rather than a bare
+    /// `Vec<OverlayKind>` so one kind from a newer build costs nothing: the
+    /// unknown names ride along and are written back on save, and only
+    /// [`KindList::known`](super::config::KindList) is ever applied.
+    pub overlays: super::config::KindList,
 }
 
 impl Default for PresetConfig {
@@ -78,7 +82,7 @@ impl Default for PresetConfig {
             name: String::new(),
             pane_count: 1,
             panes: Vec::new(),
-            overlays: Vec::new(),
+            overlays: super::config::KindList::default(),
         }
     }
 }
@@ -137,7 +141,8 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
                 OverlayKind::StormReports,
                 OverlayKind::CityLabels,
                 OverlayKind::ColorScale,
-            ],
+            ]
+            .into(),
         },
         // Watching rain fall and add up.
         PresetConfig {
@@ -152,7 +157,8 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
                 OverlayKind::NwsAlerts,
                 OverlayKind::CityLabels,
                 OverlayKind::ColorScale,
-            ],
+            ]
+            .into(),
         },
         // Flying around weather: echo tops for the vertical extent, METAR and
         // lightning for the field conditions.
@@ -170,7 +176,8 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
                 OverlayKind::Lightning,
                 OverlayKind::CityLabels,
                 OverlayKind::ColorScale,
-            ],
+            ]
+            .into(),
         },
     ]
 }
@@ -721,7 +728,8 @@ impl super::Gui {
                 .iter()
                 .copied()
                 .filter(|&kind| active.is_overlay_enabled(kind))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
@@ -766,7 +774,10 @@ impl super::Gui {
         for idx in 0..count {
             let mut pane = std::mem::take(&mut self.panes[idx]);
             for &kind in OverlayKind::all() {
-                let on = preset.overlays.contains(&kind);
+                // Only the kinds this build can serve are applied; a preset
+                // saved by a newer build keeps its extra names in
+                // `overlays.unknown`, which the save writes back.
+                let on = preset.overlays.known.contains(&kind);
                 self.set_pane_overlay_with_fetch(&mut pane, idx, kind, on, actions);
             }
             self.panes[idx] = pane;
