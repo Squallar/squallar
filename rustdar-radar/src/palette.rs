@@ -38,6 +38,7 @@
 //! scales admit.
 
 use crate::types::{MS_TO_MPH, RadarProduct};
+use std::sync::LazyLock;
 
 const TRANSPARENCY: u8 = 180;
 
@@ -789,6 +790,7 @@ static NROT_ANTICYCLONIC: ColorScale = &(
 
 /// Color bar description for a product. Values are in the units fed to
 /// `get_color_for_value()`.
+#[derive(Clone)]
 pub struct LegendScale {
     /// Color stops, sorted ascending by value.
     pub thresholds: Vec<(f32, [u8; 3])>,
@@ -840,7 +842,7 @@ fn merge_bidirectional(inbound: ColorScale, outbound: ColorScale, unit_factor: f
 }
 
 /// Thresholds are in the same unit domain as `get_color_for_value()`.
-pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
+fn build_legend_scale(product: RadarProduct) -> LegendScale {
     match product {
         RadarProduct::Reflectivity => extract_scale(REFLECTIVITY),
         RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
@@ -863,6 +865,37 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
             merge_bidirectional(NROT_ANTICYCLONIC, NROT_CYCLONIC, 1.0)
         }
     }
+}
+
+/// [`build_legend_scale`]'s answer for every product, built once.
+///
+/// A legend is asked for per frame (colour-bar draw, tick layout, hover) and
+/// its thresholds are an allocating `Vec`, so the per-call build was pure
+/// rebuild-the-same-answer work. Built by **calling** [`build_legend_scale`]
+/// over [`RadarProduct::all`], never by restating any table, and indexed by
+/// `product as usize` — sound under the declaration-order law
+/// `product_spec::tests::all_lists_every_variant_in_declaration_order` holds.
+///
+/// A `LazyLock` companion function rather than a `RadarProductSpec` field
+/// because a `const fn` cannot read a `static` (E0013) and the thresholds
+/// allocate.
+pub(crate) fn legend_scale_static(product: RadarProduct) -> &'static LegendScale {
+    static ALL: LazyLock<Vec<LegendScale>> = LazyLock::new(|| {
+        RadarProduct::all()
+            .iter()
+            .map(|&p| build_legend_scale(p))
+            .collect()
+    });
+    &ALL[product as usize]
+}
+
+/// Thresholds are in the same unit domain as `get_color_for_value()`.
+///
+/// The allocating signature every caller has always had; the borrowed
+/// reshape is E5's. The clone is of [`legend_scale_static`]'s entry, so the
+/// answer is the built-once table's, byte for byte.
+pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
+    legend_scale_static(product).clone()
 }
 
 #[cfg(test)]

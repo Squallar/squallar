@@ -403,6 +403,7 @@ use crate::palette::{get_color_for_value, get_legend_scale};
 use crate::par::*;
 use crate::sampler::{Column, VolumeSampler};
 use crate::types::{MomentSlot, RadarProduct};
+use std::sync::LazyLock;
 
 /// The palette index meaning "the radar did not measure anything here", and
 /// simultaneously the bottom of the affine value ramp. See the module doc —
@@ -2283,6 +2284,41 @@ fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
     lut
 }
 
+/// [`colormap_lut`]'s answer for every voxel-capable product, built once.
+///
+/// `None` exactly where [`crate::derive::volume_slot`] is `None`: a product
+/// with neither a native moment nor a derivation has no ramp to bake. For the
+/// rest, the entry is `colormap_lut(p, value_range_for_product(p,
+/// volume_slot(p)))` — range and table are both **functions of the product**
+/// (the rule [`VoxelGrid::from_bytes`]'s decode-verify holds), so baking per
+/// product loses nothing and the bytes are the per-call build's, identically.
+/// `colormap_lut` stays the one builder; this only stops it re-running per
+/// grid and per decode.
+///
+/// This is **not** the value-quantised RGBA table the module doc rejects:
+/// every entry is produced by *calling* [`get_color_for_value`] over the
+/// voxel grid's own 256 discrete cell levels — an encoding that already
+/// exists — never by re-quantising continuous values, and the plan-view
+/// per-gate paths keep their direct palette calls.
+///
+/// Indexed by `product as usize` under the declaration-order law
+/// `product_spec::tests::all_lists_every_variant_in_declaration_order`
+/// holds; a `LazyLock` companion function rather than a `RadarProductSpec`
+/// field because a `const fn` cannot read a `static` (E0013) and the table
+/// allocates.
+pub(crate) fn volume_lut_static(product: RadarProduct) -> Option<&'static [u8]> {
+    static ALL: LazyLock<Vec<Option<Vec<u8>>>> = LazyLock::new(|| {
+        RadarProduct::all()
+            .iter()
+            .map(|&p| {
+                crate::derive::volume_slot(p)
+                    .map(|slot| colormap_lut(p, value_range_for_product(p, slot)))
+            })
+            .collect()
+    });
+    ALL[product as usize].as_deref()
+}
+
 /// One y row's share of a grid under construction: the row's `nx` cells in
 /// each of the `nz` horizontal planes, cut out of the output so the row can be
 /// filled without touching anything another row owns.
@@ -2566,7 +2602,10 @@ pub fn build_voxels_with_motion<'a>(
         * 0.0003048;
 
     let value_range = value_range_for_product(req.product, slot);
-    let lut = colormap_lut(req.product, value_range);
+    // The baked table: `Some` because `volume_slot` was `Some` above, and
+    // built over this same `value_range` (both are functions of the product),
+    // so the wire payload's bytes are the per-call build's, identically.
+    let lut = volume_lut_static(req.product)?.to_vec();
 
     let (nx, ny, nz) = (shape.nx, shape.ny, shape.nz);
     let cells = shape.cells();
@@ -2879,7 +2918,7 @@ impl VoxelGrid {
         // reserved on the claimed length before that.
         let lut_len = r.u32()?;
         let lut = r.take(lut_len as usize)?.to_vec();
-        if lut.len() != LUT_LEN || lut != colormap_lut(product, value_range) {
+        if lut.len() != LUT_LEN || Some(lut.as_slice()) != volume_lut_static(product) {
             return None;
         }
         let index_len = r.u32()?;
