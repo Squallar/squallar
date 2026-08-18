@@ -106,6 +106,12 @@ async fn job_request_bytes_survive_a_real_message_channel_transfer() {
 /// `string_field` (the exact helpers `worker_port::handle_message` reads a
 /// HELLO with), and a doctored token compares unequal -- the `theirs != ours`
 /// branch that terminates and respawns the worker.
+///
+/// Both shapes `build_token` can yield ride the same path: CI-shaped
+/// (`version/sha`) and dev-shaped (`version/wire-<digest>`),
+/// equal-compares-equal and ANY single-character doctoring compares unequal.
+/// (The real `build_token()` above already exercises whichever shape this
+/// run was built under; the two literals are the deterministic pair.)
 #[wasm_bindgen_test]
 fn the_token_compare_reads_real_js_values() {
     use rustdar_web::worker_protocol::{TOKEN, build_token, set_field, string_field};
@@ -128,6 +134,28 @@ fn the_token_compare_reads_real_js_values() {
         theirs, ours,
         "the doctored token must read as a different build, or the respawn path is dead code"
     );
+
+    for shaped in ["1.2.3/abc123sha", "1.2.3/wire-00aa11bb22cc33dd"] {
+        let object = js_sys::Object::new();
+        set_field(&object, TOKEN, &JsValue::from_str(shaped));
+        assert_eq!(
+            string_field(&object, TOKEN).as_deref(),
+            Some(shaped),
+            "a {shaped:?}-shaped token must compare equal to itself through the real JS path"
+        );
+        for i in 0..shaped.len() {
+            let mut doctored: Vec<u8> = shaped.bytes().collect();
+            doctored[i] = if doctored[i] == b'x' { b'y' } else { b'x' };
+            let doctored = String::from_utf8(doctored).expect("ASCII stays ASCII");
+            let object = js_sys::Object::new();
+            set_field(&object, TOKEN, &JsValue::from_str(&doctored));
+            assert_ne!(
+                string_field(&object, TOKEN).unwrap_or_default(),
+                shaped,
+                "doctoring byte {i} of a {shaped:?}-shaped token must compare unequal"
+            );
+        }
+    }
 }
 
 /// A config value stored through [`LocalStorageConfigStore`] lands under the

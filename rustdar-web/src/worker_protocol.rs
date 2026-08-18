@@ -118,154 +118,6 @@ pub const OUT: &str = "out";
 /// The tag says which decoder to run, and the magic says whether it was right.
 pub const OUT_KIND: &str = "outkind";
 
-/// Bumped whenever the shapes above change.
-///
-/// Part of [`build_token`] rather than checked on its own: a page and a worker
-/// running different protocol versions are, by definition, different builds.
-///
-/// Version 2 added [`OUT`] and [`OUT_KIND`], when a job could answer with
-/// something other than a plan-view frame. Version 3 added [`NYQUIST`], when
-/// the plan view began reporting the fold limit of the sweep it drew. It is
-/// folded into the token, so a page and a worker on opposite sides of a deploy
-/// boundary terminate cleanly rather than exchanging a reply one of them cannot
-/// read.
-///
-/// A missing [`NYQUIST`] would degrade rather than break — the page would read
-/// `None` and the legend would say nothing — but "degrades quietly" is exactly
-/// the class of mismatch a version number exists to convert into a clean
-/// termination, and a page silently unable to name a fold limit is the same
-/// silence this workstream is closing everywhere else.
-///
-/// Version 4 added [`MELTING_LAYER`], and that one is not merely a caption: a
-/// page reading `None` from an older worker would draw *no* qualification over
-/// a classification standing on the fleet default, which is the picture that
-/// scores 16 % against the RPG's own answer. Silently indistinguishable from
-/// the 95 % one is precisely what the version number is here to prevent.
-/// Version 5 widened [`OUT_KIND`] past `RenderView`'s three codes: a decoded
-/// Level II volume is an output that is not a view of anything, and it takes
-/// code 4. A version 4 worker has no encoder for it and a version 4 page no
-/// decoder, and either mismatch would be a decode that silently produced
-/// nothing — the browser's whole radar picture, missing, with no error. The
-/// token is what turns that into a clean termination.
-/// Version 6 added [`STORM_MOTION`], for the reason version 4 added the melting
-/// layer and not the reason version 3 added the Nyquist. A page reading `None`
-/// from an older worker would draw *no* qualification over a storm-relative
-/// field built on the Bunkers right-mover — a field that agrees with the RPG's
-/// own answer on 17 % of its gates, and on fewer than half of them to within
-/// one display level. Left unqualified it is indistinguishable from the one
-/// that sits at the achievable ceiling, which is exactly the silence the token
-/// exists to convert into a clean termination.
-/// Version 7 added [`STORM_MOTION_SPEED`] and [`STORM_MOTION_DIR`] beside that
-/// byte, so a storm-relative reply carries the **vector** and not only its
-/// provenance. It is version 6's case one turn further on. The page draws the
-/// speed and direction in its legend now, and the two derived rungs are fitted
-/// from a VAD profile that exists only where the volume was decoded — so a page
-/// reading these two as absent from a version 6 worker draws no vector at all,
-/// on *every* rung including the RPG's own. That is the whole legend entry
-/// gone, silently, on the one product whose gates all carry a shift the reader
-/// cannot otherwise see. The reverse pairing is no better: a version 6 page
-/// ignores the two fields and shows nothing a version 7 worker took the trouble
-/// to send.
-///
-/// Version 8 changed no field at all, and that is why it is worth reading. The
-/// bytes inside [`POLAR`] grew an elevation and restated their two ranges as
-/// slant rather than ground, when `beam::ground_range_km` became the spherical
-/// arc and the ground grid stopped being uniform enough to name with a first
-/// value and a step. The reply's field *set* is identical either side of that
-/// change, so `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
-/// — which scrapes field names out of `worker.rs` — cannot see it and did not
-/// fire. **A change to `PolarField::to_bytes`'s layout has to be bumped here by
-/// hand** — but it is no longer *unwatched*: `rustdar_radar`'s
-/// `render::polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships`
-/// digests the bytes that encoder produces over a fixture built from literals,
-/// so an edit to the layout goes red and its message names this constant. What
-/// it cannot check is that the bump happened, because this constant is
-/// `wasm32`-only in a crate downstream of that one. The same holds in the other
-/// direction for `rustdar_frontend`'s `JobRequest` framing, whose own digest is
-/// `offload::tests::the_job_framing_is_the_one_this_protocol_ships`, and for the
-/// decoded volume `OUT` carries under code 4, pinned by `rustdar_radar`'s
-/// `volume_wire::tests::the_volume_wire_layout_is_the_one_this_version_ships`
-/// against its own `VERSION`. Mismatched halves would mostly fail `from_bytes`'s
-/// length checks and answer `None`, so the readout would go quiet rather than
-/// lie; but "degrades quietly" is the exact failure this number exists to
-/// convert into a clean termination, which is the argument versions 3, 4 and 6
-/// were each landed on.
-///
-/// Version 9 added the overlay job (`JobRequest::Overlay`, tag 8 in the
-/// page→worker framing) and its reply, `OUT` code 5 — the first rasterization
-/// of an *overlay* to cross this port, so the site markers stop being drawn
-/// inline on the page's one thread. Like version 8 it changes **no field
-/// name**: the job direction is a byte codec under [`REQUEST`] and the reply
-/// rides the existing [`OUT`]/[`OUT_KIND`] pair, so the reply-shape scrape
-/// below cannot see either half and did not fire. What pins them instead is
-/// `rustdar_frontend`'s `offload::tests` — the framing digest gained an
-/// `overlay/sites` row and the tag table an eighth entry — and code 5's
-/// payload is deliberately unframed raw RGBA whose acceptance is the
-/// dispatcher's own length check, so there is no third codec to digest. A
-/// version 8 worker answers the new tag with a failed job (its `from_bytes`
-/// refuses tag 8) and a version 8 page would drop `OUT` code 5 as unknown:
-/// both halves degrade quietly, which is exactly the mismatch the token turns
-/// into a clean termination and a respawn.
-///
-/// Version 10 widened the overlay job's **inner** code space: the three
-/// polygon overlay kinds — NWS alerts, SPC outlooks, SPC mesoscale
-/// discussions — travel under tag 8 as input codes 2, 3 and 4 beside the
-/// sites render's 1, so the layer set the frame-thread audit measured at
-/// 224 ms of inline gesture-end rasterization (measured at main@ebe0ad3b,
-/// 2026-08-12 web-baseline campaign; instrumentation 3673d316) runs in the
-/// worker. Like
-/// versions 8 and 9 it changes **no field name** — the reply is still `OUT`
-/// code 5's unframed RGBA, accepted by the dispatching page's own length
-/// check — so the reply-shape scrape cannot see it and did not fire. What
-/// pins it is `rustdar_frontend`'s `offload::tests`: the framing digest
-/// gained an `overlay/alerts`, `overlay/outlooks` and `overlay/discussions`
-/// row and the overlay input-code table its three entries. A version 9
-/// worker answers the new codes with a failed job (its
-/// `decode_overlay_input` refuses them), which is a warning layer that
-/// silently never draws — the degradation the token turns into a clean
-/// termination and a respawn.
-///
-/// Version 11 is the first bump since the overlay reply gained guards to
-/// change what that reply **carries**: the two hit-map overlay kinds — storm
-/// reports and GLM lightning — travel under tag 8 as input codes 5 and 6, and
-/// `OUT` code 5's payload stopped being bare RGBA. It now opens with a
-/// one-byte hit-cells tag and, when the tag says so, a framed block of
-/// quarter-res cell → item-index lists, with the raw RGBA as the rest — the
-/// portable half of a hit map, whose `Arc` id_map half never crosses this
-/// port (the page zips the two at delivery). The GLM input also carries the
-/// page's own `now`: flash age is a page-side fact captured at dispatch, and
-/// a worker re-reading its clock would render a picture the page never asked
-/// for. Like versions 8–10 this changes **no field name**, so the reply-shape
-/// scrape cannot see either half; what pins them is `rustdar_frontend`'s
-/// `offload::tests` — two new framing-digest rows, input codes 5–6 in the
-/// literal table, and a digest over the reply codec itself
-/// (`the_overlay_reply_framing_is_the_one_this_protocol_ships`), which `OUT`
-/// code 5 never needed before because it had no layout to digest. A version
-/// 10 worker refuses codes 5–6 and answers a failed job; a mismatched pairing
-/// of the reply framing fails the page's `width × height × 4` length check
-/// whichever side is older — a first byte lost to the tag, or a tag byte
-/// counted as a pixel — and reads as a failed render. Both degrade quietly,
-/// which is exactly what the token turns into a clean termination and a
-/// respawn.
-///
-/// Version 12 completes tag 8's inner code space: the HRRR model grid — the
-/// last overlay kind that still rasterized inline on the page — travels as
-/// input code 7, carrying the grid's Lambert constants and the values of its
-/// projection window (cut at encode time, so a gesture-settle re-render ships
-/// a window's few hundred KB rather than the 7.62 MB grid; a grid wholly in
-/// view still ships whole, because every point of it can paint). The reply
-/// shape is untouched — the model grid has no hit map, so its `OUT` code 5
-/// payload is the tag-0 form version 11 defined. Like versions 8–11 this
-/// changes **no field name**; what pins it is `rustdar_frontend`'s
-/// `offload::tests` — the `overlay/model` framing-digest row, input code 7 in
-/// the literal table, and the model parity and malformed suites. A version 11
-/// worker refuses code 7 and answers a failed job, which is a model layer
-/// that silently never draws — the degradation the token turns into a clean
-/// termination and a respawn. This bump also retires the opaque overlay
-/// closure path on the page side entirely; that is invisible to the wire, but
-/// it is why no thirteenth kind should ever arrive opaque.
-const PROTOCOL_VERSION: u32 = 12;
-
 /// What the page and the worker compare before the page trusts the worker.
 ///
 /// They can differ. A dedicated worker is its own service-worker client, so
@@ -277,17 +129,32 @@ const PROTOCOL_VERSION: u32 = 12;
 /// which is silent and much worse.
 ///
 /// `GITHUB_SHA` is what actually distinguishes two deploys; it is present in
-/// CI and absent locally, where the protocol version carries the check alone.
-/// A cached build can bake a stale SHA, but it bakes the *same* stale SHA into
-/// both halves — so the failure mode is only ever a missed detection, never a
-/// false one.
+/// CI and absent locally, where the token's second segment is a digest of the
+/// wire's pinned identity rows instead
+/// (`rustdar_frontend::wire_identity::wire_digest`). Both halves of one build
+/// digest the same module, so the fallback cannot false-mismatch a matched
+/// pair — and a local pair whose pinned wire rows differ now diverges, where
+/// the deleted hand-kept protocol number matched any two local builds alike.
+/// What the digest deliberately does not cover — the nested payload layouts,
+/// pinned by `rustdar-radar`'s own suites — leaves a rasterizer-only local
+/// staleness reading as the same build: a missed detection, accepted, because
+/// locally there is no service-worker deploy skew to create such a pair and
+/// production always has the SHA. (A cached CI build can bake a stale SHA,
+/// but it bakes the *same* stale SHA into both halves — still only ever a
+/// missed detection, never a false one.)
 pub fn build_token() -> String {
-    format!(
-        "{}/{}/{}",
-        env!("CARGO_PKG_VERSION"),
-        PROTOCOL_VERSION,
-        option_env!("GITHUB_SHA").unwrap_or("dev"),
-    )
+    match option_env!("GITHUB_SHA") {
+        // CI/production: the SHA distinguishes deploys — finer than any
+        // hand-kept number, and it cannot be forgotten.
+        Some(sha) => format!("{}/{}", env!("CARGO_PKG_VERSION"), sha),
+        // Local dev: no SHA. Digest the wire's pinned identity rows instead —
+        // see rustdar_frontend::wire_identity for scope and residuals.
+        None => format!(
+            "{}/wire-{:016x}",
+            env!("CARGO_PKG_VERSION"),
+            rustdar_frontend::wire_identity::wire_digest()
+        ),
+    }
 }
 
 /// `js_sys::Reflect::get` with the failure folded into `None`: every read here
