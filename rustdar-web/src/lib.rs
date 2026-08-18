@@ -89,8 +89,12 @@ mod entry;
 mod worker;
 #[cfg(target_arch = "wasm32")]
 mod worker_port;
+/// Public for the Tier-1 browser gate (`tests/tier1_wasm.rs`), which pins the
+/// build-token compare against real JS values through the same Reflect
+/// helpers `worker_port::handle_message` reads with. Still wasm-gated, so
+/// nothing native gains a surface.
 #[cfg(target_arch = "wasm32")]
-mod worker_protocol;
+pub mod worker_protocol;
 
 #[cfg(target_arch = "wasm32")]
 pub use entry::start;
