@@ -554,6 +554,12 @@ pub(super) fn render_pane_map_content(
         // zoom other than the map's — i.e. whether a settle render is still owed.
         let mut settle_owed = false;
 
+        // The live theme, read once per frame and mixed into every overlay's
+        // cache token below. Reading it *here* — not caching it app-side — is
+        // what makes a theme flip re-rasterize on the very next frame: the
+        // token moves the moment the style does. See `overlay_cache_token`.
+        let is_dark = ui.ctx().global_style().visuals.dark_mode;
+
         for &kind in OverlayKind::all() {
             if ctx.overlays.render_mode(kind) != Some(RenderMode::Texture) {
                 continue;
@@ -564,7 +570,7 @@ pub(super) fn render_pane_map_content(
                 continue;
             }
             let enabled = ctx.pane.is_overlay_enabled(kind);
-            let token = overlay_cache_token(ctx.overlays, ctx.pane, kind);
+            let token = overlay_cache_token(ctx.overlays, ctx.pane, kind, is_dark);
             let has_data = ctx.overlays.has_data(kind);
             let cache = ctx.pane.overlay_cache_mut(kind);
             // Asked on every frame the overlay is live, and *not* gated on
@@ -697,13 +703,39 @@ pub(super) fn render_pane_map_content(
 /// pane's own `radar_sites_render_gen`, bumped when the egui context is torn
 /// down and every texture handle with it (`Gui::clear_graphics_state`).
 ///
+/// # The theme is a coordinate of the picture
+///
+/// Handlers rasterize *in* the theme: the SPC outlook's hatch colour, the GLM
+/// and storm-report glyphs, and the METAR station text all branch on
+/// `RasterizeContext::is_dark` at raster time. So a dark-mode raster and a
+/// light-mode raster of identical content are different pictures, and the
+/// token says so by XOR-ing in a fixed odd 64-bit constant when the theme is
+/// dark — distinct token per theme, applied uniformly to both arms (the
+/// `RadarSites` gen is bumped on a theme flip anyway, so the mix is redundant
+/// there — harmless, and uniformity beats a special case). The caller reads
+/// the live theme each frame, which is what makes a flip propagate on the
+/// next frame with no app-side plumbing; the collision worst case of the XOR
+/// is one redundant raster.
+///
+/// E5-forward: at E5 `is_dark` formalizes into `RenderKey` as a
+/// **handler-declared** `SelectKey` part — not universal. The radar's
+/// theme-independent 32-128 MiB `RenderCache` LRU must not flush on a theme
+/// flip; this fix keeps radar out of the theme term via the draw loop's
+/// radar skip, and E5 must preserve that.
+///
 /// [`OverlayHandler::content_signature`]: rustdar_overlays::render::overlay_state::OverlayHandler::content_signature
-fn overlay_cache_token(overlays: &OverlayRegistry, pane: &PaneState, kind: OverlayKind) -> u64 {
-    if kind == OverlayKind::RadarSites {
+fn overlay_cache_token(
+    overlays: &OverlayRegistry,
+    pane: &PaneState,
+    kind: OverlayKind,
+    is_dark: bool,
+) -> u64 {
+    let base = if kind == OverlayKind::RadarSites {
         pane.radar_sites_render_gen
     } else {
         overlays.content_signature(kind)
-    }
+    };
+    base ^ if is_dark { 0x9E37_79B9_7F4A_7C15 } else { 0 }
 }
 
 /// Render the radar image overlay, range ring, and hover tooltip (loop playback path) (loop playback path).
@@ -3049,3 +3081,7 @@ mod tests {
 #[path = "ui_map_pane/raster_registration_tests.rs"]
 #[cfg(test)]
 mod raster_registration_tests;
+
+#[path = "ui_map_pane/theme_flip_tests.rs"]
+#[cfg(test)]
+mod theme_flip_tests;

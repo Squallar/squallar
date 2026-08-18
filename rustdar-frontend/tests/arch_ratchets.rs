@@ -144,8 +144,11 @@ const UI_SETTER_MAX: usize = 23;
 /// Row 4a. WO-E9 (FieldId adoption) reaches 0.
 const PRODUCT_IN_EGUI_MAX: usize = 444;
 /// Row 5a. WO-M8 shrinks it; WO-M8c deletes the enum and re-shapes the
-/// metric to enum-absent in the same land.
-const KIND_MAX: usize = 762;
+/// metric to enum-absent in the same land. Re-baselined 762 -> 766 per the
+/// 2026-08-18 KIND_MAX amendment in the campaign log: WO-THEME's
+/// plan-mandated regression tests name the enum (+4, minimized); the
+/// ceiling ratchets only downward from 766.
+const KIND_MAX: usize = 766;
 /// Row 6. COUNT ceiling only — the shrink-only field-list pin lands at
 /// WO-E3 and is verified at WO-M13b; the hub stays at 18 (WO-E4.9's extract
 /// channel is orchestrator-local, not a hub pair).
