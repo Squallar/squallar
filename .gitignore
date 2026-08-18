@@ -23,3 +23,6 @@
 # developer and every CI row. An ignore rule on it means the fix for a silent
 # runtime failure is itself dropped silently.
 /.claude/worktrees/
+# The Tier-2 browser gate's run artifacts (screenshots, per-leg JSON, driver
+# logs). CI uploads them on failure; they must never land in the tree.
+/.github/browser-rig/out/
