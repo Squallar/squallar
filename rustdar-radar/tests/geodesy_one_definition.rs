@@ -1,7 +1,7 @@
 //! One planet for horizontal geodesy, enforced by scanning the workspace.
 //!
-//! `rustdar_radar::types::EARTH_RADIUS_KM` and the
-//! `rustdar_radar::types::KM_PER_DEGREE_LAT` derived from it are the *only*
+//! `rustdar_geo::EARTH_RADIUS_KM` and the
+//! `rustdar_geo::KM_PER_DEGREE_LAT` derived from it are the *only*
 //! sphere anything in this workspace may convert between degrees and ground
 //! kilometres on. That was not true: `render_gate` placed gates on 6371 while
 //! `ImageBounds`, the plan-view range ring, `volume.wgsl`'s floor and the
@@ -50,7 +50,7 @@
 //!
 //! # The Web Mercator latitude limit rides along
 //!
-//! `types::MERCATOR_LAT_LIMIT_DEG` — 85.051128779806°, the latitude whose
+//! `rustdar_geo::MERCATOR_LAT_LIMIT_DEG` — 85.051128779806°, the latitude whose
 //! projected `y` is exactly `π` — went the same way and for the same reason.
 //! Three modules each spelled it `85.05`: the tile helpers, `overlay_cache`
 //! and `rustdar-overlays`'s `render::rasterize`. Two were repaired one at a
@@ -106,20 +106,18 @@ const MERCATOR_BAND: &str = "mercator latitude limit";
 const ALLOWED: &[(&str, &str, &str)] = &[
     // ── The definition ──────────────────────────────────────────────────
     (
-        "rustdar-radar/src/types.rs",
+        "rustdar-geo/src/lib.rs",
         "pub const EARTH_RADIUS_KM: f64 = 6371.0;",
-        "THE definition. Everything horizontal is this sphere or an \
-         expression over it.",
+        "THE definition, in the workspace's geodesy floor. Everything \
+         horizontal is this sphere or an expression over it.",
     ),
     (
-        "rustdar-source/src/geo.rs",
+        "rustdar-geo/src/lib.rs",
         "pub const MERCATOR_LAT_LIMIT_DEG: f64 = 85.051_128_779_806_6;",
         "THE definition of the Web Mercator latitude limit, for the same \
-         reason and after the same three-copy history. `rustdar-egui`'s \
-         `tiles` re-exports this rather than restating it (through \
-         `rustdar_radar::types`' re-export), and `rustdar-overlays`'s \
-         `render::rasterize` reads it from `rustdar_source::geo`, so this is \
-         the only literal spelling in non-test code.",
+         reason and after the same three-copy history. Every other crate \
+         reaches it by re-export rather than restating it, so this is the \
+         only literal spelling in non-test code.",
     ),
     // ── Atmospheric refraction: a different physical quantity ───────────
     (
@@ -506,11 +504,11 @@ fn horizontal_geodesy_has_exactly_one_definition() {
         "{} site(s) name an earth radius, a kilometres-per-degree figure or \
          the Web Mercator latitude limit without saying why:\n\n{}\n\nIf this \
          is horizontal geodesy — turning degrees into ground kilometres or \
-         back — use `rustdar_radar::types::KM_PER_DEGREE_LAT` (or \
+         back — use `rustdar_geo::KM_PER_DEGREE_LAT` (or \
          `EARTH_RADIUS_KM` for a great circle) instead; that is the whole \
          reason it exists, and a second spelling puts the data and the map \
          under it on different planets. If it is the latitude Web Mercator \
-         ends at, use `rustdar_radar::types::MERCATOR_LAT_LIMIT_DEG`: `85.05` \
+         ends at, use `rustdar_geo::MERCATOR_LAT_LIMIT_DEG`: `85.05` \
          is 125.51 m short of it, and a clamp at one figure feeding a texture \
          placed at the other is the defect this band exists for. If it is \
          something else — a refraction model, a Level III twin's own \

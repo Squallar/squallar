@@ -97,7 +97,7 @@
 //! rather than trusting "always under one gate", which stops being true the
 //! moment a caller wants heights the troposphere does not have.
 //!
-//! # Horizontal geometry: 6371, spherical
+//! # Horizontal geometry: 6371, spherical — the sphere ops live in `rustdar-geo` now
 //!
 //! [`site_bearing_range_km`], [`great_circle_destination`] and
 //! [`great_circle_point`] measure on a sphere of
@@ -106,6 +106,14 @@
 //! drawn on a plan view lands on the ground the plan view put under the
 //! cursor. The map's hover readout reads [`site_bearing_range_km`] for exactly
 //! that reason.
+//!
+//! All three moved **verbatim** to `rustdar-geo` — the workspace's geometry
+//! floor, below even `rustdar-source` — at WO-G1, and are re-exported here
+//! under the paths this module always published them at, so `beam::`
+//! spellings and the tests' `use super::*` glob keep resolving. Their docs,
+//! the equirectangular error table and the antipodal guard's derivation
+//! travelled with them; the history stays here too, because it is this
+//! module's history:
 //!
 //! The first two of those are a matched pair, inverse and direct, and the plan
 //! view goes through the direct one: `render_gate` asks
@@ -197,7 +205,12 @@
 //! 6371-vs-6378 inconsistency [`crate::types::ImageBounds`] used to carry is a
 //! tenth of a pixel beside what was closed here.
 
-use crate::types::EARTH_RADIUS_KM;
+// The consuming sphere ops moved to `rustdar-geo` (WO-G1); this import stays
+// for `beam/tests.rs`' `use super::*` glob, and is `cfg(test)`-gated because
+// nothing in a non-test build uses it any more (rustc lints an unused
+// `pub(crate) use` too, measured at this land).
+#[cfg(test)]
+pub(crate) use crate::types::EARTH_RADIUS_KM;
 
 /// Effective earth radius under the standard 4/3 refraction model, km.
 ///
@@ -396,181 +409,14 @@ pub fn height_at_ground_km(ground_range_km: f64, elev_deg: f64) -> f64 {
     )
 }
 
-/// Initial great-circle bearing (degrees clockwise from true north, `0..360`)
-/// and surface distance (km) from a radar site to a geographic point.
-///
-/// The radar-relative polar coordinates of a point the user picked on a map:
-/// the bearing is the azimuth to steer, the distance is the ground range to
-/// walk. Haversine distance on [`EARTH_RADIUS_KM`] and the standard forward
-/// azimuth.
-///
-/// `ui_map::compute_hover_info_raw` used to compute the same pair inline for its
-/// hover readout and now calls this. The de-duplication is provably not a change
-/// to the readout: `the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
-/// carries the deleted spelling and compares bit patterns, and the one place the
-/// two forms *can* diverge — the clamp below, which the inline copy had no
-/// counterpart for — is measured there too.
-///
-/// Distance is a *ground* range, so pairing it with a slant-range gate index
-/// wants [`slant_range_for_ground_km`] in between.
-pub fn site_bearing_range_km(site_lat: f64, site_lon: f64, lat: f64, lon: f64) -> (f64, f64) {
-    let lat1 = site_lat.to_radians();
-    let lon1 = site_lon.to_radians();
-    let lat2 = lat.to_radians();
-    let lon2 = lon.to_radians();
-    let dlat = lat2 - lat1;
-    let dlon = lon2 - lon1;
-
-    // Clamped for the same reason `sites::distance_km` clamps: the haversine can
-    // round to a hair *over* 1.0 for a near-antipodal pair, and `(1.0 - a).sqrt()`
-    // is then `NaN` — which would come back as a `NaN` range rather than as the
-    // 20 015 km half-circumference it should be. Measured: 3.7 % of antipodal
-    // latitude pairs land above 1.0. Identity for anything closer than that.
-    let a = ((dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2))
-        .clamp(0.0, 1.0);
-    let range_km = EARTH_RADIUS_KM * 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-
-    let y = dlon.sin() * lat2.cos();
-    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let bearing_deg = (y.atan2(x).to_degrees() + 360.0) % 360.0;
-
-    (bearing_deg, range_km)
-}
-
-/// Where a point `ground_range_km` from the site along initial bearing
-/// `bearing_deg` actually is, as `(lat, lon)` in degrees — the exact inverse of
-/// [`site_bearing_range_km`].
-///
-/// The direct problem on the same [`EARTH_RADIUS_KM`] sphere the inverse one is
-/// solved on, so `site_bearing_range_km` composed with this is the identity to
-/// rounding (`a_bearing_and_range_round_trip_through_the_destination`, 3.9e-10 km
-/// over a 4-site × 3600-azimuth × 6-range sweep).
-///
-/// # This is what a gate's position *is*
-///
-/// A radar measures a bearing and a distance and nothing else, so a gate's
-/// geography is this function of them — there is no other definition available.
-/// The plan view used to place gates by walking `r·cos az` north and
-/// `r·sin az` east of the site and reading those off as degrees, which is an
-/// equirectangular approximation: it is the first-order expansion of the
-/// formula below and it drops the whole second-order term. Two things go wrong
-/// with it, both outward on the diagonals and both growing with the square of
-/// the range:
-///
-/// | site | range | worst displacement | worst range overrun |
-/// |---|---|---:|---:|
-/// | KTLX, 35.33°N |  88.8 km |  0.44 km | 0.17 km |
-/// | KTLX, 35.33°N | 460.0 km | 11.79 km | 4.81 km |
-/// | KMSX, 47.04°N | 460.0 km | 17.87 km | 7.27 km |
-///
-/// The overrun column is the one that had a consumer: a gate at the raster's
-/// declared extent came out *past* it, so the number a render reports did not
-/// bound the picture it hands over. The displacement column is the one a viewer
-/// sees — an echo drawn 12 km from the ground it fell on.
-///
-/// Distance is a **ground** range, matching [`site_bearing_range_km`]'s output
-/// and [`ground_range_km`]'s; a caller holding a slant range applies
-/// [`ground_range_km`] first.
-///
-/// [`crate::render`]'s rasterizers do not, and this line used to claim they
-/// did. They multiply by a hoisted `cos e` instead, which was the same answer
-/// while [`ground_range_km`] was the tangent plane and is no longer — the
-/// module doc's "Nothing spells the tangent plane any more" measures what that is
-/// worth and why the hoist cannot simply be swapped for a call.
-///
-/// A range past half the circumference wraps over the pole and keeps going,
-/// which is what the spherical formula means and not something to guard: no
-/// radar reaches 20 015 km. `NaN` in either coordinate propagates.
-pub fn great_circle_destination(
-    site_lat: f64,
-    site_lon: f64,
-    bearing_deg: f64,
-    ground_range_km: f64,
-) -> (f64, f64) {
-    let (sin_lat1, cos_lat1) = site_lat.to_radians().sin_cos();
-    let (sin_az, cos_az) = bearing_deg.to_radians().sin_cos();
-    let (sin_d, cos_d) = (ground_range_km / EARTH_RADIUS_KM).sin_cos();
-
-    // Clamped for the same reason the haversine is: the sum can round a hair
-    // past ±1 for a range landing on a pole, and `asin` of that is `NaN`.
-    let sin_lat2 = (sin_lat1 * cos_d + cos_lat1 * sin_d * cos_az).clamp(-1.0, 1.0);
-    let dlon = (sin_az * sin_d * cos_lat1).atan2(cos_d - sin_lat1 * sin_lat2);
-
-    (sin_lat2.asin().to_degrees(), site_lon + dlon.to_degrees())
-}
-
-/// The point a fraction `t` of the way from `a` to `b` along their great
-/// circle, as `(lat, lon)` in degrees. `t` outside `0..=1` extrapolates along
-/// the same circle.
-///
-/// Spherical interpolation, so the parameter is **angle** and the sphere's
-/// radius cancels out entirely — which is what makes it exact rather than
-/// merely consistent with [`site_bearing_range_km`]: a point at `t` along a
-/// line starting at the site sits at exactly `t` of that line's ground range
-/// (`a_fraction_along_a_line_is_that_fraction_of_its_ground_range`). A
-/// latitude-longitude lerp has neither property and bends visibly over a
-/// 460 km section.
-///
-/// Returns `a` when the two endpoints are coincident or antipodal, neither of
-/// which names a unique great circle. A cross-section never hits either, but
-/// both are reachable by hand and both fail *plausibly* rather than loudly if
-/// left alone: a coincident pair divides by zero, and an antipodal pair returns
-/// `(0.0, 0.0)`, a real place in the Gulf of Guinea. The guard's derivation and
-/// its 1.519 m reach are in the comment at the test itself.
-///
-/// A non-finite input is **not** caught. `hav` is then `NaN`, which fails both
-/// of the guard's comparisons, so `NaN` propagates to the result — the honest
-/// answer for a coordinate that was never a coordinate.
-pub fn great_circle_point(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
-    let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians());
-    let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians());
-
-    let dlat = lat2 - lat1;
-    let dlon = lon2 - lon1;
-    // Clamped for the reason given in `site_bearing_range_km`.
-    let hav = ((dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2))
-        .clamp(0.0, 1.0);
-    let d = 2.0 * hav.sqrt().atan2((1.0 - hav).sqrt());
-
-    // Refuse on `hav`, not on `sin d`, and with a threshold derived from the
-    // conditioning rather than from zero.
-    //
-    // `hav` is computed straight from the inputs and carries ~1 ulp of error.
-    // `d` does not: with `u = 1 − hav`, `d = π − 2√u + O(u^1.5)`, so `hav`'s
-    // last ulp lands on `d` amplified to ≈ ε/√u while the divisor `sin d` is
-    // only ≈ 2√u. The divisor's relative error is therefore ≈ ε/(2u), which
-    // passes 1 % once `u` drops under ~50ε — the direction of the "great
-    // circle" is noise below that, not merely undefined.
-    //
-    // Testing `d` or `sin d` instead is what a first attempt does and it does
-    // not work, because a truly antipodal pair does not reliably land `hav` on
-    // exactly 1.0. Measured over 3602 antipodal latitude pairs: 2922 (81.1 %)
-    // give exactly 1.0, 648 (18.0 %) one ulp below, 32 (0.89 %) two ulps below.
-    // `√(1 − hav)` turns even one ulp into `sin d ≈ 2e-8`, and two into
-    // `≈ 3e-8` — eight orders above `f64::EPSILON`. So `sin d == 0.0` catches
-    // **0** of the 3602, `|sin d| < f64::EPSILON` catches the 2922 that landed
-    // on 1.0 and misses all 680 that did not, and only the `hav` test
-    // catches every one. What leaks returns `(0.0, 0.0)` — null island, a real
-    // place in the Gulf of Guinea — which is the failure mode this guard exists
-    // to prevent.
-    //
-    // Cost in reach: the guard withdraws below a 1.519 m separation, 165× finer
-    // than one 250 m gate.
-    const MIN_CONDITIONING: f64 = 64.0 * f64::EPSILON;
-    if hav < MIN_CONDITIONING || 1.0 - hav < MIN_CONDITIONING {
-        return a;
-    }
-    let sin_d = d.sin();
-
-    let ka = ((1.0 - t) * d).sin() / sin_d;
-    let kb = (t * d).sin() / sin_d;
-
-    let x = ka * lat1.cos() * lon1.cos() + kb * lat2.cos() * lon2.cos();
-    let y = ka * lat1.cos() * lon1.sin() + kb * lat2.cos() * lon2.sin();
-    let z = ka * lat1.sin() + kb * lat2.sin();
-
-    (z.atan2(x.hypot(y)).to_degrees(), y.atan2(x).to_degrees())
-}
+/// The three sphere operations, defined verbatim in `rustdar-geo` (reached
+/// through [`rustdar_source::geo`]) and re-exported under the `beam::` paths
+/// this crate always published them at. The module doc above carries the move
+/// and their history; their own docs — the equirectangular error table, the
+/// clamp reasoning, the antipodal guard's derivation — travelled with them.
+pub use rustdar_source::geo::{
+    great_circle_destination, great_circle_point, site_bearing_range_km,
+};
 
 #[cfg(test)]
 mod tests;

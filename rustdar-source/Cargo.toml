@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 chrono = { workspace = true }
 reqwest = { workspace = true }
+# The geodesy floor: `src/geo.rs` re-exports it wholesale, so every
+# `rustdar_source::geo::` path keeps resolving while the definitions live one
+# crate further down. Charter: `tests/charter.rs`.
+rustdar-geo = { workspace = true }
 
 # `tls` installs the process-wide *ring* provider here: this is the lowest crate
 # in the graph that reaches a TLS handshake.
