@@ -76,6 +76,11 @@
 //! The IO runtime is split per target exactly as walkers splits it: a thread
 //! with a current-thread tokio runtime on native, `spawn_local` on wasm, where
 //! `reqwest` becomes a `fetch()` call and the browser owns the trust store.
+//!
+//! `spawn_local` means the "IO task" shares the page thread with the frame
+//! loop, so on wasm a completed fetch hands over its **compressed bytes**
+//! rather than a decoded tile, and the decode + texture upload runs in the
+//! frame pump under [`WASM_TILE_DECODES_PER_PUMP`] — see [`FetchPayload`].
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -164,6 +169,42 @@ pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
 /// [`MAX_PARALLEL_DOWNLOADS`] slots for as long as the process lives.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Tile decodes the frame side performs per **source** per **pass**, wasm32
+/// only.
+///
+/// On native this plays no part: the IO thread decodes and uploads off the
+/// frame thread, and the frame side only moves finished tiles into the cache.
+/// On wasm there is no other thread — `spawn_local` runs the fetch loop on the
+/// page itself — so before this bound existed every completed fetch decoded
+/// its PNG and uploaded its texture the moment it landed, and a pan that
+/// exposed a fresh row of tiles paid for up to [`MAX_PARALLEL_DOWNLOADS`]
+/// decode+upload rounds *per live source* in one stretch of the very thread
+/// the gesture runs on.
+///
+/// # The denominator
+///
+/// Every [`HttpsTiles`] owns its own [`DecodeBudget`], and the standard
+/// configuration drives two live sources a pass (base + labels), so the
+/// constraint a typical frame actually gets is **4** decode+upload rounds,
+/// not 2. A frame that runs a second pass (`egui::Context::request_discard`,
+/// up to `max_passes`) doubles its allowance again: the budget keys on
+/// `Context::cumulative_pass_nr`, which advances on discarded passes too.
+/// Against the pre-fix burst — up to 6 rounds per source, 12 across base +
+/// labels, in one stretch — every one of those figures is still a cut of 3×.
+///
+/// Two per source per pass keeps each source filling at ~120 tiles a second
+/// at 60 fps — that source's six in-flight downloads would each have to
+/// finish in under 50 ms to outpace it — while capping what one pass pays
+/// per source at two 256x256 decodes and uploads. The pump requests a
+/// repaint whenever it uses its whole allowance, so a backlog drains over
+/// idle frames rather than waiting for the next input.
+///
+/// Deliberately **capped inline, not offloaded**: tile PNGs behind the
+/// overlay worker's job round-trip would trade a bounded per-pass cost for
+/// seconds of blank basemap, and held-but-undrawn data is the one thing the
+/// map never shows.
+pub const WASM_TILE_DECODES_PER_PUMP: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Target-dependent bounds
 // ---------------------------------------------------------------------------
@@ -183,6 +224,21 @@ impl<T: TileSource + Send + Sync + 'static> AsyncTileSource for T {}
 pub trait AsyncTileSource: TileSource + 'static {}
 #[cfg(target_arch = "wasm32")]
 impl<T: TileSource + 'static> AsyncTileSource for T {}
+
+/// What one completed fetch hands the frame side.
+///
+/// Native: the decoded [`Tile`] — [`fetch_one`] decodes and uploads on the IO
+/// thread, off the frame thread, which is also where walkers does it.
+///
+/// wasm32: the compressed PNG bytes. `spawn_local` puts the fetch loop on the
+/// page thread, so decoding at completion time was frame-thread work at
+/// whatever burst size the network delivered; instead the frame pump decodes,
+/// at most [`WASM_TILE_DECODES_PER_PUMP`] per source per pass — see
+/// [`HttpsTiles::receive_fetched_tiles`].
+#[cfg(not(target_arch = "wasm32"))]
+type FetchPayload = Tile;
+#[cfg(target_arch = "wasm32")]
+type FetchPayload = Vec<u8>;
 
 /// Managed IO runtime for the tile fetch task.
 mod runtime {
@@ -369,13 +425,101 @@ pub struct HttpsTiles {
 
     /// Tiles the IO task should fetch.
     request_tx: Sender<TileId>,
-    /// Tiles the IO task has fetched and decoded.
-    tile_rx: Receiver<(TileId, Tile)>,
+    /// Tiles the IO task has fetched: decoded on native, compressed bytes on
+    /// wasm32, where this channel doubles as the decode queue the frame pump
+    /// drains under [`WASM_TILE_DECODES_PER_PUMP`].
+    tile_rx: Receiver<(TileId, FetchPayload)>,
+
+    /// wasm32 only: the context the frame pump decodes and uploads through,
+    /// and asks for the queue-draining repaint on. On native the IO thread
+    /// owns the context's clone instead.
+    #[cfg(target_arch = "wasm32")]
+    egui_ctx: Context,
+    /// wasm32 only: what is left of [`WASM_TILE_DECODES_PER_PUMP`] this pass.
+    #[cfg(target_arch = "wasm32")]
+    decode_budget: DecodeBudget,
 
     /// Declared last so it drops last: the channels above must close first, which
     /// is what tells the fetch loop to exit.
     #[expect(dead_code, reason = "owned for its Drop; shuts the IO task down")]
     runtime: runtime::Runtime,
+}
+
+/// One source's per-pass decode allowance, wasm32 only.
+///
+/// [`Tiles::at`] runs once per visible tile per pass, and the pump runs at the
+/// top of every call — so a per-*call* bound of two would let one pass's many
+/// calls drain the whole backlog two at a time, which is no bound on the pass
+/// at all. The pass number is what turns the bound per-pass: the first call
+/// of a new pass restores the full allowance, every later call in the same
+/// pass gets only what is left. Per *source* because each [`HttpsTiles`]
+/// owns one of these — the frame-level constraint that adds up to is stated
+/// on [`WASM_TILE_DECODES_PER_PUMP`], denominator and all.
+///
+/// Compiled on native for the tests (the wasm pump itself never compiles
+/// there; there is no web behavioural gate in this workspace), which is why
+/// the cfg is `any(test, target_arch = "wasm32")`.
+#[cfg(any(test, target_arch = "wasm32"))]
+struct DecodeBudget {
+    /// The pass [`Self::spent`] counts within.
+    pass_nr: u64,
+    /// Decodes already performed in [`Self::pass_nr`].
+    spent: usize,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl DecodeBudget {
+    fn new() -> Self {
+        Self {
+            pass_nr: 0,
+            spent: 0,
+        }
+    }
+
+    /// Decodes still allowed in `pass_nr`, resetting the count when the pass
+    /// has moved on since the last call.
+    fn remaining(&mut self, pass_nr: u64) -> usize {
+        if pass_nr != self.pass_nr {
+            self.pass_nr = pass_nr;
+            self.spent = 0;
+        }
+        WASM_TILE_DECODES_PER_PUMP.saturating_sub(self.spent)
+    }
+
+    /// Record `taken` decodes performed against the allowance.
+    fn record(&mut self, taken: usize) {
+        self.spent += taken;
+    }
+}
+
+/// Move at most `budget` completed fetches out of `rx`, handing each to `take`.
+///
+/// Returns how many were taken — counted here, where the work happens, which
+/// is what the budget test pins. Stops early when the channel is empty; a
+/// closed channel is the IO task gone, logged exactly as
+/// [`HttpsTiles::receive_one_fetched_tile`] logs it, because both mean the
+/// same thing.
+///
+/// Compiled on native for the tests, like [`DecodeBudget`]; the native frame
+/// path keeps its own one-per-call [`HttpsTiles::receive_one_fetched_tile`]
+/// untouched.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn drain_up_to<T>(rx: &mut Receiver<T>, budget: usize, mut take: impl FnMut(T)) -> usize {
+    let mut taken = 0;
+    while taken < budget {
+        match rx.try_recv() {
+            Ok(item) => {
+                take(item);
+                taken += 1;
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Closed) => {
+                log::error!("the tile IO task is gone");
+                break;
+            }
+        }
+    }
+    taken
 }
 
 impl HttpsTiles {
@@ -420,6 +564,11 @@ impl HttpsTiles {
         let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
 
+        // The frame pump needs the context too on wasm: it is the decoding
+        // side there. See `FetchPayload`.
+        #[cfg(target_arch = "wasm32")]
+        let frame_ctx = egui_ctx.clone();
+
         let runtime = runtime::spawn(fetch_continuously(
             source, client, request_rx, tile_tx, egui_ctx,
         ));
@@ -431,6 +580,10 @@ impl HttpsTiles {
             cache: LruCache::new(cache_entries),
             request_tx,
             tile_rx,
+            #[cfg(target_arch = "wasm32")]
+            egui_ctx: frame_ctx,
+            #[cfg(target_arch = "wasm32")]
+            decode_budget: DecodeBudget::new(),
             runtime,
         }
     }
@@ -440,6 +593,7 @@ impl HttpsTiles {
     /// One per call, as walkers does: this runs every frame for every visible
     /// tile, and draining the whole channel here would put an unbounded number of
     /// texture uploads in one frame.
+    #[cfg(not(target_arch = "wasm32"))]
     fn receive_one_fetched_tile(&mut self) {
         match self.tile_rx.try_recv() {
             Ok((tile_id, tile)) => {
@@ -447,6 +601,53 @@ impl HttpsTiles {
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Closed) => log::error!("the tile IO task is gone"),
+        }
+    }
+
+    /// Decode, upload and cache at most this pass's remaining allowance of
+    /// fetched tiles. The wasm32 counterpart of
+    /// [`Self::receive_one_fetched_tile`].
+    ///
+    /// The bytes waited in the channel; this is the only place they become a
+    /// texture, and [`DecodeBudget`] is what keeps a burst of completed
+    /// fetches from billing one pass for this source's whole backlog at once
+    /// — the pan lag [`WASM_TILE_DECODES_PER_PUMP`] describes, denominator
+    /// included. The put is unconditional,
+    /// exactly as a native tile arriving is: an entry whose pending marker was
+    /// evicted while the bytes waited is re-admitted as the freshest entry,
+    /// and a decode failure leaves the `None` marker meaning what it always
+    /// means — failed, do not ask again.
+    #[cfg(target_arch = "wasm32")]
+    fn receive_fetched_tiles(&mut self) {
+        let Self {
+            cache,
+            tile_rx,
+            egui_ctx,
+            decode_budget,
+            ..
+        } = self;
+
+        let budget = decode_budget.remaining(egui_ctx.cumulative_pass_nr());
+        let taken = drain_up_to(tile_rx, budget, |(tile_id, bytes): (TileId, Vec<u8>)| {
+            // `Style::default()` for the reason `fetch_one` gives on native.
+            #[allow(
+                clippy::default_constructed_unit_structs,
+                reason = "keeps compiling if walkers/mvt is ever enabled"
+            )]
+            match Tile::new(&bytes, &Style::default(), tile_id.zoom, egui_ctx) {
+                Ok(tile) => {
+                    cache.put(tile_id, Some(tile));
+                }
+                Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
+            }
+        });
+        decode_budget.record(taken);
+
+        if budget > 0 && taken == budget {
+            // The whole allowance went, so more completions may be waiting.
+            // Ask for a frame: this is what drains a backlog while the user
+            // is idle instead of leaving tiles hostage to the next input.
+            egui_ctx.request_repaint();
         }
     }
 
@@ -544,7 +745,10 @@ impl Tiles for HttpsTiles {
     /// Called once per visible tile per frame by walkers' flood fill, so
     /// everything here is cheap and non-blocking.
     fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
+        #[cfg(not(target_arch = "wasm32"))]
         self.receive_one_fetched_tile();
+        #[cfg(target_arch = "wasm32")]
+        self.receive_fetched_tiles();
 
         if !tile_id_is_valid(tile_id) {
             return None;
@@ -571,12 +775,14 @@ impl Tiles for HttpsTiles {
 // The IO task
 // ---------------------------------------------------------------------------
 
-/// Download, decode and upload one tile.
+/// Download one tile — and on native, decode and upload it too.
 ///
-/// Decoding happens here, on the IO runtime, rather than on the UI thread —
-/// which is also where walkers does it. [`Tile::new`] performs the PNG decode and
-/// the [`egui::Context::load_texture`] call; `Context` is `Send + Sync` and locks
-/// internally, so uploading from this thread is sound.
+/// On native, decoding happens here, on the IO runtime, rather than on the UI
+/// thread — which is also where walkers does it. [`Tile::new`] performs the PNG
+/// decode and the [`egui::Context::load_texture`] call; `Context` is
+/// `Send + Sync` and locks internally, so uploading from this thread is sound.
+/// On wasm32 the IO "runtime" *is* the UI thread, so the bytes are handed over
+/// undecoded — [`FetchPayload`] tells that story.
 ///
 /// The error is a `String` because the decode error type, walkers' `TileError`,
 /// is not exported from walkers and so cannot be named here. Nothing acts on
@@ -584,9 +790,16 @@ impl Tiles for HttpsTiles {
 async fn fetch_one<S: TileSource>(
     source: &S,
     client: &reqwest::Client,
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            unused_variables,
+            reason = "on wasm the frame pump decodes; see FetchPayload"
+        )
+    )]
     egui_ctx: &Context,
     tile_id: TileId,
-) -> Result<(TileId, Tile), String> {
+) -> Result<(TileId, FetchPayload), String> {
     let url = source.tile_url(tile_id);
     log::trace!("downloading '{url}'");
 
@@ -608,14 +821,19 @@ async fn fetch_one<S: TileSource>(
     // on it is a real struct with fields, `&Style` stops compiling, and
     // `default()` keeps working. Writing the unit literal would make this file
     // silently depend on a feature of a dependency staying disabled.
+    #[cfg(not(target_arch = "wasm32"))]
     #[allow(
         clippy::default_constructed_unit_structs,
         reason = "keeps compiling if walkers/mvt is ever enabled"
     )]
-    let tile = Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
+    let payload = Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
         .map_err(|error| format!("decoding '{url}': {error}"))?;
 
-    Ok((tile_id, tile))
+    // On wasm the decode belongs to the frame pump, under its budget.
+    #[cfg(target_arch = "wasm32")]
+    let payload = body.to_vec();
+
+    Ok((tile_id, payload))
 }
 
 /// Serve tile requests until [`HttpsTiles`] is dropped.
@@ -632,7 +850,7 @@ async fn fetch_continuously<S: TileSource>(
     source: S,
     client: reqwest::Client,
     mut request_rx: Receiver<TileId>,
-    mut tile_tx: Sender<(TileId, Tile)>,
+    mut tile_tx: Sender<(TileId, FetchPayload)>,
     egui_ctx: Context,
 ) {
     let mut outstanding = FuturesUnordered::new();
