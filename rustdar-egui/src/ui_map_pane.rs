@@ -2585,11 +2585,7 @@ fn render_per_frame_overlay(
 
     for pt in points {
         // Fast geo-bounds rejection before the costly projection.
-        if pt.lat < geo_bounds.min_lat
-            || pt.lat > geo_bounds.max_lat
-            || pt.lon < geo_bounds.min_lon
-            || pt.lon > geo_bounds.max_lon
-        {
+        if !geo_bounds.contains_point(pt.lat, pt.lon) {
             continue;
         }
 

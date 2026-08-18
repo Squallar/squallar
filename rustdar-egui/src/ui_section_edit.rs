@@ -355,22 +355,15 @@ pub(crate) fn bearing_deg(line: SectionLine) -> f64 {
 /// anything outside it, and a translation across the antimeridian is a place a
 /// section can legitimately go.
 fn destination(from: GeoPoint, bearing_deg: f64, distance_km: f64) -> GeoPoint {
-    let ang = distance_km / rustdar_radar::types::EARTH_RADIUS_KM;
-    let bearing = bearing_deg.to_radians();
-    let lat1 = from.lat.to_radians();
-    let lat2 = (lat1.sin() * ang.cos() + lat1.cos() * ang.sin() * bearing.cos()).asin();
-    let lon2 = from.lon.to_radians()
-        + (bearing.sin() * ang.sin() * lat1.cos()).atan2(ang.cos() - lat1.sin() * lat2.sin());
-    let mut lon = lon2.to_degrees();
+    let (lat, lon_raw) =
+        rustdar_radar::beam::great_circle_destination(from.lat, from.lon, bearing_deg, distance_km);
+    let mut lon = lon_raw;
     if lon > 180.0 {
         lon -= 360.0;
     } else if lon < -180.0 {
         lon += 360.0;
     }
-    GeoPoint {
-        lat: lat2.to_degrees(),
-        lon,
-    }
+    GeoPoint { lat, lon }
 }
 
 /// The line rebuilt about `mid` with the given bearing and half-length — the

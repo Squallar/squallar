@@ -314,38 +314,72 @@ impl GeoBounds {
             && self.min_lon <= other.max_lon
             && self.max_lon >= other.min_lon
     }
+
+    /// Whether `(lat, lon)` is inside the box, **inclusive on all four
+    /// edges** — a point exactly on an edge is contained, matching
+    /// [`GeoBounds::intersects`]'s own inclusivity.
+    ///
+    /// Spelled as the negation of the reject test rather than as a
+    /// conjunction of `>=`/`<=` on purpose: the two hand-rolled copies this
+    /// replaced (the HRRR hover's and the station-picker's) were both
+    /// written as "reject when any coordinate is out", and under a `NaN`
+    /// coordinate the two spellings differ — every ordering against `NaN` is
+    /// false, so the reject form lets a `NaN` point through to the caller's
+    /// own arithmetic (where it fails the distance test or projects to a
+    /// `NaN` the next check drops) while the conjunction form would silently
+    /// swallow it here. Convergence has to be the identity, so this keeps
+    /// the reject form's answer.
+    pub fn contains_point(&self, lat: f64, lon: f64) -> bool {
+        !(lat < self.min_lat || lat > self.max_lat || lon < self.min_lon || lon > self.max_lon)
+    }
+
+    /// The workspace's one min/max bounds fold: the tightest box around
+    /// every `(lat, lon)` yielded, `None` when the iterator yields nothing.
+    ///
+    /// `f64::min`/`f64::max` never adopt a `NaN` — a `NaN` vertex leaves
+    /// every edge where it was, exactly as the `if lat < min_lat` spelling
+    /// it also replaced (in the HRRR domain-extent pass) behaved: an
+    /// ordering against `NaN` is false, so neither form admits one. The
+    /// `None` on emptiness is what the streaming copy did *not* have — it
+    /// fell through to a `{MAX, MIN, MAX, MIN}` box for its caller to trip
+    /// over; refusal is the honest form, and the caller states its own
+    /// error.
+    pub fn from_points(points: impl IntoIterator<Item = (f64, f64)>) -> Option<GeoBounds> {
+        let mut min_lat = f64::MAX;
+        let mut max_lat = f64::MIN;
+        let mut min_lon = f64::MAX;
+        let mut max_lon = f64::MIN;
+        let mut any = false;
+
+        for (lat, lon) in points {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+            any = true;
+        }
+
+        if any {
+            Some(GeoBounds {
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// `None` when there is not a single vertex.
 pub fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
-    let mut any = false;
-
-    for polygon in polygons {
-        for ring in polygon {
-            for &(lat, lon) in ring {
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                any = true;
-            }
-        }
-    }
-
-    if any {
-        Some(GeoBounds {
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
-        })
-    } else {
-        None
-    }
+    GeoBounds::from_points(
+        polygons
+            .iter()
+            .flatten()
+            .flat_map(|ring| ring.iter().copied()),
+    )
 }
 
 /// The latitude Web Mercator ends at: the one whose projected `y` is exactly
@@ -420,4 +454,88 @@ pub fn mercator_y_from_sin_lat(sin_lat: f64) -> f64 {
     // one that survives `s == 1.0` as `+∞` rather than depending on a libm's
     // choice there.
     0.5 * ((1.0 + sin_lat) / (1.0 - sin_lat)).ln()
+}
+
+/// The one inverse Web Mercator: the latitude, in **radians**, whose
+/// [`lat_rad_to_mercator_y`] is `merc_y` — the Gudermannian, `atan(sinh y)`.
+///
+/// # Why this spelling and not `2·atan(eʸ) − π/2`
+///
+/// The projection has two textbook inverses and the workspace held one copy
+/// of each: `rustdar-egui`'s tile math spells `atan ∘ sinh` (the form
+/// `walkers` and every slippy-tile reference implementation use, and the one
+/// the mercantile reference vectors in `tiles/tests.rs` pin), while
+/// `rustdar-overlays`' rasterizer spelled `2·atan(eʸ) − π/2`. They agree to
+/// an ulp across the projection's working range, so the choice is which
+/// copy's bits survive — and it is the tile form, for two reasons. It keeps
+/// the tile path bit-identical, so the reference vectors that anchor the
+/// grid to mercantile keep passing unedited when that path delegates here.
+/// And it computes a pole-adjacent latitude directly rather than as the
+/// small difference of two quantities the size of `π` — `atan(eʸ)` saturates
+/// toward `π/2` as `y` grows, so the doubled-and-shifted form reaches a
+/// latitude near `+π/2` by cancellation while `atan(sinh y)` lands on it in
+/// one rounding.
+///
+/// Total, like the forward function: `±∞` maps to `±π/2` (the poles the
+/// forward form sends to `±∞`) and `NaN` propagates. Degrees are the
+/// caller's own `.to_degrees()`, matching [`lat_rad_to_mercator_y`] taking
+/// radians.
+pub fn mercator_y_to_lat_rad(merc_y: f64) -> f64 {
+    merc_y.sinh().atan()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bit-level distance between two finite `f64`s, in units in the last
+    /// place: their positions in the monotonic order all finite doubles
+    /// admit. Sign-symmetric (`-0.0` and `+0.0` are 0 apart).
+    fn ulp_distance(a: f64, b: f64) -> u64 {
+        fn ordered(x: f64) -> i64 {
+            let bits = x.to_bits() as i64;
+            if bits < 0 {
+                i64::MIN.wrapping_sub(bits)
+            } else {
+                bits
+            }
+        }
+        ordered(a).abs_diff(ordered(b))
+    }
+
+    /// [`mercator_y_to_lat_rad`] inverts [`lat_rad_to_mercator_y`] to within
+    /// 4 ulps at ±60°, ±45° and the equator — latitudes chosen to sit outside
+    /// every literal band the geodesy scan guards, so this file stays free of
+    /// banded numbers.
+    ///
+    /// Measured on this pipeline: ±45° and −60° round-trip **exactly**, +60°
+    /// is 1 ulp out; the 4-ulp ceiling is headroom over that, not a hope.
+    ///
+    /// The equator is asserted in absolute terms because the ulp metric
+    /// degenerates at zero: the forward projection computes `ln(tan(π/4))`,
+    /// whose result carries the ~2⁻⁵³ absolute rounding floor of `tan` near
+    /// 1, and every representable double between 0 and that floor counts as
+    /// an ulp — no finite-precision implementation could meet a raw 4-ulp
+    /// bound there. Measured: the round trip lands at −2⁻⁵³ radians exactly
+    /// (half an epsilon, ~0.7 picometres of meridian); the bound allows four
+    /// times that, mirroring the headroom the ulp arm gets.
+    #[test]
+    fn the_inverse_mercator_round_trips_the_forward() {
+        for lat_deg in [-60.0_f64, -45.0, 0.0, 45.0, 60.0] {
+            let lat_rad = lat_deg.to_radians();
+            let back = mercator_y_to_lat_rad(lat_rad_to_mercator_y(lat_rad));
+            if lat_rad == 0.0 {
+                assert!(
+                    back.abs() <= 2.0 * f64::EPSILON,
+                    "equator round trip landed {back:e} rad from 0"
+                );
+            } else {
+                let ulps = ulp_distance(lat_rad, back);
+                assert!(
+                    ulps <= 4,
+                    "{lat_deg}° round trip is {ulps} ulps out: {lat_rad:e} -> {back:e}"
+                );
+            }
+        }
+    }
 }

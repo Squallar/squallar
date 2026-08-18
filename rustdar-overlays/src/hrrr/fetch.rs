@@ -388,34 +388,8 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
 
     // One streaming pass for the bounds: nothing is retained, so the 30 MB of
     // coordinates this used to build never exists.
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
-
-    for index in 0..coords.len() {
-        let Some((lat, lon)) = coords.at(index) else {
-            break;
-        };
-        if lat < min_lat {
-            min_lat = lat;
-        }
-        if lat > max_lat {
-            max_lat = lat;
-        }
-        if lon < min_lon {
-            min_lon = lon;
-        }
-        if lon > max_lon {
-            max_lon = lon;
-        }
-    }
-
-    let bounds = GeoBounds {
-        min_lat,
-        max_lat,
-        min_lon,
-        max_lon,
+    let Some(bounds) = GeoBounds::from_points((0..coords.len()).map_while(|i| coords.at(i))) else {
+        return Err("GRIB2 grid decoded no coordinates".into());
     };
     // Here, not in the rasterizer: this is where a *domain* first states its
     // extent, and the person who changed the domain is standing here.
