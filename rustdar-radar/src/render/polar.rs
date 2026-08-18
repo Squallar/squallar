@@ -502,22 +502,22 @@ impl PolarField {
     /// **The guard in `rustdar_web` does not cover this function, and the one
     /// that does is
     /// `tests::the_polar_wire_layout_is_the_one_this_protocol_ships`.**
-    /// `rustdar_web`'s `the_worker_reply_shape_is_the_one_this_protocol_version_declares`
+    /// `rustdar_web`'s `the_worker_reply_shape_is_the_one_this_build_ships`
     /// scrapes the *field names* of the worker's reply object, so it fires when
     /// a reply grows or loses a field. These bytes travel **inside** one of
     /// those fields, so changing this encoding leaves the field set identical
-    /// and that guard silent — measured: the header grew an `f64` at protocol
-    /// version 8 and it did not fire. The digest test beside this module pins
-    /// the bytes themselves, so an edit here goes red; what it *cannot* do is
-    /// check that `PROTOCOL_VERSION` was raised, because that constant is
-    /// `#[cfg(target_arch = "wasm32")]` in a crate downstream of this one.
-    /// Whoever edits this function still bumps it by hand, and the digest is
-    /// what makes sure they are asked. The mismatch it prevents is a page and a
-    /// worker on opposite sides of a deploy exchanging a buffer they lay out
-    /// differently. `from_bytes` length-checks would turn most such pairs into
-    /// `None` and a quiet readout rather than a wrong one, but "degrades
-    /// quietly" is the exact failure the version number exists to convert into
-    /// a clean termination.
+    /// and that guard silent — measured: the header once grew an `f64` and it
+    /// did not fire. The digest test beside this module pins the bytes
+    /// themselves, so an edit here goes red. A page and a worker on opposite
+    /// sides of a *deploy* cannot exchange a buffer they lay out differently:
+    /// their build tokens differ by `GITHUB_SHA` and the pair refuses at the
+    /// HELLO handshake. What no instrument covers is a **local** pair
+    /// differing only in these nested bytes — the local token digests the
+    /// framing rows (`rustdar_frontend::wire_identity`), deliberately not the
+    /// payloads inside the reply's fields — so such a pair still attaches;
+    /// `from_bytes` length-checks turn most mismatches into `None` and a
+    /// quiet readout rather than a wrong one, the accepted residual
+    /// `wire_identity`'s module doc records.
     pub fn to_bytes(&self) -> Vec<u8> {
         let g = &self.geometry;
         let mut out = Vec::with_capacity(Self::HEADER + g.wedges.len() * 8 + self.values.len() * 4);

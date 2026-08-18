@@ -3804,13 +3804,14 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// load-bearing *between* builds.
 ///
 /// Between builds is where it is the only defence — **in a dev build**.
-/// `rustdar-web`'s page/worker handshake is `build_token =
-/// version/PROTOCOL_VERSION/GITHUB_SHA`, and `GITHUB_SHA` is absent outside
-/// CI, so locally it degrades to `…/dev` and a stale worker shares a token
-/// with a fresh page. In a deployed build the SHA differs across the deploy
+/// `rustdar-web`'s page/worker handshake compares `build_token`: in a
+/// deployed build it carries `GITHUB_SHA`, the SHA differs across the deploy
 /// boundary, the tokens disagree, and `worker_port::handle_message` terminates
 /// the worker at the HELLO handshake — before any payload is exchanged, so
-/// this constant is never reached. `RDVX` has
+/// this constant is never reached. Locally there is no SHA and the token
+/// folds the wire's pinned framing rows (`rustdar_frontend::wire_identity`),
+/// deliberately not this nested payload — so a stale worker differing only
+/// here still shares a token with a fresh page. `RDVX` has
 /// never been bumped, so the exposure is the *first* bump being forgotten:
 /// a layout change that reorders two same-width fields — the three `f64`
 /// axis ranges, or `site` against them — round-trips perfectly through its

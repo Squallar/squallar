@@ -2763,13 +2763,17 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// and the constant is only load-bearing *between* builds.
 ///
 /// Between builds is where it is the only defence. `rustdar-web`'s
-/// page/worker handshake is `build_token = version/PROTOCOL_VERSION/
-/// GITHUB_SHA`, and `GITHUB_SHA` is absent outside CI, so it degrades to
-/// `…/dev` and a stale worker shares a token with a fresh page. If a layout
-/// change forgets the bump — reordering two same-width `f64` axis fields is
-/// the easy one, since it round-trips perfectly through its own build's
-/// codec — the stale worker's payload decodes into the new field order
-/// silently, and a section is drawn with its axes swapped.
+/// page/worker handshake compares `build_token`; in a deployed build it
+/// carries `GITHUB_SHA`, so pairs across a deploy boundary refuse each
+/// other at the HELLO handshake. Locally there is no SHA and the token
+/// folds the wire's pinned framing rows
+/// (`rustdar_frontend::wire_identity`), deliberately not this nested
+/// payload — so a stale worker differing only here still shares a token
+/// with a fresh page. If a layout change forgets the bump — reordering two
+/// same-width `f64` axis fields is the easy one, since it round-trips
+/// perfectly through its own build's codec — the stale worker's payload
+/// decodes into the new field order silently, and a section is drawn with
+/// its axes swapped.
 ///
 /// So the literal is written twice on purpose: once as the constant, once
 /// as the bytes on the wire. Mirrors `render_input`'s
