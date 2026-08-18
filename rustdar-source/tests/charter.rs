@@ -67,8 +67,16 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 }
 
 /// The substrate stays a substrate: its dependency set may not grow past the
-/// charter. `[dependencies]` ⊆ {rustdar-units, chrono, serde, web-time,
-/// reqwest, rustls, log}; dev additionally {tokio, serde_json}; no build deps.
+/// charter. `[dependencies]` ⊆ {rustdar-geo, rustdar-units, chrono, serde,
+/// web-time, reqwest, rustls, log}; dev additionally {tokio, serde_json}; no
+/// build deps.
+///
+/// `rustdar-geo` entered the ceiling at WO-G1 (the Phase 2G rustdar-geo
+/// insertion, campaign plan amendment of 2026-08-18) — the written amendment
+/// the failure message below demands: the horizontal geodesy this crate's
+/// `geo` module used to define moved down to the workspace's geometry floor,
+/// and the module re-exports it wholesale so every path above keeps
+/// resolving.
 ///
 /// A ⊆ ceiling and not equality on purpose: the charter *allows* the unlisted
 /// members (serde arrives with later steps) without requiring them. The floor
@@ -77,6 +85,7 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 #[test]
 fn the_dependency_ceiling_holds() {
     const NORMAL_CEILING: &[&str] = &[
+        "rustdar-geo",
         "rustdar-units",
         "chrono",
         "serde",

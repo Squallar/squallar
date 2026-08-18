@@ -6,7 +6,6 @@ use nexrad_model::data::Radial;
 use nexrad_model::data::Scan;
 use rustdar_units::{Quantity, UserPreferences};
 use std::collections::HashMap;
-use std::f64::consts::PI;
 
 /// The wasm32 side length, named **outside** the [`IMAGE_SIZE`] cascade so that
 /// it is reachable from a host build's tests.
@@ -366,62 +365,15 @@ pub fn data_limited_side_px(extent_km: f64, sample_km: f64) -> usize {
     (at_reference.max(at_nyquist).ceil() as usize).max(1)
 }
 
-/// Mean radius of Earth in kilometers — the IUGG mean radius, and the one
-/// sphere every *horizontal* measurement in this workspace stands on.
-///
-/// # This is the horizontal-geodesy radius, not a propagation radius
-///
-/// Three different quantities in this crate are spelled with a number near
-/// 6371 and they are not interchangeable:
-///
-/// * **This one.** Degrees ↔ kilometres on the ground: where a gate is
-///   painted, where the image bounds fall, how far the cursor is from the
-///   site, where a cross-section's ground track runs. One sphere, because
-///   the *only* thing that matters is that the data and the map under it
-///   agree; see [`KM_PER_DEGREE_LAT`].
-/// * **[`crate::beam::RE_EFF_KM`]**, `6371 · 4/3`. An atmospheric refraction
-///   model that happens to be derived from the same figure. Changing it is a
-///   change to beam physics, not to geodesy.
-/// * **The `1.21 · 6371` Level III models** in [`crate::eet`],
-///   [`crate::dpprep`] and [`crate::hca`]. Each reproduces an RPG product
-///   bit-for-bit and each says so at its own constant.
-///
-/// `rustdar-radar/tests/geodesy_one_definition.rs` is the guard that keeps
-/// the first of those three from acquiring a fourth spelling; it carries the
-/// reason for every other site in the workspace that names one of these
-/// numbers.
-pub const EARTH_RADIUS_KM: f64 = 6371.0;
-
-/// Kilometres per degree of latitude on [`EARTH_RADIUS_KM`]: 111.194927 km.
-///
-/// **Derived, never written down.** This is the workspace's single conversion
-/// between angle and ground distance, and it is an expression over
-/// [`EARTH_RADIUS_KM`] precisely so that no caller can hold a different
-/// planet from the one [`crate::render::render_gate`] paints gates on. The
-/// only copy that is not this expression is `volume.wgsl`'s, which cannot
-/// see Rust; `rustdar-frontend`'s
-/// `the_shaders_km_per_degree_is_the_radar_crates_own` pins that literal to
-/// this value.
-///
-/// # It used to be 111.32, and 111.32 is the equatorial figure
-///
-/// `ImageBounds::from_radar_site` and everything downstream of it — the
-/// plan-view range ring, the volume floor, the region-drag preview — spelled
-/// `111.32`, which is a degree on a 6378.1 km (WGS-84 *equatorial*) sphere,
-/// while the radar data itself was placed on 6371. The gap is 0.11 %: 0.26 km
-/// at the 230 km raster edge, biased one way rather than averaging out, so
-/// echoes sat consistently outside the geography drawn under them and the
-/// error grew with range.
-///
-/// Neither figure is "correct" — a real degree of latitude runs 110.57 km at
-/// the equator to 111.69 km at the poles — so the choice is consistency, not
-/// accuracy. It resolved to 6371 because that is the sphere the *data* is on
-/// (`render_gate`, [`crate::beam::site_bearing_range_km`],
-/// `great_circle_point`, the voxel builder): framing follows the data rather
-/// than the other way round. It is also the better of the two figures for
-/// the latitudes this application serves — a degree at 35–45 °N is
-/// 110.94–111.13 km, which 111.195 misses by ~0.1 % and 111.32 by ~0.25 %.
-pub const KM_PER_DEGREE_LAT: f64 = EARTH_RADIUS_KM * PI / 180.0;
+/// The horizontal-geodesy sphere and its degree ↔ kilometre conversion,
+/// defined in `rustdar-geo` — the workspace's geometry floor, reached through
+/// [`rustdar_source::geo`]'s re-export — and re-exported under the paths this
+/// crate always published them at (`sites`, `render`, `xsect` and the voxel
+/// builder all read them as `crate::types::`). The constants' own docs carry
+/// the one-sphere reasoning and the 111.32 history;
+/// `rustdar-radar/tests/geodesy_one_definition.rs` still guards against a
+/// second spelling anywhere in the workspace.
+pub use rustdar_source::geo::{EARTH_RADIUS_KM, KM_PER_DEGREE_LAT};
 
 /// m/s to mph conversion factor.
 pub const MS_TO_MPH: f32 = 2.23694;

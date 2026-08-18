@@ -4236,6 +4236,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustdar-geo"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "rustdar-gps"
 version = "0.1.0"
 dependencies = [
@@ -4321,6 +4328,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "reqwest 0.13.4",
+ "rustdar-geo",
  "rustls",
  "serde_json",
  "tokio",

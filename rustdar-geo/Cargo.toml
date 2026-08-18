@@ -1,0 +1,15 @@
+[package]
+name = "rustdar-geo"
+version.workspace = true
+edition.workspace = true
+
+# Empty on purpose, and pinned that way: rustdar-geo is the workspace's
+# arithmetic floor -- pure geometry over std. `tests/charter.rs` holds the
+# ceiling; a dependency lands here only after the charter in that test and the
+# plan change first, in writing.
+[dependencies]
+
+[dev-dependencies]
+# `tests/charter.rs` parses `cargo metadata` output to pin this crate's
+# (empty) dependency ceiling and the floor-under-substrate graph edge.
+serde_json = { workspace = true }
