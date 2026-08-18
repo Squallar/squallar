@@ -3,7 +3,9 @@
 //! `spawn_overlay_render`'s handler arm used to close over a rasterize
 //! closure and hand it to the opaque funnel, whose wasm arm ran it inline on
 //! the browser's one thread — 224 ms of measured gesture-end stall for the
-//! layer set these kinds make up. These pin the replacement, per kind: the
+//! layer set these kinds make up (measured at main@ebe0ad3b, 2026-08-12
+//! web-baseline campaign; instrumentation 3673d316). These pin the
+//! replacement, per kind: the
 //! dispatch asks the handler for its described input (`prepare_job`), builds
 //! a `JobRequest::Overlay`, and hands it to the funnel — so a browser with a
 //! worker attached posts it across the port instead of paying the raster on
