@@ -106,7 +106,10 @@ fn a_poll_no_pane_can_use_is_not_scheduled_for() {
     let mut gui = Gui::new();
     only_the_radar_poll(&mut gui);
     polled(&mut gui, INTERVAL * 4);
-    gui.set_viewing_live_for_pane(0, false);
+    gui.apply(crate::shell_api::GuiEvent::ViewingLiveForPane {
+        pane_idx: 0,
+        live: false,
+    });
 
     assert!(
         !gui.is_any_pane_live(),
@@ -144,7 +147,7 @@ fn a_fetch_in_flight_yields_the_wake_to_whatever_ends_it() {
     let mut gui = Gui::new();
     only_the_radar_poll(&mut gui);
     polled(&mut gui, INTERVAL * 2);
-    gui.set_fetching(true);
+    gui.apply(crate::shell_api::GuiEvent::Fetching(true));
 
     assert_eq!(gui.auto_poll_delay(), None);
 }

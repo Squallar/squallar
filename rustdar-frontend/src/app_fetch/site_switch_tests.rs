@@ -674,7 +674,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
 
 /// The switch ends the accumulation; it does not weaken it.
 ///
-/// `apply_chunk_scan_info` unions a partial volume's products and tilts into
+/// The `ChunkScanInfo` event unions a partial volume's products and tilts into
 /// what the pane holds and never removes one, so the picker does not shrink and
 /// regrow every few seconds as a live volume fills. That union is right
 /// *within* one site and only within one — this walks both halves in order: the
@@ -688,20 +688,22 @@ fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() 
     switch_to(&mut app, TDWR);
 
     // The surveillance cut, then the first Doppler cut of the same volume.
-    app.gui.apply_chunk_scan_info(
-        TDWR,
-        tdwr_chunk_scan_info(&[(RadarProduct::Reflectivity, &[0.3])], 5),
-    );
-    app.gui.apply_chunk_scan_info(
-        TDWR,
-        tdwr_chunk_scan_info(
-            &[
-                (RadarProduct::Reflectivity, &[0.5]),
-                (RadarProduct::Velocity, &[0.5]),
-            ],
-            6,
-        ),
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ChunkScanInfo {
+            site: (TDWR).to_owned(),
+            info: tdwr_chunk_scan_info(&[(RadarProduct::Reflectivity, &[0.3])], 5),
+        });
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ChunkScanInfo {
+            site: (TDWR).to_owned(),
+            info: tdwr_chunk_scan_info(
+                &[
+                    (RadarProduct::Reflectivity, &[0.5]),
+                    (RadarProduct::Velocity, &[0.5]),
+                ],
+                6,
+            ),
+        });
 
     let info = app
         .gui

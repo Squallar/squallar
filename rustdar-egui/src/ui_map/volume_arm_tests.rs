@@ -18,7 +18,10 @@ fn volume_harness(painter: StubVolumePainter) -> (InputHarness, Arc<StubVolumePa
     h.set_pane_count(2);
     h.make_pane_volume(1);
     h.load_scan("KTLX");
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.frames_for(2, FRAME_DT);
     (h, painter)
 }
@@ -113,7 +116,10 @@ fn a_volume_pane_with_no_scan_names_the_site_it_is_waiting_for() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.make_pane_volume(1);
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.frames_for(2, FRAME_DT);
 
     let outcome = h.volume_arms()[0].outcome.clone().expect("an empty state");
@@ -144,7 +150,10 @@ fn a_pane_with_no_published_stamp_does_not_build_from_the_plan_views_scan() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.make_pane_volume(1);
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.load_scan("KTLX");
     // The plan view's volume is on screen; the App has published no stamp
     // for this site. `load_scan` fills both halves — it stands in for a
@@ -195,7 +204,10 @@ fn the_target_names_the_published_stamp_rather_than_the_displayed_time() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.make_pane_volume(1);
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.load_scan("KTLX");
     let shown = h
         .gui_mut()
@@ -232,8 +244,8 @@ fn the_target_names_the_published_stamp_rather_than_the_displayed_time() {
 /// on the pane's own `scan_info.timestamp`.
 ///
 /// Staged through the two setters the host really uses — `handle_navigate_time`
-/// calls `set_viewing_live_for_pane(idx, false)` and the scan drain calls
-/// `set_scan_info_for_site` with the volume that came back. The published
+/// applies `ViewingLiveForPane { live: false }` and the scan drain applies
+/// `ScanInfoForSite` with the volume that came back. The published
 /// stamp is deliberately left where it was: on a chunk-fed site the feed
 /// goes on sealing sweeps and the stamp never moves backwards at all,
 /// which is the state the report came from.
@@ -243,7 +255,10 @@ fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.make_pane_volume(1);
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.load_scan("KTLX");
     let live = h
         .gui_mut()
@@ -265,13 +280,17 @@ fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
     // The scrub. Half an hour back, which is several volumes.
     //
     // Every pane on the site, because that is what a navigation does: the
-    // scan drain's `set_scan_info_for_site` writes the site's panes and
+    // scan drain's `ScanInfoForSite` event writes the site's panes and
     // `propagate_layer_sync` converges `viewing_live` across the time-linked
     // group. Writing pane 1 alone would be undone by that pass before the
     // frame drew, which is not a state production can be in.
     let scrubbed = live - chrono::Duration::minutes(30);
     for idx in 0..2 {
-        h.gui_mut().set_viewing_live_for_pane(idx, false);
+        h.gui_mut()
+            .apply(crate::shell_api::GuiEvent::ViewingLiveForPane {
+                pane_idx: idx,
+                live: false,
+            });
         h.gui_mut()
             .pane_mut(idx)
             .expect("a pane")
@@ -1765,7 +1784,9 @@ fn volume_pane_harness() -> InputHarness {
     h.set_pane_count(2);
     h.make_pane_volume(1);
     h.gui_mut()
-        .set_volume_painter(Some(Arc::new(StubVolumePainter::painting())));
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(Arc::new(
+            StubVolumePainter::painting(),
+        ))));
     h.load_scan("KTLX");
     h.frames_for(2, FRAME_DT);
     h
@@ -1877,7 +1898,10 @@ fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(1);
     h.load_scan("KTLX");
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.frames_for(2, FRAME_DT);
     assert_eq!(
         h.pane_kinds(),
@@ -1937,7 +1961,10 @@ fn two_3d_panes_get_two_strips_that_cannot_collide() {
     h.make_pane_volume(0);
     h.make_pane_volume(1);
     h.load_scan("KTLX");
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.frames_for(2, FRAME_DT);
 
     let screen = h.screen_rect();
@@ -2050,7 +2077,10 @@ fn ground_witness_harness() -> (InputHarness, Arc<StubVolumePainter>) {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(1);
     h.load_scan("KTLX");
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
     h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
     h.gui_mut()
         .pane_mut(0)
@@ -2939,7 +2969,9 @@ fn a_double_tap_drag_zooms_a_3d_panes_ground_without_spinning_its_box() {
     h.load_scan("KTLX");
     h.make_pane_volume(0);
     h.gui_mut()
-        .set_volume_painter(Some(Arc::new(StubVolumePainter::painting())));
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(Arc::new(
+            StubVolumePainter::painting(),
+        ))));
     h.warm_up();
 
     let start = h.pane_rects()[0].center();

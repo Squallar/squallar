@@ -431,7 +431,8 @@ fn a_loop_still_fetching_its_listing_keeps_its_window() {
 fn the_volume_a_pane_is_viewing_survives_with_no_loop_naming_it() {
     let mut app = app_on_site();
     let info = rustdar_radar::types::ScanInfo::from_scan(&empty_scan(), SITE, at(3), None);
-    app.gui.set_scan_info_for_pane(0, info);
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane { pane_idx: 0, info });
     app.loop_mgr.cache_scan(SITE, at(3), volume());
     app.loop_mgr.cache_scan(SITE, at(9), volume());
     assert!(
@@ -640,7 +641,8 @@ fn paired_objects_no_live_frame_names_are_not_kept() {
 fn a_departed_sites_day_listings_go_and_a_shown_sites_stay() {
     let mut app = app_on_site();
     let info = rustdar_radar::types::ScanInfo::from_scan(&empty_scan(), SITE, at(0), None);
-    app.gui.set_scan_info_for_pane(0, info);
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane { pane_idx: 0, info });
     app.loop_mgr
         .cache_l3_keys(SITE, "EET", vec!["TLX_EET_2024_01_01_00_00_30".to_string()]);
     app.loop_mgr.cache_l3_keys(

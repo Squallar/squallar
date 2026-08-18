@@ -198,8 +198,8 @@ fn a_completed_volume_re_renders_every_whole_volume_pane() {
 
 /// The rest of the branch, which is what the site reset exists to serve.
 ///
-/// `scan_info` moved to the completed volume — `set_scan_info_for_site`, the
-/// wide form, not the mid-volume merge — and the volume reached the loop
+/// `scan_info` moved to the completed volume — the `ScanInfoForSite` event,
+/// the wide form, not the mid-volume merge — and the volume reached the loop
 /// cache under its own start time, which is the frame an active loop takes.
 #[test]
 fn a_completed_volume_reaches_the_scan_info_and_the_loop_cache() {
@@ -253,7 +253,8 @@ fn a_completed_volume_replaces_the_scan_info_rather_than_merging_into_it() {
         .entry(product)
         .or_default()
         .push(9.9);
-    app.gui.set_fetching(true);
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::Fetching(true));
 
     app.apply_chunk_outcome("KTLX", &closing_round(5));
 

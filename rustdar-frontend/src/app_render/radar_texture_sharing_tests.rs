@@ -71,22 +71,23 @@ fn point_at_tilts(
     pane.site = site.to_string();
     pane.selected_product = product;
     pane.selected_elevation = tilts[0];
-    app.gui.set_scan_info_for_pane(
-        pane_idx,
-        rustdar_radar::types::ScanInfo {
-            site: radar,
-            site_source: rustdar_radar::site_position::SitePositionSource::Table,
-            site_position: None,
-            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
-                .unwrap()
-                .and_hms_opt(18, 30, 0)
-                .unwrap(),
-            vcp_number: 212,
-            available_products: vec![product],
-            product_elevations,
-            status: String::new(),
-        },
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx,
+            info: rustdar_radar::types::ScanInfo {
+                site: radar,
+                site_source: rustdar_radar::site_position::SitePositionSource::Table,
+                site_position: None,
+                timestamp: chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+                    .unwrap()
+                    .and_hms_opt(18, 30, 0)
+                    .unwrap(),
+                vcp_number: 212,
+                available_products: vec![product],
+                product_elevations,
+                status: String::new(),
+            },
+        });
 }
 
 /// A finished render landing on the channel for `pane_idx`, then drained.

@@ -58,7 +58,10 @@ fn a_partial_volume_does_not_shrink_the_tilt_list() {
     let mut gui = gui_with(full);
 
     // The next volume has only completed its lowest cut.
-    gui.apply_chunk_scan_info("KTLX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KTLX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+    });
 
     let merged = gui.pane(0).unwrap().scan_info.clone().unwrap();
     assert_eq!(
@@ -90,7 +93,10 @@ fn a_partial_volume_keeps_the_level3_products_already_registered() {
     );
     let mut gui = gui_with(existing);
 
-    gui.apply_chunk_scan_info("KTLX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KTLX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+    });
 
     let merged = gui.pane(0).unwrap().scan_info.clone().unwrap();
     assert!(
@@ -112,10 +118,10 @@ fn a_partial_volume_keeps_the_level3_products_already_registered() {
 #[test]
 fn a_newly_seen_tilt_is_added_to_the_list() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
-    gui.apply_chunk_scan_info(
-        "KTLX",
-        info(5, &[(RadarProduct::Reflectivity, &[0.5, 6.4])]),
-    );
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KTLX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5, 6.4])]),
+    });
     assert_eq!(
         gui.pane(0)
             .unwrap()
@@ -139,7 +145,10 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     let backed_off = gui.auto_poll.interval_secs;
     assert!(backed_off > 60, "the fixture must actually be backed off");
 
-    gui.apply_chunk_scan_info("KTLX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KTLX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+    });
 
     assert!(
         gui.radar.fetching,
@@ -151,13 +160,16 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     );
 }
 
-/// The one behaviour it does share with `set_scan_info_for_site`: with
+/// The one behaviour it does share with the `ScanInfoForSite` event: with
 /// chunks feeding live mode, the first data of a session arrives here.
 #[test]
 fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
     gui.initial_zoom_set = false;
-    gui.apply_chunk_scan_info("KTLX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KTLX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+    });
     assert!(gui.initial_zoom_set);
 }
 
@@ -169,7 +181,10 @@ fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
 fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
     gui.initial_zoom_set = false;
-    gui.apply_chunk_scan_info("KABX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KABX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+    });
     assert!(
         !gui.initial_zoom_set,
         "a volume for a site no pane is on spent the latch"
@@ -181,7 +196,10 @@ fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
 fn a_chunk_update_only_reaches_its_own_site() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
     gui.pane_mut(0).unwrap().site = "KOUN".to_string();
-    gui.apply_chunk_scan_info("KTLX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
+        site: "KTLX".to_owned(),
+        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+    });
     assert_eq!(
         gui.pane(0).unwrap().scan_info.as_ref().unwrap().timestamp,
         at(0)

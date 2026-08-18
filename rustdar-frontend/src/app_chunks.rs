@@ -478,7 +478,7 @@ impl super::App {
                 outcome.sealed_elevations
             );
         }
-        // Deliberately absent on both paths: `set_radar_config`, which belongs
+        // Deliberately absent on both paths: a `RadarConfig` event, which belongs
         // to user navigation and would drag the time picker along every few
         // seconds, and `manual_nav_pending`, which would trigger
         // `reinit_active_loops` and re-list the whole lookback window per round.

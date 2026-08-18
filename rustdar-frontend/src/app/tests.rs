@@ -2288,7 +2288,11 @@ fn scan_info_for(site: &str) -> ScanInfo {
 fn a_volume_no_pane_is_showing_is_dropped() {
     let mut app = headless(TestBridge::desktop());
     app.gui.pane_mut(0).unwrap().site = "KTLX".to_string();
-    app.gui.set_scan_info_for_pane(0, scan_info_for("KTLX"));
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx: 0,
+            info: scan_info_for("KTLX"),
+        });
     for site in ["KTLX", "KOUN"] {
         app.scan_data.insert(
             site.to_string(),
@@ -2481,7 +2485,11 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
 #[test]
 fn the_volume_a_switching_pane_is_still_drawing_survives() {
     let mut app = headless(TestBridge::desktop());
-    app.gui.set_scan_info_for_pane(0, scan_info_for("KTLX"));
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx: 0,
+            info: scan_info_for("KTLX"),
+        });
     app.gui.pane_mut(0).unwrap().site = "KOUN".to_string();
     app.scan_data.insert(
         "KTLX".to_string(),

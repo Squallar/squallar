@@ -50,7 +50,11 @@
 //!      push to Gui::apply / the per-frame FrameInputs compose)
 //!  1b  ... excluding test-named paths                  186  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' -g '!*tests*' | wc -l
 //!      (198 at E0c; same land)
-//!  2   Gui setter fns in rustdar-egui/src/ui.rs         23  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
+//!  2   Gui setter fns in rustdar-egui/src/ui.rs          3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
+//!      (23 at E0c; WO-E2 Land 2 deleted the 18 converted setters plus
+//!      apply_chunk_scan_info and clear_gps_fix, and demoted the two
+//!      armed-toggles to pub(crate) — the three chunk-settings setters
+//!      remain until WO-E8b reaches 0)
 //!  3   wasm-cfg lines per crate                          -  for c in rustdar-frontend rustdar-radar rustdar-egui rustdar-web rustdar-overlays; do
 //!      [RECORDED, NOT ASSERTED]                             printf '%s ' "$c"; rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs' \
 //!      frontend 165, radar 54, egui 40, web 31,             | awk -F: '{s+=$2} END {print s+0}'; done
@@ -144,8 +148,9 @@ const SELF_GUI_MAX: usize = 192;
 /// Row 1b — the same needle outside test-named paths. 198 -> 186 at WO-E2
 /// Land 1.
 const SELF_GUI_NON_TEST_MAX: usize = 186;
-/// Row 2. WO-E2 Land 2 leaves 3; WO-E8b reaches 0.
-const UI_SETTER_MAX: usize = 23;
+/// Row 2. Lowered 23 -> 3 at WO-E2 Land 2 (the chunk-settings setters
+/// remain); WO-E8b reaches 0.
+const UI_SETTER_MAX: usize = 3;
 /// Row 4a. WO-E9 (FieldId adoption) reaches 0.
 const PRODUCT_IN_EGUI_MAX: usize = 444;
 /// Row 5a. WO-M8 shrinks it; WO-M8c deletes the enum and re-shapes the

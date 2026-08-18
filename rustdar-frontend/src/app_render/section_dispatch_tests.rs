@@ -189,19 +189,20 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
         pane.set_kind(PaneKind::CrossSection);
         pane.cross_section_mut().unwrap().line = Some(line());
     }
-    app.gui.set_scan_info_for_pane(
-        0,
-        ScanInfo {
-            site,
-            site_source: rustdar_radar::site_position::SitePositionSource::Table,
-            site_position: None,
-            timestamp: volume_time(),
-            vcp_number: 212,
-            available_products: vec![product],
-            product_elevations: std::collections::HashMap::new(),
-            status: String::new(),
-        },
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx: 0,
+            info: ScanInfo {
+                site,
+                site_source: rustdar_radar::site_position::SitePositionSource::Table,
+                site_position: None,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![product],
+                product_elevations: std::collections::HashMap::new(),
+                status: String::new(),
+            },
+        });
     app.render.ensure_pane_count(1);
     // Into the substrate's base holder, and deliberately **not** into
     // `scan_data`: sections cut from the merged current volume, and a
@@ -1336,7 +1337,7 @@ fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
 /// live feed fails here on the premise rather than passing for the wrong
 /// reason. And `product_elevations` is left **untouched** across the growth,
 /// because that is the source this discriminator was first written against
-/// and it is wrong: `Gui::apply_chunk_scan_info` merges angles in and never
+/// and it is wrong: the `ChunkScanInfo` event merges angles in and never
 /// removes one, so after a session's first complete volume the pane already
 /// knows the whole VCP and the count never moves again.
 #[test]

@@ -4867,7 +4867,7 @@ fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
 
 /// 23. **Host safe-area insets reach the chrome.**
 ///
-///     `set_safe_area_insets` -> `LayoutCtx::resolve` -> the root `Ui`'s
+///     the insets fact -> `LayoutCtx::resolve` -> the root `Ui`'s
 ///     rect, which is what insets every nested `Panel`. That last hop was
 ///     untested: dropping `.max_rect(..)` leaves the chrome under the
 ///     status bar, and nothing in the suite ever set an inset.
@@ -6615,7 +6615,8 @@ fn a_scan_arriving_moves_no_widget_id() {
     // Roughly a Fold 7 inner screen: wide enough for the long status bar,
     // too narrow for the sidebar, which is where this was seen.
     let mut h = InputHarness::with_screen(egui::vec2(750.0, 900.0));
-    h.gui_mut().set_fetching(true);
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::Fetching(true));
     h.warm_up();
     assert!(
         h.status_bar().poll_chip.is_none(),
@@ -6753,10 +6754,12 @@ fn crossing_a_breakpoint_re_keys_nothing() {
 #[test]
 fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.gui_mut().set_error("boom".to_owned());
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::Error("boom".to_owned()));
     // `set_error` ends the fetch, so put it back: the transition under test
     // is the auto-poll spinner (three widgets) becoming the chip (one).
-    h.gui_mut().set_fetching(true);
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::Fetching(true));
     h.warm_up();
     assert!(
         h.status_bar().poll_chip.is_none(),
@@ -6921,7 +6924,8 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
     // from what the active pane is viewing.
     let mut config = h.gui_mut().get_radar_config().clone();
     config.site = "KDMX".to_owned();
-    h.gui_mut().set_radar_config(config);
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::RadarConfig(config));
     h.warm_up();
     assert_eq!(
         h.gui_mut().active_pane().site,
@@ -9743,8 +9747,7 @@ fn a_back_press_cancels_the_armed_modal_drag() {
 fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Prompt, false);
+    h.set_location_state(rustdar_gps::LocationPermission::Prompt, false);
     h.warm_up();
     assert!(
         h.painted_text_strings()
@@ -9755,8 +9758,7 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
         h.painted_text_strings()
     );
 
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9787,8 +9789,7 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
 fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Granted, true);
+    h.set_location_state(rustdar_gps::LocationPermission::Granted, true);
     h.warm_up();
     let painted = h.painted_text_strings();
     assert!(
@@ -9798,8 +9799,7 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
 
     // Revoked in system settings. Nothing in this crate was told to change
     // its mind; the cached state simply moved underneath it.
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9820,8 +9820,7 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
 fn a_platform_without_location_is_told_so_and_offered_nothing() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Unavailable, false);
+    h.set_location_state(rustdar_gps::LocationPermission::Unavailable, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9853,8 +9852,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
 
     let mut h = InputHarness::new();
     h.open_settings();
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9864,7 +9862,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
              to open one. Painted: {painted:?}"
     );
 
-    h.gui_mut().set_location_settings_available(true);
+    h.set_location_settings_available(true);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9881,7 +9879,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
         rustdar_gps::LocationPermission::Unknown,
         rustdar_gps::LocationPermission::Unavailable,
     ] {
-        h.gui_mut().set_location_state(state, false);
+        h.set_location_state(state, false);
         h.warm_up();
         let painted = h.painted_text_strings();
         assert!(
@@ -9908,8 +9906,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
 fn a_linux_refusal_names_the_setting_that_would_undo_it() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9932,8 +9929,7 @@ fn a_linux_refusal_names_the_setting_that_would_undo_it() {
 fn a_granted_permission_with_no_fix_yet_says_so() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.gui_mut()
-        .set_location_state(rustdar_gps::LocationPermission::Granted, true);
+    h.set_location_state(rustdar_gps::LocationPermission::Granted, true);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9943,8 +9939,7 @@ fn a_granted_permission_with_no_fix_yet_says_so() {
              'On.'. Painted: {painted:?}"
     );
 
-    h.gui_mut()
-        .set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+    h.set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -10593,7 +10588,7 @@ fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     // A deliberately non-default budget, so a caption printing the default
     // could not pass by coincidence.
-    h.gui_mut().set_loop_frame_budget(12);
+    h.set_loop_frame_budget(12);
     h.mouse_click(h.timeline().expander.center());
     h.warm_up();
 
@@ -12483,7 +12478,9 @@ fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
 #[test]
 fn the_phone_error_toast_sits_under_the_top_bar_and_its_cross_dismisses() {
     let mut h = phone();
-    h.gui_mut().set_error("the feed went away".to_owned());
+    h.gui_mut().apply(crate::shell_api::GuiEvent::Error(
+        "the feed went away".to_owned(),
+    ));
     h.warm_up();
 
     let toast = h.error_toast().expect("an error must put the toast up");
@@ -12520,7 +12517,9 @@ fn the_phone_error_toast_sits_under_the_top_bar_and_its_cross_dismisses() {
 fn the_phone_error_toast_stays_visible_and_dismissible_over_an_open_sheet() {
     let mut h = phone();
     h.open_catalog();
-    h.gui_mut().set_error("the feed went away".to_owned());
+    h.gui_mut().apply(crate::shell_api::GuiEvent::Error(
+        "the feed went away".to_owned(),
+    ));
     h.warm_up();
 
     let toast = h
@@ -13394,7 +13393,9 @@ fn the_sheet_host_draws_no_duplicate_headers() {
 fn the_error_surface_stays_visible_while_faded() {
     // Wide: the status bar goes, the toast carries the error.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.gui_mut().set_error("the feed went away".to_owned());
+    h.gui_mut().apply(crate::shell_api::GuiEvent::Error(
+        "the feed went away".to_owned(),
+    ));
     h.warm_up();
     assert!(
         h.error_toast().is_none(),
@@ -13416,7 +13417,9 @@ fn the_error_surface_stays_visible_while_faded() {
 
     // Phone: the toast stays up through the fade.
     let mut h = phone();
-    h.gui_mut().set_error("the feed went away".to_owned());
+    h.gui_mut().apply(crate::shell_api::GuiEvent::Error(
+        "the feed went away".to_owned(),
+    ));
     h.warm_up();
     assert!(h.error_toast().is_some(), "precondition: the toast is up");
     h.mouse_click(h.pane_rects()[0].center());

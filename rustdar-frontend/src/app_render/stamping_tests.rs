@@ -107,19 +107,20 @@ pub(super) fn app_showing_site() -> crate::app::App {
         .expect("KMPX is a real radar")
         .clone();
     app.gui.pane_mut(0).unwrap().site = SITE.to_string();
-    app.gui.set_scan_info_for_pane(
-        0,
-        ScanInfo {
-            site,
-            site_source: rustdar_radar::site_position::SitePositionSource::Table,
-            site_position: None,
-            timestamp: volume_time(),
-            vcp_number: 212,
-            available_products: vec![PRODUCT],
-            product_elevations: std::collections::HashMap::new(),
-            status: String::new(),
-        },
-    );
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
+            pane_idx: 0,
+            info: ScanInfo {
+                site,
+                site_source: rustdar_radar::site_position::SitePositionSource::Table,
+                site_position: None,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![PRODUCT],
+                product_elevations: std::collections::HashMap::new(),
+                status: String::new(),
+            },
+        });
     app.render.ensure_pane_count(1);
     app
 }
