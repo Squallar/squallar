@@ -127,7 +127,7 @@ jobs:
       # IOKit.
       #
       # Note `--all-targets` also compiles rustdar-web/tests/{pwa_assets,
-      # sw_behaviour}.rs and rustdar-frontend/tests/wgpu_guard.rs here, so a
+      # sw_behaviour}.rs and rustdar-gpu/tests/wgpu_guard.rs here, so a
       # future host-only integration test in either crate would fail this row
       # spuriously -- gate any such test on `cfg(not(target_arch = "wasm32"))`.
       - name: Verify the autofixed tree still builds (wasm32)

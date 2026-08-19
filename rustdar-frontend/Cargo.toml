@@ -19,11 +19,11 @@ rustdar-egui = { workspace = true }
 # resolver moved down at WO-RD; this crate reads its budgets from below.
 rustdar-device-profile = { workspace = true }
 # The wgpu boundary: the egui renderer, texture upload, pane mirror, staging
-# ring and device-request policy moved down at WO-RG. NOTE (interim): this
-# crate still carries its own wgpu feature-chooser and per-target backend
-# blocks below — app.rs still owns the instance creation and the single-wgpu
-# guard until WO-RV land 3 moves them into rustdar-gpu. The redundancy is
-# deliberate and temporary.
+# ring and device-request policy moved down at WO-RG; the wgpu feature-chooser,
+# per-target backend blocks and the single-wgpu guard followed at WO-RV land 3.
+# This crate deliberately has NO direct `wgpu` dependency — every `wgpu::`
+# value rides `egui_wgpu::wgpu`, and rustdar-gpu's manifest is the one
+# feature-chooser for the whole graph.
 rustdar-gpu = { workspace = true }
 # The 3D volume stack: probe/latch, raymarch, staging, uniforms, blue noise,
 # degrade policy and the bridge moved down at WO-RV.
@@ -52,7 +52,6 @@ rustdar-nmea-serial = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 chrono = { workspace = true }
 # The volume grid's texel encoder writes `Rg16Float`; see the workspace note.
-half = { workspace = true }
 egui = { workspace = true }
 # Defaults are off at the workspace level, because egui-wgpu's `default` set
 # contains `wgpu/default` -- and that contains `webgpu`, which this build must
@@ -71,18 +70,6 @@ nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
-# Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
-# re-export. This entry is not there to be imported from; it exists to *choose
-# wgpu's features*, which egui-wgpu cannot express (it offers only the blanket
-# `wgpu/default`, and that drags in `webgpu`).
-#
-# `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
-# asks for. The backends are per target, below. There is no `webgpu` on any
-# target: `rustdar_frontend::app` pins `Backends::GL` on wasm32 and Firefox has
-# no stable WebGPU, so compiling that backend would only add an untested second
-# rendering path -- and, until the workspace pin was fixed, a duplicate set of
-# WebGPU bindings that broke `wasm-bindgen` outright.
-wgpu = { workspace = true, features = ["std", "wgsl"] }
 ewebsock = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -93,9 +80,6 @@ serde_json = { workspace = true }
 # so the web build spawns onto that instead. See `App::spawn_detached`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
-# `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
-# anything where there are threads to contend, so the browser does not take it.
-wgpu = { workspace = true, features = ["parking_lot"] }
 
 # `clipboard` pulls `arboard`, which has no wasm backend at all -- it fails to
 # compile rather than degrading. `wayland`/`x11` are likewise meaningless in a
@@ -115,62 +99,22 @@ egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x
 [target.'cfg(target_os = "ios")'.dependencies]
 egui-winit = { workspace = true, features = ["links"] }
 
-# The native backend set, split the way wgpu's own build.rs splits it.
-#
-# Each of these features is a no-op on targets the corresponding backend does not
-# support -- wgpu-hal gates the actual implementations by target -- so listing
-# them per platform is documentation as much as it is resolution. It does keep
-# wgpu-core from enabling backends that could never run, which is what the old
-# blanket `wgpu/default` did.
-#
-# `vulkan` and `gles` are the pair wgpu itself calls the "native Vulkan"/"native
-# OpenGL" platforms. Note `gles` deliberately does NOT cover the browser: WebGL
-# is a separate `webgl` feature, requested in the wasm32 section below.
-[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
-wgpu = { workspace = true, features = ["vulkan", "gles"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-wgpu = { workspace = true, features = ["dx12"] }
-
-# Metal is the only backend wgpu will use on Apple targets without an explicit
-# MoltenVK/ANGLE opt-in (`vulkan-portability` / `angle`), neither of which this
-# project wants. `macos-window-resize-jitter-fix` is scoped here for the same
-# reason -- egui-wgpu reads it only under `cfg(target_os = "macos")`.
+# `macos-window-resize-jitter-fix` is scoped here because egui-wgpu reads it
+# only under `cfg(target_os = "macos")`. The per-target wgpu BACKEND blocks
+# that used to sit here moved to rustdar-gpu at WO-RV land 3 — that manifest
+# is the one feature-chooser for the whole graph.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 egui-wgpu = { workspace = true, features = ["macos-window-resize-jitter-fix"] }
-wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 egui-winit = { workspace = true, features = ["links"] }
-# The whole browser backend set: WebGL2 and nothing else.
-#
-# `webgl` is what `Backends::GL` resolves to on wasm32; the native `gles` feature
-# explicitly excludes the browser, so this is not a duplicate of the section
-# above. `webgpu` is absent on purpose and must stay absent.
-#
 # `fragile-send-sync-non-atomic-wasm` makes egui-wgpu's `CallbackResources` the
 # concurrent `TypeMap` and wgpu's handles `Send + Sync` on a target that has no
 # threads to be unsound about. Without it the browser build stops compiling.
-wgpu = { workspace = true, features = ["webgl"] }
+# (The browser wgpu backend itself — `webgl`, never `webgpu` — is chosen by
+# rustdar-gpu's manifest since WO-RV land 3.)
 egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
 # Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.126).
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.
 wasm-bindgen-futures = "=0.4.76"
-
-# Target-gated for the reason rustdar-web's dev-dependencies are: a plain
-# `[dev-dependencies]` entry is built for every target under `--all-targets`.
-#
-# `syn` parses `src/app.rs` in `tests/wgpu_guard.rs`. Same 3.0.3 the proc-macro
-# crates already resolve, so this adds no package -- and being a dev-dependency
-# it reaches no shipped artifact.
-#
-# `naga` translates `src/volume.wgsl` to GLSL ES 300 in `tests/volume_shader.rs`
-# -- the one check that says what a WebGL2 browser will actually be handed. See
-# the workspace manifest for why it is a direct dependency rather than reached
-# through wgpu. The gate here is the wasm32 clippy row: the test file is
-# `#![cfg(not(target_arch = "wasm32"))]`, so on that target the dependency would
-# be built and then used by nothing.
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-naga = { workspace = true }
-syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }
