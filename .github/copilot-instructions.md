@@ -8,12 +8,12 @@ Keep this document, `features.md`, and `data.md` updated when architecture or fe
 
 ## Workspace Architecture
 
-Cargo workspace (`resolver = "2"`, edition 2024) with ten crates:
+Cargo workspace (`resolver = "2"`, edition 2024) with sixteen first-party crates (plus `nexrad-level3` and three vendored members):
 
 | Crate | Role |
 |---|---|
-| `rustdar-frontend` | The portable half of the application: winit application handler, wgpu/egui renderer, fetch and render dispatch, app state. `app.rs` orchestrates lifecycle with `#[path]` submodules `app_fetch.rs` and `app_render.rs`. Defines the `PlatformBridge` trait that per-OS crates implement. |
-| `rustdar` | Binary (`rustdar`) + lib (`rustdar_native`, rlib+cdylib). Desktop, Android and iOS entry points: the event loop bootstrap (`run.rs`), the concrete `PlatformBridge` implementations, and the cfg(android) module tree (`src/android/`) that owns every JNI bridge — insets, compass, location, back handling, theme detection, `android_main` — and injects the callback-shaped ones into the bridge. No portable code — that lives in `rustdar-frontend`, which this crate depends on (never the other way round). |
+| `rustdar-app` | The portable half of the application: winit application handler, fetch and render dispatch, app state (the wgpu/egui renderer itself lives in `rustdar-gpu`). `app.rs` orchestrates lifecycle with `#[path]` submodules `app_fetch.rs` and `app_render.rs`. Defines the `PlatformBridge` trait that per-OS crates implement. |
+| `rustdar` | Binary (`rustdar`) + lib (`rustdar_native`, rlib+cdylib). Desktop, Android and iOS entry points: the event loop bootstrap (`run.rs`), the concrete `PlatformBridge` implementations, and the cfg(android) module tree (`src/android/`) that owns the shell's JNI bridges — insets, compass, back handling, theme detection, `android_main` (the location JNI arm lives in `rustdar-location` since WO-RL-4) — and injects the callback-shaped ones into the bridge. No portable code — that lives in `rustdar-app`, which this crate depends on (never the other way round). |
 | `rustdar-web` | Browser target (wasm32 + WebGL2): the entry point, the browser `PlatformBridge`, and the PWA shell (`index.html`, `sw.js`, `manifest.webmanifest`, icons). Deployed to GitHub Pages by `build.yaml` on every push to `main`. |
 | `rustdar-egui` | Pure egui UI layer — no wgpu dependency. Defines `Gui` + `GuiAction` enum. Uses `walkers` crate for CartoDB map tiles. Split via `#[path]` submodules off `ui.rs` (`ui_popups.rs`, `ui_config.rs`, `ui_map_overlays.rs`, `ui_chrome.rs`, `ui_menu.rs`, `ui_map.rs`, `ui_settings.rs`; `ui_map_pane.rs` hangs off `ui_map.rs`) plus plain modules `ui_input.rs` and `ui_layout.rs`. |
 | `rustdar-units` | Leaf crate for unit conversion and timezone formatting. `UserPreferences` persisted in `ui.json`. Conversions happen at display boundaries only — internal data stays in original units. |
@@ -31,13 +31,13 @@ Overlay fetching uses `OverlayRegistry::create_fetch_tasks()` → handler-specif
 
 ## Key Conventions
 
-- **Lints:** `rustdar-frontend` and `rustdar-web` are `#![warn(clippy::all)]` + `#![forbid(unsafe_code)]`. `rustdar` is `#![deny(unsafe_code)]`, not `forbid` — the entry symbols (iOS main, the android JNI symbols) carry scoped `allow`s, which a `forbid` could not be overridden by; all other unsafe stays confined to the cfg(android) modules — which is *why* Android capabilities reach the shared code as injected `fn` pointers rather than direct calls. `nexrad-level3` is `#![forbid(unsafe_code)]` + `#![deny(clippy::unwrap_used)]` + `#![deny(clippy::expect_used)]`.
+- **Lints:** `rustdar-app` and `rustdar-web` are `#![warn(clippy::all)]` + `#![forbid(unsafe_code)]`. `rustdar` is `#![deny(unsafe_code)]`, not `forbid` — the entry symbols (iOS main, the android JNI symbols) carry scoped `allow`s, which a `forbid` could not be overridden by; all other unsafe stays confined to the cfg(android) modules — which is *why* Android capabilities reach the shared code as injected `fn` pointers rather than direct calls. `nexrad-level3` is `#![forbid(unsafe_code)]` + `#![deny(clippy::unwrap_used)]` + `#![deny(clippy::expect_used)]`.
 - **CI:** `cargo clippy --fix` auto-applied, then strict clippy re-run. Always pass `cargo clippy --all-targets --all-features`.
 - **Generation counters** (`fetch_generation`, `render_generation`) guard against stale results. Increment before spawning; discard results with generation < current.
 - **`#[path]` submodule pattern:** Large files split via `#[path = "ui_xxx.rs"] mod xxx;`. Extracted methods use `impl super::Gui {}` with `pub(super)` visibility.
 - **Pinned crate versions:** every external dependency is pinned exactly (`=x.y.z`) in `[workspace.dependencies]` in the root `Cargo.toml` — that section is the source of truth for versions; don't restate them elsewhere, and don't upgrade without testing.
 - **Config:** `ui.json` saved/loaded from `XDG_CONFIG_HOME/rustdar` or `~/.config/rustdar`. Uses `#[serde(default)]` for backward compatibility.
-- **Web target is WebGL2, never WebGPU.** `rustdar_frontend::app` pins `Backends::GL` on wasm32, and the `webgpu` wgpu feature is deliberately absent on every target — Firefox has no stable WebGPU, so compiling it would only add an untested second rendering path. See the wgpu feature comments in `rustdar-frontend/Cargo.toml` before touching wgpu features anywhere.
+- **Web target is WebGL2, never WebGPU.** `rustdar_app::app` pins `Backends::GL` on wasm32, and the `webgpu` wgpu feature is deliberately absent on every target — Firefox has no stable WebGPU, so compiling it would only add an untested second rendering path. See the wgpu feature comments in `rustdar-gpu/Cargo.toml` (the one feature-chooser for the whole graph) before touching wgpu features anywhere.
 - **Android:** `#[cfg(target_os = "android")]` gates in the `rustdar` crate and Cargo.toml deps. TLS is `rustls` + `rustls-platform-verifier` over the OS trust store; there is no OpenSSL and no bundled root store.
 
 ## Build & Run

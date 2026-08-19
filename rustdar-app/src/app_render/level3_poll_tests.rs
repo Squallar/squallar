@@ -111,7 +111,7 @@ fn a_landed_object_offers_every_product_it_feeds() {
 /// the single-field product and once for VIL density.
 ///
 /// Run with:
-///   cargo test -p rustdar-frontend --lib -- --ignored --nocapture live_a_poll
+///   cargo test -p rustdar-app --lib -- --ignored --nocapture live_a_poll
 #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
 #[test]
 fn live_a_poll_fetches_each_object_once() {

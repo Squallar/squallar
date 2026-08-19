@@ -114,7 +114,7 @@ pub(crate) use provider::OsLocationReader;
 /// `Arc<dyn …>` and not `impl Fn`, because two providers hand it to more than
 /// one place: Linux clones it into every session thread it starts, Windows
 /// clones it into every `StartDelivery` command. `Send + Sync` is what
-/// `RedrawWaker` already guarantees — `rustdar-frontend` pins that with a
+/// `RedrawWaker` already guarantees — `rustdar-app` pins that with a
 /// `const` assertion — so requiring it here costs nothing and is what makes the
 /// clone legal.
 pub(crate) type RedrawWake = crate::provider::Wake;

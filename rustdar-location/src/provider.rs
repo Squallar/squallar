@@ -20,7 +20,7 @@ use crate::permission::LocationPermission;
 ///
 /// `Arc<dyn …>` and not `impl Fn`, because providers hand it to more than one
 /// place — session threads, callbacks, poll threads. `Send + Sync` is what the
-/// app's `RedrawWaker` already guarantees (rustdar-frontend pins that with a
+/// app's `RedrawWaker` already guarantees (rustdar-app pins that with a
 /// `const` assertion), so requiring it here costs nothing and is what makes
 /// the clone legal. On wasm there are no threads to send it across; the bound
 /// is still satisfied and still harmless.
@@ -98,7 +98,7 @@ pub trait LocationProvider {
 /// the ones behind it are already stale. Draining rather than taking one per
 /// frame keeps a fast producer from building a backlog the UI then walks
 /// through one frame at a time. (The app side keeps its own copy in
-/// `rustdar_frontend::platform` for its theme/heading channels — a five-line
+/// `rustdar_app::platform` for its theme/heading channels — a five-line
 /// helper does not cross a crate boundary; keep them in step.)
 #[allow(
     dead_code,

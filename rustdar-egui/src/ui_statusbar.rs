@@ -356,7 +356,7 @@ fn render_auto_poll_status(
     ui: &mut egui::Ui,
     fetching: bool,
     auto_poll: &super::AutoPollState,
-    chunks: &super::ChunkFeedStatus,
+    chunks: &rustdar_radar::chunk_feed::ChunkFeedStatus,
 ) -> Option<(egui::Rect, String, Option<std::time::Duration>)> {
     if fetching {
         ui.label("\u{21bb}");

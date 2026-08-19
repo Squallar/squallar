@@ -970,7 +970,7 @@ mod tests {
     // The two pins on the app side's *use* of this crate —
     // `app_state_probes_the_device_and_installs_the_latch` and
     // `a_surface_loss_is_only_counted_when_a_volume_was_on_screen` — moved to
-    // rustdar-frontend's `app_render::egui_frame_pin_tests` at WO-RV: they
+    // rustdar-app's `app_render::egui_frame_pin_tests` at WO-RV: they
     // scrape frontend files, and the file a test pins is the crate it lives in.
 
     /// The limits the app *requests* clear the floor the volume probe applies.

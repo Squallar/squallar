@@ -386,8 +386,8 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
 
     // The grid fits its own budget **in bytes** is no longer asserted here:
     // the byte figure is the raymarch's arithmetic (`resident_grid_bytes`),
-    // which sits above this crate, so that proof moved to rustdar-frontend's
-    // `volume_raymarch::tests::budget_agreement` at WO-RD
+    // which sits above this crate, so that proof moved to rustdar-volumetric's
+    // `raymarch::tests::budget_agreement` at WO-RD
     // (`the_volume_grid_fits_the_target_texture_budget`). Nothing is lost by
     // the move: `resolve` spends one promotion on both brackets and `demote`'s
     // grid rung resets both together, so every reachable
@@ -797,7 +797,7 @@ fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
     );
     // "And the pool it is divided out of moves with it, on the same rung" is
     // asserted beside the pool: `LoopPool` sits above this crate, so that half
-    // lives in rustdar-frontend's `loop_pool::tests::budget_agreement`
+    // lives in rustdar-app's `loop_pool::tests::budget_agreement`
     // (`a_promoted_browsers_pool_moves_on_the_same_rung`, WO-RD).
 
     // Neither is promoted past the bracket, and both satisfy every invariant.

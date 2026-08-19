@@ -1,6 +1,6 @@
 //! Where a long-running, CPU-bound job runs.
 //!
-//! Four places on the app side (rustdar-frontend) used to hand a closure
+//! Four places on the app side (rustdar-app) used to hand a closure
 //! somewhere it would not
 //! stall the frame that created it: the static radar render, the loop-frame
 //! render, the overlay rasterization and the radar-sites rasterization. All

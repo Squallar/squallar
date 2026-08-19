@@ -71,7 +71,7 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 /// provably imports, nothing more.
 ///
 /// rustdar-gpu is the wgpu boundary — egui must never depend on it, and it
-/// must never depend on rustdar-volumetric or rustdar-frontend (normal); the
+/// must never depend on rustdar-volumetric or rustdar-app (normal); the
 /// GPU test suite's dev-dep back onto rustdar-volumetric (WO-RV land 3, the
 /// hardware quarantine) is legal because dev-deps never enter the normal
 /// graph.
@@ -121,7 +121,7 @@ fn the_dependency_ceiling_holds() {
             allowed,
             "rustdar-gpu declares {name} ({kind}). rustdar-gpu is the wgpu \
              boundary — egui must never depend on it, it must never depend on \
-             rustdar-volumetric or rustdar-frontend as a NORMAL dep; the GPU \
+             rustdar-volumetric or rustdar-app as a NORMAL dep; the GPU \
              test suite's dev-dep back onto rustdar-volumetric (WO-RV land 3, \
              the hardware quarantine) is legal because dev-deps never enter \
              the normal graph. Anything else lands here only after this \
@@ -146,7 +146,7 @@ fn the_dependency_ceiling_holds() {
     }
 }
 
-/// The graph shape WO-RG created stays: rustdar-frontend stands on rustdar-gpu,
+/// The graph shape WO-RG created stays: rustdar-app stands on rustdar-gpu,
 /// so the app side reaches the renderer, the upload path, the mirror and the
 /// staging ring through this boundary rather than by owning them.
 ///
@@ -155,12 +155,12 @@ fn the_dependency_ceiling_holds() {
 #[test]
 fn the_boundary_sits_under_the_app() {
     let meta = metadata();
-    let frontend = declared_deps(&meta, "rustdar-frontend");
+    let frontend = declared_deps(&meta, "rustdar-app");
 
     assert!(
         frontend
             .iter()
             .any(|(kind, name)| kind == "normal" && name == "rustdar-gpu"),
-        "rustdar-frontend no longer stands on rustdar-gpu: {frontend:?}",
+        "rustdar-app no longer stands on rustdar-gpu: {frontend:?}",
     );
 }

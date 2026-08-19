@@ -1,7 +1,7 @@
 //! The model grid's windowed wire carry paints **the same bytes** as the
 //! whole grid — the rasterize-level half of the S5d parity story, whose
 //! wire-level half (through the codec, `execute_bytes` and the premultiply
-//! seam) is `rustdar_frontend::offload::tests`.
+//! seam) is `rustdar_worker::offload::tests`.
 //!
 //! The claim under test is the one the transport decision stands on: the
 //! values outside [`projection_window`] are **dead to the raster**, so a

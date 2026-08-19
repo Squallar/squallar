@@ -2770,7 +2770,7 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// carries `GITHUB_SHA`, so pairs across a deploy boundary refuse each
 /// other at the HELLO handshake. Locally there is no SHA and the token
 /// folds the wire's pinned framing rows
-/// (`rustdar_frontend::wire_identity`), deliberately not this nested
+/// (`rustdar_worker::wire_identity`), deliberately not this nested
 /// payload — so a stale worker differing only here still shares a token
 /// with a fresh page. If a layout change forgets the bump — reordering two
 /// same-width `f64` axis fields is the easy one, since it round-trips

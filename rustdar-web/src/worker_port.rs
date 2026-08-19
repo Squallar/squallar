@@ -2,7 +2,7 @@
 //!
 //! `rustdar_worker::offload` owns the decision about where a CPU-bound job
 //! runs, and knows nothing about the browser: the dependency runs
-//! `rustdar-web` → `rustdar-frontend`, and adding `web-sys` to the frontend to
+//! `rustdar-web` → `rustdar-app`, and adding `web-sys` to the frontend to
 //! close the loop would put browser types in the crate desktop, Android and iOS
 //! all share. So the worker is *installed* into the funnel as a
 //! [`JobSink`], from here — and this file is where a `JobRequest` becomes the

@@ -36,14 +36,14 @@ crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-rustdar-frontend = { workspace = true }
+rustdar-app = { workspace = true }
 rustdar-egui = { workspace = true }
 rustdar-kv = { workspace = true }
 # The domain vocabulary (Fix, LocationPermission). `serial` is requested per target below.
 rustdar-location = { workspace = true }
 # `GeoPoint`, which the android module's fix literal spells
 # (`src/android/location.rs`). Unconditional rather than android-gated: the
-# crate is already in every one of this package's graphs via rustdar-frontend,
+# crate is already in every one of this package's graphs via rustdar-app,
 # so gating it would buy nothing but a second copy of the `jni-typecheck`
 # feature plumbing. (Import-forced; the fold order's dep list predates
 # WO-RL-1's `point: rustdar_geo::GeoPoint` re-type.)
@@ -132,7 +132,7 @@ rustdar-location = { workspace = true, features = ["os-providers"] }
 #
 # One dep to add and nothing else: `jni` 0.22 is `default = []` and pure Rust,
 # and everything else the android modules read -- log, rustdar-location,
-# rustdar-geo, rustdar-frontend -- is already an unconditional dependency of
+# rustdar-geo, rustdar-app -- is already an unconditional dependency of
 # this crate since the fold. Forwards to rustdar-location's feature of the
 # same name since WO-RL-4, so the facade's JNI arm (the location half that
 # moved out) is type-checked in the same pass. It does not replace the

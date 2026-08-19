@@ -17,7 +17,7 @@ use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 // `pub`, not `pub(crate)`, for `alert::NwsAlertFetchResult`'s reason: the
-// described-job dispatch and hit-map zip tests in `rustdar-frontend` seed a
+// described-job dispatch tests in `rustdar-app` and the hit-map zip tests in `rustdar-worker` seed a
 // live registry through `apply_fetch_result`, and the payload type has to be
 // nameable where the test constructs it.
 pub struct StormReportsFetchResult(pub Result<StormReportRound, crate::fetch_policy::FetchError>);

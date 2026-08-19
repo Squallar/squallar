@@ -10,7 +10,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Pin the rustls provider at a predictable point rather than letting
     // whichever background task fetches first choose it. Redundant — every
     // client constructor calls this too (see `rustdar_radar::tls`).
-    rustdar_frontend::tls::init();
+    rustdar_app::tls::init();
 
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
@@ -38,7 +38,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Starting rustdar (native)");
 
     let event_loop = create_event_loop();
-    let mut app = rustdar_frontend::app::App::new(
+    let mut app = rustdar_app::app::App::new(
         Box::new(crate::platform::create_platform()),
         crate::platform::create_location(),
     );

@@ -16,7 +16,7 @@ use crate::render::overlay_state::{
 use crate::render::rasterize;
 use rustdar_source::job::{DescribedJob, JobCodec};
 
-/// `pub`, not `pub(crate)`: `rustdar-frontend`'s described-job dispatch tests
+/// `pub`, not `pub(crate)`: `rustdar-app`'s described-job dispatch tests
 /// seed a live registry with alerts through `apply_fetch_result`, which takes
 /// a type-erased payload the handler downcasts to exactly this — so the type
 /// has to be nameable where the test constructs it.

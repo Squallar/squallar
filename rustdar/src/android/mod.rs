@@ -17,7 +17,7 @@
 //! `set_back_handler` / `set_back_press_taker` as injected `fn` pointers even
 //! though, since the fold, callee and caller share this crate. The injection
 //! is the frontend portability contract, not a crate-graph workaround:
-//! `PlatformBridge` is declared in rustdar-frontend, which must compile for
+//! `PlatformBridge` is declared in rustdar-app, which must compile for
 //! targets that have never heard of JNI; the bridge structs stay
 //! `deny(unsafe_code)`-clean and host-testable (TestBridge injects the same
 //! fn pointers); and the JNI surface stays confined to these cfg(android)

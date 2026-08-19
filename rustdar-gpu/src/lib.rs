@@ -9,7 +9,7 @@
 //! ([`staging_ring`]), and the device-request policy ([`device`]).
 //!
 //! What deliberately does NOT live here: the app loop, the window/surface
-//! lifecycle (rustdar-frontend's `AppState` spans surface, renderer and
+//! lifecycle (rustdar-app's `AppState` spans surface, renderer and
 //! volume support and stays above), and the 3D volume stack (rustdar-volumetric
 //! depends on this crate, never the reverse — a dev-dep back from here onto it
 //! arrives with the GPU test suite at WO-RV and is legal because dev-deps
@@ -23,7 +23,7 @@ pub mod staging_ring;
 
 /// Type alias for a reference-counted Window.
 ///
-/// Duplicated from rustdar-frontend deliberately — two type aliases to the
+/// Duplicated from rustdar-app deliberately — two type aliases to the
 /// same type are the same type, and the alternative is this crate reaching up
 /// into the app crate for a name.
 pub type WindowRef = std::sync::Arc<winit::window::Window>;

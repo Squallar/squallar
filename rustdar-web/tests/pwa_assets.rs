@@ -855,7 +855,7 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 /// Each digest was measured against an uncooperative regressor: a same-width
 /// field reorder made to encoder and decoder in step left every other test
 /// in its crate green (890 of 891 in `rustdar-radar`, 807 of 808 in
-/// `rustdar-frontend`) and the guards here green as well, and only the
+/// what is now `rustdar-worker`) and the guards here green as well, and only the
 /// digest fell over.
 ///
 /// # Why a list and not a digest
@@ -880,7 +880,7 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///
 /// The page→worker `job` direction and the `hello`/`fatal` messages. The `job`
 /// direction is a byte codec rather than a field set, and it is pinned by
-/// `rustdar_frontend`'s `the_job_framing_is_the_one_this_protocol_ships` — see
+/// `rustdar_worker`'s `the_job_framing_is_the_one_this_protocol_ships` — see
 /// above. `hello` and `fatal` are still built elsewhere and are as unbound as
 /// this one was.
 #[test]

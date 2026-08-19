@@ -45,7 +45,7 @@
 //! So **about 2.2×**, not the 4× the column arithmetic on its own suggests.
 //! Native figures on a desktop CPU; the web's single worker is slower in
 //! absolute terms and the ratio is the transferable part. All of it is paid on
-//! a worker thread (`rustdar_frontend::offload::execute`) and none of it on the
+//! a worker thread (`rustdar_worker::offload::execute`) and none of it on the
 //! frame thread, which is what makes it affordable at all. The loop
 //! below therefore runs `for y { for x { column_into(...); for z { ... } } }`
 //! and nothing else — one [`crate::sampler::VolumeSampler::sample`] per voxel
@@ -267,7 +267,7 @@
 //! is the paragraph that made the palette's fade band the renderer's only
 //! defence at a data/no-data boundary.
 //!
-//! `rustdar-frontend`'s raymarch uploads this grid as **`Rg16Float`**, not
+//! `rustdar-volumetric`'s raymarch uploads this grid as **`Rg16Float`**, not
 //! `R8Unorm`: `R = coverage × index`, `G = coverage`, where coverage is 1 for
 //! a cell whose index is not [`NO_DATA_INDEX`] and 0 for one whose is. Both
 //! channels are filtered `Linear` in hardware and the shader reconstructs
@@ -385,13 +385,13 @@
 //! cell, and it is what travels. It is **not** what the GPU holds: the frontend
 //! widens it on upload into a four-byte `Rg16Float` texel — a premultiplied
 //! index and a coverage, a half float each — so the texture is four times this
-//! table's `indices` column, and `rustdar_frontend::constants`'s
+//! table's `indices` column, and `rustdar_device_profile::constants`'s
 //! `VOLUME_TEXTURE_BUDGET_BYTES` is the budget for *that*. The value plane is a
 //! third thing again: host-side, four times larger, and present only when a
 //! caller asks for it — see [`VoxelRequest::values_wanted`].
 //!
 //! **[`default_shape`] cannot pick the mobile shape, and that is deliberate.**
-//! The `mobile` cfg is emitted by `rustdar-frontend/build.rs`, and cargo scopes
+//! The `mobile` cfg is emitted by `rustdar-device-profile/build.rs`, and cargo scopes
 //! a build script's cfgs to its own crate; this crate has no build script, so
 //! `#[cfg(mobile)]` here would be an `unexpected_cfgs` warning attached to dead
 //! code that silently took the desktop budget on a handheld. [`MOBILE_SHAPE`]
@@ -433,7 +433,7 @@ pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
 /// was asserting a number it had no way to check and no way to relax for a
 /// device that reports more.
 ///
-/// The device's limit lives in `rustdar_frontend::constants` — see
+/// The device's limit lives in `rustdar_device_profile::constants` — see
 /// `WEBGL2_MAX_TEXTURE_DIMENSION_3D`, which is *derived* from
 /// `wgpu::Limits::downlevel_webgl2_defaults()` and is the floor a browser may
 /// legitimately report — and the adapter's own `max_texture_dimension_3d` is
@@ -455,7 +455,7 @@ pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
 /// would be a `cfg`-shaped behavioural split wearing a constant's clothes.
 ///
 /// The **request** wire is a narrower thing again and is bounded by its own
-/// encoding: `rustdar_frontend::offload` writes each requested axis as a `u16`,
+/// encoding: `rustdar_worker::offload` writes each requested axis as a `u16`,
 /// which 1625 fits with room to spare. `an_axis_outside_the_arithmetic_bound_is_refused`
 /// is the test for this one; the device guarantee is tested where the adapter
 /// lives, in the frontend.
@@ -744,7 +744,7 @@ impl HalfExtentKm {
 /// quotes, which points at `campaign/site-position-probe`'s fetch scripts —
 /// and that branch kept the apparatus and not the readings, so a re-run
 /// measures today's archive rather than confirming this one. Worth saying
-/// out loud because the claim travels: `rustdar-frontend`'s volume bridge
+/// out loud because the claim travels: `rustdar-volumetric`'s volume bridge
 /// restates it to justify *not* refusing to draw a held grid inside a pending
 /// build's box, which is a universal quantifier borrowed across a crate
 /// boundary to stand down a safety check. The code here does not lean on it —
@@ -849,7 +849,7 @@ pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
 /// What one grid's index plane may occupy, bytes.
 ///
 /// **A runtime check, and this doc said it was not for as long as it had a
-/// consumer.** `rustdar_frontend::offload`'s voxel job refuses a request whose
+/// consumer.** `rustdar_worker::offload`'s voxel job refuses a request whose
 /// `shape.cells()` exceeds this figure — one byte a cell, so the cell count
 /// *is* the plane's length — and a refusal is a logged blank 3D pane rather
 /// than an allocation nobody sized. That matters because the shape is a runtime
@@ -863,7 +863,7 @@ pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
 /// times larger, and it is optional. Its figures are in the module doc's
 /// table.
 ///
-/// **Not the same thing as `rustdar_frontend::constants::VOLUME_TEXTURE_BUDGET_BYTES`,
+/// **Not the same thing as `rustdar_device_profile::constants::VOLUME_TEXTURE_BUDGET_BYTES`,
 /// despite the names, and deliberately not bound to it.** That one is
 /// per-target (6 MiB / 20 MiB / 48 MiB) and carries ~1.3× headroom for the
 /// alignment and driver overhead a real GPU allocation costs; this one is a
@@ -976,7 +976,7 @@ pub const NZ_MIN: usize = 16;
 /// `wgpu::CommandEncoder::copy_buffer_to_texture` requires every row of the
 /// source buffer to start on a `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` — 256 byte
 /// — boundary, and the frontend's staging ring
-/// (`rustdar_frontend::volume::raymarch::staging`) is that copy: its
+/// (`rustdar_volumetric::raymarch::staging`) is that copy: its
 /// `PlaneLayout::of` pads each row up to that boundary. The grid's texture
 /// format is four bytes a cell (`Rg16Float`: a premultiplied index and a
 /// coverage, a half float each), so the constraint on the **cell** count is
@@ -1018,7 +1018,7 @@ pub const HORIZONTAL_AXIS_MULTIPLE: usize = 64;
 /// horizontal cannot reach an unaligned value -- 64 is four of these -- so the
 /// vertical is the only axis the leftover-spending step can spoil.
 ///
-/// `rustdar_frontend`'s `the_vertical_axis_multiple_is_the_texture_depth_block`
+/// `rustdar_volumetric`'s `the_vertical_axis_multiple_is_the_texture_depth_block`
 /// is the other end, where this number is tied to the layout arithmetic the
 /// frontend charges against, since only that crate has `wgpu` to ask.
 ///
@@ -1175,7 +1175,7 @@ const fn spend_budget(cell_budget: usize, nz_floor: usize, cap: usize) -> VoxelS
 /// wasm arm that named the wrong constant would pass everything that actually
 /// runs. Mutation testing found exactly that: replacing the wasm arm's body
 /// wholesale survived the entire suite. Routing both arms through one testable
-/// function is the move `rustdar-frontend`'s `mobile_cfg.rs` already makes for
+/// function is the move `rustdar-device-profile`'s `mobile_cfg.rs` already makes for
 /// the `mobile` predicate, for the same reason.
 ///
 /// What stays unpinned on the host is only the `cfg` dispatch itself — that
@@ -2705,7 +2705,7 @@ pub fn build_voxels_with_motion<'a>(
 // ── Codec ────────────────────────────────────────────────────────────────────
 //
 // The payload type owns its codec; the job framing that carries it lives in
-// `rustdar-frontend`'s `offload`. That split is `render_input`'s, kept for the
+// `rustdar-worker`'s `offload`. That split is `render_input`'s, kept for the
 // reason it was made there: a grid that can encode itself can be put on a
 // message port, in an IndexedDB blob or in a test fixture without any of the
 // three learning its layout, and there is one place where the layout is

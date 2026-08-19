@@ -261,7 +261,7 @@ impl LoopDownloadManager {
     // ------------------------------------------------------------------
     // Test probes. `#[cfg(test)]` until the WO-RF2n fold; unconditional
     // since, because their consumers — the ten loop-pin suites — live
-    // app-side in `rustdar-frontend`, across a crate boundary `cfg(test)`
+    // app-side in `rustdar-app`, across a crate boundary `cfg(test)`
     // cannot reach. Read-only counts and containment checks, nothing more.
     // ------------------------------------------------------------------
 
@@ -324,13 +324,13 @@ impl LoopDownloadManager {
     ///
     /// # Why it returns them rather than dropping them
     ///
-    /// The mirror of `RenderCache::retain` (`rustdar-frontend`'s
+    /// The mirror of `RenderCache::retain` (`rustdar-app`'s
     /// `render_dispatch` module) in shape and its opposite in destination.
     /// `retain` frees in place, and in place is the frame thread: an entry here
     /// is a whole decoded volume, 47–69 MiB across thousands of per-radial
     /// buffers, and returning them is what lets the caller hand them to
     /// `rustdar_worker::offload::discard_each` instead.
-    /// Same reasoning, and the same helper's reasoning, as `rustdar-frontend`'s
+    /// Same reasoning, and the same helper's reasoning, as `rustdar-app`'s
     /// `app::evicted`.
     ///
     /// The Level III cache is bounded by [`retain_l3`](Self::retain_l3), which

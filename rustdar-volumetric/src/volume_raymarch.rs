@@ -1482,7 +1482,7 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
 /// tiled more coarsely than this is the case that would need re-measuring, and
 /// `the_charged_grid_bytes_are_never_under_what_the_device_reserved` is what
 /// would catch it — `#[ignore]`d behind a real adapter, so it does so only under
-/// `cargo test -p rustdar-frontend --test volume_gpu -- --ignored`.
+/// `cargo test -p rustdar-gpu --test volume_gpu -- --ignored`.
 const TEXTURE_TILE_TEXELS_X: usize = 16;
 /// Rows a 3D texture's **height** is rounded up to. See [`TEXTURE_TILE_TEXELS_X`].
 const TEXTURE_TILE_ROWS_Y: usize = 8;

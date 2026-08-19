@@ -19,7 +19,7 @@
 //! Run the lot with:
 //!
 //! ```text
-//! cargo test -p rustdar-frontend --test volume_gpu -- --ignored --nocapture
+//! cargo test -p rustdar-gpu --test volume_gpu -- --ignored --nocapture
 //! ```
 //!
 //! **These tests hold a process-wide lock and therefore run one at a time**,
@@ -108,7 +108,7 @@ macro_rules! clearing_pass {
 /// other thread or nothing at all.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_pipelines_build_on_a_real_device -- --ignored --exact --nocapture
 /// ```
 #[test]
@@ -149,7 +149,7 @@ fn the_pipelines_build_on_a_real_device() {
 /// after a resize, which looks like a camera bug.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     an_offscreen_is_reused_at_one_size_and_rebuilt_at_another \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -201,7 +201,7 @@ fn an_offscreen_is_reused_at_one_size_and_rebuilt_at_another() {
 /// come back fully transparent rather than fully black.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     a_uniform_grid_paints_its_palette_colour -- --ignored --exact --nocapture
 /// ```
 #[test]
@@ -286,7 +286,7 @@ fn a_uniform_grid_paints_its_palette_colour() {
 /// `[ambient, 1] = [0.35, 1]` of the decoded colour.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -402,7 +402,7 @@ fn grey_span(pixels: &[[u8; 4]], size: [u32; 2]) -> (u8, u8) {
 ///   whole slab of index.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -462,7 +462,7 @@ fn an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed() {
 /// first sample — the centre value itself.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     a_diverging_isosurface_draws_both_lobes_of_its_own_field \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -541,7 +541,7 @@ fn a_diverging_isosurface_draws_both_lobes_of_its_own_field() {
 /// can survive as a tolerance argument.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     an_isosurface_excludes_unmeasured_air \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -638,7 +638,7 @@ fn an_isosurface_excludes_unmeasured_air() {
 /// `volume::bridge`'s reasoning needs rewriting rather than relaxing.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -754,7 +754,7 @@ fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
 /// whole volume simply looks denser.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     opacity_accumulates_per_kilometre_not_per_box_diagonal \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -856,7 +856,7 @@ fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
 ///    over it.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_map_floor_stands_under_the_volume_and_only_when_asked \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -988,7 +988,7 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
 /// host, per texel, in `tests/floor_alignment.rs`.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_floor_and_the_volume_put_the_same_weather_in_the_same_place \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1133,7 +1133,7 @@ fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
 /// change must leave bit-identical: above the plane the fade is exactly 1.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_floor_is_transparent_from_below \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1265,7 +1265,7 @@ fn gamma_from_linear(linear: f64) -> f64 {
 /// blind to this and why mid grey is the fixture.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_floor_decodes_the_mirror_only_when_the_flag_says_to \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1386,7 +1386,7 @@ fn the_floor_decodes_the_mirror_only_when_the_flag_says_to() {
 /// ground and the east must be nothing.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1509,7 +1509,7 @@ fn floor_hit_of_pixel(col: u32, row: u32, size: [u32; 2]) -> (f64, f64) {
 ///     capable of telling them apart rather than agreeing with both.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_floor_takes_cos_at_the_pixels_latitude_not_the_sites \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1676,7 +1676,7 @@ fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
 /// one, against 128 for both when it is right.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     a_translucent_mirror_composites_at_its_own_alpha \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1774,7 +1774,7 @@ fn a_translucent_mirror_composites_at_its_own_alpha() {
 ///   silhouette harness's index-1 sphere, which this test leaves untouched.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_smoothed_reconstruction_spreads_a_lone_voxel \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1875,7 +1875,7 @@ fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
 /// comparison a statement about the omission rather than about a dead uniform.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -2018,7 +2018,7 @@ fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
 /// 2.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -2111,7 +2111,7 @@ fn coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
 }
 
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_blit_matches_egui_exactly_on_both_surface_formats \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -2301,7 +2301,7 @@ fn blitted(
 ///    survives rather than by how many did.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     release_pane_frees_that_panes_offscreen -- --ignored --exact --nocapture
 /// ```
 #[test]
@@ -2421,7 +2421,7 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
 /// than a subtly different one.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     both_upload_routes_paint_the_same_frame -- --ignored --exact --nocapture
 /// ```
 #[test]
@@ -2526,7 +2526,7 @@ fn both_upload_routes_paint_the_same_frame() {
 /// palette that another test also owns.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -2732,7 +2732,7 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 /// shipped shapes to the byte, on every target.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_charged_grid_bytes_are_never_under_what_the_device_reserved \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -3039,7 +3039,7 @@ fn named_level_payload(cells: [u32; 3], coarse: CoarseLevel) -> u64 {
 /// pins the arm's expression rather than its consequences and runs everywhere.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_gpu \
+/// cargo test -p rustdar-gpu --test volume_gpu \
 ///     the_floor_composites_on_one_arm_per_frame -- --ignored --exact --nocapture
 /// ```
 #[test]

@@ -213,7 +213,7 @@ impl PaneContent {
     /// What a render dispatched for this pane produces.
     ///
     /// The single content → view table, and the only place the mapping lives.
-    /// `rustdar_frontend` keys its render cache and its sibling-texture
+    /// `rustdar_app` keys its render cache and its sibling-texture
     /// broadcast on the *view*, not on the pane kind: a cached raster outlives
     /// the pane that asked for it, and the thing that must not be handed to the
     /// wrong consumer is the buffer's shape.
@@ -1189,7 +1189,7 @@ const MAX_PITCH_DEG: f32 = 89.0;
 /// a supported camera, not an accident: the raymarch clamps its slab entry to
 /// zero (`max(near.z, 0.0)` in `slab_entry_exit`), so a ray from inside the box
 /// marches forward from the eye rather than from behind it, and
-/// `rustdar-frontend`'s silhouette harness renders from an inside eye to prove
+/// `rustdar-gpu`'s silhouette harness renders from an inside eye to prove
 /// the GPU agrees.
 ///
 /// Not zero, and not merely to avoid a strange picture: at exactly 0 the eye

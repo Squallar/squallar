@@ -3610,7 +3610,7 @@ fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
 /// A cut whose leading radial lost the product's moment is still offered to
 /// the loop's snap.
 ///
-/// [`find_closest_elevation`] is what `rustdar_frontend`'s loop dispatch asks
+/// [`find_closest_elevation`] is what `rustdar_app`'s loop dispatch asks
 /// which elevation each historical scan actually holds. Asked of the leading
 /// radial alone, one blank radial took the whole cut out of that answer, so a
 /// steady selection snapped to a *neighbouring* tilt — or, on a volume with no

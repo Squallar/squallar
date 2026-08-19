@@ -376,9 +376,9 @@ fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.re
     listOf(
         "nexrad-level3",
         "rustdar",
+        "rustdar-app",
         "rustdar-device-profile",
         "rustdar-egui",
-        "rustdar-frontend",
         "rustdar-geo",
         "rustdar-gpu",
         "rustdar-kv",

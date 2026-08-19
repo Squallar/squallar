@@ -2,7 +2,7 @@
 //!
 //! # Why by hand
 //!
-//! `rustdar-frontend` **is** `#![forbid(unsafe_code)]` (`lib.rs:2`), and
+//! `rustdar-app` **is** `#![forbid(unsafe_code)]` (`lib.rs:2`), and
 //! `forbid` cannot be lifted by an inner `allow`, so `bytemuck`'s derive — which
 //! emits a bare `unsafe impl` with no allow of its own — is genuinely barred
 //! here. (An earlier draft of this comment had that backwards, and named

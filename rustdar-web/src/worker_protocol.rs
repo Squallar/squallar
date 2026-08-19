@@ -19,7 +19,7 @@ pub const JOB: &str = "job";
 pub const DONE: &str = "done";
 
 pub const ID: &str = "id";
-/// Page → worker: the framed job, as `rustdar_frontend`'s
+/// Page → worker: the framed job, as `rustdar_worker`'s
 /// `JobRequest::to_bytes` writes it.
 ///
 /// As of WO-M7b the leading byte of that payload is a **composed-registry

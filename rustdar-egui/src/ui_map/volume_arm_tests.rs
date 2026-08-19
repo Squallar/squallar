@@ -386,7 +386,7 @@ fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
 /// The painter's report reaches the caption the user reads.
 ///
 /// The two halves of the stand-in are pinned apart — the renderer decides
-/// what to draw (`rustdar-frontend`'s `volume_stand_in` suite) and
+/// what to draw (`rustdar-gpu`'s `volume_stand_in` suite) and
 /// `volume_caption` decides what to write — and this is the seam between
 /// them. It is exactly the sort of wiring that can be dropped without a
 /// compiler error: `render_volume_pane` could ignore the `showing` field and

@@ -144,7 +144,7 @@ pub(crate) use probes::ControlProbe;
 #[path = "gui/state.rs"]
 mod state;
 pub(super) use state::AutoPollState;
-pub use state::{ChunkFeedStatus, CurrentVolumeStamp, Gui, StormMotionOverride, TiltFreshness};
+pub use state::{CurrentVolumeStamp, Gui, StormMotionOverride};
 #[path = "gui/frame.rs"]
 mod frame;
 #[path = "gui/layer_glue.rs"]
@@ -961,7 +961,7 @@ impl Gui {
         self.notifier_endpoint = endpoint.into();
     }
 
-    pub fn chunk_status(&self) -> &ChunkFeedStatus {
+    pub fn chunk_status(&self) -> &rustdar_radar::chunk_feed::ChunkFeedStatus {
         &self.chunk_status
     }
 

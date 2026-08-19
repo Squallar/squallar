@@ -8,7 +8,7 @@ edition.workspace = true
 
 # Deliberately this and NOTHING else normal: `tests/charter.rs` holds the
 # ceiling. In particular never wgpu (the WebGL2 3D floor is a pinned literal,
-# held to wgpu by rustdar-frontend's agreement test) and never rustdar-egui
+# held to wgpu by rustdar-app's agreement test) and never rustdar-egui
 # (the pane caps moved down HERE so the UI could sit above the floor). A
 # dependency lands here only after the charter test and the plan change first,
 # in writing.

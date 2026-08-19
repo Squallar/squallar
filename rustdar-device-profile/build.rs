@@ -7,8 +7,8 @@
 //! those cfgs.
 //!
 //! `mobile` says what is actually meant. `target_os = "android"` stays where the
-//! point really is Android specifically (the JNI wiring in rustdar-frontend's
-//! `app.rs`).
+//! point really is Android specifically (the JNI wiring in the `rustdar`
+//! shell's `src/android/` modules and rustdar-location's android arm).
 //!
 //! Cargo scopes a build script's cfgs to the crate that declares it, so this
 //! file has to be duplicated by every crate that wants `mobile` — today that is

@@ -54,7 +54,7 @@
 //!
 //! [`GradientShading::On`] now selects the whole **cloud look**: gradient
 //! lighting, the mip-blended smooth reconstruction, and half-cell steps
-//! (rustdar-frontend's `volume::bridge::{CLOUD_RECONSTRUCTION_LOD,
+//! (rustdar-volumetric's `bridge::{CLOUD_RECONSTRUCTION_LOD,
 //! CLOUD_STEP_CELLS}`). The
 //! half-cell step is the expensive part — roughly twice the samples — and it
 //! is what takes the jitter's per-step opacity residual below the eight-bit
@@ -92,7 +92,7 @@
 //! `cfg!` inside it can only ever be tested on the arm the test runner was
 //! built for — and the arms that matter most here are the two no CI row runs a
 //! test binary for. Passing the ceiling in makes every arm reachable from one
-//! host test. rustdar-frontend's `volume::disposition` already uses this
+//! host test. rustdar-volumetric's `disposition` already uses this
 //! shape for the same reason.
 
 use crate::constants::{VOLUME_OFFSCREEN_BUDGET_BYTES, VOLUME_OFFSCREEN_REFERENCE_PANE_PX};
@@ -324,7 +324,7 @@ pub const PLATFORM_CEILING: VolumeQuality = DESKTOP_PLATFORM_CEILING;
 /// `ceiling` is a parameter rather than [`PLATFORM_CEILING`] read inline — see
 /// the module doc for why.
 ///
-/// Called once per renderer, from rustdar-frontend's
+/// Called once per renderer, from rustdar-app's
 /// `App::install_volume_bridge`, as `select(device_class_of(adapter
 /// .get_info().device_type), PLATFORM_CEILING)` — `device_class_of` is the
 /// frontend's wgpu-touching classifier, kept above this crate so the floor

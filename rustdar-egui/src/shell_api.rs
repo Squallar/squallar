@@ -24,7 +24,8 @@
 //! called once at startup, and dissolves at E6.
 
 use crate::actions::RadarConfig;
-use crate::ui::{ChunkFeedStatus, CurrentVolumeStamp};
+use crate::ui::CurrentVolumeStamp;
+use rustdar_radar::chunk_feed::ChunkFeedStatus;
 use rustdar_radar::types::ScanInfo;
 
 /// One frame's facts, composed by the App from state it already owns, applied

@@ -997,7 +997,7 @@ fn the_arithmetic_bound_is_the_largest_cubable_axis() {
         MAX_AXIS + 1,
     );
     // The wire that carries a *request* is a `u16` per axis
-    // (`rustdar_frontend::offload::encode_voxel_request`), so the bound has
+    // (`rustdar_worker::offload::encode_voxel_request`), so the bound has
     // to fit one or the encoder would truncate a shape this crate accepts.
     assert!(u16::try_from(MAX_AXIS).is_ok());
 }
@@ -3810,7 +3810,7 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// boundary, the tokens disagree, and `worker_port::handle_message` terminates
 /// the worker at the HELLO handshake — before any payload is exchanged, so
 /// this constant is never reached. Locally there is no SHA and the token
-/// folds the wire's pinned framing rows (`rustdar_frontend::wire_identity`),
+/// folds the wire's pinned framing rows (`rustdar_worker::wire_identity`),
 /// deliberately not this nested payload — so a stale worker differing only
 /// here still shares a token with a fresh page. `RDVX` has
 /// never been bumped, so the exposure is the *first* bump being forgotten:
@@ -3831,7 +3831,7 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 ///
 /// # Why the coverage-premultiplied texture did NOT bump it
 ///
-/// `rustdar-frontend` now uploads the grid as `Rg16Float` with
+/// `rustdar-volumetric` now uploads the grid as `Rg16Float` with
 /// `R = coverage x index` and `G = coverage`, and quadrupling a texture is the
 /// shape of change that usually earns a bump. This one does not, because
 /// **not one byte of this payload changed, in layout or in meaning**:
@@ -4484,7 +4484,7 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
 /// Coverage is **exactly** `index != NO_DATA_INDEX`, for every product — the
 /// premise the renderer's coverage-premultiplied texture rests on.
 ///
-/// `rustdar-frontend` uploads this grid as `Rg16Float` with `R = coverage x
+/// `rustdar-volumetric` uploads this grid as `Rg16Float` with `R = coverage x
 /// index` and `G = coverage`, and it synthesises that second channel at upload
 /// time from the index plane alone rather than carrying it on the wire. That is
 /// only lossless if no measurement can encode as index 0 and no absence can

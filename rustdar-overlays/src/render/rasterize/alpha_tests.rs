@@ -2,7 +2,7 @@
 //! rather than against the field.
 //!
 //! [`AlphaMode`] exists because this module produces both, and the consumer
-//! (`rustdar_frontend::offload::execute`'s convert-inside-the-job seam)
+//! (`rustdar_worker::offload::execute`'s convert-inside-the-job seam)
 //! cannot tell them apart by looking: the two conventions are identical bags
 //! of bytes and neither conversion can fail. A wrong declaration is therefore
 //! silent all the way to the screen, where it shows up as every translucent

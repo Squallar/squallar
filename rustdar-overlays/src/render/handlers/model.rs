@@ -77,7 +77,7 @@ const _: () = assert!(MODEL_GRID_CACHE_ENTRIES >= 2);
 /// The resident grids, bounded by [`MODEL_GRID_CACHE_ENTRIES`], evicted
 /// least-recently-touched first.
 ///
-/// Shaped after `rustdar_frontend::render_dispatch::RenderCache`: an entries
+/// Shaped after `rustdar_app::render_dispatch::RenderCache`: an entries
 /// map plus a recency list holding exactly the keys of `entries`, each exactly
 /// once, oldest use first. Every method that touches one touches the other, and
 /// both fields are private so no caller can desynchronise them.

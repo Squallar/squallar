@@ -116,15 +116,16 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 /// of these caches — base and labels, light and dark, four at most with two
 /// live per theme — so the desktop figure carried onto wasm32 could put
 /// 256 MiB of basemap texture against the 288 MiB
-/// `rustdar-frontend`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES` allows the
-/// whole application.
+/// `rustdar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES`
+/// allows the whole application.
 ///
 /// The tiers follow that crate's budget cascade (`APP_TEXTURE_BUDGET_BYTES`'s
 /// wasm32/mobile/desktop arms, with mobile the `target_os` rule of
-/// `rustdar-frontend/src/mobile_cfg.rs`: `"android" | "ios"`), **spelled
-/// rather than imported** because the dependency runs rustdar-frontend →
-/// rustdar-egui and cannot run back — the same boundary
-/// `MODEL_GRID_CACHE_ENTRIES` in rustdar-overlays states.
+/// `rustdar-device-profile/src/mobile_cfg.rs`: `"android" | "ios"`), **spelled
+/// rather than imported** — copied when the cascade lived above this crate
+/// (rustdar-app → rustdar-egui, no back-edge) and kept spelled as a written
+/// decision here; `MODEL_GRID_CACHE_ENTRIES` in rustdar-overlays states the
+/// same posture, where the no-back-edge boundary still forces it.
 ///
 /// What the wasm arm accepts, quantified: the working set at native zoom is
 /// the window's own tile count (`tiles::tiles_resident_for`), so a
@@ -152,7 +153,7 @@ pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
 /// The wasm32 arm of [`TILE_CACHE_ENTRIES`].
 ///
 /// All three arms are named outside the cascade, the shape
-/// `rustdar-frontend`'s `constants::WASM_VOLUME_GRID_CELLS` documents and for
+/// `rustdar-device-profile`'s `constants::WASM_VOLUME_GRID_CELLS` documents and for
 /// the reason it gives: this workspace runs `cargo test` on one arm, so the
 /// other two are only reachable from a test if they have names.
 pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is not zero");

@@ -120,7 +120,7 @@ fn the_dependency_ceiling_holds() {
              (rustdar-device-profile) and the voxel/pane vocabularies \
              (rustdar-radar, rustdar-egui) — never on wgpu directly (the \
              boundary is the one feature-chooser and the single-copy guard \
-             depends on it), never on rustdar-frontend, and CPU rasterizers \
+             depends on it), never on rustdar-app, and CPU rasterizers \
              never move here. Anything else lands here only after this \
              charter and the plan change first, in writing.",
         );
@@ -145,7 +145,7 @@ fn the_dependency_ceiling_holds() {
     }
 }
 
-/// The graph shape WO-RV created stays: rustdar-frontend stands on
+/// The graph shape WO-RV created stays: rustdar-app stands on
 /// rustdar-volumetric, so the app side reaches the probe, the raymarch, the
 /// staging path and the bridge through this crate rather than by owning them.
 ///
@@ -154,12 +154,12 @@ fn the_dependency_ceiling_holds() {
 #[test]
 fn the_stack_sits_under_the_app() {
     let meta = metadata();
-    let frontend = declared_deps(&meta, "rustdar-frontend");
+    let frontend = declared_deps(&meta, "rustdar-app");
 
     assert!(
         frontend
             .iter()
             .any(|(kind, name)| kind == "normal" && name == "rustdar-volumetric"),
-        "rustdar-frontend no longer stands on rustdar-volumetric: {frontend:?}",
+        "rustdar-app no longer stands on rustdar-volumetric: {frontend:?}",
     );
 }

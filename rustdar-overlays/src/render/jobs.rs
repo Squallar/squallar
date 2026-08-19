@@ -4,7 +4,7 @@
 //! Each row is a [`JobSpec`] over one of the wire-form inputs `rasterize`
 //! already defines, monomorphized into a [`JobCodec`] in [`JOB_CODECS`]. The
 //! codec bodies moved here **verbatim** (post-WO-M6.1 text) from
-//! `rustdar_frontend::offload`, which keeps byte-identical duplicates until
+//! `rustdar_worker::offload`, which keeps byte-identical duplicates until
 //! WO-M6.3 flips the frontend onto this table and deletes them — until that
 //! flip nothing routes through this module, and the frontend's framing
 //! digests over the duplicate bodies are the byte gate the flip must pass.
@@ -32,7 +32,7 @@
 //!
 //! **No egui.** `run` answers each rasterizer's own alpha convention
 //! untouched; the premultiply that follows is egui arithmetic and stays in
-//! `rustdar_frontend::offload`.
+//! `rustdar_worker::offload`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -644,7 +644,7 @@ fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
 /// foreign message (the `JobOutCodec` convention, WO-M7d).
 ///
 /// `alpha` is not on the reply wire because only one convention ever crosses
-/// it: `rustdar_frontend::offload::execute`'s output stage converts the one
+/// it: `rustdar_worker::offload::execute`'s output stage converts the one
 /// straight-alpha producer (the model grid) to premultiplied before any
 /// reply is encoded, so a decoded reply states [`AlphaMode::Premultiplied`]
 /// — the only value that is ever true of these bytes.
@@ -666,7 +666,7 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 /// The cells are written **sorted by cell index** — a `HashMap`'s iteration
 /// order is seeded per process, and these bytes have to be a function of the
 /// value for two encodes of one reply to agree and for the framing digest in
-/// `rustdar_frontend::offload::tests` to pin them. The RGBA takes the rest,
+/// `rustdar_worker::offload::tests` to pin them. The RGBA takes the rest,
 /// so no length prefix can lie about it; its one guard stays the dispatch's
 /// length check.
 ///

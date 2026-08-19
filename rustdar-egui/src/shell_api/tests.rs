@@ -8,7 +8,8 @@
 
 use super::FrameInputs;
 use crate::input_harness::InputHarness;
-use crate::ui::{ChunkFeedStatus, CurrentVolumeStamp};
+use crate::ui::CurrentVolumeStamp;
+use rustdar_radar::chunk_feed::ChunkFeedStatus;
 
 /// A timestamp no default produces, so reading it back can only mean the
 /// applied entry was stored.

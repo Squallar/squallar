@@ -80,7 +80,7 @@ fn fade_lut(band: usize) -> Vec<u8> {
 /// constructor a `VoxelGrid` has.
 ///
 /// The app side's store/release tests keep a twin of this fixture
-/// (`rustdar_frontend`'s `volume_fixture::ready_grid`, WO-RV): a test helper
+/// (`rustdar_app`'s `volume_fixture::ready_grid`, WO-RV): a test helper
 /// does not cross a crate boundary, and this module is `cfg(test)`-gated,
 /// invisible over there. Keep the two in step with the resampler together.
 pub(crate) fn ready_grid() -> VolumeEntry {

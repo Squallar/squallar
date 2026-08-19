@@ -1,5 +1,5 @@
 [package]
-name = "rustdar-frontend"
+name = "rustdar-app"
 version.workspace = true
 edition.workspace = true
 

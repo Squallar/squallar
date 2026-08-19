@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 
 # Since WO-RV land 3 this manifest is the ONE wgpu feature-chooser for the
-# whole graph (rustdar-frontend dropped its duplicate copies), and src/lib.rs
+# whole graph (rustdar-app dropped its duplicate copies), and src/lib.rs
 # carries the single-copy and backend-features guards that hold it.
 
 [dependencies]
@@ -36,7 +36,7 @@ rustdar-device-profile = { workspace = true }
 #
 # `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
 # asks for. The backends are per target, below. There is no `webgpu` on any
-# target: `rustdar_frontend::app` pins `Backends::GL` on wasm32 and Firefox has
+# target: `rustdar_app::app` pins `Backends::GL` on wasm32 and Firefox has
 # no stable WebGPU, so compiling that backend would only add an untested second
 # rendering path -- and, until the workspace pin was fixed, a duplicate set of
 # WebGPU bindings that broke `wasm-bindgen` outright.

@@ -12,7 +12,7 @@
 //! VOL=/path/to/KDMX20250314_175512_V06 \
 //! CENTRE_LAT=41.0 CENTRE_LON=-93.4 HALF_KM=75 THRESH=20 \
 //! OUT=/tmp/rd_kdmx \
-//! cargo test -p rustdar-frontend --test volume_real_mask -- --ignored --nocapture
+//! cargo test -p rustdar-gpu --test volume_real_mask -- --ignored --nocapture
 //! ```
 //!
 //! # The environment contract
@@ -557,7 +557,7 @@ fn render_a_real_volume_mask() {
 ///
 /// ```text
 /// VOL=… CENTRE_LAT=… CENTRE_LON=… THRESH=20 OUT=/tmp/rd PRODUCT=NROT \
-/// cargo test -p rustdar-frontend --test volume_real_mask -- --ignored \
+/// cargo test -p rustdar-gpu --test volume_real_mask -- --ignored \
 ///     measure_boundary_honesty_and_smoothness --nocapture
 /// ```
 ///

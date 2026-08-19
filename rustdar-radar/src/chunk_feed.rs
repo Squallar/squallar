@@ -31,8 +31,8 @@ pub const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600)
 
 /// How fresh the tilt on screen is.
 ///
-/// Defined here, beside the feed that produces it, since WO-RF1; rustdar-egui
-/// re-exports it at the path it always published (`rustdar_egui::TiltFreshness`).
+/// Defined here, beside the feed that produces it, since WO-RF1. This is the
+/// one published path (rustdar-egui's temporary re-export died at WO-RA).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TiltFreshness {
     /// The elevation the active pane is actually rendering — the snapped angle,
@@ -54,8 +54,8 @@ pub struct TiltFreshness {
 /// front of them is current, and a volume can be most of the way assembled while
 /// their own tilt is still minutes old.
 ///
-/// Defined here, beside the feed that produces it, since WO-RF1; rustdar-egui
-/// re-exports it at the path it always published (`rustdar_egui::ChunkFeedStatus`).
+/// Defined here, beside the feed that produces it, since WO-RF1. This is the
+/// one published path (rustdar-egui's temporary re-export died at WO-RA).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ChunkFeedStatus {
     /// Some live site is being fed from the real-time bucket.

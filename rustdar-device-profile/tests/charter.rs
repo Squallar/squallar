@@ -96,7 +96,7 @@ fn the_dependency_ceiling_holds() {
              in rustdar-radar's size vocabulary; a dependency lands here only \
              after this charter and the plan change first, in writing. In \
              particular: NEVER wgpu (the 3D floor is a pinned literal, held \
-             to wgpu by rustdar-frontend's agreement test), NEVER rustdar-egui \
+             to wgpu by rustdar-app's agreement test), NEVER rustdar-egui \
              (the pane caps moved HERE so the UI could sit above the floor), \
              NEVER rustdar-kv until the kv lane lands the memo re-home in \
              writing.",
@@ -119,7 +119,7 @@ fn the_dependency_ceiling_holds() {
 }
 
 /// The graph shape WO-RD created stays: the app side stands on the policy
-/// floor — rustdar-frontend reads its budgets from here, and rustdar-egui
+/// floor — rustdar-app reads its budgets from here, and rustdar-egui
 /// reads the pane caps from here rather than the other way round.
 ///
 /// Presence, not absence, so it doubles as this file's second falsifiability
@@ -127,7 +127,7 @@ fn the_dependency_ceiling_holds() {
 #[test]
 fn the_floor_sits_under_the_app_side() {
     let meta = metadata();
-    for consumer in ["rustdar-frontend", "rustdar-egui"] {
+    for consumer in ["rustdar-app", "rustdar-egui"] {
         let deps = declared_deps(&meta, consumer);
         assert!(
             deps.iter()

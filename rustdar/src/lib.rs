@@ -9,7 +9,7 @@
 
 //! The rustdar app, one crate: desktop, Android and iOS entry points, the
 //! event loop bootstrap and the concrete [`platform::PlatformBridge`]
-//! implementations. The portable application lives in `rustdar-frontend`.
+//! implementations. The portable application lives in `rustdar-app`.
 
 // The `jni-typecheck` feature compiles the android modules (except
 // `android::entry`) for the host, so the JNI bodies get type-checked without

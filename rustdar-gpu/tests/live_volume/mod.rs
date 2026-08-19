@@ -38,7 +38,7 @@ use nexrad_model::meta::Site;
 ///
 /// **Not** `nexrad_data::volume::File::scan`, which is what
 /// `rustdar-radar/examples/render_product.rs` uses: `nexrad-data` is
-/// deliberately not a dependency of `rustdar-frontend` (its manifest says so in
+/// deliberately not a dependency of `rustdar-app` (its manifest says so in
 /// as many words), so the only route from bytes to a `Scan` this crate's
 /// dependency set offers is `rustdar_radar::chunks::decode_chunk` — which
 /// dispatches on the `AR2` magic and walks exactly the same records — plus
@@ -52,7 +52,7 @@ pub fn scan_from_archive(path: &std::path::Path) -> Scan {
     assert!(
         !bytes.starts_with(&[0x1f, 0x8b]),
         "{} is gzipped. Level II reaches this crate through nexrad-data's \
-         bzip2-per-record framing and nothing in rustdar-frontend's dependency \
+         bzip2-per-record framing and nothing in rustdar-app's dependency \
          set can gunzip a whole file; run `gunzip` on it first.",
         path.display(),
     );

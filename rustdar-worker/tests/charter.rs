@@ -100,7 +100,7 @@ fn the_dependency_ceiling_holds() {
 }
 
 /// The direction pin: the engine sits ABOVE the vocabulary and pipeline
-/// crates and BELOW the app side. rustdar-frontend and rustdar-web each stand
+/// crates and BELOW the app side. rustdar-app and rustdar-web each stand
 /// on rustdar-worker (the presence half that keeps the absence half
 /// falsifiable), and neither rustdar-radar nor rustdar-overlays may ever
 /// declare it back — codec rows live beside their pipelines and are composed
@@ -109,7 +109,7 @@ fn the_dependency_ceiling_holds() {
 fn the_engine_sits_above_the_vocabulary() {
     let meta = metadata();
 
-    for consumer in ["rustdar-frontend", "rustdar-web"] {
+    for consumer in ["rustdar-app", "rustdar-web"] {
         let deps = declared_deps(&meta, consumer);
         assert!(
             deps.iter()

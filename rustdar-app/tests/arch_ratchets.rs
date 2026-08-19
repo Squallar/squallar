@@ -11,7 +11,7 @@
 //!   positive check on the same haystack, so a moved or renamed haystack
 //!   fails loudly instead of counting zero and going silently green
 //!   (`the_opaque_overlay_path_stays_deleted`,
-//!   rustdar-frontend/src/app_render/frame_thread_conversion_tests.rs:200).
+//!   rustdar-app/src/app_render/frame_thread_conversion_tests.rs:200).
 //! - self-verifying inventory (`every_colour_scale_static_is_registered`,
 //!   rustdar-radar/src/palette.rs:946).
 //!
@@ -45,17 +45,17 @@
 //!
 //! ```text
 //!  #   metric                                        value  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-frontend     192  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' | wc -l
+//!  1a  App-pokes-Gui occurrences, rustdar-app     192  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
 //!      (204 at E0c; lowered at WO-E2 Land 1, which converted every setter
 //!      push to Gui::apply / the per-frame FrameInputs compose)
-//!  1b  ... excluding test-named paths                  186  rg -o 'self\.''gui\.' rustdar-frontend --glob '*.rs' -g '!*tests*' | wc -l
+//!  1b  ... excluding test-named paths                  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //!      (198 at E0c; same land)
 //!  2   Gui setter fns in rustdar-egui/src/ui.rs          3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
 //!      (23 at E0c; WO-E2 Land 2 deleted the 18 converted setters plus
 //!      apply_chunk_scan_info and clear_gps_fix, and demoted the two
 //!      armed-toggles to pub(crate) — the three chunk-settings setters
 //!      remain until WO-E8b reaches 0)
-//!  3   wasm-cfg lines per crate                          -  for c in rustdar-frontend rustdar-radar rustdar-egui rustdar-web rustdar-overlays rustdar-device-profile; do
+//!  3   wasm-cfg lines per crate                          -  for c in rustdar-app rustdar-radar rustdar-egui rustdar-web rustdar-overlays rustdar-device-profile; do
 //!      [RECORDED, NOT ASSERTED]                             printf '%s ' "$c"; rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs' \
 //!      frontend 93, radar 43, egui 40, web 31,              | awk -F: '{s+=$2} END {print s+0}'; done
 //!      overlays 25, device-profile 73 (sum 305;
@@ -68,7 +68,7 @@
 //!  5a  overlay-kind occurrences, whole tree            762  rg -o 'Overlay''Kind' . --glob '*.rs' | wc -l
 //!  5b  ... files containing it (info)                   61  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
 //!      (56 at the E0c-era count; re-counted at WO-RD)
-//!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-frontend/src/channels.rs | wc -l
+//!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
 //!      (70 and 57 occurrences at E0c — 38 and 37 distinct paths — shrunk
@@ -106,12 +106,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Workspace root: this integration test's manifest dir is `rustdar-frontend/`.
+/// Workspace root: this integration test's manifest dir is `rustdar-app/`.
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
 /// The five application crates the campaign's counters walk.
 const CRATES: [&str; 5] = [
-    "rustdar-frontend",
+    "rustdar-app",
     "rustdar-radar",
     "rustdar-egui",
     "rustdar-web",
@@ -283,11 +283,11 @@ fn in_test_path(path: &Path, crate_root: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Row 1 — the App-pokes-Gui coupling (occurrences of the split needle in
-/// rustdar-frontend). WO-E2/WO-E8 drive it to 0 via GuiEvent; transitional
+/// rustdar-app). WO-E2/WO-E8 drive it to 0 via GuiEvent; transitional
 /// scaffolding, deleted at campaign close.
 #[test]
 fn the_app_pokes_gui_coupling_never_grows() {
-    let crate_root = Path::new(ROOT).join("rustdar-frontend");
+    let crate_root = Path::new(ROOT).join("rustdar-app");
     let files = load_tree(&crate_root);
     assert_anchored(&files, "src/app.rs", APP_ANCHOR);
 
@@ -384,7 +384,7 @@ fn the_overlay_kind_enum_never_spreads_further() {
 /// mpsc, not a hub pair — the hub stays at 18 through the campaign.
 #[test]
 fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
-    let channels_rs = Path::new(ROOT).join("rustdar-frontend/src/channels.rs");
+    let channels_rs = Path::new(ROOT).join("rustdar-app/src/channels.rs");
     let text = anchored_file(&channels_rs, HUB_ANCHOR);
     let n = text.matches(RECEIVER_FIELD).count();
     assert!(

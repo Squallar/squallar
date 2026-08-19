@@ -20,11 +20,11 @@
 //! | key                | owner                                          |
 //! |--------------------|------------------------------------------------|
 //! | `"ui"`             | rustdar-egui `ui_config` (the UI layout)       |
-//! | `"location"`       | rustdar-frontend `location_permission` (memo)  |
-//! | `"loop_pool"`      | rustdar-frontend `loop_pool` (device memo)     |
-//! | `"site_catalogue"` | rustdar-frontend `site_catalogue`              |
-//! | `"site_positions"` | rustdar-frontend `site_positions`              |
-//! | `"budget_steps"`   | rustdar-frontend `budget` (device memo)        |
+//! | `"location"`       | rustdar-location `gate` (memo)                 |
+//! | `"loop_pool"`      | rustdar-app `loop_pool` (device memo)          |
+//! | `"site_catalogue"` | rustdar-app `site_catalogue`                   |
+//! | `"site_positions"` | rustdar-app `site_positions`                   |
+//! | `"budget_steps"`   | rustdar-app `budget_memo` (device memo)        |
 //!
 //! The key *strings* are on-disk compatibility: a changed string silently
 //! orphans every config or memo an existing install has saved. Each constant

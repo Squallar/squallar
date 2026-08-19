@@ -47,7 +47,7 @@ Notes on the Rustdar column:
 - **Level 2 real-time chunks** — `rustdar-radar/src/chunks.rs` reads the
   `unidata-nexrad-level2-chunks` bucket, so the 0.5° tilt arrives seconds after
   the radar collects it rather than at end-of-volume. A WebSocket push feed
-  (`rustdar-frontend/src/chunk_notify.rs`) drives the fetch.
+  (`rustdar-radar/src/chunk_notify.rs`) drives the fetch.
 - **HHC, POSH, MEHS, NROT** are derived locally from the Level 2 volume;
   **KDP, EET, VIL, VILD and DPR** come from the Level III bucket
   (`RadarProduct::is_level3`).
@@ -64,7 +64,7 @@ Notes on the Rustdar column:
 - **3D volumetric rendering** — a pane can be switched to a 3D view
   (View → 3D volume view), which resamples the volume onto a Cartesian voxel
   grid (`rustdar-radar/src/voxel.rs`) and raymarches it
-  (`rustdar-frontend/src/volume.wgsl`, `volume_raymarch.rs`, wired by
+  (`rustdar-volumetric/src/volume.wgsl`, `volume_raymarch.rs`, wired by
   `volume_bridge.rs`). Drag to orbit, scroll or pinch to zoom. **Reflectivity
   only**: the other five samplable moments have colour tables that are opaque at
   the bottom of their scale, and a volume drawn through one of those saturates
@@ -87,7 +87,7 @@ Notes on the Rustdar column:
   (`nrot::WindProfileBuilder`), but only as an input to storm-relative velocity
   and NROT. It is never displayed as a wind profile, so this is ❌ as a feature.
 - **Radar loop animation** — frame ceiling is per device class: 60 desktop, 20
-  mobile, 12 web (`rustdar-frontend/src/constants.rs`).
+  mobile, 12 web (`rustdar-device-profile/src/constants.rs`).
 - **Archive radar playback** — `rustdar-radar/src/archive.rs`, over the full
   public NEXRAD Level 2 archive rather than a rolling window.
 

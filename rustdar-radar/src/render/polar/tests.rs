@@ -342,7 +342,7 @@ fn layout_fixture() -> PolarField {
 ///
 /// This encoding has no version of its own. What a page and a worker from
 /// opposite sides of a deploy actually compare is `rustdar_web`'s
-/// `build_token` — `GITHUB_SHA` in CI, the `rustdar_frontend::wire_identity`
+/// `build_token` — `GITHUB_SHA` in CI, the `rustdar_worker::wire_identity`
 /// framing-rows digest locally — and the guards standing over that boundary
 /// are all blind here:
 ///
@@ -355,7 +355,7 @@ fn layout_fixture() -> PolarField {
 ///     those fields (`polar`), so the field set is identical either side of a
 ///     change here and that guard cannot see one.
 ///   * The local token digests the *framing rows* — the request and reply
-///     layouts `rustdar_frontend`'s own tests pin — and deliberately not the
+///     layouts `rustdar_worker`'s own tests pin — and deliberately not the
 ///     nested payloads inside the reply's fields, so a change here moves no
 ///     token either.
 ///
@@ -378,7 +378,7 @@ fn layout_fixture() -> PolarField {
 ///
 /// It cannot make a **local** page/worker pair differing only in these bytes
 /// refuse each other: the local token deliberately folds the framing rows
-/// and not the nested payloads — `rustdar_frontend::wire_identity` records
+/// and not the nested payloads — `rustdar_worker::wire_identity` records
 /// that accepted residual, and deployed pairs always differ by `GITHUB_SHA`
 /// and refuse at the handshake. What it can do is fail for the person who
 /// changes the layout, and say in the message what they owe. That is the
@@ -406,7 +406,7 @@ fn the_polar_wire_layout_is_the_one_this_protocol_ships() {
          GITHUB_SHA at the HELLO handshake; a LOCAL pair differing only \
          here still attaches, and `from_bytes`'s length checks turn most \
          such pairs into `None` and a readout that goes quiet — the \
-         accepted residual `rustdar_frontend::wire_identity` records, until \
+         accepted residual `rustdar_worker::wire_identity` records, until \
          full layout identity joins the token.",
     );
 }
