@@ -266,7 +266,7 @@ impl DecodedScan {
 /// This is rayon's *global* pool, which is also where [`crate::render`] and
 /// [`crate::voxel`] run their `par_iter`s. Every production entry into render,
 /// voxel and cross-section work goes through
-/// `rustdar_frontend::offload::execute`: on a pool thread natively, and on the
+/// `rustdar_worker::offload::execute`: on a pool thread natively, and on the
 /// caller's thread only in the logged fallback where the pool has no worker
 /// left. On wasm it is the worker, or inline on the page thread without one,
 /// where `crate::par` is serial anyway. A render issued while a decode is in
@@ -490,7 +490,7 @@ fn fold_contributions(
 /// belongs to whoever has the fetch stack, and the CPU half is the 0.9–5.3
 /// billion instructions [`decoded`] documents. Splitting them at the bytes lets
 /// the frontend download on the thread that can and decode wherever it should —
-/// see `rustdar_frontend::offload::JobRequest::Volume`, whose payload is
+/// see `rustdar_worker::offload::JobRequest::Volume`, whose payload is
 /// precisely these bytes.
 ///
 /// The `Vec` is taken by value because [`nexrad_data::volume::File`] owns its
@@ -576,7 +576,7 @@ pub async fn check_latest_scan(
 /// the web this future runs on the browser's main thread (`spawn_local`), and
 /// the decode is the second this application must not spend there. Splitting at
 /// the bytes lets the caller hand the CPU half to a worker — see
-/// `rustdar_frontend::offload::JobRequest::Decode`.
+/// `rustdar_worker::offload::JobRequest::Decode`.
 pub async fn fetch_scan(site: &str, timestamp: NaiveDateTime) -> Result<Vec<u8>> {
     let date = timestamp.date();
     let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? else {
@@ -788,8 +788,8 @@ pub async fn list_scans_for_range(
 ///
 /// Because consecutive volumes from one site are *minutes* apart. The shortest
 /// WSR-88D cadence anywhere in this tree is a measured 198 s — KPBZ's lowest
-/// 30-minute median, `rustdar-frontend/src/constants/tests.rs:468` — against a
-/// 259 s daily median for the same VCP (`rustdar-frontend/src/budget.rs:640`).
+/// 30-minute median, `rustdar-device-profile/src/constants/tests.rs:264` — against a
+/// 259 s daily median for the same VCP (`rustdar-device-profile/src/budget.rs:608`).
 /// Two timestamps that truncate alike are under 1 s apart, so the nearest
 /// volume this could conceivably confuse for its neighbour sits **198×**
 /// further away than the widest pair it admits. TDWR is wider still at 360 s

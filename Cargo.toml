@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "rustdar",
-    "rustdar-frontend",
+    "rustdar-app",
     "rustdar-device-profile",
     "rustdar-worker",
     "rustdar-gpu",
@@ -47,9 +47,9 @@ edition = "2024"
 
 [workspace.dependencies]
 nexrad-level3 = { path = "nexrad-level3" }
+rustdar-app = { path = "rustdar-app" }
 rustdar-device-profile = { path = "rustdar-device-profile" }
 rustdar-egui = { path = "rustdar-egui" }
-rustdar-frontend = { path = "rustdar-frontend" }
 rustdar-geo = { path = "rustdar-geo" }
 rustdar-gpu = { path = "rustdar-gpu" }
 rustdar-kv = { path = "rustdar-kv" }
@@ -78,14 +78,14 @@ winit = "=0.30.13"
 # bytes; Rust's own `f16` is still nightly-only.
 #
 # Adds no package and no build time: naga already pulls this exact version in
-# through wgpu-core, so every target that compiles `rustdar-frontend` was
+# through wgpu-core, so every target that compiles `rustdar-app` was
 # already compiling it. Pinned like the rest, and `default-features = false`
 # keeps `std`'s float-formatting arm out — the encoder needs the conversions
 # and nothing else.
 half = { version = "=2.7.1", default-features = false }
 
 # A **dev**-only, direct handle on the shader compiler wgpu already contains,
-# pinned to the exact version wgpu-29.0.4 resolves. `rustdar-frontend`'s
+# pinned to the exact version wgpu-29.0.4 resolves. `rustdar-app`'s
 # `tests/volume_shader.rs` translates the volume raymarch to GLSL ES 300 with
 # it, so that what a WebGL2 browser will be handed is checked on every CI row
 # rather than only in a browser nobody runs in CI.

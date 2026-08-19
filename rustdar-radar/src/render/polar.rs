@@ -425,7 +425,7 @@ impl PolarField {
     /// Give up the numbers and keep the geometry, for a render whose caller
     /// asked for the picture and not the values.
     ///
-    /// The counterpart of `rustdar_frontend`'s `values_wanted`, and the reason
+    /// The counterpart of `rustdar_app`'s `values_wanted`, and the reason
     /// it can stay a request rather than becoming two render paths: a loop
     /// frame drops 5.03 MiB of numbers it can read back out of the volume it
     /// was rendered from and keeps 5.8 KiB of geometry it cannot.
@@ -513,7 +513,7 @@ impl PolarField {
     /// their build tokens differ by `GITHUB_SHA` and the pair refuses at the
     /// HELLO handshake. What no instrument covers is a **local** pair
     /// differing only in these nested bytes — the local token digests the
-    /// framing rows (`rustdar_frontend::wire_identity`), deliberately not the
+    /// framing rows (`rustdar_worker::wire_identity`), deliberately not the
     /// payloads inside the reply's fields — so such a pair still attaches;
     /// `from_bytes` length-checks turn most mismatches into `None` and a
     /// quiet readout rather than a wrong one, the accepted residual

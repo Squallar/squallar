@@ -181,7 +181,7 @@ mod tests {
     /// added or moved:
     ///
     /// ```text
-    /// cargo test -p rustdar-frontend --all-features -- --ignored the_live_anchor_survey
+    /// cargo test -p rustdar-app --all-features -- --ignored the_live_anchor_survey
     /// ```
     ///
     /// 400 km is deliberately looser than a WSR-88D's ~230 km reflectivity

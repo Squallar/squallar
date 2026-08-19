@@ -208,7 +208,8 @@ enum BackPress {
 /// (and `crate::loop_pool` reads `constants::VOLUME_GRID_CELLS` at module
 /// level).
 ///
-/// ## Module census (every remaining rustdar-frontend module)
+/// ## Module census (every remaining module of this crate — rustdar-app
+/// since WO-RA renamed it from the old frontend name)
 ///
 /// | module (LOC) | dest | note |
 /// |---|---|---|
@@ -262,8 +263,10 @@ enum BackPress {
 /// (tests.rs is a source probe over app.rs; the other two drive
 /// App+TestBridge). Forced seam adaptations, each cycle-driven:
 /// `ChunkFeedStatus`/`TiltFreshness` definitions moved rustdar-egui -> radar
-/// chunk_feed with egui re-exporting at the published paths (radar cannot dep
-/// egui); `retain_live` returns the evicted `SiteFeed`s and the app drain
+/// chunk_feed (radar cannot dep egui); RF1's temporary egui re-exports at the
+/// old published paths were KILLED at WO-RA — one name, one path:
+/// `rustdar_radar::chunk_feed::{ChunkFeedStatus, TiltFreshness}`;
+/// `retain_live` returns the evicted `SiteFeed`s and the app drain
 /// hands them to `offload::discard_each` (radar cannot dep rustdar-worker;
 /// same shape as RF2's parameterization precedent); radar feature
 /// `test-support` compiles the three cross-crate test hooks
@@ -286,14 +289,15 @@ enum BackPress {
 /// mechanical re-points ONLY; RF2n also de-fused the loop_pool survival
 /// comment (d5, executed).
 ///
-/// **Stale `rustdar_frontend::` prose in radar/overlays/source/geo (RF1/RF2
-/// own the repair)**: 55 occurrences / 24 files at this tree (radar 36/15,
-/// overlays 16/6, source 2/2, geo 1/1) — 45 name the worker-moved
-/// offload/wire_identity family (WO-RW's "~45" was exactly this family), 5
-/// name volumetric-moved modules, 3 name device-profile-moved constants, 1
-/// named chunk_feed (radar chunks.rs — REPAIRED at RF1 to `crate::chunk_feed`
-/// when the module arrived), 1 names render_dispatch (overlays
-/// handlers/model.rs — still valid today, re-keys at WO-RA, not at RF1/RF2).
+/// **Stale old-crate-name prose in radar/overlays/source/geo** (doc mentions
+/// spelling items through the pre-rename crate root): the census counted 55
+/// occurrences / 24 files (radar 36/15, overlays 16/6,
+/// source 2/2, geo 1/1) — 45 naming the worker-moved offload/wire_identity
+/// family, 5 volumetric-moved modules, 3 device-profile-moved constants, 1
+/// chunk_feed (REPAIRED at RF1), 1 render_dispatch (overlays
+/// handlers/model.rs). SWEPT at WO-RA: every mention workspace-wide now
+/// spells the named item's true home (rustdar_worker / rustdar_volumetric /
+/// rustdar_device_profile / rustdar_gpu / rustdar_app).
 ///
 /// ## Discrepancies vs the plan's expectations
 ///
@@ -364,7 +368,7 @@ pub struct App {
     user_heading: Option<f32>,
     /// What the real-time chunk feed is doing, restated by `drive_chunk_feeds`
     /// every frame so the status bar never shows a stale claim.
-    chunk_feed_status: rustdar_egui::ChunkFeedStatus,
+    chunk_feed_status: rustdar_radar::chunk_feed::ChunkFeedStatus,
     /// Each site's current-volume stamp, rebuilt by `publish_base_volumes`
     /// every frame. The decoded `Scan`s stay here; the UI holds only names.
     current_volume_stamps: HashMap<String, rustdar_egui::CurrentVolumeStamp>,
@@ -1152,7 +1156,7 @@ impl App {
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
             user_gps: None,
             user_heading: None,
-            chunk_feed_status: rustdar_egui::ChunkFeedStatus::default(),
+            chunk_feed_status: rustdar_radar::chunk_feed::ChunkFeedStatus::default(),
             current_volume_stamps: HashMap::new(),
             volume_painter: None,
             mirror_rungs: rustdar_gpu::egui_renderer::MirrorRungs::default(),

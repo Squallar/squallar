@@ -7,7 +7,7 @@
 //! three is testable. The cascade is not *wrong* — a wasm build genuinely
 //! cannot hold what a desktop build can — but it answers the question with the
 //! only fact available at compile time, which is **which APIs exist**, not
-//! **what the machine is**. rustdar-frontend `loop_pool`'s own module doc states that
+//! **what the machine is**. rustdar-app `loop_pool`'s own module doc states that
 //! taxonomy and the pool already obeys it; this module is that idea generalised
 //! to every budget rather than one.
 //!
@@ -57,7 +57,7 @@
 //! grid cells, then the raster side. [`demote`] walks it. A rung never crosses
 //! its bracket floor, so the worst a machine that keeps failing can reach is
 //! the configuration this build already shipped to it, and below that the 3D
-//! view retires entirely, which rustdar-frontend's `volume::degrade` already latches.
+//! view retires entirely, which rustdar-volumetric's `degrade` already latches.
 //!
 //! # There is no browser in [`DeviceProfile`], and there must not be
 //!
@@ -72,7 +72,7 @@
 //!
 //! # Capability is a different question and is already answered
 //!
-//! *Can this device do the thing at all* is rustdar-frontend's `volume::probe`, which reads
+//! *Can this device do the thing at all* is rustdar-volumetric's `probe`, which reads
 //! four limits and two format features and returns a human-readable reason.
 //! *How much of the thing can it afford* is this module. Keeping them apart is
 //! what makes "available in one browser, absent in the other on the same box" a
@@ -83,7 +83,7 @@ use crate::quality::{DeviceClass, GradientShading, VolumeQuality};
 
 /// Which APIs exist. **Not** which machine this is.
 ///
-/// The distinction rustdar-frontend `loop_pool`'s module doc draws: the `cfg` tells you
+/// The distinction rustdar-app `loop_pool`'s module doc draws: the `cfg` tells you
 /// what is callable, and the device class, discovered at runtime, tells you what
 /// the machine is. Two variants, and deliberately no third for `mobile` — a
 /// native Android build and a native desktop build have the same API surface and
@@ -101,7 +101,7 @@ pub enum Platform {
 ///
 /// `None` on every target that has no bridge to ask. Browser-side this is
 /// `matchMedia('(pointer: coarse)')` and friends, and the shortlist
-/// rustdar-frontend `loop_pool`'s module doc surveys — a touchscreen laptop reports
+/// rustdar-app `loop_pool`'s module doc surveys — a touchscreen laptop reports
 /// *both* coarse and fine, which is the case a naive `coarse` test gets wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FormFactor {
@@ -230,7 +230,7 @@ impl Promotion {
 /// refuse an allocation is better than any guess from a device type, and
 /// honouring it is also what keeps a reopen 1:1 rather than showing a different
 /// loop length on every start. Both fields are persisted in their own
-/// `KvStore` entries, written synchronously — rustdar-frontend's
+/// `KvStore` entries, written synchronously — rustdar-app's
 /// `loop_pool::LOOP_POOL_KEY` for the pool and `budget_memo::BUDGET_MEMO_KEY`
 /// for the ladder (the read/write pair stayed app-side with the store) —
 /// because a value learned by crashing the GPU is exactly the value that must
@@ -369,7 +369,7 @@ impl DeviceProfile {
 /// A compile-time `[floor, ceiling]` pair for one number.
 ///
 /// The two halves are different *kinds* of statement and the asymmetry is the
-/// whole design, exactly as rustdar-frontend `loop_pool::LoopPoolLimits`' doc puts it:
+/// whole design, exactly as rustdar-app `loop_pool::LoopPoolLimits`' doc puts it:
 ///
 /// * **floor** — a decision. The worst device this build is willing to work on,
 ///   never crossed downward whatever happens. It is what the wasm `cargo check`
@@ -1136,7 +1136,7 @@ impl Budgets {
     /// * the loop pool at its **ceiling** — one term, not `panes ×` a per-pane
     ///   figure, because the pool is divided among the loops that want one and
     ///   a 3D loop takes one share per *volume* rather than per pane;
-    /// * the volume store's **floor**, which rustdar-frontend's `App::setup_egui_frame` applies
+    /// * the volume store's **floor**, which rustdar-app's `App::setup_egui_frame` applies
     ///   with `.max(...)` *outside* the pool, so a screen with no 3D loop at all
     ///   spends the whole pool on raster frames and still leaves the store
     ///   floored;
@@ -1271,7 +1271,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
 ///
 /// # Only the first rungs are reachable, and that is by design
 ///
-/// rustdar-frontend's `volume::degrade` retires the 3D view after **two** surface losses. So a
+/// rustdar-volumetric's `degrade` retires the 3D view after **two** surface losses. So a
 /// machine walking this ladder gets one rung, then a second, then loses 3D
 /// entirely — the floor the plan names. The later rungs exist so the ordering
 /// is stated and testable, not because a session will spend them.

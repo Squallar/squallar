@@ -188,7 +188,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "rustdar-volumetric/src/volume.wgsl",
         "const KM_PER_DEGREE_LAT: f32 = 111.194927;",
         "WGSL cannot read a Rust constant. This is the only copy of the \
-         figure anywhere, and `rustdar-frontend`'s \
+         figure anywhere, and `rustdar-volumetric`'s \
          `the_shaders_km_per_degree_is_the_radar_crates_own` compares it to \
          `KM_PER_DEGREE_LAT` on f32 bits, so it cannot drift.",
     ),
@@ -652,7 +652,7 @@ fn only_files_named_as_tests_are_exempt() {
         // Not a test file: `tests` is a path component of neither, and the
         // exemption must not spread by substring.
         "rustdar-radar/src/latest.rs",
-        "rustdar-frontend/src/app_fetch.rs",
+        "rustdar-app/src/app_fetch.rs",
     ] {
         assert!(!is_test_file(path), "`{path}` is source, not a test");
     }

@@ -178,7 +178,7 @@ struct FrameFactsForTest {
     gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     user_heading: Option<f32>,
     catalogue_pending: bool,
-    chunk_status: crate::ui::ChunkFeedStatus,
+    chunk_status: rustdar_radar::chunk_feed::ChunkFeedStatus,
     current_volumes: std::collections::HashMap<String, crate::ui::CurrentVolumeStamp>,
     floor_tile_zoom_bias: u8,
 }
@@ -196,7 +196,7 @@ impl Default for FrameFactsForTest {
             gps: None,
             user_heading: None,
             catalogue_pending: false,
-            chunk_status: crate::ui::ChunkFeedStatus::default(),
+            chunk_status: rustdar_radar::chunk_feed::ChunkFeedStatus::default(),
             current_volumes: Default::default(),
             floor_tile_zoom_bias: 0,
         }
@@ -1639,7 +1639,7 @@ impl InputHarness {
     /// from the render's own product, *snapped* elevation and declared fold
     /// limit rather than from the pane's selection. There is one such assignment
     /// in production, shared by both datasources, and
-    /// `a_placed_render_describes_what_it_depicts` in `rustdar-frontend` holds
+    /// `a_placed_render_describes_what_it_depicts` in `rustdar-app` holds
     /// this fixture to it.
     ///
     /// `nyquist_ms` is `None` for everything a real render has no declaration

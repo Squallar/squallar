@@ -900,7 +900,7 @@ mod budget_agreement {
         const HEADER: &str = "| target  | frames | 3D texture | resident  | headroom | share   |";
         // The table lives in the floor crate's doc comment; this side owns the
         // planner that derives it, so the scrape crosses the crate boundary by
-        // path (from rustdar-frontend/src/loop_pool/ up to the workspace root).
+        // path (from rustdar-app/src/loop_pool/ up to the workspace root).
         let source = include_str!("../../../rustdar-device-profile/src/constants.rs");
         let rows: Vec<Vec<String>> = source
             .lines()

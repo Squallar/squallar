@@ -40,7 +40,7 @@ pub struct HitCells {
     /// `qy * width + qx` → covering item indices. Occupied cells only.
     ///
     /// Public because this is a wire form: the codec in
-    /// `rustdar_frontend::offload` reads and rebuilds it, and *it* polices the
+    /// `rustdar_worker::offload` reads and rebuilds it, and *it* polices the
     /// in-range invariant on untrusted bytes. Everything built through
     /// [`record`](Self::record) is in range by construction.
     pub cells: HashMap<u32, Vec<u32>>,
@@ -116,7 +116,7 @@ impl HitMap {
     /// input rows by the handler's `paint_input` helper, the items by its
     /// `hit_items` — and the wire codec appends and reads lists in order, so
     /// the invariant holds by construction. It is pinned rather than trusted:
-    /// `rustdar_frontend::offload::tests` zips a deliberately shuffled id_map
+    /// `rustdar_worker::offload::tests` zips a deliberately shuffled id_map
     /// and asserts the hit comes back **wrong**, because a silent order
     /// mismatch here is a hover that names the wrong storm report — worse than
     /// no hit map at all.
@@ -147,7 +147,7 @@ impl HitMap {
 /// copy, `from_rgba_unmultiplied` is a copy through a 64 KiB lookup table — and
 /// picking the wrong one does not fail, it shifts every translucent colour. So
 /// the convention is carried on [`RasterizeOutput`] rather than known by the
-/// consumer: `rustdar_frontend::offload::execute`'s output stage reads it off
+/// consumer: `rustdar_worker::offload::execute`'s output stage reads it off
 /// the value it was handed, converts the straight case inside the job, and
 /// answers premultiplied-always — so the one page-side read is a
 /// compute-nothing `from_rgba_premultiplied` that cannot be written to assume
@@ -404,7 +404,7 @@ pub struct OutlooksInput {
 rustdar_source::impl_job_input!(OutlooksInput);
 
 /// [`RasterizeOutput`] for the reason [`rasterize_radar_sites`] answers one:
-/// with the outlook render a described job, `rustdar_frontend::offload`'s
+/// with the outlook render a described job, `rustdar_worker::offload`'s
 /// `execute` calls this directly and needs the alpha convention stated by the
 /// value rather than known by the caller. Premultiplied on every path.
 pub fn rasterize_spc_outlooks(
@@ -1175,7 +1175,7 @@ pub struct GlmStrikesInput {
     /// the direct call: parity between the two paths is only byte-exact
     /// because this value travels on the wire with the flashes it ages. The
     /// capture site is [`RasterizeContext::now`], filled by the dispatching
-    /// pane; `rustdar_frontend::offload::tests` pins that a shifted `now`
+    /// pane; `rustdar_worker::offload::tests` pins that a shifted `now`
     /// really does change the picture on a fixture whose flashes straddle the
     /// fade steps, so a worker re-derivation cannot pass the parity gate.
     ///
@@ -1812,14 +1812,14 @@ fn projection_window(
 ///    pool and serialises nothing) pays a refcount where every other carry
 ///    would pay a memcpy.
 ///  * [`Self::Window`] is the wire's carry: the window and exactly its
-///    values. `rustdar_frontend::offload`'s encoder cuts a `Whole` down to
+///    values. `rustdar_worker::offload`'s encoder cuts a `Whole` down to
 ///    this at `to_bytes` time — the one place that knows the texture's
 ///    bounds — and its decoder only ever produces this form.
 ///
 /// Both arms run the one rasterizer, and the byte parity between them is
 /// pinned twice: `render::rasterize::model_window_tests` proves a proper
 /// subset window paints identically to the whole grid, and
-/// `rustdar_frontend::offload::tests` proves it again through the codec.
+/// `rustdar_worker::offload::tests` proves it again through the codec.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelDataInput {
     /// The grid as fetched, whole, by reference.

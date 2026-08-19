@@ -169,7 +169,7 @@ pub struct SectionImageData {
 /// path they would collide in an LRU; here they would collide in a **broadcast**
 /// — see [`LoopPlaybackState::view`].
 ///
-/// [`RenderCacheKey`]: https://docs.rs/rustdar-frontend
+/// [`RenderCacheKey`]: https://docs.rs/rustdar-app
 #[derive(Clone)]
 pub enum LoopFrameImage {
     /// A square plan-view raster, positioned by the site's coordinates.

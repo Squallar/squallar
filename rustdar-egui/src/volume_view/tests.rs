@@ -74,7 +74,7 @@ fn the_centre_of_the_screen_looks_at_the_centre_of_the_box() {
 /// nothing in `build_view` assumes the eye is outside — the derivation is a
 /// point and a direction, not a framing. The GPU half (the raymarch's slab
 /// entry clamped to zero so an inside eye marches forward from itself)
-/// lives in `rustdar-frontend`'s silhouette harness, where the shader runs.
+/// lives in `rustdar-gpu`'s silhouette harness, where the shader runs.
 /// Checked at 1x and 12x. The stop no longer moves with the knob — the
 /// framing radius reads the true box — but the *box* still grows around
 /// the eye, so "inside" is a claim worth re-making at both ends.
@@ -349,7 +349,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
     assert!(
         payload.downcast_ref::<StubPayload>().is_some(),
         "the stub's payload is its own type, which nothing in egui_wgpu can draw — \
-             the real payload's downcast is pinned in rustdar-frontend by \
+             the real payload's downcast is pinned in rustdar-volumetric by \
              `the_payload_the_painter_hands_over_is_one_egui_wgpu_can_draw`",
     );
     assert_eq!(painter.seen.lock().unwrap().len(), 1);

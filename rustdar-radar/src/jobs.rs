@@ -5,7 +5,7 @@
 //! [`RadarPlanJob`] and its five siblings, the shapes of the frontend's
 //! `JobRequest` variants minus the envelope — monomorphized into a
 //! [`JobCodec`] in [`JOB_CODECS`]. The codec bodies moved here **verbatim**
-//! (post-WO-M6.3 text) from `rustdar_frontend::offload`, which keeps
+//! (post-WO-M6.3 text) from `rustdar_worker::offload`, which keeps
 //! byte-identical duplicates until WO-M7.2 flips the frontend onto this
 //! table and deletes them — until that flip nothing routes through this
 //! module, and the frontend's framing digests over the duplicate bodies are
@@ -88,7 +88,7 @@ pub static JOB_CODECS: &[JobCodec] = &[
 /// was a 21.04 MiB memcpy per widest 2048² still frame, plus the encode
 /// sink's whole-reply double-buffer on top). The tail ORDER is load-bearing
 /// both ends and is pinned by the frame-reply digest rows
-/// (`rustdar_frontend::wire_identity::WIRE_FRAME_REPLY_ROWS`): a symmetric
+/// (`rustdar_worker::wire_identity::WIRE_FRAME_REPLY_ROWS`): a symmetric
 /// swap here and in `from_parts` keeps every round-trip green, and the
 /// digest is what goes red.
 macro_rules! frame_reply_codec {

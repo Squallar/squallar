@@ -1374,7 +1374,7 @@ impl VolumePainter for BridgeVolumePainter {
         // one-cell sheet to 0.502, and a `>= 0.5` cut deletes them. Measured
         // by `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`
         // — `#[ignore]`d, it needs a real adapter, so run it with
-        // `cargo test -p rustdar-frontend --test volume_gpu -- --ignored`.
+        // `cargo test -p rustdar-gpu --test volume_gpu -- --ignored`.
         // Sequential isosurface at threshold 100/255, 128 x 128 px, one
         // camera, same fixtures at both levels:
         //

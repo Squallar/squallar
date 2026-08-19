@@ -444,7 +444,7 @@ mod tests {
     /// only thing that can be checked there.
     ///
     /// ```text
-    /// cargo test -p rustdar-frontend --lib \
+    /// cargo test -p rustdar-volumetric --lib \
     ///     volume::raymarch::staging::tests::the_two_routes_write_the_same_plane \
     ///     -- --ignored --exact --nocapture
     /// ```
@@ -614,7 +614,7 @@ mod tests {
     /// what it costs when it happens is this.
     ///
     /// ```text
-    /// cargo test -p rustdar-frontend --lib \
+    /// cargo test -p rustdar-volumetric --lib \
     ///     volume::raymarch::staging::tests::the_worst_case_residency_is_the_ring_and_the_widening_together \
     ///     -- --ignored --exact --nocapture
     /// ```

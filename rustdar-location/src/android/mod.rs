@@ -16,7 +16,7 @@
 //! Before WO-RL-4 the location calls reached the app's bridge as injected `fn`
 //! pointers (`set_location_hooks`), under the rule written in the shell's
 //! `rustdar/src/android/mod.rs`. That rule STANDS for insets, theme and back:
-//! their consumer is `PlatformBridge`, declared in rustdar-frontend, which
+//! their consumer is `PlatformBridge`, declared in rustdar-app, which
 //! must compile for targets that have never heard of JNI. Location's consumer
 //! is no longer the bridge at all — it is this crate's own facade, the JNI
 //! calls are made directly by [`AndroidBackend`], and the portability contract

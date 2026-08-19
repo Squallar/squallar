@@ -320,7 +320,7 @@ pub struct LambertGrid {
 /// [`LambertGrid::from_parts`].
 ///
 /// It exists because the grid's fields are private and the codec that carries
-/// a model-grid overlay job (`rustdar_frontend::offload`) lives in another
+/// a model-grid overlay job (`rustdar_worker::offload`) lives in another
 /// crate. The fields are the *stored* values — derived constants and the
 /// measured `wraps_longitude` included — precisely so the far side restores
 /// bits instead of re-deriving anything: a re-derivation would put libm's last
@@ -517,7 +517,7 @@ impl LambertGrid {
     }
 
     /// This grid's stored constants, whole, for the one boundary that can only
-    /// carry numbers: `rustdar_frontend::offload`'s described-overlay codec.
+    /// carry numbers: `rustdar_worker::offload`'s described-overlay codec.
     ///
     /// Every field is the **stored** value — the derived projection constants
     /// included — so [`Self::from_parts`] restores bits rather than re-running

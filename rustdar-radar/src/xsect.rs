@@ -443,7 +443,7 @@ impl SectionAxes {
 ///
 /// The fields are private and the lengths are checked in
 /// [`from_parts`](Self::from_parts), because a mis-shaped section is not a
-/// recoverable error anywhere downstream. `rustdar-frontend`'s
+/// recoverable error anywhere downstream. `rustdar-app`'s
 /// `app_render::upload_section_raster` builds a `ColorImage` from a buffer and
 /// a size; the length check is `epaint`'s own, an `assert_eq!` inside
 /// `ColorImage::from_rgba_premultiplied` (`epaint-0.35.0/src/image.rs:128`). It
@@ -523,7 +523,7 @@ impl CrossSection {
     ///
     /// * **A plane that is not exactly this build's [`SECTION_WIDTH`] ×
     ///   [`SECTION_HEIGHT`].** Not a recoverable error anywhere downstream:
-    ///   `rustdar-frontend`'s `app_render::upload_section_raster` builds a
+    ///   `rustdar-app`'s `app_render::upload_section_raster` builds a
     ///   `ColorImage` from a buffer and a size, and the length check is
     ///   `epaint`'s own `assert_eq!` inside
     ///   `ColorImage::from_rgba_premultiplied`
@@ -626,7 +626,7 @@ impl CrossSection {
     /// and what every consumer's `ColorImage` assertion stands on, and a slice
     /// cannot change it. What a caller may do is change the *convention* the
     /// bytes are in, which is exactly the one caller there is:
-    /// `rustdar-frontend`'s `offload::execute` premultiplies each raster before
+    /// `rustdar-worker`'s `offload::execute` premultiplies each raster before
     /// it leaves the job, so a section reaches its texture upload as a
     /// reinterpretation rather than as a per-pixel walk on the frame thread.
     ///
@@ -980,10 +980,10 @@ fn render_with_sampler(
 /// 4,608 pages**. All three are well under glibc's
 /// `DEFAULT_MMAP_THRESHOLD_MAX` of 33,554,432, so this is *not* the `mmap`
 /// cliff that `crate::render`'s `POOLED_CELLS` and
-/// `rustdar_frontend::volume_raymarch::coverage_premultiplied_into` were fixed
+/// `rustdar_volumetric::raymarch::coverage_premultiplied_into` were fixed
 /// for — these blocks come out of an arena, which is exactly the problem.
 ///
-/// A cut runs on a thread of its own (`rustdar_frontend::offload` spawns one
+/// A cut runs on a thread of its own (`rustdar_worker::offload` spawns one
 /// per job natively), so it takes whichever arena glibc hands that thread; the
 /// planes are freed when the section is dropped, the arena trims, and the next
 /// cut faults all 4,608 pages back in. Which arena it gets is decided by the
@@ -1090,11 +1090,11 @@ fn render_with_sampler(
 ///
 /// This is `crate::render`'s `POOLED_CELLS` argument, and it applies here
 /// unchanged because the callers are the same three:
-/// `rustdar_frontend::offload::execute` is documented *pure* and is the one
+/// `rustdar_worker::offload::execute` is documented *pure* and is the one
 /// implementation shared by a fresh `std::thread` per job on native, a browser
 /// worker reached over a message port that cannot be handed a pointer, and the
 /// inline fallback. None of the three has a buffer to lend.
-/// `rustdar_frontend::volume_bridge::VolumeResources::staging` is the other
+/// `rustdar_volumetric::bridge::VolumeResources::staging` is the other
 /// shape and is right where it is used, because *its* caller is the frame
 /// thread, which spans every upload. There is no such caller here.
 ///
@@ -1412,7 +1412,7 @@ fn section_color(product: RadarProduct, sample: Sample) -> (u8, u8, u8, u8) {
 // ── Codec ────────────────────────────────────────────────────────────────────
 //
 // The payload type owns its codec; the job framing that carries it lives in
-// `rustdar-frontend`'s `offload`. That split is `render_input`'s, kept for the
+// `rustdar-worker`'s `offload`. That split is `render_input`'s, kept for the
 // reason it was made there: a section that can encode itself can be put on a
 // message port, in an IndexedDB blob or in a test fixture without any of the
 // three learning its layout, and there is one place where the layout is

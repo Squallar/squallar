@@ -595,7 +595,7 @@ pub trait OverlayHandler: Send {
     /// answers `None`
     /// (`handlers::texture_tests::every_texture_handler_agrees_with_its_own_rasterizer`),
     /// or `ui_map_pane`'s settle machinery asks for a render nothing can
-    /// satisfy, every 100 ms, forever. The dispatch site (`rustdar_frontend`'s
+    /// satisfy, every 100 ms, forever. The dispatch site (`rustdar_app`'s
     /// `spawn_overlay_render`) routes by an explicit match on kind, not by
     /// probing this method, so a kind moved between paths is a decision made
     /// there and tested in
@@ -833,7 +833,7 @@ pub struct RasterizeContext {
 // Two bounds, not one: the future, and the type-erased payload it sends back
 // over an `mpsc::Sender`. Relaxing only the future still fails to compile.
 //
-// **Do not relax the renderer's bounds to match.** `rustdar-frontend`'s render
+// **Do not relax the renderer's bounds to match.** `rustdar-app`'s render
 // dispatch spawns real OS threads and needs `Send` on every target; matching
 // it to this compiles for web while silently breaking desktop threading.
 

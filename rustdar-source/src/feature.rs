@@ -30,7 +30,7 @@ pub enum HatchPattern {
 }
 
 /// `PartialEq` because features ride inside
-/// `rustdar_frontend::offload::JobRequest` (the described overlay jobs for the
+/// `rustdar_worker::offload::JobRequest` (the described overlay jobs for the
 /// polygon kinds), whose wire round-trip tests compare whole requests; it is
 /// derived and carries [`GeoBounds`]'s own `f64` caveat that `NaN != NaN`.
 #[derive(Debug, Clone, PartialEq)]

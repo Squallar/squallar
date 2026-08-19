@@ -127,7 +127,7 @@ pub struct PreparedFrame {
     /// the click's own events happened to produce (press, release, a stray
     /// move — the reported ~3 frames) and then froze until the next input.
     /// Honoured by `App::handle_redraw` via the app side's `repaint_action`
-    /// (rustdar-frontend's `app` module).
+    /// (rustdar-app's `app` module).
     repaint_delay: std::time::Duration,
     /// Command buffers egui collected from this frame's paint callbacks.
     ///
@@ -226,7 +226,7 @@ fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
 /// **Only a zero delay wakes.** A timed request — `request_repaint_after`, a
 /// tooltip's dwell, a cursor blink — is already carried out of the frame by
 /// `FullOutput`'s `repaint_delay` and scheduled by the app side's
-/// `repaint_action` (rustdar-frontend's `app` module), and honouring it here as
+/// `repaint_action` (rustdar-app's `app` module), and honouring it here as
 /// well would turn every such request into an immediate redraw: egui re-asks
 /// on each pass, so the "wait half a second" would become a frame per frame,
 /// forever. The one thing this drops is an off-frame *timed* request, which

@@ -71,7 +71,7 @@ pub fn start() -> Result<(), JsValue> {
     let platform = crate::bridge::WebPlatform::new(canvas);
     let location =
         rustdar_location::LocationFacade::new(Box::new(rustdar_location::web::WebBackend::new()));
-    let app = rustdar_frontend::app::App::new(Box::new(platform), location);
+    let app = rustdar_app::app::App::new(Box::new(platform), location);
 
     event_loop.spawn_app(app);
     Ok(())

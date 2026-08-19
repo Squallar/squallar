@@ -1,11 +1,11 @@
 //! Concrete [`PlatformBridge`] implementations. The trait lives in
-//! `rustdar-frontend`, which must never name a per-OS type.
+//! `rustdar-app`, which must never name a per-OS type.
 
-use rustdar_frontend::platform::{PlatformBridge, RedrawWaker};
+use rustdar_app::platform::{PlatformBridge, RedrawWaker};
 // Only the android bridge drains channels since WO-RL-4 took the desktop
 // bridge's location channels into the facade.
 #[cfg(target_os = "android")]
-use rustdar_frontend::platform::drain_latest;
+use rustdar_app::platform::drain_latest;
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -312,7 +312,7 @@ impl PlatformBridge for AndroidPlatform {
         }
         self.theme_detector = Some(detector);
 
-        match rustdar_frontend::platform::spawn_state_poller(
+        match rustdar_app::platform::spawn_state_poller(
             "theme-detect",
             std::time::Duration::from_secs(2),
             detector,

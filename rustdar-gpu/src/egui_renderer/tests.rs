@@ -86,7 +86,7 @@ fn a_timed_repaint_request_is_left_to_the_frames_own_schedule() {
 /// The behavioural tests above drive `install_repaint_wake` directly and stay
 /// green with nothing calling it. The old assertion's other half — that the
 /// wake ends in a redraw request — travelled to the app side with the closure
-/// at WO-RG: rustdar-frontend's `egui_frame_pin_tests` pins that the wake
+/// at WO-RG: rustdar-app's `egui_frame_pin_tests` pins that the wake
 /// `AppState::new` builds calls its `notify_redraw`.
 #[test]
 fn the_renderer_installs_that_wake_on_the_context_it_builds() {
@@ -174,7 +174,7 @@ fn end_pass_and_upload_carries_the_callback_command_buffers() {
     );
 }
 
-// `the_frame_path_submits_only_through_prepared_frame` pins rustdar-frontend's
+// `the_frame_path_submits_only_through_prepared_frame` pins rustdar-app's
 // `present_frame` and stayed behind at WO-RG: it lives in the app side's
 // `app_render/egui_frame_pin_tests.rs`, beside the file it scrapes.
 
@@ -209,7 +209,7 @@ fn attachment_config_is_built_from_new_s_own_parameters() {
 }
 
 // `the_pass_draw_opens_matches_what_attachment_config_promises` scrapes BOTH
-// this crate's `egui_renderer.rs` and rustdar-frontend's `app_state.rs` (the
+// this crate's `egui_renderer.rs` and rustdar-app's `app_state.rs` (the
 // only production construction), so it stayed on the app side at WO-RG — in
 // `app_render/egui_frame_pin_tests.rs`, where the same-crate half lives.
 

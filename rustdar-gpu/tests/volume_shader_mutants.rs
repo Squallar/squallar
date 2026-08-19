@@ -22,7 +22,7 @@
 //! can see.
 //!
 //! ```text
-//! cargo test -p rustdar-frontend --test volume_shader_mutants -- --ignored --nocapture
+//! cargo test -p rustdar-gpu --test volume_shader_mutants -- --ignored --nocapture
 //! ```
 //!
 //! **An unmatched pattern is a hard failure.** A battery whose patterns have
@@ -1565,7 +1565,7 @@ static MUTANTS: &[Mutant] = &[
     // bit, and at it they disagree by one ULP in a band where `floor_fade` has
     // already multiplied both arms by ~0. What stands on them is
     // `volume_gpu::the_floor_composites_on_one_arm_per_frame` — `#[ignore]`d
-    // behind a real adapter, run with `cargo test -p rustdar-frontend --test
+    // behind a real adapter, run with `cargo test -p rustdar-gpu --test
     // volume_gpu -- --ignored` — which asks a different question: not "does
     // this pixel move" but "is the whole frame on one arm", which is the
     // property that was false. Its host-side half,
@@ -1582,7 +1582,7 @@ static MUTANTS: &[Mutant] = &[
 /// machine, before anybody looks at a GPU job.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_shader_mutants \
+/// cargo test -p rustdar-gpu --test volume_shader_mutants \
 ///     every_mutant_still_matches_the_shader_it_mutates -- --exact
 /// ```
 #[test]
@@ -1710,7 +1710,7 @@ fn pipelines_from(
 /// probe, not a deleted row.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_shader_mutants -- --ignored --nocapture
+/// cargo test -p rustdar-gpu --test volume_shader_mutants -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]

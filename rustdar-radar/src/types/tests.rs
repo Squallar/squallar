@@ -966,7 +966,7 @@ fn mehs_in_inches_is_what_it_printed_before_the_preference_existed() {
 /// Distinctness and round-trip both survive a **renumbering** — swapping
 /// two views' bytes in both [`RenderView::wire_code`] and
 /// [`RenderView::from_wire_code`] keeps them — and this byte is the kind
-/// tag on a worker's out-of-band reply (`rustdar_frontend::offload`'s
+/// tag on a worker's out-of-band reply (`rustdar_worker::offload`'s
 /// `decode_output`), so a renumbering makes the page run the *volume*
 /// decoder over a cross-section's bytes.
 ///

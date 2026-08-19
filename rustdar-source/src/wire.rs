@@ -36,7 +36,7 @@ impl<'a> Reader<'a> {
     /// value rather than a misread, and the cursor never sits past the end of
     /// the buffer, so the slice below cannot panic.
     ///
-    /// Semantics match the duplicate cursor in `rustdar_frontend::offload`
+    /// Semantics match the duplicate cursor in `rustdar_worker::offload`
     /// (which lives beside this one until WO-M7.2): its first consumer here
     /// is the overlay reply decoder's raw RGBA tail (WO-M6.2), then the
     /// radar decode arms (WO-M7.1/M7.2).

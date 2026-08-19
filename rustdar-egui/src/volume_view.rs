@@ -1043,7 +1043,7 @@ fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
 /// the wrong type is precisely what `egui_wgpu` swallows — one `log::warn!` in
 /// `prepare` and a silent `continue` in `paint` — so a suite built only on this
 /// stub proves the callback was pushed and proves nothing about whether it
-/// would ever draw. The test that closes that gap lives in `rustdar-frontend`,
+/// would ever draw. The test that closes that gap lives in `rustdar-volumetric`,
 /// where the real payload's type is nameable, and it is named in this crate's
 /// tests so the pairing is findable from either end.
 #[cfg(test)]

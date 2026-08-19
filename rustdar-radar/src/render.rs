@@ -587,7 +587,7 @@ struct RenderBuffers {
 /// # Why one buffer, and not one per thread
 ///
 /// A `thread_local` is the obvious shape and is the wrong one here. On native,
-/// `rustdar-frontend`'s `offload` spawns a **fresh `std::thread` per job**, so a
+/// `rustdar-worker`'s `offload` spawns a **fresh `std::thread` per job**, so a
 /// thread-local would be allocated, faulted in and freed with the thread every
 /// single render — the reuse rate would be exactly zero. Even against a
 /// long-lived pool it would pin one 32 MiB buffer per worker thread that had
@@ -596,7 +596,7 @@ struct RenderBuffers {
 ///
 /// # Why it is not threaded through from the caller
 ///
-/// `rustdar_frontend::volume_bridge::VolumeResources::widening` — the same
+/// `rustdar_volumetric::bridge::VolumeResources::widening` — the same
 /// cliff, fixed the same way — is the caller's buffer, and that is the right
 /// shape there because its caller is the frame thread, which spans every
 /// upload. This renderer has no
@@ -757,7 +757,7 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 ///
 /// The first is that it does not compile. [`SweepRender`]'s buffers are `pub`,
 /// and they are moved out — by
-/// `rustdar_frontend::offload`'s `From<SweepRender> for RenderedFrame`, by two
+/// `rustdar_worker::offload`'s `From<SweepRender> for RenderedFrame`, by two
 /// integration tests in that crate and by two dozen destructurings in this
 /// module's own tests. A type with a `Drop` impl cannot have a field moved out
 /// of it (E0509), so `Drop` here is a compile error at every one of those
@@ -782,7 +782,7 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 /// Because the two buffers die in different places and at different times, and
 /// on the path that matters most one of them does not die at all.
 ///
-/// **The grid dies at one site, on every path.** `rustdar_frontend::offload`'s
+/// **The grid dies at one site, on every path.** `rustdar_worker::offload`'s
 /// `From<SweepRender> for RenderedFrame` is that site: it is the one conversion
 /// all three rasterizing arms come through, and the grid does not go past it.
 /// Nothing outside this crate reads it any more — a readout reads gates now, at
@@ -1072,7 +1072,7 @@ impl RenderBuffers {
     ///
     /// So this grows and shrinks the one buffer instead — the same grow-only
     /// arm as the caller's buffer in
-    /// `rustdar_frontend::volume_raymarch::coverage_premultiplied_into`, which
+    /// `rustdar_volumetric::raymarch::coverage_premultiplied_into`, which
     /// has always varied its grid shape this way. `resize_with` truncating is a
     /// length store that keeps the capacity, and `resize_with` extending fills
     /// from that capacity when it is already there, so a workload alternating

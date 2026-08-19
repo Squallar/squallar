@@ -1244,7 +1244,7 @@ fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_storm_motion() {
 /// nothing, whichever way either start was stated.
 ///
 /// The shortest WSR-88D cadence measured anywhere in this tree is 198 s
-/// (`rustdar-frontend/src/constants/tests.rs:468`), against the under-1 s
+/// (`rustdar-device-profile/src/constants/tests.rs:264`), against the under-1 s
 /// spread the pairing admits — a margin of 198×. This is the frontend's
 /// restatement of that bound through the two accessors, so the guarantee the
 /// two tests above rely on is pinned where it is read and not only where it is

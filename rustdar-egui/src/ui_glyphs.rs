@@ -323,14 +323,17 @@ mod tests {
     /// The UI sources under scan: this crate's `src/` and the sibling crates
     /// whose strings reach the screen — the overlay crate's display strings
     /// (status lines, control labels, popup text and the fetch errors the
-    /// toast presents) and the frontend crate's, whose `VolumePaint::Empty`
-    /// prose is the 3D pane's on-screen empty state. Test files carry
+    /// toast presents), the app crate's (rustdar-app), and the volumetric
+    /// crate's, whose `VolumePaint::Empty` prose is the 3D pane's on-screen
+    /// empty state (that file rode out of the app crate at WO-RV and had
+    /// silently escaped this scan — re-covered at WO-RA). Test files carry
     /// developer prose and are skipped by name.
     fn scanned_sources() -> Vec<std::path::PathBuf> {
         let mut roots = vec![
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rustdar-overlays/src"),
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rustdar-frontend/src"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rustdar-app/src"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rustdar-volumetric/src"),
         ];
         let mut files = Vec::new();
         while let Some(dir) = roots.pop() {

@@ -1578,7 +1578,7 @@ fn gate_ranges_survive_the_kilometre_round_trip() {
 /// under the velocity colour ramp, labelled "kt". This one `u16` sits in
 /// the header of all three payloads that cross the worker port
 /// ([`RenderInput`], `CrossSection`, `VoxelGrid`) and in every arm of
-/// `rustdar_frontend::offload`'s job framing, so it is pinned here by
+/// `rustdar_worker::offload`'s job framing, so it is pinned here by
 /// value, the way `SampleStatus`'s codes are in [`crate::sampler`].
 ///
 /// Read the table below as the wire contract it is: a number in it is not

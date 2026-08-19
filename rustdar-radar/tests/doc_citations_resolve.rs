@@ -4,7 +4,7 @@
 //! The convention everywhere in this tree is that a doc comment says which
 //! test pins the behaviour it describes. That convention is load-bearing: it is
 //! how a reader tells a guarantee from an intention. It is also unenforced, and
-//! two hand sweeps across `rustdar-radar` and `rustdar-frontend` found four
+//! two hand sweeps across `rustdar-radar` and `rustdar-app` found four
 //! citations pointing at nothing —
 //!
 //! * `sampler.rs` cited a refusal test whose replacement asserts the opposite,
@@ -182,13 +182,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          necessarily names it.",
     ),
     (
-        "rustdar-frontend/src/app.rs",
+        "rustdar-app/src/app.rs",
         "new_without_display_handle_from_env",
         "`egui_winit`'s constructor, named where this crate explains which of \
          the two it calls and why.",
     ),
     (
-        "rustdar-frontend/src/app_render.rs",
+        "rustdar-app/src/app_render.rs",
         "get_texture_latest_submission_index",
         "wgpu-core's own lifetime bookkeeping, walked through in the comment \
          that argues why dropping a replaced texture immediately is safe. \
@@ -219,7 +219,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          test checks it.",
     ),
     (
-        "rustdar-frontend/src/platform.rs",
+        "rustdar-app/src/platform.rs",
         "attach_current_thread_for_scope",
         "The `jni` crate's scoped attachment call — the one this module must \
          use instead of the permanent form.",
@@ -371,7 +371,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          distinction without naming it.",
     ),
     (
-        "rustdar-frontend/src/app_render/loop_level3_tests.rs",
+        "rustdar-app/src/app_render/loop_level3_tests.rs",
         "clear_all_empties_the_level3_state_as_well",
         "The Level III half of the same replacement, split along the line the \
          keys draw: the pane-keyed queues go with `remove_pending`, the \
@@ -977,7 +977,7 @@ fn a_citation_to_an_ignored_test_says_that_it_is_ignored() {
          it and the sentence beside it promises a guard the build does not provide. Say so \
          in the same comment block — the word `{}` anywhere in the block satisfies this, and \
          the useful form is the invocation, e.g. \"`#[ignore]`d; run with \
-         `cargo test -p rustdar-frontend --test volume_gpu -- --ignored`\". Do **not** \
+         `cargo test -p rustdar-gpu --test volume_gpu -- --ignored`\". Do **not** \
          un-ignore the test to silence this: a test that needs a real adapter is right to be \
          ignored, and the thing being fixed is the prose. There is no allowance list, \
          because every site can satisfy this by writing what is true.",

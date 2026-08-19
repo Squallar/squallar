@@ -2,7 +2,7 @@
 //! renderer that fills it (WO-M7.1), and its wire form (WO-M7c).
 //!
 //! [`RenderedFrame`] and its `From<SweepRender>` conversion moved here
-//! **verbatim** from `rustdar_frontend::offload` at WO-M7.1 — the move is
+//! **verbatim** from `rustdar_worker::offload` at WO-M7.1 — the move is
 //! what lets the radar codec rows ([`crate::jobs`]) name their own output
 //! type in their `run` bodies. WO-M7c closed the reply direction: the frame
 //! stopped crossing the browser's reply port as eight hand-written JS
@@ -141,7 +141,7 @@ impl RenderedFrame {
     /// that order, riding the browser's transfer list as separate buffers
     /// ([`crate::jobs`]' frame reply codec is where the encode side spells
     /// that order, [`Self::from_parts`] the decode side, and the
-    /// frame-reply digest rows in `rustdar_frontend::wire_identity` are
+    /// frame-reply digest rows in `rustdar_worker::wire_identity` are
     /// what catch a symmetric swap).
     ///
     /// Until WO-M7d both were concatenated after this block —
@@ -267,7 +267,7 @@ impl RenderedFrame {
 /// A [`MeltingLayerSource`](crate::hca::MeltingLayerSource) as a number, for
 /// the one boundary that can only carry numbers — which is
 /// [`RenderedFrame::write_head`], the frame's wire head, since WO-M7c. (The
-/// pair spent its earlier life in `rustdar_frontend::offload`, spelling the
+/// pair spent its earlier life in `rustdar_worker::offload`, spelling the
 /// same bytes into a named JS field on the browser's reply port; the codec
 /// is that boundary's one descendant, so the pair moved here beside it.)
 ///
@@ -422,7 +422,7 @@ mod tests {
     /// where the codec moves, because these tests still hold the frame
     /// afterward. (A test-side mirror of `crate::jobs`' encode,
     /// deliberately: the frame-reply digest rows in
-    /// `rustdar_frontend::wire_identity` run the production encoder and
+    /// `rustdar_worker::wire_identity` run the production encoder and
     /// are the cross-check that the two spellings agree.)
     fn encode_parts(frame: &RenderedFrame) -> (Vec<u8>, Vec<Vec<u8>>) {
         let mut head = Vec::new();

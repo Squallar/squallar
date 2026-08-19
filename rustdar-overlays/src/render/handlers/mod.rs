@@ -1,5 +1,5 @@
 // The polygon-kind modules and `reports` are `pub` because their fetch-result
-// types are: `rustdar-frontend`'s described-job dispatch tests seed a live
+// types are: `rustdar-app`'s described-job dispatch tests seed a live
 // registry through `apply_fetch_result`, and the payload type has to be
 // nameable where the test constructs it. (`glm` needs no widening for the
 // same tests: its payload type, `crate::glm::GlmFetchResult`, is already

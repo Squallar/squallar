@@ -1703,7 +1703,7 @@ impl super::Gui {
     /// floor for one frame on every entry into 3D, on every machine, and would
     /// look like a slow load on the ones where the frame is long.
     /// `the_strip_is_tessellated_on_its_very_first_frame` in
-    /// `rustdar-frontend/tests/floor_offscreen_strip.rs` asserts on frame **0**
+    /// `rustdar-gpu/tests/floor_offscreen_strip.rs` asserts on frame **0**
     /// for exactly that reason, and it fails against an `Area`.
     ///
     /// # Why the interaction is emptied rather than suppressed
@@ -2876,7 +2876,7 @@ pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
 /// * the **mirror** pass's attachment is the frame *plus* the strips, so it has
 ///   texels down there and draws it.
 ///
-/// `tests/floor_offscreen_strip.rs` in `rustdar-frontend` asserts all of that
+/// `tests/floor_offscreen_strip.rs` in `rustdar-gpu` asserts all of that
 /// against real tessellator output, including that egui does not cull the strip
 /// and that a pointer over the pane cannot reach the map in it.
 ///

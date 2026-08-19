@@ -38,7 +38,7 @@ pub const NATIVE_IMAGE_SIZE: usize = 2048;
 ///
 /// Written here rather than derived from wgpu because this crate has no wgpu
 /// dependency and must not grow one: it is the rasterizer, and it hands finished
-/// RGBA buffers to a caller that owns the GPU. `rustdar-frontend`'s
+/// RGBA buffers to a caller that owns the GPU. `rustdar-app`'s
 /// `the_web_image_fits_the_texture_size_webgl2_guarantees` checks this figure
 /// against `wgpu::Limits::downlevel_webgl2_defaults()` from the crate that does
 /// have wgpu, so the number cannot drift away from wgpu's own.
@@ -262,7 +262,7 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// # Why the ceiling is an argument
 ///
 /// The largest texture this machine will accept is not a fact this crate has.
-/// It is a `wgpu` device limit, read by `rustdar-frontend`, and it is a
+/// It is a `wgpu` device limit, read by `rustdar-gpu`'s `device::device_limits`, and it is a
 /// *runtime* answer: Vulkan guarantees 4096, iOS Metal offers 8192, and the
 /// GLES 3.0 floor is 2048, so an Android handheld can be the one device that
 /// cannot take the long-range raster. The build-script `cfg` that names the
@@ -1088,7 +1088,7 @@ impl RenderView {
     ///
     /// # One predicate, because two copies of it already disagreed
     ///
-    /// `rustdar_frontend`'s `render_cache_key` and `rustdar_egui`'s
+    /// `rustdar_app`'s `render_cache_key` and `rustdar_egui`'s
     /// `LoopPlaybackState::retarget_renders_keyed` both ask this. They used to
     /// answer it separately, and they disagreed in both directions: the loop
     /// charged a tilt click for the four whole-volume plan views the cache
@@ -1304,7 +1304,7 @@ impl RadarProduct {
     /// representation: reordering or renaming the variants must not silently
     /// change what an already-encoded message means. Both message formats that
     /// cross the browser's worker boundary — [`crate::render_input`]'s payload
-    /// and `rustdar_frontend::offload`'s job framing — read this one table.
+    /// and `rustdar_worker::offload`'s job framing — read this one table.
     ///
     /// The registration in [`crate::product_spec::spec`] is exhaustive with
     /// every field explicit, so a new variant fails to compile until it is
@@ -1370,10 +1370,10 @@ impl RadarProduct {
     ///
     /// - [`crate::render_input::RenderInput::extract`] reads it to decide how
     ///   many sweeps travel to the renderer.
-    /// - `rustdar_frontend`'s `cut_selection_for` reads it to decide how much
+    /// - `crate::chunk_feed::cut_selection_for` reads it to decide how much
     ///   of a live volume the chunk feed downloads *at all*
     ///   ([`crate::chunks::CutSelection`]).
-    /// - `rustdar_frontend`'s `reset_panes_for_tilts` reads it to decide whether
+    /// - `rustdar_app`'s `reset_panes_for_tilts` reads it to decide whether
     ///   a completed cut re-renders a pane or leaves it for the wider reset a
     ///   closing volume does.
     ///
@@ -1426,10 +1426,10 @@ impl RadarProduct {
     ///
     /// # It lives on the product, in this crate, because two crates ask it
     ///
-    /// `rustdar_frontend`'s `render_cache_key` asks it to collapse those four
+    /// `rustdar_app`'s `render_cache_key` asks it to collapse those four
     /// into one cache slot, and `rustdar_egui`'s
     /// `LoopPlaybackState::retarget_renders_keyed` asks it to keep a plan-view
-    /// loop's frames when only the tilt moved. `rustdar_frontend` depends on
+    /// loop's frames when only the tilt moved. `rustdar_app` depends on
     /// `rustdar_egui`, so the second cannot call into the first, and a second
     /// copy of the list in the crate that cannot reach the original is exactly
     /// the failure `reads_whole_volume` above describes. Both depend on this

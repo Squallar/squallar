@@ -38,7 +38,7 @@ fn android_main(app: AndroidApp) {
     // `rustdar_radar::tls`) -- but doing it first here keeps the choice of
     // provider at a predictable point rather than leaving it to whichever
     // background thread fetches first.
-    rustdar_frontend::tls::init();
+    rustdar_app::tls::init();
 
     // Initialize rustls-platform-verifier for TLS certificate verification.
     // reqwest uses it to reach Android's TrustManager over JNI; without this,
@@ -184,7 +184,7 @@ fn android_main(app: AndroidApp) {
 
     // Create and run the platform app. The location facade's arm is the JNI
     // one `rustdar_location::android::init` above prepared.
-    let mut platform_app = rustdar_frontend::app::App::new(
+    let mut platform_app = rustdar_app::app::App::new(
         Box::new(crate::platform::create_platform()),
         crate::platform::create_location(),
     );
@@ -244,7 +244,7 @@ fn android_main(app: AndroidApp) {
     // a handle that is *empty right now* -- the window does not exist until the
     // first `resumed()`, which is inside `run_app`. That is the whole reason it
     // is a slot rather than a window handle it takes a copy of;
-    // see `rustdar_frontend::platform::RedrawWaker`.
+    // see `rustdar_app::platform::RedrawWaker`.
 
     // Start compass heading thread and wire it to the app
     let (heading_sender, heading_receiver) = std::sync::mpsc::channel();

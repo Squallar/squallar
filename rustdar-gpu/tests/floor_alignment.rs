@@ -69,7 +69,7 @@
 //!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 [THRESH=15] [OUT=/tmp/prefix] \
-//! cargo test -p rustdar-frontend --release --test floor_alignment -- --ignored --nocapture
+//! cargo test -p rustdar-gpu --release --test floor_alignment -- --ignored --nocapture
 //! ```
 //!
 //! | variable | required | default | meaning |

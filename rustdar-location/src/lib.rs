@@ -19,7 +19,7 @@
 //! - `web-provider` — the browser arm (`web`): Geolocation + Permissions
 //!   APIs (the `web-sys`/`js-sys` family).
 //!
-//! Consumers that only speak the vocabulary (rustdar-egui, rustdar-frontend)
+//! Consumers that only speak the vocabulary (rustdar-egui, rustdar-app)
 //! declare `default-features = false` and no features; the `rustdar` shell
 //! and rustdar-web turn their target's arm on and hand the facade to the app.
 

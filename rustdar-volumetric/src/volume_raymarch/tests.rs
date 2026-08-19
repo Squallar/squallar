@@ -1138,7 +1138,7 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
 /// it anyway because it is the larger of the two layouts and this figure may
 /// only err upwards. Which layout a given backend uses is read off the device by
 /// `the_charged_grid_bytes_are_never_under_what_the_device_reserved`, which is
-/// `#[ignore]`d behind a real adapter — `cargo test -p rustdar-frontend --test
+/// `#[ignore]`d behind a real adapter — `cargo test -p rustdar-gpu --test
 /// volume_gpu -- --ignored` — while this test needs none and asserts the
 /// arithmetic alone.
 ///

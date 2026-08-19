@@ -5,11 +5,11 @@
 //!
 //! This crate is to the browser what the `rustdar` crate is to the desktop — the
 //! entry point, the concrete [`PlatformBridge`] and the capabilities that bridge
-//! exposes. Everything visible on the page belongs to `rustdar-frontend`.
+//! exposes. Everything visible on the page belongs to `rustdar-app`.
 //!
 //! WebGL2, not WebGPU: Firefox has no stable WebGPU, and taking WebGPU where it
 //! exists would give the same binary two rendering paths with only one ever
-//! exercised. `rustdar_frontend::app` pins `Backends::GL` on wasm32.
+//! exercised. `rustdar_app::app` pins `Backends::GL` on wasm32.
 //!
 //! ```text
 //! cd rustdar-web
@@ -63,7 +63,7 @@
 //! `rustdar_geo::lat_rad_to_mercator_y`; see `rustdar_radar::render`'s
 //! `RenderBuffers`.
 //!
-//! [`PlatformBridge`]: rustdar_frontend::platform::PlatformBridge
+//! [`PlatformBridge`]: rustdar_app::platform::PlatformBridge
 
 // `geolocation` moved to `rustdar_location::web` at WO-RL-4 (seam ruling 6:
 // every remote location arm lives in the facade); `entry` hands the app a

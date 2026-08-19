@@ -250,7 +250,7 @@ jobs:
           # One crate resolved to two versions -- invisible to every compiler.
           # Bumping `jni` or `rustls-platform-verifier` alone still builds, and
           # Android TLS goes silently no-op. A second `wgpu` copy once left
-          # rustdar-frontend's backend selection applying to an inert one; its
+          # rustdar-app's backend selection applying to an inert one; its
           # `const _` guard is per-crate, so this is the only graph-wide check.
           # Per-target, because resolution is, and `-p`-scoped to the crate that
           # actually ships that target: an unscoped `cargo tree -i` answers for

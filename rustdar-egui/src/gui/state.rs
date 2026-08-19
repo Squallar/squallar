@@ -99,10 +99,11 @@ impl AutoPollState {
 /// One second, for [`AutoPollState::countdown_tick_delay`]'s remainder.
 const NANOS_PER_SEC: u32 = 1_000_000_000;
 
-/// The chunk-feed status vocabulary, defined beside its producer in
-/// `rustdar_radar::chunk_feed` since WO-RF1 and re-exported here at the paths
-/// this crate always published them at.
-pub use rustdar_radar::chunk_feed::{ChunkFeedStatus, TiltFreshness};
+// The chunk-feed status vocabulary is defined beside its producer in
+// `rustdar_radar::chunk_feed` (WO-RF1). WO-RA killed the temporary re-export
+// pair (`ChunkFeedStatus`/`TiltFreshness`) this crate carried at its old
+// published paths — one name, one path: consumers spell the radar path.
+use rustdar_radar::chunk_feed::ChunkFeedStatus;
 
 /// One site's current-volume stamp, as the App publishes it each frame.
 ///
@@ -682,7 +683,7 @@ pub struct Gui {
     /// accuracy knob. See `rustdar_radar::srv::SrvFallback`.
     ///
     /// `pub` for the reason [`Self::storm_motion_override`] beside it is: the
-    /// crate that owns the commit rule is `rustdar_frontend`.
+    /// crate that owns the commit rule is `rustdar_app`.
     pub srv_fallback: rustdar_radar::srv::SrvFallback,
     /// Whether one of the storm-motion `DragValue`s is under the pointer or
     /// holding the keyboard *right now*. See [`Self::storm_motion_mid_edit`].
@@ -696,7 +697,7 @@ pub struct Gui {
     /// applied again.
     ///
     /// `pub` for the reason [`Self::storm_motion_override`] beside it is: the
-    /// crate that owns the commit rule is `rustdar_frontend`, and it has to be
+    /// crate that owns the commit rule is `rustdar_app`, and it has to be
     /// able to drive both halves of it in a test.
     pub storm_motion_editing: bool,
     /// Whatever can actually draw a 3D pane, or `None` on a machine or a frame

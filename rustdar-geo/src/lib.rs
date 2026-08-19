@@ -89,7 +89,7 @@ pub const EARTH_RADIUS_KM: f64 = 6371.0;
 /// planet from the one `rustdar-radar`'s `render::render_gate` paints gates
 /// on. The
 /// only copy that is not this expression is `volume.wgsl`'s, which cannot
-/// see Rust; `rustdar-frontend`'s
+/// see Rust; `rustdar-volumetric`'s
 /// `the_shaders_km_per_degree_is_the_radar_crates_own` pins that literal to
 /// this value.
 ///
@@ -325,7 +325,7 @@ pub type GeoPolygon = Vec<GeoPolygonRing>;
 /// Geographic bounding box for viewport culling.
 ///
 /// `PartialEq` because the box rides inside
-/// `rustdar_frontend::offload::JobRequest`, whose wire round-trip tests compare
+/// `rustdar_worker::offload::JobRequest`, whose wire round-trip tests compare
 /// whole requests; it is derived — four `f64` comparisons — and carries the
 /// usual `f64` caveat that `NaN != NaN`.
 #[derive(Debug, Clone, Copy, PartialEq)]

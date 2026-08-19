@@ -64,7 +64,7 @@ pub(crate) struct RadarProductSpec {
     /// or renaming the variants must not silently change what an
     /// already-encoded message means. Both message formats that cross the
     /// browser's worker boundary — [`crate::render_input`]'s payload and
-    /// `rustdar_frontend::offload`'s job framing — read this one column, and
+    /// `rustdar_worker::offload`'s job framing — read this one column, and
     /// the registration is exhaustive with every field explicit, so a new
     /// variant fails to compile until it is given a code.
     pub(crate) wire_code: u16,

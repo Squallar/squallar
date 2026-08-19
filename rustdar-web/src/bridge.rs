@@ -2,7 +2,7 @@
 //! `rustdar_native::platform::DesktopPlatform`. Most of the trait is
 //! capabilities a tab does not have, so most of this file is honest `None`s.
 
-use rustdar_frontend::platform::{PlatformBridge, RedrawWaker};
+use rustdar_app::platform::{PlatformBridge, RedrawWaker};
 use winit::platform::web::WindowAttributesExtWebSys;
 
 const DARK_SCHEME_QUERY: &str = "(prefers-color-scheme: dark)";

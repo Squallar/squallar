@@ -4178,8 +4178,8 @@ dependencies = [
  "jni",
  "log",
  "pollster",
+ "rustdar-app",
  "rustdar-egui",
- "rustdar-frontend",
  "rustdar-geo",
  "rustdar-kv",
  "rustdar-location",
@@ -4187,6 +4187,39 @@ dependencies = [
  "rustdar-radar",
  "rustls-platform-verifier",
  "walkers",
+ "winit",
+]
+
+[[package]]
+name = "rustdar-app"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "log",
+ "nexrad-level3",
+ "nexrad-model",
+ "pollster",
+ "reqwest 0.13.4",
+ "rustdar-device-profile",
+ "rustdar-egui",
+ "rustdar-geo",
+ "rustdar-gpu",
+ "rustdar-kv",
+ "rustdar-location",
+ "rustdar-nmea-serial",
+ "rustdar-overlays",
+ "rustdar-radar",
+ "rustdar-source",
+ "rustdar-volumetric",
+ "rustdar-worker",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen-futures",
+ "web-time",
  "winit",
 ]
 
@@ -4224,39 +4257,6 @@ dependencies = [
  "walkers",
  "wasm-bindgen-futures",
  "web-time",
-]
-
-[[package]]
-name = "rustdar-frontend"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "log",
- "nexrad-level3",
- "nexrad-model",
- "pollster",
- "reqwest 0.13.4",
- "rustdar-device-profile",
- "rustdar-egui",
- "rustdar-geo",
- "rustdar-gpu",
- "rustdar-kv",
- "rustdar-location",
- "rustdar-nmea-serial",
- "rustdar-overlays",
- "rustdar-radar",
- "rustdar-source",
- "rustdar-volumetric",
- "rustdar-worker",
- "serde",
- "serde_json",
- "tokio",
- "wasm-bindgen-futures",
- "web-time",
- "winit",
 ]
 
 [[package]]
@@ -4428,8 +4428,8 @@ dependencies = [
  "egui",
  "js-sys",
  "log",
+ "rustdar-app",
  "rustdar-egui",
- "rustdar-frontend",
  "rustdar-geo",
  "rustdar-kv",
  "rustdar-location",

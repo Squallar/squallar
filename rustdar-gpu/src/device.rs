@@ -1,7 +1,7 @@
 //! The device-request policy: the three silent forks (surface format, limit
 //! set, present mode) and the one `request_device` every target shares.
 //!
-//! Moved here from rustdar-frontend's `app_state.rs` at WO-RG. What stayed
+//! Moved here from rustdar-app's `app_state.rs` at WO-RG. What stayed
 //! behind: `AppState` itself (it spans surface, renderer and volume support),
 //! `request_adapter` (winit-coupled — it needs the surface), and the volume
 //! probe/latch (volumetric items this crate must not name; volumetric→gpu is

@@ -117,7 +117,7 @@ The consequence is worth knowing before filing a bug about it:
   window will not group under this launcher whatever the entry says.
 
 Fixing the second properly means calling winit's
-`WindowAttributesExtWayland::with_name` in `rustdar-frontend`; it is out of
+`WindowAttributesExtWayland::with_name` in `rustdar-app`; it is out of
 scope here and is noted rather than papered over.
 
 ## Icons

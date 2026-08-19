@@ -18,7 +18,7 @@
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 \
 //! CENTRE_LAT=41.0 CENTRE_LON=-93.4 HALF_KM=75 \
-//! cargo test -p rustdar-frontend --test volume_march_cost -- --ignored --nocapture
+//! cargo test -p rustdar-gpu --test volume_march_cost -- --ignored --nocapture
 //! ```
 //!
 //! | variable | required | default | meaning |

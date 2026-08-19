@@ -21,7 +21,7 @@
 //! yourself with:
 //!
 //! ```text
-//! cargo test -p rustdar-frontend --test volume_silhouette -- --ignored --nocapture
+//! cargo test -p rustdar-gpu --test volume_silhouette -- --ignored --nocapture
 //! ```
 //!
 //! **These tests hold a process-wide lock and run one at a time**, for the same
@@ -842,7 +842,7 @@ const COARSE: [u32; 3] = [64, 64, 64];
 ///    so a soft default greys hundreds of boundary pixels instead of zero.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1025,7 +1025,7 @@ fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
 /// them and the point is the size of the gap, not which side of it is "right".
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     a_planted_sphere_projects_to_its_exact_ray_cast_silhouette \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1127,7 +1127,7 @@ fn a_planted_sphere_projects_to_its_exact_ray_cast_silhouette() {
 /// mistaken for an error.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     an_off_centre_sphere_puts_its_silhouette_where_the_rays_say \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1199,7 +1199,7 @@ fn an_off_centre_sphere_puts_its_silhouette_where_the_rays_say() {
 /// grows around the eye, so "inside" is worth re-asserting at both ends.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1307,7 +1307,7 @@ fn an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind() {
 /// axes a camera at 225° sees most obliquely.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     a_planted_slab_projects_to_its_exact_ray_cast_silhouette \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1431,7 +1431,7 @@ fn a_planted_slab_projects_to_its_exact_ray_cast_silhouette() {
 /// conversion produces.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1556,7 +1556,7 @@ fn a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one() {
 /// same box half-extent `h`.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     the_silhouette_matches_the_rays_at_every_vertical_exaggeration \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1703,7 +1703,7 @@ fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
 /// printed next to it so the gap between the two is on the record.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     optical_depth_is_measured_against_the_unexaggerated_box \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -1808,7 +1808,7 @@ fn optical_depth_is_measured_against_the_unexaggerated_box() {
 /// being that the artifact is a fixed fraction of a cell, not a fixed distance.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     the_linear_filter_bleeds_half_a_cell_past_a_sharp_top \
 ///     -- --ignored --exact --nocapture
 /// ```
@@ -2017,7 +2017,7 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
 /// which.
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --test volume_silhouette \
+/// cargo test -p rustdar-gpu --test volume_silhouette \
 ///     what_the_voxel_locked_march_resolves_of_a_thin_slab_and_a_fine_grid \
 ///     -- --ignored --exact --nocapture
 /// ```

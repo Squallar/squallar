@@ -741,7 +741,7 @@ fn has_hit_map(kind: OverlayKind) -> bool {
 /// rider of is deleted — and, for the hit-map kinds, `hit_items` agrees with
 /// `prepare_job` in every state the layer stack can reach.
 ///
-/// `rustdar-frontend`'s `spawn_overlay_render` routes by an explicit match on
+/// `rustdar-app`'s `spawn_overlay_render` routes by an explicit match on
 /// kind, not by probing `prepare_job` — so the match there and the
 /// implementations here are two statements of one set, and this test is what
 /// keeps a kind from joining one and not the other. A kind routed described
