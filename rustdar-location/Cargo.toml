@@ -7,9 +7,9 @@ edition.workspace = true
 
 [dependencies]
 rustdar-geo = { workspace = true }
+rustdar-kv = { workspace = true }
 chrono = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
+web-time = { workspace = true }

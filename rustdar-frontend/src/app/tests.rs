@@ -961,7 +961,7 @@ fn a_low_accuracy_fix_does_not_spend_the_provisional_site() {
 
     fixes
         .send(rustdar_location::Fix {
-            accuracy_m: Some(MAX_RELOCATION_ACCURACY_M * 2.0),
+            accuracy_m: Some(rustdar_location::MAX_RELOCATION_ACCURACY_M * 2.0),
             ..rustdar_location::Fix::from_device_position(46.7867, -92.1005)
         })
         .unwrap();
@@ -986,30 +986,9 @@ fn a_low_accuracy_fix_does_not_spend_the_provisional_site() {
     assert_eq!(opening_site(&app), "KDLH");
 }
 
-/// The measured portal number, pinned. It is an order of magnitude coarser
-/// than a satellite fix and an order of magnitude better than it needs to
-/// be: displacing a sample point by 25 km changed the chosen site in 5.5%
-/// of probes. A threshold that rejected it would switch off the largest
-/// single improvement this feature has.
-#[test]
-fn the_accuracy_gate_admits_a_coarse_but_usable_fix() {
-    assert!(fix_is_accurate_enough_to_relocate(Some(25_000.0)));
-    assert!(
-        fix_is_accurate_enough_to_relocate(None),
-        "the serial path reports no accuracy at all and has always been \
-             trusted"
-    );
-    assert!(!fix_is_accurate_enough_to_relocate(Some(1_000_000.0)));
-    assert!(
-        !fix_is_accurate_enough_to_relocate(Some(f64::NAN)),
-        "a NaN accuracy compares false against everything, so it has to be \
-             rejected explicitly or it slips through as 'good enough'"
-    );
-}
-
 // ── The location permission gate, from the App's side ───────────────
 //
-// `location_permission.rs` owns the state machine and tests it against a
+// `rustdar_location::gate` owns the state machine and tests it against a
 // clock it controls. What belongs here is the wiring: that the gate is
 // stepped at all, that what it observes reaches the UI, and that a
 // revocation takes the dot with it.

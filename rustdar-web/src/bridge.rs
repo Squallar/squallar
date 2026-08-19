@@ -157,11 +157,6 @@ impl PlatformBridge for WebPlatform {
     /// where yet" the way the Android bridge does.
     fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
 
-    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
-        crate::kv::LocalStorageKvStore::new()
-            .map(|store| Box::new(store) as Box<dyn rustdar_kv::KvStore>)
-    }
-
     fn iana_timezone(&self) -> Option<String> {
         crate::geolocation::browser_timezone()
     }
@@ -181,6 +176,33 @@ impl PlatformBridge for WebPlatform {
     // anything is asked *for*, and the watch is started only from
     // `request_location` — which the gate reaches only from a state that
     // licenses it.
+
+    fn window_attributes(
+        &self,
+        attributes: winit::window::WindowAttributes,
+    ) -> winit::window::WindowAttributes {
+        // No `with_inner_size`, deliberately. winit's web backend reports
+        // `inner_size()` from a cell written only by its ResizeObserver, so the
+        // size is zero for the first frame or two either way (the zero-size
+        // guard in `App::handle_redraw` is the actual fix) — and setting it
+        // writes an inline pixel `width`/`height` that outranks the stylesheet's
+        // `width: 100%`, pinning the canvas to its startup size forever.
+        attributes
+            .with_canvas(Some(self.canvas.clone()))
+            // Otherwise the browser also handles events egui already consumed:
+            // scrolling the map scrolls the page, dragging selects text.
+            .with_prevent_default(true)
+            // The canvas is already in the document; appending adds a second one
+            // that nothing has sized.
+            .with_append(false)
+    }
+}
+
+impl rustdar_location::LocationBridge for WebPlatform {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
+        crate::kv::LocalStorageKvStore::new()
+            .map(|store| Box::new(store) as Box<dyn rustdar_kv::KvStore>)
+    }
 
     /// The composition is [`geolocation::browser_permission`]'s; see it for why
     /// each fallback is the state it is.
@@ -252,25 +274,5 @@ impl PlatformBridge for WebPlatform {
 
     fn location_active(&self) -> bool {
         self.watch.is_some()
-    }
-
-    fn window_attributes(
-        &self,
-        attributes: winit::window::WindowAttributes,
-    ) -> winit::window::WindowAttributes {
-        // No `with_inner_size`, deliberately. winit's web backend reports
-        // `inner_size()` from a cell written only by its ResizeObserver, so the
-        // size is zero for the first frame or two either way (the zero-size
-        // guard in `App::handle_redraw` is the actual fix) — and setting it
-        // writes an inline pixel `width`/`height` that outranks the stylesheet's
-        // `width: 100%`, pinning the canvas to its startup size forever.
-        attributes
-            .with_canvas(Some(self.canvas.clone()))
-            // Otherwise the browser also handles events egui already consumed:
-            // scrolling the map scrolls the page, dragging selects text.
-            .with_prevent_default(true)
-            // The canvas is already in the document; appending adds a second one
-            // that nothing has sized.
-            .with_append(false)
     }
 }

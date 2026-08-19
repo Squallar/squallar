@@ -263,6 +263,13 @@ impl TestBridge {
     /// `WebPlatform`: `localStorage` from the first frame with no directory
     /// involved, no filesystem for the zone cache, no back handler, and an
     /// "exit" that is only the event loop stopping.
+    ///
+    /// Unused since the gate suite moved to `rustdar-location` (WO-RL-2) with
+    /// a double of its own, but the constructor set mirrors the four real
+    /// bridges on purpose — an app-level web-shaped test is a one-word reach,
+    /// and deleting the shape would also gut [`StoreAvailability::Always`]'s
+    /// "three real cases" story.
+    #[allow(dead_code)]
     pub(crate) fn web() -> Self {
         Self {
             store_availability: StoreAvailability::Always,
@@ -299,34 +306,9 @@ impl TestBridge {
         self
     }
 
-    /// Whether `request_location` reports that the ask reached the OS.
-    ///
-    /// Only Android's bridge can honestly answer `false`; the default here is
-    /// `true`, as the other four fabricate it.
-    pub(crate) fn with_request_reaching_the_os(self, reaches: bool) -> Self {
-        self.location.reaches_the_os.set(reaches);
-        self
-    }
-
     /// See [`LocationRecord`]. Taken before the bridge is boxed into an `App`.
     pub(crate) fn location_record(&self) -> LocationRecord {
         self.location.clone()
-    }
-
-    /// The cell behind `location_permission`, for the tests that need the OS to
-    /// change its mind mid-session.
-    pub(crate) fn permission_cell(&self) -> Rc<Cell<LocationPermission>> {
-        Rc::clone(&self.location.permission)
-    }
-
-    /// How many times the app has called `request_location`.
-    pub(crate) fn location_requests(&self) -> usize {
-        self.location.requests.get()
-    }
-
-    /// How many times the app has read `location_permission`.
-    pub(crate) fn permission_queries(&self) -> usize {
-        self.location.queries.get()
     }
 
     /// How many times the app has written config through this bridge.
@@ -433,24 +415,6 @@ impl PlatformBridge for TestBridge {
         self.config_dir = Some(dir);
     }
 
-    /// `None` until this platform has been told where config lives, which is
-    /// what makes `App::set_config_dir` observable: before it, there is no
-    /// store to load from. See [`StoreAvailability`] for the two bridges that
-    /// do not work that way.
-    fn kv(&self) -> Option<Box<dyn KvStore>> {
-        let available = match self.store_availability {
-            StoreAvailability::WhenToldADirectory => self.config_dir.is_some(),
-            StoreAvailability::Always => true,
-            StoreAvailability::Never => false,
-        };
-        available.then(|| {
-            Box::new(SharedStore {
-                inner: Rc::clone(&self.store),
-                writes: Rc::clone(&self.writes),
-            }) as Box<_>
-        })
-    }
-
     fn iana_timezone(&self) -> Option<String> {
         self.timezone.clone()
     }
@@ -501,6 +465,26 @@ impl PlatformBridge for TestBridge {
 
     fn gps_active(&self) -> bool {
         self.gps.borrow().is_some()
+    }
+}
+
+impl rustdar_location::LocationBridge for TestBridge {
+    /// `None` until this platform has been told where config lives, which is
+    /// what makes `App::set_config_dir` observable: before it, there is no
+    /// store to load from. See [`StoreAvailability`] for the two bridges that
+    /// do not work that way.
+    fn kv(&self) -> Option<Box<dyn KvStore>> {
+        let available = match self.store_availability {
+            StoreAvailability::WhenToldADirectory => self.config_dir.is_some(),
+            StoreAvailability::Always => true,
+            StoreAvailability::Never => false,
+        };
+        available.then(|| {
+            Box::new(SharedStore {
+                inner: Rc::clone(&self.store),
+                writes: Rc::clone(&self.writes),
+            }) as Box<_>
+        })
     }
 
     fn location_permission(&self) -> LocationPermission {

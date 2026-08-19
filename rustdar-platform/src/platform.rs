@@ -81,7 +81,7 @@ struct OsLocation {
     /// An atomic and not a `Cell`, because it is written from whatever thread
     /// the provider is given — a portal session thread, a WinRT RPC thread,
     /// the main run loop — and read from
-    /// [`location_permission`](PlatformBridge::location_permission), which is a
+    /// [`location_permission`](rustdar_location::LocationBridge::location_permission), which is a
     /// `&self` getter on the frame path. That rules out a `Cell` (not `Send`),
     /// a `Receiver` (cannot be drained through `&self`) and a `Mutex` (a lock
     /// on the frame path). See [`rustdar_location::encode_permission`].
@@ -330,12 +330,6 @@ impl PlatformBridge for DesktopPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
-        self.config_dir
-            .clone()
-            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
-    }
-
     fn iana_timezone(&self) -> Option<String> {
         system_timezone()
     }
@@ -394,6 +388,26 @@ impl PlatformBridge for DesktopPlatform {
     // is the entire `cfg` surface, and every arm of it implements the same
     // trait.
 
+    /// Asked once, at startup, and before any provider exists — which is why
+    /// the trait's is an associated function rather than a method.
+    fn location_settings_available(&self) -> bool {
+        use crate::os_location::OsLocationProvider as _;
+        crate::os_location::OsLocationReader::settings_available()
+    }
+
+    fn open_location_settings(&mut self) {
+        self.os_location.open_settings();
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl rustdar_location::LocationBridge for DesktopPlatform {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
+        self.config_dir
+            .clone()
+            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
+    }
+
     fn location_permission(&self) -> rustdar_location::LocationPermission {
         self.os_location.permission()
     }
@@ -408,17 +422,6 @@ impl PlatformBridge for DesktopPlatform {
 
     fn location_active(&self) -> bool {
         self.os_location.active()
-    }
-
-    /// Asked once, at startup, and before any provider exists — which is why
-    /// the trait's is an associated function rather than a method.
-    fn location_settings_available(&self) -> bool {
-        use crate::os_location::OsLocationProvider as _;
-        crate::os_location::OsLocationReader::settings_available()
-    }
-
-    fn open_location_settings(&mut self) {
-        self.os_location.open_settings();
     }
 }
 
@@ -442,13 +445,13 @@ pub struct AndroidPlatform {
     config_dir: Option<std::path::PathBuf>,
     /// Injected by `rustdar-android`: all four are JNI calls, for the same
     /// reason `theme_detector` is injected. `None` until they are installed —
-    /// see [`PlatformBridge::location_permission`] below for why that is
+    /// see [`rustdar_location::LocationBridge::location_permission`] for why that is
     /// reported as `Unavailable` rather than `Unknown`.
     location_hooks: Option<rustdar_frontend::platform::LocationHooks>,
     /// What the app last said about how many times it has asked, kept for the
     /// hooks to read. Android is the one platform that cannot tell "never
     /// asked" from "permanently denied" without it — see
-    /// [`PlatformBridge::set_location_attempts`].
+    /// [`rustdar_location::LocationBridge::set_location_attempts`].
     location_attempts: u8,
     /// Handed to the theme poller below, so a light/dark switch noticed on that
     /// thread gets a frame to be applied on. See [`RedrawWaker`].
@@ -555,12 +558,6 @@ impl PlatformBridge for AndroidPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
-        self.config_dir
-            .clone()
-            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
-    }
-
     fn iana_timezone(&self) -> Option<String> {
         system_timezone()
     }
@@ -623,6 +620,28 @@ impl PlatformBridge for AndroidPlatform {
     // `rustdar-android` — that crate depends on this one — so the calls arrive
     // as `fn` pointers, exactly as the theme detector does.
 
+    /// Refuses a second set, as `set_theme_detector` refuses a second detector
+    /// and for the same reason: a half-replaced set would leave the state query
+    /// and the request pointing at different implementations, which is a bug
+    /// with no symptom until somebody is standing in front of a permission
+    /// dialog that never appears.
+    fn set_location_hooks(&mut self, hooks: rustdar_frontend::platform::LocationHooks) {
+        if self.location_hooks.is_some() {
+            log::warn!("location hooks already installed; ignoring the second set");
+            return;
+        }
+        self.location_hooks = Some(hooks);
+    }
+}
+
+#[cfg(target_os = "android")]
+impl rustdar_location::LocationBridge for AndroidPlatform {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
+        self.config_dir
+            .clone()
+            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
+    }
+
     /// `Unavailable` until the hooks are installed, deliberately not `Unknown`.
     ///
     /// `Unknown` is "the platform has not answered *yet*", and the gate keeps
@@ -650,19 +669,6 @@ impl PlatformBridge for AndroidPlatform {
 
     fn location_active(&self) -> bool {
         self.location_hooks.is_some_and(|hooks| (hooks.active)())
-    }
-
-    /// Refuses a second set, as `set_theme_detector` refuses a second detector
-    /// and for the same reason: a half-replaced set would leave the state query
-    /// and the request pointing at different implementations, which is a bug
-    /// with no symptom until somebody is standing in front of a permission
-    /// dialog that never appears.
-    fn set_location_hooks(&mut self, hooks: rustdar_frontend::platform::LocationHooks) {
-        if self.location_hooks.is_some() {
-            log::warn!("location hooks already installed; ignoring the second set");
-            return;
-        }
-        self.location_hooks = Some(hooks);
     }
 
     fn set_location_attempts(&mut self, attempts: u8) {
@@ -775,12 +781,6 @@ impl PlatformBridge for IosPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
-        self.config_dir
-            .clone()
-            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
-    }
-
     fn iana_timezone(&self) -> Option<String> {
         system_timezone()
     }
@@ -811,6 +811,24 @@ impl PlatformBridge for IosPlatform {
     // The same forwards `DesktopPlatform` writes, to the same [`OsLocation`],
     // running the same provider.
 
+    fn location_settings_available(&self) -> bool {
+        use crate::os_location::OsLocationProvider as _;
+        crate::os_location::OsLocationReader::settings_available()
+    }
+
+    fn open_location_settings(&mut self) {
+        self.os_location.open_settings();
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl rustdar_location::LocationBridge for IosPlatform {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
+        self.config_dir
+            .clone()
+            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
+    }
+
     fn location_permission(&self) -> rustdar_location::LocationPermission {
         self.os_location.permission()
     }
@@ -836,15 +854,6 @@ impl PlatformBridge for IosPlatform {
     fn location_active(&self) -> bool {
         self.os_location.active()
     }
-
-    fn location_settings_available(&self) -> bool {
-        use crate::os_location::OsLocationProvider as _;
-        crate::os_location::OsLocationReader::settings_available()
-    }
-
-    fn open_location_settings(&mut self) {
-        self.os_location.open_settings();
-    }
 }
 
 /// Create the platform-appropriate bridge.
@@ -866,6 +875,7 @@ pub fn create_platform() -> IosPlatform {
 #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
 mod tests {
     use super::*;
+    use rustdar_location::LocationBridge;
     use rustdar_location::LocationPermission as P;
 
     /// A bridge whose provider has not been built has nothing to report, and

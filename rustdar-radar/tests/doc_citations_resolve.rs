@@ -330,7 +330,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          the name that identifies it.",
     ),
     (
-        "rustdar-frontend/src/location_hint.rs",
+        "rustdar-location/src/hint.rs",
         "anchors_sit_within_plausible_radar_range",
         "The hermetic remnant's doc, saying what is *left* of the deleted \
          network test that can be checked without a network. Naming the \

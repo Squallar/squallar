@@ -1,5 +1,5 @@
+use super::GateDouble;
 use super::*;
-use crate::platform_double::TestBridge;
 use rustdar_kv::MemoryKvStore;
 use std::rc::Rc;
 
@@ -10,13 +10,13 @@ use std::rc::Rc;
 /// decision the gate makes is on a *difference*.
 struct Fixture {
     gate: LocationGate,
-    bridge: TestBridge,
+    bridge: GateDouble,
     t0: Instant,
     elapsed: Duration,
 }
 
 impl Fixture {
-    fn new(bridge: TestBridge) -> Self {
+    fn new(bridge: GateDouble) -> Self {
         Self {
             gate: LocationGate::new(),
             bridge,
@@ -51,8 +51,8 @@ impl Fixture {
 
 /// A desktop bridge whose store the test keeps, so a "restart" can hand the
 /// same blobs to a fresh gate.
-fn desktop_with_store(store: Rc<MemoryKvStore>) -> TestBridge {
-    TestBridge::desktop().with_store(store)
+fn desktop_with_store(store: Rc<MemoryKvStore>) -> GateDouble {
+    GateDouble::desktop().with_store(store)
 }
 
 // ── Not asking ──────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ fn desktop_with_store(store: Rc<MemoryKvStore>) -> TestBridge {
 /// has that window at startup, so this is not a web-only guard.
 #[test]
 fn a_platform_that_has_not_answered_yet_is_never_prompted() {
-    let mut f = Fixture::new(TestBridge::web().with_permission(LocationPermission::Unknown));
+    let mut f = Fixture::new(GateDouble::web().with_permission(LocationPermission::Unknown));
 
     for _ in 0..5 {
         f.step_after_the_cadence();
@@ -82,7 +82,7 @@ fn a_platform_that_has_not_answered_yet_is_never_prompted() {
 #[test]
 fn a_platform_without_location_is_never_asked_and_never_polled() {
     let mut f =
-        Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Unavailable));
+        Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Unavailable));
 
     f.step();
     let after_first = f.bridge.permission_queries();
@@ -128,7 +128,7 @@ fn a_remembered_denial_is_never_prompted_again() {
 /// The startup ask, and the bound on it.
 #[test]
 fn a_first_run_asks_for_location_once_and_only_once() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Prompt));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Prompt));
 
     for _ in 0..20 {
         f.wait(RETRY_INTERVAL).step();
@@ -149,7 +149,7 @@ fn a_first_run_asks_for_location_once_and_only_once() {
 #[test]
 fn an_ask_that_never_reached_the_os_is_tried_again_within_the_bound() {
     let mut f = Fixture::new(
-        TestBridge::desktop()
+        GateDouble::desktop()
             .with_permission(LocationPermission::Prompt)
             .with_request_reaching_the_os(false),
     );
@@ -174,7 +174,7 @@ fn an_ask_that_never_reached_the_os_is_tried_again_within_the_bound() {
 /// removed, there is no second chance.
 #[test]
 fn a_grant_that_arrives_after_the_ask_still_starts_delivery() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Prompt));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Prompt));
     let permission = f.bridge.permission_cell();
 
     f.step();
@@ -227,7 +227,7 @@ fn a_prompt_the_user_walked_away_from_is_not_repeated_on_the_next_run() {
 #[test]
 fn a_device_with_no_kv_is_still_asked() {
     let mut f = Fixture::new(
-        TestBridge::web()
+        GateDouble::web()
             .without_kv()
             .with_permission(LocationPermission::Prompt),
     );
@@ -256,7 +256,7 @@ fn a_device_with_no_kv_is_still_asked() {
 /// settings takes.
 #[test]
 fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Granted));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Granted));
     let permission = f.bridge.permission_cell();
     f.step();
     assert!(f.bridge.location_active(), "delivery never started");
@@ -336,7 +336,7 @@ fn enabling_location_in_settings_asks_again_after_a_dismissal() {
 /// dialog the platform will not show anyway.
 #[test]
 fn enabling_location_in_settings_cannot_re_ask_after_a_remembered_denial() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Denied));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Denied));
     f.step();
 
     f.gate.enable(&mut f.bridge);
@@ -357,7 +357,7 @@ fn enabling_location_in_settings_cannot_re_ask_after_a_remembered_denial() {
 /// on every frame. On Android each of these is a JNI call.
 #[test]
 fn a_pending_permission_is_polled_on_a_bounded_cadence_not_every_frame() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Prompt));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Prompt));
 
     f.step();
     assert_eq!(f.bridge.permission_queries(), 1);
@@ -378,7 +378,7 @@ fn a_pending_permission_is_polled_on_a_bounded_cadence_not_every_frame() {
 /// up promptly.
 #[test]
 fn an_open_settings_window_keeps_watching_a_settled_permission() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Denied));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Denied));
     f.step();
     let settled = f.bridge.permission_queries();
 
@@ -403,7 +403,7 @@ fn an_open_settings_window_keeps_watching_a_settled_permission() {
 /// cadence has stopped entirely.
 #[test]
 fn a_permission_changed_while_the_app_was_away_is_noticed_on_resume() {
-    let mut f = Fixture::new(TestBridge::desktop().with_permission(LocationPermission::Denied));
+    let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Denied));
     f.step();
     let permission = f.bridge.permission_cell();
 

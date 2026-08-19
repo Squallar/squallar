@@ -67,11 +67,21 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 
 /// The domain crate sits under every provider, so its ceiling is what keeps a
 /// provider concern (a parser, a transport, an OS bridge) from leaking down
-/// into the vocabulary every one of them shares. The geo floor, time, logging
-/// and serde are the whole allowance.
+/// into the vocabulary every one of them shares. The geo floor, the kv blob
+/// floor (the gate persists its memo through it — the whole reason WO-RK
+/// preceded this crate), time, logging and serde are the allowance; amended
+/// in writing at WO-RL-2 when the gate moved in.
 #[test]
 fn the_dependency_ceiling_holds() {
-    const NORMAL_CEILING: &[&str] = &["rustdar-geo", "chrono", "log", "serde"];
+    const NORMAL_CEILING: &[&str] = &[
+        "rustdar-geo",
+        "rustdar-kv",
+        "chrono",
+        "log",
+        "serde",
+        "serde_json",
+        "web-time",
+    ];
 
     let meta = metadata();
     let deps = declared_deps(&meta, "rustdar-location");

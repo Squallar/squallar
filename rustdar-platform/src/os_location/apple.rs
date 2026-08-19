@@ -568,7 +568,7 @@ mod corelocation {
 
         /// Prompt if the user has never been asked, and start delivering.
         ///
-        /// The `bool` is the hint `PlatformBridge::request_location` documents,
+        /// The `bool` is the hint `LocationBridge::request_location` documents,
         /// not a fact: `requestWhenInUseAuthorization` returns `void` and fails
         /// silently. `false` here means only that there was nothing to ask —
         /// the user has already refused — which is the one case this side can

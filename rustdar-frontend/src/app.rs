@@ -15,7 +15,6 @@ use crate::channels::ChannelHub;
 // `create_window` — the web build takes its size from the canvas. A glob import
 // would go unused on wasm32 and warn.
 use crate::input::InputHandler;
-use crate::location_permission::LocationGate;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
@@ -23,6 +22,7 @@ use crate::render_dispatch::RenderDispatcher;
 use rustdar_device_profile::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_egui::{Gui, actions::GuiAction};
+use rustdar_location::LocationGate;
 use rustdar_radar::site_position::SitePositionSource;
 use rustdar_radar::types::ScanInfo;
 
@@ -564,7 +564,7 @@ pub struct App {
     /// why the emptying is the load-bearing half.
     redraw_waker: RedrawWaker,
     /// The only thing in this application that can raise a location permission
-    /// prompt. See [`crate::location_permission`].
+    /// prompt. See [`rustdar_location::LocationGate`].
     location: LocationGate,
     /// Where earlier volumes said their radars are.
     ///
@@ -804,37 +804,6 @@ fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
     log::info!("first run: opening on {site}, nearest to timezone {zone}");
     gui.set_initial_site(site);
     true
-}
-
-/// How coarse a fix may be and still be allowed to spend the provisional site.
-///
-/// **Deliberately enormous, and the number is measured rather than guessed.**
-/// The instinct is to demand a tight fix here, and it is exactly backwards: the
-/// thing this replaces is the IANA timezone guess, whose population-weighted
-/// mean error is **605 km** and which opens 61% of sampled US metro population
-/// on a radar that physically cannot see their weather. A portal IP lookup —
-/// the coarsest source rustdar will ever read — measures **25 km**, and
-/// displacing every sample point by that much changed the chosen site in only
-/// **5.5%** of probes, by a median of 17 km. WSR-88D sites sit ~200 km apart;
-/// this job simply does not need precision.
-///
-/// So the gate exists to reject the absurd, not to hold a standard. 150 km is
-/// roughly where a fix stops beating the hint it would replace. Set it tight
-/// and the single largest win in the feature is silently switched off.
-const MAX_RELOCATION_ACCURACY_M: f64 = 150_000.0;
-
-/// Whether a fix reporting this accuracy may choose the opening site.
-///
-/// `None` passes. Every NMEA source reports no accuracy at all — the sentences
-/// carry HDOP, a dimensionless geometry factor, and no way to turn it into
-/// metres — and the serial path has been trusted since before this field
-/// existed. Treating absence as failure would disable the serial dongle's own
-/// upgrade, which is the one source here that is *more* accurate than the
-/// threshold, not less.
-fn fix_is_accurate_enough_to_relocate(accuracy_m: Option<f64>) -> bool {
-    // `is_none_or`, so a NaN accuracy — which no producer should emit and which
-    // compares false against everything — is rejected rather than admitted.
-    accuracy_m.is_none_or(|m| m <= MAX_RELOCATION_ACCURACY_M)
 }
 
 /// Take out of `map` every value whose key `doomed` names, and hand them back
@@ -3076,7 +3045,7 @@ impl App {
         if !fix.fix_quality.can_relocate() {
             return;
         }
-        if !fix_is_accurate_enough_to_relocate(fix.accuracy_m) {
+        if !rustdar_location::fix_is_accurate_enough_to_relocate(fix.accuracy_m) {
             log::debug!(
                 "ignoring a {:.0} km fix for the opening site; the timezone \
                  guess it would replace is better than that",

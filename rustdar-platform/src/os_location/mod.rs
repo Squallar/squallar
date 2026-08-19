@@ -207,7 +207,7 @@ pub trait OsLocationProvider: Sized {
 
     /// Prompt if the platform needs prompting, and start delivering.
     ///
-    /// The `bool` is the hint `PlatformBridge::request_location` documents, and
+    /// The `bool` is the hint `LocationBridge::request_location` documents, and
     /// nothing durable may hang off it: two of the three platforms cannot tell
     /// whether the ask reached a human.
     fn request(&mut self) -> bool;
