@@ -73,13 +73,13 @@ jobs:
             package: macos
             macos_arch: aarch64
             cmd: cargo build --release --workspace --all-targets --all-features --target aarch64-apple-darwin
-            artifact: macos/build/aarch64-apple-darwin/rustdar.app.zip
+            artifact: packaging/macos/build/aarch64-apple-darwin/rustdar.app.zip
           - name: macos-x86_64
             target: x86_64-apple-darwin
             package: macos
             macos_arch: x86_64
             cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-apple-darwin
-            artifact: macos/build/x86_64-apple-darwin/rustdar.app.zip
+            artifact: packaging/macos/build/x86_64-apple-darwin/rustdar.app.zip
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
@@ -90,17 +90,17 @@ jobs:
           # codegens the whole graph, and the link is where the failures that
           # only iOS has actually appear: a missing `-framework`, or a
           # dependency that reaches for IOKit. `IN_CONTAINER=1` because this job
-          # already runs inside the image ios/Makefile would otherwise start.
+          # already runs inside the image packaging/ios/Makefile would otherwise start.
           # `zip` is not in the image and is only needed to package the .ipa.
           - name: ios-aarch64
             target: aarch64-apple-ios
             workspaces: ". -> target-ios"
-            artifact: ios/build/linux/iphoneos/rustdar.ipa
+            artifact: packaging/ios/build/linux/iphoneos/rustdar.ipa
             cmd: |
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends zip
-              make -C ios IN_CONTAINER=1
-              test -f ios/build/linux/iphoneos/rustdar.ipa \
+              make -C packaging/ios IN_CONTAINER=1
+              test -f packaging/ios/build/linux/iphoneos/rustdar.ipa \
                 || { echo "::error::no .ipa was packaged"; exit 1; }
           # Same link against the simulator SDK. Not redundant: it is a
           # different target triple with its own std, its own clang wrapper and
@@ -109,8 +109,8 @@ jobs:
           - name: ios-aarch64-sim
             target: aarch64-apple-ios-sim
             workspaces: ". -> target-ios"
-            artifact: ios/build/linux/iphonesimulator/rustdar.app
-            cmd: make -C ios IN_CONTAINER=1 SIMULATOR=1
+            artifact: packaging/ios/build/linux/iphonesimulator/rustdar.app
+            cmd: make -C packaging/ios IN_CONTAINER=1 SIMULATOR=1
 
           # `./gradlew assembleRelease`, not a bare `cargo ndk`. These were the
           # only rows whose artifact nobody could act on: every other row ships
@@ -625,7 +625,7 @@ jobs:
       # rotation, and a rotation costs every user one more prompt.
       #
       # Until the secret exists, and on every fork pull request (which never
-      # gets secrets), macos/Makefile falls back to an **ad-hoc** signature.
+      # gets secrets), packaging/macos/Makefile falls back to an **ad-hoc** signature.
       # That still launches on arm64 — it is a real signature — but its
       # designated requirement is the code hash, so it re-prompts on each
       # rebuild. The Makefile says so in the log; it is a labelled fallback,
@@ -636,7 +636,7 @@ jobs:
           MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
           MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
         run: |
-          make -C macos IN_CONTAINER=1 ARCHIVE=1 \
+          make -C packaging/macos IN_CONTAINER=1 ARCHIVE=1 \
             ARCH=${{ matrix.macos_arch }} \
             BIN=target/${{ matrix.target }}/release/rustdar-platform
 

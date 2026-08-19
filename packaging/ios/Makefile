@@ -1,8 +1,8 @@
 # iOS app build, run entirely on Linux inside the rust-cross container:
 #
-#   make -C ios                 device   (aarch64-apple-ios),     release -> .app + .ipa
-#   make -C ios SIMULATOR=1     simulator(aarch64-apple-ios-sim), release -> .app
-#   make -C ios DEBUG=1         debug profile
+#   make -C packaging/ios                 device   (aarch64-apple-ios),     release -> .app + .ipa
+#   make -C packaging/ios SIMULATOR=1     simulator(aarch64-apple-ios-sim), release -> .app
+#   make -C packaging/ios DEBUG=1         debug profile
 #
 # Output is UNSIGNED. Installing on a device needs `rcodesign`; the simulator
 # does not care. No Apple tools and no macOS host are involved -- the .app is
@@ -11,19 +11,19 @@
 # CI already runs *inside* the image, so it sets IN_CONTAINER=1 and the same
 # recipe executes directly instead of nesting a second container.
 #
-# The app is a thin UIKit shell (ios/Sources/main.m) linking the Rust staticlib
-# and calling `rustdar_ios_main`. Bundle metadata is read out of ios/project.yml
+# The app is a thin UIKit shell (packaging/ios/Sources/main.m) linking the Rust staticlib
+# and calling `rustdar_ios_main`. Bundle metadata is read out of packaging/ios/project.yml
 # so Xcode and this Makefile cannot disagree about it.
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
 .ONESHELL:
-ROOT := $(realpath $(CURDIR)/..)
+ROOT := $(realpath $(CURDIR)/../..)
 
 # Digest-pinned to the same image the CI matrix uses.
 IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
 # Named volume for the crate cache, so a rebuild does not re-download the index.
 CARGO_VOL ?= rustdar-xcross-cargo
-# Must match MinimumOSVersion in ios/Info.plist; it is what drives the clang
+# Must match MinimumOSVersion in packaging/ios/Info.plist; it is what drives the clang
 # wrapper's -target/-mios-version-min and so the binary's LC_BUILD_VERSION.
 IOS_MIN ?= 14.0
 # Separate from target/, which holds host artifacts: one directory shared by two
@@ -52,7 +52,7 @@ build:
 	# putting `staticlib` in rustdar-platform's [lib] would archive the whole
 	# graph on every desktop build and every --all-targets clippy run too.
 	#
-	# The framework list mirrors ios/project.yml. Nothing here is auto-linked:
+	# The framework list mirrors packaging/ios/project.yml. Nothing here is auto-linked:
 	# a link without `-framework Security` fails on SecTrustEvaluateWithError,
 	# which is rustls-platform-verifier's Apple trust path, and one without
 	# `-framework CoreLocation` fails on the CLLocationManager class reference
@@ -63,7 +63,7 @@ build:
 	    export CARGO_TARGET_DIR=$(TARGET_DIR)
 	    cargo rustc $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar-platform --lib --crate-type staticlib
 	    test -f $$LIBDIR/librustdar_platform_lib.a || { echo 'staticlib missing'; exit 1; }
-	    $$IOS_CC -c ios/Sources/main.m -o $$LIBDIR/rustdar_main.o
+	    $$IOS_CC -c packaging/ios/Sources/main.m -o $$LIBDIR/rustdar_main.o
 	    $$IOS_CC $$LIBDIR/rustdar_main.o $$LIBDIR/librustdar_platform_lib.a \
 	        -lobjc \
 	        -framework UIKit -framework QuartzCore -framework Metal \
@@ -98,18 +98,18 @@ build:
 
 	# ---- assemble the .app (plain file ops, no Apple tools) ----
 	echo "==> assemble rustdar.app"
-	# Single source of bundle metadata: ios/project.yml.
-	yaml_val() { sed -n "s/.*$$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" ios/project.yml | head -1; }
+	# Single source of bundle metadata: packaging/ios/project.yml.
+	yaml_val() { sed -n "s/.*$$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" packaging/ios/project.yml | head -1; }
 	BUNDLE_ID="$$(yaml_val PRODUCT_BUNDLE_IDENTIFIER)"
 	MARKETING_VERSION="$$(yaml_val MARKETING_VERSION)"
 	CURRENT_PROJECT_VERSION="$$(yaml_val CURRENT_PROJECT_VERSION)"
-	: "$${BUNDLE_ID:?could not read PRODUCT_BUNDLE_IDENTIFIER from ios/project.yml}"
+	: "$${BUNDLE_ID:?could not read PRODUCT_BUNDLE_IDENTIFIER from packaging/ios/project.yml}"
 	# DTSDKName is read off the SDK the link just used rather than written down
 	# here, so it cannot drift from the image.
 	SDK_NAME="$$(cat "$$LIBDIR/sdk-name")"
 	: "$${SDK_NAME:?no CanonicalName in the SDKSettings.json of the linked SDK}"
 
-	OUT="ios/build/linux/$$SDK"; APP="$$OUT/rustdar.app"
+	OUT="packaging/ios/build/linux/$$SDK"; APP="$$OUT/rustdar.app"
 	rm -rf "$$OUT"; mkdir -p "$$APP"
 	cp "$$LIBDIR/rustdar" "$$APP/rustdar"; chmod +x "$$APP/rustdar"
 	# Resolve the Xcode build-setting variables xcodebuild would have expanded.
@@ -120,7 +120,7 @@ build:
 	    -e "s|\$$(SUPPORTED_PLATFORM)|$$SUPPORTED_PLATFORM|g" \
 	    -e "s|\$$(PLATFORM_NAME)|$$SDK|g" \
 	    -e "s|\$$(SDK_NAME)|$$SDK_NAME|g" \
-	    ios/Info.plist > "$$APP/Info.plist"
+	    packaging/ios/Info.plist > "$$APP/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }
 	echo ""
@@ -148,4 +148,4 @@ build:
 	fi
 
 clean:
-	@rm -rf "$(ROOT)/ios/build" "$(ROOT)/$(TARGET_DIR)"
+	@rm -rf "$(ROOT)/packaging/ios/build" "$(ROOT)/$(TARGET_DIR)"

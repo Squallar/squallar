@@ -1,10 +1,10 @@
 # macOS app build, run entirely on Linux inside the rust-cross container:
 #
-#   make -C macos                    arm64  (aarch64-apple-darwin), release
-#   make -C macos ARCH=x86_64        Intel  (x86_64-apple-darwin),  release
-#   make -C macos DEBUG=1            debug profile
-#   make -C macos BIN=path/to/exe    package a binary that already exists
-#   make -C macos ARCHIVE=1          also produce rustdar.app.zip
+#   make -C packaging/macos                    arm64  (aarch64-apple-darwin), release
+#   make -C packaging/macos ARCH=x86_64        Intel  (x86_64-apple-darwin),  release
+#   make -C packaging/macos DEBUG=1            debug profile
+#   make -C packaging/macos BIN=path/to/exe    package a binary that already exists
+#   make -C packaging/macos ARCHIVE=1          also produce rustdar.app.zip
 #
 # `ARCHIVE` and not the obvious `ZIP`: a variable set on make's command line is
 # exported into the recipe's environment, and Info-ZIP's `zip` reads `ZIP` (and
@@ -19,7 +19,7 @@
 # CI already runs *inside* the image, so it sets IN_CONTAINER=1 and the recipe
 # executes directly instead of nesting a second container.
 #
-# This mirrors ios/Makefile, with three differences that are not stylistic:
+# This mirrors packaging/ios/Makefile, with three differences that are not stylistic:
 #
 #   * The layout is not flat. A macOS bundle is
 #     Contents/{Info.plist, MacOS/rustdar, Resources/, PkgInfo}; an iOS one puts
@@ -48,7 +48,7 @@
 #
 # Then either point this Makefile at it —
 #
-#   make -C macos P12_FILE=../rustdar-signing.p12 P12_PASSWORD="$$PW"
+#   make -C packaging/macos P12_FILE=../rustdar-signing.p12 P12_PASSWORD="$$PW"
 #
 # — or, for CI, put `base64 -w0 rustdar-signing.p12` in the repository secret
 # `MACOS_SIGNING_P12` and the password in `MACOS_SIGNING_P12_PASSWORD`; this
@@ -65,7 +65,7 @@
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
 .ONESHELL:
-ROOT := $(realpath $(CURDIR)/..)
+ROOT := $(realpath $(CURDIR)/../..)
 
 # Digest-pinned to the same image the CI matrix uses.
 IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
@@ -153,16 +153,16 @@ build:
 	fi
 
 	# ---- bundle metadata ----
-	# Single source: macos/project.yml. Its own file and never ios/project.yml:
+	# Single source: packaging/macos/project.yml. Its own file and never packaging/ios/project.yml:
 	# this reader takes the first `KEY:` in the file, comments included, and the
 	# iOS spec's comment block names two of these keys before its settings do.
-	yaml_val() { sed -n "s/.*$$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" macos/project.yml | head -1; }
+	yaml_val() { sed -n "s/.*$$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" packaging/macos/project.yml | head -1; }
 	BUNDLE_ID="$$(yaml_val PRODUCT_BUNDLE_IDENTIFIER)"
 	MARKETING_VERSION="$$(yaml_val MARKETING_VERSION)"
 	CURRENT_PROJECT_VERSION="$$(yaml_val CURRENT_PROJECT_VERSION)"
 	MACOS_MIN="$$(yaml_val MACOSX_DEPLOYMENT_TARGET)"
-	: "$${BUNDLE_ID:?could not read PRODUCT_BUNDLE_IDENTIFIER from macos/project.yml}"
-	: "$${MACOS_MIN:?could not read MACOSX_DEPLOYMENT_TARGET from macos/project.yml}"
+	: "$${BUNDLE_ID:?could not read PRODUCT_BUNDLE_IDENTIFIER from packaging/macos/project.yml}"
+	: "$${MACOS_MIN:?could not read MACOSX_DEPLOYMENT_TARGET from packaging/macos/project.yml}"
 
 	# The plist's floor and the compiler's floor are two different files, and
 	# the whole point of the floor is that a binary built below it links
@@ -173,13 +173,13 @@ build:
 	: "$${CARGO_MIN:?no MACOSX_DEPLOYMENT_TARGET in .cargo/config.toml; the Apple deployment floor is unset}"
 	[ "$$CARGO_MIN" = "$$MACOS_MIN" ] || {
 	  echo "ERROR: .cargo/config.toml says MACOSX_DEPLOYMENT_TARGET=$$CARGO_MIN"
-	  echo "       macos/project.yml says MACOSX_DEPLOYMENT_TARGET=$$MACOS_MIN"
+	  echo "       packaging/macos/project.yml says MACOSX_DEPLOYMENT_TARGET=$$MACOS_MIN"
 	  exit 1
 	}
 
 	# ---- assemble the .app (plain file ops, no Apple tools) ----
 	echo "==> assemble rustdar.app"
-	OUT="macos/build/$$RUST_TARGET"; APP="$$OUT/rustdar.app"
+	OUT="packaging/macos/build/$$RUST_TARGET"; APP="$$OUT/rustdar.app"
 	rm -rf "$$OUT"; mkdir -p "$$APP/Contents/MacOS" "$$APP/Contents/Resources"
 	cp "$$EXE" "$$APP/Contents/MacOS/rustdar"; chmod +x "$$APP/Contents/MacOS/rustdar"
 	# Four bytes of type and creator. Vestigial, and every real .app has it.
@@ -190,7 +190,7 @@ build:
 	    -e "s|\$$(MARKETING_VERSION)|$$MARKETING_VERSION|g" \
 	    -e "s|\$$(CURRENT_PROJECT_VERSION)|$$CURRENT_PROJECT_VERSION|g" \
 	    -e "s|\$$(MACOSX_DEPLOYMENT_TARGET)|$$MACOS_MIN|g" \
-	    macos/Info.plist > "$$APP/Contents/Info.plist"
+	    packaging/macos/Info.plist > "$$APP/Contents/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Contents/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }
 
@@ -268,4 +268,4 @@ build:
 	echo "Run it with:  open '$(ROOT)/$$APP'"
 
 clean:
-	@rm -rf "$(ROOT)/macos/build" "$(ROOT)/$(TARGET_DIR)"
+	@rm -rf "$(ROOT)/packaging/macos/build" "$(ROOT)/$(TARGET_DIR)"
