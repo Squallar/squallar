@@ -4,10 +4,11 @@
 //! The portable half of rustdar.
 //!
 //! Everything here is shared by every target: the winit application handler,
-//! the wgpu/egui renderer, the fetch and render dispatch, and the app state
-//! they operate on. The per-OS entry points and the concrete
-//! [`platform::PlatformBridge`] implementations live in `rustdar-platform`,
-//! which depends on this crate — never the other way round.
+//! the fetch and render dispatch, and the app state they operate on. The
+//! wgpu/egui renderer itself lives below, in `rustdar-gpu` (WO-RG). The
+//! per-OS entry points and the concrete [`platform::PlatformBridge`]
+//! implementations live in `rustdar-platform`, which depends on this crate —
+//! never the other way round.
 
 use std::sync::Arc;
 use winit::window::Window;
@@ -32,7 +33,6 @@ pub mod budget_memo;
 pub mod channels;
 pub mod chunk_feed;
 pub mod chunk_notify;
-pub mod egui_renderer;
 pub mod input;
 pub mod location_hint;
 pub mod location_permission;
@@ -46,7 +46,6 @@ pub(crate) mod platform_double;
 pub mod render_dispatch;
 pub mod site_catalogue;
 pub mod site_positions;
-pub mod staging_ring;
 /// The radars this crate's tests run against. See the module note for why
 /// there is exactly one such list.
 #[cfg(test)]

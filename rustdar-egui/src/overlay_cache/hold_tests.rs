@@ -3,7 +3,7 @@
 //! The four ways a hold can end, and the one thing that must never happen while
 //! it lasts. Everything here is about *what is on screen* rather than about
 //! bytes crossing PCIe: whether the last band has landed is
-//! `rustdar_frontend::egui_renderer::texture_upload`'s question, and it is
+//! `rustdar_gpu::egui_renderer::texture_upload`'s question, and it is
 //! passed in here as a predicate precisely so these can be asked without a GPU.
 
 use super::*;

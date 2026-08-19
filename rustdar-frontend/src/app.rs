@@ -38,7 +38,7 @@ mod chunks;
 #[path = "frame_pump.rs"]
 mod frame_pump;
 
-/// Whether this build is the browser build. See `app_state::WEB`, which is the
+/// Whether this build is the browser build. See `rustdar_gpu::device`'s `WEB`, which is the
 /// same value for the same reason: a `cfg!` forks a function both of whose arms
 /// still compile, so a host `cargo test` can call either one.
 const WEB: bool = cfg!(target_arch = "wasm32");
@@ -249,7 +249,7 @@ pub struct App {
     /// The rung the pane mirror is drawn at, and the hysteresis that governs
     /// when it may move. One per application, because the mirror is one texture
     /// for the whole application. See `egui_renderer::mirror`.
-    mirror_rungs: crate::egui_renderer::MirrorRungs,
+    mirror_rungs: rustdar_gpu::egui_renderer::MirrorRungs,
     /// The application's whole loop allowance, and the hysteresis that governs
     /// how it is divided. One per application, because the pool is one
     /// allowance for the whole application. See `crate::loop_pool`.
@@ -1038,7 +1038,7 @@ impl App {
             chunk_feed_status: rustdar_egui::ChunkFeedStatus::default(),
             current_volume_stamps: HashMap::new(),
             volume_painter: None,
-            mirror_rungs: crate::egui_renderer::MirrorRungs::default(),
+            mirror_rungs: rustdar_gpu::egui_renderer::MirrorRungs::default(),
             budgets,
             device_profile,
             loop_pool,
@@ -1567,7 +1567,7 @@ impl App {
     ///   (this project's own RTX 3090 reports `DiscreteGpu` through Vulkan and
     ///   `Other` through GL);
     /// * the **ceilings the adapter reports**, off the *device* rather than off
-    ///   the adapter, because the web arm of `app_state::device_limits` has
+    ///   the adapter, because the web arm of `rustdar_gpu::device::device_limits` has
     ///   already reconciled them with what WebGL2 can express — so this is the
     ///   figure the app can actually spend on every target rather than a claim
     ///   one of them would refuse.
@@ -1612,11 +1612,9 @@ impl App {
 
         // Read before the `&mut` borrow below, because the pool it also decides
         // lives on `App` rather than on `AppState` — see `Self::loop_pool`.
-        let Some(class) = self
-            .state
-            .as_ref()
-            .map(|state| device_class_of(state.adapter.get_info().device_type))
-        else {
+        let Some(class) = self.state.as_ref().map(|state| {
+            rustdar_gpu::device::device_class_of(state.adapter.get_info().device_type)
+        }) else {
             return;
         };
 
@@ -3556,58 +3554,6 @@ impl App {
         // This keeps resumed() fast on Android, preventing ANRs during
         // configuration changes (e.g. folding/unfolding the device).
         window.request_redraw();
-    }
-}
-
-/// Classify what the adapter says it is.
-///
-/// Exhaustive on purpose: a new `DeviceType` variant should be a compile
-/// error here, not a silent fall into `Unknown`.
-///
-/// A free fn beside its only caller rather than an inherent method on
-/// `DeviceClass`: the class moved down into rustdar-device-profile at WO-RD,
-/// an inherent impl can only live in the defining crate, and the floor's
-/// charter forbids it a wgpu dependency — so the one wgpu-touching line stays
-/// up here. WO-RG re-homes this into rustdar-gpu.
-fn device_class_of(device_type: wgpu::DeviceType) -> rustdar_device_profile::quality::DeviceClass {
-    use rustdar_device_profile::quality::DeviceClass;
-    match device_type {
-        wgpu::DeviceType::DiscreteGpu => DeviceClass::Discrete,
-        wgpu::DeviceType::IntegratedGpu => DeviceClass::Integrated,
-        wgpu::DeviceType::VirtualGpu => DeviceClass::Virtual,
-        wgpu::DeviceType::Cpu => DeviceClass::Software,
-        wgpu::DeviceType::Other => DeviceClass::Unknown,
-    }
-}
-
-#[cfg(test)]
-mod device_class_tests {
-    use super::device_class_of;
-    use rustdar_device_profile::quality::DeviceClass;
-
-    /// Every `DeviceType` classifies, and no two collapse that must not.
-    ///
-    /// `Cpu` mapping to anything but `Software` is the one that matters: a
-    /// software rasteriser given the discrete GPU's quality is a frame time in
-    /// seconds, and a browser falling back to SwiftShader is a real path.
-    /// (Travelled here from the floor crate's quality tests at WO-RD, with
-    /// the classifier itself.)
-    #[test]
-    fn every_adapter_device_type_maps_to_its_own_class() {
-        use egui_wgpu::wgpu;
-        for (device_type, expected) in [
-            (wgpu::DeviceType::DiscreteGpu, DeviceClass::Discrete),
-            (wgpu::DeviceType::IntegratedGpu, DeviceClass::Integrated),
-            (wgpu::DeviceType::VirtualGpu, DeviceClass::Virtual),
-            (wgpu::DeviceType::Cpu, DeviceClass::Software),
-            (wgpu::DeviceType::Other, DeviceClass::Unknown),
-        ] {
-            assert_eq!(
-                device_class_of(device_type),
-                expected,
-                "{device_type:?} no longer classifies as {expected:?}"
-            );
-        }
     }
 }
 

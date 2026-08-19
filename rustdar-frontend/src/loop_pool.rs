@@ -42,7 +42,7 @@
 //!
 //! A pane appearing and disappearing must not re-fetch and re-render the world
 //! each time, so the demand passes through [`LoopPoolState`], which is the same
-//! shape as `crate::egui_renderer::MirrorRungs`: a dwell of
+//! shape as `rustdar_gpu::egui_renderer::MirrorRungs`: a dwell of
 //! [`LOOP_POOL_DWELL_FRAMES`] before any change is taken at all, and a dead band
 //! of [`LOOP_POOL_HYSTERESIS`] on the direction that is optional.
 //!
@@ -189,7 +189,7 @@ pub const LOOP_POOL_KEY: &str = "loop_pool";
 /// The bounds this target holds a discovered pool between.
 ///
 /// The pair is deliberately asymmetric in kind, exactly as
-/// `crate::egui_renderer::MirrorLimits` is: the floor is a **decision** about
+/// `rustdar_gpu::egui_renderer::MirrorLimits` is: the floor is a **decision** about
 /// the worst device this target is willing to work on, and the value between
 /// floor and ceiling is a **measurement**. The ceiling is what stops a
 /// misread — or a device that lies — from claiming the whole GPU.
@@ -562,7 +562,7 @@ impl LoopPool {
 /// The allocation in force, and how long the panes have disagreed with it.
 ///
 /// One per application, because the pool is one allowance for the whole
-/// application. The shape is `crate::egui_renderer::MirrorRungs`', deliberately:
+/// application. The shape is `rustdar_gpu::egui_renderer::MirrorRungs`', deliberately:
 /// a pending demand that has to survive a dwell before it is taken, and a dead
 /// band on the direction that is optional.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

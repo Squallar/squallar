@@ -38,7 +38,7 @@ pub struct AttachmentConfig {
     /// The colour attachment's format — the swapchain's, in practice.
     ///
     /// Note this is deliberately *not* always non-sRGB.
-    /// `app_state::preferred_surface_format` prefers a non-sRGB format on
+    /// `device::preferred_surface_format` prefers a non-sRGB format on
     /// wasm32 and prefers `Bgra8Unorm` — also non-sRGB — natively, falling back
     /// to `capabilities.formats[0]` only on an adapter that does not offer it.
     /// So an sRGB format here is the *rare* case rather than the routine
@@ -64,9 +64,10 @@ pub use mirror::{
     MIRROR_RUNG_DWELL_FRAMES, MIRROR_RUNG_HYSTERESIS, MIRROR_SCALE_MAX, MirrorLimits, MirrorPlan,
     MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
 };
-// The moved side cap, re-exported so this module's consumers keep one spelling
-// until the whole renderer moves at WO-RG (frontend-internal interim only —
-// new readers import the floor crate directly).
+// The side cap lives in the floor crate (WO-RD moved it beside the mirror
+// byte cascade); re-exported here so the mirror's own consumers and tests keep
+// one spelling beside the mirror vocabulary above. New readers outside this
+// crate import rustdar_device_profile directly.
 pub use rustdar_device_profile::constants::MIRROR_MAX_SIDE;
 
 /// How a texture delta gets onto the GPU without the frame paying for it.
@@ -125,7 +126,8 @@ pub struct PreparedFrame {
     /// another frame: an open/close animation advanced only on the frames
     /// the click's own events happened to produce (press, release, a stray
     /// move — the reported ~3 frames) and then froze until the next input.
-    /// Honoured by `App::handle_redraw` via [`crate::app::repaint_action`].
+    /// Honoured by `App::handle_redraw` via the app side's `repaint_action`
+    /// (rustdar-frontend's `app` module).
     repaint_delay: std::time::Duration,
     /// Command buffers egui collected from this frame's paint callbacks.
     ///
@@ -223,8 +225,8 @@ fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
 ///
 /// **Only a zero delay wakes.** A timed request — `request_repaint_after`, a
 /// tooltip's dwell, a cursor blink — is already carried out of the frame by
-/// `FullOutput`'s `repaint_delay` and scheduled by
-/// [`repaint_action`](crate::app::repaint_action), and honouring it here as
+/// `FullOutput`'s `repaint_delay` and scheduled by the app side's
+/// `repaint_action` (rustdar-frontend's `app` module), and honouring it here as
 /// well would turn every such request into an immediate redraw: egui re-asks
 /// on each pass, so the "wait half a second" would become a frame per frame,
 /// forever. The one thing this drops is an off-frame *timed* request, which
@@ -248,15 +250,14 @@ impl EguiRenderer {
         output_depth_format: Option<TextureFormat>,
         msaa_samples: u32,
         window: &crate::WindowRef,
+        // The app side's redraw request, injected because this crate cannot —
+        // and must not — name the event loop. The caller's closure holds the
+        // window and ends in its `notify_redraw`; see `install_repaint_wake`
+        // for what the wake is and why only a zero delay fires it.
+        wake: impl Fn() + Send + Sync + 'static,
     ) -> EguiRenderer {
         let egui_context = Context::default();
-        // See `install_repaint_wake`. The window is held by the closure for as
-        // long as this context lives, which is exactly as long as the renderer
-        // that owns it — `suspended` drops both together.
-        let held = Some(window.clone());
-        install_repaint_wake(&egui_context, move || {
-            crate::app::notify_redraw(&held);
-        });
+        install_repaint_wake(&egui_context, wake);
 
         // Query the device's actual texture size limit
         let max_texture_side = device.limits().max_texture_dimension_2d as usize;

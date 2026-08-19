@@ -184,7 +184,7 @@ mod tests {
     /// literal to the value the device request is actually held to. A wgpu
     /// bump that moved the floor is a visible failure to be reviewed here,
     /// rather than a grid bound that silently drifts from what
-    /// `app_state::device_limits` enforces. (Replaces the floor crate's old
+    /// `rustdar_gpu::device::device_limits` enforces. (Replaces the floor crate's old
     /// source-scrape of its own derivation — same intent, new mechanism,
     /// WO-RD.)
     #[test]

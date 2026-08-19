@@ -40,10 +40,10 @@
 use egui_wgpu::wgpu;
 use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
-use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::VolumePipelines;
 use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::uniform::VolumeUniform;
+use rustdar_gpu::egui_renderer::AttachmentConfig;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{DESKTOP_SHAPE, HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels};
 

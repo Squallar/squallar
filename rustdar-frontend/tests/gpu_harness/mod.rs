@@ -15,10 +15,10 @@
 
 use egui_wgpu::wgpu;
 use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
-use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::raymarch::{CoarseLevel, FLOOR_FORMAT, PaneMirror, VolumePipelines};
 use rustdar_frontend::volume::uniform::VolumeUniform;
+use rustdar_gpu::egui_renderer::AttachmentConfig;
 
 /// Held for the length of a test, so only one talks to the GPU at a time.
 ///
