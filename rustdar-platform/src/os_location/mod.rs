@@ -24,7 +24,7 @@
 //! `platform.rs` says which *bridge* exists, and not one of them says anything
 //! about how that bridge does location.
 //!
-//! [`SerialGpsReader::start`]: rustdar_gps::SerialGpsReader::start
+//! [`SerialGpsReader::start`]: rustdar_nmea_serial::SerialGpsReader::start
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -112,7 +112,7 @@ pub type RedrawWake = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Announces a permission the app did not ask for.
 pub type ReportPermission =
-    std::sync::Arc<dyn Fn(rustdar_gps::LocationPermission) + Send + Sync + 'static>;
+    std::sync::Arc<dyn Fn(rustdar_location::LocationPermission) + Send + Sync + 'static>;
 
 /// The three ways a provider talks back to the app, and the only three.
 ///
@@ -127,8 +127,8 @@ pub type ReportPermission =
 #[derive(Clone)]
 pub struct OsLocationSink {
     /// Where fixes go. `DesktopPlatform` drains this alongside the serial
-    /// reader's and picks between them; see [`prefer_fix`].
-    pub fixes: std::sync::mpsc::Sender<rustdar_gps::GpsFix>,
+    /// reader's and picks between them; see [`rustdar_location::prefer_fix`].
+    pub fixes: std::sync::mpsc::Sender<rustdar_location::Fix>,
     /// See [`RedrawWake`].
     pub wake: RedrawWake,
     /// See [`ReportPermission`] and the note on [`OsLocationProvider::start`].
@@ -146,11 +146,12 @@ pub struct OsLocationSink {
 /// differently-shaped constructor of its own. Nothing caught any of that,
 /// because nothing was comparing them. A trait is compared by the compiler.
 ///
-/// # Why the parameter is not a `GpsConfig`
+/// # Why the parameter is not a `SerialConfig`
 ///
-/// The old signature took one, inherited from [`SerialGpsReader::start`], whose
-/// job it is to open a serial port. `GpsConfig` carries a port name, a baud
-/// rate and a heading source: three settings for a piece of hardware the user
+/// The old signature took one (a `GpsConfig`, then), inherited from
+/// [`SerialGpsReader::start`], whose
+/// job it is to open a serial port. That config carries a port name and a baud
+/// rate: settings for a piece of hardware the user
 /// plugged in. A portal session, a WinRT `Geolocator` and a `CLLocationManager`
 /// have none of those and can use none of them — every provider that landed
 /// ignored the argument, and one of them said so in a doc comment. What a
@@ -191,9 +192,9 @@ pub struct OsLocationSink {
 /// Windows leaves it `Unknown` until its worker's first `CheckAccess`, which is
 /// what the settings pane's "Checking…" exists for.
 ///
-/// [`SerialGpsReader::start`]: rustdar_gps::SerialGpsReader::start
-/// [`Unknown`]: rustdar_gps::LocationPermission::Unknown
-/// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
+/// [`SerialGpsReader::start`]: rustdar_nmea_serial::SerialGpsReader::start
+/// [`Unknown`]: rustdar_location::LocationPermission::Unknown
+/// [`Prompt`]: rustdar_location::LocationPermission::Prompt
 pub trait OsLocationProvider: Sized {
     /// Bring the provider up, prompting nobody and delivering nothing.
     ///
@@ -201,7 +202,7 @@ pub trait OsLocationProvider: Sized {
     /// subscribe to — which is not the same as the user having said no, and the
     /// bridge renders it as [`Unavailable`] rather than as a refusal.
     ///
-    /// [`Unavailable`]: rustdar_gps::LocationPermission::Unavailable
+    /// [`Unavailable`]: rustdar_location::LocationPermission::Unavailable
     fn start(sink: OsLocationSink) -> Option<Self>;
 
     /// Prompt if the platform needs prompting, and start delivering.
@@ -233,98 +234,4 @@ pub trait OsLocationProvider: Sized {
 
     /// Open the system location settings. Fire and forget; must not block.
     fn open_settings(&mut self) {}
-}
-
-/// Choose between a fix from the serial reader and one from the OS.
-///
-/// **"Serial with a positional quality wins", not "serial wins".** The plain
-/// rule looks obviously right — a dongle with a sky view beats an IP lookup by
-/// three orders of magnitude — and it has a failure mode that is silent and
-/// permanent: a receiver with *no* sky view goes on emitting GGA at quality 0,
-/// with the last coordinates it had and a cleared fix flag, at 1 Hz forever. A
-/// user with a USB GPS in a drawer and a working platform location service
-/// would have the good fix discarded on every single frame in favour of a fix
-/// the receiver itself is saying not to trust.
-///
-/// So the serial reader wins only while it is actually reporting a fix. When it
-/// is not, and the OS is, the OS's fix is what there is. When neither is
-/// positional the serial one is still preferred: it carries satellite counts
-/// and HDOP the OS never reports, and preserving it is what keeps today's
-/// behaviour unchanged on a machine with no OS provider at all.
-pub fn prefer_fix(
-    serial: Option<rustdar_gps::GpsFix>,
-    os: Option<rustdar_gps::GpsFix>,
-) -> Option<rustdar_gps::GpsFix> {
-    match (serial, os) {
-        (Some(serial), Some(os)) => Some(if serial.fix_quality == rustdar_gps::FixQuality::None {
-            os
-        } else {
-            serial
-        }),
-        (serial, os) => serial.or(os),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rustdar_gps::{FixQuality, GpsFix};
-
-    fn serial_fix(quality: FixQuality) -> GpsFix {
-        GpsFix {
-            fix_quality: quality,
-            ..GpsFix::from_lat_lon(35.25, -97.5)
-        }
-    }
-
-    fn os_fix() -> GpsFix {
-        GpsFix {
-            accuracy_m: Some(25_000.0),
-            ..GpsFix::from_device_position(39.74, -104.99)
-        }
-    }
-
-    /// A receiver that has a fix is the better source by three orders of
-    /// magnitude, and it stays the better source.
-    #[test]
-    fn a_serial_fix_outranks_the_operating_systems() {
-        let chosen = prefer_fix(Some(serial_fix(FixQuality::Gps)), Some(os_fix()))
-            .expect("both were present");
-        assert_eq!(chosen.fix_quality, FixQuality::Gps);
-    }
-
-    /// The regression the qualifier exists for: a dongle indoors emits quality
-    /// 0 with real-looking coordinates at 1 Hz forever, and plain "serial wins"
-    /// discards a good OS fix on every frame in favour of it.
-    #[test]
-    fn a_dongle_with_no_sky_view_does_not_shadow_a_real_fix() {
-        let chosen = prefer_fix(Some(serial_fix(FixQuality::None)), Some(os_fix()))
-            .expect("both were present");
-        assert_eq!(
-            chosen.fix_quality,
-            FixQuality::Device,
-            "a serial reader reporting no fix suppressed the one source that \
-             had one"
-        );
-    }
-
-    /// With nothing else on offer the serial reading still stands, quality and
-    /// all. This is today's behaviour on a machine with no OS provider, and it
-    /// must not change.
-    #[test]
-    fn a_lone_source_is_used_whatever_it_says() {
-        assert_eq!(
-            prefer_fix(Some(serial_fix(FixQuality::None)), None)
-                .expect("the serial reading")
-                .fix_quality,
-            FixQuality::None,
-        );
-        assert_eq!(
-            prefer_fix(None, Some(os_fix()))
-                .expect("the OS reading")
-                .fix_quality,
-            FixQuality::Device,
-        );
-        assert!(prefer_fix(None, None).is_none());
-    }
 }

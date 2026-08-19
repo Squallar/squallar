@@ -34,7 +34,7 @@ jobs:
       matrix:
         include:
           # `--all-features` on the desktop rows only: it enables
-          # rustdar-gps/serial, which links IOKit. It also enables
+          # rustdar-nmea-serial/serial, which links IOKit. It also enables
           # rustdar-android/jni-typecheck, so these rows type-check the JNI layer.
           #
           # `--release` on every row whose artifact a person can run, and folded
@@ -187,7 +187,8 @@ jobs:
             artifact: rustdar-android/android/app/build/outputs/apk/release/app-x86_64-release.apk
 
           # The only wasm build, and deliberately so. The deleted `wasm32
-          # libraries` row named members as roots, so rustdar-gps took its own
+          # libraries` row named members as roots, so the gps crate (rustdar-nmea-serial
+          # today) took its own
           # defaults and serialport -- the crate the `serial`/`gps-serial` gates
           # exist to keep off web and iOS -- got compiled for wasm32. Nothing
           # ships that combination, so it gated nothing. Do not restore the row.
@@ -231,8 +232,9 @@ jobs:
 
           # Not a triple: every member alone on its own default features, which
           # `--all-features` hides. rustdar-egui was broken this way for weeks --
-          # it called `rustdar_gps::detect_gps_ports` while that sat behind
-          # rustdar-gps's `serial` feature, which every desktop row turns on.
+          # it called the port enumeration (`detect_gps_ports`, rustdar-nmea-serial
+          # today) while that sat behind
+          # its `serial` feature, which every desktop row turns on.
           - name: standalone
             cmd: |
               members=$(cargo tree --workspace --depth 0 --prefix none | awk 'NF {print $1}' | sort -u)

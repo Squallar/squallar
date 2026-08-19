@@ -31,14 +31,14 @@ wasm-opt = [
 ]
 
 # Not wasm32-gated on purpose. The pure-logic parts (config key mapping,
-# geolocation reading -> GpsFix) compile and are tested on the host; there is no
+# geolocation reading -> Fix) compile and are tested on the host; there is no
 # wasm test runner here, so gating the crate would make those tests never run.
 [dependencies]
 rustdar-egui = { workspace = true }
 rustdar-kv = { workspace = true }
-# Types only (GpsFix). The browser's Geolocation replaces the serial reader, so
+# Types only (Fix). The browser's Geolocation replaces the serial reader, so
 # the `serial` feature stays off, as in rustdar-frontend.
-rustdar-gps = { workspace = true }
+rustdar-location = { workspace = true }
 log = { workspace = true }
 
 # Browser-only, and gated so a native `cargo build` does not pull web-sys and

@@ -25,8 +25,8 @@ path = "src/lib.rs"
 rustdar-frontend = { workspace = true }
 rustdar-egui = { workspace = true }
 rustdar-kv = { workspace = true }
-# Types only here (GpsFix, GpsConfig). `serial` is requested per target below.
-rustdar-gps = { workspace = true }
+# The domain vocabulary (Fix, LocationPermission). `serial` is requested per target below.
+rustdar-location = { workspace = true }
 iana-time-zone = { workspace = true }
 log = { workspace = true }
 pollster = { workspace = true }
@@ -109,7 +109,7 @@ dark-light = "=2.0.0"
 # the compile, so only the .app build would have caught it. Features are
 # additive across the graph, so this also keeps the port picker off mobile.
 rustdar-egui = { workspace = true, features = ["gps-serial"] }
-rustdar-gps = { workspace = true, features = ["serial"] }
+rustdar-nmea-serial = { workspace = true, features = ["serial"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `org.freedesktop.portal.Location`, for `os_location/linux.rs`. **Zero new
@@ -155,7 +155,7 @@ ashpd = { version = "=0.10.3", default-features = false, features = [
 # nothing here spawns.
 futures-lite = "=2.6.1"
 futures-channel = "=0.3.34"
-# For `GpsFix::timestamp`, which is a `chrono::NaiveDateTime` and arrives from
-# the portal as epoch seconds. Already in the graph via `rustdar-gps`; named
-# here because this crate now converts one.
+# For `Fix::timestamp`, which is a `chrono::NaiveDateTime` and arrives from
+# the portal as epoch seconds. Already in the graph via `rustdar-location`;
+# named here because this crate now converts one.
 chrono = { workspace = true }

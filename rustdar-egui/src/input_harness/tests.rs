@@ -9747,7 +9747,7 @@ fn a_back_press_cancels_the_armed_modal_drag() {
 fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.set_location_state(rustdar_gps::LocationPermission::Prompt, false);
+    h.set_location_state(rustdar_location::LocationPermission::Prompt, false);
     h.warm_up();
     assert!(
         h.painted_text_strings()
@@ -9758,7 +9758,7 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
         h.painted_text_strings()
     );
 
-    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_location::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9789,7 +9789,7 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
 fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.set_location_state(rustdar_gps::LocationPermission::Granted, true);
+    h.set_location_state(rustdar_location::LocationPermission::Granted, true);
     h.warm_up();
     let painted = h.painted_text_strings();
     assert!(
@@ -9799,7 +9799,7 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
 
     // Revoked in system settings. Nothing in this crate was told to change
     // its mind; the cached state simply moved underneath it.
-    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_location::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9820,7 +9820,7 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
 fn a_platform_without_location_is_told_so_and_offered_nothing() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.set_location_state(rustdar_gps::LocationPermission::Unavailable, false);
+    h.set_location_state(rustdar_location::LocationPermission::Unavailable, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9852,7 +9852,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
 
     let mut h = InputHarness::new();
     h.open_settings();
-    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_location::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9874,10 +9874,10 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
 
     // Every other state has something better on offer, or nothing to fix.
     for state in [
-        rustdar_gps::LocationPermission::Granted,
-        rustdar_gps::LocationPermission::Prompt,
-        rustdar_gps::LocationPermission::Unknown,
-        rustdar_gps::LocationPermission::Unavailable,
+        rustdar_location::LocationPermission::Granted,
+        rustdar_location::LocationPermission::Prompt,
+        rustdar_location::LocationPermission::Unknown,
+        rustdar_location::LocationPermission::Unavailable,
     ] {
         h.set_location_state(state, false);
         h.warm_up();
@@ -9906,7 +9906,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
 fn a_linux_refusal_names_the_setting_that_would_undo_it() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.set_location_state(rustdar_gps::LocationPermission::Denied, false);
+    h.set_location_state(rustdar_location::LocationPermission::Denied, false);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9929,7 +9929,7 @@ fn a_linux_refusal_names_the_setting_that_would_undo_it() {
 fn a_granted_permission_with_no_fix_yet_says_so() {
     let mut h = InputHarness::new();
     h.open_settings();
-    h.set_location_state(rustdar_gps::LocationPermission::Granted, true);
+    h.set_location_state(rustdar_location::LocationPermission::Granted, true);
     h.warm_up();
 
     let painted = h.painted_text_strings();
@@ -9939,7 +9939,7 @@ fn a_granted_permission_with_no_fix_yet_says_so() {
              'On.'. Painted: {painted:?}"
     );
 
-    h.set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+    h.set_gps_fix(rustdar_location::Fix::from_device_position(35.25, -97.5));
     h.warm_up();
 
     let painted = h.painted_text_strings();

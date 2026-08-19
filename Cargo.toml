@@ -13,7 +13,8 @@ members = [
     "rustdar-geo",
     "rustdar-kv",
     "rustdar-units",
-    "rustdar-gps",
+    "rustdar-location",
+    "rustdar-nmea-serial",
     "nexrad-level3",
     # A vendored crates.io crate, and a member rather than an `exclude` on
     # purpose: its own test targets and its 15 in-source snapshot suites are
@@ -55,7 +56,8 @@ rustdar-radar = { path = "rustdar-radar" }
 rustdar-source = { path = "rustdar-source" }
 rustdar-units = { path = "rustdar-units" }
 rustdar-web = { path = "rustdar-web" }
-rustdar-gps = { path = "rustdar-gps", default-features = false }
+rustdar-location = { path = "rustdar-location" }
+rustdar-nmea-serial = { path = "rustdar-nmea-serial", default-features = false }
 
 egui = "=0.35.0"
 egui-wgpu = { version = "=0.35.0", default-features = false }

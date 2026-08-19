@@ -46,8 +46,8 @@ fn every_frame_input_surfaces_and_persists() {
         supports_exit: false,
         loop_frame_budget: 7,
         location_settings_available: true,
-        location: (rustdar_gps::LocationPermission::Denied, false),
-        gps: Some((rustdar_gps::GpsFix::from_lat_lon(12.5, -34.25), gps_at)),
+        location: (rustdar_location::LocationPermission::Denied, false),
+        gps: Some((rustdar_location::Fix::from_lat_lon(12.5, -34.25), gps_at)),
         user_heading: Some(123.0),
         catalogue_pending: true,
         chunk_status: status,
@@ -80,7 +80,7 @@ fn every_frame_input_surfaces_and_persists() {
         );
         assert_eq!(
             gui.location_permission(),
-            rustdar_gps::LocationPermission::Denied,
+            rustdar_location::LocationPermission::Denied,
             "location permission did not survive frame {frame}"
         );
         assert!(
@@ -90,7 +90,7 @@ fn every_frame_input_surfaces_and_persists() {
         let fix = gui
             .gps_fix()
             .unwrap_or_else(|| panic!("the gps fix did not survive frame {frame}"));
-        assert_eq!((fix.latitude, fix.longitude), (12.5, -34.25));
+        assert_eq!((fix.point.lat, fix.point.lon), (12.5, -34.25));
         assert_eq!(
             gui.user_heading(),
             Some(123.0),
@@ -133,9 +133,9 @@ fn a_none_gps_clears_the_fix() {
         supports_exit: true,
         loop_frame_budget: 60,
         location_settings_available: false,
-        location: (rustdar_gps::LocationPermission::Granted, true),
+        location: (rustdar_location::LocationPermission::Granted, true),
         gps: Some((
-            rustdar_gps::GpsFix::from_lat_lon(35.25, -97.5),
+            rustdar_location::Fix::from_lat_lon(35.25, -97.5),
             web_time::Instant::now(),
         )),
         user_heading: None,
@@ -152,7 +152,7 @@ fn a_none_gps_clears_the_fix() {
 
     h.gui_mut().apply_frame_inputs(FrameInputs {
         gps: None,
-        location: (rustdar_gps::LocationPermission::Denied, false),
+        location: (rustdar_location::LocationPermission::Denied, false),
         safe_area_insets: (0.0, 0.0, 0.0, 0.0),
         supports_exit: true,
         loop_frame_budget: 60,

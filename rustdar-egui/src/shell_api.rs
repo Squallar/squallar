@@ -43,12 +43,12 @@ pub struct FrameInputs<'a> {
     /// Whether this platform has a location settings page to offer.
     pub location_settings_available: bool,
     /// What the platform location service is doing: (permission, active).
-    pub location: (rustdar_gps::LocationPermission, bool),
+    pub location: (rustdar_location::LocationPermission, bool),
     /// Fix + when the app heard it. The instant travels WITH the fix because
     /// `user_fix_at` is "when did we last hear anything", stamped at arrival —
     /// re-stamping per frame would break the settings pane's staleness
     /// question (see `user_fix_at` on the `Gui` state).
-    pub gps: Option<(rustdar_gps::GpsFix, web_time::Instant)>,
+    pub gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     /// Compass heading in degrees, once a platform has delivered one.
     pub user_heading: Option<f32>,
     /// Whether the site list is still short of the network.

@@ -294,8 +294,8 @@ impl super::Gui {
                     };
 
                     // Clone user location and heading for use in closure
-                    let user_location = self.user_fix.as_ref().map(|f| (f.latitude, f.longitude));
-                    let user_heading = self.gps_config.heading_source.effective_heading(
+                    let user_location = self.user_fix.as_ref().map(|f| (f.point.lat, f.point.lon));
+                    let user_heading = self.heading_source.effective_heading(
                         self.user_heading,
                         self.user_fix.as_ref().and_then(|f| f.heading_deg),
                         self.user_fix.as_ref().and_then(|f| f.speed_mps),
@@ -1938,7 +1938,7 @@ struct FloorStripCtx<'a> {
     color_scale_floor: f32,
     user_location: Option<(f64, f64)>,
     user_heading: Option<f32>,
-    user_fix: Option<rustdar_gps::GpsFix>,
+    user_fix: Option<rustdar_location::Fix>,
     actions: &'a mut Vec<GuiAction>,
 }
 

@@ -1,7 +1,7 @@
 //! The browser's Geolocation and Permissions APIs standing in for the serial
 //! GPS reader and for an OS permission service.
 //!
-//! Nothing downstream is serial-aware: a source pushes into a `Sender<GpsFix>`
+//! Nothing downstream is serial-aware: a source pushes into a `Sender<Fix>`
 //! and hands the `Receiver` to [`PlatformBridge::set_gps_fix_receiver`]. Android
 //! already does this over JNI.
 //!
@@ -18,9 +18,9 @@
 //!
 //! [`PlatformBridge::set_gps_fix_receiver`]: rustdar_frontend::platform::PlatformBridge::set_gps_fix_receiver
 
-use rustdar_gps::{GpsFix, LocationPermission};
+use rustdar_location::{Fix, LocationPermission};
 
-/// Build a [`GpsFix`] from a browser `GeolocationCoordinates`.
+/// Build a [`Fix`] from a browser `GeolocationCoordinates`.
 ///
 /// Separated from the `web_sys` call so the mapping is testable on the host: a
 /// swapped latitude and longitude is silently valid, whereas the `web_sys` call
@@ -42,15 +42,15 @@ pub fn fix_from_coords(
     altitude_m: Option<f64>,
     speed_mps: Option<f64>,
     heading_deg: Option<f64>,
-) -> GpsFix {
-    GpsFix {
+) -> Fix {
+    Fix {
         altitude_m,
         speed_mps,
         heading_deg,
         accuracy_m: Some(accuracy_m),
         // `from_device_position` is what sets `fix_quality`; a struct literal
         // would drift from whatever it decides a fused platform fix means.
-        ..GpsFix::from_device_position(latitude, longitude)
+        ..Fix::from_device_position(latitude, longitude)
     }
 }
 
@@ -211,7 +211,7 @@ pub fn is_secure_context() -> bool {
 
 /// A live `watchPosition`, cancelled by dropping it.
 ///
-/// Same shape as `rustdar_gps`'s `SerialGpsReader` — started, then dropped to
+/// Same shape as `rustdar_nmea_serial`'s `SerialGpsReader` — started, then dropped to
 /// stop — and it is a *handle* rather than a `forget()`ten subscription for a
 /// reason the user can see: the settings pane
 /// has a **Turn off** button, the gate calls `stop_location` from it and from
@@ -292,7 +292,7 @@ impl Drop for LocationWatch {
 #[cfg(target_arch = "wasm32")]
 pub fn watch_position(
     geolocation: &web_sys::Geolocation,
-    sender: std::sync::mpsc::Sender<GpsFix>,
+    sender: std::sync::mpsc::Sender<Fix>,
     permission: PermissionCell,
     waker: SharedWaker,
 ) -> Option<LocationWatch> {
@@ -511,18 +511,18 @@ fn adopt_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_gps::FixQuality;
+    use rustdar_location::FixQuality;
 
     /// Nothing downstream would notice a transposition: both are plain `f64` and
     /// a swapped pair is a valid location, just the wrong one.
     #[test]
     fn latitude_and_longitude_keep_their_places() {
         let fix = fix_from_coords(35.25, -97.5, 30.0, None, None, None);
-        assert_eq!(fix.latitude, 35.25);
-        assert_eq!(fix.longitude, -97.5);
+        assert_eq!(fix.point.lat, 35.25);
+        assert_eq!(fix.point.lon, -97.5);
     }
 
-    /// Not `GpsFix::default()`, whose quality is `FixQuality::None` — the "no
+    /// Not `Fix::default()`, whose quality is `FixQuality::None` — the "no
     /// fix yet" state, whose coordinates mean nothing. The map does not read
     /// the quality at all (`ui_map.rs` draws the dot from latitude and
     /// longitude alone), so what a defaulted quality would break is the

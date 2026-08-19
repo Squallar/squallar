@@ -9,7 +9,7 @@
 //! through untouched rather than needing a version to explain it.
 
 /// The config format this build writes.
-pub(crate) const CONFIG_VERSION: u32 = 1;
+pub(crate) const CONFIG_VERSION: u32 = 2;
 
 /// The version a file with no `config_version` key speaks: every config
 /// written before the field existed. A constant fact about history — this
@@ -26,9 +26,39 @@ type Migration = (u32, fn(&mut serde_json::Value));
 /// place to speak the next one. Applied in order by [`migrate_to_current`],
 /// so a v1 file walks every rung to reach the current format.
 ///
-/// Empty at M2 — the table exists so the *mechanism* is proven before the
-/// first real migration (E6 adds v1 → v2) rather than alongside it.
-const MIGRATIONS: &[Migration] = &[];
+/// The table (empty from M2 until WO-RL-1) exists so the *mechanism* was
+/// proven before the first real migration rather than alongside it.
+const MIGRATIONS: &[Migration] = &[(1, split_gps_config)];
+
+/// v1 → v2: the `gps_config` container split with its crate (WO-RL-1) — the
+/// serial half (`port_path`, `baud_rate`) keeps the container under the new
+/// name `serial_config`, and `heading_source` becomes its own top-level key,
+/// because heading choice matters on every platform and the serial port on
+/// almost none.
+///
+/// A pure `Value` edit, deliberately: members this build cannot name ride the
+/// rename verbatim (parsing into the new types here would silently shed them
+/// — the tolerant loader does the parsing *after* the walk, at field
+/// granularity). A `gps_config` that is absent or not an object is left
+/// untouched: the tolerant load defaults both new fields, and whatever the
+/// old key held rides on as unknown content.
+fn split_gps_config(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if !root.get("gps_config").is_some_and(|v| v.is_object()) {
+        return;
+    }
+    let mut blob = root.remove("gps_config").expect("presence checked above");
+    let heading = blob
+        .as_object_mut()
+        .expect("shape checked above")
+        .remove("heading_source");
+    root.insert("serial_config".to_string(), blob);
+    if let Some(heading) = heading {
+        root.insert("heading_source".to_string(), heading);
+    }
+}
 
 /// Walk `value` up from whatever version it speaks to [`CONFIG_VERSION`].
 ///

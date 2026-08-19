@@ -1,6 +1,6 @@
 use crate::config::MIN_SPEED_FOR_BEARING_MPS;
-use crate::types::{FixQuality, GpsFix};
 use nmea::sentences::FixType;
+use rustdar_location::{Fix, FixQuality};
 
 /// A fix is spread across several sentence types (GGA, RMC, GSA, VTG), so
 /// fields accumulate here until a position-bearing one completes.
@@ -16,7 +16,7 @@ impl NmeaState {
     }
 
     /// `sentence` must keep its `$` prefix and `*XX` checksum.
-    pub fn feed_sentence(&mut self, sentence: &str) -> Option<GpsFix> {
+    pub fn feed_sentence(&mut self, sentence: &str) -> Option<Fix> {
         if self.parser.parse(sentence).is_err() {
             return None;
         }
@@ -57,9 +57,7 @@ impl NmeaState {
             date.and_time(t)
         });
 
-        Some(GpsFix {
-            latitude: lat,
-            longitude: lon,
+        Some(Fix {
             altitude_m,
             speed_mps,
             heading_deg,
@@ -72,6 +70,11 @@ impl NmeaState {
             // honest answer and every reader treats it as passing.
             accuracy_m: None,
             timestamp,
+            // The position rides through `from_lat_lon`, which is also what
+            // stamps `Gps` quality -- overridden by the `fix_quality` named
+            // above. This crate deliberately does not name the geo floor's
+            // point type; the domain crate's constructor is its spelling.
+            ..Fix::from_lat_lon(lat, lon)
         })
     }
 }

@@ -1,5 +1,5 @@
 use crate::actions::GuiAction;
-use rustdar_gps::HeadingSource;
+use rustdar_location::HeadingSource;
 use rustdar_units::{
     DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TemperatureUnit,
     TimezonePreference, UnitLabel, UserPreferences,
@@ -349,14 +349,14 @@ impl super::Gui {
                     // because `detect_gps_ports` touches the serial
                     // subsystem, so formatting the two halves separately
                     // would mean probing it twice.
-                    let ports = gps_port_options(rustdar_gps::detect_gps_ports());
-                    let selected = gps_port_label(&ports, self.gps_config.port_path.as_deref());
+                    let ports = gps_port_options(rustdar_nmea_serial::detect_gps_ports());
+                    let selected = gps_port_label(&ports, self.serial_config.port_path.as_deref());
                     egui::ComboBox::from_id_salt("gps_port")
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
                             for (value, label) in &ports {
                                 ui.selectable_value(
-                                    &mut self.gps_config.port_path,
+                                    &mut self.serial_config.port_path,
                                     value.clone(),
                                     label.as_str(),
                                 );
@@ -369,18 +369,22 @@ impl super::Gui {
             "gps.baud" => {
                 ui.horizontal(|ui| {
                     ui.label("Baud:");
-                    let baud_label = if self.gps_config.auto_baud() {
+                    let baud_label = if self.serial_config.auto_baud() {
                         "Auto-detect".to_string()
                     } else {
-                        self.gps_config.baud_rate.to_string()
+                        self.serial_config.baud_rate.to_string()
                     };
                     egui::ComboBox::from_id_salt("gps_baud")
                         .selected_text(baud_label)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.gps_config.baud_rate, 0, "Auto-detect");
+                            ui.selectable_value(
+                                &mut self.serial_config.baud_rate,
+                                0,
+                                "Auto-detect",
+                            );
                             for &rate in GPS_BAUD_RATES {
                                 ui.selectable_value(
-                                    &mut self.gps_config.baud_rate,
+                                    &mut self.serial_config.baud_rate,
                                     rate,
                                     rate.to_string(),
                                 );
@@ -397,7 +401,7 @@ impl super::Gui {
                 // Note: gps_active state is only meaningful on desktop
                 if ui.button("Connect GPS").clicked() {
                     actions.push(GuiAction::StartGps {
-                        config: self.gps_config.clone(),
+                        config: self.serial_config.clone(),
                     });
                 }
                 if ui.button("Disconnect GPS").clicked() {
@@ -426,14 +430,10 @@ impl super::Gui {
                 ui.horizontal(|ui| {
                     ui.label("Heading:");
                     egui::ComboBox::from_id_salt("heading_source")
-                        .selected_text(self.gps_config.heading_source.label())
+                        .selected_text(self.heading_source.label())
                         .show_ui(ui, |ui| {
                             for &src in HeadingSource::ALL {
-                                ui.selectable_value(
-                                    &mut self.gps_config.heading_source,
-                                    src,
-                                    src.label(),
-                                );
+                                ui.selectable_value(&mut self.heading_source, src, src.label());
                             }
                         });
                 });
@@ -617,7 +617,8 @@ impl super::Gui {
                 ui.add_space(SETTINGS_SMALL_SPACING);
                 if ui.button("Reset to defaults").clicked() {
                     self.preferences = UserPreferences::default();
-                    self.gps_config = rustdar_gps::GpsConfig::default();
+                    self.serial_config = rustdar_nmea_serial::SerialConfig::default();
+                    self.heading_source = rustdar_location::HeadingSource::default();
                     self.storm_motion_override = crate::StormMotionOverride::default();
                     self.srv_fallback = rustdar_radar::srv::SrvFallback::default();
                     // The location memo lives outside `Gui` — it is persisted
@@ -654,7 +655,7 @@ impl super::Gui {
     /// and — on the platforms where nothing else would say so — whether a fix
     /// has actually arrived.
     fn render_location_controls(&self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
-        use rustdar_gps::LocationPermission;
+        use rustdar_location::LocationPermission;
 
         match self.location_permission {
             // No service to grant. No control, because there is no sequence of
@@ -758,7 +759,7 @@ impl super::Gui {
 /// labelling can be tested; enumeration needs real hardware.
 #[cfg(feature = "gps-serial")]
 fn gps_port_options(
-    ports: impl IntoIterator<Item = rustdar_gps::GpsPortInfo>,
+    ports: impl IntoIterator<Item = rustdar_nmea_serial::GpsPortInfo>,
 ) -> Vec<(Option<String>, String)> {
     std::iter::once((None, "Auto-detect".to_owned()))
         .chain(ports.into_iter().map(|port| {
@@ -810,7 +811,7 @@ mod tests {
     /// Built by the shipped `gps_port_options`, so the labels under test are
     /// the ones the dropdown really offers.
     fn ports() -> Vec<(Option<String>, String)> {
-        gps_port_options([rustdar_gps::GpsPortInfo {
+        gps_port_options([rustdar_nmea_serial::GpsPortInfo {
             port_name: "/dev/ttyUSB0".to_owned(),
             description: "FT232R USB UART".to_owned(),
         }])

@@ -290,7 +290,7 @@ pub struct LocationHooks {
     /// reads out of its own static is a value that can be stale, that has no
     /// compile-time obligation to be installed, and whose absence looks exactly
     /// like "this install has never asked". As a parameter it is none of those.
-    pub query: fn(u8) -> rustdar_gps::LocationPermission,
+    pub query: fn(u8) -> rustdar_location::LocationPermission,
     /// Backs [`PlatformBridge::request_location`]; see the honesty note there
     /// before believing the `bool`.
     pub request: fn() -> bool,
@@ -315,8 +315,8 @@ pub trait PlatformBridge {
     /// a change is detected, `None` otherwise.
     fn poll_theme(&mut self) -> Option<bool>;
 
-    /// Poll for GPS fix updates. Returns the latest [`GpsFix`](rustdar_gps::GpsFix) if available.
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix>;
+    /// Poll for GPS fix updates. Returns the latest [`Fix`](rustdar_location::Fix) if available.
+    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix>;
 
     /// Poll for compass heading updates. Returns degrees (0–360) if available.
     fn poll_heading(&mut self) -> Option<f32>;
@@ -443,7 +443,11 @@ pub trait PlatformBridge {
     fn set_redraw_waker(&mut self, _waker: RedrawWaker) {}
 
     /// Set a receiver for GPS fix updates (Android only, no-op on desktop).
-    fn set_gps_fix_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {}
+    fn set_gps_fix_receiver(
+        &mut self,
+        _receiver: std::sync::mpsc::Receiver<rustdar_location::Fix>,
+    ) {
+    }
 
     /// Set a receiver for compass heading updates (Android only, no-op on desktop).
     fn set_heading_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<f32>) {}
@@ -466,7 +470,7 @@ pub trait PlatformBridge {
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}
 
     /// Start the desktop serial GPS reader (no-op on Android).
-    fn start_gps(&mut self, _config: &rustdar_gps::GpsConfig) {}
+    fn start_gps(&mut self, _config: &rustdar_nmea_serial::SerialConfig) {}
 
     /// Stop the desktop serial GPS reader (no-op on Android).
     fn stop_gps(&mut self) {}
@@ -481,7 +485,7 @@ pub trait PlatformBridge {
     // A different question from the four `*_gps` methods above, and the split
     // is the point. `start_gps` opens a serial port: a device the user plugged
     // in and named. These ask the operating system for a privilege it can
-    // withdraw without telling us. See `rustdar_gps::LocationPermission`.
+    // withdraw without telling us. See `rustdar_location::LocationPermission`.
 
     /// What the OS currently says about this app's access to the user's
     /// location.
@@ -497,9 +501,9 @@ pub trait PlatformBridge {
     /// whatever thread the platform hands it to and answers [`Unknown`] until
     /// that lands; the gate is built to wait.
     ///
-    /// [`Unavailable`]: rustdar_gps::LocationPermission::Unavailable
-    /// [`Unknown`]: rustdar_gps::LocationPermission::Unknown
-    fn location_permission(&self) -> rustdar_gps::LocationPermission;
+    /// [`Unavailable`]: rustdar_location::LocationPermission::Unavailable
+    /// [`Unknown`]: rustdar_location::LocationPermission::Unknown
+    fn location_permission(&self) -> rustdar_location::LocationPermission;
 
     /// Prompt if the platform needs prompting, and start delivering fixes.
     ///

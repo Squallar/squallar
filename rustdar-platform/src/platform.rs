@@ -35,9 +35,9 @@ pub struct DesktopPlatform {
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     /// Active serial GPS reader (dropped to stop).
-    gps_reader: Option<rustdar_gps::SerialGpsReader>,
+    gps_reader: Option<rustdar_nmea_serial::SerialGpsReader>,
     /// Receives GPS fixes from the serial reader thread.
-    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
     /// The OS location service and everything the bridge keeps beside it. See
     /// [`OsLocation`].
     os_location: OsLocation,
@@ -84,7 +84,7 @@ struct OsLocation {
     /// [`location_permission`](PlatformBridge::location_permission), which is a
     /// `&self` getter on the frame path. That rules out a `Cell` (not `Send`),
     /// a `Receiver` (cannot be drained through `&self`) and a `Mutex` (a lock
-    /// on the frame path). See [`encode_permission`].
+    /// on the frame path). See [`rustdar_location::encode_permission`].
     ///
     /// **It deliberately outlives every session.** A revocation arrives as a
     /// permission change *and* stops delivery, and the gate responds to
@@ -105,7 +105,7 @@ struct OsLocation {
     /// channel survives a stop and is reused by the next start.
     ///
     /// [`prefer_fix`]: crate::os_location::prefer_fix
-    fixes: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    fixes: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -115,9 +115,9 @@ impl OsLocation {
     fn new() -> Self {
         Self {
             provider: None,
-            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_permission(
-                rustdar_gps::LocationPermission::Unknown,
-            ))),
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                rustdar_location::encode_permission(rustdar_location::LocationPermission::Unknown),
+            )),
             fixes: None,
         }
     }
@@ -153,7 +153,7 @@ impl OsLocation {
                 // is causing a redraw for.
                 report: std::sync::Arc::new(move |permission| {
                     reported.store(
-                        encode_permission(permission),
+                        rustdar_location::encode_permission(permission),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     report_waker.wake();
@@ -173,10 +173,12 @@ impl OsLocation {
     /// would sit on "Checking…" for the life of the process. `Unavailable` is
     /// the truth: this build has no OS location provider, the pane says so, and
     /// nothing spins.
-    fn permission(&self) -> rustdar_gps::LocationPermission {
+    fn permission(&self) -> rustdar_location::LocationPermission {
         match self.provider {
-            Some(_) => decode_permission(self.state.load(std::sync::atomic::Ordering::Relaxed)),
-            None => rustdar_gps::LocationPermission::Unavailable,
+            Some(_) => rustdar_location::decode_permission(
+                self.state.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            None => rustdar_location::LocationPermission::Unavailable,
         }
     }
 
@@ -228,41 +230,8 @@ impl OsLocation {
     }
 
     /// The newest fix waiting, if any.
-    fn poll_fix(&self) -> Option<rustdar_gps::GpsFix> {
+    fn poll_fix(&self) -> Option<rustdar_location::Fix> {
         self.fixes.as_ref().and_then(drain_latest)
-    }
-}
-
-/// [`rustdar_gps::LocationPermission`] as one byte, for the atomic above.
-///
-/// Hand-written rather than derived, and the discriminants are pinned by the
-/// round-trip test at the bottom of this file: the enum is not `repr(u8)` and
-/// nothing in `rustdar-gps` promises its variants keep their order, so a
-/// `as u8` cast here would be a silent miscommunication the first time someone
-/// inserts a variant.
-#[cfg(not(target_os = "android"))]
-fn encode_permission(permission: rustdar_gps::LocationPermission) -> u8 {
-    use rustdar_gps::LocationPermission as P;
-    match permission {
-        P::Unknown => 0,
-        P::Prompt => 1,
-        P::Granted => 2,
-        P::Denied => 3,
-        P::Unavailable => 4,
-    }
-}
-
-/// The inverse of [`encode_permission`], with anything unrecognised read as
-/// `Unknown` — the one state that neither asks nor concludes.
-#[cfg(not(target_os = "android"))]
-fn decode_permission(raw: u8) -> rustdar_gps::LocationPermission {
-    use rustdar_gps::LocationPermission as P;
-    match raw {
-        1 => P::Prompt,
-        2 => P::Granted,
-        3 => P::Denied,
-        4 => P::Unavailable,
-        _ => P::Unknown,
     }
 }
 
@@ -317,11 +286,11 @@ impl PlatformBridge for DesktopPlatform {
     /// OS provider pushes on its own schedule and nothing else empties it, so a
     /// serial fix arriving first would build an unbounded backlog behind it
     /// that later surfaces as minutes-old positions. See
-    /// [`prefer_fix`](crate::os_location::prefer_fix) for which one wins and
+    /// [`prefer_fix`](rustdar_location::prefer_fix) for which one wins and
     /// why it is not simply "serial".
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
         let serial = self.gps_fix_receiver.as_ref().and_then(drain_latest);
-        crate::os_location::prefer_fix(serial, self.os_location.poll_fix())
+        rustdar_location::prefer_fix(serial, self.os_location.poll_fix())
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -387,7 +356,7 @@ impl PlatformBridge for DesktopPlatform {
         self.os_location.start(&self.redraw_waker);
     }
 
-    fn start_gps(&mut self, config: &rustdar_gps::GpsConfig) {
+    fn start_gps(&mut self, config: &rustdar_nmea_serial::SerialConfig) {
         // Stop any existing reader first
         self.stop_gps();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -395,7 +364,9 @@ impl PlatformBridge for DesktopPlatform {
         // on a frame: under `ControlFlow::Wait` a fix it pushes while the app is
         // idle is invisible until something else happens to draw one.
         let wake = self.redraw_waker.clone();
-        if let Some(reader) = rustdar_gps::SerialGpsReader::start(config, tx, move || wake.wake()) {
+        if let Some(reader) =
+            rustdar_nmea_serial::SerialGpsReader::start(config, tx, move || wake.wake())
+        {
             self.gps_reader = Some(reader);
             self.gps_fix_receiver = Some(rx);
             log::info!("Desktop serial GPS reader started");
@@ -423,7 +394,7 @@ impl PlatformBridge for DesktopPlatform {
     // is the entire `cfg` surface, and every arm of it implements the same
     // trait.
 
-    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+    fn location_permission(&self) -> rustdar_location::LocationPermission {
         self.os_location.permission()
     }
 
@@ -460,7 +431,7 @@ pub struct AndroidPlatform {
     theme_detector: Option<fn() -> bool>,
     /// Theme changes from the poll thread `set_theme_detector` starts.
     theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,
-    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
@@ -517,7 +488,7 @@ impl PlatformBridge for AndroidPlatform {
         self.theme_receiver.as_ref().and_then(drain_latest)
     }
 
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
         self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
@@ -605,7 +576,7 @@ impl PlatformBridge for AndroidPlatform {
         self.redraw_waker = waker;
     }
 
-    fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
+    fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_location::Fix>) {
         self.gps_fix_receiver = Some(receiver);
     }
 
@@ -660,10 +631,10 @@ impl PlatformBridge for AndroidPlatform {
     /// pane parked on "Checking…" for the life of the process. `android_main`
     /// installs the hooks before `run_app`, so on a wired build this window
     /// closes before the first frame.
-    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+    fn location_permission(&self) -> rustdar_location::LocationPermission {
         match self.location_hooks {
             Some(hooks) => (hooks.query)(self.location_attempts),
-            None => rustdar_gps::LocationPermission::Unavailable,
+            None => rustdar_location::LocationPermission::Unavailable,
         }
     }
 
@@ -757,10 +728,10 @@ impl PlatformBridge for IosPlatform {
         None
     }
 
-    /// One source, so no [`prefer_fix`](crate::os_location::prefer_fix): iOS
+    /// One source, so no [`prefer_fix`](rustdar_location::prefer_fix): iOS
     /// has no serial port to plug a dongle into and the `gps-serial` feature is
     /// not compiled here at all.
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
         self.os_location.poll_fix()
     }
 
@@ -840,7 +811,7 @@ impl PlatformBridge for IosPlatform {
     // The same forwards `DesktopPlatform` writes, to the same [`OsLocation`],
     // running the same provider.
 
-    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+    fn location_permission(&self) -> rustdar_location::LocationPermission {
         self.os_location.permission()
     }
 
@@ -895,53 +866,7 @@ pub fn create_platform() -> IosPlatform {
 #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
 mod tests {
     use super::*;
-    use rustdar_gps::LocationPermission as P;
-
-    const ALL: &[P] = &[P::Unknown, P::Prompt, P::Granted, P::Denied, P::Unavailable];
-
-    /// The provider thread writes this byte and the frame path reads it, so a
-    /// mapping that is not a bijection is a permission silently turning into a
-    /// different one — most damagingly `Denied` arriving as `Granted`.
-    #[test]
-    fn every_permission_survives_the_trip_through_the_atomic() {
-        for &permission in ALL {
-            assert_eq!(decode_permission(encode_permission(permission)), permission);
-        }
-    }
-
-    /// Distinct codes, checked separately from the round trip: a collision
-    /// where two variants share a byte would still round-trip for one of them
-    /// and quietly rewrite the other.
-    #[test]
-    fn no_two_permissions_share_a_code() {
-        let mut codes: Vec<u8> = ALL.iter().map(|&p| encode_permission(p)).collect();
-        codes.sort_unstable();
-        let count = codes.len();
-        codes.dedup();
-        assert_eq!(
-            codes.len(),
-            count,
-            "two permissions encode to the same byte"
-        );
-    }
-
-    /// The atomic starts at zero, and a `AtomicU8::new(0)` that meant anything
-    /// else would have the bridge claiming an answer before one exists.
-    /// `Unknown` is the state that neither asks nor concludes, which is the
-    /// only safe thing for a value nobody has written yet to mean.
-    #[test]
-    fn an_unwritten_atomic_reads_as_unknown() {
-        assert_eq!(decode_permission(0), P::Unknown);
-        assert_eq!(encode_permission(P::Unknown), 0);
-    }
-
-    /// Nothing writes a byte outside the mapping today, but the decode is on
-    /// the frame path and a garbage value must not become a *grant*.
-    #[test]
-    fn an_unrecognised_code_reads_as_unknown_rather_than_as_a_grant() {
-        assert_eq!(decode_permission(200), P::Unknown);
-        assert_eq!(decode_permission(u8::MAX), P::Unknown);
-    }
+    use rustdar_location::LocationPermission as P;
 
     /// A bridge whose provider has not been built has nothing to report, and
     /// `Unavailable` is the honest answer: it is the state the settings pane

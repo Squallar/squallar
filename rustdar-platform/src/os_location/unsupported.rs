@@ -18,7 +18,7 @@ use super::{OsLocationProvider, OsLocationSink};
 
 /// A location session on a target that has none.
 ///
-/// [`SerialGpsReader`]: rustdar_gps::SerialGpsReader
+/// [`SerialGpsReader`]: rustdar_nmea_serial::SerialGpsReader
 pub struct OsLocationReader {
     /// Uninhabited in practice — `start` never returns a value — but a
     /// zero-field struct would let a real provider be added without anyone

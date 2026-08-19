@@ -42,7 +42,7 @@ fn a_scripted_action_batch_lands_through_the_seam() {
     // Seed a fix the way `poll_platform_state` records one: into the App's
     // own field, stamped at arrival, visible after the next compose.
     app.user_gps = Some((
-        rustdar_gps::GpsFix::from_lat_lon(35.25, -97.5),
+        rustdar_location::Fix::from_lat_lon(35.25, -97.5),
         web_time::Instant::now(),
     ));
     app.push_frame_inputs();

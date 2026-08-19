@@ -113,7 +113,7 @@ pub(super) struct PaneRenderCtx<'a> {
     pub overlays: &'a mut OverlayRegistry,
     pub user_location: Option<(f64, f64)>,
     pub user_heading: Option<f32>,
-    pub user_fix: Option<rustdar_gps::GpsFix>,
+    pub user_fix: Option<rustdar_location::Fix>,
     pub label_tiles: &'a mut Option<HttpsTiles>,
     /// How many slippy zoom levels deeper than this pane's own zoom its raster
     /// tile layers should fetch — see
@@ -1109,7 +1109,7 @@ fn render_user_location(
     user_lat: f64,
     user_lon: f64,
     heading: Option<f32>,
-    fix: Option<&rustdar_gps::GpsFix>,
+    fix: Option<&rustdar_location::Fix>,
 ) {
     let user_screen = projector
         .project(walkers::lat_lon(user_lat, user_lon))
@@ -1176,7 +1176,7 @@ fn render_user_location(
                 |tooltip_ui| {
                     tooltip_ui.label(format!(
                         "Lat: {:.5}°  Lon: {:.5}°",
-                        fix.latitude, fix.longitude
+                        fix.point.lat, fix.point.lon
                     ));
                     if let Some(alt) = fix.altitude_m {
                         tooltip_ui.label(format!("Alt: {:.0} m", alt));

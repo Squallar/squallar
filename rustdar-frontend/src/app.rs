@@ -224,7 +224,7 @@ pub struct App {
     /// `user_fix_at` answers "when did we last hear anything", and a per-frame
     /// re-stamp would hold that staleness question at zero forever. `None`
     /// when consent went away or nothing has been delivered.
-    user_gps: Option<(rustdar_gps::GpsFix, web_time::Instant)>,
+    user_gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     /// Compass heading in degrees, once a platform has delivered one.
     user_heading: Option<f32>,
     /// What the real-time chunk feed is doing, restated by `drive_chunk_feeds`
@@ -3053,7 +3053,7 @@ impl App {
     /// or whose site came back from storage, keeps it: someone in Dallas
     /// watching a storm over Kansas must not be yanked home by a fix arriving
     /// late.
-    fn upgrade_provisional_site(&mut self, fix: &rustdar_gps::GpsFix) {
+    fn upgrade_provisional_site(&mut self, fix: &rustdar_location::Fix) {
         if !self.site_is_provisional {
             return;
         }
@@ -3081,7 +3081,7 @@ impl App {
             return;
         }
         let Some((site, dist)) =
-            rustdar_radar::sites::nearest_wsr88d_site(fix.latitude, fix.longitude)
+            rustdar_radar::sites::nearest_wsr88d_site(fix.point.lat, fix.point.lon)
         else {
             return;
         };
@@ -3399,7 +3399,7 @@ impl App {
     /// way; desktop reads a serial port instead, through `start_gps`.
     pub fn set_gps_fix_receiver(
         &mut self,
-        receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>,
+        receiver: std::sync::mpsc::Receiver<rustdar_location::Fix>,
     ) {
         self.platform.set_gps_fix_receiver(receiver);
     }

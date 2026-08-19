@@ -1,0 +1,14 @@
+{
+  "config_version": 1,
+  "site": "KTLX",
+  "loop_lookback_secs": 3600,
+  "loop_speed_fps": 5.0,
+  "time_step_secs": 600,
+  "panes": [{}],
+  "gps_config": {
+    "port_path": "/dev/ttyUSB0",
+    "baud_rate": 4800,
+    "heading_source": "CompassOnly",
+    "dgps_beacon_hz": 310.5
+  }
+}
