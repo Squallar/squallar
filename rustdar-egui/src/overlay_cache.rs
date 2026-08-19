@@ -182,7 +182,7 @@ pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_
 ///
 /// That wash is a **native** result, and it holds only because native puts just
 /// the `write_texture` row on the frame thread — the one row that scales with
-/// area exactly. On wasm `rustdar_frontend::offload` has no thread to give:
+/// area exactly. On wasm `rustdar_worker::offload` has no thread to give:
 /// `overlay-render` runs *inline*, so raster, convert and upload are all on the
 /// frame thread, and per unit of pan the trade is `4 · (67.9 + 5.7 + 8.7)`
 /// against `1 · (92.2 + 22.6 + 34.8)` — about 2.2× worse, because the raster

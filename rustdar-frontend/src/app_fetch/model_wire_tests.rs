@@ -30,15 +30,15 @@ use std::sync::{Arc, Mutex};
 /// `polygon_wire_tests`' port, restated because each test file owns its
 /// double.
 struct RecordingPort {
-    taken: Arc<Mutex<Vec<(u64, crate::offload::JobRequest)>>>,
+    taken: Arc<Mutex<Vec<(u64, rustdar_worker::offload::JobRequest)>>>,
 }
 
-impl crate::offload::JobSink for RecordingPort {
+impl rustdar_worker::offload::JobSink for RecordingPort {
     fn send(
         &self,
         id: u64,
-        request: crate::offload::JobRequest,
-    ) -> Result<(), crate::offload::JobRequest> {
+        request: rustdar_worker::offload::JobRequest,
+    ) -> Result<(), rustdar_worker::offload::JobRequest> {
         self.taken.lock().unwrap().push((id, request));
         Ok(())
     }
@@ -138,7 +138,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
 #[test]
 fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
     let taken = Arc::new(Mutex::new(Vec::new()));
-    let _guard = crate::offload::install_test_worker(Box::new(RecordingPort {
+    let _guard = rustdar_worker::offload::install_test_worker(Box::new(RecordingPort {
         taken: Arc::clone(&taken),
     }));
 
@@ -157,7 +157,7 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
     let (_, request) = &posted[0];
     // The envelope destructure is irrefutable since WO-M7.2; the typed
     // downcast below is what proves the dispatch posted this kind.
-    let crate::offload::JobRequest { geometry, job } = request;
+    let rustdar_worker::offload::JobRequest { geometry, job } = request;
     assert_eq!(
         (geometry.width, geometry.height),
         (64, 48),
@@ -181,7 +181,7 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
     // is asserted on the *pixels*: direct execution of the recorded request
     // and execution of its own bytes must paint the same picture — with a
     // painted floor, or the equality would hold over a blank buffer.
-    let direct = crate::offload::execute(request)
+    let direct = rustdar_worker::offload::execute(request)
         .and_then(|out| out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>())
         .expect("the posted model job rasterizes")
         .rgba;
@@ -190,7 +190,7 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
         "the seeded grid painted nothing, so the wire parity below is \
          vacuous",
     );
-    let via_wire = crate::offload::execute_bytes(&request.to_bytes())
+    let via_wire = rustdar_worker::offload::execute_bytes(&request.to_bytes())
         .and_then(|out| out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>())
         .expect("the posted model job survives its own wire form")
         .rgba;
@@ -212,7 +212,7 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
 #[test]
 fn a_dead_worker_unwedges_a_model_pane() {
     let taken = Arc::new(Mutex::new(Vec::new()));
-    let _guard = crate::offload::install_test_worker(Box::new(RecordingPort {
+    let _guard = rustdar_worker::offload::install_test_worker(Box::new(RecordingPort {
         taken: Arc::clone(&taken),
     }));
 
@@ -230,7 +230,7 @@ fn a_dead_worker_unwedges_a_model_pane() {
          pane in flight",
     );
 
-    crate::offload::abandon_worker("test: the worker died");
+    rustdar_worker::offload::abandon_worker("test: the worker died");
     let resp = app.channels.overlay_render_receiver.try_recv().expect(
         "a job the worker never answered sent nothing on the overlay \
          channel: the pane stays marked in flight forever and the model \

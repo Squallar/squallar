@@ -1,6 +1,7 @@
 //! Where a long-running, CPU-bound job runs.
 //!
-//! Four places in this crate used to hand a closure somewhere it would not
+//! Four places on the app side (rustdar-frontend) used to hand a closure
+//! somewhere it would not
 //! stall the frame that created it: the static radar render, the loop-frame
 //! render, the overlay rasterization and the radar-sites rasterization. All
 //! of it is **described jobs** now — [`JobRequest`] values a worker can be
@@ -117,7 +118,7 @@ use std::collections::HashMap;
 ///
 /// Use [`discard_each`] for a collection: a batch handed over whole is one
 /// payload, freed in one turn, and the pacing is lost.
-pub(crate) fn discard(name: &'static str, payload: impl Send + 'static) {
+pub fn discard(name: &'static str, payload: impl Send + 'static) {
     let payload: Box<dyn std::any::Any + Send> = Box::new(payload);
     #[cfg(not(target_arch = "wasm32"))]
     // `Err` is a free lane with no live worker — see [`pool::run_free`]. The
@@ -149,10 +150,7 @@ pub(crate) fn discard(name: &'static str, payload: impl Send + 'static) {
 /// one on the calling thread — iterate `Box`es or `Arc`s — and a collection of
 /// handles frees nothing unless these are the last ones. It must be called from
 /// the frame thread for the reason [`discard`] must.
-pub(crate) fn discard_each<T: Send + 'static>(
-    name: &'static str,
-    payloads: impl IntoIterator<Item = T>,
-) {
+pub fn discard_each<T: Send + 'static>(name: &'static str, payloads: impl IntoIterator<Item = T>) {
     for payload in payloads {
         discard(name, payload);
     }
@@ -198,7 +196,7 @@ thread_local! {
 /// `pub(crate)` for exactly that: `app::tests` reaches it to put a payload on
 /// the queue the way a browser's [`discard`] does, because the native routing
 /// would hand it to the pool and the frame loop is what that test is about.
-pub(crate) fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Send>) {
+pub fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Send>) {
     DEFERRED_DROPS.with(|q| q.borrow_mut().push_back((name, payload)));
 }
 
@@ -206,7 +204,7 @@ pub(crate) fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Se
 ///
 /// Read by `App::handle_redraw` — see [`drain_deferred_drops`] for the
 /// invariant it is read *for*, which is the whole reason this is public.
-pub(crate) fn has_deferred_drops() -> bool {
+pub fn has_deferred_drops() -> bool {
     DEFERRED_DROPS.with(|q| !q.borrow().is_empty())
 }
 
@@ -276,7 +274,7 @@ pub(crate) fn has_deferred_drops() -> bool {
 /// a frame-time guarantee is not on offer, and
 /// [`rustdar_device_profile::constants::DEFERRED_DROP_BUDGET_PER_FRAME`] says so where a reader
 /// looking for the bound will land.
-pub(crate) fn drain_deferred_drops(budget: std::time::Duration) -> usize {
+pub fn drain_deferred_drops(budget: std::time::Duration) -> usize {
     // Nothing to do, and nothing measured: this runs on every frame of every
     // target, and on wasm `Instant::now` is a call across the JS boundary to
     // `performance.now()`. An empty queue must cost a thread-local read.
@@ -433,7 +431,7 @@ impl JobRequest {
 /// bounds are zeroed: nothing on those rows reads them, the canonical
 /// envelope carries the zeroes across the wire verbatim, and so a round trip
 /// is the identity.
-pub(crate) fn ceiling_only_geometry(side_ceiling_px: u32) -> rustdar_source::job::JobGeometry {
+pub fn ceiling_only_geometry(side_ceiling_px: u32) -> rustdar_source::job::JobGeometry {
     rustdar_source::job::JobGeometry {
         width: 0,
         height: 0,
@@ -618,8 +616,8 @@ impl JobRequest {
 /// The composed codec registry this crate frames jobs against — the six
 /// radar rows and then the seven overlay rows, each half in its own
 /// load-bearing order. The composition itself lives in
-/// [`crate::job_registry`], which is the one frontend module that names the
-/// source crates' registries; this funnel consumes rows and never their
+/// [`crate::job_registry`], which is the one module in this crate that names
+/// the source crates' registries; this funnel consumes rows and never their
 /// crates.
 pub(crate) use crate::job_registry::job_codecs;
 
@@ -1405,10 +1403,14 @@ fn hand_waiting_jobs_to_the_sink() {
 /// the same thread and buries the real fault under wreckage it caused. `Drop`
 /// runs on the unwind too, which is the whole reason this is a guard and not a
 /// function called at the end.
-#[cfg(test)]
+///
+/// Not `#[cfg(test)]` since WO-RW: the guard's consumers are the app-side
+/// crates' own test modules, and another crate's `cfg(test)` is invisible to
+/// them. It composes two calls that are already public ([`set_worker`],
+/// [`abandon_worker`]) — ungating it adds no capability a caller did not
+/// have.
 pub struct InstalledTestWorker;
 
-#[cfg(test)]
 impl Drop for InstalledTestWorker {
     fn drop(&mut self) {
         abandon_worker("test teardown");
@@ -1419,7 +1421,6 @@ impl Drop for InstalledTestWorker {
 ///
 /// The test-only counterpart of [`set_worker`] — see [`InstalledTestWorker`]
 /// for why the retirement is a guard rather than a call at the end of the test.
-#[cfg(test)]
 pub fn install_test_worker(port: Box<dyn JobSink>) -> InstalledTestWorker {
     set_worker(port);
     InstalledTestWorker

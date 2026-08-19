@@ -476,10 +476,10 @@ impl ChunkFeedManager {
     /// place, on the frame thread, in the same frame.
     ///
     /// This runs from `poll_data_channels`, on the frame thread, which is where
-    /// [`crate::offload::discard_each`] requires it to be called from.
+    /// [`rustdar_worker::offload::discard_each`] requires it to be called from.
     pub fn retain_live(&mut self, live_sites: &[String]) {
         let unshown = |site: &String| !live_sites.iter().any(|s| s == site);
-        crate::offload::discard_each(
+        rustdar_worker::offload::discard_each(
             "retired-feed",
             crate::app::evicted(&mut self.feeds, &unshown),
         );

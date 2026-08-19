@@ -21,11 +21,11 @@ use std::sync::mpsc;
 /// test built on it are native-only with it. The protocol they pin is
 /// target-independent; the instrument is not.
 #[cfg(not(target_arch = "wasm32"))]
-fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
+fn gated_render() -> (mpsc::Sender<()>, rustdar_worker::offload::Job) {
     let (release, held) = mpsc::channel::<()>();
     (
         release,
-        crate::offload::Job::Opaque(Box::new(move || {
+        rustdar_worker::offload::Job::Opaque(Box::new(move || {
             held.recv().expect("every gated render is released");
             Some(rustdar_source::job::DescribedOut(Box::new(
                 rustdar_radar::frame::RenderedFrame {
@@ -45,11 +45,11 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
 /// `Job::renders_nothing` produces when no sweep carries the product, held
 /// open so the abandonment protocol can be exercised around it.
 #[cfg(not(target_arch = "wasm32"))]
-fn gated_nothing() -> (mpsc::Sender<()>, crate::offload::Job) {
+fn gated_nothing() -> (mpsc::Sender<()>, rustdar_worker::offload::Job) {
     let (release, held) = mpsc::channel::<()>();
     (
         release,
-        crate::offload::Job::Opaque(Box::new(move || {
+        rustdar_worker::offload::Job::Opaque(Box::new(move || {
             held.recv().expect("every gated render is released");
             None
         })),

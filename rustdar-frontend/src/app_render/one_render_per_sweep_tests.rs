@@ -28,9 +28,9 @@
 //! coarsened later. Both are guards worth keeping and neither is evidence that
 //! the suppression works.
 
-use crate::offload::{JobRequest, JobSink};
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
@@ -66,10 +66,11 @@ impl JobSink for Recorder {
 /// fail for reasons of its own. See `offload::InstalledTestWorker`.
 fn recorder() -> (
     Arc<Mutex<Vec<Vec<u8>>>>,
-    crate::offload::InstalledTestWorker,
+    rustdar_worker::offload::InstalledTestWorker,
 ) {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    let installed = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+    let installed =
+        rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
     (posted, installed)
 }
 

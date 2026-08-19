@@ -1213,7 +1213,7 @@ impl App {
         // what keeps the rest of the queue from waiting on the user. Natively
         // this is usually an empty-queue check: `discard` hands the pool's free
         // lane the payload, and only a lane with no worker lands here.
-        crate::offload::drain_deferred_drops(
+        rustdar_worker::offload::drain_deferred_drops(
             rustdar_device_profile::constants::DEFERRED_DROP_BUDGET_PER_FRAME,
         );
         // Ahead of the minimized and zero-area early returns below: a window
@@ -1304,7 +1304,7 @@ impl App {
             // a teardown would stop after one frame and the remainder would
             // stay resident until the user next touched the app. See
             // `offload::drain_deferred_drops`, where the invariant is written.
-            || crate::offload::has_deferred_drops()
+            || rustdar_worker::offload::has_deferred_drops()
         {
             notify_redraw(&self.window);
         }
@@ -1700,7 +1700,7 @@ impl App {
     /// Dispatch the voxel build a 3D pane asked for, unless the volume is
     /// already in hand or in flight.
     ///
-    /// The build runs through [`crate::offload::offload_job`] — a thread
+    /// The build runs through [`rustdar_worker::offload::offload_job`] — a thread
     /// natively, the render worker on wasm — never on the frame thread. It
     /// used to run here synchronously at a measured 150–200 ms per volume,
     /// which was tolerable when the source was an archive volume that changed
@@ -2620,13 +2620,16 @@ impl App {
         // over. A site still shown by some other holder frees nothing at all
         // this pass, which is the same answer `retain` gave.
         let unshown = |site: &String| !shown.iter().any(|shown| *shown == site);
-        crate::offload::discard_each("evicted-scan", evicted(&mut self.scan_data, &unshown));
+        rustdar_worker::offload::discard_each(
+            "evicted-scan",
+            evicted(&mut self.scan_data, &unshown),
+        );
         // The same bound, for the same reason: an entry is a whole decoded
         // volume, and a session that visits ten sites would otherwise keep all
         // ten resident. `shown` already covers a pane's live site *and* the site
         // of the scan it is drawing, which is what stops a switch evicting the
         // volume a 3D pane is still building from.
-        crate::offload::discard_each(
+        rustdar_worker::offload::discard_each(
             "evicted-base-volume",
             evicted(&mut self.base_scans, &unshown),
         );
@@ -2638,7 +2641,7 @@ impl App {
         // every one of their latest volumes for the life of the process. The
         // entry exists to serve `JumpToLive`, which is a per-pane action, so a
         // site no pane shows cannot be jumped to and holds nothing here.
-        crate::offload::discard_each(
+        rustdar_worker::offload::discard_each(
             "evicted-cached-volume",
             evicted(&mut self.latest_cached_scans, &unshown),
         );
@@ -2849,7 +2852,10 @@ impl App {
         // That is the correct outcome, not a shortfall: whichever holder turns
         // out to hold the last handle pays the deep free, and it is paid
         // off-frame only if every holder hands its own over.
-        crate::offload::discard_each("evicted-loop-volume", self.loop_mgr.retain_scans(keep));
+        rustdar_worker::offload::discard_each(
+            "evicted-loop-volume",
+            self.loop_mgr.retain_scans(keep),
+        );
         // **The other datasource's cache, by the same rule and the same
         // predicate.** `l3_cache` had exactly the shape `scan_cache` had — one
         // entry per frame per AWIPS code, written by `cache_l3_product` and
@@ -2864,7 +2870,7 @@ impl App {
         // code — see `LoopDownloadManager::retain_l3` for why that is the rule
         // rather than a shortcut, and note that the frames a loop names do not
         // move when its product does.
-        crate::offload::discard_each("evicted-loop-object", self.loop_mgr.retain_l3(keep));
+        rustdar_worker::offload::discard_each("evicted-loop-object", self.loop_mgr.retain_l3(keep));
         // **The bucket-key listings, at the only resolution their key has.**
         // `l3_keys` is `(site, AWIPS code)` with no volume in it, so this asks
         // whether anything still needs the site at all — derived from the *same
@@ -2879,7 +2885,7 @@ impl App {
         // listing is re-used for a window whose days it does not cover and every
         // frame outside them reads as a gap.
         let keep_site = |site: &str| settling.contains(site) || needed.contains_key(site);
-        crate::offload::discard_each(
+        rustdar_worker::offload::discard_each(
             "evicted-loop-l3-listing",
             self.loop_mgr.retain_l3_keys(keep_site),
         );

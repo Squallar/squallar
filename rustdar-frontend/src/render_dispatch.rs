@@ -1781,15 +1781,19 @@ impl RenderDispatcher {
                 params.elevation,
                 sender,
                 window,
-                crate::offload::Job::Described(crate::offload::JobRequest::describe(
-                    rustdar_radar::jobs::Level3PairJob {
-                        dvl: std::sync::Arc::clone(&dvl.bytes),
-                        eet: std::sync::Arc::clone(&eet.bytes),
-                        radar_lat: params.lat,
-                        radar_lon: params.lon,
-                    },
-                    crate::offload::ceiling_only_geometry(self.static_side_ceiling_px() as u32),
-                )),
+                rustdar_worker::offload::Job::Described(
+                    rustdar_worker::offload::JobRequest::describe(
+                        rustdar_radar::jobs::Level3PairJob {
+                            dvl: std::sync::Arc::clone(&dvl.bytes),
+                            eet: std::sync::Arc::clone(&eet.bytes),
+                            radar_lat: params.lat,
+                            radar_lon: params.lon,
+                        },
+                        rustdar_worker::offload::ceiling_only_geometry(
+                            self.static_side_ceiling_px() as u32,
+                        ),
+                    ),
+                ),
             );
             return true;
         }
@@ -1820,14 +1824,14 @@ impl RenderDispatcher {
             // `Level3Message` has no wire form, and re-decoding is cheap against
             // the render it precedes — so on the web the decode moves off the
             // main thread with it.
-            crate::offload::Job::Described(crate::offload::JobRequest::describe(
+            rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
                 rustdar_radar::jobs::Level3Job {
                     bytes: std::sync::Arc::clone(&l3_msg.bytes),
                     product,
                     radar_lat: lat,
                     radar_lon: lon,
                 },
-                crate::offload::ceiling_only_geometry(ceiling_for_this_render),
+                rustdar_worker::offload::ceiling_only_geometry(ceiling_for_this_render),
             )),
         );
         true
@@ -1945,40 +1949,44 @@ impl RenderDispatcher {
             env_heights,
         ) {
             Some(input) => {
-                crate::offload::Job::Described(crate::offload::JobRequest::describe(
-                    rustdar_radar::jobs::RadarPlanJob {
-                        // Stamped after extraction rather than threaded through it,
-                        // which is the shape `with_declared_nyquist` is documented
-                        // for: the walk builds the payload out of the sweeps, and
-                        // the one thing the sweeps do not carry comes from the
-                        // table the caller holds. The wire field already existed
-                        // for the vertical views — this is the plan view joining
-                        // them on it, so a section and the map under it fold the
-                        // same sweep at the same speed.
-                        // Stamped alongside the fold table and for the same
-                        // reason: the walk builds the payload out of the sweeps,
-                        // and the melting layer is not in them. `None` here is
-                        // not an error — it is `resolve_melting_layer` falling to
-                        // its next rung, which the pane then says out loud.
-                        // Stamped on the same terms again, and `None` here is not
-                        // an error either — it is `srv::storm_motion` falling to
-                        // its next rung, which the pane then says out loud.
-                        input: Box::new(
-                            input
-                                .with_declared_nyquist(declared)
-                                .with_srv_fallback(self.last_srv_fallback)
-                                .with_melting_layer_product(melting_layer)
-                                .with_rpg_storm_motion(rpg_storm_motion),
+                rustdar_worker::offload::Job::Described(
+                    rustdar_worker::offload::JobRequest::describe(
+                        rustdar_radar::jobs::RadarPlanJob {
+                            // Stamped after extraction rather than threaded through it,
+                            // which is the shape `with_declared_nyquist` is documented
+                            // for: the walk builds the payload out of the sweeps, and
+                            // the one thing the sweeps do not carry comes from the
+                            // table the caller holds. The wire field already existed
+                            // for the vertical views — this is the plan view joining
+                            // them on it, so a section and the map under it fold the
+                            // same sweep at the same speed.
+                            // Stamped alongside the fold table and for the same
+                            // reason: the walk builds the payload out of the sweeps,
+                            // and the melting layer is not in them. `None` here is
+                            // not an error — it is `resolve_melting_layer` falling to
+                            // its next rung, which the pane then says out loud.
+                            // Stamped on the same terms again, and `None` here is not
+                            // an error either — it is `srv::storm_motion` falling to
+                            // its next rung, which the pane then says out loud.
+                            input: Box::new(
+                                input
+                                    .with_declared_nyquist(declared)
+                                    .with_srv_fallback(self.last_srv_fallback)
+                                    .with_melting_layer_product(melting_layer)
+                                    .with_rpg_storm_motion(rpg_storm_motion),
+                            ),
+                            // A static pane keeps the grid: it is what a hover reads.
+                            values_wanted: true,
+                        },
+                        // And it is the one render kind that may take the
+                        // long-range raster, if this device can hold one.
+                        rustdar_worker::offload::ceiling_only_geometry(
+                            self.static_side_ceiling_px() as u32,
                         ),
-                        // A static pane keeps the grid: it is what a hover reads.
-                        values_wanted: true,
-                    },
-                    // And it is the one render kind that may take the
-                    // long-range raster, if this device can hold one.
-                    crate::offload::ceiling_only_geometry(self.static_side_ceiling_px() as u32),
-                ))
+                    ),
+                )
             }
-            None => crate::offload::Job::renders_nothing(),
+            None => rustdar_worker::offload::Job::renders_nothing(),
         };
         self.spawn_render(pane_idx, site, product, elevation, sender, window, job);
     }
@@ -2093,16 +2101,17 @@ impl RenderDispatcher {
         let wanted = self.pane_render[pane_idx].want_result();
         let target = target.clone();
 
-        let job = crate::offload::Job::Described(crate::offload::JobRequest::describe(
-            rustdar_radar::jobs::SectionJob {
-                input: Box::new((*cached.input).clone()),
-                request,
-            },
-            // A section's raster is a constant of the view, so its envelope
-            // carries no ceiling — the same effective 0 it has always had.
-            crate::offload::ceiling_only_geometry(0),
-        ));
-        crate::offload::offload_job("section-render", job, move |output| {
+        let job =
+            rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
+                rustdar_radar::jobs::SectionJob {
+                    input: Box::new((*cached.input).clone()),
+                    request,
+                },
+                // A section's raster is a constant of the view, so its envelope
+                // carries no ceiling — the same effective 0 it has always had.
+                rustdar_worker::offload::ceiling_only_geometry(0),
+            ));
+        rustdar_worker::offload::offload_job("section-render", job, move |output| {
             let _guard = guard;
             // An output of another kind becomes `None` — "nothing to draw" —
             // which the receiver already handles, with the budget still unwound
@@ -2168,16 +2177,17 @@ impl RenderDispatcher {
         let target = target.clone();
         let started = web_time::Instant::now();
 
-        let job = crate::offload::Job::Described(crate::offload::JobRequest::describe(
-            rustdar_radar::jobs::VoxelJob {
-                input: Box::new(input),
-                request,
-            },
-            // A voxel grid's shape is already on the wire, so its envelope
-            // carries no ceiling — the same effective 0 it has always had.
-            crate::offload::ceiling_only_geometry(0),
-        ));
-        crate::offload::offload_job("voxels", job, move |output| {
+        let job =
+            rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
+                rustdar_radar::jobs::VoxelJob {
+                    input: Box::new(input),
+                    request,
+                },
+                // A voxel grid's shape is already on the wire, so its envelope
+                // carries no ceiling — the same effective 0 it has always had.
+                rustdar_worker::offload::ceiling_only_geometry(0),
+            ));
+        rustdar_worker::offload::offload_job("voxels", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` — "nothing to draw".
             let grid = output
@@ -2229,7 +2239,7 @@ impl RenderDispatcher {
         elevation: f32,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
-        job: crate::offload::Job,
+        job: rustdar_worker::offload::Job,
     ) {
         // Check concurrent render limit
         let current = self.renders_in_flight.load(Ordering::Relaxed);
@@ -2247,7 +2257,7 @@ impl RenderDispatcher {
         // `deliver` carries the only other reference to it, which is also what
         // `want_result`'s `Arc::strong_count` pruning reads as "still stoppable".
         let wanted = self.pane_render[pane_idx].want_result();
-        crate::offload::offload_job("radar-render", job, move |output| {
+        rustdar_worker::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` here — "nothing to draw",
             // which every path below already handles (`DescribedOut::take`

@@ -4244,6 +4244,7 @@ dependencies = [
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-source",
+ "rustdar-worker",
  "serde",
  "serde_json",
  "syn 3.0.3",
@@ -4400,12 +4401,30 @@ dependencies = [
  "rustdar-location",
  "rustdar-radar",
  "rustdar-source",
+ "rustdar-worker",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
  "winit",
+]
+
+[[package]]
+name = "rustdar-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "log",
+ "nexrad-model",
+ "rustdar-device-profile",
+ "rustdar-geo",
+ "rustdar-overlays",
+ "rustdar-radar",
+ "rustdar-source",
+ "serde_json",
+ "web-time",
 ]
 
 [[package]]

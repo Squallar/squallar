@@ -328,7 +328,7 @@ impl LoopDownloadManager {
     /// place is the frame thread: an entry here is a whole decoded volume,
     /// 47–69 MiB across thousands of per-radial buffers, and returning them is
     /// what lets the caller hand them to
-    /// [`crate::offload::discard_each`](crate::offload::discard_each) instead.
+    /// [`rustdar_worker::offload::discard_each`](rustdar_worker::offload::discard_each) instead.
     /// Same reasoning, and the same helper's reasoning, as
     /// [`crate::app::evicted`].
     ///

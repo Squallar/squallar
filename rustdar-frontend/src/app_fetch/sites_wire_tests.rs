@@ -21,15 +21,15 @@ use std::sync::{Arc, Mutex};
 /// funnel hands it over by value — and the wire round trip is asserted on the
 /// recording, so the codec is on this path exactly as it is on the browser's.
 struct RecordingPort {
-    taken: Arc<Mutex<Vec<(u64, crate::offload::JobRequest)>>>,
+    taken: Arc<Mutex<Vec<(u64, rustdar_worker::offload::JobRequest)>>>,
 }
 
-impl crate::offload::JobSink for RecordingPort {
+impl rustdar_worker::offload::JobSink for RecordingPort {
     fn send(
         &self,
         id: u64,
-        request: crate::offload::JobRequest,
-    ) -> Result<(), crate::offload::JobRequest> {
+        request: rustdar_worker::offload::JobRequest,
+    ) -> Result<(), rustdar_worker::offload::JobRequest> {
         self.taken.lock().unwrap().push((id, request));
         Ok(())
     }
@@ -71,7 +71,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
 #[test]
 fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
     let taken = Arc::new(Mutex::new(Vec::new()));
-    let _guard = crate::offload::install_test_worker(Box::new(RecordingPort {
+    let _guard = rustdar_worker::offload::install_test_worker(Box::new(RecordingPort {
         taken: Arc::clone(&taken),
     }));
 
@@ -90,7 +90,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
         let (_, request) = &posted[0];
         // The envelope destructure is irrefutable since WO-M7.2; the typed
         // downcast below is what proves the dispatch posted this kind.
-        let crate::offload::JobRequest { geometry, job } = request;
+        let rustdar_worker::offload::JobRequest { geometry, job } = request;
         assert_eq!(
             (geometry.width, geometry.height),
             (64, 48),
@@ -112,7 +112,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
         // The browser's sink serialises exactly this value on its way out; the
         // round trip here keeps the codec on the recorded path.
         assert_eq!(
-            crate::offload::JobRequest::from_bytes(&request.to_bytes()).as_ref(),
+            rustdar_worker::offload::JobRequest::from_bytes(&request.to_bytes()).as_ref(),
             Some(request),
             "the posted job does not survive its own wire form",
         );
@@ -131,7 +131,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
     // this half pins that a dead worker *produces* it, because a `deliver`
     // that returned early on `None` would leave this channel empty and that
     // test's fixture unreachable from production.
-    crate::offload::abandon_worker("test: the worker died");
+    rustdar_worker::offload::abandon_worker("test: the worker died");
     let resp = app.channels.overlay_render_receiver.try_recv().expect(
         "a job the worker never answered sent nothing on the overlay channel: \
          the pane stays marked in flight forever and the site-marker layer \

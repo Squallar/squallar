@@ -47,7 +47,7 @@ fn the_first_egui_frame_ever_executed_on_wasm() {
 /// zero-copy contract the worker wire depends on.
 #[wasm_bindgen_test]
 async fn job_request_bytes_survive_a_real_message_channel_transfer() {
-    use rustdar_frontend::offload::JobRequest;
+    use rustdar_worker::offload::JobRequest;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
     let archive: Vec<u8> = (0..=255u8).cycle().take(1024).collect();

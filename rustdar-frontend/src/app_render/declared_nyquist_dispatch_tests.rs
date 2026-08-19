@@ -21,9 +21,9 @@
 //! posts jobs carrying `None` here and is dealiased against the estimate, the
 //! same as it was before any of this existed.
 
-use crate::offload::{JobRequest, JobSink};
 use crate::platform_double::TestBridge;
 use rustdar_radar::types::RadarProduct;
+use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
@@ -238,7 +238,7 @@ fn posted_jobs(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<JobRequest> {
 #[test]
 fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    crate::offload::set_worker(Box::new(Recorder(Arc::clone(&posted))));
+    rustdar_worker::offload::set_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = app_showing_site();
     let ctx = egui::Context::default();
@@ -274,7 +274,7 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     app.dispatch_section_renders();
 
     let jobs = posted_jobs(&posted);
-    crate::offload::abandon_worker("test teardown");
+    rustdar_worker::offload::abandon_worker("test teardown");
 
     let plan = jobs
         .iter()
@@ -320,7 +320,7 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
 #[test]
 fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    crate::offload::set_worker(Box::new(Recorder(Arc::clone(&posted))));
+    rustdar_worker::offload::set_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = app_showing_site();
     let ctx = egui::Context::default();
@@ -353,7 +353,7 @@ fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
     );
 
     let jobs = posted_jobs(&posted);
-    crate::offload::abandon_worker("test teardown");
+    rustdar_worker::offload::abandon_worker("test teardown");
 
     let radar: Vec<Vec<(u8, f64)>> = jobs
         .iter()

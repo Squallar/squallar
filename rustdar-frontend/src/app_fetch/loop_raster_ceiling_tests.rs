@@ -6,8 +6,8 @@
 //! there is nothing left to distinguish a policy from a coincidence.
 
 use super::*;
-use crate::offload::{JobRequest, JobSink};
 use crate::platform_double::TestBridge;
+use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
@@ -128,7 +128,8 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     // install and that call, and any of them unwinding past it would hand this
     // port to the next test on this harness thread. See
     // `offload::InstalledTestWorker`.
-    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+    let _worker =
+        rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)

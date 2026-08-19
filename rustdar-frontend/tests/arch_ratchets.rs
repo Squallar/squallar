@@ -69,8 +69,8 @@
 //!  5b  ... files containing it (info)                   61  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
 //!      (56 at the E0c-era count; re-counted at WO-RD)
 //!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-frontend/src/channels.rs | wc -l
-//!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-frontend/src/offload.rs | wc -l
-//!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-frontend/src/offload.rs | wc -l
+//!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
+//!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
 //!      (70 and 57 occurrences at E0c — 38 and 37 distinct paths — shrunk
 //!      through WO-M5/M6/M7; ZERO in both directions since WO-M7c)
 //! ```
@@ -410,12 +410,13 @@ fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
 /// The presence controls keep the pin non-vacuous both ways: the anchored
 /// read fails if `offload_job` ever leaves the file (the scrape is of the
 /// real funnel, not an empty or renamed file), and the same two needles
-/// must still match in `job_registry.rs` — the one frontend module that
-/// legitimately names both source crates — so a needle that rotted would
-/// fail there rather than count zero here forever.
+/// must still match in `job_registry.rs` — the one rustdar-worker module
+/// that legitimately names both source crates — so a needle that rotted
+/// would fail there rather than count zero here forever. (Both paths
+/// re-keyed to rustdar-worker at WO-RW; ROOT reaches across crates.)
 #[test]
 fn offload_names_zero_source_crate_types() {
-    let offload_rs = Path::new(ROOT).join("rustdar-frontend/src/offload.rs");
+    let offload_rs = Path::new(ROOT).join("rustdar-worker/src/offload.rs");
     let text = anchored_file(&offload_rs, OFFLOAD_ANCHOR);
 
     for (needle, crate_name) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {
@@ -434,7 +435,7 @@ fn offload_names_zero_source_crate_types() {
     // Presence control: the needles are alive — the composition module
     // names both crates by construction, so a rotted needle fails HERE
     // rather than counting zero above forever.
-    let registry_rs = Path::new(ROOT).join("rustdar-frontend/src/job_registry.rs");
+    let registry_rs = Path::new(ROOT).join("rustdar-worker/src/job_registry.rs");
     let registry = read(&registry_rs);
     for (needle, what) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {
         assert!(
