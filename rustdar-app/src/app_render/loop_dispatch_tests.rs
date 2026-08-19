@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_keys;
 use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
 };
@@ -19,8 +20,12 @@ fn ts(minute: u32) -> chrono::NaiveDateTime {
         + chrono::Duration::minutes(minute as i64)
 }
 
+/// This suite's plan-view target: [`test_keys::key`] with the product this
+/// suite is about pinned in. It delegates rather than being flattened into its
+/// callers because it is named inside `assert!` bodies, and rewriting an
+/// assertion to route a constructor would edit the pin instead of the plumbing.
 fn target(site: &str, elevation: f32) -> RenderTarget {
-    RenderTarget::new(site, RadarProduct::Reflectivity, elevation)
+    test_keys::key(site, RadarProduct::Reflectivity, elevation)
 }
 
 fn identifier(name: &str) -> Identifier {
@@ -282,7 +287,7 @@ fn suppression_and_acceptance_weigh_the_same_sweep() {
 #[test]
 fn a_queued_render_for_another_product_suppresses_nothing() {
     let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
-    let velocity = RenderTarget::new("KTLX", RadarProduct::Velocity, 0.5);
+    let velocity = test_keys::key("KTLX", RadarProduct::Velocity, 0.5);
     assert!(!render_already_queued(q.iter(), ts(0), &velocity, 0.48));
 }
 
@@ -1281,11 +1286,7 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
 
     let mut rr = response(
         ts(0),
-        RenderTarget {
-            site: "KTLX".into(),
-            product: RadarProduct::Reflectivity,
-            elevation: 0.5,
-        },
+        test_keys::key("KTLX", RadarProduct::Reflectivity, 0.5),
     );
     rr.site_lat = lat;
     rr.site_lon = lon;

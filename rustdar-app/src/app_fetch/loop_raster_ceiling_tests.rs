@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::platform_double::TestBridge;
+use crate::test_keys;
 use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
@@ -164,11 +165,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
                 Default::default(),
             ),
             params(),
-            rustdar_egui::pane::RenderTarget {
-                site: SITE.to_string(),
-                product: RadarProduct::Reflectivity,
-                elevation: 0.5,
-            },
+            test_keys::key(SITE, RadarProduct::Reflectivity, 0.5),
         ),
         "the fixture must actually reach the dispatch",
     );

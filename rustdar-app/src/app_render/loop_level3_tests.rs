@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_keys;
 use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock};
 use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
 use rustdar_radar::archive::Identifier;
@@ -329,7 +330,7 @@ fn a_frame_needs_every_one_of_its_products_codes() {
 fn a_level3_frames_sweep_is_its_objects_own_elevation() {
     let mut mgr = LoopDownloadManager::new();
     let code = codes(L3)[0];
-    let tgt = RenderTarget::new(SITE, L3, 0.5);
+    let tgt = test_keys::key(SITE, L3, 0.5);
 
     assert!(
         matches!(frame_sweep(&mgr, &tgt, ts(0)), FrameSweep::Pending),
@@ -351,7 +352,7 @@ fn a_gap_makes_its_frame_unrenderable_rather_than_pending() {
     let mut mgr = LoopDownloadManager::new();
     mgr.cache_l3_product(SITE, codes(L3)[0], ts(0), None);
     assert!(matches!(
-        frame_sweep(&mgr, &RenderTarget::new(SITE, L3, 0.5), ts(0)),
+        frame_sweep(&mgr, &test_keys::key(SITE, L3, 0.5), ts(0)),
         FrameSweep::Unrenderable
     ));
 }
@@ -364,12 +365,12 @@ fn frame_data_follows_the_targets_own_product() {
     let mut mgr = LoopDownloadManager::new();
     mgr.cache_l3_product(SITE, codes(L3)[0], ts(0), Some(object(0)));
 
-    match frame_data(&mgr, &RenderTarget::new(SITE, L3, 0.5), ts(0)) {
+    match frame_data(&mgr, &test_keys::key(SITE, L3, 0.5), ts(0)) {
         Some(LoopFrameData::Products(objects)) => assert_eq!(objects.len(), codes(L3).len()),
         _ => panic!("a Level III target must resolve to its objects"),
     }
     assert!(
-        frame_data(&mgr, &RenderTarget::new(SITE, L2, 0.5), ts(0)).is_none(),
+        frame_data(&mgr, &test_keys::key(SITE, L2, 0.5), ts(0)).is_none(),
         "a Level II target reads the volume cache, which holds nothing here",
     );
 }

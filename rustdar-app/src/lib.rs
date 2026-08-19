@@ -42,6 +42,10 @@ pub(crate) mod platform_double;
 pub mod render_dispatch;
 pub mod site_catalogue;
 pub mod site_positions;
+/// The one place this crate's loop suites spell a render identity, so the
+/// WO-E5 key flip re-pins in one place instead of across every loop pin.
+#[cfg(test)]
+pub(crate) mod test_keys;
 /// The radars this crate's tests run against. See the module note for why
 /// there is exactly one such list.
 #[cfg(test)]
