@@ -79,10 +79,10 @@ fn fade_lut(band: usize) -> Vec<u8> {
 /// exercise them. Built through `build_voxels` because that is the one
 /// constructor a `VoxelGrid` has.
 ///
-/// `pub(crate)` for the same reason: `app_render`'s hidden-pane tests measure
-/// the bytes a release gives back, and only a `Ready` entry has any. A second
-/// copy of this fixture over there would be a second thing to keep in step
-/// with the resampler.
+/// The app side's store/release tests keep a twin of this fixture
+/// (`rustdar_frontend`'s `volume_fixture::ready_grid`, WO-RV): a test helper
+/// does not cross a crate boundary, and this module is `cfg(test)`-gated,
+/// invisible over there. Keep the two in step with the resampler together.
 pub(crate) fn ready_grid() -> VolumeEntry {
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
@@ -890,11 +890,8 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
 #[test]
 fn the_cloud_rung_marches_the_smoothed_field_at_half_cell_steps() {
     assert_eq!(CLOUD_RECONSTRUCTION_LOD, 1.0);
-    assert_eq!(
-        CLOUD_STEP_CELLS,
-        crate::volume::raymarch::RAYMARCH_STEP_CELLS / 2.0,
-    );
-    let ceiling = crate::volume::raymarch::RAYMARCH_STEP_CEILING as f32;
+    assert_eq!(CLOUD_STEP_CELLS, crate::raymarch::RAYMARCH_STEP_CELLS / 2.0,);
+    let ceiling = crate::raymarch::RAYMARCH_STEP_CEILING as f32;
     let desktop_diagonal_cells = (256.0f32 * 256.0 + 256.0 * 256.0 + 128.0 * 128.0).sqrt();
     assert!(
         desktop_diagonal_cells / CLOUD_STEP_CELLS <= ceiling,
@@ -1063,7 +1060,7 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
 /// only at a region box. It does not. Reflectivity's box is 1.797 km/cell and
 /// omits it; the Doppler-cut products' box is 1.172 km/cell and **builds** it,
 /// which is five of the six products a 3D pane can show. Both rows are here
-/// now, and [`crate::volume::raymarch::CoarseLevel`]'s own doc says the same.
+/// now, and [`crate::raymarch::CoarseLevel`]'s own doc says the same.
 #[test]
 fn the_coarse_level_is_built_only_where_something_will_sample_it() {
     use rustdar_device_profile::quality::{
@@ -1424,7 +1421,7 @@ fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
 fn the_store_eviction_actually_bounds() {
     let store = VolumeStore::new();
     let one = match ready_grid() {
-        VolumeEntry::Ready(grid) => crate::volume::raymarch::resident_grid_bytes([
+        VolumeEntry::Ready(grid) => crate::raymarch::resident_grid_bytes([
             u32::try_from(grid.shape().nx).unwrap(),
             u32::try_from(grid.shape().ny).unwrap(),
             u32::try_from(grid.shape().nz).unwrap(),
@@ -1568,7 +1565,7 @@ fn one_grid_texture_bytes() -> usize {
     match ready_grid() {
         VolumeEntry::Ready(grid) => {
             let shape = grid.shape();
-            crate::volume::raymarch::resident_grid_bytes([
+            crate::raymarch::resident_grid_bytes([
                 u32::try_from(shape.nx).unwrap(),
                 u32::try_from(shape.ny).unwrap(),
                 u32::try_from(shape.nz).unwrap(),

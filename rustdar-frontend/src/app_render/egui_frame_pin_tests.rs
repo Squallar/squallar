@@ -1,8 +1,10 @@
-//! The renderer pins that stayed behind when the egui/wgpu renderer moved to
-//! rustdar-gpu (WO-RG): each one scrapes a file THIS crate owns — the frame
-//! path in `app_render.rs`, the one production `EguiRenderer::new` call and
-//! the wake closure in `app_state.rs` — so they live beside their subjects
-//! rather than in the crate whose type they mention.
+//! The renderer and volume pins that stayed behind when the egui/wgpu
+//! renderer moved to rustdar-gpu (WO-RG) and the 3D stack to
+//! rustdar-volumetric (WO-RV): each one scrapes a file THIS crate owns — the
+//! frame path and surface-loss gate in `app_render.rs`, the one production
+//! `EguiRenderer::new` call, the wake closure and the probe/latch calls in
+//! `app_state.rs` — so they live beside their subjects rather than in the
+//! crate whose type they mention.
 
 /// A named function's body, read out of a source file this crate ships.
 ///
@@ -134,5 +136,59 @@ fn the_wake_app_state_builds_ends_in_a_redraw_request() {
         binding.contains("window.clone()"),
         "the wake no longer captures the window, so it has nothing to ask for \
              a redraw: {binding}"
+    );
+}
+
+/// `AppState::new` must actually install the latch and run the probe.
+///
+/// Neither is enforced by the type system: `volume_support` could be filled
+/// in with a literal `Supported` and `install_error_latch` deleted outright,
+/// and everything would still compile and pass. What would be lost is the
+/// entire second layer of defence — errors back to panicking, on a device
+/// nobody checked. `AppState::new` needs a window and a surface, so reading
+/// the source is the only handle there is.
+///
+/// Moved here from rustdar-volumetric's crate root at WO-RV (it scrapes a
+/// file THIS crate owns), needles re-keyed to the cross-crate spellings the
+/// re-point left behind.
+#[test]
+fn app_state_probes_the_device_and_installs_the_latch() {
+    let body = body_of(include_str!("../app_state.rs"), "pub async fn new(");
+
+    for call in [
+        "rustdar_volumetric::probe(",
+        "rustdar_volumetric::install_error_latch(",
+    ] {
+        assert!(
+            body.contains(call),
+            "AppState::new no longer calls `{call}`, so the volume view's \
+             pre-check or its error latch is gone"
+        );
+    }
+}
+
+/// A lost surface only counts against the volume when one was on screen.
+///
+/// The gate is the property, not the call: counting every surface loss would
+/// retire 3D after two unplugged monitors on a machine whose GPU never
+/// complained. `present_frame` needs a real swapchain, so this reads source.
+///
+/// Moved here from rustdar-volumetric's crate root at WO-RV, with the pins
+/// above, for the same reason: the file it pins is this crate's.
+#[test]
+fn a_surface_loss_is_only_counted_when_a_volume_was_on_screen() {
+    let body = body_of(
+        include_str!("../app_render.rs"),
+        "pub(super) fn present_frame(",
+    );
+
+    let call = body
+        .find("note_surface_loss_with_volume(")
+        .expect("present_frame no longer counts surface losses against the volume view");
+    let preamble = &body[..call];
+    assert!(
+        preamble.contains("rustdar_radar::types::RenderView::Volume"),
+        "present_frame counts a surface loss against the volume view without \
+         first checking that a volume pane was on screen"
     );
 }

@@ -49,7 +49,8 @@ fn model(
     LoopFrameModel {
         plan_view: loop_image_size * loop_image_size * 4,
         section: section_width * (section_width / 2) * 4,
-        grid: crate::volume::raymarch::resident_grid_bytes(grid).expect("a shipped grid shape"),
+        grid: rustdar_volumetric::raymarch::resident_grid_bytes(grid)
+            .expect("a shipped grid shape"),
         render_budget,
     }
 }

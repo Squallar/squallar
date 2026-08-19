@@ -22,7 +22,7 @@
 //! the same site at the same product each cache their own — so they are two
 //! loops and cost two shares. A 3D loop caches **inputs**: its frames are
 //! resident voxel grids in the single application-wide
-//! [`crate::volume::bridge::VolumeStore`], keyed by `VolumeTarget`, so two 3D
+//! [`rustdar_volumetric::bridge::VolumeStore`], keyed by `VolumeTarget`, so two 3D
 //! panes orbiting one volume from two angles already share one build, one
 //! upload and one set. They are **one** loop and cost **one** share.
 //!
@@ -151,7 +151,7 @@
 //! # Behaviour is the fallback where nothing can be queried
 //!
 //! [`LoopPool::back_off`] halves the pool toward the floor. It is driven from
-//! the same two signals `crate::volume::degrade` already latches — an
+//! the same two signals `rustdar_volumetric::degrade` already latches — an
 //! uncaptured device error and a lost surface — because those are the only
 //! evidence a browser will ever give that an allocation was too large. Starting
 //! conservative and stepping down on refusal is the honest shape when the
@@ -282,7 +282,7 @@ impl LoopFrameModel {
         Self {
             plan_view: side * side * 4,
             section: rustdar_radar::xsect::SECTION_WIDTH * rustdar_radar::xsect::SECTION_HEIGHT * 4,
-            grid: crate::volume::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
+            grid: rustdar_volumetric::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
                 .unwrap_or(usize::MAX),
             render_budget: MAX_LOOP_RENDER_BUDGET,
         }
@@ -307,7 +307,7 @@ impl LoopFrameModel {
             // exact shape `for_target` above already uses — because the
             // resolver moved below the raymarch at WO-RD and must not call up
             // into it.
-            grid: crate::volume::raymarch::resident_grid_bytes(budgets.grid_cells)
+            grid: rustdar_volumetric::raymarch::resident_grid_bytes(budgets.grid_cells)
                 .unwrap_or(usize::MAX),
             render_budget: budgets.loop_render_budget,
         }
@@ -500,7 +500,7 @@ impl LoopPool {
     /// is the caller's cue not to write the same value to the config store
     /// again.
     ///
-    /// One-way, like `crate::volume::degrade`'s counters and for the same
+    /// One-way, like `rustdar_volumetric::degrade`'s counters and for the same
     /// reason: a device that could not serve a texture will not be able to
     /// serve it after a restart either.
     pub fn back_off(&mut self, limits: LoopPoolLimits) -> bool {

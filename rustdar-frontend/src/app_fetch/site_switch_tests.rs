@@ -745,9 +745,9 @@ fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() 
 // pass on a fix that freed nothing.
 // ---------------------------------------------------------------------------
 
-use crate::volume::bridge::tests::ready_grid;
-use crate::volume::bridge::{Hold, VolumeEntry};
+use crate::volume_fixture::ready_grid;
 use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
+use rustdar_volumetric::bridge::{Hold, VolumeEntry};
 
 /// A 3D target on `site`, at a time that separates one volume from the next.
 fn volume_target(site: &str, minute: u32) -> VolumeTarget {
@@ -769,7 +769,7 @@ fn one_grid_bytes() -> usize {
         unreachable!("ready_grid is Ready")
     };
     let shape = grid.shape();
-    crate::volume::raymarch::resident_grid_bytes([
+    rustdar_volumetric::raymarch::resident_grid_bytes([
         u32::try_from(shape.nx).unwrap(),
         u32::try_from(shape.ny).unwrap(),
         u32::try_from(shape.nz).unwrap(),

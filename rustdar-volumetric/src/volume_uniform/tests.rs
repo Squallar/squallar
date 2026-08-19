@@ -385,13 +385,9 @@ fn no_negative_reconstruction_sentinel_survives_in_the_lane_or_the_shader() {
     let uniform = VolumeUniform::new([1.0, 1.0, 1.0], [2, 2, 2]);
     assert!(uniform.reconstruction_lod >= 0.0);
     assert!(
-        crate::volume::bridge::CLOUD_RECONSTRUCTION_LOD >= 0.0
+        crate::bridge::CLOUD_RECONSTRUCTION_LOD >= 0.0
             && (0..=40)
-                .map(
-                    |tenths| crate::volume::bridge::cloud_reconstruction_lod_for(
-                        tenths as f32 / 10.0
-                    )
-                )
+                .map(|tenths| crate::bridge::cloud_reconstruction_lod_for(tenths as f32 / 10.0))
                 .all(|lod| lod >= 0.0),
         "a production writer produced a negative reconstruction level, which \
              the shader would now sample the grid at rather than treat as a \

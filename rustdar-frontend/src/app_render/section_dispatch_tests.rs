@@ -585,7 +585,7 @@ fn an_override_edit_invalidates_the_srv_vertical_views() {
         app.volume_store.insert(
             0,
             srv_target.clone(),
-            crate::volume::bridge::VolumeEntry::Refused("the old vector's".into()),
+            rustdar_volumetric::bridge::VolumeEntry::Refused("the old vector's".into()),
         );
     };
     arm(&mut app);

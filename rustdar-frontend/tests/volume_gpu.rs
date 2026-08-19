@@ -59,11 +59,11 @@
 
 use egui_wgpu::wgpu;
 use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
-use rustdar_frontend::volume::raymarch::{
+use rustdar_volumetric::raymarch::{
     CoarseLevel, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, GRID_BYTES_PER_CELL, GRID_MIP_LEVELS,
     OffscreenTarget, VolumePipelines, mirror_is_gamma_encoded,
 };
-use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
+use rustdar_volumetric::uniform::{ISO_OFF, VolumeUniform};
 
 mod gpu_harness;
 use gpu_harness::{
@@ -313,7 +313,7 @@ fn an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone() {
     let lut = palette(INDEX, COLOUR);
 
     // Lit volume over a zero-alpha entry: nothing at all.
-    uniform.iso_threshold = rustdar_frontend::volume::uniform::ISO_OFF;
+    uniform.iso_threshold = rustdar_volumetric::uniform::ISO_OFF;
     let pixels = raymarch_once(
         &device, &queue, &pipelines, cells, &filled, &lut, &uniform, size,
     );
@@ -671,7 +671,7 @@ fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
     let mut uniform = iso_uniform(cells);
     uniform.iso_centre = ISO_OFF;
     uniform.iso_threshold = 100.0 / 255.0;
-    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
 
     let painted = |indices: &[u8], uniform: &VolumeUniform| {
         raymarch_once(
@@ -683,7 +683,7 @@ fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
     };
 
     let raw = (painted(&lone_voxel, &uniform), painted(&sheet, &uniform));
-    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+    uniform.reconstruction_lod = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
     let smoothed = (painted(&lone_voxel, &uniform), painted(&sheet, &uniform));
     println!(
         "isosurface at threshold 100/255, {}x{} px:\n  \
@@ -692,10 +692,10 @@ fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
         size[0],
         size[1],
         raw.0,
-        rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD,
+        rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD,
         smoothed.0,
         raw.1,
-        rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD,
+        rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD,
         smoothed.1,
     );
 
@@ -1816,8 +1816,8 @@ fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
     };
 
     let raw = painted(&uniform);
-    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
-    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.reconstruction_lod = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
+    uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
     let cloud = painted(&uniform);
     println!("lone voxel: raw field paints {raw} px, smoothed reconstruction {cloud} px");
 
@@ -1886,7 +1886,7 @@ fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
     let size = [64u32, 64];
     let cells = [16u32, 16, 16];
     /// The rung a desktop asks for when the taper has not closed it.
-    const CLOUD_LOD: f32 = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+    const CLOUD_LOD: f32 = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
 
     let (device, queue) = device();
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
@@ -1906,7 +1906,7 @@ fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
     uniform.gradient_shading = false;
     // The cloud rung's own step, held for every render below: the LOD is the
     // one variable, so an exact comparison is a comparison of the texture.
-    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
 
     let render = |coarse: CoarseLevel, lod: f32| {
         let mut uniform = uniform;
@@ -2308,8 +2308,8 @@ fn blitted(
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of() {
     use rustdar_device_profile::quality::offscreen_bytes;
-    use rustdar_frontend::volume::bridge::VolumeResources;
-    use rustdar_frontend::volume::raymarch::resident_grid_bytes_at;
+    use rustdar_volumetric::bridge::VolumeResources;
+    use rustdar_volumetric::raymarch::resident_grid_bytes_at;
 
     let _serialised = gpu_lock();
     let (device, queue) = device();
@@ -2427,7 +2427,7 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn both_upload_routes_paint_the_same_frame() {
-    use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
+    use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 
     let _serialised = gpu_lock();
     let (device, queue) = device();
@@ -2739,8 +2739,8 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
-    use rustdar_frontend::volume::raymarch::grid_bytes_at;
-    use rustdar_frontend::volume::raymarch::staging::VolumeStaging;
+    use rustdar_volumetric::raymarch::grid_bytes_at;
+    use rustdar_volumetric::raymarch::staging::VolumeStaging;
 
     let _serialised = gpu_lock();
     let (device, queue) = device();
@@ -2904,7 +2904,7 @@ enum MipLayout {
 /// the probe cannot be measuring something the rungs below never do; 4 MiB,
 /// created twice and freed, once per process.
 fn probe_mip_layout(device: &wgpu::Device, queue: &wgpu::Queue) -> MipLayout {
-    use rustdar_frontend::volume::VOLUME_TEXTURE_FORMAT;
+    use rustdar_volumetric::VOLUME_TEXTURE_FORMAT;
 
     const PROBE_CELLS: [u32; 3] = [128, 128, 64];
     const PROBE_LABEL: &str = "rustdar.volume.grid.miplayout.probe";
@@ -3045,7 +3045,7 @@ fn named_level_payload(cells: [u32; 3], coarse: CoarseLevel) -> u64 {
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_composites_on_one_arm_per_frame() {
-    use rustdar_frontend::volume::raymarch::VOLUME_SHADER_WGSL;
+    use rustdar_volumetric::raymarch::VOLUME_SHADER_WGSL;
 
     /// The one line the two forced builds replace. Asserted to match, because a
     /// battery whose anchor has moved is a green test that proves nothing.

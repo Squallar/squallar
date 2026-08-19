@@ -16,12 +16,12 @@
 
 use crate::app::tests::{headless, two_pane_app};
 use crate::platform_double::TestBridge;
-use crate::volume::bridge::tests::ready_grid;
-use crate::volume::bridge::{Hold, VolumeEntry};
+use crate::volume_fixture::ready_grid;
 use rustdar_egui::UI_CONFIG_KEY;
 use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
 use rustdar_kv::{KvStore, MemoryKvStore};
 use rustdar_radar::types::RadarProduct;
+use rustdar_volumetric::bridge::{Hold, VolumeEntry};
 
 const SITE: &str = "KTLX";
 
@@ -46,7 +46,7 @@ fn one_grid() -> usize {
         unreachable!("ready_grid is Ready")
     };
     let shape = grid.shape();
-    crate::volume::raymarch::resident_grid_bytes([
+    rustdar_volumetric::raymarch::resident_grid_bytes([
         u32::try_from(shape.nx).unwrap(),
         u32::try_from(shape.ny).unwrap(),
         u32::try_from(shape.nz).unwrap(),

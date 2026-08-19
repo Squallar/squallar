@@ -4245,6 +4245,7 @@ dependencies = [
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-source",
+ "rustdar-volumetric",
  "rustdar-worker",
  "serde",
  "serde_json",
@@ -4401,6 +4402,25 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+]
+
+[[package]]
+name = "rustdar-volumetric"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "egui-wgpu",
+ "half",
+ "log",
+ "nexrad-model",
+ "pollster",
+ "rustdar-device-profile",
+ "rustdar-egui",
+ "rustdar-geo",
+ "rustdar-gpu",
+ "rustdar-radar",
+ "serde_json",
 ]
 
 [[package]]

@@ -104,21 +104,20 @@ jobs:
       # the environment, no such file exists in this repository, and radar data
       # is not going into git. They remain hand-run.
       - name: Run the adapter-only unit tests
-        # Named exactly, because the frontend binary's ignored set also holds
-        # `live_a_poll_fetches_each_object_once`, which hits a live S3 bucket.
-        #
-        # A rename would leave `--exact` matching nothing, and the harness exits
-        # 0 on zero tests -- silently reopening exactly the hole this job was
-        # added to close. So the counts are asserted rather than assumed.
+        # Named exactly: `--exact` because a rename would leave the filter
+        # matching nothing, and the harness exits 0 on zero tests -- silently
+        # reopening exactly the hole this job was added to close. So the
+        # counts are asserted rather than assumed.
         #
         # Two invocations since WO-RG: the renderer's sentinel test moved to
-        # rustdar-gpu with the renderer (module path unchanged -- only the -p
-        # moved); the volume trio stays in rustdar-frontend until WO-RV.
+        # rustdar-gpu with the renderer; the volume trio moved to
+        # rustdar-volumetric with the 3D stack at WO-RV (the `volume::` module
+        # segment became the crate root, so the paths lost that prefix).
         run: |
-          cargo test -p rustdar-frontend --lib -- --ignored --nocapture --exact \
-            volume::tests::a_real_adapter_supports_the_volume_format \
-            volume::raymarch::staging::tests::the_two_routes_write_the_same_plane \
-            volume::raymarch::staging::tests::the_worst_case_residency_is_the_ring_and_the_widening_together \
+          cargo test -p rustdar-volumetric --lib -- --ignored --nocapture --exact \
+            tests::a_real_adapter_supports_the_volume_format \
+            raymarch::staging::tests::the_two_routes_write_the_same_plane \
+            raymarch::staging::tests::the_worst_case_residency_is_the_ring_and_the_widening_together \
             | tee "$RUNNER_TEMP/lib-gpu.log"
           grep -q '^test result: ok\. 3 passed' "$RUNNER_TEMP/lib-gpu.log"
           cargo test -p rustdar-gpu --lib -- --ignored --nocapture --exact \

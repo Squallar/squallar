@@ -245,7 +245,7 @@ pub struct App {
     ///
     /// `None` until the renderer is built, and replaced wholesale whenever it
     /// is rebuilt, so it can never point at a painter `Gui` is no longer using.
-    volume_painter: Option<Arc<crate::volume::bridge::BridgeVolumePainter>>,
+    volume_painter: Option<Arc<rustdar_volumetric::bridge::BridgeVolumePainter>>,
     /// The rung the pane mirror is drawn at, and the hysteresis that governs
     /// when it may move. One per application, because the mirror is one texture
     /// for the whole application. See `egui_renderer::mirror`.
@@ -255,7 +255,7 @@ pub struct App {
     /// allowance for the whole application. See `crate::loop_pool`.
     ///
     /// On `App` rather than on `AppState`, and that is load-bearing for exactly
-    /// the reason `crate::volume::degrade`'s counters are module statics: a lost
+    /// the reason `rustdar_volumetric::degrade`'s counters are module statics: a lost
     /// surface sets `self.state = None`, and a pool that backed off *because* of
     /// a lost surface would be destroyed by the event it just learned from.
     /// Every per-target number this build spends, resolved once from a
@@ -547,7 +547,7 @@ pub struct App {
     ///
     /// `Arc` because the painter handed to the `Gui` reads it during the UI
     /// pass, while this side writes it from the action handler.
-    volume_store: std::sync::Arc<crate::volume::bridge::VolumeStore>,
+    volume_store: std::sync::Arc<rustdar_volumetric::bridge::VolumeStore>,
     /// How many times [`extract_current_volume`] has run — the call-count
     /// seam for the tests that pin *when* the frame thread pays for the
     /// merged-volume walk, the same property the section path carries in its
@@ -1038,7 +1038,7 @@ impl App {
             site_is_provisional,
             catalogue_pending,
             site_hint_pending,
-            volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
+            volume_store: std::sync::Arc::new(rustdar_volumetric::bridge::VolumeStore::new()),
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
             http_client,
@@ -1638,12 +1638,12 @@ impl App {
         // Nothing is built on a device that cannot render a volume — the
         // pipelines would compile a shader against limits already known to be
         // short, and `create_render_pipeline` has no `Result` to notice it in.
-        if crate::volume::support(&state.volume_support).is_supported() {
+        if rustdar_volumetric::support(&state.volume_support).is_supported() {
             log::info!(
                 "3D volume view: {quality:?} on {:?}",
                 state.adapter.get_info().device_type
             );
-            let resources = crate::volume::bridge::VolumeResources::new(
+            let resources = rustdar_volumetric::bridge::VolumeResources::new(
                 &state.device,
                 state.egui_renderer.attachment_config(),
                 &state.queue,
@@ -1654,7 +1654,7 @@ impl App {
                 .insert(resources);
         }
 
-        let painter = std::sync::Arc::new(crate::volume::bridge::BridgeVolumePainter::new(
+        let painter = std::sync::Arc::new(rustdar_volumetric::bridge::BridgeVolumePainter::new(
             self.volume_store.clone(),
             quality,
             self.budgets.offscreen_bytes,
@@ -1710,7 +1710,7 @@ impl App {
     }
 
     fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
-        if self.prepare_volume(pane_idx, &target, crate::volume::bridge::Hold::Single)
+        if self.prepare_volume(pane_idx, &target, rustdar_volumetric::bridge::Hold::Single)
             == VolumePrepare::Served
         {
             self.mark_volume_rendered(pane_idx, &target);
@@ -1722,7 +1722,7 @@ impl App {
     ///
     /// `hold` is the whole difference between the two callers: a live 3D pane
     /// holds one grid and lets the store shed the rest, a loop holds its whole
-    /// frame list. See [`crate::volume::bridge::Hold`].
+    /// frame list. See [`rustdar_volumetric::bridge::Hold`].
     ///
     /// # Which volume a target names
     ///
@@ -1760,9 +1760,9 @@ impl App {
         &mut self,
         pane_idx: usize,
         target: &rustdar_egui::pane::VolumeTarget,
-        hold: crate::volume::bridge::Hold,
+        hold: rustdar_volumetric::bridge::Hold,
     ) -> VolumePrepare {
-        use crate::volume::bridge::VolumeEntry;
+        use rustdar_volumetric::bridge::VolumeEntry;
 
         // Built, building, or refused — attach and share rather than repeat.
         if self.volume_store.share_held(pane_idx, target, hold) {
@@ -1930,7 +1930,7 @@ impl App {
     /// other half is `lookup_for_pane` keeping the old grid on screen while
     /// the build ran.
     fn poll_voxel_results(&mut self) {
-        use crate::volume::bridge::VolumeEntry;
+        use rustdar_volumetric::bridge::VolumeEntry;
 
         while let Ok(vr) = self.channels.voxel_receiver.try_recv() {
             let ready_grid = vr.grid.map(|grid| std::sync::Arc::new(*grid));
@@ -2114,7 +2114,7 @@ impl App {
             && let Some(resources) = state
                 .egui_renderer
                 .callback_resources_mut()
-                .get_mut::<crate::volume::bridge::VolumeResources>()
+                .get_mut::<rustdar_volumetric::bridge::VolumeResources>()
         {
             resources.release_pane(pane_idx, &live);
         }
@@ -2145,7 +2145,7 @@ impl App {
     ///
     /// # What it must not disturb
     ///
-    /// A 3D loop holds a **set** of grids ([`crate::volume::bridge::Hold::Set`]),
+    /// A 3D loop holds a **set** of grids ([`rustdar_volumetric::bridge::Hold::Set`]),
     /// exempt from every shed there is. Two directions therefore matter and
     /// both are pinned:
     ///
