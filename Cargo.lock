@@ -4388,6 +4388,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rustdar-geo",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
 ]
