@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_units::UserPreferences;
 
@@ -1437,6 +1438,36 @@ impl OverlayKind {
     pub fn default_draw_order() -> Vec<OverlayKind> {
         Self::all().to_vec()
     }
+
+    /// The M8a bridge: this variant's open-string identity. Each arm hands
+    /// out the [`known`] const whose spelling equals the variant's `Debug`
+    /// spelling — the equality the spelling-pin test below holds, and the
+    /// reason M8's enum-to-string flip needs no config migration.
+    pub fn id(self) -> LayerId {
+        match self {
+            Self::ModelData => known::MODEL_DATA,
+            Self::SpcOutlook => known::SPC_OUTLOOK,
+            Self::SpcDiscussions => known::SPC_DISCUSSIONS,
+            Self::NwsAlerts => known::NWS_ALERTS,
+            Self::StormReports => known::STORM_REPORTS,
+            Self::Lightning => known::LIGHTNING,
+            Self::Metar => known::METAR,
+            Self::Radar => known::RADAR,
+            Self::CityLabels => known::CITY_LABELS,
+            Self::RadarSites => known::RADAR_SITES,
+            Self::UserLocation => known::USER_LOCATION,
+            Self::ColorScale => known::COLOR_SCALE,
+        }
+    }
+
+    /// The bridge's other direction: the variant whose [`Self::id`] equals
+    /// `id`, or `None` for an id no variant owns (open strings admit ids the
+    /// enum never will — callers keep unknowns, they don't invent variants).
+    /// Scans [`Self::all`] rather than matching a second literal spelling
+    /// table: `id()` stays the one enum-to-string spelling site.
+    pub fn from_id(id: &LayerId) -> Option<Self> {
+        Self::all().iter().copied().find(|kind| &kind.id() == id)
+    }
 }
 
 // ── Unified overlay fetch result ──────────────────────────────────────────
@@ -2338,6 +2369,59 @@ mod state_key_tests {
                 "{debug_spelling} is not one of the twelve names saved configs \
                  file handler state under — a renamed variant orphans the \
                  user's saved state for it",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod layer_id_bridge_tests {
+    use rustdar_source::id::LAYER_ID_LEDGER;
+
+    use super::OverlayKind;
+
+    /// Test group 1 (spelling pin): every variant's `LayerId` is its own
+    /// `Debug` spelling, byte for byte — **THE zero-config-migration proof**.
+    /// Configs key on the Debug spellings today (the E0a corpus pins them);
+    /// M8b re-keys on `id().as_str()`; this equality is why nothing in any
+    /// user's file moves. A red here means a `known` const drifted from its
+    /// variant — fix the const, never the enum.
+    #[test]
+    fn every_kinds_id_is_its_own_debug_spelling() {
+        assert_eq!(OverlayKind::all().len(), 12);
+        for &kind in OverlayKind::all() {
+            assert_eq!(
+                kind.id().as_str(),
+                format!("{kind:?}"),
+                "the known const for {kind:?} does not spell the Debug name — \
+                 M8b's re-key would orphan this layer's saved state",
+            );
+        }
+    }
+
+    /// Test group 2 (round-trip): the bridge inverts — `from_id(id())`
+    /// answers the variant it came from, for all twelve.
+    #[test]
+    fn the_bridge_round_trips_every_variant() {
+        for &kind in OverlayKind::all() {
+            assert_eq!(
+                OverlayKind::from_id(&kind.id()),
+                Some(kind),
+                "from_id(id()) failed to invert for {kind:?}",
+            );
+        }
+    }
+
+    /// Test group 3's bridge half: every variant's id appears in the
+    /// append-only ledger — the enum cannot register a spelling the ledger
+    /// does not carry.
+    #[test]
+    fn every_variants_id_sits_in_the_ledger() {
+        for &kind in OverlayKind::all() {
+            assert!(
+                LAYER_ID_LEDGER.contains(&kind.id().as_str()),
+                "{kind:?}'s id is missing from LAYER_ID_LEDGER — ledger rows \
+                 are append-only and this one was never appended",
             );
         }
     }

@@ -6,6 +6,7 @@
 //! `tests/charter.rs`.
 
 pub mod feature;
+pub mod id;
 pub mod job;
 pub mod origins;
 pub mod tls;
