@@ -224,7 +224,7 @@ exists so the fetch can start immediately. Nothing notifies the user of weather.
 | GR2Analyst placefile compat | ✅         | ❌           | ❌    | ❌                 |
 
 - **Mobile** is Partial: Android ships (`rustdar-android`), and iOS builds an
-  `.ipa` in CI (`ios/Makefile`, the `ios-aarch64` row of `build.yaml`), but it
+  `.ipa` in CI (`packaging/ios/Makefile`, the `ios-aarch64` row of `build.yaml`), but it
   is unsigned and undistributed.
 - **Multi-pane** is up to six panes on desktop and four on mobile
   (`MAX_PANES_DESKTOP` / `MAX_PANES_MOBILE` in `rustdar-egui/src/pane.rs`).

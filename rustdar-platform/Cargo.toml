@@ -16,7 +16,7 @@ name = "rustdar_platform_lib"
 #
 # iOS needs a `staticlib` to link the .app against, but adding it here would
 # archive the whole graph on every desktop build and every `--all-targets`
-# clippy run too. `ios/Makefile` asks for it per-build with
+# clippy run too. `packaging/ios/Makefile` asks for it per-build with
 # `cargo rustc --crate-type staticlib` instead.
 crate-type = ["rlib"]
 path = "src/lib.rs"
