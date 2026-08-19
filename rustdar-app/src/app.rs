@@ -2623,6 +2623,11 @@ impl App {
                             self.gui.clear_loading_site_for_site(&site);
                             self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
+                            // The volume just became the one the panes draw:
+                            // rebuild their extraction payloads at arrival
+                            // (WO-E4.9) — after the ScanInfoForSite apply, so
+                            // the tuple read here is the tuple dispatch reads.
+                            self.refresh_extract_cache_for_site(&site);
 
                             // Append the new scan to any active loops on this site
                             self.append_scan_to_active_loops(
@@ -2772,6 +2777,13 @@ impl App {
             "evicted-cached-volume",
             evicted(&mut self.latest_cached_scans, &unshown),
         );
+        // The extraction payloads (WO-E4.9): entries die with their volume,
+        // on this same pass — a site no pane names has no dispatch left to
+        // serve. (Within a shown site, each arrival already swept the
+        // previous volume's entries in `refresh_extract_cache_for_site`.)
+        // Before the loop sweep below only because `unshown` borrows the
+        // pane list and that sweep takes `&mut self`.
+        self.render.retain_extracts(|key| !unshown(&key.site));
         self.evict_unneeded_loop_scans();
         // And the derivation memo (WO-E4.8), pruned against what SURVIVED the
         // passes above — every holder of a whole decoded volume contributes,

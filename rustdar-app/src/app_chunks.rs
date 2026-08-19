@@ -466,6 +466,14 @@ impl super::App {
         // to user navigation and would drag the time picker along every few
         // seconds, and `manual_nav_pending`, which would trigger
         // `reinit_active_loops` and re-list the whole lookback window per round.
+
+        // Both arms above installed a new snapshot into `scan_data`, and on a
+        // live volume the snapshot keeps its `volume_start` while sweeps seal
+        // — exactly the case WO-E4.9's stale-first invalidation exists for.
+        // Rebuild the shown panes' extraction payloads off the new snapshot;
+        // until they home, dispatch takes the miss fallback (today's inline
+        // walk), never a stale hit.
+        self.refresh_extract_cache_for_site(site);
     }
 
     /// Hand a site back to the archive path.
