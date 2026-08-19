@@ -94,11 +94,15 @@ jobs:
       # above take there. A mutant is one shader compile and one small render,
       # and neither is what a software rasteriser is slow at.
       - name: Run the adapter-only integration tests
+        # `-p rustdar-gpu` since WO-RV land 3: the ENTIRE GPU-bound suite lives
+        # in rustdar-gpu/tests (the hardware quarantine — this job is the ONE
+        # owner of every `--ignored` adapter invocation; `cargo test` on any
+        # other package needs no adapter).
         run: |
-          cargo test -p rustdar-frontend \
+          cargo test -p rustdar-gpu \
             --test volume_gpu --test volume_silhouette --test volume_shader_mutants \
             -- --ignored --nocapture
-      # The other three `#[ignore]`d files in that directory --
+      # The other three `#[ignore]`d files in rustdar-gpu/tests --
       # volume_real_mask, volume_march_cost and floor_alignment -- are
       # deliberately not here. Each reads a Level II volume from a path given in
       # the environment, no such file exists in this repository, and radar data

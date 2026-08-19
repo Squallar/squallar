@@ -316,14 +316,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          successor is wider.",
     ),
     (
-        "rustdar-frontend/tests/floor_alignment.rs",
+        "rustdar-gpu/tests/floor_alignment.rs",
         "the_sites_pixel_lands_in_the_middle_of_a_site_centred_floor",
         "Names the test in the **deleted** `volume_floor/tests.rs` that this \
          one was re-pinned from, so a reader can see which half of the old \
          contract survived the floor texture's removal.",
     ),
     (
-        "rustdar-frontend/tests/floor_alignment.rs",
+        "rustdar-gpu/tests/floor_alignment.rs",
         "a_tile_pixel_and_a_radar_gate_at_the_same_ground_land_on_the_same_texel",
         "As above, for the gate/pixel coincidence pin. The old contract's \
          tile route went with the compositor; the paragraph says so and keeps \

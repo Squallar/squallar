@@ -6,11 +6,9 @@ name = "rustdar-gpu"
 version.workspace = true
 edition.workspace = true
 
-# NOTE (WO-RG interim): rustdar-frontend still carries its own copies of the
-# wgpu feature-chooser and per-target backend blocks below — app.rs still owns
-# the instance creation and the single-wgpu guard until WO-RV land 3 moves
-# them here. The redundancy is deliberate and temporary; at land 3 this
-# manifest becomes the one feature-chooser for the whole graph.
+# Since WO-RV land 3 this manifest is the ONE wgpu feature-chooser for the
+# whole graph (rustdar-frontend dropped its duplicate copies), and src/lib.rs
+# carries the single-copy and backend-features guards that hold it.
 
 [dependencies]
 egui = { workspace = true }
@@ -111,4 +109,37 @@ egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"]
 serde_json = { workspace = true }
 # `a_paint_callbacks_own_command_buffer_reaches_the_queue` blocks on a real
 # adapter request; the test is `#[ignore]`d by default and CI's gpu job opts in.
+# gpu_harness blocks on adapter/device requests the same way.
 pollster = { workspace = true }
+# The ENTIRE GPU-bound integration suite lives in this crate's tests/ (WO-RV
+# land 3, the hardware quarantine): one wgpu_guard, one CI job, and
+# rustdar-volumetric's default test run stays CPU-only. The dev-dep back onto
+# rustdar-volumetric is LEGAL: dev-deps never enter the normal graph, so the
+# normal edge volumetric -> gpu stands unopposed.
+rustdar-volumetric = { workspace = true }
+# The voxel vocabulary and product names the suites drive the stack with.
+rustdar-radar = { workspace = true }
+# live_volume decodes real Level II archives into nexrad-model scans;
+# volume_stand_in stamps one with chrono; floor_alignment's differential
+# fixtures read rustdar-geo directly.
+nexrad-model = { workspace = true }
+chrono = { workspace = true }
+rustdar-geo = { workspace = true }
+
+# Target-gated for the reason rustdar-web's dev-dependencies are: a plain
+# `[dev-dependencies]` entry is built for every target under `--all-targets`.
+#
+# `syn` parses `src/lib.rs` in `tests/wgpu_guard.rs`. Same 3.0.3 the proc-macro
+# crates already resolve, so this adds no package -- and being a dev-dependency
+# it reaches no shipped artifact.
+#
+# `naga` translates rustdar-volumetric's `src/volume.wgsl` (reached as
+# `rustdar_volumetric::raymarch::VOLUME_SHADER_WGSL`, a dev-dep of this crate)
+# to GLSL ES 300 in `tests/volume_shader.rs` -- the one check that says what a
+# WebGL2 browser will actually be handed. See the workspace manifest for why it
+# is a direct dependency rather than reached through wgpu. The gate here is the
+# wasm32 clippy row: the test file is `#![cfg(not(target_arch = "wasm32"))]`,
+# so on that target the dependency would be built and then used by nothing.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+naga = { workspace = true }
+syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }

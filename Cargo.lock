@@ -4228,9 +4228,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "ewebsock",
- "half",
  "log",
- "naga",
  "nexrad-level3",
  "nexrad-model",
  "pollster",
@@ -4249,11 +4247,9 @@ dependencies = [
  "rustdar-worker",
  "serde",
  "serde_json",
- "syn 3.0.3",
  "tokio",
  "wasm-bindgen-futures",
  "web-time",
- "wgpu",
  "winit",
 ]
 
@@ -4268,13 +4264,20 @@ dependencies = [
 name = "rustdar-gpu"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "naga",
+ "nexrad-model",
  "pollster",
  "rustdar-device-profile",
  "rustdar-egui",
+ "rustdar-geo",
+ "rustdar-radar",
+ "rustdar-volumetric",
  "serde_json",
+ "syn 3.0.3",
  "wgpu",
  "winit",
 ]

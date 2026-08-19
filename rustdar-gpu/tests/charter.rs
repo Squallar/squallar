@@ -72,8 +72,9 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 ///
 /// rustdar-gpu is the wgpu boundary — egui must never depend on it, and it
 /// must never depend on rustdar-volumetric or rustdar-frontend (normal); the
-/// GPU test suite's dev-dep on rustdar-volumetric arrives at WO-RV and is
-/// legal because dev-deps never enter the normal graph.
+/// GPU test suite's dev-dep back onto rustdar-volumetric (WO-RV land 3, the
+/// hardware quarantine) is legal because dev-deps never enter the normal
+/// graph.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata();
@@ -82,8 +83,25 @@ fn the_dependency_ceiling_holds() {
     for (kind, name) in &deps {
         let allowed: bool = match kind.as_str() {
             // serde_json parses `cargo metadata` in this very file; pollster
-            // blocks on the adapter request in the `#[ignore]`d GPU unit test.
-            "dev" => name == "serde_json" || name == "pollster",
+            // blocks on the adapter requests in the `#[ignore]`d GPU tests.
+            // The rest arrived with the GPU-bound integration suite (WO-RV
+            // land 3): rustdar-volumetric is the quarantined stack under
+            // test; rustdar-radar/nexrad-model/chrono/rustdar-geo feed the
+            // suites' scans and fixtures; naga translates the volumetric
+            // shader in volume_shader.rs; syn parses the single-copy guard
+            // in wgpu_guard.rs. All dev — none enters the normal graph.
+            "dev" => matches!(
+                name.as_str(),
+                "serde_json"
+                    | "pollster"
+                    | "rustdar-volumetric"
+                    | "rustdar-radar"
+                    | "nexrad-model"
+                    | "chrono"
+                    | "rustdar-geo"
+                    | "naga"
+                    | "syn"
+            ),
             "normal" => matches!(
                 name.as_str(),
                 "egui"
@@ -103,11 +121,11 @@ fn the_dependency_ceiling_holds() {
             allowed,
             "rustdar-gpu declares {name} ({kind}). rustdar-gpu is the wgpu \
              boundary — egui must never depend on it, it must never depend on \
-             rustdar-volumetric or rustdar-frontend (normal); the GPU test \
-             suite's dev-dep on rustdar-volumetric arrives at WO-RV and is \
-             legal because dev-deps never enter the normal graph. Anything \
-             else lands here only after this charter and the plan change \
-             first, in writing.",
+             rustdar-volumetric or rustdar-frontend as a NORMAL dep; the GPU \
+             test suite's dev-dep back onto rustdar-volumetric (WO-RV land 3, \
+             the hardware quarantine) is legal because dev-deps never enter \
+             the normal graph. Anything else lands here only after this \
+             charter and the plan change first, in writing.",
         );
     }
 
@@ -116,6 +134,7 @@ fn the_dependency_ceiling_holds() {
     // package cannot pass as an empty set.
     for (kind, name) in [
         ("dev", "serde_json"),
+        ("dev", "rustdar-volumetric"),
         ("normal", "rustdar-egui"),
         ("normal", "rustdar-device-profile"),
     ] {

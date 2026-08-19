@@ -1,16 +1,16 @@
-//! Gates the shape of the single-copy wgpu guard in `src/app.rs`. The guard's
+//! Gates the shape of the single-copy wgpu guard in `src/lib.rs`. The guard's
 //! own `on_unimplemented` notes say what it is for.
 //!
 //! It is inert code nothing references, and edits exist that leave it compiling
 //! while it asserts nothing — dropping the leading `::` is the one to know
-//! about, since bare `wgpu::` in `app.rs` is the `use egui_wgpu::wgpu` at the
-//! top of the file. So: parse `app.rs`, resolve the two types it compares, and
+//! about, since bare `wgpu::` in the boundary crate rides the `egui_wgpu::wgpu` re-export, per its
+//! top of the file. So: parse `lib.rs`, resolve the two types it compares, and
 //! check they are different crates. Parsing rather than scanning is what makes
 //! decoys in comments and string literals inert; matching on structure rather
 //! than on the aliases' names is what keeps renames and side-swaps passing.
 //!
 //! The second test here closes the hole the first one's *premise* leaves open.
-//! `guard_compares_two_different_crates` proves `app.rs` compares this crate's
+//! `guard_compares_two_different_crates` proves `lib.rs` compares this crate's
 //! `wgpu` against egui-wgpu's — and that is the whole check, for the whole
 //! crate. It says nothing about any *other* file, and any other file naming
 //! `::wgpu` reaches the direct dependency rather than the re-export. Today they
@@ -96,8 +96,8 @@ fn crate_path(ty: &Type) -> CratePath {
 /// The two types the guard compares: the one the marker trait is implemented
 /// for, and the one the assertion requires it of.
 fn guard_sides() -> (CratePath, CratePath) {
-    let file = syn::parse_file(include_str!("../src/app.rs"))
-        .expect("rustdar-frontend/src/app.rs does not parse");
+    let file = syn::parse_file(include_str!("../src/lib.rs"))
+        .expect("rustdar-gpu/src/lib.rs does not parse");
 
     // The guard is the anonymous const that declares a trait. The backend
     // assertion next to it is also a `const _`, but declares no items.
@@ -118,14 +118,14 @@ fn guard_sides() -> (CratePath, CratePath) {
 
     let block = blocks.next().unwrap_or_else(|| {
         panic!(
-            "the wgpu single-copy guard is gone from rustdar-frontend/src/app.rs. Without it \
+            "the wgpu single-copy guard is gone from rustdar-gpu/src/lib.rs. Without it \
              a second wgpu resolves silently and this crate's backend features go to a copy \
              nothing renders through."
         )
     });
     assert!(
         blocks.next().is_none(),
-        "more than one candidate guard block in app.rs"
+        "more than one candidate guard block in lib.rs"
     );
 
     let mut aliases: HashMap<String, &Type> = HashMap::new();
@@ -170,7 +170,7 @@ fn guard_compares_two_different_crates() {
     assert_eq!(
         rooted, 1,
         "the wgpu guard compares `{impl_side}` against `{assert_side}`, of which {rooted} are \
-         `::`-rooted; exactly one must be. Bare `wgpu::` in app.rs is the `use egui_wgpu::wgpu` \
+         `::`-rooted; exactly one must be. Bare `wgpu::` outside the guard is the `egui_wgpu::wgpu` re-export \
          at the top of the file, so a guard with no `::`-rooted side compares egui-wgpu's copy \
          against itself and passes however many wgpus are in the graph."
     );
@@ -257,7 +257,7 @@ fn source_files(dir: &FsPath, into: &mut Vec<PathBuf>) {
     }
 }
 
-/// `app.rs` must be the only file in this crate that names `::wgpu`.
+/// `lib.rs` must be the only file in this crate that names `::wgpu`.
 ///
 /// The guard above establishes that *one* pair of paths in *one* file resolves
 /// to two different crates. That is the entire single-copy check, and its blast
@@ -270,7 +270,7 @@ fn source_files(dir: &FsPath, into: &mut Vec<PathBuf>) {
 /// nothing, or a texture that never appears.
 ///
 /// So the rule is: reach wgpu through `egui_wgpu::wgpu`, everywhere except the
-/// guard itself. `app.rs` is exempt because naming the direct dependency is
+/// guard itself. `lib.rs` is exempt because naming the direct dependency is
 /// precisely what it is for — that is what keeps `cargo machete` and `cargo
 /// udeps` from reporting the manifest entry as dead.
 #[test]
@@ -281,7 +281,7 @@ fn every_wgpu_path_outside_the_guard_goes_through_egui_wgpu() {
     files.sort();
 
     // A scan over nothing passes. Pin that there is something to scan, and that
-    // the exemption is still earning its keep — if `app.rs` stops naming
+    // the exemption is still earning its keep — if `lib.rs` stops naming
     // `::wgpu`, the guard has moved or gone and this test's exemption is stale.
     assert!(
         files.len() > 5,
@@ -291,7 +291,7 @@ fn every_wgpu_path_outside_the_guard_goes_through_egui_wgpu() {
         src.display()
     );
 
-    let mut app_rs_seen = false;
+    let mut lib_rs_seen = false;
     for file in &files {
         let name = file
             .file_name()
@@ -305,11 +305,11 @@ fn every_wgpu_path_outside_the_guard_goes_through_egui_wgpu() {
         let mut found = RootedWgpuPaths::default();
         found.visit_file(&parsed);
 
-        if name == "app.rs" {
-            app_rs_seen = true;
+        if name == "lib.rs" {
+            lib_rs_seen = true;
             assert!(
                 !found.0.is_empty(),
-                "app.rs no longer names `::wgpu`, so the single-copy guard has \
+                "lib.rs no longer names `::wgpu`, so the single-copy guard has \
                  moved or gone — and this test is exempting a file that no \
                  longer holds the guard it is exempted for"
             );
@@ -331,7 +331,7 @@ fn every_wgpu_path_outside_the_guard_goes_through_egui_wgpu() {
     }
 
     assert!(
-        app_rs_seen,
-        "src/app.rs was not scanned, so the guard's own file went unchecked"
+        lib_rs_seen,
+        "src/lib.rs was not scanned, so the guard's own file went unchecked"
     );
 }
