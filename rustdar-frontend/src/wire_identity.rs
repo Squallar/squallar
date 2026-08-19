@@ -67,12 +67,25 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
 
 /// The 2 overlay-reply framing rows, exactly as
 /// `offload::tests::the_overlay_reply_framing_is_the_one_this_protocol_ships`
-/// asserts them: the reply direction's only framed layout, folded into the
-/// token beside the request rows — same suite, same mechanism, strictly
-/// better local detection.
+/// asserts them, folded into the token beside the request rows — same
+/// suite, same mechanism, strictly better local detection.
 pub const WIRE_REPLY_ROWS: &[&str] = &[
     "bare | 17 | 0x770d1b313226dd5f",
     "cells | 69 | 0x6637c90fa10e397a",
+];
+
+/// The 2 frame-reply framing rows, exactly as
+/// `offload::tests::the_frame_reply_framing_is_the_one_this_registry_ships`
+/// asserts them: the frame's wire form
+/// (`rustdar_radar::frame::RenderedFrame::to_bytes`, WO-M7c) over one
+/// fixture with all three optional trios present and one with none, folded
+/// into the token beside the overlay reply rows on the M5 seam ruling's own
+/// grounds — same suite, same mechanism, strictly better local detection:
+/// a local page/worker pair differing only in the frame reply's layout
+/// would otherwise still pair, and misread every frame.
+pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
+    "frame/full | 121 | 0x2d1d072668c28197",
+    "frame/bare | 59 | 0x29c0bfe9f51ad71e",
 ];
 
 /// The canonical envelope's layout as one literal sentence, folded into
@@ -102,7 +115,9 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// The wire's identity as one number, based on the composed registry
 /// (WO-M7b): FNV-1a 64 over, in order, each row of [`WIRE_FRAMING_ROWS`]
 /// prefixed by the composed-registry index of the row's kind, then
-/// [`CANONICAL_ENVELOPE_LAYOUT`], then every row of [`WIRE_REPLY_ROWS`].
+/// [`CANONICAL_ENVELOPE_LAYOUT`], then every row of [`WIRE_REPLY_ROWS`],
+/// then every row of [`WIRE_FRAME_REPLY_ROWS`] (WO-M7c — the reply
+/// direction's framing is registry-shipped in both payload families now).
 ///
 /// The index prefix is resolved against the crate-private
 /// `job_registry::job_codecs` composition by the row's own kind label — the
@@ -134,6 +149,9 @@ pub fn wire_digest() -> u64 {
     }
     hash = fnv1a64(hash, CANONICAL_ENVELOPE_LAYOUT.as_bytes());
     for row in WIRE_REPLY_ROWS {
+        hash = fnv1a64(hash, row.as_bytes());
+    }
+    for row in WIRE_FRAME_REPLY_ROWS {
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash

@@ -52,13 +52,13 @@ use crate::render::rasterize::{
 /// and the labels are the shipped kind strings the frontend's framing rows
 /// print, byte for byte.
 pub static JOB_CODECS: &[JobCodec] = &[
-    JobCodec::with_out::<SitesJob>(),
-    JobCodec::with_out::<AlertsJob>(),
-    JobCodec::with_out::<OutlooksJob>(),
-    JobCodec::with_out::<DiscussionsJob>(),
-    JobCodec::with_out::<ReportsJob>(),
-    JobCodec::with_out::<GlmJob>(),
-    JobCodec::with_out::<ModelJob>(),
+    JobCodec::of::<SitesJob>(),
+    JobCodec::of::<AlertsJob>(),
+    JobCodec::of::<OutlooksJob>(),
+    JobCodec::of::<DiscussionsJob>(),
+    JobCodec::of::<ReportsJob>(),
+    JobCodec::of::<GlmJob>(),
+    JobCodec::of::<ModelJob>(),
 ];
 
 /// The radar-site markers row.
@@ -1017,11 +1017,11 @@ fn decode_polygon(r: &mut Reader) -> Option<crate::types::GeoPolygon> {
 // ── The wire enums ───────────────────────────────────────────────────────
 
 /// An [`AlertCategory`](crate::nws::alert::AlertCategory) as a number, in
-/// the newtype-pair shape `MeltingLayerWire` (in `rustdar_frontend::offload`)
-/// set: both directions are exhaustive over the same arms, so a variant
-/// added upstream fails this build rather than silently encoding as
-/// something else. The numbering is the enum's own declaration order, most
-/// severe first.
+/// the newtype-pair shape `MeltingLayerWire` (in `rustdar_radar::frame`,
+/// beside the frame codec since WO-M7c) set: both directions are exhaustive
+/// over the same arms, so a variant added upstream fails this build rather
+/// than silently encoding as something else. The numbering is the enum's own
+/// declaration order, most severe first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AlertCategoryWire(crate::nws::alert::AlertCategory);
 
@@ -1260,12 +1260,9 @@ mod tests {
                 "every overlay row is a raster job (`{}`)",
                 row.label,
             );
-            assert!(
-                row.encode_out.is_some() && row.decode_out.is_some(),
-                "every overlay reply is a raster; the reply codecs ride \
-                 every row (`{}`)",
-                row.label,
-            );
+            // The reply codecs ride every row by construction since WO-M7c
+            // de-Optioned the pair; the reply round-trip tests in this
+            // module are what pin their behaviour.
         }
         let distinct: std::collections::HashSet<std::any::TypeId> =
             JOB_CODECS.iter().map(|row| (row.input_type)()).collect();
@@ -1486,14 +1483,11 @@ mod tests {
             alpha: AlphaMode::Premultiplied,
         }));
         let mut bytes = Vec::new();
-        (row.encode_out
-            .expect("every overlay row carries the reply codecs"))(&reply, &mut bytes);
-        let back = (row
-            .decode_out
-            .expect("every overlay row carries the reply codecs"))(&bytes)
-        .expect("a row must decode its own reply encode")
-        .take::<RasterizeOutput>()
-        .expect("the reply is a raster");
+        (row.encode_out)(&reply, &mut bytes);
+        let back = (row.decode_out)(&bytes)
+            .expect("a row must decode its own reply encode")
+            .take::<RasterizeOutput>()
+            .expect("the reply is a raster");
         assert_eq!(back.rgba, rgba, "the RGBA tail must survive unjudged");
         assert_eq!(back.hit_cells, hit_cells, "the cells must survive framed");
         assert_eq!(

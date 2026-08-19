@@ -360,7 +360,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             response,
             app.channels.overlay_render_sender.clone(),
             None,
-        )(Some(output));
+        )(Some(rustdar_source::job::DescribedOut(Box::new(output))));
         app.channels
             .overlay_render_receiver
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -371,9 +371,11 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     // the zipped map answers the item the cells name — at cell 33 = (1, 2).
     let ok = deliver(
         Some(items.clone()),
-        crate::offload::JobOutput::OverlayRaster {
+        rustdar_overlays::render::rasterize::RasterizeOutput {
             rgba: rgba.clone(),
             hit_cells: Some(cells(33, 1)),
+            // The reply contract: pixels arrive premultiplied.
+            alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
         },
     );
     assert!(ok.image.is_some(), "the well-shaped reply must deliver");
@@ -390,49 +392,63 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     // Every mismatch: a grid that is not this dispatch's, an id past the
     // captured items, cells without items, items without cells, and a
     // buffer of the wrong length beside well-formed cells.
-    let mismatches: Vec<(&str, IdMap, crate::offload::JobOutput)> = vec![
+    let mismatches: Vec<(
+        &str,
+        IdMap,
+        rustdar_overlays::render::rasterize::RasterizeOutput,
+    )> = vec![
         (
             "a wrong-grid reply",
             Some(items.clone()),
-            crate::offload::JobOutput::OverlayRaster {
+            rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: Some(HitCells {
                     width: 17,
                     height: 12,
                     cells: std::collections::HashMap::from([(33u32, vec![1u32])]),
                 }),
+                // The reply contract: pixels arrive premultiplied.
+                alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
         (
             "an id past the captured items",
             Some(items.clone()),
-            crate::offload::JobOutput::OverlayRaster {
+            rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: Some(cells(33, 2)),
+                // The reply contract: pixels arrive premultiplied.
+                alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
         (
             "cells with no items captured",
             None,
-            crate::offload::JobOutput::OverlayRaster {
+            rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: Some(cells(33, 0)),
+                // The reply contract: pixels arrive premultiplied.
+                alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
         (
             "no cells where items were captured",
             Some(items.clone()),
-            crate::offload::JobOutput::OverlayRaster {
+            rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: None,
+                // The reply contract: pixels arrive premultiplied.
+                alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
         (
             "a short buffer beside well-formed cells",
             Some(items.clone()),
-            crate::offload::JobOutput::OverlayRaster {
+            rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: vec![0u8; 16],
                 hit_cells: Some(cells(33, 1)),
+                // The reply contract: pixels arrive premultiplied.
+                alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
     ];

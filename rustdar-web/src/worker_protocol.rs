@@ -33,100 +33,32 @@ pub const ID: &str = "id";
 pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
-pub const IMAGE: &str = "image";
-/// Worker → page: the gates behind the raster, as
-/// [`rustdar_radar::render::polar::PolarField::to_bytes`] writes them.
-///
-/// It carried a `Float32Array` of the `side²` raster value grid until the
-/// readout stopped reading pixels: 16 MiB on this target, transferred but still
-/// copied once into the worker's linear memory to build and once out of the
-/// page's to read. This is the same numbers at the resolution the radar took
-/// them — about 5 MiB for the widest sweep, and a few kilobytes for a loop
-/// frame, which carries geometry and no values at all.
-pub const POLAR: &str = "polar";
-pub const MAX_RANGE: &str = "range";
-/// Worker → page: where the rendered sweep's cut declared its velocity folds,
-/// m/s, or **null** for a raster with no one cut behind it.
-///
-/// Null is the encoding of `None`, not a compatibility shim: a Level III
-/// product, a volume product and a Message 1 volume all legitimately have no
-/// such number, and `Option::None` has to cross as something. The page reads it
-/// back through the same `as_f64` filter every numeric field takes, so an
-/// absent field and a null one resolve alike — which is what makes writing it
-/// unconditionally in every arm of `post_result` the whole of the contract.
-pub const NYQUIST: &str = "nyq";
-/// Worker → page: where the melting layer the rendered raster was classified
-/// against came from, as
-/// [`rustdar_frontend::offload::MeltingLayerWire::wire_code`], or **null** for
-/// a raster that classified nothing — which is every product but the hybrid
-/// classification.
-///
-/// A number and not a string for the reason [`OUT_KIND`] is one: the page turns
-/// it back into the enum through the same exhaustive pair that wrote it, so a
-/// byte this build does not have resolves to "no source stated" rather than to
-/// a plausible-looking label. Null encodes `None`, exactly as [`NYQUIST`]'s
-/// does, and the page reads both back through the same `as_f64` filter.
-pub const MELTING_LAYER: &str = "mls";
 
-/// Worker → page: which storm motion vector a storm-relative velocity raster
-/// was shifted by, as [`rustdar_frontend::offload::StormMotionWire`]'s byte, or
-/// null for a raster that applied none — which is every product but
-/// storm-relative velocity.
+/// Worker → page: **the whole answer to a job**, every kind alike, as one
+/// transferred `Uint8Array` in the dispatched codec row's own `encode_out`
+/// form — or null for a job that produced nothing (a `None` result writes
+/// both fields null explicitly, because the page holds a slot per id and
+/// silence would strand it).
 ///
-/// A number and not a string for the reason [`MELTING_LAYER`] is one, and it
-/// carries the same weight: the two rungs on either side of this byte are not
-/// a better and a worse rendering of one field, they are different fields. A
-/// page that read a Bunkers right-mover as the RPG's own applied vector would
-/// caption a picture that disagrees with the reference on 83 % of its gates as
-/// the one that matches it. Null encodes `None`, and a byte this build does
-/// not have resolves to "no source stated" rather than to a plausible label.
-pub const STORM_MOTION: &str = "smv";
-
-/// Worker → page: the **speed** of that vector, knots, or null for a raster
-/// that applied none.
-///
-/// Split from [`STORM_MOTION`] rather than packed with it because the page
-/// reads every numeric field back through one `as_f64` filter, and a packed
-/// pair would need a decoder of its own on a boundary whose whole discipline is
-/// that it carries plain numbers.
-///
-/// It travels because the page **cannot recompute it**. The RPG's vector and a
-/// user override are both known page-side, but the two derived rungs are fitted
-/// from a VAD wind profile that exists only where the volume was decoded — so
-/// without these two fields the legend could name the source of a derived
-/// vector and never the vector, which is exactly the pane that could only
-/// apologise.
-pub const STORM_MOTION_SPEED: &str = "sms";
-
-/// Worker → page: the **direction** that vector comes *from*, degrees, or null
-/// for a raster that applied none. See [`STORM_MOTION_SPEED`].
-pub const STORM_MOTION_DIR: &str = "smd";
-
-/// Worker → page: an output that is not a plan-view frame — a cross-section
-/// raster or a voxel grid — as **one** transferred `Uint8Array` in the payload
-/// type's own wire form.
-///
-/// One field rather than a field per kind, and one array rather than one per
-/// plane, because the codec that produced it
-/// (`rustdar_radar::xsect::CrossSection::to_bytes`,
-/// `rustdar_radar::voxel::VoxelGrid::to_bytes`) already carries its own magic,
-/// version and length prefixes. Splitting a section into three typed arrays
-/// here would put a second description of those planes' lengths on the wire,
-/// and the two could disagree in a way the receiving side would have to
-/// invent an answer for.
-///
-/// On a `Frame` reply this is null and [`IMAGE`]/[`VALUES`]/[`MAX_RANGE`] are
-/// written exactly as they always were; on a `Section` or `Voxels` reply those
-/// three are null and this is set. A `None` result writes all four null-ish,
-/// because the page holds a slot per id and silence would strand it.
+/// One field for every kind since WO-M7c closed the reply direction onto
+/// the codec table: the plan-view frame, whose reply used to ride eight
+/// named fields beside this one, travels in its own wire form
+/// (`rustdar_radar::frame::RenderedFrame::to_bytes`) like every other
+/// output. One array rather than one per buffer because each payload's
+/// codec carries its own counts and refusals; a second description of the
+/// same lengths on this message could disagree with the first in a way the
+/// receiving side would have to invent an answer for.
 pub const OUT: &str = "out";
-/// Worker → page: which kind of output [`OUT`] carries, as
-/// `rustdar_radar::types::RenderView::wire_code`.
+/// Worker → page: which codec row's `encode_out` wrote [`OUT`] — the row's
+/// **dense composed-registry code** (index plus one), the same one code
+/// space the request direction's leading byte speaks, so one table names
+/// every kind in both directions.
 ///
-/// The payload wire forms are self-describing enough to *refuse* the wrong one
-/// — each has its own magic — but "try to decode it as a section, and if that
-/// fails try a grid" turns a corrupt payload into a silently different kind.
-/// The tag says which decoder to run, and the magic says whether it was right.
+/// The page does not route on it: the reply is decoded through the row
+/// recorded when the job was dispatched, and this tag is *verified* against
+/// that row's code (`offload::deliver_encoded_reply`) — a mismatch is a
+/// corrupt message or another build's reply, refused as "nothing to draw"
+/// rather than decoded as whatever the tag claims.
 pub const OUT_KIND: &str = "outkind";
 
 /// What the page and the worker compare before the page trusts the worker.

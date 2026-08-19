@@ -66,10 +66,10 @@
 //!  5a  overlay-kind occurrences, whole tree            762  rg -o 'Overlay''Kind' . --glob '*.rs' | wc -l
 //!  5b  ... files containing it (info)                   56  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
 //!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-frontend/src/channels.rs | wc -l
-//!  7a  overlays-crate path occurrences in offload.rs    70  rg -o 'rustdar_''overlays::' rustdar-frontend/src/offload.rs | wc -l
-//!  7b  radar-crate path occurrences in offload.rs       57  rg -o 'rustdar_''radar::' rustdar-frontend/src/offload.rs | wc -l
-//!  7c  ... distinct overlays paths (info)               38  rg -o 'rustdar_''overlays::[A-Za-z0-9_:]+' rustdar-frontend/src/offload.rs | sort -u | wc -l
-//!  7d  ... distinct radar paths (info)                  37  rg -o 'rustdar_''radar::[A-Za-z0-9_:]+' rustdar-frontend/src/offload.rs | sort -u | wc -l
+//!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-frontend/src/offload.rs | wc -l
+//!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-frontend/src/offload.rs | wc -l
+//!      (70 and 57 occurrences at E0c — 38 and 37 distinct paths — shrunk
+//!      through WO-M5/M6/M7; ZERO in both directions since WO-M7c)
 //! ```
 //!
 //! Notes:
@@ -96,8 +96,9 @@
 //!   LANDS at WO-E3 and is VERIFIED at WO-M13b. WO-E4.9's extract-results
 //!   channel is a RenderOrchestrator-local mpsc, not a hub pair — the hub
 //!   stays at 18 through the campaign.
-//! - Rows 7a/7b track the REQUEST direction of the offload wire until
-//!   WO-M7c, which drives them to 0.
+//! - Rows 7a/7b reached 0 at WO-M7c (the reply direction joined the codec
+//!   table) and are EXACT-ZERO pins from that land on, prose included: the
+//!   funnel speaks the substrate's erased vocabulary and no source crate's.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,10 +164,6 @@ const KIND_MAX: usize = 766;
 /// WO-E3 and is verified at WO-M13b; the hub stays at 18 (WO-E4.9's extract
 /// channel is orchestrator-local, not a hub pair).
 const HUB_RECEIVER_MAX: usize = 18;
-/// Row 7a. Request direction shrinks through WO-M5/M6/M7; WO-M7c reaches 0.
-const OFFLOAD_OVERLAYS_PATH_MAX: usize = 70;
-/// Row 7b. Same trajectory as row 7a.
-const OFFLOAD_RADAR_PATH_MAX: usize = 57;
 
 // ---------------------------------------------------------------------------
 // Walker + counters (std-only, pure file reads: the coverage job runs this
@@ -396,27 +393,54 @@ fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
     );
 }
 
-/// Row 7 — the offload wire's crate-path vocabulary (request direction).
-/// WO-M5/M6/M7 shrink it; WO-M7c reaches 0.
+/// Row 7 — offload.rs names ZERO source-crate types, in EITHER direction.
+///
+/// The campaign's full-scope terminus (WO-M7c): the request direction went
+/// source-type-free at WO-M7.2 and the reply direction at WO-M7c, so the
+/// funnel speaks `rustdar_source::job`'s erased vocabulary and nothing
+/// else. The baseline this fell from: 70 overlays-path and 57 radar-path
+/// occurrences at E0c (38 and 37 distinct paths — the plan brief's
+/// "38+38"), pre-campaign. An EXACT zero, prose included — a doc comment
+/// that names a source-crate path is a doc comment describing a coupling
+/// this file no longer has.
+///
+/// The presence controls keep the pin non-vacuous both ways: the anchored
+/// read fails if `offload_job` ever leaves the file (the scrape is of the
+/// real funnel, not an empty or renamed file), and the same two needles
+/// must still match in `job_registry.rs` — the one frontend module that
+/// legitimately names both source crates — so a needle that rotted would
+/// fail there rather than count zero here forever.
 #[test]
-fn the_offload_wire_vocabulary_never_grows() {
+fn offload_names_zero_source_crate_types() {
     let offload_rs = Path::new(ROOT).join("rustdar-frontend/src/offload.rs");
     let text = anchored_file(&offload_rs, OFFLOAD_ANCHOR);
 
-    let overlays_n = text.matches(OVERLAYS_PATH).count();
-    let radar_n = text.matches(RADAR_PATH).count();
-    assert!(
-        overlays_n <= OFFLOAD_OVERLAYS_PATH_MAX,
-        "offload.rs speaks more overlays-crate paths: {overlays_n} occurrences > \
-         ceiling {OFFLOAD_OVERLAYS_PATH_MAX}. WO-M5/M6/M7 shrink the request \
-         direction; WO-M7c reaches 0. Lower the MAX in the land that earns it; \
-         never raise it without a written plan amendment."
-    );
-    assert!(
-        radar_n <= OFFLOAD_RADAR_PATH_MAX,
-        "offload.rs speaks more radar-crate paths: {radar_n} occurrences > ceiling \
-         {OFFLOAD_RADAR_PATH_MAX}. WO-M5/M6/M7 shrink the request direction; \
-         WO-M7c reaches 0. Lower the MAX in the land that earns it; never raise it \
-         without a written plan amendment."
-    );
+    for (needle, crate_name) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {
+        let n = text.matches(needle).count();
+        assert_eq!(
+            n, 0,
+            "offload.rs speaks {n} {crate_name}-crate path(s) where the pin is \
+             ZERO, in either direction, prose included (WO-M7c closed the \
+             reply direction; the request direction closed at WO-M7.2). A job \
+             kind's types belong beside its pipeline, reached through the \
+             composed registry (`job_registry.rs`) — never named in the \
+             funnel. Never raise this without a written plan amendment."
+        );
+    }
+
+    // Presence control: the needles are alive — the composition module
+    // names both crates by construction, so a rotted needle fails HERE
+    // rather than counting zero above forever.
+    let registry_rs = Path::new(ROOT).join("rustdar-frontend/src/job_registry.rs");
+    let registry = read(&registry_rs);
+    for (needle, what) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {
+        assert!(
+            registry.matches(needle).count() > 0,
+            "the {what} needle no longer matches job_registry.rs, which \
+             composes both source-crate registries by name. Either the \
+             composition moved (re-point this control) or the needle rotted \
+             (fix it) — a dead needle would leave the zero pin above green \
+             over anything."
+        );
+    }
 }

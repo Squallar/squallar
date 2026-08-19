@@ -182,18 +182,18 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
     // and execution of its own bytes must paint the same picture — with a
     // painted floor, or the equality would hold over a blank buffer.
     let direct = crate::offload::execute(request)
-        .and_then(crate::offload::JobOutput::overlay_raster)
+        .and_then(|out| out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>())
         .expect("the posted model job rasterizes")
-        .0;
+        .rgba;
     assert!(
         direct.iter().skip(3).step_by(4).any(|&a| a > 0),
         "the seeded grid painted nothing, so the wire parity below is \
          vacuous",
     );
     let via_wire = crate::offload::execute_bytes(&request.to_bytes())
-        .and_then(crate::offload::JobOutput::overlay_raster)
+        .and_then(|out| out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>())
         .expect("the posted model job survives its own wire form")
-        .0;
+        .rgba;
     assert_eq!(
         via_wire, direct,
         "the posted model job paints differently through its own wire form",

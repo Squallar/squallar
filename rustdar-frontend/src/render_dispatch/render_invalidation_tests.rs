@@ -27,8 +27,8 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
         release,
         crate::offload::Job::Opaque(Box::new(move || {
             held.recv().expect("every gated render is released");
-            Some(crate::offload::JobOutput::Frame(
-                crate::offload::RenderedFrame {
+            Some(rustdar_source::job::DescribedOut(Box::new(
+                rustdar_radar::frame::RenderedFrame {
                     image: Vec::new(),
                     max_range_km: 230.0,
                     polar: Default::default(),
@@ -36,7 +36,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
                     melting_layer_source: None,
                     storm_motion: None,
                 },
-            ))
+            )))
         })),
     )
 }

@@ -27,12 +27,12 @@
 //! canonical envelope is what carries it across the wire. Every decode here
 //! passes the envelope through unchanged.
 //!
-//! **The frame rows carry no reply codec yet.** `radar`, `level3` and
-//! `level3/vild` ride [`JobCodec::of`] — their replies still cross the
-//! browser port as the legacy named fields, and WO-M7c is where the frame
-//! reply joins the OUT codec. The section, voxel and decode rows' outputs
-//! already have wire forms of their own ([`CrossSection`], [`VoxelGrid`]
-//! and [`DecodedScan`] `to_bytes`/`from_bytes`), which their [`JobOutCodec`]
+//! **Every row states both directions.** The three frame rows' replies ride
+//! [`RenderedFrame::to_bytes`]/[`from_bytes`](RenderedFrame::from_bytes) —
+//! the wire form WO-M7c gave the frame when the reply direction joined the
+//! codec table — and the section, voxel and decode rows' outputs already had
+//! wire forms of their own ([`CrossSection`], [`VoxelGrid`] and
+//! [`DecodedScan`] `to_bytes`/`from_bytes`), which their [`JobOutCodec`]
 //! halves delegate to unchanged.
 //!
 //! **The refusal contract**, shared by every `decode` here: `None` for a
@@ -65,18 +65,37 @@ use crate::xsect::{CrossSection, SectionRequest};
 /// and the labels are the shipped kind strings the frontend's `kind()`
 /// prints, byte for byte (`radar`'s per-product `"radar/nrot"`/`"radar/srv"`
 /// refinements are a `kind()` nicety over the same row, not row labels).
-///
-/// The three frame rows ride [`JobCodec::of`] — no reply codec until
-/// WO-M7c — and the three whose outputs already have wire forms ride
-/// [`JobCodec::with_out`].
 pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<RadarPlanJob>(),
     JobCodec::of::<Level3Job>(),
     JobCodec::of::<Level3PairJob>(),
-    JobCodec::with_out::<SectionJob>(),
-    JobCodec::with_out::<VoxelJob>(),
-    JobCodec::with_out::<DecodeJob>(),
+    JobCodec::of::<SectionJob>(),
+    JobCodec::of::<VoxelJob>(),
+    JobCodec::of::<DecodeJob>(),
 ];
+
+/// The frame rows' shared reply half: the wire form lives on the type
+/// ([`RenderedFrame::to_bytes`]), and the three rows delegate to it through
+/// one macro so a Level III frame and a Level II one cannot come to encode
+/// themselves differently — the same argument `From<SweepRender>` makes for
+/// the direct path.
+macro_rules! frame_reply_codec {
+    ($spec:ty) => {
+        impl JobOutCodec for $spec {
+            fn encode_out(v: &RenderedFrame, out: &mut Vec<u8>) {
+                out.extend_from_slice(&v.to_bytes());
+            }
+
+            fn decode_out(bytes: &[u8]) -> Option<RenderedFrame> {
+                RenderedFrame::from_bytes(bytes)
+            }
+        }
+    };
+}
+
+frame_reply_codec!(RadarPlanJob);
+frame_reply_codec!(Level3Job);
+frame_reply_codec!(Level3PairJob);
 
 /// Rasterize a Level II frame.
 ///
@@ -382,6 +401,12 @@ impl rustdar_source::job::JobOut for CrossSection {
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
+
+    /// The cut raster is the one straight-alpha buffer here; the two axis
+    /// tables beside it are numbers, not pixels.
+    fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
+        vec![self.image_mut()]
+    }
 }
 
 /// Resample a volume into a Cartesian grid for a raymarch.
@@ -451,6 +476,12 @@ impl rustdar_source::job::JobOut for VoxelGrid {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+
+    /// A grid carries palette indices for the raymarcher, never pixels —
+    /// there is nothing here to premultiply, stated rather than defaulted.
+    fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
+        Vec::new()
     }
 }
 
@@ -550,6 +581,12 @@ impl rustdar_source::job::JobOut for DecodedScan {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+
+    /// A decoded volume carries gate codes, not pixels — there is nothing
+    /// here to premultiply, stated rather than defaulted.
+    fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
+        Vec::new()
     }
 }
 
@@ -906,13 +943,32 @@ mod tests {
                 "the archive decode is the one non-raster job (`{}`)",
                 row.label,
             );
-            let frame_row = matches!(row.label, "radar" | "level3" | "level3/vild");
+        }
+        // Every row carries its reply codec by construction since WO-M7c
+        // de-Optioned the pair — what is left to pin is that the three frame
+        // rows' reply half really is the frame codec: a frame reply
+        // round-trips through the erased row exactly as through the type.
+        for row in &JOB_CODECS[..3] {
+            let frame = crate::frame::RenderedFrame {
+                image: vec![9, 8, 7, 6],
+                max_range_km: 230.0,
+                polar: crate::render::polar::PolarField::default(),
+                nyquist_ms: Some(8.5),
+                melting_layer_source: None,
+                storm_motion: None,
+            };
+            let mut bytes = Vec::new();
+            (row.encode_out)(
+                &rustdar_source::job::DescribedOut(Box::new(frame.clone())),
+                &mut bytes,
+            );
+            assert_eq!(bytes, frame.to_bytes(), "`{}`", row.label);
             assert_eq!(
-                row.encode_out.is_none() && row.decode_out.is_none(),
-                frame_row,
-                "the three frame rows carry no reply codec until WO-M7c, and \
-                 the three rows whose outputs have wire forms carry both \
-                 (`{}`)",
+                (row.decode_out)(&bytes)
+                    .expect("the frame reply decodes")
+                    .take::<crate::frame::RenderedFrame>(),
+                Some(frame),
+                "`{}`: the reply half is not the frame codec",
                 row.label,
             );
         }

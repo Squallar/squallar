@@ -191,9 +191,7 @@ impl super::App {
                 // `None` here is an archive that did not decode, which
                 // `execute`'s arm has already logged. Every caller treats it as
                 // the failed fetch it is.
-                let volume = result
-                    .and_then(crate::offload::JobOutput::volume)
-                    .map(|boxed| *boxed);
+                let volume = result.and_then(|out| out.take::<rustdar_radar::scan::DecodedScan>());
                 if let Some(message) = respond(volume) {
                     let _ = sender.send(message);
                 }
@@ -1064,8 +1062,8 @@ impl super::App {
     /// panes' in-flight marks — see `OverlayRenderResponse::image`.
     ///
     /// The dispatch's own `width` and `height` are the only statement of the
-    /// raster's shape — the reply's buffer carries none
-    /// (`offload::JobOutput::OverlayRaster`) — so the length check here is
+    /// raster's shape — the reply's buffer carries none (nothing on this
+    /// port describes its own shape) — so the length check here is
     /// what stands between a payload from another build and a texture of the
     /// wrong shape.
     ///
@@ -1102,8 +1100,12 @@ impl super::App {
     ) -> impl FnOnce(crate::offload::JobResult) + Send + 'static {
         move |result| {
             let expected = (width as usize) * (height as usize) * 4;
-            if let Some((rgba, hit_cells)) =
-                result.and_then(crate::offload::JobOutput::overlay_raster)
+            if let Some(rustdar_overlays::render::rasterize::RasterizeOutput {
+                rgba,
+                hit_cells,
+                ..
+            }) = result
+                .and_then(|out| out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>())
             {
                 let sized = rgba.len() == expected;
                 if !sized {
@@ -2039,8 +2041,9 @@ impl super::App {
             // An output of another kind is `None` here, which is the same
             // "nothing to draw" a failed render has always been — this consumer
             // is shaped for a plan-view frame and must never be handed a
-            // section's differently-shaped buffers. See `JobOutput::frame`.
-            let frame = output.and_then(crate::offload::JobOutput::frame);
+            // section's differently-shaped buffers (`DescribedOut::take`
+            // states the contract).
+            let frame = output.and_then(|out| out.take::<rustdar_radar::frame::RenderedFrame>());
             // A failed render still has to be sent, so render_in_flight gets cleared.
             let (image, max_range_km, nyquist_ms, describes, polar) = match frame {
                 Some(mut frame) => {
@@ -2383,8 +2386,9 @@ impl super::App {
             // An output of another kind is `None`, which takes the same
             // "nothing to draw" path a refused cut does. This consumer is
             // shaped for a `SECTION_WIDTH × SECTION_HEIGHT` raster and must
-            // never be handed a plan view's — see `JobOutput::section`.
-            let cut = output.and_then(crate::offload::JobOutput::section);
+            // never be handed a plan view's (`DescribedOut::take` states the
+            // contract).
+            let cut = output.and_then(|out| out.take::<rustdar_radar::xsect::CrossSection>());
             let (image, axes, tilt_elevations_deg, tilt_collected_ms) = match cut {
                 Some(cut) => match loop_section_image(cut.image()) {
                     Some(image) => (

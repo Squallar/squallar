@@ -40,27 +40,15 @@
 //! that queue draining is a term in the frame loop's own wake-up condition —
 //! see [`drain_deferred_drops`], where the invariant is written.
 
-// Reply-direction types only, and deliberately: the REQUEST direction of
-// this module is source-type-free since WO-M7.2 — every job kind's input,
-// codec and run body lives with its pipeline, reached through the composed
-// registry (`crate::job_registry`) — and the reply vocabulary below
-// ([`JobOutput`] and its decoders) survives here only until WO-M7c closes
-// the reply direction onto the same table.
-use rustdar_radar::voxel::VoxelGrid;
-use rustdar_radar::xsect::CrossSection;
+// Source-type-free in BOTH directions since WO-M7c closed the reply
+// direction (the request direction closed at WO-M7.2): every job kind's
+// input, codec, run body and reply codec lives with its pipeline, reached
+// through the composed registry (`crate::job_registry`) — this funnel names
+// the substrate's erased vocabulary (`rustdar_source::job`) and no source
+// crate's types, which `arch_ratchets`'
+// `offload_names_zero_source_crate_types` pins at zero.
 use std::cell::RefCell;
 use std::collections::HashMap;
-
-/// The storm motion vector [`RenderedFrame::storm_motion`] carries,
-/// re-exported for the reason [`crate::tls`] is: a platform adapter that has to
-/// *rebuild* one of these off a message port should not need its own
-/// `rustdar-radar` dependency to name the type.
-///
-/// `rustdar-web` is the adapter in question, and it does not have one — the
-/// browser build reaches this crate and stops. Naming the path through
-/// `rustdar_radar` there compiles nowhere, which is a thing only a wasm32
-/// target check finds.
-pub use rustdar_radar::srv::SrvMotion;
 
 /// Free `payload` away from the frame that stopped needing it.
 ///
@@ -414,7 +402,7 @@ pub struct JobRequest {
     ///     correct picture rather than a texture creation that fails.
     ///
     /// Neither is "the picture the display always made": the extent is the
-    /// sweep's either way, and `rustdar_radar::types::raster_side_px` spends
+    /// sweep's either way, and the radar crate's `raster_side_px` spends
     /// this ceiling only as far as the sweep's own gates justify. The figure
     /// is resolved at the dispatch site rather than in the row because this
     /// type travels to a worker that has no device to ask. The section, voxel
@@ -459,302 +447,21 @@ pub(crate) fn ceiling_only_geometry(side_ceiling_px: u32) -> rustdar_source::job
     }
 }
 
-/// What a job produces.
+/// The answer a job's `deliver` receives: the row's typed output behind the
+/// erasure seam, or `None` where the job produced nothing — a scan with no
+/// matching sweep, an archive that did not decode, bytes another build
+/// wrote. Callers treat `None` as the failure the renderer already meant by
+/// it, and read the typed output back with
+/// [`DescribedOut::take`](rustdar_source::job::DescribedOut::take) — the
+/// wrong kind answers `None` there too, which is the same "nothing to draw"
+/// every path already handles, with the budget still unwound and the pane
+/// still told.
 ///
-/// Widened from a bare [`RenderedFrame`] when a section and a voxel grid became
-/// things a worker could be asked for. **[`RenderedFrame`] itself is
-/// deliberately untouched**, and in particular did not gain a width and a
-/// height even once a plan view stopped having one size: its consumers derive
-/// the side from the buffer's own length and check it — a whole number of
-/// pixels, a perfect square, a side inside this build's own bounds
-/// (`constants::raster_side_from_rgba_len`), which is the same guard a named
-/// constant was — a `ColorImage` panic on a render worker means no response
-/// ever arrives and the pane stays blank forever —
-/// without the payload being trusted to describe itself. See
-/// [`JobOutput::frame`].
-#[derive(Debug, PartialEq)]
-pub enum JobOutput {
-    Frame(RenderedFrame),
-    /// Boxed: a `CrossSection` owns three `SECTION_WIDTH × SECTION_HEIGHT`
-    /// planes, which is megabytes against the enum's other variants.
-    Section(Box<CrossSection>),
-    /// Boxed for the same reason, more so: a desktop grid is 8 MiB of indices.
-    Voxels(Box<VoxelGrid>),
-    /// A decoded Level II volume — the answer to the `decode` row's
-    /// `DecodeJob`, and the only output here that is not a picture of
-    /// anything.
-    ///
-    /// Boxed like the two above and for a stronger version of their reason: a
-    /// `DecodedScan` owns every gate of every radial of every sweep, 47–69 MiB
-    /// across the volumes this was measured on, which is an order of magnitude
-    /// past the largest thing that had been in this enum.
-    Volume(Box<rustdar_radar::scan::DecodedScan>),
-    /// An overlay raster — the answer to a described overlay job: the RGBA
-    /// texture, **always premultiplied** ([`execute`]'s output conversion
-    /// premultiplies any rasterizer that declares straight alpha), and — for
-    /// the two hit-map kinds — the portable half of their hit map.
-    ///
-    /// `rgba` is deliberately a bare buffer with no width, height or framing,
-    /// for the reason [`RenderedFrame`] has no width: nothing on this port
-    /// describes its own shape. The dispatch site captured the texture's
-    /// dimensions and its `deliver` believes the buffer only if its length is
-    /// exactly `width × height × 4` of *those* values — a payload from
-    /// another build, or one tagged with the wrong kind, fails that
-    /// arithmetic and reads as "nothing to draw" rather than as a picture of
-    /// the wrong shape.
-    ///
-    /// `hit_cells` carries item **indices**, never items: the
-    /// `Arc<dyn OverlayItem>`s a click resolves to stay on the page, captured
-    /// at dispatch and zipped with these cells at delivery
-    /// (`rustdar_overlays::render::rasterize::HitMap::from_cells` states the
-    /// order invariant the zip stands on). The deliver believes the cells
-    /// only if their quarter-res grid is the one its own captured dimensions
-    /// imply and every index fits the id_map it captured — anything else is
-    /// a reply from a build whose layout this is not, and reads as a failed
-    /// render.
-    OverlayRaster {
-        rgba: Vec<u8>,
-        hit_cells: Option<rustdar_overlays::render::rasterize::HitCells>,
-    },
-}
-
-impl JobOutput {
-    /// The frame, or `None` for an output of another kind.
-    ///
-    /// This is what makes widening the result type safe for every existing
-    /// consumer: a `Section` handed to a frame consumer becomes `None`, which
-    /// is "nothing to draw" — a state every path already handles, with
-    /// `deliver` still running and the render budget still unwound.
-    pub fn frame(self) -> Option<RenderedFrame> {
-        match self {
-            Self::Frame(frame) => Some(frame),
-            Self::Section(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster { .. } => {
-                None
-            }
-        }
-    }
-
-    /// The section, or `None` for an output of another kind.
-    pub fn section(self) -> Option<Box<CrossSection>> {
-        match self {
-            Self::Section(section) => Some(section),
-            Self::Frame(_) | Self::Voxels(_) | Self::Volume(_) | Self::OverlayRaster { .. } => None,
-        }
-    }
-
-    /// The voxel grid, or `None` for an output of another kind.
-    pub fn voxels(self) -> Option<Box<VoxelGrid>> {
-        match self {
-            Self::Voxels(grid) => Some(grid),
-            Self::Frame(_) | Self::Section(_) | Self::Volume(_) | Self::OverlayRaster { .. } => {
-                None
-            }
-        }
-    }
-
-    /// The decoded volume, or `None` for an output of another kind.
-    ///
-    /// The same shape as the three above, and the same reason: a consumer
-    /// handed the wrong kind sees `None`, which every caller already treats as
-    /// "the job produced nothing" — a state a failed decode and a failed
-    /// render have always shared.
-    pub fn volume(self) -> Option<Box<rustdar_radar::scan::DecodedScan>> {
-        match self {
-            Self::Volume(volume) => Some(volume),
-            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::OverlayRaster { .. } => {
-                None
-            }
-        }
-    }
-
-    /// The overlay raster and its optional hit cells, or `None` for an output
-    /// of another kind.
-    ///
-    /// The narrow accessor the four above are, for the same reason — and
-    /// neither half it answers is believed anywhere until the dispatch's
-    /// `deliver` has checked it: the buffer against its own captured
-    /// `width × height × 4`, the cells against the quarter-res grid those
-    /// dimensions imply and the id_map it captured. See
-    /// [`JobOutput::OverlayRaster`].
-    pub fn overlay_raster(
-        self,
-    ) -> Option<(
-        Vec<u8>,
-        Option<rustdar_overlays::render::rasterize::HitCells>,
-    )> {
-        match self {
-            Self::OverlayRaster { rgba, hit_cells } => Some((rgba, hit_cells)),
-            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) | Self::Volume(_) => None,
-        }
-    }
-
-    /// Which decoder owns this output's bytes when it travels as the worker
-    /// reply's out-of-band payload, or `None` for a frame — which does not
-    /// travel that way at all, having its own fields on the message.
-    ///
-    /// # Its own code space, and no longer `RenderView`'s
-    ///
-    /// It used to be `view().wire_code()`, and that read as a tidy reuse right
-    /// up until an output arrived that is not a view of anything. A decoded
-    /// volume is not a plan view, a cross-section or a raymarch grid; it is
-    /// what all three are *made from*. Widening `RenderView` to admit it would
-    /// have put a variant into the enum that decides pane layout, tilt-family
-    /// widening and download scope
-    /// ([`RenderView::reads_whole_volume`](rustdar_radar::types::RenderView::reads_whole_volume)),
-    /// none of which a decode has an answer for.
-    ///
-    /// So the wire gets its own byte. The two existing values are unchanged
-    /// deliberately — a cross-section is still 2 and a voxel grid still 3 — so
-    /// this is a widening of the code space rather than a renumbering of it,
-    /// and the protocol version bump beside it is what refuses a worker that
-    /// predates the fourth.
-    pub fn out_kind(&self) -> Option<u8> {
-        match self {
-            // A frame rides the `IMAGE`/`POLAR`/`MAX_RANGE` fields.
-            Self::Frame(_) => None,
-            Self::Section(_) => Some(OUT_KIND_SECTION),
-            Self::Voxels(_) => Some(OUT_KIND_VOXELS),
-            Self::Volume(_) => Some(OUT_KIND_VOLUME),
-            Self::OverlayRaster { .. } => Some(OUT_KIND_OVERLAY),
-        }
-    }
-}
-
-/// A cross-section raster. Was `RenderView::CrossSection`'s wire code and keeps
-/// its value — see [`JobOutput::out_kind`].
-pub const OUT_KIND_SECTION: u8 = 2;
-/// A Cartesian voxel grid. Was `RenderView::Volume`'s wire code.
-pub const OUT_KIND_VOXELS: u8 = 3;
-/// A decoded Level II volume. The first code that never was a `RenderView`.
-pub const OUT_KIND_VOLUME: u8 = 4;
-/// An overlay raster: a one-byte hit-cells tag, the framed hit cells when the
-/// tag says so, and then raw premultiplied RGBA as the rest.
-///
-/// The payload was unframed raw RGBA until protocol version 11, when the
-/// hit-map kinds crossed the wire and the reply had to carry their cells —
-/// the **first reply-shape change since the guards over this port landed**,
-/// and one no field-name scrape can see, since the reply still rides the
-/// same `OUT`/`OUT_KIND` pair. What pins the framing instead is
-/// `offload::tests`' digest over [`encode_overlay_out`]'s bytes
-/// (`the_overlay_reply_framing_is_the_one_this_protocol_ships`), beside the
-/// code-byte pin this constant has always had.
-///
-/// The RGBA tail still has no magic — raw pixels have no header to carry one
-/// — so what stands in for it is unchanged: the length check at the consumer
-/// ([`JobOutput::OverlayRaster`]) believes the tail only at exactly
-/// `width × height × 4` bytes of the raster the dispatch asked for. The
-/// hit-cells block *does* refuse malformed bytes ([`decode_overlay_out`]),
-/// and the length check is also what catches a cross-version pairing the
-/// token missed: a raw version-10 payload read as framed loses its first
-/// byte to the tag and fails the arithmetic either way the byte falls, and a
-/// framed payload read raw is at least one byte too long — both read as
-/// "nothing to draw". The protocol version beside the code is what keeps
-/// such a worker from being attached at all.
-pub const OUT_KIND_OVERLAY: u8 = 5;
-
-/// What a rasterizing job produces — the frame reply type, defined in
-/// `rustdar-radar` beside the renderer that fills it
-/// ([`rustdar_radar::frame`], WO-M7.1) and re-exported under the path this
-/// crate always published it at, so the radar codec rows' `run` bodies can
-/// name their own output type. [`MeltingLayerWire`]/[`StormMotionWire`]
-/// below stay here until the reply direction joins the codec table
-/// (WO-M7c).
-pub use rustdar_radar::frame::RenderedFrame;
-
-/// A [`MeltingLayerSource`](rustdar_radar::hca::MeltingLayerSource) as a
-/// number, for the one boundary that can only carry numbers.
-///
-/// The enum lives in `rustdar-radar`, which has no wire form for it and needs
-/// none: nothing in that crate crosses a message port. The browser's
-/// page↔worker port does, and it carries JS values — so the mapping is written
-/// here, beside [`RenderedFrame`], which is the type that actually crosses.
-///
-/// A newtype rather than two free functions so the pair cannot drift apart:
-/// [`from_wire_code`](Self::from_wire_code) is exhaustive over the same match
-/// arms [`wire_code`](Self::wire_code) writes, so adding a variant upstream
-/// fails this build rather than silently encoding as "unknown".
-///
-/// `None` from `from_wire_code` is a byte this build does not have — a page and
-/// a worker on opposite sides of a deploy, which the protocol token already
-/// refuses — and reads as "no source stated", the same as an absent field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MeltingLayerWire(pub rustdar_radar::hca::MeltingLayerSource);
-
-impl MeltingLayerWire {
-    pub fn wire_code(self) -> u8 {
-        use rustdar_radar::hca::MeltingLayerSource as S;
-        match self.0 {
-            S::Rpg => 0,
-            S::RadarDetected => 1,
-            S::Sounding => 2,
-            S::FleetDefault => 3,
-        }
-    }
-
-    /// The inverse of [`wire_code`](Self::wire_code).
-    pub fn from_wire_code(code: u8) -> Option<Self> {
-        use rustdar_radar::hca::MeltingLayerSource as S;
-        let source = match code {
-            0 => S::Rpg,
-            1 => S::RadarDetected,
-            2 => S::Sounding,
-            3 => S::FleetDefault,
-            _ => return None,
-        };
-        Some(Self(source))
-    }
-}
-
-/// A [`StormMotionSource`](rustdar_radar::srv::StormMotionSource) as a number,
-/// for the same boundary [`MeltingLayerWire`] crosses.
-///
-/// Written here for the reason that one is: the enum lives in `rustdar-radar`,
-/// which crosses no message port and needs no wire form; the browser's
-/// page↔worker port does, and it carries JS values.
-///
-/// A newtype rather than two free functions so the pair cannot drift apart:
-/// [`from_wire_code`](Self::from_wire_code) is exhaustive over the same match
-/// arms [`wire_code`](Self::wire_code) writes, so adding a rung upstream fails
-/// this build rather than silently encoding as "unknown" — which for this
-/// value would mean an SRV pane reporting a Bunkers prediction as the RPG's own
-/// cell average, the one confusion the whole path exists to prevent.
-///
-/// The numbering **is** the declaration order, which is the fallback order, so
-/// a code reads as a rung of the chain. `None` from `from_wire_code` is a byte
-/// this build does not have — a page and a worker on opposite sides of a
-/// deploy, which the protocol token already refuses — and reads as "no source
-/// stated", the same as an absent field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StormMotionWire(pub rustdar_radar::srv::StormMotionSource);
-
-impl StormMotionWire {
-    pub fn wire_code(self) -> u8 {
-        use rustdar_radar::srv::StormMotionSource as S;
-        match self.0 {
-            S::UserOverride => 0,
-            S::RpgScitAverage => 1,
-            S::BunkersRightMover => 2,
-            S::MeanWind => 3,
-        }
-    }
-
-    /// The inverse of [`wire_code`](Self::wire_code).
-    pub fn from_wire_code(code: u8) -> Option<Self> {
-        use rustdar_radar::srv::StormMotionSource as S;
-        let source = match code {
-            0 => S::UserOverride,
-            1 => S::RpgScitAverage,
-            2 => S::BunkersRightMover,
-            3 => S::MeanWind,
-            _ => return None,
-        };
-        Some(Self(source))
-    }
-}
-
-/// `None` where the renderer found nothing to draw — a scan with no matching
-/// sweep. Callers treat it as the failure the renderer already meant by it.
-pub type JobResult = Option<JobOutput>;
+/// This dissolved the `JobOutput` enum (WO-M7c): the reply vocabulary is the
+/// registry's own erased seam now, so this module names no output kind — a
+/// frame, a section, a grid, a volume and an overlay raster are all the
+/// row's business, in both directions.
+pub type JobResult = Option<rustdar_source::job::DescribedOut>;
 
 /// A rasterizing job. Every arm reaches [`offload_job`], which is the point:
 /// there is one place that decides where work runs, and adding a job kind
@@ -897,8 +604,12 @@ impl JobRequest {
         Some(Self { job, geometry })
     }
 
-    /// For the timing log, so a slow job says which kind it was: the codec
-    /// row's label, which is the shipped kind string.
+    /// The codec row's label — the shipped kind string, for the native
+    /// pool's lane loops and the tests. The dispatch resolves the row once
+    /// and reads `row.label` itself (WO-M7c), and the browser has no pool,
+    /// so on wasm32 this is dead — stated with an `expect` so a new wasm
+    /// caller retires the attribute rather than silently voiding it.
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code))]
     fn kind(&self) -> &'static str {
         row_for(&self.job).label
     }
@@ -1006,48 +717,6 @@ fn premultiply_raster(rgba: &mut [u8]) {
     }
 }
 
-/// [`execute`]'s output stage: every raster an output carries leaves in egui's
-/// premultiplied convention.
-///
-/// # Why it is here and not at the consumer
-///
-/// Because *here* is wherever the job ran, and the consumer is wherever the
-/// picture is drawn, and on the web those are two different threads. The
-/// per-pixel walk this performs is 4.2–4.6 ms at the 2048 px browser ceiling
-/// against a 16.7 ms frame budget, and it used to be spent on the browser's
-/// main thread; it is now spent in the worker. Natively both were already the
-/// same spawned thread, so what moves there is the line and not the cost —
-/// except for the static cross-section, whose upload
-/// (`app_render::upload_section_raster`) converted **on the frame thread** on
-/// both targets and now converts on neither.
-///
-/// A `Voxels` output carries no raster. It is listed rather than caught by a
-/// wildcard so that a fourth output kind carrying pixels has to say here
-/// whether it is premultiplied, instead of silently declining to be.
-fn premultiplied(output: JobOutput) -> JobOutput {
-    match output {
-        JobOutput::Frame(mut frame) => {
-            premultiply_raster(&mut frame.image);
-            JobOutput::Frame(frame)
-        }
-        JobOutput::Section(mut section) => {
-            premultiply_raster(section.image_mut());
-            JobOutput::Section(section)
-        }
-        JobOutput::Voxels(grid) => JobOutput::Voxels(grid),
-        // A decoded volume carries gate codes, not pixels.
-        JobOutput::Volume(volume) => JobOutput::Volume(volume),
-        // Already premultiplied: [`execute`]'s overlay arm converted at the
-        // rasterizer's own declaration, which is the one place the declared
-        // `AlphaMode` is still in hand. Running the table again here would
-        // double-multiply every translucent pixel. The hit cells carry
-        // indices, not pixels.
-        JobOutput::OverlayRaster { rgba, hit_cells } => {
-            JobOutput::OverlayRaster { rgba, hit_cells }
-        }
-    }
-}
-
 /// Do the work.
 ///
 /// Pure, and the *only* implementation: the worker calls it, the native thread
@@ -1056,23 +725,28 @@ fn premultiplied(output: JobOutput) -> JobOutput {
 /// two are not two renderers that agree, they are one renderer.
 ///
 /// Every raster that leaves here is **premultiplied**, which is the one thing
-/// this function does that the rasterizers underneath it do not — see
-/// [`premultiplied`], and [`premultiply_raster`] for why the conversion is a
-/// call to egui's own constructor rather than arithmetic written out again.
-/// It runs here rather than at the consumer because here is off the browser's
-/// main thread and off the frame thread on both targets.
+/// this function does that the rasterizers underneath it do not — each
+/// output type states its straight rasters
+/// (`rustdar_source::job::JobOut::straight_rasters_mut`, required so a new
+/// kind cannot silently decline to answer), and [`premultiply_raster`] says
+/// why the conversion is a call to egui's own constructor rather than
+/// arithmetic written out again. It runs here rather than at the consumer
+/// because here is off the browser's main thread and off the frame thread
+/// on both targets: the per-pixel walk is 4.2–4.6 ms at the 2048 px browser
+/// ceiling against a 16.7 ms frame budget, and it used to be spent on the
+/// browser's main thread.
 ///
 /// "Pure" is a claim about what it *returns*, and it survives four pieces of
 /// process-wide state underneath, all of them buffer pools and all admissible
 /// for the same one reason:
 ///
 /// * the plan-view rasterizer carries its cell buffer between calls
-///   (`rustdar_radar::render`'s `POOLED_CELLS`);
+///   (the radar renderer's `POOLED_CELLS`);
 /// * the section rasterizer carries its three planes between cuts
-///   (`rustdar_radar::xsect`'s `POOLED_PLANES`), which the section row
+///   (the section renderer's `POOLED_PLANES`), which the section row
 ///   reaches through `render_section`; and
 /// * the plan-view rasterizer carries the RGBA texture and the value grid it
-///   answers with (`rustdar_radar::render`'s `POOLED_IMAGE` and
+///   answers with (the radar renderer's `POOLED_IMAGE` and
 ///   `POOLED_VALUES`).
 ///
 /// No buffer can be handed out in any state but the one a fresh allocation would
@@ -1105,78 +779,18 @@ pub fn execute(request: &JobRequest) -> JobResult {
     // whichever carry arrived — those facts live beside the rows in their
     // source crates now.
     let row = row_for(&request.job);
-    let output = (row.run)(&request.job, &request.geometry).and_then(described_into_output);
-    // One place, after every kind, so no rasterizing row can be added that
-    // forgets it — the alternative is five call sites and a sixth that does
-    // not exist yet.
-    output.map(premultiplied)
-}
-
-/// A row's typed output back into this crate's reply vocabulary — the
-/// downcast ladder from [`rustdar_source::job::DescribedOut`] to
-/// [`JobOutput`], which survives here until WO-M7c dissolves the reply
-/// direction onto the codec table too.
-///
-/// Every output type a row can answer has an arm; a type outside the ladder
-/// is `None`, which is "nothing to draw" — unreachable while the rows below
-/// answer exactly the five types this enum names, and a refusal rather than
-/// a misread if a row ever answers something else.
-fn described_into_output(out: rustdar_source::job::DescribedOut) -> Option<JobOutput> {
-    let any = out.0.into_any();
-    let any = match any.downcast::<RenderedFrame>() {
-        Ok(frame) => return Some(JobOutput::Frame(*frame)),
-        Err(any) => any,
-    };
-    let any = match any.downcast::<CrossSection>() {
-        Ok(section) => return Some(JobOutput::Section(section)),
-        Err(any) => any,
-    };
-    let any = match any.downcast::<VoxelGrid>() {
-        Ok(grid) => return Some(JobOutput::Voxels(grid)),
-        Err(any) => any,
-    };
-    let any = match any.downcast::<rustdar_radar::scan::DecodedScan>() {
-        Ok(volume) => return Some(JobOutput::Volume(volume)),
-        Err(any) => any,
-    };
-    match any.downcast::<rustdar_overlays::render::rasterize::RasterizeOutput>() {
-        Ok(output) => {
-            // The output contract is **premultiplied, always** — stated on
-            // [`JobOutput::OverlayRaster`] — where each rasterizer's own
-            // convention is whatever it declares. The tiny-skia rasterizers
-            // declare premultiplied on every path (a pixmap *is*
-            // premultiplied), so the arm below is theirs never; it exists
-            // because the model-grid rasterizer writes straight palette
-            // bytes and declares so, and a seam that silently dropped the
-            // declaration would ship that layer double-bright.
-            //
-            // The conversion is [`premultiply_raster`] — egui's own
-            // constructor per pixel, the exact call the frame-thread consumer
-            // used to make — so via-wire and direct bytes stay identical. It
-            // stays HERE, not in the rows: it is egui arithmetic, and
-            // `rustdar-overlays` never gains egui.
-            let output = *output;
-            let mut rgba = output.rgba;
-            match output.alpha {
-                rustdar_overlays::render::rasterize::AlphaMode::Premultiplied => {}
-                rustdar_overlays::render::rasterize::AlphaMode::Straight => {
-                    premultiply_raster(&mut rgba)
-                }
-            }
-            // The cells ride the reply; the items they index into never left
-            // the dispatch, which zips the two at delivery. The four
-            // no-hit-map kinds answer `None` here on every path, and the
-            // reply says so with its own tag byte.
-            Some(JobOutput::OverlayRaster {
-                rgba,
-                hit_cells: output.hit_cells,
-            })
-        }
-        Err(other) => {
-            log::error!("a job answered {other:?}, which this build has no reply arm for");
-            None
-        }
+    let mut out = (row.run)(&request.job, &request.geometry)?;
+    // The output stage, after every kind, so no rasterizing row can be added
+    // that forgets it: each output type states its own premultiply posture
+    // (`JobOut::straight_rasters_mut` is required, no default), and whatever
+    // it hands over is converted in place, here, with egui's own arithmetic.
+    // What the old exhaustive match guaranteed by listing five kinds, the
+    // trait now guarantees structurally for the sixth that does not exist
+    // yet.
+    for raster in out.0.straight_rasters_mut() {
+        premultiply_raster(raster);
     }
+    Some(out)
 }
 
 /// [`execute`] straight off the wire, for a worker that holds bytes rather than
@@ -1186,102 +800,35 @@ pub fn execute_bytes(bytes: &[u8]) -> JobResult {
     execute(&JobRequest::from_bytes(bytes)?)
 }
 
-/// The reverse of the non-frame half of a worker reply: a
-/// [`RenderView::wire_code`](rustdar_radar::types::RenderView::wire_code) byte
-/// and the payload type's own bytes, back into a [`JobOutput`].
+/// [`execute_bytes`] plus the reply's own wire form: the row's registry
+/// code and its `encode_out` bytes — exactly what the worker posts back as
+/// the `OUT`/`OUT_KIND` pair (WO-M7c; `rustdar_web::worker` is the one
+/// production caller).
 ///
-/// Here rather than in `rustdar-web` for the reason [`execute_bytes`] is here:
-/// the browser crate is the adapter, this crate owns what a job means, and a
-/// decode that lived over there would be reachable only from a browser. It also
-/// keeps `rustdar-web` from needing a `rustdar-radar` dependency of its own.
+/// Here rather than in `rustdar-web` for the reason [`execute_bytes`] is
+/// here: the browser crate is the adapter, this crate owns what a job means,
+/// and an encode that lived over there would be reachable only from a
+/// browser. The code is the row's dense registry code — the SAME code space
+/// the request direction speaks (`wire_code`, composed-index plus one) —
+/// so one table names every kind in both directions and a reply cannot be
+/// tagged with a vocabulary the requests do not have.
 ///
-/// `None` for a kind byte this build does not have, for a payload the type's
-/// own codec refuses, and for a `PlanView` tag — a frame does not travel this
-/// way, and a reply that says it does comes from a build whose protocol is not
-/// this one. All three are "nothing to draw", which is what a failed render has
-/// always meant, and all three still deliver.
-/// The [`OUT_KIND_OVERLAY`] payload's bytes: a hit-cells tag, the framed
-/// cells when the tag says so, and the raw RGBA as the rest.
-///
-/// The cells are written **sorted by cell index** — a `HashMap`'s iteration
-/// order is seeded per process, and these bytes have to be a function of the
-/// value for two encodes of one reply to agree and for the framing digest in
-/// `offload::tests` to pin them. The RGBA takes the rest, so no length prefix
-/// can lie about it; its one guard stays the dispatch's length check.
-///
-/// The body lives with the codec rows
-/// (`rustdar_overlays::render::jobs::encode_overlay_out`) since WO-M6.3; the
-/// signature stays here because `rustdar_web::worker` and the reply digest
-/// call it by this path.
-pub fn encode_overlay_out(
-    rgba: &[u8],
-    hit_cells: Option<&rustdar_overlays::render::rasterize::HitCells>,
-) -> Vec<u8> {
-    rustdar_overlays::render::jobs::encode_overlay_out(rgba, hit_cells)
-}
-
-/// The inverse of [`encode_overlay_out`]. `None` for a tag outside `{0, 1}`,
-/// a cell index at or past the grid the stated dimensions span, indices out
-/// of ascending order or repeated (the canonical form the encoder writes and
-/// the only one accepted, so one value has one byte string), an empty id
-/// list (the rasterizer never records one), or a buffer shorter than its own
-/// counts claim. The RGBA tail is handed back **unjudged**: only the
-/// dispatch knows the dimensions it must match.
-///
-/// Delegates beside [`encode_overlay_out`] for the same reason.
-pub fn decode_overlay_out(
-    bytes: &[u8],
-) -> Option<(
-    Vec<u8>,
-    Option<rustdar_overlays::render::rasterize::HitCells>,
-)> {
-    rustdar_overlays::render::jobs::decode_overlay_out(bytes)
-}
-
-pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
-    match kind {
-        OUT_KIND_SECTION => {
-            CrossSection::from_bytes(bytes).map(|section| JobOutput::Section(Box::new(section)))
-        }
-        OUT_KIND_VOXELS => {
-            VoxelGrid::from_bytes(bytes).map(|grid| JobOutput::Voxels(Box::new(grid)))
-        }
-        OUT_KIND_VOLUME => rustdar_radar::scan::DecodedScan::from_bytes(bytes)
-            .map(|volume| JobOutput::Volume(Box::new(volume))),
-        // The hit-cells block refuses its malformed shapes; the RGBA tail is
-        // still raw, and its acceptance is still deferred to the dispatch's
-        // own length check — see [`OUT_KIND_OVERLAY`] for what stands where.
-        OUT_KIND_OVERLAY => decode_overlay_out(bytes)
-            .map(|(rgba, hit_cells)| JobOutput::OverlayRaster { rgba, hit_cells }),
-        _ => {
-            log::error!(
-                "a worker sent an out-of-band payload tagged {kind}, which this build has no decoder for"
-            );
-            None
-        }
-    }
-}
-
-/// The gates behind a rendered frame, back from the bytes a worker posted.
-///
-/// Here for the two reasons [`decode_output`] is here — the browser crate is
-/// the adapter and this crate owns what a job means, and it keeps `rustdar-web`
-/// from needing a `rustdar-radar` dependency of its own — and for a third: a
-/// frame arrives through the `IMAGE` field rather than through `OUT`, so it
-/// does not go past `decode_output` at all.
-///
-/// An empty field for anything this build did not write. That is the same
-/// answer a loop frame gives on purpose, and it reads the same way at the far
-/// end: a readout with no gates to find says nothing rather than panicking on a
-/// slice index in a browser, where nobody would see the panic.
-pub fn decode_polar(bytes: &[u8]) -> rustdar_radar::render::polar::PolarField {
-    rustdar_radar::render::polar::PolarField::from_bytes(bytes).unwrap_or_else(|| {
-        log::error!(
-            "a worker sent {} bytes of gates this build cannot read",
-            bytes.len()
-        );
-        rustdar_radar::render::polar::PolarField::default()
-    })
+/// `None` for a payload this build cannot read and for a job that produced
+/// nothing — the page cannot tell them apart and does not need to: both
+/// mean "nothing to draw", and the caller still posts the explicit-null
+/// reply that keeps the pane from wedging.
+pub fn execute_encoded(bytes: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let request = JobRequest::from_bytes(bytes)?;
+    let row = row_for(&request.job);
+    let out = execute(&request)?;
+    // One buffer for the whole reply — for a frame this concatenates the
+    // image and the polar block that used to transfer separately, one extra
+    // memcpy (up to ~20 MiB for the widest still frame) paid HERE, where the
+    // job ran: in the worker, off the frame thread, accepted by design for
+    // one payload shape on the whole reply direction (M-B).
+    let mut encoded = Vec::new();
+    (row.encode_out)(&out, &mut encoded);
+    Some((wire_code(row), encoded))
 }
 
 // ── The job sink ─────────────────────────────────────────────────────────────
@@ -1338,6 +885,13 @@ struct Pending {
     /// between a test tearing down its own fake port and a test tearing down
     /// the port of whichever test happens to be running beside it.
     sink: u64,
+    /// The codec row the dispatched job resolved to, recorded at dispatch —
+    /// **before** the send, with the entry (the register-before-send order
+    /// below) — so an encoded reply is decoded through the row *this page*
+    /// dispatched under, never through whatever the reply's own tag claims:
+    /// [`deliver_encoded_reply`] verifies the reply's kind against this
+    /// row's code and refuses a mismatch as "nothing to draw".
+    row: &'static rustdar_source::job::JobCodec,
     /// Holds the `RenderGuard`, the pane's `Arc<AtomicBool>` and the response
     /// channel. Consuming it is what decrements the render budget and clears
     /// the pane's in-flight mark, so it must run on *every* path out of the
@@ -1919,7 +1473,11 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
 /// registry, the same id space, the same fallthrough — rather than reach for
 /// the sink itself. A generic `offload_job` cannot take one back.
 fn dispatch(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(JobResult) + Send>) {
-    let kind = request.kind();
+    // Resolved once, ahead of the send: the label names the job in the log,
+    // and the row itself rides the pending entry so the reply is decoded
+    // through what THIS dispatch resolved (see `Pending::row`).
+    let row = row_for(&request.job);
+    let kind = row.label;
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Try the sink on every target: one implementation of the lifecycle, and
@@ -1948,6 +1506,7 @@ fn dispatch(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(Job
                 kind,
                 started: web_time::Instant::now(),
                 sink: *sink_id,
+                row,
                 deliver,
             },
         );
@@ -2047,6 +1606,47 @@ pub fn deliver_job_reply(id: u64, result: JobResult) {
         job.started.elapsed().as_millis()
     );
     (job.deliver)(result);
+}
+
+/// [`deliver_job_reply`] for a reply that arrived as bytes — the browser's
+/// `OUT`/`OUT_KIND` pair, or `None` for a worker that answered explicit
+/// nulls (a job that produced nothing).
+///
+/// The decode runs through **the row recorded at dispatch**
+/// (`Pending::row`), never through a registry lookup on the reply's own
+/// tag: the tag is *verified* against that row's code and a mismatch is
+/// logged and delivered as `None` — a reply of the wrong kind is another
+/// build's or a corrupt message, and "nothing to draw" is what every
+/// consumer already does with one, with the slot still released. The bytes
+/// the row's own codec refuses land on the same answer through
+/// `decode_out`'s failure channel.
+///
+/// The row is read without removing the entry, and the removal, the timing
+/// log and the delivery stay [`deliver_job_reply`]'s — one path out of the
+/// registry, whichever form the reply took. On the one thread a browser has
+/// nothing can retire the entry between the read and the call; anywhere
+/// else the entry-less case is the already-abandoned job both functions
+/// already ignore.
+pub fn deliver_encoded_reply(id: u64, reply: Option<(u8, Vec<u8>)>) {
+    let row = pending().get(&id).map(|job| job.row);
+    let result = match (row, reply) {
+        (Some(row), Some((kind, bytes))) => {
+            if kind == wire_code(row) {
+                (row.decode_out)(&bytes)
+            } else {
+                log::error!(
+                    "a worker answered job {id} with out-kind {kind} where the \
+                     dispatched `{}` row's code is {}; treating it as a failed \
+                     job",
+                    row.label,
+                    wire_code(row),
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+    deliver_job_reply(id, result);
 }
 
 /// How many jobs this thread's sink owes an answer for. For diagnostics and

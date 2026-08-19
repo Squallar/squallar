@@ -1,11 +1,17 @@
 use super::*;
+use rustdar_overlays::render::jobs::{decode_overlay_out, encode_overlay_out};
+use rustdar_overlays::render::rasterize::RasterizeOutput;
+use rustdar_radar::frame::RenderedFrame;
 use rustdar_radar::jobs::{
     DecodeJob, Level3Job, Level3PairJob, RadarPlanJob, SectionJob, VoxelJob,
 };
 use rustdar_radar::render_input::RenderInput;
+use rustdar_radar::scan::DecodedScan;
+use rustdar_radar::voxel::VoxelGrid;
 use rustdar_radar::voxel::{VoxelRequest, VoxelShape};
+use rustdar_radar::xsect::CrossSection;
 use rustdar_radar::xsect::SectionRequest;
-use rustdar_source::job::{DescribedJob, JobGeometry};
+use rustdar_source::job::{DescribedJob, DescribedOut, JobGeometry};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1066,22 +1072,26 @@ fn a_malformed_vertical_job_is_refused_rather_than_misread() {
 #[test]
 fn the_vertical_jobs_produce_their_own_output_kinds() {
     let section = execute(&a_section_job()).expect("the section job draws");
-    assert_eq!(section.out_kind(), Some(crate::offload::OUT_KIND_SECTION));
-    assert!(section.section().is_some());
+    assert!(section.downcast_ref::<CrossSection>().is_some());
 
     let voxels = execute(&a_voxel_job()).expect("the voxel job builds");
-    assert_eq!(voxels.out_kind(), Some(crate::offload::OUT_KIND_VOXELS));
-    let grid = voxels.voxels().expect("the voxel job answers a grid");
+    let grid = voxels
+        .take::<VoxelGrid>()
+        .expect("the voxel job answers a grid");
     assert_eq!(grid.shape().cells(), 8 * 6 * 4);
 
     // And the same jobs off the wire, which is the path a worker takes.
-    assert_eq!(
-        execute_bytes(&a_section_job().to_bytes()).map(|o| o.out_kind()),
-        Some(Some(crate::offload::OUT_KIND_SECTION)),
+    assert!(
+        execute_bytes(&a_section_job().to_bytes())
+            .expect("the section job draws via the wire")
+            .downcast_ref::<CrossSection>()
+            .is_some(),
     );
-    assert_eq!(
-        execute_bytes(&a_voxel_job().to_bytes()).map(|o| o.out_kind()),
-        Some(Some(crate::offload::OUT_KIND_VOXELS)),
+    assert!(
+        execute_bytes(&a_voxel_job().to_bytes())
+            .expect("the voxel job builds via the wire")
+            .downcast_ref::<VoxelGrid>()
+            .is_some(),
     );
 }
 
@@ -1098,76 +1108,124 @@ fn the_vertical_jobs_produce_their_own_output_kinds() {
 #[test]
 fn a_frame_consumer_sees_nothing_rather_than_another_kinds_buffers() {
     let section = execute(&a_section_job()).expect("the section job draws");
-    assert_eq!(section.frame(), None);
+    assert!(section.take::<RenderedFrame>().is_none());
     let voxels = execute(&a_voxel_job()).expect("the voxel job builds");
-    assert_eq!(voxels.frame(), None);
-    // And the frame arm still yields its frame, so the accessor is not
-    // simply always `None`.
+    assert!(voxels.take::<RenderedFrame>().is_none());
+    // And the frame job still yields its frame, so the take is not simply
+    // always `None`.
     assert!(
         execute(&a_job())
-            .and_then(JobOutput::frame)
+            .and_then(|out| out.take::<RenderedFrame>())
             .is_some_and(|f| !f.image.is_empty()),
     );
-    // The two vertical accessors are equally narrow.
-    assert!(execute(&a_job()).and_then(JobOutput::section).is_none());
-    assert!(execute(&a_job()).and_then(JobOutput::voxels).is_none());
+    // The vertical takes are equally narrow.
+    assert!(
+        execute(&a_job())
+            .and_then(|out| out.take::<CrossSection>())
+            .is_none()
+    );
+    assert!(
+        execute(&a_job())
+            .and_then(|out| out.take::<VoxelGrid>())
+            .is_none()
+    );
     assert!(
         execute(&a_section_job())
-            .and_then(JobOutput::voxels)
+            .and_then(|out| out.take::<VoxelGrid>())
             .is_none()
     );
 }
 
-/// The worker reply's non-frame half, both directions.
+/// The reply codecs' cross-kind refusals, on the rows themselves.
 ///
-/// This is the whole `OUT` field: `rustdar-web` copies bytes out of a
-/// `Uint8Array` and hands them here with the kind tag, so everything that
-/// can go wrong with that field can be exercised on a host.
+/// Every row's `decode_out` is the whole `OUT` field for its kind:
+/// `rustdar-web` copies bytes out of a `Uint8Array` and the funnel decodes
+/// them through the row recorded at dispatch, so everything that can go
+/// wrong with that field can be exercised on a host — a payload of one kind
+/// handed to another kind's decoder is refused by the payload types' own
+/// magic rather than half-decoded into something plausible.
 #[test]
-fn an_out_of_band_payload_round_trips_and_refuses_what_it_should() {
-    use rustdar_radar::types::RenderView;
-
+fn a_reply_payload_of_the_wrong_kind_is_refused_by_the_rows_codec() {
     let section = execute(&a_section_job())
-        .and_then(JobOutput::section)
+        .and_then(|out| out.take::<CrossSection>())
         .expect("the section job draws");
     let grid = execute(&a_voxel_job())
-        .and_then(JobOutput::voxels)
+        .and_then(|out| out.take::<VoxelGrid>())
         .expect("the voxel job builds");
 
+    let row_decode_out = |label: &str| {
+        job_codecs()
+            .find(|row| row.label == label)
+            .expect("the label names a composed row")
+            .decode_out
+    };
     let section_bytes = section.to_bytes();
     let grid_bytes = grid.to_bytes();
+
+    // Each row decodes its own payload — the control that the refusals
+    // below are about the pairing, not the bytes.
     assert_eq!(
-        decode_output(RenderView::CrossSection.wire_code(), &section_bytes),
-        Some(JobOutput::Section(section)),
+        row_decode_out("section")(&section_bytes).and_then(|out| out.take::<CrossSection>()),
+        Some(section),
     );
     assert_eq!(
-        decode_output(RenderView::Volume.wire_code(), &grid_bytes),
-        Some(JobOutput::Voxels(grid)),
+        row_decode_out("voxels")(&grid_bytes).and_then(|out| out.take::<VoxelGrid>()),
+        Some(grid),
     );
 
-    // A kind byte this build does not have.
-    assert_eq!(decode_output(0, &section_bytes), None);
-    assert_eq!(decode_output(u8::MAX, &section_bytes), None);
-    // A frame does not travel this way; a reply claiming it does is from a
-    // build whose protocol is not this one.
-    assert_eq!(
-        decode_output(RenderView::PlanView.wire_code(), &section_bytes),
-        None,
-    );
-    // The two payload codecs each have their own magic, so the tag naming
-    // the wrong decoder is a refusal rather than a reinterpretation.
-    assert_eq!(
-        decode_output(RenderView::Volume.wire_code(), &section_bytes),
-        None,
-    );
-    assert_eq!(
-        decode_output(RenderView::CrossSection.wire_code(), &grid_bytes),
-        None,
-    );
-    assert_eq!(
-        decode_output(RenderView::CrossSection.wire_code(), &[]),
-        None
-    );
+    // The payload codecs each have their own magic, so a decoder handed the
+    // wrong kind's bytes is a refusal rather than a reinterpretation.
+    assert!(row_decode_out("voxels")(&section_bytes).is_none());
+    assert!(row_decode_out("section")(&grid_bytes).is_none());
+    assert!(row_decode_out("decode")(&section_bytes).is_none());
+    // The frame codec refuses both — neither opens with a shape its walk
+    // accepts end to end — and empty bytes refuse everywhere.
+    assert!(row_decode_out("radar")(&section_bytes).is_none());
+    assert!(row_decode_out("section")(&[]).is_none());
+    assert!(row_decode_out("radar")(&[]).is_none());
+}
+
+/// The deliver-side half of the reply pairing: the funnel decodes a reply
+/// through the row recorded at dispatch and **verifies the reply's kind
+/// against that row's code** — a mismatched kind is another build's reply
+/// or a corrupt message, delivered as `None` ("nothing to draw", slot
+/// released) rather than decoded as whatever the tag claims.
+#[test]
+fn a_reply_of_the_wrong_kind_is_refused_at_the_deliver() {
+    let section_code = 4u8; // section = composed index 3 + 1, pinned by the code table test.
+    for (delivered_kind, decodes) in [(section_code, true), (section_code + 1, false), (0, false)] {
+        let posted = attach(true);
+        let (tx, rx) = mpsc::channel();
+        offload_job("test", Job::Described(a_section_job()), move |result| {
+            let _ = tx.send(result.and_then(|out| out.take::<CrossSection>()).is_some());
+        });
+        let id = posted.lock().unwrap()[0].0;
+        let bytes = execute(&a_section_job())
+            .and_then(|out| out.take::<CrossSection>())
+            .expect("the section job draws")
+            .to_bytes();
+        deliver_encoded_reply(id, Some((delivered_kind, bytes)));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(decodes),
+            "kind {delivered_kind}: the deliver must decode exactly the \
+             dispatched row's code and refuse every other as nothing-to-draw",
+        );
+        detach();
+    }
+
+    // Explicit nulls — a job that produced nothing — deliver `None` through
+    // the same path, and the entry is still released.
+    let posted = attach(true);
+    let (tx, rx) = mpsc::channel();
+    offload_job("test", Job::Described(a_section_job()), move |result| {
+        let _ = tx.send(result.is_some());
+    });
+    let id = posted.lock().unwrap()[0].0;
+    deliver_encoded_reply(id, None);
+    assert_eq!(rx.try_recv(), Ok(false), "a null reply still delivers");
+    assert_eq!(jobs_in_worker(), 0, "the null reply must release the entry");
+    detach();
 }
 
 /// **The invariant the render budget depends on: every `deliver` sends on
@@ -1187,7 +1245,7 @@ fn a_job_answered_with_the_wrong_output_kind_still_delivers() {
         // The consumer is shaped for a frame — the shape both production
         // `offload_job` callers have — and the job answers a section.
         offload_job("test", Job::Described(job), move |output| {
-            let _ = tx.send(output.and_then(JobOutput::frame).is_some());
+            let _ = tx.send(output.and_then(|out| out.take::<RenderedFrame>()).is_some());
         });
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(10)),
@@ -1286,10 +1344,9 @@ fn a_malformed_job_is_refused_rather_than_misread() {
 /// not a panic — the bytes come off a message port.
 #[test]
 fn an_undecodable_level3_payload_renders_nothing() {
-    assert_eq!(execute(&a_level3_job()), None);
-    assert_eq!(
-        execute(&a_level3_pair_job()),
-        None,
+    assert!(execute(&a_level3_job()).is_none());
+    assert!(
+        execute(&a_level3_pair_job()).is_none(),
         "neither object of the pair decodes",
     );
 }
@@ -1399,14 +1456,14 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
     let id = posted.lock().unwrap()[0].0;
     deliver_job_reply(
         id,
-        Some(JobOutput::Frame(RenderedFrame {
+        Some(DescribedOut(Box::new(RenderedFrame {
             image: vec![0; 4],
             max_range_km: 230.0,
             polar: Default::default(),
             nyquist_ms: None,
             melting_layer_source: None,
             storm_motion: None,
-        })),
+        }))),
     );
 
     assert!(rx.try_recv().is_err(), "an abandoned render must not send");
@@ -1518,12 +1575,12 @@ fn a_decode_job_is_not_readable_as_another_kind() {
 /// would see it.
 #[test]
 fn an_archive_that_does_not_decode_produces_nothing() {
-    assert_eq!(execute(&a_decode_job()), None);
-    assert_eq!(execute_bytes(&a_decode_job().to_bytes()), None);
+    assert!(execute(&a_decode_job()).is_none());
+    assert!(execute_bytes(&a_decode_job().to_bytes()).is_none());
 }
 
-/// The reply half: a decoded volume comes back through `decode_output` under
-/// its own kind byte, and under nobody else's.
+/// The reply half: a decoded volume comes back through the decode row's own
+/// reply codec, and through nobody else's.
 #[test]
 fn a_decoded_volume_comes_back_under_its_own_out_kind() {
     // An empty volume: this test is about the envelope, and the payload codec
@@ -1550,82 +1607,26 @@ fn a_decoded_volume_comes_back_under_its_own_out_kind() {
     };
     let bytes = volume.to_bytes();
 
-    let back = decode_output(crate::offload::OUT_KIND_VOLUME, &bytes)
-        .expect("a volume payload under the volume kind");
-    assert_eq!(back.out_kind(), Some(crate::offload::OUT_KIND_VOLUME));
-    assert_eq!(*back.volume().expect("it is a volume"), volume);
+    let row_decode_out = |label: &str| {
+        job_codecs()
+            .find(|row| row.label == label)
+            .expect("the label names a composed row")
+            .decode_out
+    };
+    let back = row_decode_out("decode")(&bytes)
+        .expect("a volume payload under the decode row")
+        .take::<DecodedScan>()
+        .expect("it is a volume");
+    assert_eq!(back, volume);
 
-    // The same bytes under the other kinds' tags are refused by those types'
-    // own magic rather than half-decoded into something plausible.
-    for kind in [
-        crate::offload::OUT_KIND_SECTION,
-        crate::offload::OUT_KIND_VOXELS,
-    ] {
+    // The same bytes under the other kinds' decoders are refused by those
+    // types' own magic rather than half-decoded into something plausible.
+    for label in ["section", "voxels"] {
         assert!(
-            decode_output(kind, &bytes).is_none(),
-            "kind {kind} accepted"
+            row_decode_out(label)(&bytes).is_none(),
+            "the {label} row accepted a volume payload"
         );
     }
-}
-
-/// **Every storm motion rung has a stable, distinct byte, and it survives the
-/// round trip.**
-///
-/// The only boundary a [`rustdar_radar::srv::StormMotionSource`] crosses as a
-/// number is the browser's page↔worker port, and what is on the far side of
-/// that number is which vector an SRV field was shifted by. A renumbering that
-/// went one way and not the other would not blank the notice — it would move
-/// it, and the page would caption a Bunkers right-mover as the RPG's own
-/// applied vector, or the reverse. That is not a degraded picture; the two are
-/// different quantities and the whole path exists to keep them apart.
-///
-/// So this asserts three things at once: the codes are the ones the wire is
-/// documented to carry, no two rungs share one, and `from_wire_code` is the
-/// genuine inverse rather than a second table that agrees today. The exhaustive
-/// walk over `ALL` is what makes it a property of the enum: a fifth rung added
-/// upstream fails the match arms in `StormMotionWire` first, and this row-count
-/// assertion second.
-#[test]
-fn every_storm_motion_rung_has_a_stable_distinct_wire_code() {
-    use rustdar_radar::srv::StormMotionSource as S;
-
-    // Declaration order, which is fallback order, which is the numbering.
-    const ALL: [(S, u8); 4] = [
-        (S::UserOverride, 0),
-        (S::RpgScitAverage, 1),
-        (S::BunkersRightMover, 2),
-        (S::MeanWind, 3),
-    ];
-
-    let mut seen = std::collections::HashSet::new();
-    for (source, expected) in ALL {
-        let code = StormMotionWire(source).wire_code();
-        assert_eq!(
-            code, expected,
-            "{source:?} moved on the wire: a page and a worker built either \
-             side of that change caption one rung with another's words",
-        );
-        assert!(
-            seen.insert(code),
-            "{source:?} shares byte {code} with another rung",
-        );
-        assert_eq!(
-            StormMotionWire::from_wire_code(code),
-            Some(StormMotionWire(source)),
-            "byte {code} did not decode back to {source:?}",
-        );
-    }
-    assert_eq!(
-        seen.len(),
-        4,
-        "a rung was added or removed without this table moving",
-    );
-
-    // A byte this build does not have reads as "no source stated" — a page and
-    // a worker on opposite sides of a deploy, which the protocol token already
-    // refuses — rather than as some rung picked by arithmetic.
-    assert_eq!(StormMotionWire::from_wire_code(4), None);
-    assert_eq!(StormMotionWire::from_wire_code(u8::MAX), None);
 }
 
 // ── The job framing's layout ────────────────────────────────────────────────
@@ -1979,7 +1980,7 @@ fn the_radar_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let direct = execute(&job)
-        .and_then(JobOutput::frame)
+        .and_then(|out| out.take::<RenderedFrame>())
         .expect("the fixture sweep renders");
     assert!(
         !direct.image.is_empty() && painted(&direct.image) > 0,
@@ -1987,7 +1988,7 @@ fn the_radar_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let via_wire = execute_bytes(&bytes)
-        .and_then(JobOutput::frame)
+        .and_then(|out| out.take::<RenderedFrame>())
         .expect("the described radar job renders off its own wire form");
     assert_eq!(
         via_wire, direct,
@@ -2013,15 +2014,15 @@ fn the_level3_render_is_byte_identical_direct_and_via_the_wire() {
         Some(&job),
         "the level3 job does not survive its own wire form",
     );
-    assert_eq!(
-        execute_bytes(&bytes),
-        execute(&job),
+    // Refusal parity, arm by arm — the fixture's payload does not decode,
+    // and both paths must say so (an erased output carries no equality, so
+    // the parity IS the pair of refusals; a rendering fixture would compare
+    // frames as the radar gate above does).
+    assert!(execute(&job).is_none(), "the opaque fixture must refuse");
+    assert!(
+        execute_bytes(&bytes).is_none(),
         "the two arms answered differently for one level3 job",
     );
-    // The agreement above is a real refusal on both arms, stated so this
-    // cannot silently become a green comparison of two rendering paths
-    // nobody looked at: the fixture's payload does not decode.
-    assert_eq!(execute(&job), None, "the opaque fixture must refuse");
 }
 
 /// **The parity gate for the VIL-density (`level3/vild`) row**, on
@@ -2037,12 +2038,13 @@ fn the_vild_render_is_byte_identical_direct_and_via_the_wire() {
         Some(&job),
         "the level3/vild job does not survive its own wire form",
     );
-    assert_eq!(
-        execute_bytes(&bytes),
-        execute(&job),
+    // Refusal parity, arm by arm — see the level3 gate for why the erased
+    // reply makes the pair of refusals the comparison.
+    assert!(execute(&job).is_none(), "neither opaque object decodes");
+    assert!(
+        execute_bytes(&bytes).is_none(),
         "the two arms answered differently for one level3/vild job",
     );
-    assert_eq!(execute(&job), None, "neither opaque object decodes");
 }
 
 /// **The parity gate for the section row: direct call and via-wire
@@ -2060,7 +2062,7 @@ fn the_section_cut_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let direct = execute(&job)
-        .and_then(JobOutput::section)
+        .and_then(|out| out.take::<CrossSection>())
         .expect("the fixture volume cuts");
     assert!(
         painted(direct.image()) > 0,
@@ -2068,7 +2070,7 @@ fn the_section_cut_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let via_wire = execute_bytes(&bytes)
-        .and_then(JobOutput::section)
+        .and_then(|out| out.take::<CrossSection>())
         .expect("the described section job cuts off its own wire form");
     assert_eq!(
         via_wire, direct,
@@ -2091,7 +2093,7 @@ fn the_voxel_build_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let direct = execute(&job)
-        .and_then(JobOutput::voxels)
+        .and_then(|out| out.take::<VoxelGrid>())
         .expect("the fixture volume builds a grid");
     assert_eq!(
         direct.shape().cells(),
@@ -2101,7 +2103,7 @@ fn the_voxel_build_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let via_wire = execute_bytes(&bytes)
-        .and_then(JobOutput::voxels)
+        .and_then(|out| out.take::<VoxelGrid>())
         .expect("the described voxel job builds off its own wire form");
     assert_eq!(
         via_wire, direct,
@@ -2125,12 +2127,14 @@ fn the_archive_decode_is_byte_identical_direct_and_via_the_wire() {
         Some(&job),
         "the decode job does not survive its own wire form",
     );
-    assert_eq!(
-        execute_bytes(&bytes).map(|out| out.volume()),
-        execute(&job).map(|out| out.volume()),
+    // Refusal parity, arm by arm — the fixture archive does not decode,
+    // and both paths must say so (the erased reply carries no equality; a
+    // decoding fixture would compare volumes through the typed take).
+    assert!(execute(&job).is_none(), "the fixture archive must refuse");
+    assert!(
+        execute_bytes(&bytes).is_none(),
         "the two arms answered differently for one decode job",
     );
-    assert_eq!(execute(&job), None, "the fixture archive must refuse");
 }
 
 /// **The parity gate for the sites render: direct call and via-wire execution
@@ -2172,14 +2176,18 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
         "the fixture painted nothing, so byte-identity would be vacuous",
     );
 
-    let (via_wire, hit_cells) = execute_bytes(
+    let RasterizeOutput {
+        rgba: via_wire,
+        hit_cells,
+        ..
+    } = execute_bytes(
         &JobRequest {
             geometry,
             job: job.clone(),
         }
         .to_bytes(),
     )
-    .and_then(JobOutput::overlay_raster)
+    .and_then(|out| out.take::<RasterizeOutput>())
     .expect("the described sites job rasterizes");
 
     assert_eq!(
@@ -2219,9 +2227,12 @@ fn overlay_reply_via_wire(
     Vec<u8>,
     Option<rustdar_overlays::render::rasterize::HitCells>,
 ) {
-    execute_bytes(&job.to_bytes())
-        .and_then(JobOutput::overlay_raster)
-        .expect("the described overlay job rasterizes")
+    let RasterizeOutput {
+        rgba, hit_cells, ..
+    } = execute_bytes(&job.to_bytes())
+        .and_then(|out| out.take::<RasterizeOutput>())
+        .expect("the described overlay job rasterizes");
+    (rgba, hit_cells)
 }
 
 /// **The parity gate for the alert render**, the sites gate's shape on the
@@ -2907,13 +2918,18 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
 }
 
 /// The framing the overlay reply ships is **this** framing — the rows of
-/// [`crate::wire_identity::WIRE_REPLY_ROWS`], the digest the `OUT` code 5
+/// [`crate::wire_identity::WIRE_REPLY_ROWS`], the digest the overlay `OUT`
 /// payload never needed while it was raw RGBA with no layout at all. It has
 /// one since the hit-map kinds' cells started riding ahead of the pixels,
 /// and no guard over the reply direction can see it otherwise: the
 /// reply-shape scrape in `rustdar-web/tests/pwa_assets.rs` watches field
 /// names, and no field name moves when this layout does. The rows feed the
 /// build token beside the request rows — same suite, same mechanism.
+///
+/// The helpers are reached in `rustdar_overlays::render::jobs` directly —
+/// their one home since WO-M7c deleted the frontend delegation wrappers;
+/// the bytes are the rows' `encode_out` bytes, byte for byte (the shared
+/// adapter, pinned by `an_overlay_reply_travels_as_its_own_out_kind`).
 #[test]
 fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     let rgba: Vec<u8> = (0..16).collect();
@@ -2945,11 +2961,97 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     );
 }
 
+/// The framing the FRAME reply ships is **this** framing — the rows of
+/// [`crate::wire_identity::WIRE_FRAME_REPLY_ROWS`], over
+/// `rustdar_radar::frame::RenderedFrame::to_bytes` on two literal fixtures:
+/// one with all three optional trios present (Nyquist, melting-layer code,
+/// the atomic storm trio), one with none. The frame reply rides the
+/// `OUT`/`OUT_KIND` pair since WO-M7c, so this is the digest the eight
+/// named JS fields never needed and the byte layout now demands — the
+/// reply-shape scrape in `rustdar-web/tests/pwa_assets.rs` watches field
+/// names, and no field name moves when this layout does. The rows feed the
+/// build token beside the overlay reply rows — same suite, same mechanism.
+///
+/// The polar block is built from literal bytes (not an extract, whose gates
+/// would be whatever the platform's libm said), so these digests are a
+/// function of the layout alone.
+#[test]
+fn the_frame_reply_framing_is_the_one_this_registry_ships() {
+    let polar = {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&2.125f64.to_le_bytes());
+        bytes.extend_from_slice(&0.25f64.to_le_bytes());
+        bytes.extend_from_slice(&0.5f64.to_le_bytes());
+        for wedge in [(10.0f32, 0.5f32), (11.0, 0.5)] {
+            bytes.extend_from_slice(&wedge.0.to_le_bytes());
+            bytes.extend_from_slice(&wedge.1.to_le_bytes());
+        }
+        for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        rustdar_radar::render::polar::PolarField::from_bytes(&bytes)
+            .expect("the literal polar block decodes")
+    };
+    let full = RenderedFrame {
+        image: vec![10, 20, 30, 40, 50, 60, 70, 80],
+        max_range_km: 230.0,
+        polar,
+        nyquist_ms: Some(26.4),
+        melting_layer_source: Some(rustdar_radar::hca::MeltingLayerSource::RadarDetected),
+        storm_motion: Some(rustdar_radar::srv::SrvMotion {
+            speed_kt: 33.5,
+            direction_deg: 245.0,
+            source: rustdar_radar::srv::StormMotionSource::BunkersRightMover,
+        }),
+    };
+    let bare = RenderedFrame {
+        image: vec![1, 2, 3, 4],
+        max_range_km: 460.0,
+        polar: Default::default(),
+        nyquist_ms: None,
+        melting_layer_source: None,
+        storm_motion: None,
+    };
+    let full_bytes = full.to_bytes();
+    let bare_bytes = bare.to_bytes();
+    let rows = vec![
+        format!(
+            "frame/full | {} | {:#018x}",
+            full_bytes.len(),
+            layout_digest(&full_bytes)
+        ),
+        format!(
+            "frame/bare | {} | {:#018x}",
+            bare_bytes.len(),
+            layout_digest(&bare_bytes)
+        ),
+    ];
+    assert_eq!(
+        rows,
+        crate::wire_identity::WIRE_FRAME_REPLY_ROWS,
+        "the framing `RenderedFrame::to_bytes` writes is not the framing \
+         `wire_identity::WIRE_FRAME_REPLY_ROWS` pins. Left is what this \
+         build posts; right is what that list was last told. If the change \
+         was deliberate, re-pin the row in `wire_identity.rs`: the row feeds \
+         the local build token, so two local builds with different rows \
+         refuse each other and respawn, and in CI the `GITHUB_SHA` does the \
+         same for every change. These rows are within-build parity pins and \
+         refactor gates, not cross-version contracts — the wire is \
+         same-build-only by construction, and the token is what keeps a \
+         mispaired page/worker from ever exchanging bytes one of them \
+         misreads.",
+    );
+}
+
 /// The reply codec's malformed shapes, each with a paired positive control
 /// proving the mutation landed where this test believes it did. The RGBA
 /// tail is deliberately unjudged here — it takes the rest, and its guard is
-/// the dispatch's own length check (`OUT_KIND_OVERLAY` states what stands
-/// where) — so the walk covers the framed prefix and only it.
+/// the dispatch's own length check (nothing on this port describes its own
+/// shape) — so the walk covers the framed prefix and only it.
 #[test]
 fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     let rgba: Vec<u8> = (0..16).collect();
@@ -3491,48 +3593,60 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     }
 }
 
-/// The overlay reply's kind code and its raw round trip — plus the accessor
-/// narrowness every other output kind already pins.
+/// The overlay reply through its own row's codec — plus the take narrowness
+/// every other output kind already pins.
 #[test]
 fn an_overlay_reply_travels_as_its_own_out_kind() {
     let output = execute(&an_overlay_sites_job()).expect("the sites job draws");
-    assert_eq!(output.out_kind(), Some(OUT_KIND_OVERLAY));
 
     // A frame consumer, a section consumer and a voxel consumer all see
     // "nothing to draw" — never a wrong-shaped buffer.
     assert!(
         execute(&an_overlay_sites_job())
-            .and_then(JobOutput::frame)
+            .and_then(|out| out.take::<RenderedFrame>())
             .is_none()
     );
     assert!(
         execute(&an_overlay_sites_job())
-            .and_then(JobOutput::section)
+            .and_then(|out| out.take::<CrossSection>())
             .is_none()
     );
     assert!(
         execute(&an_overlay_sites_job())
-            .and_then(JobOutput::voxels)
+            .and_then(|out| out.take::<VoxelGrid>())
             .is_none()
     );
 
-    // The payload round-trips through its own codec and `decode_output`: the
-    // hit-cells block is framed since protocol version 11, the RGBA is still
-    // the raw rest — see `OUT_KIND_OVERLAY` — and acceptance of the tail is
-    // still the dispatcher's length check rather than a magic.
-    let (rgba, hit_cells) = output.overlay_raster().expect("an overlay raster");
-    let encoded = encode_overlay_out(&rgba, hit_cells.as_ref());
-    assert_eq!(
-        decode_output(OUT_KIND_OVERLAY, &encoded),
-        Some(JobOutput::OverlayRaster {
+    // The payload round-trips through the sites row's own reply codec: the
+    // hit-cells block is framed, the RGBA is still the raw rest, and
+    // acceptance of the tail is still the dispatcher's length check rather
+    // than a magic.
+    let RasterizeOutput {
+        rgba, hit_cells, ..
+    } = output.take::<RasterizeOutput>().expect("an overlay raster");
+    let sites_row = job_codecs()
+        .find(|row| row.label == "overlay/sites")
+        .expect("the sites row is composed");
+    let mut encoded = Vec::new();
+    (sites_row.encode_out)(
+        &DescribedOut(Box::new(RasterizeOutput {
             rgba: rgba.clone(),
-            hit_cells,
-        }),
+            hit_cells: hit_cells.clone(),
+            alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        })),
+        &mut encoded,
     );
-    // And the accessor is as narrow as its four siblings.
+    assert_eq!(encoded, encode_overlay_out(&rgba, hit_cells.as_ref()));
+    let back = (sites_row.decode_out)(&encoded)
+        .expect("the sites reply decodes")
+        .take::<RasterizeOutput>()
+        .expect("the sites reply is a raster");
+    assert_eq!(back.rgba, rgba);
+    assert_eq!(back.hit_cells, hit_cells);
+    // And the take is as narrow as its four siblings.
     assert!(
         execute(&a_job())
-            .and_then(JobOutput::overlay_raster)
+            .and_then(|out| out.take::<RasterizeOutput>())
             .is_none()
     );
 }
