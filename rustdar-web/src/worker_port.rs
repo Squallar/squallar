@@ -18,7 +18,7 @@
 
 use crate::worker_protocol as proto;
 use crate::worker_retry::Backoff;
-use rustdar_frontend::offload::{self, JobOutput, JobRequest, JobSink, RenderedFrame};
+use rustdar_frontend::offload::{self, JobRequest, JobSink};
 use std::cell::Cell;
 use wasm_bindgen::prelude::*;
 
@@ -266,99 +266,38 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
     }
 }
 
-/// Turn a `done` message back into a [`JobResult`](offload::JobResult) and hand
-/// it to the job that asked for it.
+/// Hand a `done` message to the job that asked for it.
 ///
-/// The buffers arrive transferred, so reading them here is the first copy back
-/// into this instance's linear memory; there is no way around that one without
-/// a `SharedArrayBuffer`, which needs COOP/COEP headers GitHub Pages does not
+/// The reply is the `OUT`/`OUT_KIND` pair — one transferred `Uint8Array` in
+/// the dispatched row's own `encode_out` form, plus the registry code naming
+/// the row that wrote it — or explicit nulls for a job that produced
+/// nothing. Reading the buffer here is the first copy back into this
+/// instance's linear memory; there is no way around that one without a
+/// `SharedArrayBuffer`, which needs COOP/COEP headers GitHub Pages does not
 /// let this deployment set.
+///
+/// Everything after the copy is `offload::deliver_encoded_reply`'s: it holds
+/// the codec row recorded when the job was dispatched, verifies the reply's
+/// kind against that row's code (a mismatch is another build's reply or a
+/// corrupt message, delivered as "nothing to draw"), and decodes through the
+/// row — so this crate stays the browser adapter and the payload codecs are
+/// reachable from a host test rather than only from a browser.
 fn deliver(data: &JsValue) {
     let Some(id) = proto::field(data, proto::ID).and_then(|v| v.as_f64()) else {
         log::error!("worker answered with no job id");
         return;
     };
 
-    let image = proto::field(data, proto::IMAGE).filter(|v| !v.is_null());
-    let frame = image.map(|image| {
-        JobOutput::Frame(RenderedFrame {
-            image: js_sys::Uint8Array::new(&image).to_vec(),
-            max_range_km: proto::field(data, proto::MAX_RANGE)
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            // A message this build did not write, or one whose two halves
-            // disagree about the picture, decodes to nothing — the readout goes
-            // quiet rather than the page panicking on a slice index in a
-            // browser. See `PolarField::from_bytes`.
-            polar: proto::field(data, proto::POLAR)
-                .filter(|v| !v.is_null())
-                .map(|v| offload::decode_polar(&js_sys::Uint8Array::new(&v).to_vec()))
-                .unwrap_or_default(),
-            // `as_f64` is `None` for the null this field carries whenever the
-            // rendered raster had no one cut behind it, so the absence needs no
-            // separate test — see `proto::NYQUIST`.
-            nyquist_ms: proto::field(data, proto::NYQUIST).and_then(|v| v.as_f64()),
-            // Null (a raster that classified nothing) and a byte this build
-            // does not have both land on `None` — see `proto::MELTING_LAYER`.
-            // The page then draws no qualification, which is the same thing it
-            // draws for a measured layer; the protocol token is what keeps a
-            // worker old enough to produce that from ever being attached.
-            melting_layer_source: proto::field(data, proto::MELTING_LAYER)
-                .and_then(|v| v.as_f64())
-                .and_then(|v| offload::MeltingLayerWire::from_wire_code(v as u8))
-                .map(|wire| wire.0),
-            // The same filter for the same reason — see `proto::STORM_MOTION`.
-            // A raster that applied no vector and a byte this build cannot read
-            // both land on `None`, and the pane then draws no vector at all;
-            // the protocol token is what keeps a worker old enough to mean the
-            // second by the first from ever being attached.
-            //
-            // All three fields or none. A trio that arrived half-formed would
-            // otherwise become a legend reading a real source beside a zeroed
-            // speed, which is a confident lie about what shifted the picture —
-            // so the `?`-chain drops the lot.
-            storm_motion: (|| {
-                let source = proto::field(data, proto::STORM_MOTION)
-                    .and_then(|v| v.as_f64())
-                    .and_then(|v| offload::StormMotionWire::from_wire_code(v as u8))?
-                    .0;
-                let speed_kt =
-                    proto::field(data, proto::STORM_MOTION_SPEED).and_then(|v| v.as_f64())? as f32;
-                let direction_deg =
-                    proto::field(data, proto::STORM_MOTION_DIR).and_then(|v| v.as_f64())? as f32;
-                Some(offload::SrvMotion {
-                    speed_kt,
-                    direction_deg,
-                    source,
-                })
-            })(),
-        })
-    });
-
-    // A frame and an `OUT` payload are mutually exclusive on the wire; `or_else`
-    // rather than a branch so a message carrying both — which only a build
-    // mismatch the token check already refuses could produce — still resolves to
-    // exactly one output rather than to a pair somebody has to arbitrate.
-    offload::deliver_job_reply(id as u64, frame.or_else(|| decode_out(data)));
-}
-
-/// The non-frame half of a reply: one transferred `Uint8Array` plus the tag
-/// saying which decoder owns it.
-///
-/// `None` for anything this build cannot read — a missing payload, a kind byte
-/// it does not have, or bytes the payload type's own codec refuses. All three
-/// are "nothing to draw", which is what a failed render has always been, and
-/// all three still deliver: the caller's slot is released either way.
-/// The decoding itself is [`offload::decode_output`], in the frontend beside
-/// [`offload::execute_bytes`] — so this crate stays the browser adapter and the
-/// payload codecs are reachable from a host test rather than only from a
-/// browser.
-fn decode_out(data: &JsValue) -> Option<offload::JobOutput> {
-    let out = proto::field(data, proto::OUT).filter(|v| !v.is_null())?;
-    let kind = proto::field(data, proto::OUT_KIND)
-        .and_then(|v| v.as_f64())
-        .map(|v| v as u8)?;
-    offload::decode_output(kind, &js_sys::Uint8Array::new(&out).to_vec())
+    let reply = (|| {
+        let out = proto::field(data, proto::OUT).filter(|v| !v.is_null())?;
+        let kind = proto::field(data, proto::OUT_KIND)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as u8)?;
+        Some((kind, js_sys::Uint8Array::new(&out).to_vec()))
+    })();
+    // `None` — a missing payload, a missing kind, a job that produced
+    // nothing — still delivers: the caller's slot is released either way.
+    offload::deliver_encoded_reply(id as u64, reply);
 }
 
 /// The installed port. Owns the `Worker` handle, so the worker lives exactly as

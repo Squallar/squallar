@@ -91,7 +91,7 @@ fn a_real_plan_view_render_lands_on_the_same_picture() {
         .expect("the rasterizer answers at a side this build makes");
 
     let frame = execute(&request)
-        .and_then(JobOutput::frame)
+        .and_then(|out| out.take::<rustdar_radar::frame::RenderedFrame>())
         .expect("the same job through the funnel draws the same sweep");
 
     assert_eq!(
@@ -128,7 +128,7 @@ fn a_real_section_cut_lands_on_the_same_picture() {
     .to_vec();
 
     let cut = execute(&tests::a_section_job())
-        .and_then(JobOutput::section)
+        .and_then(|out| out.take::<rustdar_radar::xsect::CrossSection>())
         .expect("the same job through the funnel cuts the same section");
 
     let size = [SECTION_WIDTH, SECTION_HEIGHT];
@@ -143,10 +143,11 @@ fn a_real_section_cut_lands_on_the_same_picture() {
 /// A voxel grid carries no raster, and the output stage must leave it exactly
 /// as the builder answered.
 ///
-/// Named rather than left to inference because [`premultiplied`] matches on the
-/// output kind, and the `Voxels` arm is the one that has to *decline* to do
-/// anything. A wildcard there would have been silently right today and silently
-/// wrong for the next output kind that carries pixels.
+/// Named rather than left to inference because the output stage runs on what
+/// each output type declares (`JobOut::straight_rasters_mut`), and the grid's
+/// empty answer is the declaration that has to *decline*. The method is
+/// required with no default, so the next output kind that carries pixels has
+/// to state its posture rather than inherit a silent decline.
 #[test]
 fn a_voxel_grid_passes_through_the_output_stage_untouched() {
     let voxel_job = tests::a_voxel_job();
@@ -166,11 +167,11 @@ fn a_voxel_grid_passes_through_the_output_stage_untouched() {
     .expect("the fixture volume builds a grid");
 
     let through = execute(&tests::a_voxel_job())
-        .and_then(JobOutput::voxels)
+        .and_then(|out| out.take::<rustdar_radar::voxel::VoxelGrid>())
         .expect("the same job through the funnel builds the same grid");
 
     assert_eq!(
-        *through, built,
+        through, built,
         "the output stage altered a voxel grid. It carries no raster; the \
          `Voxels` arm exists to do nothing to it.",
     );

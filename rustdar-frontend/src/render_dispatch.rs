@@ -2105,8 +2105,11 @@ impl RenderDispatcher {
             let _guard = guard;
             // An output of another kind becomes `None` — "nothing to draw" —
             // which the receiver already handles, with the budget still unwound
-            // and the pane still told.
-            let section = output.and_then(crate::offload::JobOutput::section);
+            // and the pane still told; the typed take is the accessor's
+            // stated contract (`DescribedOut::take`).
+            let section = output
+                .and_then(|out| out.take::<rustdar_radar::xsect::CrossSection>())
+                .map(Box::new);
             if wanted.load(Ordering::Relaxed) {
                 let _ = sender.send(crate::channels::SectionResponse {
                     pane_idx,
@@ -2175,7 +2178,10 @@ impl RenderDispatcher {
         ));
         crate::offload::offload_job("voxels", job, move |output| {
             let _guard = guard;
-            let grid = output.and_then(crate::offload::JobOutput::voxels);
+            // An output of another kind is `None` — "nothing to draw".
+            let grid = output
+                .and_then(|out| out.take::<rustdar_radar::voxel::VoxelGrid>())
+                .map(Box::new);
             // The claim the whole worker move is measured by: the resample no
             // longer spends this time on the frame thread. Logged with the
             // outcome so a refused build is distinguishable from a slow one.
@@ -2243,8 +2249,9 @@ impl RenderDispatcher {
         crate::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` here — "nothing to draw",
-            // which every path below already handles. See `JobOutput::frame`.
-            let frame = output.and_then(crate::offload::JobOutput::frame);
+            // which every path below already handles (`DescribedOut::take`
+            // states the contract).
+            let frame = output.and_then(|out| out.take::<rustdar_radar::frame::RenderedFrame>());
             // Sent whether or not there is a frame, because the receiver is what
             // clears `render_in_flight` and a pane that never hears back stops
             // dispatching. Still gated on `wanted`: an abandoned render must not

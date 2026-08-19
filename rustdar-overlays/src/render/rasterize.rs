@@ -207,6 +207,22 @@ impl rustdar_source::job::JobOut for RasterizeOutput {
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
+
+    /// The declared [`AlphaMode`] is the whole answer: a straight raster is
+    /// handed over for conversion **and the declaration flips with it**, so
+    /// the statement and the buffer cannot come to disagree — after the run
+    /// funnel premultiplies what it is handed here, this output honestly
+    /// declares what its bytes are, which is also the only convention the
+    /// reply wire ever carries.
+    fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
+        match self.alpha {
+            AlphaMode::Premultiplied => Vec::new(),
+            AlphaMode::Straight => {
+                self.alpha = AlphaMode::Premultiplied;
+                vec![&mut self.rgba]
+            }
+        }
+    }
 }
 
 // ── Mercator projection helpers ──────────────────────────────────────────

@@ -111,7 +111,7 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
 ///
 /// * No arm may convert. `offload::execute` converts inside the job at the
 ///   rasterizer's own declaration — the model grid's straight alpha included
-///   — the contract on `offload::JobOutput::OverlayRaster` is
+///   — the reply contract (`RasterizeOutput::straight_rasters_mut`) is
 ///   premultiplied-always, and the per-kind
 ///   `..._is_byte_identical_direct_and_via_the_wire` parity tests in
 ///   `offload::tests` pin the bytes. The deliver therefore reads the buffer
@@ -239,13 +239,15 @@ fn the_opaque_overlay_path_stays_deleted() {
 }
 
 /// The radar rasters are converted by **the job**, at the one place every
-/// rasterizing arm funnels through.
+/// rasterizing row funnels through.
 ///
 /// The counterpart of the assertions above: they say the conversion is not on
 /// the frame thread, and this says where it went instead. `execute`'s output
-/// stage, rather than any of its five arms, because an arm-by-arm conversion is
-/// one a sixth arm can be added without — and the two consumers that would then
-/// read a straight-alpha buffer through `from_rgba_premultiplied` would draw it
+/// stage — the `straight_rasters_mut` walk over what the row's own output
+/// type declares (required, no default, since WO-M7c) — rather than any
+/// per-kind arm, because an arm-by-arm conversion is one a new kind can be
+/// added without, and the two consumers that would then read a
+/// straight-alpha buffer through `from_rgba_premultiplied` would draw it
 /// too bright with nothing to catch them.
 ///
 /// Read off the source for the module's reason: what is being asserted is that
@@ -255,8 +257,9 @@ fn the_opaque_overlay_path_stays_deleted() {
 fn the_job_converts_its_own_rasters() {
     let body = free_body_of(OFFLOAD, "pub fn execute(");
     assert!(
-        body.contains("output.map(premultiplied)"),
-        "`execute` no longer premultiplies what it answers with. Every radar \
+        body.contains("straight_rasters_mut()") && body.contains("premultiply_raster(raster)"),
+        "`execute` no longer premultiplies what it answers with (the \
+         `straight_rasters_mut` walk left its output stage). Every radar \
          consumer reads its buffers through \
          `ColorImage::from_rgba_premultiplied`, which computes nothing — so a \
          straight-alpha raster reaching one is not an error, it is a picture \
@@ -264,9 +267,10 @@ fn the_job_converts_its_own_rasters() {
     );
     assert!(
         !body.contains(UNMULTIPLY),
-        "`execute` names the unmultiply in one of its arms. It belongs in the \
-         output stage after all of them, which is what stops a sixth arm from \
-         being added without it.",
+        "`execute` names the unmultiply per kind. It belongs in the output \
+         stage after every kind, driven by each output type's own declared \
+         posture, which is what stops a new kind from being added without \
+         it.",
     );
 }
 

@@ -600,9 +600,12 @@ fn the_worker_protocol_is_versionless_and_the_token_names_the_build() {
 /// entry against each id it posted, and only a reply releases them — so a path
 /// through `post_result` that left a field absent, or posted nothing at all,
 /// wedges that pane forever with no error anywhere. The defaults are written
-/// once before the match, which is what makes "every arm" a property of the
-/// shape rather than of three arms agreeing; this pins that shape, because the
-/// function is `wasm32`-only and no host test can run it.
+/// once before the answering arm, which is what makes "every arm" a property
+/// of the shape rather than of the arms agreeing; this pins that shape,
+/// because the function is `wasm32`-only and no host test can run it.
+///
+/// Two fields since WO-M7c: the whole reply is the `OUT`/`OUT_KIND` pair
+/// (the eight frame fields died with the named-field frame path).
 #[test]
 fn the_worker_reply_writes_every_field_on_every_arm() {
     let body = RASTER_WORKER_RS
@@ -610,99 +613,90 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         .expect("worker.rs no longer has a post_result")
         .1;
     let defaults = body
-        .split_once("match result {")
-        .expect("post_result no longer matches on the result")
+        .split_once("if let Some((kind, bytes)) = result")
+        .expect("post_result no longer branches on the result")
         .0;
     for field in [
         // Matched **with the trailing comma**, because `proto::OUT` is a prefix
         // of `proto::OUT_KIND`: without it, deleting the `OUT` default outright
         // still satisfied this loop, which is exactly how that mutation
         // survived this test's first draft.
-        "proto::IMAGE,",
-        "proto::POLAR,",
-        "proto::MAX_RANGE,",
-        "proto::NYQUIST,",
-        // The two provenance fields were missing from this list, which is the
-        // one thing it exists to enumerate: both are written before the match
-        // exactly as the others are, and neither was pinned. A default deleted
-        // from either would have left every non-SRV, non-classification reply
-        // carrying a stale provenance from whatever the worker answered last.
-        "proto::MELTING_LAYER,",
-        // The trailing comma is doing real work on these three: without it
-        // `proto::STORM_MOTION,` would be satisfied by `proto::STORM_MOTION_SPEED`
-        // and the plain provenance byte could vanish unnoticed.
-        "proto::STORM_MOTION,",
-        // The speed and direction shipped as version 7's whole reason and were
-        // written only inside the `Frame` arm's `if let`, so every other reply
-        // left them absent rather than null while `smv` beside them was null.
-        "proto::STORM_MOTION_SPEED,",
-        "proto::STORM_MOTION_DIR,",
         "proto::OUT,",
         "proto::OUT_KIND,",
     ] {
         assert!(
             defaults.contains(field),
-            "{field} is not written before the match in post_result, so an arm \
-             that does not set it leaves it absent and the page cannot tell a \
-             null answer from a lost one"
+            "{field} is not written before the answering arm in post_result, \
+             so a path that does not set it leaves it absent and the page \
+             cannot tell a null answer from a lost one"
         );
     }
 }
 
-/// The `Frame` arm still writes the four fields it always wrote, and still
-/// transfers both buffers.
+/// The frame reply rides the `OUT`/`OUT_KIND` pair and its one buffer is
+/// **transferred** — the reply direction's shape since WO-M7c, pinned at
+/// the source because `post_result` is `wasm32`-only and no host test can
+/// run it.
 ///
-/// The second buffer changed shape without changing role: it carried the
-/// `side²` `f32` raster value grid as a `Float32Array` and now carries the
-/// gates behind those pixels as bytes — 16 MiB against about 5 MiB for the
-/// widest sweep, and a few kilobytes for a loop frame, which sends geometry and
-/// no values at all. What this test is about is unchanged, and is why the field
-/// is still checked by name: it must be *written* and it must be
-/// **transferred**, or the browser copies it per frame instead of moving it.
+/// Three claims, each of which would fail silently at runtime:
 ///
-/// Widening the reply to carry sections and grids was supposed to leave the
-/// working path untouched, and that claim is otherwise verified only by
-/// reading the diff. A `Frame` arm that stopped setting `MAX_RANGE`, or that
-/// lost a `transfer.push`, would not fail to compile and would not fail any
-/// test that exists — it would copy 4 MiB per frame instead of moving it, or
-/// report every plan view's range as the `0.0` default, which is a texture
-/// projected at the wrong scale rather than an error.
-///
-/// `NYQUIST` joined the three when the plan view began reporting where the
-/// sweep it drew folds. It is written here and nowhere else on this arm, and a
-/// `Frame` reply that stopped writing it would leave every velocity pane in
-/// the browser unable to say where its own picture wraps — silently, because
-/// the default written before the match is a legitimate answer for the Level
-/// III and volume products.
+/// * **Exactly one `transfer.push` on the answering arm.** The reply is one
+///   payload buffer, moved, not copied — a lost push would structured-clone
+///   up to ~21 MiB per still frame instead of transferring it, and nothing
+///   else would fail; a second push would mean a second payload this
+///   protocol does not have.
+/// * **`OUT` and `OUT_KIND` are written on the answering arm.** The pair is
+///   the whole answer; an arm that wrote only one would post a payload the
+///   page refuses (the kind verification) or a kind with no payload.
+/// * **The eight frame-field idents are GONE from worker.rs** — the
+///   deletion pin. `proto::IMAGE`/`proto::POLAR` and the six beside them
+///   were the frame's named-field path; a write that came back would be a
+///   second reply shape beside the codec's, and the page would have to
+///   arbitrate between two outputs for one job.
 #[test]
-fn the_frame_arm_of_the_worker_reply_is_unchanged() {
-    let arm = RASTER_WORKER_RS
-        .split_once("Some(JobOutput::Frame(RenderedFrame {")
-        .expect("post_result no longer has a Frame arm")
+fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
+    let body = without_line_comments(RASTER_WORKER_RS);
+    let answering_arm = body
+        .split_once("if let Some((kind, bytes)) = result")
+        .expect("post_result no longer branches on the result")
         .1
-        .split_once("Some(output) => {")
-        .expect("the Frame arm is no longer followed by the out-of-band arm")
+        .split_once("scope.post_message_with_transfer")
+        .expect("post_result no longer ends by posting the message it built")
         .0;
-    for needle in [
-        "proto::IMAGE, &image",
-        "proto::POLAR, &polar",
-        "proto::MAX_RANGE,",
-        "proto::NYQUIST,",
-        "transfer.push(&image.buffer());",
-        "transfer.push(&polar.buffer());",
-    ] {
+
+    assert_eq!(
+        answering_arm.matches("transfer.push(").count(),
+        1,
+        "the answering arm must transfer exactly one buffer — the whole \
+         reply is one `OUT` payload, moved rather than copied",
+    );
+    for needle in ["proto::OUT,", "proto::OUT_KIND,"] {
         assert!(
-            arm.contains(needle),
-            "the Frame arm no longer contains {needle:?}; the plan-view reply \
-             is supposed to be byte-for-byte what it was before the widening"
+            answering_arm.contains(needle),
+            "the answering arm no longer writes {needle} — the OUT/OUT_KIND \
+             pair is the whole answer since WO-M7c",
         );
     }
-    assert!(
-        !arm.contains("proto::OUT"),
-        "the Frame arm writes an out-of-band field; a frame travels in \
-         IMAGE/POLAR/MAX_RANGE/NYQUIST and nothing else, and a reply carrying \
-         both leaves the page arbitrating between two outputs for one job"
-    );
+
+    // The deletion pin: the eight frame-field idents died with the
+    // named-field frame path. Split literals (the arch_ratchets needle
+    // discipline) so this file never contains what it forbids.
+    for ident in [
+        concat!("proto::", "IMAGE"),
+        concat!("proto::", "POLAR"),
+        concat!("proto::", "MAX_RANGE"),
+        concat!("proto::", "NYQUIST"),
+        concat!("proto::", "MELTING_LAYER"),
+        concat!("proto::", "STORM_MOTION"),
+    ] {
+        assert!(
+            !body.contains(ident),
+            "worker.rs names {ident} again. The frame reply rides the \
+             OUT/OUT_KIND pair in `RenderedFrame::to_bytes` form since \
+             WO-M7c; a named frame field beside it is a second reply shape \
+             the page would have to arbitrate against the codec's",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -760,30 +754,21 @@ fn post_result_body() -> String {
         .to_string()
 }
 
-/// That body split into the three places a field can be written: before the
-/// match, in the `Frame` arm, in the arm that carries everything else.
+/// That body split into the two places a field can be written: before the
+/// answering arm (the defaults every reply carries), and the answering arm
+/// itself.
 ///
-/// The same three slices the tests above take, by the same markers. The `None`
-/// arm falls in no slice because it writes nothing; if it ever writes something
-/// the call-site count in
-/// [`the_worker_reply_shape_is_the_one_this_build_ships`] is what
-/// notices, which is the point of counting.
+/// The same two slices the tests above take, by the same marker. The null
+/// reply falls in no slice of its own because it writes nothing beyond the
+/// defaults; if a third place ever writes a field the call-site count in
+/// [`the_worker_reply_shape_is_the_one_this_build_ships`] is what notices,
+/// which is the point of counting.
 fn post_result_arms() -> Vec<(&'static str, String)> {
     let body = post_result_body();
-    let (head, tail) = body
-        .split_once("match result {")
-        .expect("post_result no longer matches on the result");
-    let (frame, out) = tail
-        .split_once("Some(JobOutput::Frame(RenderedFrame {")
-        .expect("post_result no longer has a Frame arm")
-        .1
-        .split_once("Some(output) => {")
-        .expect("the Frame arm is no longer followed by the out-of-band arm");
-    vec![
-        ("head", head.to_string()),
-        ("frame", frame.to_string()),
-        ("out", out.to_string()),
-    ]
+    let (head, answer) = body
+        .split_once("if let Some((kind, bytes)) = result")
+        .expect("post_result no longer branches on the result");
+    vec![("head", head.to_string()), ("answer", answer.to_string())]
 }
 
 /// The key argument of every `set_field(&message, <KEY>, ..)` in one slice, in
@@ -835,18 +820,21 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 /// it produces over a fixture built from literals:
 ///
 ///   * `rustdar_radar::render::polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships`
-///     for `POLAR`;
+///     for the polar block inside a frame reply;
 ///   * `rustdar_radar::volume_wire::tests::the_volume_wire_layout_is_the_one_this_version_ships`
-///     for the decoded volume `OUT` carries under code 4 (`OUT`'s other two
-///     payloads, a section and a voxel grid, were already pinned by their own
-///     crates);
+///     for the decoded volume `OUT` carries under the decode row's registry
+///     code (the section and voxel payloads were already pinned by their
+///     own crates);
 ///   * `rustdar_frontend::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
-///     for the page->worker direction named below, and
-///     `..._the_overlay_reply_framing_is_the_one_this_protocol_ships` for the
-///     overlay payload `OUT` carries under code 5, whose hit-map cells ride
-///     ahead of the raw RGBA (the RGBA tail has no layout to digest, and its
-///     guard is the dispatching page's own `width × height × 4` length
-///     check).
+///     for the page->worker direction named below,
+///     `..._the_overlay_reply_framing_is_the_one_this_protocol_ships` for
+///     the overlay reply payloads (hit-map cells riding ahead of raw RGBA;
+///     the RGBA tail has no layout to digest, and its guard is the
+///     dispatching page's own `width × height × 4` length check), and
+///     `..._the_frame_reply_framing_is_the_one_this_registry_ships` for the
+///     frame reply's `RenderedFrame::to_bytes` form (WO-M7c — the layout
+///     change that retired the eight named frame fields this list once
+///     pinned).
 ///
 /// Those framing rows do double duty since M5: they live in
 /// `rustdar_frontend::wire_identity` as production consts, and the local
@@ -923,28 +911,12 @@ fn the_worker_reply_shape_is_the_one_this_build_ships() {
     assert_eq!(
         written,
         [
-            "frame | IMAGE | image",
-            "frame | MAX_RANGE | range",
-            "frame | MELTING_LAYER | mls",
-            "frame | NYQUIST | nyq",
-            "frame | POLAR | polar",
-            "frame | STORM_MOTION | smv",
-            "frame | STORM_MOTION_DIR | smd",
-            "frame | STORM_MOTION_SPEED | sms",
+            "answer | OUT | out",
+            "answer | OUT_KIND | outkind",
             "head | ID | id",
-            "head | IMAGE | image",
             "head | KIND | kind",
-            "head | MAX_RANGE | range",
-            "head | MELTING_LAYER | mls",
-            "head | NYQUIST | nyq",
             "head | OUT | out",
             "head | OUT_KIND | outkind",
-            "head | POLAR | polar",
-            "head | STORM_MOTION | smv",
-            "head | STORM_MOTION_DIR | smd",
-            "head | STORM_MOTION_SPEED | sms",
-            "out | OUT | out",
-            "out | OUT_KIND | outkind",
         ]
         .map(str::to_string),
         "the shape of a `done` reply is not the shape this list was last \

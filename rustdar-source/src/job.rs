@@ -22,10 +22,10 @@
 //!   context and the run signature would otherwise fork per kind — and the
 //!   fork is exactly where the substrate would start naming kinds.
 //!
-//! **The one downcast.** [`JobCodec::of`] and [`JobCodec::with_out`] build
-//! monomorphized shims over a [`JobSpec`], and those shims are the ONE place
-//! where the erased forms meet the typed ones. Everything above them stays
-//! erased; everything below — a row's `encode`/`decode`/`run` — stays typed.
+//! **The one downcast.** [`JobCodec::of`] builds monomorphized shims over a
+//! [`JobOutCodec`], and those shims are the ONE place where the erased forms
+//! meet the typed ones. Everything above them stays erased; everything below
+//! — a row's `encode`/`decode`/`run`/`encode_out`/`decode_out` — stays typed.
 
 use std::any::{Any, TypeId};
 
@@ -118,6 +118,21 @@ pub struct EncodeCtx {
 pub trait JobOut: std::fmt::Debug + Send + 'static {
     fn as_any(&self) -> &dyn Any;
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
+    /// Every raster this output carries in **straight** alpha, for the run
+    /// funnel to premultiply in place — after which the buffers are in the
+    /// consumers' premultiplied convention and this method's contract is
+    /// spent.
+    ///
+    /// **Required, no default, deliberately**: every output type states its
+    /// premultiply posture, so a new kind carrying pixels has to say whether
+    /// they need converting instead of silently declining to be — the same
+    /// property the funnel's old exhaustive match had, now structural. An
+    /// output with no rasters (a voxel grid, a decoded volume) answers an
+    /// empty `Vec` and says so; one whose convention is dynamic (the overlay
+    /// raster's declared `AlphaMode`) flips its own declaration to
+    /// premultiplied as it hands the buffer over, so the statement and the
+    /// buffer cannot come to disagree.
+    fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]>;
 }
 
 /// A job output with its concrete type erased.
@@ -147,7 +162,7 @@ pub enum JobCost {
 
 /// One row of the job registry: everything the boundary needs to carry one
 /// job kind, as plain function pointers so a registry of rows can be a
-/// `static`. Built only through [`JobCodec::of`] / [`JobCodec::with_out`].
+/// `static`. Built only through [`JobCodec::of`].
 pub struct JobCodec {
     pub label: &'static str,
     /// The row's input `TypeId`, held as a function rather than a value:
@@ -158,24 +173,22 @@ pub struct JobCodec {
     pub encode: fn(&DescribedJob, &EncodeCtx, &mut Vec<u8>),
     /// Decodes one job off the cursor. Takes AND returns the [`JobGeometry`]:
     /// the caller parses the shared header and hands the envelope in; a row
-    /// whose legacy layout carries a geometry field inside its payload (the
-    /// radar rasters' `side_ceiling_px`, until WO-M7b canonicalises the
-    /// framing) fills it in and returns the amended envelope, while rows with
-    /// none pass it through unchanged. The pass-through is load-bearing —
-    /// WO-M7.1's rows depend on the returned value being the one the job
-    /// runs under; do not simplify it away.
+    /// whose legacy layout carried a geometry field inside its payload filled
+    /// it in and returned the amended envelope (the radar rasters'
+    /// `side_ceiling_px`, until WO-M7b canonicalised the framing), while rows
+    /// with none pass it through unchanged. The pass-through is load-bearing
+    /// — the returned value is the one the job runs under; do not simplify
+    /// it away.
     pub decode:
         fn(&mut crate::wire::Reader<'_>, JobGeometry) -> Option<(DescribedJob, JobGeometry)>,
     pub run: fn(&DescribedJob, &JobGeometry) -> Option<DescribedOut>,
-    /// Reply-direction encoder. `Option` ONLY until WO-M7c de-Options it:
-    /// rows whose replies still ride the legacy named-field path carry
-    /// `None`.
-    pub encode_out: Option<fn(&DescribedOut, &mut Vec<u8>)>,
-    /// Reply-direction decoder; `Option` on the same terms as `encode_out`.
-    // The outer Option is presence (until WO-M7c), the inner is the decode
-    // failing — collapsing them into an alias would hide which is which.
-    #[allow(clippy::type_complexity)]
-    pub decode_out: Option<fn(&[u8]) -> Option<DescribedOut>>,
+    /// Reply-direction encoder. De-Optioned at WO-M7c: every row states its
+    /// reply codec or the workspace does not compile — there is no
+    /// named-field reply path left for a row to ride instead.
+    pub encode_out: fn(&DescribedOut, &mut Vec<u8>),
+    /// Reply-direction decoder; the `Option` in its return is the decode
+    /// failing, never absence.
+    pub decode_out: fn(&[u8]) -> Option<DescribedOut>,
     pub cost: JobCost,
 }
 
@@ -194,36 +207,34 @@ pub trait JobSpec: 'static {
     fn run(input: &Self::In, geo: &JobGeometry) -> Option<Self::Out>;
 }
 
-/// The reply-direction codecs, for kinds whose output already rides the
-/// described wire. Separate from [`JobSpec`] so a kind can join the request
-/// direction first — WO-M7c is where every row gains this half.
+/// The reply-direction codecs. Separate from [`JobSpec`] in trait shape only
+/// — since WO-M7c closed the reply direction, a row cannot be built without
+/// this half ([`JobCodec::of`] bounds on it), so every kind states both
+/// directions or does not exist.
 pub trait JobOutCodec: JobSpec {
     fn encode_out(v: &Self::Out, out: &mut Vec<u8>);
     fn decode_out(bytes: &[u8]) -> Option<Self::Out>;
 }
 
 impl JobCodec {
-    /// A row over `S`, reply codecs absent. The shims this stores are the ONE
+    /// A row over `S`, both directions. The shims this stores are the ONE
     /// downcast in the system — see the module doc.
-    pub const fn of<S: JobSpec>() -> Self {
+    ///
+    /// (This was `with_out`, beside an out-less `of`, while the frame
+    /// replies still rode the browser port as named fields; WO-M7c deleted
+    /// the out-less constructor with that path, so the one way to build a
+    /// row states its reply codec.)
+    pub const fn of<S: JobOutCodec>() -> Self {
         Self {
             label: S::LABEL,
             input_type: TypeId::of::<S::In>,
             encode: encode_shim::<S>,
             decode: decode_shim::<S>,
             run: run_shim::<S>,
-            encode_out: None,
-            decode_out: None,
+            encode_out: encode_out_shim::<S>,
+            decode_out: decode_out_shim::<S>,
             cost: S::COST,
         }
-    }
-
-    /// [`JobCodec::of`] plus the reply-direction codecs.
-    pub const fn with_out<S: JobOutCodec>() -> Self {
-        let mut row = Self::of::<S>();
-        row.encode_out = Some(encode_out_shim::<S>);
-        row.decode_out = Some(decode_out_shim::<S>);
-        row
     }
 }
 
@@ -306,6 +317,10 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn Any> {
             self
         }
+
+        fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
+            Vec::new()
+        }
     }
 
     #[derive(Debug)]
@@ -317,6 +332,10 @@ mod tests {
 
         fn into_any(self: Box<Self>) -> Box<dyn Any> {
             self
+        }
+
+        fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
+            Vec::new()
         }
     }
 
@@ -415,11 +434,10 @@ mod tests {
     }
 
     /// The `const`-construction proof for the `TypeId` trap: `TypeId::of` is
-    /// not const-stable, so a row must store `fn() -> TypeId` — these two
-    /// items failing to build IS the regression, no assertion needed for
-    /// that half.
+    /// not const-stable, so a row must store `fn() -> TypeId` — this item
+    /// failing to build IS the regression, no assertion needed for that
+    /// half.
     const DOUBLING_ROW: JobCodec = JobCodec::of::<DoublingSpec>();
-    const DOUBLING_ROW_WITH_OUT: JobCodec = JobCodec::with_out::<DoublingSpec>();
 
     fn test_geometry() -> JobGeometry {
         JobGeometry {
@@ -440,14 +458,6 @@ mod tests {
         assert_eq!(DOUBLING_ROW.label, "test/doubling");
         assert_eq!(DOUBLING_ROW.cost, JobCost::Raster);
         assert_eq!((DOUBLING_ROW.input_type)(), TypeId::of::<AlphaInput>());
-        assert!(
-            DOUBLING_ROW.encode_out.is_none() && DOUBLING_ROW.decode_out.is_none(),
-            "of() leaves the reply codecs None — WO-M7c is what de-Options them",
-        );
-        assert!(
-            DOUBLING_ROW_WITH_OUT.encode_out.is_some()
-                && DOUBLING_ROW_WITH_OUT.decode_out.is_some(),
-        );
 
         // encode -> decode round-trips through the shims, and decode hands
         // back the geometry it was given (this spec amends nothing).
@@ -479,13 +489,12 @@ mod tests {
             .is_none(),
         );
 
-        // The reply half round-trips the same way.
-        let row = &DOUBLING_ROW_WITH_OUT;
+        // The reply half round-trips the same way — carried by every row,
+        // not an optional half, since WO-M7c closed the reply direction.
         let reply = DescribedOut(Box::new(AlphaOut { value: 42 }));
         let mut reply_bytes = Vec::new();
-        (row.encode_out.expect("with_out carries it"))(&reply, &mut reply_bytes);
-        let back = (row.decode_out.expect("with_out carries it"))(&reply_bytes)
-            .expect("the reply round-trips");
+        (DOUBLING_ROW.encode_out)(&reply, &mut reply_bytes);
+        let back = (DOUBLING_ROW.decode_out)(&reply_bytes).expect("the reply round-trips");
         assert_eq!(back.take::<AlphaOut>(), Some(AlphaOut { value: 42 }));
     }
 }
