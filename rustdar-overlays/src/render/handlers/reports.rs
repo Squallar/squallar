@@ -661,11 +661,11 @@ mod round_tests {
         let sources = spc_serving(responses);
         let result = runtime.block_on(fetch_storm_reports(&client, &sources));
 
-        let kind = OverlayKind::StormReports;
+        let kind = known::STORM_REPORTS;
         let mut registry = OverlayRegistry::default();
-        registry.set_enabled(kind, true);
+        registry.set_enabled(&kind, true);
         registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.id(),
+            kind: kind.clone(),
             data: Box::new(StormReportsFetchResult(result)) as FetchPayload,
         });
         let ctx = PaneControlContext {
@@ -673,13 +673,13 @@ mod round_tests {
             pane_state: None,
         };
         let note = registry
-            .controls(kind, &ctx)
+            .controls(&kind, &ctx)
             .into_iter()
             .find_map(|item| match item {
                 ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
                 _ => None,
             });
-        (registry.status_line(kind), note)
+        (registry.status_line(&kind), note)
     }
 
     /// **A CSV that would not load takes a whole kind of report off the map.**

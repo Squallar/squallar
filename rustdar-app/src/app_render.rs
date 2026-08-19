@@ -656,7 +656,6 @@ impl super::App {
     ) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_geo::GeoBounds;
-        use rustdar_overlays::render::overlay_state::OverlayKind;
         use rustdar_radar::types::ImageBounds;
 
         // Extract site coordinates before mutable borrow
@@ -784,7 +783,7 @@ impl super::App {
         let Some(pane) = self.gui.pane_mut(pane_idx) else {
             return;
         };
-        let cache = pane.overlay_cache_mut(OverlayKind::Radar);
+        let cache = pane.overlay_cache_mut(&rustdar_source::id::known::RADAR);
         // The pane's own handle for these exact pixels, if it has one, and
         // whether that handle is **whole**.
         //
@@ -1421,8 +1420,8 @@ impl super::App {
                 let Some(pane) = gui.pane_mut(pane_idx) else {
                     return false;
                 };
-                let wanted = !pane.overlay_texture_is_releasable(kind);
-                pane.overlay_cache_mut(kind).render_in_flight = false;
+                let wanted = !pane.overlay_texture_is_releasable(&kind.id());
+                pane.overlay_cache_mut(&kind.id()).render_in_flight = false;
                 wanted
             });
             if resp.pane_indices.is_empty() {
@@ -1465,7 +1464,7 @@ impl super::App {
                     continue;
                 };
 
-                let cache = pane.overlay_cache_mut(kind);
+                let cache = pane.overlay_cache_mut(&kind.id());
 
                 // Every surviving result is stored, and the staleness question is asked
                 // next frame instead. `resp.generation` is a content token, not
@@ -1844,9 +1843,7 @@ impl super::App {
                     .pane(pane_idx)
                     .is_some_and(|p| p.scan_info.is_some());
                 if !has_scan && let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let cache = pane.overlay_cache_mut(
-                        rustdar_overlays::render::overlay_state::OverlayKind::Radar,
-                    );
+                    let cache = pane.overlay_cache_mut(&rustdar_source::id::known::RADAR);
                     cache.clear();
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
@@ -2304,7 +2301,6 @@ impl super::App {
     pub(super) fn restore_cached_render(&mut self, ctx: &egui::Context) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_geo::GeoBounds;
-        use rustdar_overlays::render::overlay_state::OverlayKind;
         use rustdar_radar::types::ImageBounds;
 
         // Every raster still arriving is let go of first, on **every** pane and
@@ -2395,7 +2391,7 @@ impl super::App {
             let bounds = ImageBounds::from_radar_site(lat, lon, max_range_km);
             let geo_bounds = GeoBounds::from(bounds);
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                let cache = pane.overlay_cache_mut(OverlayKind::Radar);
+                let cache = pane.overlay_cache_mut(&rustdar_source::id::known::RADAR);
                 // Showing retires whatever the pane was showing; see the note
                 // in `App::apply_render_to_pane`.
                 cache.show(OverlayTextureData {

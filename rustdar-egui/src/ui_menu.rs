@@ -17,7 +17,7 @@
 //! construction.
 
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::{LayerId, known};
 
 /// The label on the 3D-pane toggle.
 ///
@@ -53,10 +53,10 @@ pub(super) enum MenuAction {
 }
 
 /// A boolean the menu can flip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MenuToggle {
     /// Show/hide a map overlay on the active pane.
-    Overlay(OverlayKind),
+    Overlay(LayerId),
     /// Automatic polling for new scans.
     AutoPoll,
     /// Feed live panes from the real-time chunk bucket rather than polling the
@@ -139,7 +139,7 @@ pub(super) enum MenuNode {
 
 /// Something the user did to the menu this frame, to be handed to
 /// [`super::Gui::apply_menu_event`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MenuEvent {
     Invoked(MenuAction),
     Toggled(MenuToggle, bool),
@@ -262,7 +262,7 @@ fn render_menu_items(ui: &mut egui::Ui, nodes: &[MenuNode], out: &mut MenuFrame,
                 // `*value`, not `current`: what the checkbox was *handed*.
                 out.record(label, Some(*value), &response);
                 if response.changed() {
-                    out.events.push(MenuEvent::Toggled(*toggle, current));
+                    out.events.push(MenuEvent::Toggled(toggle.clone(), current));
                 }
             }
             MenuNode::Separator => {
@@ -334,13 +334,13 @@ impl super::Gui {
                     MenuNode::Separator,
                     MenuNode::Toggle {
                         label: "Show radar sites",
-                        toggle: MenuToggle::Overlay(OverlayKind::RadarSites),
-                        value: pane.is_overlay_enabled(OverlayKind::RadarSites),
+                        toggle: MenuToggle::Overlay(known::RADAR_SITES),
+                        value: pane.is_overlay_enabled(&known::RADAR_SITES),
                     },
                     MenuNode::Toggle {
                         label: "Show city labels",
-                        toggle: MenuToggle::Overlay(OverlayKind::CityLabels),
-                        value: pane.is_overlay_enabled(OverlayKind::CityLabels),
+                        toggle: MenuToggle::Overlay(known::CITY_LABELS),
+                        value: pane.is_overlay_enabled(&known::CITY_LABELS),
                     },
                     MenuNode::Separator,
                     MenuNode::Toggle {
@@ -397,7 +397,7 @@ impl super::Gui {
                 self.drawer_open = false;
             }
             MenuEvent::Toggled(MenuToggle::Overlay(kind), on) => {
-                self.set_active_pane_overlay(kind, on);
+                self.set_active_pane_overlay(&kind, on);
                 self.propagate_layer_sync();
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
@@ -512,7 +512,7 @@ mod tests {
                 MenuNode::Submenu { children, .. } => leaves(children, out),
                 MenuNode::Item { action, .. } => out.push(MenuEvent::Invoked(*action)),
                 MenuNode::Toggle { toggle, value, .. } => {
-                    out.push(MenuEvent::Toggled(*toggle, !*value))
+                    out.push(MenuEvent::Toggled(toggle.clone(), !*value))
                 }
                 MenuNode::Separator => {}
             }
@@ -581,7 +581,7 @@ mod tests {
         for event in events {
             let before = state_fingerprint(&gui);
             let mut actions = Vec::new();
-            gui.apply_menu_event(event, &mut actions);
+            gui.apply_menu_event(event.clone(), &mut actions);
             let after = state_fingerprint(&gui);
 
             assert!(
@@ -599,14 +599,14 @@ mod tests {
     fn the_toggles_read_back_the_state_they_write() {
         let mut gui = Gui::new();
 
-        let before = overlay_toggle(&gui, OverlayKind::RadarSites);
+        let before = overlay_toggle(&gui, known::RADAR_SITES);
         let mut actions = Vec::new();
         gui.apply_menu_event(
-            MenuEvent::Toggled(MenuToggle::Overlay(OverlayKind::RadarSites), !before),
+            MenuEvent::Toggled(MenuToggle::Overlay(known::RADAR_SITES), !before),
             &mut actions,
         );
         assert_eq!(
-            overlay_toggle(&gui, OverlayKind::RadarSites),
+            overlay_toggle(&gui, known::RADAR_SITES),
             !before,
             "the model must re-read the pane, not report a snapshot"
         );
@@ -620,8 +620,8 @@ mod tests {
         assert!(auto_poll_toggle(&gui));
     }
 
-    fn find_toggle(gui: &Gui, want: MenuToggle) -> bool {
-        fn walk(nodes: &[MenuNode], want: MenuToggle) -> Option<bool> {
+    fn find_toggle(gui: &Gui, want: &MenuToggle) -> bool {
+        fn walk(nodes: &[MenuNode], want: &MenuToggle) -> Option<bool> {
             for node in nodes {
                 match node {
                     MenuNode::Submenu { children, .. } => {
@@ -629,7 +629,7 @@ mod tests {
                             return Some(v);
                         }
                     }
-                    MenuNode::Toggle { toggle, value, .. } if *toggle == want => {
+                    MenuNode::Toggle { toggle, value, .. } if toggle == want => {
                         return Some(*value);
                     }
                     _ => {}
@@ -640,12 +640,12 @@ mod tests {
         walk(&gui.menu_model(), want).expect("toggle missing from the menu model")
     }
 
-    fn overlay_toggle(gui: &Gui, kind: OverlayKind) -> bool {
-        find_toggle(gui, MenuToggle::Overlay(kind))
+    fn overlay_toggle(gui: &Gui, kind: LayerId) -> bool {
+        find_toggle(gui, &MenuToggle::Overlay(kind))
     }
 
     fn auto_poll_toggle(gui: &Gui) -> bool {
-        find_toggle(gui, MenuToggle::AutoPoll)
+        find_toggle(gui, &MenuToggle::AutoPoll)
     }
 
     /// The 3D toggle reads the *active pane's* kind, not a global flag.
@@ -659,7 +659,7 @@ mod tests {
         let mut gui = Gui::new();
         gui.set_pane_count_for_test(2);
         assert!(
-            !find_toggle(&gui, MenuToggle::VolumePane),
+            !find_toggle(&gui, &MenuToggle::VolumePane),
             "precondition: two fresh map panes"
         );
 
@@ -667,13 +667,13 @@ mod tests {
             .unwrap()
             .set_view(rustdar_radar::types::RenderView::Volume);
         assert!(
-            !find_toggle(&gui, MenuToggle::VolumePane),
+            !find_toggle(&gui, &MenuToggle::VolumePane),
             "the toggle read some other pane's kind: pane 0 is the active one and \
              it is still a map"
         );
 
         gui.active_pane = 1;
-        assert!(find_toggle(&gui, MenuToggle::VolumePane));
+        assert!(find_toggle(&gui, &MenuToggle::VolumePane));
     }
 
     /// Unticking the 3D toggle asks for a map back, rather than doing nothing.
@@ -740,8 +740,8 @@ mod tests {
     struct StubOverlayItem;
 
     impl rustdar_overlays::render::overlay_state::OverlayItem for StubOverlayItem {
-        fn kind(&self) -> OverlayKind {
-            OverlayKind::NwsAlerts
+        fn kind(&self) -> rustdar_overlays::render::overlay_state::OverlayKind {
+            rustdar_overlays::render::overlay_state::OverlayKind::NwsAlerts
         }
         fn popup_content(
             &self,
@@ -782,7 +782,7 @@ mod tests {
         let mut gui = Gui::new();
         gui.drawer_open = true;
         // A non-default selection, so the reset-on-dismiss is observable.
-        gui.select_layer(OverlayKind::NwsAlerts);
+        gui.select_layer(known::NWS_ALERTS);
         gui.time_dialog.show = true;
         gui.overlays.selected_overlays = vec![std::sync::Arc::new(StubOverlayItem)];
         gui.overlays.selected_overlay_page = 0;

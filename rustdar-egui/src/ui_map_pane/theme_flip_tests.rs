@@ -26,7 +26,6 @@
 //! The frontend's `app::theme_flip_tests` holds the other half: a flip must
 //! *not* touch the radar's theme-independent `RenderCache`.
 
-use super::*;
 use crate::ui::Gui;
 use rustdar_overlays::render::handlers::outlook::SpcOutlookFetchResult;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
@@ -35,10 +34,10 @@ use rustdar_overlays::types::{HatchPattern, OverlayFeature};
 
 /// The theme-dependent layer under test — see the module note for why this
 /// one.
-const OUTLOOK: OverlayKind = OverlayKind::SpcOutlook;
+const OUTLOOK: rustdar_source::id::LayerId = rustdar_source::id::known::SPC_OUTLOOK;
 
 /// The pane-keyed arm, for the uniformity test.
-const SITES: OverlayKind = OverlayKind::RadarSites;
+const SITES: rustdar_source::id::LayerId = rustdar_source::id::known::RADAR_SITES;
 
 /// A `Gui` whose registry holds a real SPC outlook, fed through
 /// `apply_fetch_result` — the same door a live fetch uses, the
@@ -50,7 +49,7 @@ const SITES: OverlayKind = OverlayKind::RadarSites;
 /// meet.
 fn gui_with_an_outlook() -> Gui {
     let mut gui = Gui::new();
-    gui.overlays.set_enabled(OUTLOOK, true);
+    gui.overlays.set_enabled(&OUTLOOK, true);
 
     let polygon = vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]];
     let feature = OverlayFeature::new(
@@ -62,7 +61,7 @@ fn gui_with_an_outlook() -> Gui {
         HatchPattern::None,
     );
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OUTLOOK.id(),
+        kind: OUTLOOK,
         data: Box::new(SpcOutlookFetchResult {
             day: OutlookDay::Day1,
             product: OutlookProduct::Categorical,
@@ -76,7 +75,7 @@ fn gui_with_an_outlook() -> Gui {
         }),
     });
     assert!(
-        gui.overlays.has_data(OUTLOOK),
+        gui.overlays.has_data(&OUTLOOK),
         "premise: the outlook landed, so the signature under test is a live one",
     );
     gui
@@ -94,8 +93,8 @@ fn a_theme_flip_changes_the_overlay_cache_token() {
     let gui = gui_with_an_outlook();
     let pane = gui.pane(0).expect("a fresh Gui has one pane");
 
-    let dark = super::overlay_cache_token(&gui.overlays, pane, OUTLOOK, true);
-    let light = super::overlay_cache_token(&gui.overlays, pane, OUTLOOK, false);
+    let dark = super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, true);
+    let light = super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, false);
     assert_ne!(
         dark, light,
         "one outlook, two themes, one token — the cache would keep compositing \
@@ -107,12 +106,12 @@ fn a_theme_flip_changes_the_overlay_cache_token() {
     // re-rasterize every overlay every frame.
     assert_eq!(
         dark,
-        super::overlay_cache_token(&gui.overlays, pane, OUTLOOK, true),
+        super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, true),
         "the dark-theme token must be stable across frames with unchanged content",
     );
     assert_eq!(
         light,
-        super::overlay_cache_token(&gui.overlays, pane, OUTLOOK, false),
+        super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, false),
         "the light-theme token must be stable across frames with unchanged content",
     );
 }
@@ -129,8 +128,8 @@ fn the_theme_term_applies_to_the_radar_sites_arm_too() {
     let pane = gui.pane(0).expect("a fresh Gui has one pane");
 
     assert_ne!(
-        super::overlay_cache_token(&gui.overlays, pane, SITES, true),
-        super::overlay_cache_token(&gui.overlays, pane, SITES, false),
+        super::overlay_cache_token(&gui.overlays, pane, &SITES, true),
+        super::overlay_cache_token(&gui.overlays, pane, &SITES, false),
         "the radar-sites arm must carry the same theme term as every other layer",
     );
 }

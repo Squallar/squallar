@@ -977,7 +977,7 @@ impl super::App {
     }
 
     /// Fetch overlay data for the given kind, resolving parameters from current state.
-    fn fetch_overlay(&mut self, kind: OverlayKind, pane_idx: usize) {
+    fn fetch_overlay(&mut self, kind: rustdar_source::id::LayerId, pane_idx: usize) {
         use rustdar_overlays::render::overlay_state::FetchConfig;
 
         // Load the requesting pane's config so create_fetch_tasks reads the
@@ -998,7 +998,7 @@ impl super::App {
             viewport: self.last_viewport,
         };
 
-        let tasks = self.gui.overlays.create_fetch_tasks(kind, &config);
+        let tasks = self.gui.overlays.create_fetch_tasks(&kind, &config);
         if tasks.is_empty() {
             // A handler that cannot build a task says so, and is believed.
             //
@@ -1023,7 +1023,7 @@ impl super::App {
             // request that never leaves the process.
             log::warn!("{kind:?}: no fetch task could be built; backing off");
             self.gui.overlays.record_fetch_failure(
-                kind,
+                &kind,
                 &rustdar_overlays::fetch_policy::FetchError::permanent(
                     "no fetch task could be built",
                 ),
@@ -1036,7 +1036,7 @@ impl super::App {
             kind,
             tasks.len()
         );
-        self.gui.overlays.set_fetching(kind, true);
+        self.gui.overlays.set_fetching(&kind, true);
 
         for task in tasks {
             let task_kind = task.kind;
@@ -1188,7 +1188,7 @@ impl super::App {
             return;
         }
 
-        if self.gui.overlays.render_mode(kind)
+        if self.gui.overlays.render_mode(&kind.id())
             != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture)
         {
             log::warn!(
@@ -1203,7 +1203,7 @@ impl super::App {
         // with `clear_overlay_render_marks` — see it.
         for &pidx in &pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
-                pane.overlay_cache_mut(kind).render_in_flight = true;
+                pane.overlay_cache_mut(&kind.id()).render_in_flight = true;
             }
         }
 
@@ -1278,7 +1278,7 @@ impl super::App {
                 // the id_map and the codec row are one dispatch-moment
                 // snapshot of one handler.
                 let overlays = &self.gui.overlays;
-                let Some(job) = overlays.prepare_job(kind, &rctx) else {
+                let Some(job) = overlays.prepare_job(&kind.id(), &rctx) else {
                     // Nothing to render — clear in-flight. `has_data()` and
                     // `prepare_job` agree in every reachable state
                     // (`texture_tests`' permanent-wakeup guard), so this
@@ -1292,13 +1292,13 @@ impl super::App {
                 // same data in the same order — `Some` for exactly the two
                 // hit-map kinds. It never touches the wire; the deliver zips
                 // it with the reply's cells.
-                let id_map = overlays.hit_items(kind);
+                let id_map = overlays.hit_items(&kind.id());
                 // The codec row the handler registered — its label is the
                 // job's name in the timing log. Unreachable-`None` by the
                 // bidirectional pairing gate (`texture_tests::
                 // every_texture_handler_owns_exactly_one_codec_row`): a
                 // handler that answers a job answers a row.
-                let Some(row) = overlays.job_codec(kind) else {
+                let Some(row) = overlays.job_codec(&kind.id()) else {
                     self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
@@ -1360,7 +1360,7 @@ impl super::App {
                 // The sites row, through the same registry accessor as the
                 // handler-backed kinds — registered by the sites handler even
                 // though the input above is dispatch-built.
-                let Some(row) = self.gui.overlays.job_codec(kind) else {
+                let Some(row) = self.gui.overlays.job_codec(&kind.id()) else {
                     self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
@@ -1437,7 +1437,7 @@ impl super::App {
     fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], kind: OverlayKind) {
         for &pidx in pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
-                pane.overlay_cache_mut(kind).render_in_flight = false;
+                pane.overlay_cache_mut(&kind.id()).render_in_flight = false;
             }
         }
     }

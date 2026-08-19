@@ -2370,6 +2370,15 @@ impl App {
                 // wants — the renderer's overdraw margin is a rasterization
                 // concern and would over-fetch if it leaked into the request.
                 self.last_viewport = Some(geo_bounds);
+                // b2→b3 bridge: the action carries the open LayerId; the
+                // dispatch match below still speaks the enum until b3
+                // rewrites it. Render actions are only ever emitted for
+                // registered handlers (the emitting loop walks the
+                // registry), so an unmapped id here is a bug, not a state.
+                let Some(overlay_kind) = OverlayKind::from_id(&overlay_kind) else {
+                    log::warn!("RenderOverlay for unregistered id {overlay_kind:?}; dropped");
+                    continue;
+                };
                 overlay_renders.push((
                     pane_idx,
                     overlay_kind,

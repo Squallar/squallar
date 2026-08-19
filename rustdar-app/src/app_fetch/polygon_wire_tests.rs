@@ -146,7 +146,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
             // keyed by (day, product): the toggle has to precede the payload
             // for the two to meet — the same order `texture_tests::seed`
             // states.
-            app.gui.overlays.set_enabled(kind, true);
+            app.gui.overlays.set_enabled(&kind.id(), true);
             Box::new(outlook::SpcOutlookFetchResult {
                 day: OutlookDay::Day1,
                 product: OutlookProduct::Categorical,
@@ -200,7 +200,7 @@ fn in_flight(app: &mut crate::app::App, kind: OverlayKind) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(kind)
+        .overlay_cache_mut(&kind.id())
         .render_in_flight
 }
 
@@ -249,7 +249,7 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
         let own_label = app
             .gui
             .overlays
-            .job_codec(kind)
+            .job_codec(&kind.id())
             .expect("every texture kind owns a codec row")
             .label;
         assert_eq!(

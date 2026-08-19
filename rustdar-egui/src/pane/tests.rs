@@ -1,5 +1,6 @@
 use super::*;
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
+use rustdar_source::id::known;
 use std::collections::HashSet;
 
 /// A panel `w` by `h` logical pixels.
@@ -1172,7 +1173,7 @@ fn pane_showing_render(
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     let mut pane = PaneState::new();
     pane.selected_product = product;
-    pane.overlay_cache_mut(OverlayKind::Radar)
+    pane.overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
             texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
             geo_bounds: rustdar_geo::GeoBounds {

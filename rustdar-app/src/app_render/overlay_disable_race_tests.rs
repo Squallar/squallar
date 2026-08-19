@@ -78,8 +78,8 @@ fn app_awaiting_a_render(ctx: &egui::Context) -> (crate::app::App, egui::Texture
     let parked = image(ctx, "parked");
     let id = parked.id();
     let pane = app.gui.pane_mut(0).expect("the fixture has one pane");
-    pane.set_overlay_enabled(KIND, true);
-    let cache = pane.overlay_cache_mut(KIND);
+    pane.set_overlay_enabled(KIND.id(), true);
+    let cache = pane.overlay_cache_mut(&KIND.id());
     cache.show(OverlayTextureData {
         texture: parked,
         geo_bounds: bounds(),
@@ -122,7 +122,7 @@ fn current_id(app: &mut crate::app::App) -> Option<egui::TextureId> {
         app.gui
             .pane_mut(0)
             .expect("pane 0")
-            .overlay_cache_mut(KIND)
+            .overlay_cache_mut(&KIND.id())
             .current()?
             .texture
             .id(),
@@ -133,7 +133,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(KIND)
+        .overlay_cache_mut(&KIND.id())
         .render_in_flight
 }
 
@@ -151,7 +151,7 @@ fn a_late_result_for_a_disabled_layer_is_dropped() {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .set_overlay_enabled(KIND, false);
+        .set_overlay_enabled(KIND.id(), false);
 
     assert_eq!(
         current_id(&mut app),
@@ -193,7 +193,10 @@ fn a_result_for_an_enabled_layer_still_lands() {
     let (mut app, parked) = app_awaiting_a_render(&ctx);
 
     assert!(
-        app.gui.pane(0).expect("pane 0").is_overlay_enabled(KIND),
+        app.gui
+            .pane(0)
+            .expect("pane 0")
+            .is_overlay_enabled(&KIND.id()),
         "premise: this arm differs from its sibling in exactly one field, and \
          this is the field",
     );

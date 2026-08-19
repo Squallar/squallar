@@ -310,12 +310,14 @@ impl Gui {
         // interval)`. `fetch_time` is stamped only on success, so a failing
         // layer answered "due" on every frame — 3089 SPC MD requests in 105 s
         // in the browser. See `rustdar_overlays::fetch_policy`.
-        for &kind in OverlayKind::all() {
+        let poll_ids: Vec<rustdar_source::id::LayerId> =
+            self.overlays.handlers().map(|h| h.id()).collect();
+        for kind in poll_ids {
             if self
                 .overlays
-                .auto_fetch_delay(kind)
+                .auto_fetch_delay(&kind)
                 .is_some_and(|d| d.is_zero())
-                && let Some(pane_idx) = self.first_pane_with_overlay_enabled(kind)
+                && let Some(pane_idx) = self.first_pane_with_overlay_enabled(&kind)
             {
                 actions.push(GuiAction::FetchOverlay { kind, pane_idx });
             }

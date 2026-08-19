@@ -28,7 +28,7 @@
 //! module note for the mechanism.
 
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::{LayerId, known};
 
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState, map};
@@ -194,7 +194,7 @@ impl super::Gui {
                                 InspectorSelection::Layer(_) => "body_layer",
                             }))
                             .layout(egui::Layout::top_down_justified(egui::Align::LEFT));
-                        ui.scope_builder(scope, |ui| match self.inspector_sel {
+                        ui.scope_builder(scope, |ui| match self.inspector_sel.clone() {
                             InspectorSelection::AppSettings => {
                                 #[cfg(test)]
                                 {
@@ -218,9 +218,9 @@ impl super::Gui {
                             InspectorSelection::Layer(kind) => {
                                 #[cfg(test)]
                                 {
-                                    probe.mode = Some(InspectorSelection::Layer(kind));
+                                    probe.mode = Some(InspectorSelection::Layer(kind.clone()));
                                 }
-                                self.render_layer_body(ui, pane, kind, actions);
+                                self.render_layer_body(ui, pane, &kind, actions);
                             }
                         });
                     });
@@ -292,7 +292,7 @@ impl super::Gui {
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let pane_label = format!("Pane {}", self.active_pane + 1);
-                    let tail: String = match self.inspector_sel {
+                    let tail: String = match self.inspector_sel.clone() {
                         InspectorSelection::AppSettings => {
                             ui.label(egui::RichText::new("App").strong());
                             ui.label("\u{203a}");
@@ -323,7 +323,7 @@ impl super::Gui {
                                 self.select_pane_props();
                             }
                             ui.label("\u{203a}");
-                            let name = self.overlays.display_name(kind).to_owned();
+                            let name = self.overlays.display_name(&kind).to_owned();
                             ui.add(egui::Label::new(name.as_str()).truncate());
                             name
                         }
@@ -352,7 +352,7 @@ impl super::Gui {
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
-        kind: OverlayKind,
+        kind: &LayerId,
         actions: &mut Vec<GuiAction>,
     ) {
         // The Radar handler owns nothing but the master toggle, so its body
@@ -361,7 +361,7 @@ impl super::Gui {
         // controls live, because they are pane properties (the pills and the
         // Pane-properties body own them; a copy here was the duplication the
         // second user test called out).
-        if kind == OverlayKind::Radar {
+        if *kind == known::RADAR {
             if let Some(status) = super::shell::radar_row_status(pane) {
                 ui.label(status);
                 ui.add_space(4.0);

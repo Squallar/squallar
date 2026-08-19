@@ -33,8 +33,8 @@ use rustdar_overlays::hrrr::ModelParameter;
 use rustdar_overlays::render::controls::{
     ControlEffect, ControlUpdate, ControlValue, PaneControlContextMut,
 };
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::{LayerId, known};
 use serde::{Deserialize, Serialize};
 
 /// The catalog's roomy width, narrowed by
@@ -69,10 +69,10 @@ pub(crate) struct PresetConfig {
     /// Per-pane product and tilt, index-aligned with the layout.
     pub panes: Vec<PresetPane>,
     /// The enabled-overlay set, applied to every pane. A
-    /// [`KindList`](super::config::KindList) rather than a bare
-    /// `Vec<OverlayKind>` so one kind from a newer build costs nothing: the
-    /// unknown names ride along and are written back on save, and only
-    /// [`KindList::known`](super::config::KindList) is ever applied.
+    /// [`KindList`](super::config::KindList): since M8b the names are open
+    /// [`LayerId`]s, so one from a newer build costs nothing — it rides in
+    /// [`KindList::known`](super::config::KindList) and is written back on
+    /// save; only the ids the registry serves are ever applied.
     pub overlays: super::config::KindList,
 }
 
@@ -134,13 +134,13 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
                 pane(RadarProduct::NormalizedRotation),
             ],
             overlays: vec![
-                OverlayKind::Radar,
-                OverlayKind::SpcOutlook,
-                OverlayKind::SpcDiscussions,
-                OverlayKind::NwsAlerts,
-                OverlayKind::StormReports,
-                OverlayKind::CityLabels,
-                OverlayKind::ColorScale,
+                known::RADAR,
+                known::SPC_OUTLOOK,
+                known::SPC_DISCUSSIONS,
+                known::NWS_ALERTS,
+                known::STORM_REPORTS,
+                known::CITY_LABELS,
+                known::COLOR_SCALE,
             ]
             .into(),
         },
@@ -153,10 +153,10 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
                 pane(RadarProduct::VerticallyIntegratedLiquid),
             ],
             overlays: vec![
-                OverlayKind::Radar,
-                OverlayKind::NwsAlerts,
-                OverlayKind::CityLabels,
-                OverlayKind::ColorScale,
+                known::RADAR,
+                known::NWS_ALERTS,
+                known::CITY_LABELS,
+                known::COLOR_SCALE,
             ]
             .into(),
         },
@@ -171,11 +171,11 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
                 pane(RadarProduct::SpectrumWidth),
             ],
             overlays: vec![
-                OverlayKind::Radar,
-                OverlayKind::Metar,
-                OverlayKind::Lightning,
-                OverlayKind::CityLabels,
-                OverlayKind::ColorScale,
+                known::RADAR,
+                known::METAR,
+                known::LIGHTNING,
+                known::CITY_LABELS,
+                known::COLOR_SCALE,
             ]
             .into(),
         },
@@ -385,17 +385,18 @@ impl super::Gui {
         );
 
         // -- Overlays --
-        let overlays: Vec<OverlayKind> = OverlayKind::all()
-            .iter()
-            .copied()
-            .filter(|&kind| matches_query(&query, self.overlays.display_name(kind)))
+        let overlays: Vec<LayerId> = self
+            .overlays
+            .default_draw_order()
+            .into_iter()
+            .filter(|kind| matches_query(&query, self.overlays.display_name(kind)))
             .collect();
         if !overlays.is_empty() {
             ui.add_space(6.0);
             ui.label(egui::RichText::new(format!("Overlays ({})", overlays.len())).strong());
             ui.horizontal_wrapped(|ui| {
                 for kind in overlays {
-                    let name = self.overlays.display_name(kind).to_owned();
+                    let name = self.overlays.display_name(&kind).to_owned();
                     let tile = ui.button(name.as_str());
                     #[cfg(test)]
                     probe.tiles.push(CatalogTileProbe {
@@ -626,10 +627,10 @@ impl super::Gui {
 
     /// Enable `kind` on the active pane and select it in the inspector —
     /// what clicking an overlay tile means.
-    fn catalog_apply_overlay(&mut self, kind: OverlayKind, actions: &mut Vec<GuiAction>) {
+    fn catalog_apply_overlay(&mut self, kind: LayerId, actions: &mut Vec<GuiAction>) {
         let idx = self.active_pane;
         let mut pane = std::mem::take(&mut self.panes[idx]);
-        self.set_pane_overlay_with_fetch(&mut pane, idx, kind, true, actions);
+        self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, true, actions);
         self.panes[idx] = pane;
         self.propagate_layer_sync();
         self.select_layer(kind);
@@ -652,7 +653,7 @@ impl super::Gui {
         Self::write_pane_overlay(
             &mut self.overlays,
             &mut self.panes[idx],
-            OverlayKind::Radar,
+            &known::RADAR,
             true,
         );
         let pane = &mut self.panes[idx];
@@ -663,7 +664,7 @@ impl super::Gui {
             pane.selected_elevation = 0.0;
         }
         self.propagate_layer_sync();
-        self.select_layer(OverlayKind::Radar);
+        self.select_layer(known::RADAR);
     }
 
     /// Enable the model layer, set its parameter through the handler's own
@@ -672,7 +673,7 @@ impl super::Gui {
     fn catalog_apply_hrrr(&mut self, param: ModelParameter, actions: &mut Vec<GuiAction>) {
         let idx = self.active_pane;
         let mut pane = std::mem::take(&mut self.panes[idx]);
-        self.set_pane_overlay_with_fetch(&mut pane, idx, OverlayKind::ModelData, true, actions);
+        self.set_pane_overlay_with_fetch(&mut pane, idx, &known::MODEL_DATA, true, actions);
 
         // Through `apply_control` rather than a field write, so the handler's
         // own rules hold: a cached parameter re-renders without a fetch, an
@@ -690,21 +691,15 @@ impl super::Gui {
         };
         let effect = self
             .overlays
-            .apply_control(OverlayKind::ModelData, &update, &mut pane_ctx);
+            .apply_control(&known::MODEL_DATA, &update, &mut pane_ctx);
         if matches!(effect, ControlEffect::Fetch) {
-            crate::ui::push_user_overlay_fetch(
-                &mut self.overlays,
-                actions,
-                OverlayKind::ModelData,
-                idx,
-            );
+            crate::ui::push_user_overlay_fetch(&mut self.overlays, actions, known::MODEL_DATA, idx);
         }
-        pane.overlay_configs = self.overlays.save_pane_configs();
-        pane.enabled_overlays = self.overlays.save_enabled_map();
+        pane.adopt_handler_state(&self.overlays);
 
         self.panes[idx] = pane;
         self.propagate_layer_sync();
-        self.select_layer(OverlayKind::ModelData);
+        self.select_layer(known::MODEL_DATA);
     }
 
     /// The current view as a preset: pane count, each visible pane's product
@@ -724,10 +719,11 @@ impl super::Gui {
                     elevation: finite(pane.selected_elevation),
                 })
                 .collect(),
-            overlays: OverlayKind::all()
-                .iter()
-                .copied()
-                .filter(|&kind| active.is_overlay_enabled(kind))
+            overlays: self
+                .overlays
+                .default_draw_order()
+                .into_iter()
+                .filter(|kind| active.is_overlay_enabled(kind))
                 .collect::<Vec<_>>()
                 .into(),
         }
@@ -773,12 +769,12 @@ impl super::Gui {
         // (the helper's dedupe).
         for idx in 0..count {
             let mut pane = std::mem::take(&mut self.panes[idx]);
-            for &kind in OverlayKind::all() {
-                // Only the kinds this build can serve are applied; a preset
-                // saved by a newer build keeps its extra names in
-                // `overlays.unknown`, which the save writes back.
+            for kind in self.overlays.default_draw_order() {
+                // Only the ids the registry serves are applied; an id from a
+                // newer build keeps riding in `overlays.known`, which the
+                // save writes back verbatim.
                 let on = preset.overlays.known.contains(&kind);
-                self.set_pane_overlay_with_fetch(&mut pane, idx, kind, on, actions);
+                self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, on, actions);
             }
             self.panes[idx] = pane;
         }

@@ -3,10 +3,10 @@ use chrono::NaiveDateTime;
 // The pane caps are device-class policy and live on the floor since WO-RD;
 // this module's clamp and the width classes narrow inside them.
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::hover::HoverSource;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
+use rustdar_source::id::{LayerId, known};
 use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
@@ -758,13 +758,13 @@ pub struct LoopPlaybackState {
 /// not silently stripped by the first autosave.
 #[derive(Clone, Debug, Default)]
 pub struct PaneConfigBaggage {
-    /// `draw_order` entries naming kinds this build does not know, verbatim,
-    /// re-appended after the known order on save.
+    /// `draw_order` entries that are not strings at all, verbatim,
+    /// re-appended after the ids on save. (String entries — including names
+    /// from a newer build — are ordinary open [`LayerId`]s since M8b and
+    /// ride in [`PaneState::draw_order`] itself, in place; the same goes for
+    /// unknown keys in the enabled/config maps, so those baggage halves are
+    /// gone.)
     pub draw_order: Vec<serde_json::Value>,
-    /// `enabled_overlays` entries under keys this build does not know.
-    pub enabled: serde_json::Map<String, serde_json::Value>,
-    /// `overlay_configs` entries under keys this build does not know.
-    pub configs: serde_json::Map<String, serde_json::Value>,
     /// Whole pane-level fields this build does not know.
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
@@ -844,20 +844,27 @@ pub struct PaneState {
     pub overlay_hover_value: Option<String>,
     pub last_hover_pos: Option<egui::Pos2>,
     pub map_memory: MapMemory,
-    /// Per-overlay-type texture caches (background-rendered), keyed by `OverlayKind`.
-    /// Only texture overlay kinds (SPC, NWS, discussions) have cache entries.
-    pub overlay_textures: HashMap<OverlayKind, OverlayTextureCache>,
+    /// Per-overlay-type texture caches (background-rendered), keyed by
+    /// [`LayerId`]. Only texture overlay kinds (SPC, NWS, discussions) have
+    /// cache entries; entries are created lazily by
+    /// [`Self::overlay_cache_mut`].
+    pub overlay_textures: HashMap<LayerId, OverlayTextureCache>,
     /// Per-pane draw order (bottom to top). Controls the visual stacking of all
     /// map layers. Persisted across sessions.
-    pub draw_order: Vec<OverlayKind>,
+    ///
+    /// Open ids: an entry naming a layer this build has no handler for is
+    /// RETAINED in place and skipped at draw (M8b's deliberate refinement —
+    /// the old reconcile dropped it), so a newer build's layer keeps its
+    /// position through a session under this one.
+    pub draw_order: Vec<LayerId>,
     /// Per-pane overlay enabled state (master visibility for each overlay kind).
     /// Propagated from a layer-linked active pane to the other layer-linked
     /// panes by `propagate_layer_sync`.
-    pub enabled_overlays: HashMap<OverlayKind, bool>,
+    pub enabled_overlays: HashMap<LayerId, bool>,
     /// Per-pane overlay handler config snapshots (serialized handler state per kind).
     /// Swapped into/out of the global OverlayRegistry around access points so each
     /// pane can independently configure overlay sub-controls (categories, day, etc.).
-    pub overlay_configs: HashMap<OverlayKind, serde_json::Value>,
+    pub overlay_configs: HashMap<LayerId, serde_json::Value>,
     /// Config-file content addressed to a build that is not this one — see
     /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
     /// `ui_config_json`, and never acted on in between.
@@ -1569,11 +1576,10 @@ impl PaneState {
             overlay_hover_value: None,
             last_hover_pos: None,
             map_memory,
-            overlay_textures: OverlayKind::all()
-                .iter()
-                .map(|&k| (k, OverlayTextureCache::new()))
-                .collect(),
-            draw_order: OverlayKind::default_draw_order(),
+            // Lazily filled by `overlay_cache_mut`; an absent entry answers
+            // every read exactly as a fresh empty cache did.
+            overlay_textures: HashMap::new(),
+            draw_order: rustdar_overlays::render::handlers::default_draw_order(),
             enabled_overlays: HashMap::new(),
             overlay_configs: HashMap::new(),
             config_baggage: PaneConfigBaggage::default(),
@@ -1628,7 +1634,7 @@ impl PaneState {
     /// The third question in the family, and the one the other two kept being
     /// asked in place of. [`Self::kind`] asks what a pane *is*, [`Self::is_map`]
     /// asks whether it draws the flat picture — and this asks whether the
-    /// `PaneSurface::Ground` half of the map content pass runs for it at all.
+    /// `Surface::Ground` half of the map content pass runs for it at all.
     /// Every consumer that says "a pane with no map has
     /// nowhere to put a geo-positioned layer" means *this*, and while a 3D view
     /// was a pane kind with no map of its own the three answers coincided.
@@ -1700,12 +1706,12 @@ impl PaneState {
     /// Whether this pane draws the map layers at all — the Layers panel's gate,
     /// and so the question "would a row here toggle anything?".
     ///
-    /// A plan view draws every [`OverlayKind`] onto its own rect. **A 3D pane
+    /// A plan view draws every layer onto its own rect. **A 3D pane
     /// draws them too**, onto two surfaces instead of one: the ground kinds go
     /// into the off-screen floor strip the raymarcher mirrors onto the box's
     /// bottom face (`Gui::draw_floor_strip`), and the one glass kind — the
     /// colour scale — is painted on the pane's own rect by
-    /// `Gui::draw_volume_glass`. `PaneSurface` is where that split is written
+    /// `Gui::draw_volume_glass`. The handler-declared `Surface` is where that split is written
     /// down, and both halves are gated on this pane's own
     /// [`Self::is_overlay_enabled`]. That is the whole reason a 3D pane gets
     /// rows: every layer it draws is one the user has to be able to switch off,
@@ -2058,7 +2064,7 @@ impl PaneState {
             return None;
         }
         let meta = self
-            .overlay_cache(OverlayKind::Radar)?
+            .overlay_cache(&known::RADAR)?
             .current()?
             .radar_meta
             .as_ref()?;
@@ -2143,7 +2149,7 @@ impl PaneState {
         if self.stale_image_on_screen().is_some() {
             return None;
         }
-        self.overlay_cache(OverlayKind::Radar)?
+        self.overlay_cache(&known::RADAR)?
             .current()?
             .radar_meta
             .as_ref()?
@@ -2184,7 +2190,7 @@ impl PaneState {
         if self.stale_image_on_screen().is_some() {
             return None;
         }
-        self.overlay_cache(OverlayKind::Radar)?
+        self.overlay_cache(&known::RADAR)?
             .current()?
             .radar_meta
             .as_ref()?
@@ -2254,7 +2260,7 @@ impl PaneState {
         if self.stale_image_on_screen().is_some() {
             return None;
         }
-        self.overlay_cache(OverlayKind::Radar)?
+        self.overlay_cache(&known::RADAR)?
             .current()?
             .radar_meta
             .as_ref()?
@@ -2264,23 +2270,43 @@ impl PaneState {
     /// Whether this overlay is enabled for this pane.
     ///
     /// Falls back to `false` if the kind has no entry (uninitialised pane).
-    pub fn is_overlay_enabled(&self, kind: OverlayKind) -> bool {
-        self.enabled_overlays.get(&kind).copied().unwrap_or(false)
+    pub fn is_overlay_enabled(&self, id: &LayerId) -> bool {
+        self.enabled_overlays.get(id).copied().unwrap_or(false)
     }
 
-    /// Set the per-pane enabled state for a given overlay kind.
-    pub fn set_overlay_enabled(&mut self, kind: OverlayKind, enabled: bool) {
-        self.enabled_overlays.insert(kind, enabled);
+    /// Set the per-pane enabled state for a given overlay id.
+    pub fn set_overlay_enabled(&mut self, id: LayerId, enabled: bool) {
+        self.enabled_overlays.insert(id, enabled);
     }
 
-    /// Get the overlay texture cache for a given kind (read-only).
-    pub fn overlay_cache(&self, kind: OverlayKind) -> Option<&OverlayTextureCache> {
-        self.overlay_textures.get(&kind)
+    /// Overwrite the **handler-owned** halves of this pane's overlay maps
+    /// with the registry's fresh serialize, KEEPING every entry whose id no
+    /// handler serves — the open-id doctrine's swap half: an unknown id's
+    /// saved state (a newer build's layer) must ride through every
+    /// registry-state overwrite verbatim, or the next autosave makes the
+    /// loss permanent. Every site that used to assign
+    /// `save_pane_configs()`/`save_enabled_map()` wholesale routes through
+    /// here; M10 deletes the swap itself.
+    pub fn adopt_handler_state(
+        &mut self,
+        registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    ) {
+        self.overlay_configs
+            .retain(|id, _| registry.handler_by_id(id).is_none());
+        self.overlay_configs.extend(registry.save_pane_configs());
+        self.enabled_overlays
+            .retain(|id, _| registry.handler_by_id(id).is_none());
+        self.enabled_overlays.extend(registry.save_enabled_map());
     }
 
-    /// Get the overlay texture cache for a given kind, inserting a default if absent.
-    pub fn overlay_cache_mut(&mut self, kind: OverlayKind) -> &mut OverlayTextureCache {
-        self.overlay_textures.entry(kind).or_default()
+    /// Get the overlay texture cache for a given id (read-only).
+    pub fn overlay_cache(&self, id: &LayerId) -> Option<&OverlayTextureCache> {
+        self.overlay_textures.get(id)
+    }
+
+    /// Get the overlay texture cache for a given id, inserting a default if absent.
+    pub fn overlay_cache_mut(&mut self, id: &LayerId) -> &mut OverlayTextureCache {
+        self.overlay_textures.entry(id.clone()).or_default()
     }
 
     /// Whether `kind`'s texture may be let go, judged against the enabled map
@@ -2300,7 +2326,7 @@ impl PaneState {
     ///
     /// # The radar raster is not a layer texture, and this is where that is said
     ///
-    /// [`OverlayKind::Radar`]'s cache is the only one this application does not
+    /// The radar layer's cache is the only one this application does not
     /// re-render on demand, and it is the only one carrying state nothing else
     /// can rebuild:
     ///
@@ -2329,19 +2355,16 @@ impl PaneState {
     /// The cost of the exclusion is one pane-sized texture per pane held across a
     /// Radar-off period, which is the same texture the pane had before the click
     /// and will draw again after it.
-    pub fn overlay_texture_releasable(
-        enabled: &HashMap<OverlayKind, bool>,
-        kind: OverlayKind,
-    ) -> bool {
-        // The same fallback [`Self::is_overlay_enabled`] applies: a kind with no
+    pub fn overlay_texture_releasable(enabled: &HashMap<LayerId, bool>, id: &LayerId) -> bool {
+        // The same fallback [`Self::is_overlay_enabled`] applies: an id with no
         // entry is not drawn, so its texture is releasable.
-        kind != OverlayKind::Radar && !enabled.get(&kind).copied().unwrap_or(false)
+        *id != known::RADAR && !enabled.get(id).copied().unwrap_or(false)
     }
 
     /// [`Self::overlay_texture_releasable`] against this pane's own map, for
     /// callers that hold the whole pane.
-    pub fn overlay_texture_is_releasable(&self, kind: OverlayKind) -> bool {
-        Self::overlay_texture_releasable(&self.enabled_overlays, kind)
+    pub fn overlay_texture_is_releasable(&self, id: &LayerId) -> bool {
+        Self::overlay_texture_releasable(&self.enabled_overlays, id)
     }
 
     /// Let go of the GPU texture of every overlay this pane no longer draws.
@@ -2393,8 +2416,8 @@ impl PaneState {
         // Two fields of one struct, borrowed disjointly, which is the whole
         // reason the predicate above is an associated function over the map.
         let enabled = &self.enabled_overlays;
-        for (&kind, cache) in &mut self.overlay_textures {
-            if Self::overlay_texture_releasable(enabled, kind) {
+        for (id, cache) in &mut self.overlay_textures {
+            if Self::overlay_texture_releasable(enabled, id) {
                 cache.clear();
             }
         }
@@ -2418,7 +2441,7 @@ impl PaneState {
 
     /// The id of the raster this pane is waiting on, if it is waiting on one.
     pub fn held_raster_id(&self) -> Option<egui::TextureId> {
-        Some(self.overlay_cache(OverlayKind::Radar)?.held_texture()?.id())
+        Some(self.overlay_cache(&known::RADAR)?.held_texture()?.id())
     }
 
     /// Let go of every raster that is still arriving, without showing any.
@@ -2456,7 +2479,7 @@ impl PaneState {
     /// new sweep's caption and the new sweep's ground — a wrong answer where the
     /// banding was only a late one.
     pub fn promote_held_raster(&mut self, delivered: impl Fn(egui::TextureId) -> bool) -> bool {
-        let cache = self.overlay_cache_mut(OverlayKind::Radar);
+        let cache = self.overlay_cache_mut(&known::RADAR);
         let Some(held) = cache.take_held_if_delivered(delivered) else {
             return false;
         };
@@ -2482,8 +2505,8 @@ impl PaneState {
     /// own `OverlayTextureData` — so this sweep deliberately touches nothing
     /// on the pane.
     pub fn promote_held_overlays(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {
-        for (&kind, cache) in &mut self.overlay_textures {
-            if kind == OverlayKind::Radar {
+        for (id, cache) in &mut self.overlay_textures {
+            if *id == known::RADAR {
                 continue;
             }
             if let Some(held) = cache.take_held_if_delivered(&delivered) {
@@ -2518,7 +2541,7 @@ impl PaneState {
         data_time: Option<chrono::NaiveDateTime>,
         already_whole: bool,
     ) {
-        let cache = self.overlay_cache_mut(OverlayKind::Radar);
+        let cache = self.overlay_cache_mut(&known::RADAR);
         if already_whole || cache.current().is_none() {
             cache.show(data);
             self.data_time = data_time;

@@ -1204,17 +1204,17 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
         pane_idx: 0,
         pane_state: None,
     };
-    let kind = OverlayKind::Lightning;
+    let kind = known::LIGHTNING;
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(kind, true);
+    registry.set_enabled(&kind, true);
 
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: kind.id(),
+        kind: kind.clone(),
         data: half_listed_round(),
     });
 
     let line = registry
-        .status_line(kind)
+        .status_line(&kind)
         .expect("an enabled lightning layer states its own line");
     assert!(
         line.starts_with("! incomplete"),
@@ -1226,7 +1226,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     );
 
     let note = registry
-        .controls(kind, &ctx)
+        .controls(&kind, &ctx)
         .into_iter()
         .find_map(|item| match item {
             ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
@@ -1245,7 +1245,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     // The survivor's flashes are real data on a fresh clock. A half round is
     // not a failed one and must not be filed as one.
     assert_eq!(
-        registry.fetch_health(kind),
+        registry.fetch_health(&kind),
         Some(&crate::fetch_policy::FetchHealth::Ok),
     );
     assert!(
@@ -1255,7 +1255,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
 
     // Both listings answer next poll: the mark clears itself.
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: kind.id(),
+        kind: kind.clone(),
         data: outcome(
             vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
             Vec::new(),
@@ -1265,7 +1265,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     });
     assert!(
         !registry
-            .status_line(kind)
+            .status_line(&kind)
             .is_some_and(|l| l.contains("incomplete")),
         "the mark outlived the round it was about",
     );
@@ -1309,11 +1309,11 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
     use crate::render::controls::PaneControlContext;
     use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
 
-    let kind = OverlayKind::Lightning;
+    let kind = known::LIGHTNING;
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(kind, true);
+    registry.set_enabled(&kind, true);
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: kind.id(),
+        kind: kind.clone(),
         data: payload,
     });
     let ctx = PaneControlContext {
@@ -1321,7 +1321,7 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
         pane_state: None,
     };
     let note = registry
-        .controls(kind, &ctx)
+        .controls(&kind, &ctx)
         .into_iter()
         .find_map(|item| match item {
             ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
@@ -1329,7 +1329,7 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
         });
     (
         registry
-            .status_line(kind)
+            .status_line(&kind)
             .expect("an enabled lightning layer states its own line"),
         note,
     )

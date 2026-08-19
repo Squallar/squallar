@@ -648,20 +648,20 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
 fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     use crate::pane::PaneKind;
 
-    let kind = OverlayKind::CityLabels;
+    let kind = rustdar_source::id::known::CITY_LABELS;
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
     for idx in 0..2 {
         gui.pane_mut(idx)
             .unwrap()
             .enabled_overlays
-            .insert(kind, true);
+            .insert(kind.clone(), true);
     }
     assert!(
-        gui.any_pane_has_overlay_enabled(kind),
+        gui.any_pane_has_overlay_enabled(&kind),
         "precondition: two map panes want the layer"
     );
-    assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
+    assert_eq!(gui.first_pane_with_overlay_enabled(&kind), Some(0));
 
     // Pane 0 goes 3D. It still draws this layer — on its floor — so it is still
     // the pane the fetch is attributed to.
@@ -669,11 +669,11 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
     assert_eq!(
-        gui.first_pane_with_overlay_enabled(kind),
+        gui.first_pane_with_overlay_enabled(&kind),
         Some(0),
         "the fetch skipped the 3D pane whose floor draws this very layer",
     );
-    assert!(gui.any_pane_has_overlay_enabled(kind));
+    assert!(gui.any_pane_has_overlay_enabled(&kind));
 
     // Its floor switched off, it draws nothing, and the attribution moves to
     // the map pane beside it.
@@ -683,32 +683,32 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
         .expect("a 3D pane has volume state")
         .hide_floor = true;
     assert_eq!(
-        gui.first_pane_with_overlay_enabled(kind),
+        gui.first_pane_with_overlay_enabled(&kind),
         Some(1),
         "a fetch was attributed to a pane with no surface to draw it on"
     );
-    assert!(gui.any_pane_has_overlay_enabled(kind));
+    assert!(gui.any_pane_has_overlay_enabled(&kind));
 
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
     assert!(
-        !gui.any_pane_has_overlay_enabled(kind),
+        !gui.any_pane_has_overlay_enabled(&kind),
         "no pane on screen can draw this overlay, yet its auto-poll timer is \
              still being kept alive"
     );
-    assert_eq!(gui.first_pane_with_overlay_enabled(kind), None);
+    assert_eq!(gui.first_pane_with_overlay_enabled(&kind), None);
 
     // The toggles themselves are untouched, so converting back restores the
     // layer rather than losing the user's choice.
     for idx in 0..2 {
         assert!(
-            gui.pane(idx).unwrap().is_overlay_enabled(kind),
+            gui.pane(idx).unwrap().is_overlay_enabled(&kind),
             "pane {idx} lost its remembered layer choice"
         );
     }
     gui.pane_mut(0)
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::PlanView);
-    assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
+    assert_eq!(gui.first_pane_with_overlay_enabled(&kind), Some(0));
 }
 
 /// A loop on a pane the layout no longer shows is not "active": it is

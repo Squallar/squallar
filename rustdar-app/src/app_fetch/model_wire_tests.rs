@@ -127,7 +127,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(OverlayKind::ModelData)
+        .overlay_cache_mut(&OverlayKind::ModelData.id())
         .render_in_flight
 }
 

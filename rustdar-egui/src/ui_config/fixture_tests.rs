@@ -11,8 +11,8 @@
 use crate::Gui;
 use crate::UI_CONFIG_KEY;
 use rustdar_kv::{KvStore, MemoryKvStore};
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::known;
 
 /// A store holding exactly one era's file, as the disk would.
 fn store_with(fixture: &str) -> MemoryKvStore {
@@ -39,7 +39,7 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
 
     let mut gui = Gui::new();
     assert!(
-        gui.overlays.is_enabled(OverlayKind::Radar),
+        gui.overlays.is_enabled(&known::RADAR),
         "precondition: a fresh Gui has the radar layer on, or the migration \
          assertion below could pass without the migration running",
     );
@@ -60,7 +60,7 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
     // The legacy Radar migration: no `overlay_states` in the file, so the
     // first pane's `layers["Radar"] = false` drives the global handler.
     assert!(
-        !gui.overlays.is_enabled(OverlayKind::Radar),
+        !gui.overlays.is_enabled(&known::RADAR),
         "the legacy per-pane Radar toggle was not migrated to the handler",
     );
 
@@ -132,13 +132,13 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
         "the unknown product falls back to the default, as ever",
     );
     assert_eq!(
-        pane.enabled_overlays.get(&OverlayKind::Radar),
+        pane.enabled_overlays.get(&known::RADAR),
         Some(&true),
         "the known overlay keys beside the unknown one still applied",
     );
     let order = &pane.draw_order;
-    let radar = order.iter().position(|&k| k == OverlayKind::Radar);
-    let alerts = order.iter().position(|&k| k == OverlayKind::NwsAlerts);
+    let radar = order.iter().position(|k| *k == known::RADAR);
+    let alerts = order.iter().position(|k| *k == known::NWS_ALERTS);
     assert!(
         radar < alerts,
         "the known draw-order names keep their saved relative order",
@@ -328,5 +328,151 @@ fn a_v1_gps_config_splits_into_serial_config_and_a_root_heading() {
     assert_eq!(
         v1, v2,
         "save-load-save moved the migrated file: reopening would not be 1:1"
+    );
+}
+
+/// **The M8b unknown-id pin, both directions.** A `draw_order` naming a layer
+/// no handler serves — "MysteryLayer" — survives load→save→reload **in
+/// place**, and is skipped at draw rather than resolved.
+///
+/// This is a DELIBERATE behavior change (M8b b2): the pre-M8b reconcile
+/// *dropped* unknown names from the pane's live list and a sidecar re-appended
+/// them after the known order on save, so a newer build's layer lost its
+/// position through a session under this build. With open [`LayerId`]s the
+/// unknown id is an ordinary entry: it keeps its saved position among the
+/// names it was saved between, the draw loop's `handler_by_id` gate skips it
+/// (retained-in-list, skipped-at-draw), and the second session reads back
+/// exactly what the first wrote — the fixpoint half.
+#[test]
+fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
+    let store = store_with(
+        r#"{"config_version":3,"pane_count":1,"site":"KTLX",
+            "panes":[{"site":"KTLX",
+                      "draw_order":["Radar","MysteryLayer","NwsAlerts"]}]}"#,
+    );
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+
+    let mystery = rustdar_source::id::LayerId::new("MysteryLayer");
+
+    // Direction 1 (load): retained in the live list, in place — after Radar,
+    // before NwsAlerts, exactly where the file put it.
+    let order = &gui.pane(0).expect("pane 0").draw_order;
+    let pos = |id: &rustdar_source::id::LayerId| {
+        order
+            .iter()
+            .position(|k| k == id)
+            .unwrap_or_else(|| panic!("{id:?} missing from the live draw order"))
+    };
+    assert!(
+        pos(&known::RADAR) < pos(&mystery) && pos(&mystery) < pos(&known::NWS_ALERTS),
+        "the unknown id must keep its saved position IN the list, not ride a \
+         sidecar to the end: {order:?}",
+    );
+    // The skip predicate the draw loop gates each id on: no handler, no arm.
+    assert!(
+        gui.overlays.handler_by_id(&mystery).is_none(),
+        "no handler serves MysteryLayer — the draw loop skips it by this exact \
+         predicate",
+    );
+    // The registered ids the file omitted joined at their weight positions.
+    assert_eq!(
+        order.len(),
+        13,
+        "all twelve registered layers plus the unknown id: {order:?}",
+    );
+
+    // Direction 2 (save): written back in place.
+    let saved = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    let written: Vec<&str> = v["panes"][0]["draw_order"]
+        .as_array()
+        .expect("draw_order is a list")
+        .iter()
+        .map(|e| e.as_str().expect("every entry is a string"))
+        .collect();
+    let wpos = |name: &str| {
+        written
+            .iter()
+            .position(|e| *e == name)
+            .unwrap_or_else(|| panic!("{name} missing from the saved draw order"))
+    };
+    assert!(
+        wpos("Radar") < wpos("MysteryLayer") && wpos("MysteryLayer") < wpos("NwsAlerts"),
+        "the save must write the unknown id where it sits, never appended to \
+         the tail: {written:?}",
+    );
+
+    // The fixpoint: a second session reads back exactly what the first wrote.
+    let second_store = store_with(&saved);
+    let mut second = Gui::new();
+    assert!(second.load_ui_config(&second_store), "the save must reload");
+    assert_eq!(
+        second.pane(0).expect("pane 0").draw_order,
+        gui.pane(0).expect("pane 0").draw_order,
+        "the second session's live order must equal the first's — the \
+         unknown id neither moves nor multiplies across sessions",
+    );
+    let resaved = second.ui_config_json().expect("serializable");
+    let rv: serde_json::Value = serde_json::from_str(&resaved).expect("valid JSON");
+    assert_eq!(
+        rv["panes"][0]["draw_order"], v["panes"][0]["draw_order"],
+        "save→reload→save is a fixpoint for a list carrying an unknown id",
+    );
+}
+
+/// The swap half of the unknown-id doctrine: an unregistered id's saved
+/// `enabled_overlays`/`overlay_configs` entries survive the registry-state
+/// overwrite every layer toggle performs (`PaneState::adopt_handler_state`).
+///
+/// Before M8b those entries rode a baggage sidecar the swap could not touch;
+/// with the sidecar gone the pane maps are the ONLY carrier, so a wholesale
+/// `save_pane_configs()` assignment would silently drop a newer build's
+/// layer state on the first eye click — and the next autosave would make the
+/// loss permanent. This is the test that fails instead.
+#[test]
+fn an_unknown_ids_saved_state_survives_a_layer_toggle() {
+    let store = store_with(
+        r#"{"config_version":3,"pane_count":1,"site":"KTLX",
+            "panes":[{"site":"KTLX",
+                      "draw_order":["Radar","MysteryLayer"],
+                      "enabled_overlays":{"Radar":true,"MysteryLayer":true},
+                      "overlay_configs":{"MysteryLayer":{"band":"infrared"}}}]}"#,
+    );
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+    let mystery = rustdar_source::id::LayerId::new("MysteryLayer");
+    assert_eq!(
+        gui.pane(0)
+            .expect("pane 0")
+            .overlay_configs
+            .get(&mystery)
+            .cloned(),
+        Some(serde_json::json!({"band": "infrared"})),
+        "premise: the unknown entry landed in the pane map",
+    );
+
+    // The toggle every eye click routes through — the swap overwrite.
+    gui.set_overlay_on_pane_for_test(0, &known::CITY_LABELS, true);
+
+    let pane = gui.pane(0).expect("pane 0");
+    assert_eq!(
+        pane.overlay_configs.get(&mystery).cloned(),
+        Some(serde_json::json!({"band": "infrared"})),
+        "a layer toggle's registry-state overwrite dropped an unknown id's \
+         saved config",
+    );
+    assert_eq!(
+        pane.enabled_overlays.get(&mystery).copied(),
+        Some(true),
+        "a layer toggle's registry-state overwrite dropped an unknown id's \
+         enabled flag",
+    );
+    let saved = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    assert_eq!(
+        v["panes"][0]["overlay_configs"]["MysteryLayer"],
+        serde_json::json!({"band": "infrared"}),
+        "the save after the toggle must still carry the unknown id's state",
     );
 }

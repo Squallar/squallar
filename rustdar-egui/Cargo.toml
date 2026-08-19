@@ -28,6 +28,7 @@ rustdar-kv = { workspace = true }
 rustdar-device-profile = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
+rustdar-source = { workspace = true }
 rustdar-units = { workspace = true }
 # Vocabulary only (default-features = false, re-declared deliberately): the
 # facade's provider arms (`os-providers`, `serial`) and their OS dependencies

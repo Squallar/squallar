@@ -4250,6 +4250,7 @@ dependencies = [
  "rustdar-nmea-serial",
  "rustdar-overlays",
  "rustdar-radar",
+ "rustdar-source",
  "rustdar-units",
  "serde",
  "serde_json",

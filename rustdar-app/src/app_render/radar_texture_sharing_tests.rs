@@ -152,7 +152,7 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(OverlayKind::Radar)
+        .overlay_cache_mut(&OverlayKind::Radar.id())
         .current()
         .expect("this pane was served a radar texture")
         .texture
@@ -385,7 +385,7 @@ fn stamped_elevation(app: &mut crate::app::App, pane_idx: usize) -> f32 {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(OverlayKind::Radar)
+        .overlay_cache_mut(&OverlayKind::Radar.id())
         .current()
         .expect("this pane was served a radar texture")
         .radar_meta

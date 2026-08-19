@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_source::id::{LayerId, known};
 
 /// The two durations that bracket the idle backstop, deliberately **not**
 /// derived from `POINTER_IDLE_TIMEOUT_S`.
@@ -1522,7 +1523,7 @@ fn velocity_pane_on(screen: egui::Vec2, site: &str, nyquist_ms: Option<f64>) -> 
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .set_overlay_enabled(OverlayKind::Radar, true);
+        .set_overlay_enabled(known::RADAR, true);
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::Velocity, 0.5);
     h.select_product(0, RadarProduct::Velocity);
@@ -2169,7 +2170,7 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .overlay_cache_mut(OverlayKind::Radar)
+        .overlay_cache_mut(&known::RADAR)
         .clear();
     h.warm_up();
     assert_eq!(
@@ -2935,11 +2936,11 @@ fn clickable_leaf(h: &InputHarness, label: &str) -> egui::Rect {
 #[test]
 fn the_dropdown_checkboxes_show_the_live_pane_not_a_default_one() {
     let mut h = compact_with_menu();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
     assert!(
-        h.overlay_enabled(OverlayKind::RadarSites),
+        h.overlay_enabled(&known::RADAR_SITES),
         "precondition: the live pane must really have the overlay on"
     );
 
@@ -2977,13 +2978,13 @@ fn the_dropdown_checkboxes_show_the_live_pane_not_a_default_one() {
 #[test]
 fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
     let mut h = compact_with_menu();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
-    assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
+    assert!(h.overlay_enabled(&known::RADAR_SITES), "precondition");
 
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     assert!(
-        !h.overlay_enabled(OverlayKind::RadarSites),
+        !h.overlay_enabled(&known::RADAR_SITES),
         "clicking a checked box left the overlay on — the dropdown can turn \
              an overlay on but never off"
     );
@@ -3001,7 +3002,7 @@ fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
     for frame in 0..5 {
         h.frame_after(FRAME_DT);
         assert!(
-            !h.overlay_enabled(OverlayKind::RadarSites),
+            !h.overlay_enabled(&known::RADAR_SITES),
             "the overlay came back on {} frame(s) after the click: the \
                  toggle reached `enabled_overlays` but not `overlay_configs`, \
                  so the layers panel reloaded it from the config and undid it",
@@ -3014,7 +3015,7 @@ fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        h.overlay_enabled(OverlayKind::RadarSites),
+        h.overlay_enabled(&known::RADAR_SITES),
         "the toggle did not come back on"
     );
 
@@ -3069,16 +3070,16 @@ fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
     // `serialize_state` carries `enabled`, so loading pane 0's configs
     // imports pane 0's on/off state for every kind except the one being
     // set, and pane 1's city labels would silently go out.
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
-    h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
-    h.set_overlay_on_pane(1, OverlayKind::RadarSites, true);
-    h.set_overlay_on_pane(1, OverlayKind::CityLabels, true);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
+    h.set_overlay_on_pane(0, &known::CITY_LABELS, false);
+    h.set_overlay_on_pane(1, &known::RADAR_SITES, true);
+    h.set_overlay_on_pane(1, &known::CITY_LABELS, true);
     h.warm_up();
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::RadarSites)
-            && !h.overlay_enabled_on(0, OverlayKind::RadarSites)
-            && h.overlay_enabled_on(1, OverlayKind::CityLabels)
-            && !h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        h.overlay_enabled_on(1, &known::RADAR_SITES)
+            && !h.overlay_enabled_on(0, &known::RADAR_SITES)
+            && h.overlay_enabled_on(1, &known::CITY_LABELS)
+            && !h.overlay_enabled_on(0, &known::CITY_LABELS),
         "precondition: the panes must disagree about both kinds"
     );
 
@@ -3093,23 +3094,23 @@ fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        !h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        !h.overlay_enabled_on(1, &known::RADAR_SITES),
         "the toggle did not reach the active pane"
     );
     assert!(
-        !h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        !h.overlay_enabled_on(0, &known::RADAR_SITES),
         "the toggle wrote to pane 0, which is not the active pane"
     );
 
     // The untouched kind must be untouched — on the active pane, and on
     // the one that was not being edited.
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::CityLabels),
+        h.overlay_enabled_on(1, &known::CITY_LABELS),
         "toggling radar sites on pane 1 also turned its city labels off: \
              the config was read from pane 0, which had them off"
     );
     assert!(
-        !h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        !h.overlay_enabled_on(0, &known::CITY_LABELS),
         "pane 0's city labels changed, though it is not the active pane"
     );
 }
@@ -3144,9 +3145,9 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
              whose config is left in the handlers"
     );
 
-    h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
-    h.set_overlay_on_pane(1, OverlayKind::CityLabels, false);
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(0, &known::CITY_LABELS, true);
+    h.set_overlay_on_pane(1, &known::CITY_LABELS, false);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
     h.warm_up();
     assert!(
         !h.layers_panel_on_screen(),
@@ -3158,11 +3159,11 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
     h.frames_for(5, FRAME_DT);
 
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        h.overlay_enabled_on(0, &known::RADAR_SITES),
         "precondition: the toggle must have taken effect"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        h.overlay_enabled_on(0, &known::CITY_LABELS),
         "the active pane's city labels were overwritten by pane 1's config: \
              the handlers were saved without loading the active pane first"
     );
@@ -3198,8 +3199,8 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
              `propagate_layer_sync` masks the arm under test"
     );
 
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
-    h.set_overlay_on_pane(1, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
+    h.set_overlay_on_pane(1, &known::RADAR_SITES, false);
     h.warm_up();
 
     // Through the dropdown: open ☰, then tick the box.
@@ -3208,11 +3209,11 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     h.frames_for(5, FRAME_DT);
 
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        h.overlay_enabled_on(1, &known::RADAR_SITES),
         "precondition: the active pane must have taken the toggle"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        h.overlay_enabled_on(0, &known::RADAR_SITES),
         "the toggle did not propagate to the other pane, though layer sync \
              is on"
     );
@@ -3320,9 +3321,9 @@ fn a_toggle_flipped_in_the_dropdown_reaches_the_dispatcher() {
         crate::ui_layout::WidthClass::Expanded,
         "precondition: the widest class, with the sidebar up"
     );
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
-    assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
+    assert!(h.overlay_enabled(&known::RADAR_SITES), "precondition");
 
     h.open_menu();
     assert_eq!(
@@ -3334,7 +3335,7 @@ fn a_toggle_flipped_in_the_dropdown_reaches_the_dispatcher() {
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        !h.overlay_enabled(OverlayKind::RadarSites),
+        !h.overlay_enabled(&known::RADAR_SITES),
         "the dropdown's toggle never reached apply_menu_event, or was \
              reverted by the layers panel on a later frame"
     );
@@ -4104,15 +4105,15 @@ fn expanded_with_pane_1_active() -> InputHarness {
 fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
     let mut h = expanded_with_pane_1_active();
     h.set_layer_links(false);
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
-    h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
-    h.set_overlay_on_pane(1, OverlayKind::RadarSites, true);
-    h.set_overlay_on_pane(1, OverlayKind::CityLabels, true);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
+    h.set_overlay_on_pane(0, &known::CITY_LABELS, false);
+    h.set_overlay_on_pane(1, &known::RADAR_SITES, true);
+    h.set_overlay_on_pane(1, &known::CITY_LABELS, true);
     h.warm_up();
 
     // The read half: the eye shows pane 1's state.
     let row = h
-        .stack_row(OverlayKind::RadarSites)
+        .stack_row(&known::RADAR_SITES)
         .expect("the stack must draw a RadarSites row");
     assert!(
         row.eye_on,
@@ -4123,20 +4124,20 @@ fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        !h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        !h.overlay_enabled_on(1, &known::RADAR_SITES),
         "the eye did not reach the active pane"
     );
     assert!(
-        !h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        !h.overlay_enabled_on(0, &known::RADAR_SITES),
         "the eye wrote to pane 0, which is not the active pane"
     );
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::CityLabels),
+        h.overlay_enabled_on(1, &known::CITY_LABELS),
         "toggling radar sites on pane 1 also turned its city labels off: \
              the config was read from the wrong pane"
     );
     assert!(
-        !h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        !h.overlay_enabled_on(0, &known::CITY_LABELS),
         "pane 0's city labels changed, though it is not the active pane"
     );
 }
@@ -4152,32 +4153,32 @@ fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
 #[test]
 fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
-    assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
+    assert!(h.overlay_enabled(&known::RADAR_SITES), "precondition");
 
-    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
     assert!(row.eye_on, "the eye must draw the live state");
     h.mouse_click(row.eye.center());
     for frame in 0..5 {
         h.frame_after(FRAME_DT);
         assert!(
-            !h.overlay_enabled(OverlayKind::RadarSites),
+            !h.overlay_enabled(&known::RADAR_SITES),
             "the overlay came back on {} frame(s) after the eye click: the \
                  toggle reached `enabled_overlays` but not `overlay_configs`",
             frame + 1
         );
     }
     assert!(
-        !h.stack_row(OverlayKind::RadarSites).expect("row").eye_on,
+        !h.stack_row(&known::RADAR_SITES).expect("row").eye_on,
         "the layer is off but the eye still draws it on"
     );
 
-    let row = h.stack_row(OverlayKind::RadarSites).expect("row");
+    let row = h.stack_row(&known::RADAR_SITES).expect("row");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        h.overlay_enabled(OverlayKind::RadarSites),
+        h.overlay_enabled(&known::RADAR_SITES),
         "the eye did not turn the layer back on"
     );
 }
@@ -4195,17 +4196,13 @@ fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
 #[test]
 fn the_layer_body_carries_no_master_toggle() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
-    for kind in [
-        OverlayKind::RadarSites,
-        OverlayKind::ColorScale,
-        OverlayKind::Radar,
-    ] {
-        h.open_layer_in_inspector(kind);
+    for kind in [known::RADAR_SITES, known::COLOR_SCALE, known::RADAR] {
+        h.open_layer_in_inspector(&kind);
         let rect = h.inspector_rect().expect("the inspector is open");
-        let name = h.overlay_display_name(kind).to_owned();
+        let name = h.overlay_display_name(&kind).to_owned();
         assert!(
             !h.text_painted_in(rect, &format!("Show {name}")),
             "{kind:?}'s layer body drew a \"Show {name}\" master toggle - \
@@ -4259,21 +4256,21 @@ fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
              whose config could be left in the handlers"
     );
 
-    h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
-    h.set_overlay_on_pane(1, OverlayKind::CityLabels, false);
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(0, &known::CITY_LABELS, true);
+    h.set_overlay_on_pane(1, &known::CITY_LABELS, false);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
     h.warm_up();
 
-    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
 
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        h.overlay_enabled_on(0, &known::RADAR_SITES),
         "precondition: the eye must have taken effect"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        h.overlay_enabled_on(0, &known::CITY_LABELS),
         "the active pane's city labels were overwritten by pane 1's config: \
              the handlers were saved without loading the active pane first"
     );
@@ -4296,20 +4293,20 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
         h.all_layer_linked(),
         "precondition: every pane's layer link defaults on"
     );
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
-    h.set_overlay_on_pane(1, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
+    h.set_overlay_on_pane(1, &known::RADAR_SITES, false);
     h.warm_up();
 
     // Linked source, linked target: the default, and the propagation.
-    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        h.overlay_enabled_on(1, &known::RADAR_SITES),
         "precondition: the active pane must have taken the toggle"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        h.overlay_enabled_on(0, &known::RADAR_SITES),
         "the toggle did not propagate to the linked pane, though both ends \
              are linked"
     );
@@ -4317,15 +4314,15 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
     // Unlinked target: the group's edits leave it alone.
     h.gui_mut().pane_mut(0).expect("pane 0").layer_link = false;
     h.warm_up();
-    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        !h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        !h.overlay_enabled_on(1, &known::RADAR_SITES),
         "precondition: the active pane must have taken the toggle off"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        h.overlay_enabled_on(0, &known::RADAR_SITES),
         "the toggle reached a layer-unlinked target pane"
     );
 
@@ -4339,25 +4336,25 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
         gui.pane_mut(0).expect("pane 0").layer_link = true;
         gui.pane_mut(1).expect("pane 1").layer_link = false;
     }
-    h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
-    h.set_overlay_on_pane(1, OverlayKind::CityLabels, false);
+    h.set_overlay_on_pane(0, &known::CITY_LABELS, true);
+    h.set_overlay_on_pane(1, &known::CITY_LABELS, false);
     h.warm_up();
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::CityLabels)
-            && !h.overlay_enabled_on(1, OverlayKind::CityLabels),
+        h.overlay_enabled_on(0, &known::CITY_LABELS)
+            && !h.overlay_enabled_on(1, &known::CITY_LABELS),
         "precondition: the panes must disagree about the witness kind, or \
              local-stays-local is unobservable"
     );
-    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        h.overlay_enabled_on(1, &known::RADAR_SITES),
         "precondition: the unlinked active pane must have taken its own \
              toggle"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        h.overlay_enabled_on(0, &known::CITY_LABELS),
         "an unlinked source pane propagated: pane 0's city labels were \
              overwritten with pane 1's, though pane 1's layer link is off"
     );
@@ -4375,16 +4372,14 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
 #[test]
 fn enabling_a_dataless_layer_fetches_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    let row = h.stack_row(OverlayKind::SpcOutlook).expect("row drawn");
+    let row = h.stack_row(&known::SPC_OUTLOOK).expect("row drawn");
     assert!(!row.eye_on, "precondition: outlooks default off");
     h.mouse_click(row.eye.center());
     assert!(
         h.last_actions().iter().any(|a| matches!(
             a,
-            crate::actions::GuiAction::FetchOverlay {
-                kind: OverlayKind::SpcOutlook,
-                ..
-            }
+            crate::actions::GuiAction::FetchOverlay { kind, .. }
+                if *kind == known::SPC_OUTLOOK
         )),
         "the eye enabled a layer with no data and no auto-poll, and nothing \
              will ever fetch it"
@@ -4393,7 +4388,7 @@ fn enabling_a_dataless_layer_fetches_it() {
 
 /// Drag one stack row's grip from its own centre to `to`, through the real
 /// press-move-release sequence the drag machinery sees.
-fn drag_stack_row(h: &mut InputHarness, kind: OverlayKind, to: egui::Pos2) {
+fn drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
     let handle = h
         .stack_row(kind)
         .unwrap_or_else(|| panic!("{kind:?}'s row is drawn"))
@@ -4416,7 +4411,7 @@ fn drag_stack_row(h: &mut InputHarness, kind: OverlayKind, to: egui::Pos2) {
 /// sequence — whose *release* frame batches `PointerButton{up}` with
 /// `PointerGone` (the harness's event-fidelity table), the pair that clears
 /// egui's `latest_pos` before the drag resolver runs.
-fn touch_drag_stack_row(h: &mut InputHarness, kind: OverlayKind, to: egui::Pos2) {
+fn touch_drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
     let handle = h
         .stack_row(kind)
         .unwrap_or_else(|| panic!("{kind:?}'s row is drawn"))
@@ -4451,10 +4446,10 @@ fn a_touch_drag_on_the_grip_lands_the_reorder() {
     let n = before.len();
     assert!(n >= 2, "precondition: a real layer list");
     let rows = h.stack().rows;
-    let second = rows[1].kind;
+    let second = rows[1].kind.clone();
     let above_top = egui::pos2(rows[0].rect.center().x, rows[0].rect.top() - 4.0);
 
-    touch_drag_stack_row(&mut h, second, above_top);
+    touch_drag_stack_row(&mut h, &second, above_top);
 
     let mut expected = before.clone();
     expected.swap(n - 1, n - 2);
@@ -4497,9 +4492,9 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
 
     // Drag the second row above the first: drawn later, i.e. towards the
     // *end* of `draw_order` — the top row is the last-drawn layer.
-    let second = rows[1].kind;
+    let second = rows[1].kind.clone();
     let above_top = egui::pos2(rows[0].rect.center().x, rows[0].rect.top() - 4.0);
-    drag_stack_row(&mut h, second, above_top);
+    drag_stack_row(&mut h, &second, above_top);
     let mut expected = before.clone();
     expected.swap(n - 1, n - 2);
     assert_eq!(
@@ -4519,7 +4514,7 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     // Dragging it back down one slot undoes it, so the drop arithmetic is
     // symmetric.
     let below_second = egui::pos2(rows[1].rect.center().x, rows[1].rect.bottom() - 2.0);
-    drag_stack_row(&mut h, second, below_second);
+    drag_stack_row(&mut h, &second, below_second);
     assert_eq!(
         h.gui_mut().pane(0).expect("pane 0").draw_order,
         before,
@@ -4527,12 +4522,12 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     );
 
     // A drop past the bottom lands the row last-in-display — first-drawn.
-    let top = h.stack().rows[0].kind;
+    let top = h.stack().rows[0].kind.clone();
     let below_last = {
         let rows = h.stack().rows;
         egui::pos2(rows[n - 1].rect.center().x, rows[n - 1].rect.bottom() + 4.0)
     };
-    drag_stack_row(&mut h, top, below_last);
+    drag_stack_row(&mut h, &top, below_last);
     assert_eq!(
         h.gui_mut().pane(0).expect("pane 0").draw_order[0],
         top,
@@ -4564,19 +4559,19 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
 #[test]
 fn city_labels_dragged_above_the_color_scale_paint_after_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.gui_mut().enable_overlay_for_test(OverlayKind::CityLabels);
-    h.gui_mut().enable_overlay_for_test(OverlayKind::ColorScale);
+    h.gui_mut().enable_overlay_for_test(&known::CITY_LABELS);
+    h.gui_mut().enable_overlay_for_test(&known::COLOR_SCALE);
     h.warm_up();
 
-    let paint_pos = |h: &InputHarness, kind: OverlayKind| -> usize {
+    let paint_pos = |h: &InputHarness, kind: &LayerId| -> usize {
         h.paint_order(0)
             .iter()
-            .position(|&(k, _)| k == kind)
+            .position(|(k, _)| k == kind)
             .unwrap_or_else(|| panic!("{kind:?} was not dispatched"))
     };
     // The default order paints City Labels before the Color Scale.
-    let labels_before = paint_pos(&h, OverlayKind::CityLabels);
-    let scale_before = paint_pos(&h, OverlayKind::ColorScale);
+    let labels_before = paint_pos(&h, &known::CITY_LABELS);
+    let scale_before = paint_pos(&h, &known::COLOR_SCALE);
     assert!(
         labels_before < scale_before,
         "precondition: the default draw order paints the scale over the labels"
@@ -4584,14 +4579,14 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
 
     // Drag the City Labels row above the Color Scale row.
     let scale_row = h
-        .stack_row(OverlayKind::ColorScale)
+        .stack_row(&known::COLOR_SCALE)
         .expect("the Color Scale row is drawn");
     let above_scale = egui::pos2(scale_row.rect.center().x, scale_row.rect.top() - 4.0);
-    drag_stack_row(&mut h, OverlayKind::CityLabels, above_scale);
+    drag_stack_row(&mut h, &known::CITY_LABELS, above_scale);
     h.warm_up();
 
     assert!(
-        paint_pos(&h, OverlayKind::CityLabels) > paint_pos(&h, OverlayKind::ColorScale),
+        paint_pos(&h, &known::CITY_LABELS) > paint_pos(&h, &known::COLOR_SCALE),
         "City Labels moved above the Color Scale in the stack, but the pane \
          still paints them under it - the reorder changed nothing, which is \
          the second user test's exact report"
@@ -4617,35 +4612,35 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
 #[test]
 fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.gui_mut().enable_overlay_for_test(OverlayKind::CityLabels);
-    h.gui_mut().enable_overlay_for_test(OverlayKind::ColorScale);
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::CITY_LABELS);
+    h.gui_mut().enable_overlay_for_test(&known::COLOR_SCALE);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
-    let expected: Vec<OverlayKind> = {
+    let expected: Vec<LayerId> = {
         let order = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
         order
             .into_iter()
-            .filter(|&kind| h.overlay_enabled_on(0, kind))
+            .filter(|kind| h.overlay_enabled_on(0, kind))
             .collect()
     };
     assert!(
-        expected.contains(&OverlayKind::CityLabels) && expected.contains(&OverlayKind::ColorScale),
+        expected.contains(&known::CITY_LABELS) && expected.contains(&known::COLOR_SCALE),
         "precondition: the two kinds of the user's case are enabled and ordered"
     );
 
     let order = h.paint_order(0);
     assert!(!order.is_empty(), "the map pane recorded no paint order");
-    let kinds: Vec<OverlayKind> = order.iter().map(|&(kind, _)| kind).collect();
+    let kinds: Vec<LayerId> = order.iter().map(|(kind, _)| kind.clone()).collect();
     assert_eq!(
         kinds, expected,
         "the pane's paint sequence is not its enabled draw_order"
     );
 
-    let (first_kind, first_layer) = order[0];
-    for &(kind, layer) in &order {
+    let (first_kind, first_layer) = order[0].clone();
+    for (kind, layer) in &order {
         assert_eq!(
-            layer, first_layer,
+            *layer, first_layer,
             "{kind:?} paints on its own layer while {first_kind:?} paints on \
              the pane's - their stacking is then egui's hash-order layer \
              drain, not draw_order"
@@ -4670,7 +4665,7 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
         "precondition: the inspector starts closed"
     );
 
-    let row = h.stack_row(OverlayKind::NwsAlerts).expect("row drawn");
+    let row = h.stack_row(&known::NWS_ALERTS).expect("row drawn");
     h.mouse_click(row.rect.center());
     h.warm_up();
 
@@ -4678,7 +4673,7 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
     assert!(inspector.open, "the row click did not open the inspector");
     assert_eq!(
         inspector.mode,
-        Some(crate::ui::InspectorSelection::Layer(OverlayKind::NwsAlerts)),
+        Some(crate::ui::InspectorSelection::Layer(known::NWS_ALERTS)),
         "the inspector opened on something other than the clicked layer"
     );
     assert_eq!(
@@ -4686,7 +4681,7 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
         "the crumb does not name the selection"
     );
     assert!(
-        h.stack_row(OverlayKind::NwsAlerts)
+        h.stack_row(&known::NWS_ALERTS)
             .expect("row still drawn")
             .selected,
         "the selected layer's row must draw selected"
@@ -4777,7 +4772,7 @@ fn the_control_pass_counter_counts_the_layer_body() {
         "no layer body is open, so no pass should have run"
     );
 
-    h.open_layer_in_inspector(OverlayKind::NwsAlerts);
+    h.open_layer_in_inspector(&known::NWS_ALERTS);
     assert_eq!(
         h.gui_mut().control_render_passes_for_test(),
         1,
@@ -5699,7 +5694,7 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
     h.open_pane_props();
     {
         let pane = h.gui_mut().pane_mut(0).unwrap();
-        pane.set_overlay_enabled(OverlayKind::Radar, true);
+        pane.set_overlay_enabled(known::RADAR, true);
         let info = pane.scan_info.as_mut().expect("a scan was loaded");
         info.product_elevations
             .insert(RadarProduct::Reflectivity, vec![0.5, 1.5]);
@@ -5751,7 +5746,7 @@ fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .set_overlay_enabled(OverlayKind::Radar, true);
+        .set_overlay_enabled(known::RADAR, true);
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::EchoTops, 0.5);
     h.select_product(0, showing);
@@ -5823,7 +5818,7 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
         h.gui_mut()
             .pane(0)
             .unwrap()
-            .overlay_cache(OverlayKind::Radar)
+            .overlay_cache(&known::RADAR)
             .and_then(|c| c.current())
             .is_some(),
         "the pane was cleared rather than annotated",
@@ -5955,7 +5950,7 @@ fn nothing_is_said_where_there_is_no_stale_image() {
     bare.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .set_overlay_enabled(OverlayKind::Radar, true);
+        .set_overlay_enabled(known::RADAR, true);
     bare.offer_product(0, RadarProduct::EchoTops, 0.5);
     bare.select_product(0, RadarProduct::EchoTops);
     assert!(
@@ -6068,7 +6063,7 @@ fn requested_plans(h: &InputHarness) -> Vec<crate::overlay_cache::OverlayTexture
 /// unconditionally true, so it needs no fetch to reach the render path.
 fn harness_requesting_overlays() -> InputHarness {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
     h
 }
@@ -6250,10 +6245,10 @@ fn site_switches(h: &InputHarness) -> Vec<(String, usize)> {
 fn harness_showing_site(site: &str) -> (InputHarness, egui::Pos2) {
     let mut h = InputHarness::new();
     h.load_scan(site);
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
     assert!(
-        h.overlay_enabled(OverlayKind::RadarSites),
+        h.overlay_enabled(&known::RADAR_SITES),
         "precondition: the radar-site overlay must be on, or nothing draws \
              an icon to click"
     );
@@ -6365,7 +6360,7 @@ fn clicking_beside_a_radar_site_icon_switches_nothing() {
 #[test]
 fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
     // Off the pane's centre-line, so the blocked click lands on the top
@@ -6436,7 +6431,7 @@ fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
 #[test]
 fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
     // Put the icon where a modal dialog lands, so one hover position
     // serves both halves.
@@ -6498,10 +6493,10 @@ fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
 fn a_dropdown_shows_its_option_label_not_the_raw_value() {
     // Per handler, through the inspector's layer body — the one place a
     // handler's dropdowns render since the stack/inspector split.
-    for host in [OverlayKind::ModelData, OverlayKind::Lightning] {
+    for host in [known::MODEL_DATA, known::LIGHTNING] {
         let mut h = compact_with_layers_drawer();
-        h.set_overlay_on_pane(0, host, true);
-        h.open_layer_in_inspector(host);
+        h.set_overlay_on_pane(0, &host, true);
+        h.open_layer_in_inspector(&host);
 
         // Every dropdown on screen — the layer body's, by construction.
         let drawn = h.dropdowns();
@@ -6547,8 +6542,8 @@ fn a_dropdown_shows_its_option_label_not_the_raw_value() {
         // result and one reading of the model.
         for dropdown in &drawn {
             let mut h = compact_with_layers_drawer();
-            h.set_overlay_on_pane(0, host, true);
-            h.open_layer_in_inspector(host);
+            h.set_overlay_on_pane(0, &host, true);
+            h.open_layer_in_inspector(&host);
             let (options, _) = h.dropdown_model(&dropdown.label).expect("still offered");
             let dropdown = h
                 .dropdowns()
@@ -6864,7 +6859,7 @@ fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
     );
     h.set_layer_links(false);
     assert!(
-        h.overlay_enabled(OverlayKind::Radar),
+        h.overlay_enabled(&known::RADAR),
         "precondition: the active pane must have Radar on, or there is no \
              state for the newcomer to inherit"
     );
@@ -6888,7 +6883,7 @@ fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
     );
 
     assert!(
-        h.overlay_enabled_on(1, OverlayKind::Radar),
+        h.overlay_enabled_on(1, &known::RADAR),
         "the picker's new pane came up with every overlay off — its empty \
              `enabled_overlays` was never seeded from the handler state"
     );
@@ -7401,7 +7396,7 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
         // A row from the middle of the stack, so the check is not satisfied
         // by the first one alone.
         assert!(
-            h.stack_row(OverlayKind::NwsAlerts).is_some(),
+            h.stack_row(&known::NWS_ALERTS).is_some(),
             "precondition: a map pane's stack draws the layer rows"
         );
 
@@ -7460,7 +7455,7 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             );
         } else {
             assert!(
-                h.stack_row(OverlayKind::NwsAlerts).is_some(),
+                h.stack_row(&known::NWS_ALERTS).is_some(),
                 "{kind:?}: the layer rows went with the plan view, leaving \
                  this pane's floor honouring a layer set nothing on screen \
                  can reach: {:?}",
@@ -7515,7 +7510,7 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
 
     fn lone_pane_wanting_labels() -> InputHarness {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-        h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+        h.set_overlay_on_pane(0, &known::CITY_LABELS, true);
         h
     }
 
@@ -7529,7 +7524,7 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
     let mut on_a_floor = lone_pane_wanting_labels();
     on_a_floor.make_pane_volume(0);
     assert!(
-        on_a_floor.overlay_enabled(OverlayKind::CityLabels),
+        on_a_floor.overlay_enabled(&known::CITY_LABELS),
         "precondition: the pane still *remembers* wanting labels, which is what \
              makes this a filter rather than a cleared flag"
     );
@@ -7580,7 +7575,7 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
 
 /// 46. **A non-map pane's product picker survives the Radar layer being off.**
 ///
-///     The picker used to be gated on `is_overlay_enabled(OverlayKind::Radar)`,
+///     The picker used to be gated on the radar layer's `is_overlay_enabled`,
 ///     which asks whether the *map* should draw the radar image over its tiles.
 ///     A pane with no tiles has no such layer, so a pane converted while that
 ///     toggle happened to be off would have had no product control at all —
@@ -7592,7 +7587,7 @@ fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
     h.load_scan("KTLX");
     // The picker lives in the inspector's Pane-properties body now.
     h.open_pane_props();
-    h.set_overlay_on_pane(0, OverlayKind::Radar, false);
+    h.set_overlay_on_pane(0, &known::RADAR, false);
     h.frames_for(2, FRAME_DT);
 
     let has_product = |h: &InputHarness| {
@@ -7751,7 +7746,7 @@ fn the_missing_layer_list_is_explained_for_the_kind_that_is_missing_it() {
 ///      Both halves, and the second is the one that keeps this test honest: a
 ///      cross-section's rows must still be absent, or "every pane has rows"
 ///      would pass. The row **set** is the third claim and it is why
-///      `PaneSurface` is the right authority rather than "the floor's kinds":
+///      the handler-declared `Surface` is the right authority rather than "the floor's kinds":
 ///      the ground kinds go on the floor and the colour scale goes on the
 ///      glass, so a 3D pane draws — and must be able to switch off — every one
 ///      of them. Dropping the colour-scale row would move the same defect one
@@ -7762,21 +7757,21 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
     h.load_scan("KTLX");
     h.open_layers();
 
-    let on_a_map: Vec<OverlayKind> = h.stack().rows.iter().map(|row| row.kind).collect();
+    let on_a_map: Vec<LayerId> = h.stack().rows.iter().map(|row| row.kind.clone()).collect();
     assert!(
-        on_a_map.contains(&OverlayKind::ColorScale) && on_a_map.len() > 1,
+        on_a_map.contains(&known::COLOR_SCALE) && on_a_map.len() > 1,
         "precondition: a map pane lists every layer, colour scale included: \
          {on_a_map:?}"
     );
 
     // A set the user made *before* the conversion — the state that used to
     // become unreachable the moment the pane went 3D.
-    h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
+    h.set_overlay_on_pane(0, &known::CITY_LABELS, false);
     h.make_pane_volume(0);
     h.open_layers();
 
     let stack = h.stack();
-    let on_a_volume: Vec<OverlayKind> = stack.rows.iter().map(|row| row.kind).collect();
+    let on_a_volume: Vec<LayerId> = stack.rows.iter().map(|row| row.kind.clone()).collect();
     assert_eq!(
         on_a_volume, on_a_map,
         "a 3D pane draws the ground kinds onto its floor and the colour scale \
@@ -7796,7 +7791,7 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
 
     // The pre-conversion set survived *and* is now on screen to be read…
     let labels = h
-        .stack_row(OverlayKind::CityLabels)
+        .stack_row(&known::CITY_LABELS)
         .expect("the city-labels row is in the list asserted above");
     assert!(
         !labels.eye_on,
@@ -7811,7 +7806,7 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
         h.gui_mut()
             .pane(0)
             .expect("pane 0")
-            .is_overlay_enabled(OverlayKind::CityLabels),
+            .is_overlay_enabled(&known::CITY_LABELS),
         "the eye on a 3D pane's row did not reach the pane's own layer state"
     );
 
@@ -10296,12 +10291,12 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
         "the old product's tilt must not survive the switch"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::Radar),
+        h.overlay_enabled_on(0, &known::RADAR),
         "a product under a hidden radar layer is a click that did nothing"
     );
     assert_eq!(
         h.inspector().mode,
-        Some(crate::ui::InspectorSelection::Layer(OverlayKind::Radar)),
+        Some(crate::ui::InspectorSelection::Layer(known::RADAR)),
         "the Radar layer's options must be selected"
     );
 }
@@ -10316,7 +10311,7 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
 fn an_overlay_tile_enables_the_layer_and_selects_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     assert!(
-        !h.overlay_enabled_on(0, OverlayKind::SpcOutlook),
+        !h.overlay_enabled_on(0, &known::SPC_OUTLOOK),
         "precondition: outlooks start off, so the tile has something to do"
     );
 
@@ -10328,10 +10323,8 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
     assert!(
         h.last_actions().iter().any(|a| matches!(
             a,
-            crate::actions::GuiAction::FetchOverlay {
-                kind: OverlayKind::SpcOutlook,
-                pane_idx: 0
-            }
+            crate::actions::GuiAction::FetchOverlay { kind, pane_idx: 0 }
+                if *kind == known::SPC_OUTLOOK
         )),
         "enabling a dataless, never-polled layer must queue its first fetch"
     );
@@ -10339,14 +10332,12 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
 
     assert!(!h.catalog().open, "applying a tile must close the catalog");
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::SpcOutlook),
+        h.overlay_enabled_on(0, &known::SPC_OUTLOOK),
         "the tile did not enable the layer"
     );
     assert_eq!(
         h.inspector().mode,
-        Some(crate::ui::InspectorSelection::Layer(
-            OverlayKind::SpcOutlook
-        )),
+        Some(crate::ui::InspectorSelection::Layer(known::SPC_OUTLOOK)),
         "the enabled layer's options must be selected"
     );
 }
@@ -10365,10 +10356,8 @@ fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
     assert!(
         h.last_actions().iter().any(|a| matches!(
             a,
-            crate::actions::GuiAction::FetchOverlay {
-                kind: OverlayKind::ModelData,
-                ..
-            }
+            crate::actions::GuiAction::FetchOverlay { kind, .. }
+                if *kind == known::MODEL_DATA
         )),
         "an uncached parameter must ask for its data"
     );
@@ -10376,12 +10365,12 @@ fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
 
     assert!(!h.catalog().open);
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::ModelData),
+        h.overlay_enabled_on(0, &known::MODEL_DATA),
         "the tile did not enable the model layer"
     );
     assert_eq!(
         h.inspector().mode,
-        Some(crate::ui::InspectorSelection::Layer(OverlayKind::ModelData)),
+        Some(crate::ui::InspectorSelection::Layer(known::MODEL_DATA)),
         "the model layer's options must be selected"
     );
     // The parameter landed in the handler the inspector now shows: the
@@ -10409,7 +10398,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.set_pane_count(2);
     h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
         rustdar_radar::types::RadarProduct::Velocity;
-    h.set_overlay_on_pane(0, OverlayKind::StormReports, true);
+    h.set_overlay_on_pane(0, &known::STORM_REPORTS, true);
     h.warm_up();
 
     // Save it under a name.
@@ -10443,7 +10432,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.set_pane_count(1);
     h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
         rustdar_radar::types::RadarProduct::Reflectivity;
-    h.set_overlay_on_pane(0, OverlayKind::StormReports, false);
+    h.set_overlay_on_pane(0, &known::STORM_REPORTS, false);
     h.warm_up();
     let tile = h
         .catalog_tile(crate::ui::CatalogGroup::Presets, "Chase day")
@@ -10462,8 +10451,8 @@ fn a_saved_preset_appears_applies_and_deletes() {
         "the preset's per-pane product must come back"
     );
     assert!(
-        h.overlay_enabled_on(0, OverlayKind::StormReports)
-            && h.overlay_enabled_on(1, OverlayKind::StormReports),
+        h.overlay_enabled_on(0, &known::STORM_REPORTS)
+            && h.overlay_enabled_on(1, &known::STORM_REPORTS),
         "the preset's overlay set must land on every pane"
     );
 
@@ -10693,7 +10682,7 @@ fn pill_harness() -> InputHarness {
 #[test]
 fn a_pill_click_never_reaches_the_map_and_its_popover_anchors() {
     let mut h = pill_harness();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
     // Pane 1 active, so the pill's own activate is observable.
@@ -11462,7 +11451,7 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
 fn a_consumed_map_click_reports_itself_and_a_bare_one_does_not() {
     let mut h = InputHarness::new();
     h.close_layers();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
     let pane = h.pane_rects()[0];
@@ -11479,7 +11468,7 @@ fn a_consumed_map_click_reports_itself_and_a_bare_one_does_not() {
         "a site icon that answered the click must report the consumption"
     );
 
-    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
     h.mouse_click(spot);
     assert_eq!(site_switches(&h), vec![], "control: nothing answers now");
     assert!(
@@ -11579,18 +11568,18 @@ fn a_preset_apply_queues_one_fetch_per_kind() {
         .expect("the built-in is offered");
     h.mouse_click(tile.rect.center());
 
-    let mut fetched: Vec<OverlayKind> = Vec::new();
+    let mut fetched: Vec<LayerId> = Vec::new();
     for action in h.last_actions() {
         if let GuiAction::FetchOverlay { kind, .. } = action {
             assert!(
                 !fetched.contains(kind),
                 "{kind:?} was fetched twice by one preset apply"
             );
-            fetched.push(*kind);
+            fetched.push(kind.clone());
         }
     }
     assert!(
-        fetched.contains(&OverlayKind::SpcOutlook),
+        fetched.contains(&known::SPC_OUTLOOK),
         "control: the preset enables a dataless, never-polled layer, so \
          exactly one fetch for it must be queued; got {fetched:?}"
     );
@@ -12436,7 +12425,7 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
 fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
     let desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     let row = desk
-        .stack_row(OverlayKind::NwsAlerts)
+        .stack_row(&known::NWS_ALERTS)
         .expect("the desktop sidebar is open by default");
     assert_eq!(
         row.chevron, None,
@@ -12446,7 +12435,7 @@ fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
     let mut tablet = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
     tablet.open_layers();
     let row = tablet
-        .stack_row(OverlayKind::NwsAlerts)
+        .stack_row(&known::NWS_ALERTS)
         .expect("the drawer is open");
     assert!(
         row.chevron.is_some_and(|c| c.is_positive()),
@@ -12456,7 +12445,7 @@ fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
     let mut ph = phone();
     ph.open_layers();
     let row = ph
-        .stack_row(OverlayKind::NwsAlerts)
+        .stack_row(&known::NWS_ALERTS)
         .expect("the sheet's Layers page is open");
     let chevron = row.chevron.expect("a sheet row must carry the chevron");
     assert!(
@@ -12701,7 +12690,7 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
 
     // A consumed click does not fade: the site icon answered it.
     h.close_layers();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
     let site_spot = egui::pos2(spot.x - 150.0, spot.y);
     h.place_site_at(0, "KTLX", site_spot);
@@ -13200,7 +13189,7 @@ fn a_click_that_activates_a_pane_does_not_fade() {
 fn a_consumed_click_while_faded_unfades() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.close_layers();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
     let spot = h.map_center();
     // Park the icon away from the centre first — the default view has the
@@ -13358,7 +13347,7 @@ fn the_sheet_host_draws_no_duplicate_headers() {
     );
 
     // The inspector page: crumb yes, ⟩ no, ✕-deselect yes.
-    h.open_layer_in_inspector(OverlayKind::NwsAlerts);
+    h.open_layer_in_inspector(&known::NWS_ALERTS);
     let insp = h.inspector();
     assert_eq!(
         insp.collapse,
@@ -13689,34 +13678,30 @@ fn layer_rows_are_full_width_click_targets() {
         );
     }
 
-    let radar = h
-        .stack_row(OverlayKind::Radar)
-        .expect("the Radar row is drawn");
+    let radar = h.stack_row(&known::RADAR).expect("the Radar row is drawn");
     let far_right = egui::pos2(radar.rect.right() - 6.0, radar.rect.center().y);
     h.mouse_click(far_right);
     h.warm_up();
     assert_eq!(
         h.inspector().mode,
-        Some(crate::ui::InspectorSelection::Layer(OverlayKind::Radar)),
+        Some(crate::ui::InspectorSelection::Layer(known::RADAR)),
         "a click at the row's right end must select the layer"
     );
 
     // The buttons layered on the row keep their own precedence: the eye
     // click toggles visibility rather than re-selecting.
-    let row = h.stack_row(OverlayKind::CityLabels).expect("row drawn");
+    let row = h.stack_row(&known::CITY_LABELS).expect("row drawn");
     let was_on = row.eye_on;
     h.mouse_click(row.eye.center());
     h.warm_up();
     assert_eq!(
-        h.overlay_enabled(OverlayKind::CityLabels),
+        h.overlay_enabled(&known::CITY_LABELS),
         !was_on,
         "the eye stopped toggling under the full-width row"
     );
     assert_ne!(
         h.inspector().mode,
-        Some(crate::ui::InspectorSelection::Layer(
-            OverlayKind::CityLabels
-        )),
+        Some(crate::ui::InspectorSelection::Layer(known::CITY_LABELS)),
         "the eye click leaked into a row selection"
     );
 }
@@ -14465,7 +14450,7 @@ fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert:
 #[test]
 fn a_click_inside_an_alert_polygon_still_selects_it() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
     h.warm_up();
 
     let target = h.pane_rects()[0].center();
@@ -14498,7 +14483,7 @@ fn a_click_inside_an_alert_polygon_still_selects_it() {
 #[test]
 fn a_click_outside_every_alert_polygon_still_selects_nothing() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
     h.warm_up();
 
     let pane = h.pane_rects()[0];
@@ -14540,8 +14525,7 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
     use rustdar_overlays::spc::discussion::{MdType, SpcDiscussion};
 
     let mut h = InputHarness::new();
-    h.gui_mut()
-        .enable_overlay_for_test(OverlayKind::SpcDiscussions);
+    h.gui_mut().enable_overlay_for_test(&known::SPC_DISCUSSIONS);
     h.warm_up();
 
     let ground = h.ground_at(0, h.pane_rects()[0].center());
@@ -14581,7 +14565,7 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
 /// The cache token the last frame asked `kind`'s raster to be keyed by — the
 /// value `OverlayTextureCache::needs_rerender` compares the cached texture
 /// against, so two frames agreeing on it means no re-rasterize.
-fn requested_cache_token(h: &InputHarness, kind: OverlayKind) -> u64 {
+fn requested_cache_token(h: &InputHarness, kind: &LayerId) -> u64 {
     let tokens: Vec<u64> = h
         .last_actions()
         .iter()
@@ -14590,7 +14574,7 @@ fn requested_cache_token(h: &InputHarness, kind: OverlayKind) -> u64 {
                 overlay_kind,
                 data_generation,
                 ..
-            } if *overlay_kind == kind => Some(*data_generation),
+            } if overlay_kind == kind => Some(*data_generation),
             _ => None,
         })
         .collect();
@@ -14603,11 +14587,11 @@ fn requested_cache_token(h: &InputHarness, kind: OverlayKind) -> u64 {
 
 /// How many rasterizes the last frame asked for, for `kind`. Zero is the
 /// interesting number: it means the pane looked at its cache and was satisfied.
-fn rasterizes_requested(h: &InputHarness, kind: OverlayKind) -> usize {
+fn rasterizes_requested(h: &InputHarness, kind: &LayerId) -> usize {
     h.last_actions()
         .iter()
         .filter(
-            |a| matches!(a, GuiAction::RenderOverlay { overlay_kind, .. } if *overlay_kind == kind),
+            |a| matches!(a, GuiAction::RenderOverlay { overlay_kind, .. } if overlay_kind == kind),
         )
         .count()
 }
@@ -14620,7 +14604,7 @@ fn rasterizes_requested(h: &InputHarness, kind: OverlayKind) -> usize {
 /// re-asks on every frame by definition. With it, a `RenderOverlay` afterwards
 /// is a real re-rasterize — a worker pass plus the frame-thread `ColorImage`
 /// conversion — which is the thing these tests are actually about.
-fn settle_overlay_cache(h: &mut InputHarness, kind: OverlayKind) {
+fn settle_overlay_cache(h: &mut InputHarness, kind: &LayerId) {
     let requests: Vec<_> = h
         .last_actions()
         .iter()
@@ -14632,7 +14616,7 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: OverlayKind) {
                 texture,
                 data_generation,
                 zoom,
-            } if *overlay_kind == kind => {
+            } if overlay_kind == kind => {
                 Some((*pane_idx, *geo_bounds, *texture, *data_generation, *zoom))
             }
             _ => None,
@@ -14688,7 +14672,7 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: OverlayKind) {
 #[test]
 fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
     h.warm_up();
 
     let ground = h.ground_at(0, h.pane_rects()[0].center());
@@ -14696,10 +14680,10 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
 
     ingest_alerts(&mut h, warning_set());
     h.warm_up();
-    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    settle_overlay_cache(&mut h, &known::NWS_ALERTS);
     h.warm_up();
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "fixture: a settled cache with nothing new must ask for nothing, or a \
          zero below would say nothing about the fix",
@@ -14707,17 +14691,17 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
 
     // Ten polls, two minutes apart, each returning the warning still out.
     for poll in 1..=10 {
-        let generation_before = h.gui_mut().overlays.data_generation(OverlayKind::NwsAlerts);
+        let generation_before = h.gui_mut().overlays.data_generation(&known::NWS_ALERTS);
         ingest_alerts(&mut h, warning_set());
         h.warm_up();
         assert_ne!(
-            h.gui_mut().overlays.data_generation(OverlayKind::NwsAlerts),
+            h.gui_mut().overlays.data_generation(&known::NWS_ALERTS),
             generation_before,
             "fixture: poll {poll} must really have replaced the data — that bump \
              is exactly what the pane used to key on",
         );
         assert_eq!(
-            rasterizes_requested(&h, OverlayKind::NwsAlerts),
+            rasterizes_requested(&h, &known::NWS_ALERTS),
             0,
             "poll {poll} of an unchanged warning set re-rasterized the whole \
              alert overlay: a worker pass plus a ~47 ms frame-thread ColorImage \
@@ -14741,7 +14725,7 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
     );
     h.warm_up();
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
         "a newly issued warning did not buy a re-rasterize, so the ten zeros \
          above are a cache that never refreshes rather than one that refreshes \
@@ -14762,7 +14746,7 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
 #[test]
 fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
     h.warm_up();
 
     let ground = h.ground_at(0, h.pane_rects()[0].center());
@@ -14771,7 +14755,7 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
         vec![alert_over("a", "Tornado Warning", ground.y(), ground.x())],
     );
     h.warm_up();
-    let one_warning = requested_cache_token(&h, OverlayKind::NwsAlerts);
+    let one_warning = requested_cache_token(&h, &known::NWS_ALERTS);
 
     // A second warning issues.
     ingest_alerts(
@@ -14787,7 +14771,7 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
         ],
     );
     h.warm_up();
-    let two_warnings = requested_cache_token(&h, OverlayKind::NwsAlerts);
+    let two_warnings = requested_cache_token(&h, &known::NWS_ALERTS);
     assert_ne!(
         two_warnings, one_warning,
         "a newly issued warning left the pane on its old raster",
@@ -14805,7 +14789,7 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
     );
     h.warm_up();
     assert_ne!(
-        requested_cache_token(&h, OverlayKind::NwsAlerts),
+        requested_cache_token(&h, &known::NWS_ALERTS),
         two_warnings,
         "an expired warning stayed painted",
     );
@@ -14828,7 +14812,7 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
 #[test]
 fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
     h.warm_up();
 
     let ground = h.ground_at(0, h.pane_rects()[0].center());
@@ -14846,10 +14830,10 @@ fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
     // raster land, so the pane is holding a picture with no warning in it.
     ingest_alerts(&mut h, zone_warning(0));
     h.warm_up();
-    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    settle_overlay_cache(&mut h, &known::NWS_ALERTS);
     h.warm_up();
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "fixture: the empty-geometry raster must have settled, or the ask below \
          is just the cache still filling",
@@ -14859,7 +14843,7 @@ fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
     ingest_alerts(&mut h, zone_warning(3));
     h.warm_up();
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
         "a warning arrived with its counties and the pane kept the raster that \
          does not contain it — the warning stays off the map until the user \
@@ -14884,13 +14868,13 @@ fn set_pane_zoom(h: &mut InputHarness, zoom: f64) {
 }
 
 /// The zoom the last frame's `RenderOverlay` for `kind` was keyed at.
-fn requested_render_zoom(h: &InputHarness, kind: OverlayKind) -> i32 {
+fn requested_render_zoom(h: &InputHarness, kind: &LayerId) -> i32 {
     h.last_actions()
         .iter()
         .find_map(|a| match a {
             GuiAction::RenderOverlay {
                 overlay_kind, zoom, ..
-            } if *overlay_kind == kind => Some(*zoom),
+            } if overlay_kind == kind => Some(*zoom),
             _ => None,
         })
         .expect("no RenderOverlay was emitted for this kind")
@@ -14905,7 +14889,7 @@ fn requested_render_zoom(h: &InputHarness, kind: OverlayKind) -> i32 {
 /// anything else is asking, "the overlay asked" is unobservable.
 fn settled_alert_pane(zoom: f64) -> InputHarness {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
     h.warm_up();
     let ground = h.ground_at(0, h.pane_rects()[0].center());
     ingest_alerts(
@@ -14914,7 +14898,7 @@ fn settled_alert_pane(zoom: f64) -> InputHarness {
     );
     set_pane_zoom(&mut h, zoom);
     h.warm_up();
-    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    settle_overlay_cache(&mut h, &known::NWS_ALERTS);
     // Frames until the loop actually goes idle, rather than a fixed count of
     // them. `frame_after` advances the clock, which `warm_up` does not, so
     // egui's startup fades do finish on a schedule — but they are not the only
@@ -14933,7 +14917,7 @@ fn settled_alert_pane(zoom: f64) -> InputHarness {
         h.frame_after(0.25);
     }
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "fixture: a settled cache with nothing new must ask for nothing"
     );
@@ -14948,7 +14932,7 @@ fn settled_alert_pane(zoom: f64) -> InputHarness {
 /// `notify_redraw` asks for the frame that reads it back. So a cache that is
 /// never satisfied is not a slow cache — it is a raster running at the frame
 /// rate, for ever, on no input at all.
-fn renders_until_quiet(h: &mut InputHarness, kind: OverlayKind, budget: usize) -> usize {
+fn renders_until_quiet(h: &mut InputHarness, kind: &LayerId, budget: usize) -> usize {
     for landed in 0..budget {
         h.frame();
         if rasterizes_requested(h, kind) == 0 {
@@ -14982,7 +14966,7 @@ fn every_zoom_the_map_offers_reaches_a_cache_that_is_satisfied() {
     for z in [0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 14.0, 20.0, 26.0] {
         let mut h = settled_alert_pane(7.0);
         set_pane_zoom(&mut h, z);
-        let landed = renders_until_quiet(&mut h, OverlayKind::NwsAlerts, 20);
+        let landed = renders_until_quiet(&mut h, &known::NWS_ALERTS, 20);
         assert!(
             landed < 20,
             "at zoom {z} the pane asked for a raster on every one of 20 \
@@ -15006,7 +14990,7 @@ fn zoom_gesture(h: &mut InputHarness, from: f64, step: f64, frames: usize) -> us
     for i in 1..=frames {
         set_pane_zoom(h, from + step * i as f64);
         h.frame_after(1.0 / 120.0);
-        asked += rasterizes_requested(h, OverlayKind::NwsAlerts);
+        asked += rasterizes_requested(h, &known::NWS_ALERTS);
     }
     asked
 }
@@ -15058,7 +15042,7 @@ fn a_zoom_past_the_band_re_rasterizes_while_it_moves() {
     set_pane_zoom(&mut h, Z0 + crate::overlay_cache::ZOOM_REBUILD_BAND + 0.01);
     h.frame();
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
         "a zoom past ZOOM_REBUILD_BAND left the pane on a texture more than a \
          factor of two off its own scale"
@@ -15091,7 +15075,7 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     // that misread on a phone.)
     h.frame_after(1.0 / 120.0);
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "one 120 Hz frame of stillness was called a settle; on a coalesced \
          touch stream that fires in the middle of the gesture"
@@ -15100,23 +15084,23 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     // A settle delay later, the exact render is asked for.
     h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
         "the gesture ended and nothing asked for the texture this zoom wants; \
          the overlay stays soft until something else invalidates it"
     );
     assert_eq!(
-        requested_render_zoom(&h, OverlayKind::NwsAlerts),
+        requested_render_zoom(&h, &known::NWS_ALERTS),
         crate::overlay_cache::current_quantized_zoom(stopped_at),
         "the settle render was keyed at a zoom the map is not at"
     );
 
     // Land it, and the asking stops — one settle, not a loop.
-    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    settle_overlay_cache(&mut h, &known::NWS_ALERTS);
     for frame in 0..4 {
         h.frame_after(1.0 / 120.0);
         assert_eq!(
-            rasterizes_requested(&h, OverlayKind::NwsAlerts),
+            rasterizes_requested(&h, &known::NWS_ALERTS),
             0,
             "frame {frame} after the settle landed asked for another raster; \
              the settle is a loop rather than a one-shot"
@@ -15124,7 +15108,7 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     }
     assert!(
         !h.gui_mut().panes_mut()[0]
-            .overlay_cache_mut(OverlayKind::NwsAlerts)
+            .overlay_cache_mut(&known::NWS_ALERTS)
             .zoom_is_stale(stopped_at),
         "the settle landed and the overlay is still at another zoom — this is \
          the permanent-blur failure, and it is invisible without this assertion"
@@ -15159,14 +15143,14 @@ fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
     set_pane_zoom(&mut h, Z0 + 0.2);
     h.frame_after(1.0 / 120.0);
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "fixture: a zoom inside the band must be free while it moves",
     );
     for frame in 0..4 {
         h.frame_after(1.0 / 120.0);
         assert_eq!(
-            rasterizes_requested(&h, OverlayKind::NwsAlerts),
+            rasterizes_requested(&h, &known::NWS_ALERTS),
             0,
             "frame {frame} of a coalesced pause dispatched a raster \
              mid-gesture: the settle misfire, back again",
@@ -15175,7 +15159,7 @@ fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
     set_pane_zoom(&mut h, Z0 + 0.4);
     h.frame_after(1.0 / 120.0);
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "the gesture resumed and the resume frame itself dispatched",
     );
@@ -15183,7 +15167,7 @@ fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
     // Control: an actual stop, held for the delay, settles once.
     h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
         "control: a real stop no longer settles, so the zeros above prove \
          nothing",
@@ -15211,11 +15195,11 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
     // frame the settle delay elapses on, which is the frame that would have
     // dispatched.
     h.gui_mut().panes_mut()[0]
-        .overlay_cache_mut(OverlayKind::NwsAlerts)
+        .overlay_cache_mut(&known::NWS_ALERTS)
         .render_in_flight = true;
     h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64() + 0.01);
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "fixture: an in-flight render must suppress the dispatch, or this test \
          is not about what it says"
@@ -15223,11 +15207,11 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
 
     // It lands. The settle is still owed and still asked for.
     h.gui_mut().panes_mut()[0]
-        .overlay_cache_mut(OverlayKind::NwsAlerts)
+        .overlay_cache_mut(&known::NWS_ALERTS)
         .render_in_flight = false;
     h.frame_after(1.0 / 120.0);
     assert_eq!(
-        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
         "the settle was spent on a frame that could not dispatch it, and the \
          overlay is now permanently at the wrong zoom"
@@ -15281,7 +15265,7 @@ fn classification_showing(source: Option<rustdar_radar::hca::MeltingLayerSource>
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .set_overlay_enabled(OverlayKind::Radar, true);
+        .set_overlay_enabled(known::RADAR, true);
     h.offer_product(0, RadarProduct::HydrometeorClassification, 0.5);
     h.select_product(0, RadarProduct::HydrometeorClassification);
     h.place_radar_image(
@@ -15496,7 +15480,7 @@ fn storm_relative_showing(source: Option<rustdar_radar::srv::SrvMotion>) -> Inpu
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .set_overlay_enabled(OverlayKind::Radar, true);
+        .set_overlay_enabled(known::RADAR, true);
     h.offer_product(0, RadarProduct::StormRelativeVelocity, 0.5);
     h.select_product(0, RadarProduct::StormRelativeVelocity);
     h.place_radar_image(

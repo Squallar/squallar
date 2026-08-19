@@ -35,7 +35,8 @@
 //! state remembers, and a short list still shrink-wraps.
 
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::{OverlayKind, STATUS_MARK};
+use rustdar_overlays::render::overlay_state::STATUS_MARK;
+use rustdar_source::id::LayerId;
 
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState};
@@ -105,7 +106,7 @@ const SHEET_HELPER_CAPTION: &str = "The same layer stack as on a desktop: \
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StackRowProbe {
     /// The layer this row is for.
-    pub kind: OverlayKind,
+    pub kind: LayerId,
     /// The row's click target — the **whole row**, full panel width (the M8
     /// full-row fix): clicking anywhere on it that is not one of the buttons
     /// below selects the layer in the inspector.
@@ -188,7 +189,7 @@ impl super::Gui {
         ctx: &egui::Context,
         slot: SurfaceSlot,
         pane: &mut PaneState,
-        statuses: &[(OverlayKind, Option<String>)],
+        statuses: &[(LayerId, Option<String>)],
         actions: &mut Vec<GuiAction>,
     ) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
@@ -355,7 +356,7 @@ impl super::Gui {
         is_drawer: bool,
         sheet: bool,
         pane: &mut PaneState,
-        statuses: &[(OverlayKind, Option<String>)],
+        statuses: &[(LayerId, Option<String>)],
         actions: &mut Vec<GuiAction>,
         #[cfg(test)] probe: &mut StackProbe,
     ) {
@@ -405,21 +406,22 @@ impl super::Gui {
         // A grip drag in flight is resolved after the loop, once every row's
         // rect for this frame is known — the insertion slot is a function of
         // the pointer against all of them, and the release permutes then.
-        let order: Vec<OverlayKind> = pane.draw_order.iter().rev().copied().collect();
+        let order: Vec<LayerId> = pane.draw_order.iter().rev().cloned().collect();
         let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut drag_released = false;
 
-        for &kind in order.iter() {
+        for kind in order.iter() {
             // Keyed on the layer, not the position, so a row's widget state
-            // travels with it when it is reordered.
-            ui.push_id(kind, |ui| {
+            // travels with it when it is reordered. `as_str` because the id
+            // itself is the stable identity.
+            ui.push_id(kind.as_str(), |ui| {
                 let enabled = pane.is_overlay_enabled(kind);
                 let selected =
-                    self.insp_open && self.inspector_sel == InspectorSelection::Layer(kind);
+                    self.insp_open && self.inspector_sel == InspectorSelection::Layer(kind.clone());
                 let name = self.overlays.display_name(kind).to_owned();
                 let status = statuses
                     .iter()
-                    .find(|(k, _)| *k == kind)
+                    .find(|(k, _)| k == kind)
                     .and_then(|(_, line)| line.clone());
 
                 // The whole row is the click target (the M8 full-row fix):
@@ -440,7 +442,7 @@ impl super::Gui {
                     egui::Sense::click(),
                 );
                 row_rects.push(row_rect);
-                let lifting = self.stack_drag == Some(kind);
+                let lifting = self.stack_drag.as_ref() == Some(kind);
 
                 // Hover and selection read as the whole row, in the stock
                 // theme's own selectable visuals — painted first, so the
@@ -512,7 +514,7 @@ impl super::Gui {
                     .on_hover_cursor(egui::CursorIcon::Grab)
                     .on_hover_text(format!("Drag to reorder {name}"));
                 if handle.drag_started() {
-                    self.stack_drag = Some(kind);
+                    self.stack_drag = Some(kind.clone());
                 }
                 if lifting {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -626,7 +628,7 @@ impl super::Gui {
 
                 #[cfg(test)]
                 probe.rows.push(StackRowProbe {
-                    kind,
+                    kind: kind.clone(),
                     rect: row_rect,
                     eye: eye.rect,
                     eye_on: enabled,
@@ -642,7 +644,7 @@ impl super::Gui {
                     // the list stays open beneath either way — the M3-era
                     // rule that closed the Compact drawer died with the
                     // slide-over it served.
-                    self.select_layer(kind);
+                    self.select_layer(kind.clone());
                 }
             });
         }
@@ -679,15 +681,15 @@ impl super::Gui {
     fn resolve_stack_drag(
         &mut self,
         ui: &egui::Ui,
-        order: &[OverlayKind],
+        order: &[LayerId],
         row_rects: &[egui::Rect],
         released: bool,
         pane: &mut PaneState,
     ) {
-        let Some(dragged) = self.stack_drag else {
+        let Some(dragged) = self.stack_drag.clone() else {
             return;
         };
-        let Some(from) = order.iter().position(|&kind| kind == dragged) else {
+        let Some(from) = order.iter().position(|kind| *kind == dragged) else {
             // The lifted layer left the list (a sync rewrote the order
             // mid-drag); nothing to land the drag on.
             self.stack_drag = None;
@@ -716,7 +718,7 @@ impl super::Gui {
 
         if released {
             self.stack_drag = None;
-            let mut display: Vec<OverlayKind> = order.to_vec();
+            let mut display: Vec<LayerId> = order.to_vec();
             display.remove(from);
             let insert_at = if slot > from { slot - 1 } else { slot }.min(display.len());
             display.insert(insert_at, dragged);
@@ -748,7 +750,7 @@ impl super::Gui {
         let ghost_layer =
             egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("stack_drag_ghost"));
         let painter = ui.ctx().layer_painter(ghost_layer);
-        let name = self.overlays.display_name(dragged).to_owned();
+        let name = self.overlays.display_name(&dragged).to_owned();
         let galley = painter.layout_no_wrap(
             name,
             egui::TextStyle::Body.resolve(ui.style()),

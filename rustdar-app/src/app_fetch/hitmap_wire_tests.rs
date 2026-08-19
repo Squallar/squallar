@@ -122,7 +122,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 lon,
                 comments: String::new(),
             };
-            app.gui.overlays.set_enabled(kind, true);
+            app.gui.overlays.set_enabled(&kind.id(), true);
             Box::new(StormReportsFetchResult(Ok(StormReportRound {
                 reports: vec![
                     report(StormReportKind::Tornado, 34.0, -98.2),
@@ -148,7 +148,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 satellite: GlmSatellite::GoesEast,
                 level: GlmDataLevel::Flash,
             };
-            app.gui.overlays.set_enabled(kind, true);
+            app.gui.overlays.set_enabled(&kind.id(), true);
             Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
                 flashes: vec![flash(10, 34.0, -98.2), flash(20, 36.2, -96.8)],
                 dead_feeds: Vec::new(),
@@ -180,7 +180,7 @@ fn in_flight(app: &mut crate::app::App, kind: OverlayKind) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(kind)
+        .overlay_cache_mut(&kind.id())
         .render_in_flight
 }
 
@@ -221,7 +221,7 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
         let own_label = app
             .gui
             .overlays
-            .job_codec(kind)
+            .job_codec(&kind.id())
             .expect("every texture kind owns a codec row")
             .label;
         assert_eq!(
@@ -258,7 +258,7 @@ fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
         let items = app
             .gui
             .overlays
-            .hit_items(kind)
+            .hit_items(&kind.id())
             .expect("a seeded hit-map kind captures items");
         assert_eq!(items.len(), 2, "premise: two rows seeded");
 
@@ -327,7 +327,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     let items = app
         .gui
         .overlays
-        .hit_items(OverlayKind::StormReports)
+        .hit_items(&OverlayKind::StormReports.id())
         .expect("items");
     let (width, height) = (64u32, 48u32);
     let rgba = vec![0u8; (width * height * 4) as usize];

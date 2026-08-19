@@ -58,7 +58,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(OverlayKind::RadarSites)
+        .overlay_cache_mut(&OverlayKind::RadarSites.id())
         .render_in_flight
 }
 

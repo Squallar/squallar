@@ -24,7 +24,22 @@ mod sites;
 #[cfg(test)]
 mod texture_tests;
 
+use rustdar_source::id::LayerId;
+
 use super::overlay_state::OverlayHandler;
+
+/// The default draw order, bottom to top — every registered handler's id
+/// sorted by [`OverlayHandler::draw_order_weight`]. The free-function twin of
+/// `OverlayRegistry::default_draw_order`, for the callers (fresh-pane
+/// construction, the config-absent serde default) that have no live registry
+/// in reach. Never a literal list: the weights are the one spelling of the
+/// order, and the literal-list pin in `registry_identity_tests` is what holds
+/// them to the historical `OverlayKind::all()` order.
+pub fn default_draw_order() -> Vec<LayerId> {
+    let mut handlers = create_handlers();
+    handlers.sort_by_key(|h| h.draw_order_weight());
+    handlers.iter().map(|h| h.id()).collect()
+}
 
 /// Create the default set of overlay handlers.
 pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {

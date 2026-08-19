@@ -1,6 +1,6 @@
 use chrono::NaiveDateTime;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::LayerId;
 
 /// Configuration for radar site and time selection
 #[derive(Debug, Clone)]
@@ -35,18 +35,18 @@ pub enum GuiAction {
     }, // Switch to a different radar site
     /// Fetch overlay data for the given kind (initial load when layer enabled).
     FetchOverlay {
-        kind: OverlayKind,
+        kind: LayerId,
         pane_idx: usize,
     },
     /// Re-fetch overlay data for the given kind (manual refresh).
     RefreshOverlay {
-        kind: OverlayKind,
+        kind: LayerId,
         pane_idx: usize,
     },
     /// Request a background overlay rasterization for a pane.
     RenderOverlay {
         pane_idx: usize,
-        overlay_kind: OverlayKind,
+        overlay_kind: LayerId,
         /// The *unexpanded* viewport. The renderer grows it by
         /// `texture.overdraw` — never by `OVERDRAW_FRACTION`, which the adapter
         /// may not have been able to honour.

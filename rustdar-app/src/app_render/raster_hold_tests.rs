@@ -107,7 +107,7 @@ fn on_screen(app: &crate::app::App, idx: usize) -> Option<egui::TextureId> {
     Some(
         app.gui
             .pane(idx)?
-            .overlay_cache(OverlayKind::Radar)?
+            .overlay_cache(&OverlayKind::Radar.id())?
             .current()?
             .texture
             .id(),
