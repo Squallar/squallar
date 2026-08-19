@@ -19,9 +19,11 @@
 
 use std::collections::HashSet;
 
+use rustdar_source::job::DescribedJob;
+
 use super::create_handlers;
 use crate::render::overlay_state::{
-    FetchPayload, HandlerJobInput, OverlayHandler, OverlayKind, RasterizeContext, RenderMode,
+    FetchPayload, OverlayHandler, OverlayKind, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize::{
     self, AlphaMode, ModelDataInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
@@ -57,41 +59,49 @@ fn rctx() -> RasterizeContext {
     }
 }
 
-/// Run a described input through the rasterizer its variant names — the same
-/// match `offload::execute`'s overlay arm makes — answering the kind the
-/// variant belongs to beside the raster, so a handler that described another
-/// kind's input is caught by name rather than by a wrong picture.
+/// Run a described job through the rasterizer its input type names — the
+/// same input-typed routing `offload::execute`'s overlay arm performs through
+/// the codec rows — answering the kind the input belongs to beside the
+/// raster, so a handler that described another kind's input is caught by name
+/// rather than by a wrong picture.
 fn run_described(
-    input: HandlerJobInput,
+    job: &DescribedJob,
     bounds: &GeoBounds,
     w: u32,
     h: u32,
 ) -> (OverlayKind, RasterizeOutput) {
-    match input {
-        HandlerJobInput::Alerts(input) => (
+    if let Some(input) = job.downcast_ref::<rasterize::AlertsInput>() {
+        (
             OverlayKind::NwsAlerts,
-            rasterize_nws_alerts(&input, bounds, w, h),
-        ),
-        HandlerJobInput::Outlooks(input) => (
+            rasterize_nws_alerts(input, bounds, w, h),
+        )
+    } else if let Some(input) = job.downcast_ref::<rasterize::OutlooksInput>() {
+        (
             OverlayKind::SpcOutlook,
-            rasterize_spc_outlooks(&input, bounds, w, h),
-        ),
-        HandlerJobInput::Discussions(input) => (
+            rasterize_spc_outlooks(input, bounds, w, h),
+        )
+    } else if let Some(input) = job.downcast_ref::<rasterize::DiscussionsInput>() {
+        (
             OverlayKind::SpcDiscussions,
-            rasterize_spc_discussions(&input, bounds, w, h),
-        ),
-        HandlerJobInput::Reports(input) => (
+            rasterize_spc_discussions(input, bounds, w, h),
+        )
+    } else if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
+        (
             OverlayKind::StormReports,
-            rasterize_storm_reports(&input, bounds, w, h),
-        ),
-        HandlerJobInput::Glm(input) => (
+            rasterize_storm_reports(input, bounds, w, h),
+        )
+    } else if let Some(input) = job.downcast_ref::<rasterize::GlmStrikesInput>() {
+        (
             OverlayKind::Lightning,
-            rasterize_glm_strikes(&input, bounds, w, h),
-        ),
-        HandlerJobInput::ModelData(input) => (
+            rasterize_glm_strikes(input, bounds, w, h),
+        )
+    } else if let Some(input) = job.downcast_ref::<ModelDataInput>() {
+        (
             OverlayKind::ModelData,
-            rasterize_model_data(&input, bounds, w, h),
-        ),
+            rasterize_model_data(input, bounds, w, h),
+        )
+    } else {
+        panic!("a handler described an input no handler-backed texture kind claims: {job:?}")
     }
 }
 
@@ -428,7 +438,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         let input = handler.prepare_job(&ctx).unwrap_or_else(|| {
             panic!("{kind:?} was seeded with data it should draw and answered None")
         });
-        let (named, out) = run_described(input, &BOUNDS, W, H);
+        let (named, out) = run_described(&input, &BOUNDS, W, H);
         assert_eq!(
             named, kind,
             "{kind:?}'s `prepare_job` answered another kind's input variant, \
@@ -560,7 +570,7 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
         let input = handler
             .prepare_job(&ctx)
             .expect("seeded above, and the walk next door asserts this");
-        let (_, out) = run_described(input, &BOUNDS, W, H);
+        let (_, out) = run_described(&input, &BOUNDS, W, H);
         // A pixel tells the conventions apart when it is translucent: at
         // `a == 255` the premultiply is the identity and both readings agree.
         let translucent: HashSet<u8> = drawn(&out.rgba)
@@ -753,8 +763,9 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
                     "{kind:?} grew a `prepare_job` while {state}. The \
                      described set is stated twice — here and in \
                      `spawn_overlay_render`'s match — so add the kind to the \
-                     dispatch's described arm and to the wire \
-                     (`offload::OverlayJobInput`) together.",
+                     dispatch's described arm and to the codec registry \
+                     (`render::jobs::JOB_CODECS` + its `job_codec` row) \
+                     together.",
                 );
             }
             if has_hit_map(kind) {
@@ -834,54 +845,158 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
         if !has_hit_map(kind) || !seed(handler.as_mut()) {
             continue;
         }
-        let input = handler
+        let job = handler
             .prepare_job(&ctx)
             .expect("seeded, and the agreement walk pins this");
         let items = handler.hit_items().expect("seeded");
-        match input {
-            HandlerJobInput::Reports(input) => {
-                assert_eq!(items.len(), input.reports.len(), "one item per row");
-                for (i, (row, item)) in input.reports.iter().zip(&items).enumerate() {
-                    let item = item
-                        .as_any()
-                        .downcast_ref::<super::reports::StormReportItem>()
-                        .expect("a reports handler captures report items");
-                    assert_eq!(
-                        item.index, i,
-                        "{kind:?} item {i} carries another position's index",
-                    );
-                    assert_eq!(
-                        (item.report.lat, item.report.lon),
-                        (row.lat, row.lon),
-                        "{kind:?} row {i} and item {i} are different reports — \
-                         a hover here would name the wrong one, and no \
-                         downstream test can see it because they all zip with \
-                         this very list",
-                    );
-                }
+        if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
+            assert_eq!(items.len(), input.reports.len(), "one item per row");
+            for (i, (row, item)) in input.reports.iter().zip(&items).enumerate() {
+                let item = item
+                    .as_any()
+                    .downcast_ref::<super::reports::StormReportItem>()
+                    .expect("a reports handler captures report items");
+                assert_eq!(
+                    item.index, i,
+                    "{kind:?} item {i} carries another position's index",
+                );
+                assert_eq!(
+                    (item.report.lat, item.report.lon),
+                    (row.lat, row.lon),
+                    "{kind:?} row {i} and item {i} are different reports — \
+                     a hover here would name the wrong one, and no \
+                     downstream test can see it because they all zip with \
+                     this very list",
+                );
             }
-            HandlerJobInput::Glm(input) => {
-                assert_eq!(items.len(), input.flashes.len(), "one item per row");
-                for (i, (row, item)) in input.flashes.iter().zip(&items).enumerate() {
-                    let item = item
-                        .as_any()
-                        .downcast_ref::<super::glm::GlmFlashItem>()
-                        .expect("a GLM handler captures flash items");
-                    assert_eq!(
-                        item.index, i,
-                        "{kind:?} item {i} carries another position's index",
-                    );
-                    assert_eq!(
-                        (item.flash.lat, item.flash.lon),
-                        (row.lat, row.lon),
-                        "{kind:?} row {i} and item {i} are different flashes — \
-                         a hover here would name the wrong one",
-                    );
-                }
+        } else if let Some(input) = job.downcast_ref::<rasterize::GlmStrikesInput>() {
+            assert_eq!(items.len(), input.flashes.len(), "one item per row");
+            for (i, (row, item)) in input.flashes.iter().zip(&items).enumerate() {
+                let item = item
+                    .as_any()
+                    .downcast_ref::<super::glm::GlmFlashItem>()
+                    .expect("a GLM handler captures flash items");
+                assert_eq!(
+                    item.index, i,
+                    "{kind:?} item {i} carries another position's index",
+                );
+                assert_eq!(
+                    (item.flash.lat, item.flash.lon),
+                    (row.lat, row.lon),
+                    "{kind:?} row {i} and item {i} are different flashes — \
+                     a hover here would name the wrong one",
+                );
             }
-            other => panic!("{kind:?} described {other:?}, another kind's input"),
+        } else {
+            panic!("{kind:?} described {job:?}, another kind's input");
         }
         checked += 1;
     }
     assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
+}
+
+// ── The handler ↔ codec-row pairing ──────────────────────────────────────
+
+/// **The registry pairing gate, bidirectional.** Every texture handler that
+/// rasterizes through the job boundary owns exactly one row of
+/// [`crate::render::jobs::JOB_CODECS`], each row is claimed exactly once,
+/// and no row goes unclaimed — so a handler cannot arrive without a codec
+/// and a codec cannot arrive without a handler.
+///
+/// The kind → label pairing is spelled literally rather than derived, so a
+/// *swapped* pair of registrations — two handlers each claiming the other's
+/// row, which "claimed exactly once" alone cannot see — is caught by name.
+/// `RadarSites` claims its row while its `prepare_job` stays `None` (the
+/// dispatch builds the input until M10 — the row states how the bytes cross,
+/// not who builds them); `Radar` is the one texture kind with no row at all,
+/// because its pixels come from the radar render pipeline and never cross
+/// the overlay job boundary.
+#[test]
+fn every_texture_handler_owns_exactly_one_codec_row() {
+    use crate::render::jobs::JOB_CODECS;
+
+    // Deliberately spelled out. Do not regenerate this from the registry.
+    let expected: [(OverlayKind, &str); 7] = [
+        (OverlayKind::RadarSites, "overlay/sites"),
+        (OverlayKind::NwsAlerts, "overlay/alerts"),
+        (OverlayKind::SpcOutlook, "overlay/outlooks"),
+        (OverlayKind::SpcDiscussions, "overlay/discussions"),
+        (OverlayKind::StormReports, "overlay/reports"),
+        (OverlayKind::Lightning, "overlay/glm"),
+        (OverlayKind::ModelData, "overlay/model"),
+    ];
+
+    let mut claimed: Vec<&'static str> = Vec::new();
+    for handler in create_handlers() {
+        let kind = handler.kind();
+        if handler.render_mode() != RenderMode::Texture {
+            assert!(
+                handler.job_codec().is_none(),
+                "{kind:?} is not a texture kind and has no raster to frame, \
+                 but it answers a codec row — the dispatch would label and \
+                 encode a job this kind can never describe",
+            );
+            continue;
+        }
+        if kind == OverlayKind::Radar {
+            assert!(
+                handler.job_codec().is_none(),
+                "Radar grew a codec row; its pixels come from the radar \
+                 render pipeline, never the overlay job boundary. If that \
+                 changed, decide its row story deliberately and move it into \
+                 the `expected` table above",
+            );
+            continue;
+        }
+        let row = handler.job_codec().unwrap_or_else(|| {
+            panic!(
+                "{kind:?} is a texture handler with no codec row: its \
+                 described job has no encode, decode or label, so the \
+                 dispatch cannot frame it for a worker at all",
+            )
+        });
+        let expected_label = expected
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, label)| *label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{kind:?} answers a codec row but has no line in the \
+                     `expected` table above — a new texture kind must claim \
+                     its row here, deliberately",
+                )
+            });
+        assert_eq!(
+            row.label, expected_label,
+            "{kind:?} claims the row labelled {:?} where {expected_label:?} \
+             is its own — a swapped registration frames one kind's job with \
+             another kind's codec, and the timing log lies about which layer \
+             was slow",
+            row.label,
+        );
+        assert!(
+            !claimed.contains(&row.label),
+            "{kind:?}'s row {:?} is already claimed by another handler; a \
+             row claimed twice means two kinds believe they own one wire \
+             form",
+            row.label,
+        );
+        claimed.push(row.label);
+    }
+
+    for row in JOB_CODECS {
+        assert!(
+            claimed.contains(&row.label),
+            "the row labelled {:?} is claimed by no handler: a codec with \
+             no owner is dead weight today and a mis-registration trap the \
+             day someone reuses it",
+            row.label,
+        );
+    }
+    assert_eq!(
+        claimed.len(),
+        JOB_CODECS.len(),
+        "the claimed set and the registry disagree in size even though \
+         every row is claimed — a duplicate slipped through",
+    );
 }

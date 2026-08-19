@@ -1250,7 +1250,6 @@ impl super::App {
             | OverlayKind::StormReports
             | OverlayKind::Lightning
             | OverlayKind::ModelData => {
-                use rustdar_overlays::render::overlay_state::HandlerJobInput;
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
@@ -1266,7 +1265,11 @@ impl super::App {
                     // re-reading a clock of its own.
                     now: chrono::Utc::now().naive_utc(),
                 };
-                let Some(input) = self.gui.overlays.prepare_job(kind, &rctx) else {
+                // One registry read for the three captures below — the job,
+                // the id_map and the codec row are one dispatch-moment
+                // snapshot of one handler.
+                let overlays = &self.gui.overlays;
+                let Some(job) = overlays.prepare_job(kind, &rctx) else {
                     // Nothing to render — clear in-flight. `has_data()` and
                     // `prepare_job` agree in every reachable state
                     // (`texture_tests`' permanent-wakeup guard), so this
@@ -1280,43 +1283,28 @@ impl super::App {
                 // same data in the same order — `Some` for exactly the two
                 // hit-map kinds. It never touches the wire; the deliver zips
                 // it with the reply's cells.
-                let id_map = self.gui.overlays.hit_items(kind);
-                let (label, input) = match input {
-                    HandlerJobInput::Alerts(input) => (
-                        "alerts-render",
-                        crate::offload::OverlayJobInput::Alerts(Box::new(input)),
-                    ),
-                    HandlerJobInput::Outlooks(input) => (
-                        "outlooks-render",
-                        crate::offload::OverlayJobInput::Outlooks(input),
-                    ),
-                    HandlerJobInput::Discussions(input) => (
-                        "discussions-render",
-                        crate::offload::OverlayJobInput::Discussions(input),
-                    ),
-                    HandlerJobInput::Reports(input) => (
-                        "reports-render",
-                        crate::offload::OverlayJobInput::Reports(input),
-                    ),
-                    HandlerJobInput::Glm(input) => {
-                        ("glm-render", crate::offload::OverlayJobInput::Glm(input))
-                    }
-                    HandlerJobInput::ModelData(input) => (
-                        "model-render",
-                        crate::offload::OverlayJobInput::ModelData(Box::new(input)),
-                    ),
+                let id_map = overlays.hit_items(kind);
+                // The codec row the handler registered — its label is the
+                // job's name in the timing log. Unreachable-`None` by the
+                // bidirectional pairing gate (`texture_tests::
+                // every_texture_handler_owns_exactly_one_codec_row`): a
+                // handler that answers a job answers a row.
+                let Some(row) = overlays.job_codec(kind) else {
+                    self.clear_overlay_render_marks(&pane_indices, kind);
+                    return;
                 };
-                let request = crate::offload::JobRequest::Overlay {
+                let geometry = rustdar_source::job::JobGeometry {
                     width,
                     height,
                     bounds: render_bounds,
-                    input,
+                    side_ceiling_px: 0,
                 };
+                let request = crate::offload::JobRequest::Overlay { geometry, job };
                 crate::offload::offload_job(
-                    label,
+                    row.label,
                     crate::offload::Job::Described(request),
                     Self::overlay_job_deliver(
-                        label,
+                        row.label,
                         width,
                         height,
                         id_map,
@@ -1334,6 +1322,10 @@ impl super::App {
                     ),
                 );
             }
+            // TEMPORARY until M10 (per-pane handler state): the sites handler
+            // cannot see pane.site/loading_site, so the dispatch builds
+            // SitesInput inline. Its codec row is registered like every
+            // other; only prepare_job is stubbed. Remove this arm in M10.
             OverlayKind::RadarSites => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else {
                     self.clear_overlay_render_marks(&pane_indices, kind);
@@ -1356,6 +1348,13 @@ impl super::App {
                         is_loading: target_loading.as_deref() == Some(s.name),
                     })
                     .collect();
+                // The sites row, through the same registry accessor as the
+                // handler-backed kinds — registered by the sites handler even
+                // though the input above is dispatch-built.
+                let Some(row) = self.gui.overlays.job_codec(kind) else {
+                    self.clear_overlay_render_marks(&pane_indices, kind);
+                    return;
+                };
                 // Described, not closed over: the first overlay kind whose
                 // dispatch is a `JobRequest`, which is what lets it run in the
                 // web worker instead of inline on the browser's one thread
@@ -1363,11 +1362,15 @@ impl super::App {
                 // run). On native it rides the pool's interactive lane — the
                 // same lane the closure rode — so nothing about where it runs
                 // changed there; see `offload::pool::Interactive`.
-                let request = crate::offload::JobRequest::Overlay {
+                let geometry = rustdar_source::job::JobGeometry {
                     width,
                     height,
                     bounds: render_bounds,
-                    input: crate::offload::OverlayJobInput::Sites(rasterize::SitesInput {
+                    side_ceiling_px: 0,
+                };
+                let request = crate::offload::JobRequest::Overlay {
+                    geometry,
+                    job: rustdar_source::job::DescribedJob::new(rasterize::SitesInput {
                         sites,
                         zoom: actual_zoom,
                         is_dark,
@@ -1375,10 +1378,10 @@ impl super::App {
                     }),
                 };
                 crate::offload::offload_job(
-                    "sites-render",
+                    row.label,
                     crate::offload::Job::Described(request),
                     Self::overlay_job_deliver(
-                        "sites-render",
+                        row.label,
                         width,
                         height,
                         None,

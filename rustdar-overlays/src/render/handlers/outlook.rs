@@ -8,12 +8,12 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
-    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
 /// dispatch tests seed a live registry through `apply_fetch_result`, whose
@@ -817,8 +817,14 @@ impl OverlayHandler for SpcOutlookHandler {
         // not on a data ID.
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        self.paint_input(ctx).map(HandlerJobInput::Outlooks)
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+        self.paint_input(ctx).map(DescribedJob::new)
+    }
+
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/outlooks")
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

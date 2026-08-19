@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_units::UserPreferences;
 
 use crate::fetch_policy::{
@@ -16,50 +17,6 @@ use crate::render::controls::{
 };
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::types::{OverlayFeature, OverlayLabel};
-
-/// A handler's raster **described as data** — what
-/// [`OverlayHandler::prepare_job`] answers.
-///
-/// Each variant carries the kind's own rasterizer input struct
-/// ([`crate::render::rasterize::AlertsInput`] and its siblings), captured
-/// from the handler's state at the dispatch. The frontend maps each variant
-/// onto its `offload::OverlayJobInput` twin and posts it as a
-/// `JobRequest::Overlay`, which is what lets every texture kind rasterize in
-/// the web worker instead of inline on the browser's one thread. There is no
-/// closure form beside this one any more: a raster a handler cannot describe
-/// is a raster nothing can dispatch.
-///
-/// The hit-map kinds (storm reports, lightning) are here too: their inputs
-/// carry plain rows whose **position is the hit-map id**, and the
-/// `Arc<dyn OverlayItem>` half that cannot cross a message port is captured
-/// beside the input through [`OverlayHandler::hit_items`] and zipped with the
-/// returned cells at delivery.
-#[derive(Debug, Clone, PartialEq)]
-pub enum HandlerJobInput {
-    /// NWS alerts — [`crate::render::rasterize::rasterize_nws_alerts`].
-    Alerts(crate::render::rasterize::AlertsInput),
-    /// SPC outlooks — [`crate::render::rasterize::rasterize_spc_outlooks`].
-    Outlooks(crate::render::rasterize::OutlooksInput),
-    /// SPC mesoscale discussions —
-    /// [`crate::render::rasterize::rasterize_spc_discussions`].
-    Discussions(crate::render::rasterize::DiscussionsInput),
-    /// SPC storm reports —
-    /// [`crate::render::rasterize::rasterize_storm_reports`]. The first
-    /// hit-map kind through the wire.
-    Reports(crate::render::rasterize::ReportsInput),
-    /// GLM lightning — [`crate::render::rasterize::rasterize_glm_strikes`].
-    /// Carries the page's own `now`, captured at dispatch; see
-    /// [`crate::render::rasterize::GlmStrikesInput::now`].
-    Glm(crate::render::rasterize::GlmStrikesInput),
-    /// The HRRR model grid —
-    /// [`crate::render::rasterize::rasterize_model_data`], the last kind to
-    /// gain a wire form. The handler answers the
-    /// [`Whole`](crate::render::rasterize::ModelDataInput::Whole) carry — an
-    /// `Arc` of the grid as fetched — and the frontend's encoder cuts it to
-    /// its projection window at the one place that knows the texture's
-    /// bounds; see [`crate::render::rasterize::ModelDataInput`].
-    ModelData(crate::render::rasterize::ModelDataInput),
-}
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
 /// count — see [`OverlayRegistry::status_line`].
@@ -625,6 +582,11 @@ pub trait OverlayHandler: Send {
     /// nothing to render — which is also the default, for the kinds whose
     /// pixels come from somewhere else entirely.
     ///
+    /// The answer is a [`DescribedJob`] over the kind's own rasterizer input
+    /// struct ([`crate::render::rasterize::AlertsInput`] and its siblings) —
+    /// substrate-typed, so this crate never names the frontend — and the
+    /// codec row that carries it is the one [`job_codec`] answers.
+    ///
     /// This is the **only** way a handler's raster is dispatched. The closure
     /// twin it used to agree with (`prepare_rasterize`, a boxed `FnOnce` the
     /// wasm target could only run inline on the browser's one thread) is
@@ -638,8 +600,29 @@ pub trait OverlayHandler: Send {
     /// probing this method, so a kind moved between paths is a decision made
     /// there and tested in
     /// `handlers::texture_tests::every_texture_kind_rasterizes_as_a_described_job`.
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+    ///
+    /// [`job_codec`]: OverlayHandler::job_codec
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
         let _ = ctx;
+        None
+    }
+
+    /// The codec row that encodes, decodes and runs this handler's described
+    /// job — one of [`crate::render::jobs::JOB_CODECS`] — or `None` for a
+    /// kind with no row.
+    ///
+    /// The row is this handler's whole statement of *how* its raster crosses
+    /// a message port; [`prepare_job`] states *what* crosses. The pairing is
+    /// bidirectional and pinned
+    /// (`handlers::texture_tests::every_texture_handler_owns_exactly_one_codec_row`):
+    /// every texture handler except `Radar` answers exactly one row, no row
+    /// is claimed twice, and no row goes unclaimed. `RadarSites` answers its
+    /// row here while its `prepare_job` stays `None` — the sites raster is
+    /// still described at the dispatch, which can see the pane facts the
+    /// handler cannot until per-pane handler state exists (M10).
+    ///
+    /// [`prepare_job`]: OverlayHandler::prepare_job
+    fn job_codec(&self) -> Option<&'static JobCodec> {
         None
     }
 
@@ -1218,12 +1201,14 @@ impl OverlayRegistry {
     /// [`OverlayHandler::prepare_job`] through the registry — the only way a
     /// handler's raster is reached; the closure twin this sat beside is
     /// deleted.
-    pub fn prepare_job(
-        &self,
-        kind: OverlayKind,
-        ctx: &RasterizeContext,
-    ) -> Option<HandlerJobInput> {
+    pub fn prepare_job(&self, kind: OverlayKind, ctx: &RasterizeContext) -> Option<DescribedJob> {
         self.handler(kind).and_then(|h| h.prepare_job(ctx))
+    }
+
+    /// [`OverlayHandler::job_codec`] through the registry — the codec row the
+    /// dispatch frames and labels `kind`'s described job with.
+    pub fn job_codec(&self, kind: OverlayKind) -> Option<&'static JobCodec> {
+        self.handler(kind).and_then(|h| h.job_codec())
     }
 
     /// [`OverlayHandler::hit_items`] through the registry — the page-side

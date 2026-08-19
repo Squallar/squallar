@@ -9,10 +9,11 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler, OverlayKind,
-    OverlayLegend, OverlayState, RasterizeContext, RenderMode,
+    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
+    RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
+use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// How many parameters' grids stay resident at once.
 ///
@@ -382,11 +383,15 @@ impl OverlayHandler for ModelDataHandler {
     /// where bytes must be built anyway, in the web encoder that knows the
     /// texture's bounds. The `Arc` never crosses a port; see
     /// [`rasterize::ModelDataInput`].
-    fn prepare_job(&self, _ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+    fn prepare_job(&self, _ctx: &RasterizeContext) -> Option<DescribedJob> {
         let grid = self.cached_grids.get(self.selected_param)?.clone();
-        Some(HandlerJobInput::ModelData(
-            rasterize::ModelDataInput::Whole(grid),
-        ))
+        Some(DescribedJob::new(rasterize::ModelDataInput::Whole(grid)))
+    }
+
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/model")
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

@@ -629,10 +629,10 @@ pub struct RadarSiteInfo {
 ///
 /// This is the **wire form** of the sites render. The struct exists so that a
 /// job described over a message port and a direct call cannot come to take
-/// different inputs: `rustdar_frontend::offload` carries exactly this type in
-/// its `OverlayJobInput::Sites` variant, decodes back into it, and calls the
-/// same function the direct path calls — byte-identity between the two paths
-/// is a property of the type rather than of two argument lists kept in step.
+/// different inputs: the sites codec row ([`crate::render::jobs::SitesJob`])
+/// carries exactly this type, decodes back into it, and calls the same
+/// function the direct path calls — byte-identity between the two paths is a
+/// property of the type rather than of two argument lists kept in step.
 ///
 /// The raster's own geometry — bounds, width, height — deliberately stays
 /// outside: those are shared by every overlay kind and travel once on the

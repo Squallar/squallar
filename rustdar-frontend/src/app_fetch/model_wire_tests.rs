@@ -4,8 +4,8 @@
 //!
 //! These pin the replacement from the dispatch side: the handler answers its
 //! `prepare_job` (the grid by `Arc`, so describing costs a refcount), the
-//! dispatch builds a `JobRequest::Overlay` carrying
-//! `OverlayJobInput::ModelData`, and the funnel posts it — so a browser with
+//! dispatch builds a `JobRequest::Overlay` carrying the described
+//! `ModelDataInput`, and the funnel posts it — so a browser with
 //! a worker attached rasterizes the grid across the port instead of paying
 //! the raster inline on a gesture-settle frame. What the sink serialises is
 //! the projection-window **cut** of that grid, and executing the recorded
@@ -155,22 +155,21 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
          gesture-end rasterization S5d removed",
     );
     let (_, request) = &posted[0];
-    let crate::offload::JobRequest::Overlay {
-        width,
-        height,
-        input,
-        ..
-    } = request
-    else {
+    let crate::offload::JobRequest::Overlay { geometry, job } = request else {
         panic!("the model dispatch posted a job of another kind, not JobRequest::Overlay");
     };
-    assert_eq!((*width, *height), (64, 48), "the plan's own dimensions");
-    let crate::offload::OverlayJobInput::ModelData(model) = input else {
-        panic!("the model dispatch described some other kind's input: {input:?}");
+    assert_eq!(
+        (geometry.width, geometry.height),
+        (64, 48),
+        "the plan's own dimensions"
+    );
+    let Some(model) = job.downcast_ref::<rustdar_overlays::render::rasterize::ModelDataInput>()
+    else {
+        panic!("the model dispatch described some other kind's input: {job:?}");
     };
     assert!(
         matches!(
-            &**model,
+            model,
             rustdar_overlays::render::rasterize::ModelDataInput::Whole(_)
         ),
         "the dispatch pre-cut the grid on the frame thread; the `Whole` \

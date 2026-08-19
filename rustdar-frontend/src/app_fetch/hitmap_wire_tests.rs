@@ -57,6 +57,32 @@ impl crate::offload::JobSink for RefusingPort {
 /// The id_map argument's shape, named once for the deliver-level cases below.
 type IdMap = Option<Vec<Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>>;
 
+/// The codec-row label whose input type `job` carries — the naming half the
+/// deleted `OverlayJobInput` match used to provide, restated over
+/// `downcast_ref` so a dispatch that described another kind's input is still
+/// caught by name. All seven texture inputs are listed; an input no row
+/// claims panics.
+fn described_label(job: &rustdar_source::job::DescribedJob) -> &'static str {
+    use rustdar_overlays::render::rasterize as rz;
+    if job.downcast_ref::<rz::ReportsInput>().is_some() {
+        "overlay/reports"
+    } else if job.downcast_ref::<rz::GlmStrikesInput>().is_some() {
+        "overlay/glm"
+    } else if job.downcast_ref::<rz::ModelDataInput>().is_some() {
+        "overlay/model"
+    } else if job.downcast_ref::<rz::AlertsInput>().is_some() {
+        "overlay/alerts"
+    } else if job.downcast_ref::<rz::OutlooksInput>().is_some() {
+        "overlay/outlooks"
+    } else if job.downcast_ref::<rz::DiscussionsInput>().is_some() {
+        "overlay/discussions"
+    } else if job.downcast_ref::<rz::SitesInput>().is_some() {
+        "overlay/sites"
+    } else {
+        panic!("the dispatch described an input no codec row claims: {job:?}")
+    }
+}
+
 fn a_render_request() -> super::OverlayRenderRequest {
     super::OverlayRenderRequest {
         geo_bounds: GeoBounds {
@@ -183,27 +209,23 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
              an inline gesture-end rasterization",
         );
         let (_, request) = &posted[before];
-        let crate::offload::JobRequest::Overlay {
-            width,
-            height,
-            input,
-            ..
-        } = request
-        else {
+        let crate::offload::JobRequest::Overlay { geometry, job } = request else {
             panic!("the {kind:?} dispatch posted a job of another kind, not JobRequest::Overlay");
         };
-        assert_eq!((*width, *height), (64, 48), "the plan's own dimensions");
-        let named = match input {
-            crate::offload::OverlayJobInput::Reports(_) => OverlayKind::StormReports,
-            crate::offload::OverlayJobInput::Glm(_) => OverlayKind::Lightning,
-            crate::offload::OverlayJobInput::ModelData(_) => OverlayKind::ModelData,
-            crate::offload::OverlayJobInput::Alerts(_) => OverlayKind::NwsAlerts,
-            crate::offload::OverlayJobInput::Outlooks(_) => OverlayKind::SpcOutlook,
-            crate::offload::OverlayJobInput::Discussions(_) => OverlayKind::SpcDiscussions,
-            crate::offload::OverlayJobInput::Sites(_) => OverlayKind::RadarSites,
-        };
         assert_eq!(
-            named, kind,
+            (geometry.width, geometry.height),
+            (64, 48),
+            "the plan's own dimensions"
+        );
+        let own_label = app
+            .gui
+            .overlays
+            .job_codec(kind)
+            .expect("every texture kind owns a codec row")
+            .label;
+        assert_eq!(
+            described_label(job),
+            own_label,
             "the {kind:?} dispatch described some other kind's input — the \
              worker would rasterize the wrong layer under this pane's marks",
         );
