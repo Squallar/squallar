@@ -7,7 +7,7 @@
 //! three is testable. The cascade is not *wrong* — a wasm build genuinely
 //! cannot hold what a desktop build can — but it answers the question with the
 //! only fact available at compile time, which is **which APIs exist**, not
-//! **what the machine is**. `crate::loop_pool`'s own module doc states that
+//! **what the machine is**. rustdar-frontend `loop_pool`'s own module doc states that
 //! taxonomy and the pool already obeys it; this module is that idea generalised
 //! to every budget rather than one.
 //!
@@ -57,7 +57,7 @@
 //! grid cells, then the raster side. [`demote`] walks it. A rung never crosses
 //! its bracket floor, so the worst a machine that keeps failing can reach is
 //! the configuration this build already shipped to it, and below that the 3D
-//! view retires entirely, which `volume::degrade` already latches.
+//! view retires entirely, which rustdar-frontend's `volume::degrade` already latches.
 //!
 //! # There is no browser in [`DeviceProfile`], and there must not be
 //!
@@ -72,70 +72,18 @@
 //!
 //! # Capability is a different question and is already answered
 //!
-//! *Can this device do the thing at all* is `crate::volume::probe`, which reads
+//! *Can this device do the thing at all* is rustdar-frontend's `volume::probe`, which reads
 //! four limits and two format features and returns a human-readable reason.
 //! *How much of the thing can it afford* is this module. Keeping them apart is
 //! what makes "available in one browser, absent in the other on the same box" a
 //! first-class outcome rather than a surprise.
 
 use crate::constants;
-use crate::volume::quality::{DeviceClass, GradientShading, VolumeQuality};
-use rustdar_kv::KvStore;
-
-/// Key the ladder position [`BudgetMemo::steps_back`] is persisted under.
-///
-/// Its own `KvStore` entry, beside `crate::loop_pool::LOOP_POOL_KEY` and
-/// for the identical reason: `autosave_config` writes the `UiConfig` blob on a
-/// 3 s timer behind a string compare, so a value learned in the last three
-/// seconds of a session is lost — and a session that has just lost its
-/// rendering surface may not get three more seconds. One entry holding one
-/// integer also means the blast radius of a corrupt value is one integer,
-/// rather than every setting on the next load.
-///
-/// **One key for the whole struct, not one per field.** The ladder is an
-/// ordering over subsystems and a per-field memo could not express it: three
-/// separate counts could describe a machine that had surrendered its grid
-/// without surrendering its lighting, which is a state this ladder says does
-/// not exist.
-pub const BUDGET_MEMO_KEY: &str = "budget_steps";
-
-/// What a previous session learned, read back.
-///
-/// A decimal count of rungs and nothing else, the format
-/// `crate::loop_pool::remembered` already argues for: one integer, not JSON,
-/// because a format with structure gives a corrupt entry more ways to be
-/// almost-readable. Anything unreadable is `None`, which is the same answer a
-/// first launch gets — the cost of losing it is one re-probe, and configuration
-/// is never allowed to be load-bearing.
-pub fn remembered_steps(store: Option<&dyn KvStore>) -> Option<u32> {
-    let raw = store?.load(BUDGET_MEMO_KEY)?;
-    raw.trim().parse().ok().or_else(|| {
-        log::warn!("budget memo is not a number ({raw:?}); starting this device at its ladder top");
-        None
-    })
-}
-
-/// Write what this session settled on, synchronously. See [`BUDGET_MEMO_KEY`].
-///
-/// [`KvStore::store_now`] is what makes "synchronously" true. The ordinary
-/// `store` hands the bytes to a writer thread that a dying process never gets
-/// back to, and this is called off a lost rendering surface — the moment the
-/// process is most likely to be killed. A dropped memo means the next session
-/// opens at the top rung and loses the same surface again: the ladder would
-/// never descend, which is the entire guarantee this key exists to provide. One
-/// integer costs nothing to wait for.
-pub fn remember_steps(store: Option<&dyn KvStore>, steps: u32) {
-    let Some(store) = store else {
-        return;
-    };
-    if let Err(e) = store.store_now(BUDGET_MEMO_KEY, &steps.to_string()) {
-        log::warn!("could not persist the budget ladder position: {e}");
-    }
-}
+use crate::quality::{DeviceClass, GradientShading, VolumeQuality};
 
 /// Which APIs exist. **Not** which machine this is.
 ///
-/// The distinction `crate::loop_pool`'s module doc draws: the `cfg` tells you
+/// The distinction rustdar-frontend `loop_pool`'s module doc draws: the `cfg` tells you
 /// what is callable, and the device class, discovered at runtime, tells you what
 /// the machine is. Two variants, and deliberately no third for `mobile` — a
 /// native Android build and a native desktop build have the same API surface and
@@ -153,7 +101,7 @@ pub enum Platform {
 ///
 /// `None` on every target that has no bridge to ask. Browser-side this is
 /// `matchMedia('(pointer: coarse)')` and friends, and the shortlist
-/// `crate::loop_pool`'s module doc surveys — a touchscreen laptop reports
+/// rustdar-frontend `loop_pool`'s module doc surveys — a touchscreen laptop reports
 /// *both* coarse and fine, which is the case a naive `coarse` test gets wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FormFactor {
@@ -282,10 +230,11 @@ impl Promotion {
 /// refuse an allocation is better than any guess from a device type, and
 /// honouring it is also what keeps a reopen 1:1 rather than showing a different
 /// loop length on every start. Both fields are persisted in their own
-/// `KvStore` entries, written synchronously — `crate::loop_pool::LOOP_POOL_KEY`
-/// for the pool and `crate::budget::BUDGET_MEMO_KEY` for the ladder — because a
-/// value learned by crashing the GPU is exactly the value that must not be lost
-/// to a 3 s autosave timer.
+/// `KvStore` entries, written synchronously — rustdar-frontend's
+/// `loop_pool::LOOP_POOL_KEY` for the pool and `budget_memo::BUDGET_MEMO_KEY`
+/// for the ladder (the read/write pair stayed app-side with the store) —
+/// because a value learned by crashing the GPU is exactly the value that must
+/// not be lost to a 3 s autosave timer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BudgetMemo {
     /// The loop pool this machine settled at, in bytes. `None` where nothing
@@ -420,7 +369,7 @@ impl DeviceProfile {
 /// A compile-time `[floor, ceiling]` pair for one number.
 ///
 /// The two halves are different *kinds* of statement and the asymmetry is the
-/// whole design, exactly as `crate::loop_pool::LoopPoolLimits`' doc puts it:
+/// whole design, exactly as rustdar-frontend `loop_pool::LoopPoolLimits`' doc puts it:
 ///
 /// * **floor** — a decision. The worst device this build is willing to work on,
 ///   never crossed downward whatever happens. It is what the wasm `cargo check`
@@ -611,6 +560,17 @@ impl QualityBracket {
     }
 }
 
+/// Maximum number of panes on desktop.
+///
+/// Moved down from `rustdar_egui::pane` at WO-RD: the caps are device-class
+/// policy numbers, [`Budgets::max_panes`] is a public field of the resolver's
+/// output, and the UI reads them from the floor rather than the floor
+/// depending on the UI.
+pub const MAX_PANES_DESKTOP: usize = 6;
+
+/// Maximum number of panes on mobile. See [`MAX_PANES_DESKTOP`].
+pub const MAX_PANES_MOBILE: usize = 4;
+
 /// The compile-time brackets this build resolves inside.
 ///
 /// **This is all `mobile` still does.** It no longer selects nineteen budgets;
@@ -668,10 +628,12 @@ pub struct BudgetLimits {
     /// `volume::quality::PLATFORM_CEILING`. See [`QualityBracket`] for why
     /// every shipped arm of this one is pinned.
     pub quality_ceiling: QualityBracket,
-    /// `rustdar_egui::pane`'s pane cap for this class. Not a `cfg` cascade over
-    /// there — it is chosen at runtime by width class — and it is carried here
-    /// because it is the other half of the multiplication the whole-application
-    /// ceiling makes, and the two halves live in different crates.
+    /// [`MAX_PANES_DESKTOP`] / [`MAX_PANES_MOBILE`] — the pane cap for this
+    /// class. Not a `cfg` cascade — the UI narrows at runtime by width class —
+    /// and the caps live beside these tables (moved down from
+    /// `rustdar_egui::pane` at WO-RD) because they are the other half of the
+    /// multiplication the whole-application ceiling makes, and the two halves
+    /// must not live in different crates.
     pub max_panes: Bracket,
     /// `constants::APP_TEXTURE_BUDGET_BYTES`.
     ///
@@ -756,8 +718,8 @@ impl BudgetLimits {
         offscreen_bytes: Bracket::pinned(constants::WASM_VOLUME_OFFSCREEN_BUDGET_BYTES),
         mirror_bytes: Bracket::pinned(constants::WASM_VOLUME_MIRROR_BYTES_MAX),
         render_cache_entries: Bracket::pinned(constants::NON_MOBILE_MAX_RENDER_CACHE_ENTRIES),
-        quality_ceiling: QualityBracket::pinned(crate::volume::quality::WASM_PLATFORM_CEILING),
-        max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_DESKTOP),
+        quality_ceiling: QualityBracket::pinned(crate::quality::WASM_PLATFORM_CEILING),
+        max_panes: Bracket::pinned(MAX_PANES_DESKTOP),
         app_texture_ceiling_bytes: Bracket::pinned(constants::WASM_APP_TEXTURE_BUDGET_BYTES),
         raster_side_ceiling_px: constants::WASM_RASTER_SIDE_CEILING,
     };
@@ -794,8 +756,8 @@ impl BudgetLimits {
         offscreen_bytes: Bracket::pinned(constants::MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES),
         mirror_bytes: Bracket::pinned(constants::MOBILE_VOLUME_MIRROR_BYTES_MAX),
         render_cache_entries: Bracket::pinned(constants::MOBILE_MAX_RENDER_CACHE_ENTRIES),
-        quality_ceiling: QualityBracket::pinned(crate::volume::quality::MOBILE_PLATFORM_CEILING),
-        max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_MOBILE),
+        quality_ceiling: QualityBracket::pinned(crate::quality::MOBILE_PLATFORM_CEILING),
+        max_panes: Bracket::pinned(MAX_PANES_MOBILE),
         app_texture_ceiling_bytes: Bracket::pinned(constants::MOBILE_APP_TEXTURE_BUDGET_BYTES),
         raster_side_ceiling_px: constants::MOBILE_RASTER_SIDE_CEILING,
     };
@@ -851,8 +813,8 @@ impl BudgetLimits {
         ),
         mirror_bytes: Bracket::pinned(constants::DESKTOP_VOLUME_MIRROR_BYTES_MAX),
         render_cache_entries: Bracket::pinned(constants::NON_MOBILE_MAX_RENDER_CACHE_ENTRIES),
-        quality_ceiling: QualityBracket::pinned(crate::volume::quality::DESKTOP_PLATFORM_CEILING),
-        max_panes: Bracket::pinned(rustdar_egui::pane::MAX_PANES_DESKTOP),
+        quality_ceiling: QualityBracket::pinned(crate::quality::DESKTOP_PLATFORM_CEILING),
+        max_panes: Bracket::pinned(MAX_PANES_DESKTOP),
         // The one bracket that moves *because another one did*. See
         // `Self::app_texture_ceiling_bytes` — both rungs are named constants
         // argued in bytes, neither is measured off the device, so the snugness
@@ -900,7 +862,7 @@ impl BudgetLimits {
 ///
 /// Immutable, resolved once, threaded from the constructor. No global, no
 /// `OnceLock`, no `thread_local` — a global would be untestable across the
-/// matrix, and `volume::quality::select`, `LoopPool::for_device` and
+/// matrix, and [`crate::quality::select`], `LoopPool::for_device` and
 /// `MirrorLimits::for_device` already prove the argument-passing style scales,
 /// each taking its limits as a parameter *specifically* so that all arms are
 /// reachable from one host test run.
@@ -1157,18 +1119,6 @@ impl Budgets {
         )
     }
 
-    /// Bytes one resident voxel grid costs the device: every mip level it is
-    /// laid out with, its colour table's own texture, and the jitter tile
-    /// beside it. Read from `volume::raymarch::resident_grid_bytes` rather than
-    /// recomputed, so the budget is checked against the arithmetic the upload
-    /// path allocates by.
-    ///
-    /// `None` only where the shape overflows a `usize`, which no shipped or
-    /// synthetic bracket does.
-    pub fn volume_bytes(&self) -> Option<usize> {
-        crate::volume::raymarch::resident_grid_bytes(self.grid_cells)
-    }
-
     /// The grid shape to **request** on a device whose 3D textures may be
     /// `max_axis` on a side.
     ///
@@ -1186,7 +1136,7 @@ impl Budgets {
     /// * the loop pool at its **ceiling** — one term, not `panes ×` a per-pane
     ///   figure, because the pool is divided among the loops that want one and
     ///   a 3D loop takes one share per *volume* rather than per pane;
-    /// * the volume store's **floor**, which `App::setup_egui_frame` applies
+    /// * the volume store's **floor**, which rustdar-frontend's `App::setup_egui_frame` applies
     ///   with `.max(...)` *outside* the pool, so a screen with no 3D loop at all
     ///   spends the whole pool on raster frames and still leaves the store
     ///   floored;
@@ -1207,7 +1157,7 @@ impl Budgets {
 ///
 /// **A pure function, with no `cfg!` in its body and no globals**, which is what
 /// makes the whole matrix testable without a GPU — the property
-/// `volume::quality::select`, `LoopPool::for_device` and
+/// [`crate::quality::select`], `LoopPool::for_device` and
 /// `MirrorLimits::for_device` each already have for one number and this has for
 /// all of them at once.
 ///
@@ -1321,7 +1271,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
 ///
 /// # Only the first rungs are reachable, and that is by design
 ///
-/// `volume::degrade` retires the 3D view after **two** surface losses. So a
+/// rustdar-frontend's `volume::degrade` retires the 3D view after **two** surface losses. So a
 /// machine walking this ladder gets one rung, then a second, then loses 3D
 /// entirely — the floor the plan names. The later rungs exist so the ordering
 /// is stated and testable, not because a session will spend them.

@@ -179,10 +179,10 @@ jobs:
       # The gating run. `-D warnings` goes here and not on the `--fix` step, so
       # the bot still autofixes what it can and the build fails only on the rest.
       #
-      # This is what makes `unexpected_cfgs` load-bearing: a `rustdar-frontend`
-      # build script that stopped emitting the `mobile` cfg produced warnings
-      # nobody failed on, and Android and iOS silently took desktop memory
-      # budgets.
+      # This is what makes `unexpected_cfgs` load-bearing: a
+      # `rustdar-device-profile` build script that stopped emitting the
+      # `mobile` cfg produced warnings nobody failed on, and Android and iOS
+      # silently took desktop memory budgets.
       #
       # `--all-features` enables `rustdar-android/jni-typecheck`, so this lints
       # the JNI layer -- invisible to Clippy until that feature existed.

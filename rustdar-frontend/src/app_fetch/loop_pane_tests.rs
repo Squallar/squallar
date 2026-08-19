@@ -92,7 +92,7 @@ fn allocation() -> crate::loop_pool::LoopAllocation {
 
 /// This build's resolved budgets, which is where the raster frame cap now comes
 /// from. Named beside [`allocation`] because `loop_frames_held` reads both.
-fn budgets() -> crate::budget::Budgets {
+fn budgets() -> rustdar_device_profile::budget::Budgets {
     crate::app::render::test_budgets()
 }
 

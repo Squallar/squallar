@@ -344,7 +344,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          the stronger property's test in the same sentence.",
     ),
     (
-        "rustdar-frontend/src/constants/tests.rs",
+        "rustdar-device-profile/src/constants/tests.rs",
         "an_axis_outside_the_guarantee_is_refused",
         "\"used to assert with a literal 257\", in the doc explaining why the \
          device guarantee moved to the crate that meets a device. The \

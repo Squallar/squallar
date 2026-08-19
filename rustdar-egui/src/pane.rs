@@ -1,5 +1,8 @@
 use crate::overlay_cache::OverlayTextureCache;
 use chrono::NaiveDateTime;
+// The pane caps are device-class policy and live on the floor since WO-RD;
+// this module's clamp and the width classes narrow inside them.
+use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::hover::HoverSource;
 use rustdar_radar::sites::RadarSite;
@@ -2567,12 +2570,6 @@ impl Default for PaneState {
         Self::new()
     }
 }
-
-/// Maximum number of panes on desktop.
-pub const MAX_PANES_DESKTOP: usize = 6;
-
-/// Maximum number of panes on mobile.
-pub const MAX_PANES_MOBILE: usize = 4;
 
 /// Defines how panes are arranged in a grid layout.
 pub struct PaneLayout {

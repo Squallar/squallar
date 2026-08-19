@@ -71,7 +71,7 @@ pub use crate::staging_ring::{STAGING_RING_DEPTH, STAGING_RING_FEATURE};
 /// not check them.
 ///
 /// It is host memory either way, so it is outside the GPU budget
-/// `crate::constants::APP_TEXTURE_BUDGET_BYTES` states, exactly as the widening
+/// `rustdar_device_profile::constants::APP_TEXTURE_BUDGET_BYTES` states, exactly as the widening
 /// buffer is.
 pub struct VolumeStaging {
     /// The host-side buffer the fallback widens into. See
@@ -331,9 +331,9 @@ mod tests {
     #[test]
     fn the_shipped_grid_shapes_need_no_row_padding_and_the_odd_ones_do() {
         let budgets = [
-            crate::constants::WASM_VOLUME_GRID_CELLS,
-            crate::constants::MOBILE_VOLUME_GRID_CELLS,
-            crate::constants::DESKTOP_VOLUME_GRID_CELLS,
+            rustdar_device_profile::constants::WASM_VOLUME_GRID_CELLS,
+            rustdar_device_profile::constants::MOBILE_VOLUME_GRID_CELLS,
+            rustdar_device_profile::constants::DESKTOP_VOLUME_GRID_CELLS,
         ];
         let derived = budgets.into_iter().flat_map(|budget| {
             [256usize, 512, 704, 1024, 2048].map(|limit| {
@@ -648,7 +648,7 @@ mod tests {
             return;
         }
 
-        let cells = crate::constants::DESKTOP_VOLUME_GRID_CELLS;
+        let cells = rustdar_device_profile::constants::DESKTOP_VOLUME_GRID_CELLS;
         let plane = PlaneLayout::of(cells).expect("the desktop rung").bytes as usize;
         let count = (cells[0] as usize) * (cells[1] as usize) * (cells[2] as usize);
         let indices = vec![7u8; count];

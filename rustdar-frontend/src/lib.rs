@@ -24,11 +24,14 @@ pub type WindowRef = Arc<Window>;
 
 pub mod app;
 pub mod app_state;
-pub mod budget;
+/// Shared per-arm fixtures for the budget agreement tests that stayed
+/// app-side when the cascades moved down to rustdar-device-profile (WO-RD).
+#[cfg(test)]
+pub(crate) mod budget_arms;
+pub mod budget_memo;
 pub mod channels;
 pub mod chunk_feed;
 pub mod chunk_notify;
-pub mod constants;
 pub mod egui_renderer;
 pub mod input;
 /// The composed job-codec registry — the one module that names the source
@@ -39,10 +42,6 @@ pub mod location_hint;
 pub mod location_permission;
 pub mod loop_downloads;
 pub mod loop_pool;
-/// The rule behind the `mobile` cfg. Compiled only for tests — the production
-/// copy is `include!`d by `build.rs`, which runs before this crate exists.
-#[cfg(test)]
-mod mobile_cfg;
 pub mod offload;
 pub mod platform;
 /// The [`PlatformBridge`](platform::PlatformBridge) test double. Compiled only

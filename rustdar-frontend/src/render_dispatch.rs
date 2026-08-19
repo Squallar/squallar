@@ -8,8 +8,8 @@ use rustdar_radar::srm::StormMotionSample;
 use rustdar_radar::types::{RadarProduct, RenderView};
 
 use crate::WindowRef;
-use crate::budget::Budgets;
 use crate::channels::RenderResponse;
+use rustdar_device_profile::budget::Budgets;
 
 /// Drop guard that decrements an AtomicUsize counter on drop.
 /// Guarantees the counter is decremented even if the thread panics.
@@ -878,7 +878,8 @@ impl SectionInputKey {
 /// the pane stays blank for good. `None` instead routes a malformed buffer down
 /// the "no matching sweep" path the dispatcher already retires cleanly.
 fn plan_view_image(rgba: &[u8]) -> Option<egui::ColorImage> {
-    let Some(side) = crate::constants::raster_side_from_rgba_len(rgba.len()) else {
+    let Some(side) = rustdar_device_profile::constants::raster_side_from_rgba_len(rgba.len())
+    else {
         log::error!(
             "a radar render produced {} bytes, which is no raster size this build makes",
             rgba.len(),
@@ -905,8 +906,8 @@ impl RenderDispatcher {
     /// application takes the other one, so the two numbers this struct spends
     /// arrive from the same resolved `Budgets` everything else reads.
     pub fn new() -> Self {
-        Self::with_budgets(&crate::budget::resolve(
-            &crate::budget::DeviceProfile::for_target(),
+        Self::with_budgets(&rustdar_device_profile::budget::resolve(
+            &rustdar_device_profile::budget::DeviceProfile::for_target(),
         ))
     }
 

@@ -152,9 +152,11 @@ fn start() -> Pool {
     // Resolved here rather than handed in because this pool is a process
     // singleton reached from any thread, and `resolve` is a pure function of a
     // profile every caller would have to build identically anyway.
-    let threads = crate::budget::resolve(&crate::budget::DeviceProfile::for_target())
-        .concurrent_renders
-        .max(1);
+    let threads = rustdar_device_profile::budget::resolve(
+        &rustdar_device_profile::budget::DeviceProfile::for_target(),
+    )
+    .concurrent_renders
+    .max(1);
 
     let (described, described_rx) = mpsc::channel();
     lane("rd-job", threads, described_rx, |(id, request)| {

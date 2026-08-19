@@ -98,10 +98,10 @@ use rustdar_radar::voxel::VoxelGrid;
 
 use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VolumeSupport;
-use crate::volume::quality::VolumeQuality;
 use crate::volume::raymarch::staging::VolumeStaging;
 use crate::volume::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
 use crate::volume::uniform::VolumeUniform;
+use rustdar_device_profile::quality::VolumeQuality;
 
 /// The fewest see-through entries a grid's table may have, anywhere on its
 /// ramp, before this renderer refuses to draw a volume through it.
@@ -502,7 +502,7 @@ impl StoredVolume {
     /// path's descriptors actually reserve — rather than from a
     /// per-target constant, because the eviction has to measure what is
     /// actually resident, and a runtime step-down can hand the store a grid
-    /// smaller than [`crate::constants::VOLUME_GRID_CELLS`].
+    /// smaller than [`rustdar_device_profile::constants::VOLUME_GRID_CELLS`].
     ///
     /// A shape whose product overflows a `usize` reports 0 rather than
     /// panicking in the paint path. It cannot happen — the shapes are
@@ -1691,12 +1691,12 @@ fn floor_lanes(
 /// desktop cell budget at four bytes a cell, and then the whole mip pyramid a
 /// coarse level buys — see `volume::raymarch::grid_bytes_at`), 15.5 MiB on
 /// mobile and 4.58 MiB on wasm. At `MAX_PANES_DESKTOP` = 6 that is 219 MiB of
-/// backdrop — 38% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
+/// backdrop — 38% of [`rustdar_device_profile::constants::LOOP_POOL_FLOOR_BYTES`]
 /// (576 MiB desktop), which is also `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, so it
 /// comes straight out of what a 3D loop may hold: six of the fourteen grids
 /// that floor buys, gone. On wasm the floor is 56 MiB and four panes of
 /// backdrop are 18 MiB of it, 33%. Against
-/// [`crate::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 288
+/// [`rustdar_device_profile::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 288
 /// MiB wasm) it would look affordable, and that is exactly the reading to
 /// distrust: `enforce_budget` evicts oldest-first, so what a permanent
 /// per-pane resident actually displaces is a *live* loop's frames.
@@ -2021,7 +2021,7 @@ pub struct VolumeResources {
     /// one likely to open another, and the whole point is that the pages are
     /// bought once. `VolumePipelines::upload_volume_at` has the measurement.
     /// It is host memory and so is outside the GPU budget
-    /// `crate::constants::APP_TEXTURE_BUDGET_BYTES` states — `resident_bytes`
+    /// `rustdar_device_profile::constants::APP_TEXTURE_BUDGET_BYTES` states — `resident_bytes`
     /// below counts device textures and deliberately does not count this.
     staging: VolumeStaging,
 }
@@ -2211,7 +2211,7 @@ impl VolumeResources {
             .targets
             .values()
             .flatten()
-            .map(|target| crate::volume::quality::offscreen_bytes(target.size()))
+            .map(|target| rustdar_device_profile::quality::offscreen_bytes(target.size()))
             .sum();
         let uploads: usize = self
             .uploads

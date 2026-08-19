@@ -1379,3 +1379,397 @@ fn entry_point_body(name: &str) -> &'static str {
     }
     panic!("`{name}`'s body is not brace-balanced")
 }
+
+/// The budget-agreement proofs that bridge to this module's arithmetic —
+/// moved here from the floor crate's `constants::tests` at WO-RD. The
+/// resolver lives below the raymarch and must not call up into it, so every
+/// byte proof that reads [`resident_grid_bytes`]/[`grid_bytes_with_mips`]
+/// lives beside the arithmetic instead. They ride to rustdar-volumetric with
+/// this module at WO-RV.
+mod budget_agreement {
+    use crate::budget_arms::{SHIPPED_VOLUME_LOOP_FRAMES, arms, volume_bytes};
+    use egui_wgpu::wgpu;
+    use rustdar_device_profile::constants::{
+        DESKTOP_VOLUME_GRID_CELLS, MOBILE_VOLUME_GRID_CELLS, VOLUME_LUT_BYTES,
+        WASM_VOLUME_GRID_CELLS,
+    };
+
+    /// The limits a real adapter might report, which every sweep below runs.
+    ///
+    /// The guarantee, the two powers of two either side of it, the 704 an
+    /// unaligned reading of the desktop budget lands on, and a modern desktop's
+    /// own figure.
+    const REPORTED_LIMITS: [u32; 5] = [256, 512, 704, 1024, 2048];
+
+    /// The three budget triples, whatever this target's cascade selected.
+    const ALL_ARMS: [(&str, [u32; 3]); 3] = [
+        ("wasm", WASM_VOLUME_GRID_CELLS),
+        ("mobile", MOBILE_VOLUME_GRID_CELLS),
+        ("desktop", DESKTOP_VOLUME_GRID_CELLS),
+    ];
+
+    /// A cell triple as a `VoxelShape`, axis order x, y, z — the frontend
+    /// mirror of the floor crate's private `constants::shape_of`, restated
+    /// because a private const fn does not cross a crate boundary.
+    const fn shape_of(cells: [u32; 3]) -> rustdar_radar::voxel::VoxelShape {
+        rustdar_radar::voxel::VoxelShape {
+            nx: cells[0] as usize,
+            ny: cells[1] as usize,
+            nz: cells[2] as usize,
+        }
+    }
+
+    /// The **3D volume** row of the loop table, executed.
+    ///
+    /// The third loop kind, and the one whose frames are resident inputs rather
+    /// than cached pictures — so this is a claim about GPU texture memory that is
+    /// actually enforced at runtime by `VolumeStore::enforce_budget`, unlike the
+    /// two rows above.
+    #[test]
+    fn volume_loop_grids_fit_the_application_texture_budget() {
+        for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
+            let total = frames * volume_bytes(&arm);
+            assert!(
+                total <= arm.volume_loop_bytes(),
+                "{}: {} resident grids x {} B = {:.1} MiB, over the {} MiB budget",
+                arm.name,
+                frames,
+                volume_bytes(&arm),
+                total as f64 / (1024.0 * 1024.0),
+                arm.volume_loop_bytes() / (1024 * 1024),
+            );
+        }
+    }
+
+    /// **A full 3D loop leaves room for one live 3D grid beside it.**
+    ///
+    /// Fitting the set alone is not enough, and the ~1.5% of headroom desktop had
+    /// under it was not slack — it was a defect one ordinary layout away. A second
+    /// 3D pane showing a live volume is one more grid in the same
+    /// application-wide store, and `VolumeStore::enforce_budget` evicts **oldest
+    /// first**: the loop started first, so what goes is the loop's frame 0, not
+    /// the live grid that pushed the store over. The dispatcher then re-plans that
+    /// frame on the very next pass, rebuilds it (a frame-thread extraction and an
+    /// ~89 ms worker resample), and the store evicts frame 1 to make room. That is
+    /// a permanent rebuild treadmill with a hot CPU and a loop visibly missing a
+    /// frame as its only symptoms.
+    ///
+    /// So the frame count is chosen against `budget − one grid`, which
+    /// `the_3d_loop_holds_exactly_what_it_marches` computes. This is the same
+    /// claim stated as the property rather than as the formula, because it is the
+    /// property that is load-bearing: the formula could be changed to agree with a
+    /// wrong count and this would still fail.
+    ///
+    /// It bounds the *reachable* layouts rather than every conceivable one — a
+    /// third distinct live grid is over the line again, and the eviction's answer
+    /// there is the same. What it buys is that the common two-pane case never
+    /// reaches the eviction at all.
+    #[test]
+    fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
+        for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
+            let resident = frames * volume_bytes(&arm);
+            assert!(
+                resident + volume_bytes(&arm) <= arm.volume_loop_bytes(),
+                "{}: {} resident grids + one live grid = {:.1} MiB against a {} MiB \
+                 budget, so a 3D loop beside a live 3D pane makes the store evict \
+                 the loop's own oldest frame and rebuild it for ever",
+                arm.name,
+                frames,
+                (resident + volume_bytes(&arm)) as f64 / (1024.0 * 1024.0),
+                arm.volume_loop_bytes() / (1024 * 1024),
+            );
+        }
+    }
+
+    /// A 3D loop holds exactly what it marches: the frame list **is** the resident
+    /// set.
+    ///
+    /// The other two loop kinds hold `MAX_LOOP_FRAMES` and texture
+    /// `MAX_LOOP_RENDER_BUDGET` of them, re-rendering as the playhead walks back
+    /// into a window it had left. Re-entering a resident 3D window costs ~140 ms
+    /// against a 200 ms interval at `DEFAULT_LOOP_SPEED_FPS` and 33 ms at
+    /// `MAX_LOOP_SPEED_FPS`, so that treadmill does not close here.
+    ///
+    /// What this pins is that a 3D loop's count is *one* number rather than a held
+    /// count and a resident count that could drift apart — and that it is at or
+    /// under the budget the arm above just checked, with no second number in
+    /// between. The dispatcher reads `LoopAllocation::volume_frames` for both, and
+    /// `app_render::volume_loop_tests` drives it end to end.
+    #[test]
+    fn the_3d_loop_holds_exactly_what_it_marches() {
+        for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
+            assert!(frames >= 2, "{}: a one-frame loop is not a loop", arm.name,);
+            // The frame count is the tighter of two bounds, computed rather than
+            // restated, and it is an *equality* — a list shorter than both bounds
+            // allow is history thrown away for nothing, and a longer one is the
+            // treadmill this loop kind cannot afford.
+            //
+            //  * what the byte budget admits **beside one live grid**, which binds
+            //    desktop (14 of the 36 frames a plan-view loop may texture). The
+            //    subtracted grid is not padding: see
+            //    `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` for the
+            //    layout it is there for and what happens without it.
+            //  * `MAX_LOOP_RENDER_BUDGET`, which binds wasm32 and mobile — a 3D
+            //    loop is not licensed to hold *more* history than the plan-view
+            //    loop beside it on the same device just because its grids happen
+            //    to be small there.
+            let admits =
+                arm.volume_loop_bytes().saturating_sub(volume_bytes(&arm)) / volume_bytes(&arm);
+            assert_eq!(
+                frames,
+                admits.min(arm.loop_render_budget),
+                "{}: the budget admits {admits} grids and the loop render budget is \
+                 {}, so the frame list should be their minimum, not {}",
+                arm.name,
+                arm.loop_render_budget,
+                frames,
+            );
+        }
+    }
+
+    /// Every arm is held to its own volume budget, exactly as
+    /// `one_loop_at_the_floor_gets_the_whole_span_budget` holds it to its
+    /// loop budget.
+    #[test]
+    fn the_volume_grid_fits_the_target_texture_budget() {
+        for arm in arms() {
+            let total = volume_bytes(&arm);
+            assert!(
+                total <= arm.volume_texture_bytes,
+                "{}: a {:?} grid plus a {VOLUME_LUT_BYTES} B table is {total} B, \
+                     over the {} B budget",
+                arm.name,
+                arm.grid_cells,
+                arm.volume_texture_bytes,
+            );
+        }
+    }
+
+    /// The sibling of `the_budget_is_not_slack_enough_to_hide_a_doubling`, and for
+    /// the same reason: a ceiling several times the real figure passes the check
+    /// above while permitting any axis to be silently doubled.
+    ///
+    /// Doubling one axis is the realistic regression here, not doubling the whole
+    /// grid — and it is exactly what this catches, because doubling any single
+    /// axis doubles the total.
+    ///
+    /// **What it no longer covers, since the grid's shape became a runtime
+    /// answer.** `arm.grid_cells` is the *budget* triple now, not the shape the frontend
+    /// requests, so this is a claim about two constants: that the ceiling is snug
+    /// against the budget. It is still worth making — a loose ceiling is how a term
+    /// inside it doubles unnoticed — but the tripwire half, the one that would have
+    /// caught the Android build asking for 2.4× what it budgeted, has moved to
+    /// [`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`],
+    /// which sweeps what a device is actually asked for against what its arm was
+    /// sized at. Neither is redundant: this one binds the ceiling to the budget,
+    /// that one binds the request to the budget.
+    #[test]
+    fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
+        for arm in arms() {
+            let total = volume_bytes(&arm);
+            assert!(
+                total * 2 > arm.volume_texture_bytes,
+                "{}: budget {} B is more than twice the actual {total} B — it \
+                     would not catch a doubled grid axis",
+                arm.name,
+                arm.volume_texture_bytes,
+            );
+        }
+    }
+
+    /// **The shape the frontend requests never costs more than the budget it was
+    /// computed against — on any device.**
+    ///
+    /// # What this replaces, and why it is stronger
+    ///
+    /// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` asserted that
+    /// each arm's ceiling was under twice what it bounds, so a silently doubled
+    /// grid axis could not hide inside the headroom. That test is the tripwire for
+    /// the shipped Android overrun — a build budgeting 192×192×96 while the radar
+    /// was asked for 256×256×128, 2.4× over — and it went **vacuous** the moment
+    /// the shape stopped being a constant: it compares two constants, and the thing
+    /// that can now be wrong is a *function of the device*.
+    ///
+    /// So it is re-expressed rather than deleted, against the property the whole
+    /// rebalance rests on: rearranging a budget's cells is free because there are
+    /// never more of them. For every arm and every limit an adapter might report,
+    /// what is requested must fit the budget every allocation was sized against —
+    /// in cells, and in the bytes those cells actually cost with the coarse level
+    /// beside them. That is stronger than the doubling test in two directions: it
+    /// catches any overrun rather than only a factor of two, and it catches one
+    /// that only appears on some devices.
+    #[test]
+    fn the_requested_shape_never_outgrows_the_budget_it_was_computed_against() {
+        for (name, budget) in ALL_ARMS {
+            let budget_cells = budget.iter().map(|&n| n as usize).product::<usize>();
+            let budget_bytes = crate::volume::raymarch::grid_bytes_with_mips(budget)
+                .expect("a shipped budget cannot overflow");
+            for limit in REPORTED_LIMITS {
+                let shape =
+                    rustdar_radar::voxel::shape_for_budget(shape_of(budget), limit as usize);
+                let cells = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
+                assert!(
+                    shape.cells() <= budget_cells,
+                    "{name} on a {limit}-reporting device: {cells:?} is {} cells \
+                     against the {budget_cells} this target budgeted for",
+                    shape.cells(),
+                );
+                let bytes = crate::volume::raymarch::grid_bytes_with_mips(cells)
+                    .expect("a derived shape cannot overflow");
+                assert!(
+                    bytes <= budget_bytes,
+                    "{name} on a {limit}-reporting device: {cells:?} costs \
+                     {bytes} B of texture against the {budget_bytes} B \
+                     {budget:?} was budgeted at",
+                );
+            }
+        }
+    }
+
+    /// `voxel::HORIZONTAL_AXIS_MULTIPLE` is the copy alignment expressed in cells,
+    /// and this is the only crate that can say so.
+    ///
+    /// `rustdar-radar` rounds the grid's horizontal axis to 64 and documents why —
+    /// `copy_buffer_to_texture` holds every row to
+    /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`, and the staging ring's `PlaneLayout`
+    /// pads to it — but it has no `wgpu` to check the arithmetic against. This is
+    /// the binding, in the shape `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
+    /// already uses for the triples: a number in two crates, tied by name so a
+    /// drift fails here rather than as 6% of a permanently resident staging ring
+    /// spent on padding.
+    #[test]
+    fn the_horizontal_axis_multiple_is_the_copy_alignment_in_cells() {
+        assert_eq!(
+            rustdar_radar::voxel::HORIZONTAL_AXIS_MULTIPLE,
+            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
+                / crate::volume::raymarch::GRID_BYTES_PER_CELL as usize,
+        );
+        // And that the two it is a quotient of are what the doc says, so a change
+        // to either fails by name rather than by cancelling out.
+        assert_eq!(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 256);
+        assert_eq!(crate::volume::raymarch::GRID_BYTES_PER_CELL, 4);
+    }
+
+    /// `voxel::VERTICAL_AXIS_MULTIPLE` is the depth block a 3D texture is laid out
+    /// in, and this is the only crate that can say so.
+    ///
+    /// The twin of the test above, and tied the same way: `rustdar-radar` rounds
+    /// the vertical down to 16 and documents why, but it has no texture arithmetic
+    /// to check itself against. The binding is deliberately made against the
+    /// *charging function* rather than against a second constant — what has to
+    /// stay true is that a vertical on the multiple costs what it asks for and one
+    /// off it costs a whole block more, which is a property a renamed or retuned
+    /// tile constant cannot quietly satisfy.
+    #[test]
+    fn the_vertical_axis_multiple_is_the_texture_depth_block() {
+        use crate::volume::raymarch::{CoarseLevel, grid_bytes, grid_bytes_at};
+        let multiple = rustdar_radar::voxel::VERTICAL_AXIS_MULTIPLE;
+        // One level, so this is mip 0's own layout with nothing else folded in.
+        let padding = |nz: usize| {
+            let cells = [320, 320, nz as u32];
+            grid_bytes_at(cells, CoarseLevel::Omitted).expect("a swept shape fits")
+                - grid_bytes(cells).expect("a swept shape fits")
+        };
+        let block =
+            320 * 320 * (multiple - 1) * crate::volume::raymarch::GRID_BYTES_PER_CELL as usize;
+        for k in 1..=4 {
+            assert!(
+                padding(multiple * k) < block,
+                "{} layers is a multiple of {multiple} and is still being padded by \
+                 {} B, so the multiple does not describe the layout",
+                multiple * k,
+                padding(multiple * k),
+            );
+            assert!(
+                padding(multiple * k + 1) >= block,
+                "{} layers is one over the multiple and is padded by only {} B, so \
+                 rounding the vertical down to {multiple} buys nothing",
+                multiple * k + 1,
+                padding(multiple * k + 1),
+            );
+        }
+        // Both rungs the vertical is chosen at already sit on it, which is what
+        // makes the rounding a constraint on the *leftover* alone.
+        assert_eq!(rustdar_radar::voxel::NZ_PREFERRED % multiple, 0);
+        assert_eq!(rustdar_radar::voxel::NZ_MIN % multiple, 0);
+    }
+
+    /// The two grid-byte invariants the floor crate's `check_invariants` had
+    /// to give up at WO-RD — the byte figure is this module's arithmetic and
+    /// the resolver must not call up into it — swept at every promotion a
+    /// bracket can reach rather than only at the three shipped floors: the
+    /// wasm bracket's ceiling pairs the mobile grid with the wasm pool floor,
+    /// a pair no shipped arm exhibits.
+    #[test]
+    fn every_reachable_grid_fits_its_budgets_in_bytes() {
+        use crate::budget_arms::shipped_profile;
+        use rustdar_device_profile::budget::{BudgetLimits, DeviceProfile, resolve};
+        use rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE;
+        use rustdar_device_profile::quality::DeviceClass;
+
+        for limits in BudgetLimits::SHIPPED {
+            // Unknown at the guarantee resolves the floor, Integrated the
+            // step, Discrete the ceiling — all three rungs of every bracket.
+            for class in [
+                DeviceClass::Unknown,
+                DeviceClass::Integrated,
+                DeviceClass::Discrete,
+            ] {
+                let b = resolve(&DeviceProfile {
+                    class,
+                    ..shipped_profile(limits)
+                });
+                let grid = crate::volume::raymarch::resident_grid_bytes(b.grid_cells)
+                    .expect("a bracketed grid cannot overflow");
+                // The grid fits its own budget, in bytes as well as in cells.
+                assert!(
+                    grid <= b.volume_texture_bytes,
+                    "{} / {class:?}: a {:?} grid is {grid} B against a {} B budget",
+                    b.name,
+                    b.grid_cells,
+                    b.volume_texture_bytes,
+                );
+                // One live 3D grid beside a loop at the frame minimum still
+                // fits the store floor — the eviction-treadmill guard: a grid
+                // that grew without the store growing under it means
+                // `enforce_budget` evicts the loop's own frame 0, which the
+                // dispatcher re-plans at ~89 ms of resample, for ever.
+                let live_beside_a_loop = (MIN_LOOP_FRAMES_PER_PANE + 1) * grid;
+                assert!(
+                    live_beside_a_loop <= b.volume_loop_bytes(),
+                    "{} / {class:?}: a loop at the {}-frame minimum plus one live \
+                     grid is {} MiB of {:?} grids against a {} MiB store floor",
+                    b.name,
+                    MIN_LOOP_FRAMES_PER_PANE,
+                    live_beside_a_loop / (1024 * 1024),
+                    b.grid_cells,
+                    b.volume_loop_bytes() / (1024 * 1024),
+                );
+            }
+        }
+    }
+
+    /// A pixel costs what the offscreen's format actually costs.
+    ///
+    /// Tied to nothing until now: `OFFSCREEN_BYTES_PER_PIXEL` is a 4 in the
+    /// floor crate's `quality` module and `OFFSCREEN_FORMAT` is an
+    /// `Rgba8Unorm` here, and every budget figure over there is the product of
+    /// the two. Moving the format to sixteen bits a channel would leave every
+    /// budget test passing while under-counting the real allocation by half.
+    /// (Moved beside the format at WO-RD: the floor crate cannot name a wgpu
+    /// type.)
+    #[test]
+    fn a_pixel_costs_what_the_offscreen_format_costs() {
+        use rustdar_device_profile::quality::OFFSCREEN_BYTES_PER_PIXEL;
+        let format_bytes = crate::volume::raymarch::OFFSCREEN_FORMAT
+            .block_copy_size(None)
+            .expect("the offscreen format has no single-aspect copy size");
+        assert_eq!(
+            OFFSCREEN_BYTES_PER_PIXEL,
+            format_bytes as usize,
+            "an offscreen pixel is budgeted at {OFFSCREEN_BYTES_PER_PIXEL} B \
+             but {:?} costs {format_bytes} B",
+            crate::volume::raymarch::OFFSCREEN_FORMAT
+        );
+    }
+}

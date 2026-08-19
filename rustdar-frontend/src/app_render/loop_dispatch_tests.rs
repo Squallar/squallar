@@ -1,9 +1,9 @@
 use super::*;
-use crate::constants::MAX_LOOP_FRAMES;
 use crate::loop_downloads::LoopDownloadManager;
 use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
 };
+use rustdar_device_profile::constants::MAX_LOOP_FRAMES;
 use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::sites::RadarSite;
@@ -606,7 +606,7 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
 /// `loop_frames_held` resolves a raster loop's cap from — not from
 /// [`MAX_LOOP_FRAMES`], which is the same figure today and is no longer the one
 /// the code reads. The unit half in `rustdar_egui::ui_timeline` has to write the
-/// caps out as literals because neither `crate::budget` nor `crate::constants`
+/// caps out as literals because neither `rustdar_device_profile::budget` nor `rustdar_device_profile::constants`
 /// is visible from that crate; this is what would catch it drifting from either.
 #[test]
 fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
@@ -1027,7 +1027,7 @@ fn a_loops_render_set_is_its_span_budget_at_its_own_sites_cadence() {
         ls.scan_step_secs = Some(cadence);
         let frames = loop_render_budget(allocation, &ls, &budgets);
         assert!(
-            frames >= crate::constants::MIN_LOOP_FRAMES_PER_PANE,
+            frames >= rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
             "{radar}: {frames} frames is not a loop"
         );
         // The pool's share can bind first on a crowded screen; this is the
@@ -1117,7 +1117,7 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
 /// **Every cap `rustdar_egui::ui_timeline`'s fidelity fixtures name is a cap
 /// this workspace actually ships.**
 ///
-/// That crate cannot see `crate::budget` or `crate::constants`, so its
+/// That crate cannot see `rustdar_device_profile::budget` or `rustdar_device_profile::constants`, so its
 /// measured-defect table writes the browser and desktop raster caps as bare
 /// numbers. Its doc names this test as the half that reads the resolved budget,
 /// and this is that half: the `held` column of the table, against the three
@@ -1167,7 +1167,7 @@ fn the_caption_fixtures_name_caps_this_workspace_ships() {
         "the measured-defect table is no longer two rows this can read: {caps:?}",
     );
 
-    let shipped: Vec<usize> = crate::budget::BudgetLimits::SHIPPED
+    let shipped: Vec<usize> = rustdar_device_profile::budget::BudgetLimits::SHIPPED
         .iter()
         .map(|limits| limits.loop_frames_held.floor)
         .collect();

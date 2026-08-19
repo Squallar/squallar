@@ -55,16 +55,19 @@
 //!      apply_chunk_scan_info and clear_gps_fix, and demoted the two
 //!      armed-toggles to pub(crate) — the three chunk-settings setters
 //!      remain until WO-E8b reaches 0)
-//!  3   wasm-cfg lines per crate                          -  for c in rustdar-frontend rustdar-radar rustdar-egui rustdar-web rustdar-overlays; do
+//!  3   wasm-cfg lines per crate                          -  for c in rustdar-frontend rustdar-radar rustdar-egui rustdar-web rustdar-overlays rustdar-device-profile; do
 //!      [RECORDED, NOT ASSERTED]                             printf '%s ' "$c"; rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs' \
-//!      frontend 165, radar 54, egui 40, web 31,             | awk -F: '{s+=$2} END {print s+0}'; done
-//!      overlays 25 (sum 315)
-//!  3b  ... frontend/src/constants.rs alone              42  rg -c 'target_arch = "wasm''32"' rustdar-frontend/src/constants.rs
-//!      [RECORDED, NOT ASSERTED]
+//!      frontend 93, radar 43, egui 40, web 31,              | awk -F: '{s+=$2} END {print s+0}'; done
+//!      overlays 25, device-profile 73 (sum 305;
+//!      re-counted at WO-RD — the cascades moved
+//!      down, radar had shed 11 across the M block)
+//!  3b  ... device-profile/src/constants.rs alone        42  rg -c 'target_arch = "wasm''32"' rustdar-device-profile/src/constants.rs
+//!      [RECORDED, NOT ASSERTED] (re-keyed at WO-RD)
 //!  4a  product-enum occurrences in rustdar-egui        444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
 //!  4b  ... files containing it (info)                   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
 //!  5a  overlay-kind occurrences, whole tree            762  rg -o 'Overlay''Kind' . --glob '*.rs' | wc -l
-//!  5b  ... files containing it (info)                   56  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
+//!  5b  ... files containing it (info)                   61  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
+//!      (56 at the E0c-era count; re-counted at WO-RD)
 //!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-frontend/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-frontend/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-frontend/src/offload.rs | wc -l
@@ -84,8 +87,8 @@
 //!   inappropriate for the rust ecosystem"). The qualitative rule — a cfg
 //!   may select a value, a dependency, or a type alias, never fork behaviour
 //!   inside a fn body — lives in ARCHITECTURE.md and review. constants.rs's
-//!   42 cfg lines dissolve into a profile module as refactor work,
-//!   unratcheted.
+//!   42 cfg lines moved into the rustdar-device-profile crate at WO-RD —
+//!   exactly the dissolution this note anticipated — still unratcheted.
 //! - Row 4a reaches 0 at WO-E9 (FieldId adoption); the enum itself stays pub
 //!   in rustdar-radar through the campaign.
 //! - Row 5a's command runs over `.`; measured at land, every occurrence

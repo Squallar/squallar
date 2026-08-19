@@ -61,9 +61,13 @@ pub struct AttachmentConfig {
 mod mirror;
 
 pub use mirror::{
-    MIRROR_MAX_SIDE, MIRROR_RUNG_DWELL_FRAMES, MIRROR_RUNG_HYSTERESIS, MIRROR_SCALE_MAX,
-    MirrorLimits, MirrorPlan, MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
+    MIRROR_RUNG_DWELL_FRAMES, MIRROR_RUNG_HYSTERESIS, MIRROR_SCALE_MAX, MirrorLimits, MirrorPlan,
+    MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
 };
+// The moved side cap, re-exported so this module's consumers keep one spelling
+// until the whole renderer moves at WO-RG (frontend-internal interim only —
+// new readers import the floor crate directly).
+pub use rustdar_device_profile::constants::MIRROR_MAX_SIDE;
 
 /// How a texture delta gets onto the GPU without the frame paying for it.
 ///

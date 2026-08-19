@@ -1,5 +1,5 @@
 use super::*;
-use crate::constants::{
+use rustdar_device_profile::constants::{
     DESKTOP_LOOP_IMAGE_SIZE, DESKTOP_LOOP_POOL_CEILING_BYTES, DESKTOP_LOOP_POOL_FLOOR_BYTES,
     DESKTOP_MAX_LOOP_RENDER_BUDGET, DESKTOP_VOLUME_GRID_CELLS, MOBILE_LOOP_IMAGE_SIZE,
     MOBILE_LOOP_POOL_CEILING_BYTES, MOBILE_LOOP_POOL_FLOOR_BYTES, MOBILE_MAX_LOOP_RENDER_BUDGET,
@@ -68,7 +68,7 @@ fn arms() -> [Arm; 3] {
                 floor: WASM_LOOP_POOL_FLOOR_BYTES,
                 ceiling: WASM_LOOP_POOL_CEILING_BYTES,
             },
-            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
+            max_panes: rustdar_device_profile::budget::MAX_PANES_DESKTOP,
             volume_loop_frames: 11,
         },
         Arm {
@@ -83,7 +83,7 @@ fn arms() -> [Arm; 3] {
                 floor: MOBILE_LOOP_POOL_FLOOR_BYTES,
                 ceiling: MOBILE_LOOP_POOL_CEILING_BYTES,
             },
-            max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
+            max_panes: rustdar_device_profile::budget::MAX_PANES_MOBILE,
             volume_loop_frames: 17,
         },
         Arm {
@@ -98,7 +98,7 @@ fn arms() -> [Arm; 3] {
                 floor: DESKTOP_LOOP_POOL_FLOOR_BYTES,
                 ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
             },
-            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
+            max_panes: rustdar_device_profile::budget::MAX_PANES_DESKTOP,
             volume_loop_frames: 14,
         },
     ]
@@ -609,7 +609,7 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
     };
 
     let mut state = LoopPoolState::new(pool, model);
-    for _ in 0..crate::constants::LOOP_POOL_DWELL_FRAMES {
+    for _ in 0..rustdar_device_profile::constants::LOOP_POOL_DWELL_FRAMES {
         state.observe(pool, model, one);
     }
     let settled = state.allocation();
@@ -620,7 +620,7 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
 
     // A second pane appears and vanishes on alternate frames for many times the
     // dwell. Neither demand ever holds long enough to be taken.
-    for frame in 0..crate::constants::LOOP_POOL_DWELL_FRAMES * 8 {
+    for frame in 0..rustdar_device_profile::constants::LOOP_POOL_DWELL_FRAMES * 8 {
         let demand = if frame % 2 == 0 { two } else { one };
         assert_eq!(
             state.observe(pool, model, demand),
@@ -630,7 +630,7 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
     }
 
     // Held for the dwell, it is taken — and it is shorter, not blank.
-    for _ in 0..crate::constants::LOOP_POOL_DWELL_FRAMES {
+    for _ in 0..rustdar_device_profile::constants::LOOP_POOL_DWELL_FRAMES {
         state.observe(pool, model, two);
     }
     let shared = state.allocation();
@@ -663,7 +663,7 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
         ..LoopDemand::default()
     };
     let settle = |state: &mut LoopPoolState, demand| {
-        for _ in 0..crate::constants::LOOP_POOL_DWELL_FRAMES {
+        for _ in 0..rustdar_device_profile::constants::LOOP_POOL_DWELL_FRAMES {
             state.observe(pool, model, demand);
         }
         state.allocation()
@@ -675,7 +675,7 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
     // Five of six: 6/5 = 1.2x, inside the band. Refused, and not reconsidered.
     let five = settle(&mut state, loops(5));
     assert_eq!(five, six, "a 1.2x growth was taken");
-    for _ in 0..crate::constants::LOOP_POOL_DWELL_FRAMES * 4 {
+    for _ in 0..rustdar_device_profile::constants::LOOP_POOL_DWELL_FRAMES * 4 {
         assert_eq!(state.observe(pool, model, loops(5)), six);
     }
 
@@ -791,4 +791,276 @@ fn the_compiled_model_is_one_of_the_named_arms() {
     let limits = LoopPoolLimits::for_target();
     assert!(arms().iter().any(|arm| arm.limits == limits));
     assert!(limits.floor <= limits.ceiling);
+}
+
+/// The budget-agreement proofs that bridge to this module's planner — moved
+/// here from the floor crate's `constants::tests` at WO-RD. The resolver
+/// lives below the pool and must not call up into it, so the sweeps that
+/// execute `LoopPool::plan` live beside it instead.
+mod budget_agreement {
+    use crate::budget_arms::{SHIPPED_VOLUME_LOOP_FRAMES, arms, volume_bytes};
+
+    /// The store's bound is what the sum above charges, on the arithmetic the
+    /// application actually runs rather than on the reading of it.
+    ///
+    /// `the_whole_application_fits_its_gpu_ceiling` charges `pool + floor` because
+    /// that is the maximum of `pool − v·share + max(v·share, floor)` over the
+    /// reachable `v`. A closed-form claim like that is exactly the kind that stays
+    /// written down while the code underneath it moves, so it is swept here against
+    /// `LoopPool::plan` and `LoopAllocation::volume_reserve_bytes` themselves, over
+    /// every mix of loop kinds each arm's pane count admits and at both ends of the
+    /// pool.
+    #[test]
+    fn the_volume_store_floor_is_the_widest_the_override_can_open() {
+        use crate::loop_pool::{LoopDemand, LoopFrameModel, LoopPool, LoopPoolLimits};
+
+        for arm in arms() {
+            let model = LoopFrameModel {
+                plan_view: arm.loop_frame_bytes(),
+                section: arm.section_frame_bytes(),
+                grid: volume_bytes(&arm),
+                render_budget: arm.loop_render_budget,
+            };
+            let limits = LoopPoolLimits {
+                floor: arm.loop_pool_floor_bytes,
+                ceiling: arm.loop_pool_ceiling_bytes,
+            };
+            for pool_bytes in [arm.loop_pool_floor_bytes, arm.loop_pool_ceiling_bytes] {
+                let pool = LoopPool::new(pool_bytes, limits);
+                for plan_view_loops in 0..=arm.max_panes {
+                    for section_loops in 0..=(arm.max_panes - plan_view_loops) {
+                        for volume_sets in 0..=(arm.max_panes - plan_view_loops - section_loops) {
+                            let demand = LoopDemand {
+                                plan_view_loops,
+                                section_loops,
+                                volume_sets,
+                            };
+                            let allocation = pool.plan(model, demand);
+                            // What `setup_egui_frame` hands `enforce_budget`.
+                            let store = allocation
+                                .volume_reserve_bytes()
+                                .max(arm.volume_loop_bytes());
+                            // What the raster loops may cache beside it. Nothing at
+                            // runtime takes these back, so the division is the bound.
+                            let raster =
+                                plan_view_loops * allocation.plan_view_frames * model.plan_view
+                                    + section_loops * allocation.section_frames * model.section;
+                            assert!(
+                                raster + store
+                                    <= arm.loop_pool_ceiling_bytes + arm.volume_loop_bytes(),
+                                "{}: {demand:?} at a {} MiB pool caches {} MiB of raster \
+                                 frames beside a {} MiB store bound — over the \
+                                 `pool ceiling + volume-store floor` the app ceiling \
+                                 charges",
+                                arm.name,
+                                pool.bytes() / (1024 * 1024),
+                                raster / (1024 * 1024),
+                                store / (1024 * 1024),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The budget table in `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`'s doc is the one
+    /// the constants derive.**
+    ///
+    /// Because it stopped being. The desktop row went on reading `13 | 36.001 MiB |
+    /// 468.0 MiB | 44.0 MiB` after the mip pyramid was charged for and the frame
+    /// count became 12 — prose and code contradicting each other inside one file,
+    /// with the prose the half a reader reaches for when deciding whether a frame
+    /// count is safe to move. Every other figure in that row was pre-fix too, on
+    /// every row.
+    ///
+    /// So the doc is parsed rather than trusted. A figure that drifts fails here
+    /// with both numbers, which is the only thing that keeps a hand-written table
+    /// honest against a constant it is not computed from.
+    ///
+    /// The `frames` column is compared against [`SHIPPED_VOLUME_LOOP_FRAMES`]
+    /// rather than against a constant of its own, because there is no longer a
+    /// constant of its own: `MAX_LOOP_VOLUME_FRAMES` and its three named arms had
+    /// no runtime consumer — `LoopPool::plan` computed the number and the cascade
+    /// restated it — and are retired. This test and
+    /// `the_3d_loop_holds_exactly_what_it_marches` are between them what hold those
+    /// literals to the budget arithmetic they came out of.
+    ///
+    /// The decimals are load-bearing rather than cosmetic: the cells are compared
+    /// as **strings**, so `{:.3}` on the texture column and `{:.2}` on the two
+    /// derived from it are part of what the table has to say, and a row rounded to
+    /// one place fails here.
+    #[test]
+    fn the_loop_budget_table_is_the_one_the_constants_derive() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        // Anchored on this table's own header: `constants.rs` carries a dozen
+        // tables keyed by target name, and matching on the names alone reads all of
+        // them.
+        const HEADER: &str = "| target  | frames | 3D texture | resident  | headroom | share   |";
+        // The table lives in the floor crate's doc comment; this side owns the
+        // planner that derives it, so the scrape crosses the crate boundary by
+        // path (from rustdar-frontend/src/loop_pool/ up to the workspace root).
+        let source = include_str!("../../../rustdar-device-profile/src/constants.rs");
+        let rows: Vec<Vec<String>> = source
+            .lines()
+            .map(|line| line.trim().trim_start_matches("///").trim())
+            .skip_while(|line| *line != HEADER)
+            .skip(2) // the header and the alignment rule
+            .take_while(|line| line.starts_with('|'))
+            .map(|row| {
+                row.split('|')
+                    .map(|cell| cell.trim().replace(" MiB", ""))
+                    .filter(|cell| !cell.is_empty())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the budget table is no longer three target rows this can read: {rows:?}",
+        );
+
+        for ((arm, frames), row) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES).zip(rows) {
+            assert_eq!(
+                row[0], arm.name,
+                "the table's rows are out of order: {row:?}"
+            );
+            let grid = volume_bytes(&arm);
+            let resident = grid * frames;
+            let expected = [
+                arm.name.to_string(),
+                frames.to_string(),
+                format!("{:.3}", grid as f64 / MIB),
+                format!("{:.2}", resident as f64 / MIB),
+                format!("{:.2}", (arm.volume_loop_bytes() - resident) as f64 / MIB),
+                format!("{}", arm.volume_loop_bytes() / (1024 * 1024)),
+            ];
+            assert_eq!(
+                row, expected,
+                "the {} row of the budget table has drifted from what the constants \
+                 derive — the table is what a reader consults before moving a frame \
+                 count, so it is the half that has to be right",
+                arm.name,
+            );
+        }
+    }
+
+    use crate::budget_arms::shipped_profile;
+    use rustdar_device_profile::budget::{
+        AdapterCeilings, BudgetLimits, Budgets, DESKTOP_CLASS_REPORT, DeviceProfile, Promotion,
+        resolve,
+    };
+    use rustdar_device_profile::quality::DeviceClass;
+
+    /// The pool moves with a browser promotion, on the same rung — the
+    /// `LoopPool` half of the floor crate's
+    /// `a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not`,
+    /// asserted beside the pool because the pool sits above the resolver
+    /// (WO-RD).
+    #[test]
+    fn a_promoted_browsers_pool_moves_on_the_same_rung() {
+        let web = |two_d: u32, three_d: u32| DeviceProfile {
+            adapter: AdapterCeilings {
+                max_texture_dimension_2d: two_d,
+                max_texture_dimension_3d: three_d,
+            },
+            ..shipped_profile(BudgetLimits::WASM)
+        };
+        let floor = resolve(&web(
+            AdapterCeilings::WEBGL2_GUARANTEE.max_texture_dimension_2d,
+            AdapterCeilings::WEBGL2_GUARANTEE.max_texture_dimension_3d,
+        ));
+        let promoted = resolve(&web(
+            DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
+            DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
+        ));
+        assert_eq!(floor.promotion, Promotion::Floor);
+        assert_eq!(promoted.promotion, Promotion::Ceiling);
+        let pool = |b: &Budgets, p: Promotion| {
+            crate::loop_pool::LoopPool::for_promotion(
+                p,
+                None,
+                crate::loop_pool::LoopPoolLimits::from_budgets(b),
+            )
+            .bytes()
+        };
+        assert!(
+            pool(&promoted, promoted.promotion) > pool(&floor, floor.promotion),
+            "a promoted browser's grids came out of an unpromoted pool, so the \
+             loop pays for the detail in history",
+        );
+    }
+
+    /// **What five machines get, in the units a user would notice.**
+    ///
+    /// The stage's whole answer on one page, pinned so that a change to any rule
+    /// has to come past a table someone can read. Four of the five are real: two
+    /// adapters on this project's own RTX 3090 (Vulkan naming it `DiscreteGpu`, GL
+    /// naming it `Other`), the Radeon 890M whose browser reading was measured, and
+    /// Firefox 153 on the 3090 at its **allocatable** 16384 rather than its
+    /// reported 32768. The fifth is the WebGL2 guarantee, which is what the web
+    /// budgets were derived from and is the honest stand-in for a device this
+    /// project has not measured.
+    ///
+    /// The two rows that carry the point are the last two: same binary, same
+    /// origin, same backend, same `DeviceClass::Unknown`, and 3.4x the voxels
+    /// between them. No `cfg` can express the difference — not coarsely, none.
+    #[test]
+    fn what_five_real_machines_get() {
+        let row = |limits, class, two_d, three_d| {
+            let profile = DeviceProfile {
+                class,
+                adapter: AdapterCeilings {
+                    max_texture_dimension_2d: two_d,
+                    max_texture_dimension_3d: three_d,
+                },
+                ..shipped_profile(limits)
+            };
+            let b = resolve(&profile);
+            let pool = crate::loop_pool::LoopPool::for_promotion(
+                b.promotion,
+                None,
+                crate::loop_pool::LoopPoolLimits::from_budgets(&b),
+            )
+            .bytes();
+            (
+                b.promotion,
+                b.grid_cells.iter().map(|&n| n as usize).product::<usize>(),
+                b.offscreen_bytes / (1024 * 1024),
+                pool / (1024 * 1024),
+                b.raster_side_for_adapter(two_d),
+            )
+        };
+        let d = BudgetLimits::DESKTOP;
+        let w = BudgetLimits::WASM;
+
+        // machine                       | rung     | cells     | offscreen | pool | raster
+        assert_eq!(
+            row(d, DeviceClass::Discrete, 32768, 16384),
+            (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
+            "RTX 3090 over Vulkan",
+        );
+        assert_eq!(
+            row(d, DeviceClass::Unknown, 32768, 16384),
+            (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
+            "the same RTX 3090 over GL, where the driver names it `Other` — the \
+             case a class-only rule gets wrong on real hardware",
+        );
+        assert_eq!(
+            row(d, DeviceClass::Integrated, 16384, 8192),
+            (Promotion::Step, 8_388_608, 20, 1152, 8192),
+            "a desktop integrated GPU: promoted by nothing it reports, because \
+             what it reports is capacity and what holds it back is fill rate",
+        );
+        assert_eq!(
+            row(w, DeviceClass::Unknown, 16384, 16384),
+            (Promotion::Ceiling, 3_538_944, 5, 192, 2048),
+            "Firefox 153 on the RTX 3090, at what it will actually allocate",
+        );
+        assert_eq!(
+            row(w, DeviceClass::Unknown, 2048, 256),
+            (Promotion::Floor, 1_048_576, 5, 56, 2048),
+            "a browser at the WebGL2 guarantee, which keeps every byte it had",
+        );
+    }
 }

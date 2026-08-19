@@ -9,7 +9,7 @@
 //! expressible there. It is also simply more correct — a 500pt window on a
 //! desktop wants the compact chrome, and the old gate gave it the roomy one.
 
-use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+use rustdar_device_profile::budget::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
 /// Breakpoint (points) below which the content area is [`WidthClass::Compact`].
 const COMPACT_MAX_WIDTH: f32 = 600.0;

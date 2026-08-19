@@ -3,7 +3,7 @@
 //!
 //! # What this replaces
 //!
-//! [`crate::constants::LOOP_POOL_FLOOR_BYTES`] used to be called
+//! [`rustdar_device_profile::constants::LOOP_POOL_FLOOR_BYTES`] used to be called
 //! `LOOP_TEXTURE_BUDGET_BYTES` and it was a **per-pane** allowance: 512 MiB on
 //! desktop, 256 on mobile, 48 in a browser, and nothing anywhere multiplied it
 //! by the pane count. `MAX_PANES_DESKTOP` is 6 and `MAX_PANES_MOBILE` is 4, so
@@ -34,7 +34,7 @@
 //!
 //! Every share is floored at [`MIN_LOOP_FRAMES_PER_PANE`], so a pane arriving
 //! makes its neighbours' loops *shorter* and can never blank one. That floor is
-//! only reachable at all because [`crate::constants::LOOP_POOL_FLOOR_BYTES`] is
+//! only reachable at all because [`rustdar_device_profile::constants::LOOP_POOL_FLOOR_BYTES`] is
 //! chosen to seat every pane the width class admits at it — see
 //! `the_floor_seats_every_pane_without_blanking_one`.
 //!
@@ -68,8 +68,9 @@
 //!   application sets through `wgt::MemoryBudgetThresholds`. The figures are
 //!   never handed back.
 //! * **`AdapterInfo::device_type` is queryable and is the one real signal.**
-//!   `crate::volume::quality::DeviceClass::from_device_type` already classifies
-//!   it and is reused here rather than a parallel enum being invented.
+//!   `crate::app`'s `device_class_of` already classifies it (into the floor
+//!   crate's `DeviceClass`) and is reused here rather than a parallel enum
+//!   being invented.
 //! * **WebGL2 reports nothing at all.** Every browser is
 //!   [`DeviceClass::Unknown`] whatever the silicon is (see that variant's doc),
 //!   so the browser arm sits at its floor and can only ever back *off*.
@@ -171,12 +172,12 @@
 //! re-probe, and a user who had backed off would see a different loop length
 //! every start.
 
-use crate::budget::{Budgets, Promotion};
-use crate::constants::{
+use rustdar_device_profile::budget::{Budgets, Promotion};
+use rustdar_device_profile::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
     LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
 };
-use crate::volume::quality::DeviceClass;
+use rustdar_device_profile::quality::DeviceClass;
 use rustdar_kv::KvStore;
 use rustdar_radar::types::RenderView;
 
@@ -297,7 +298,17 @@ impl LoopFrameModel {
         Self {
             plan_view: budgets.loop_frame_bytes(),
             section: budgets.section_frame_bytes(),
-            grid: budgets.volume_bytes().unwrap_or(usize::MAX),
+            // Bytes one resident voxel grid costs: every mip level it is laid
+            // out with, its colour table's own texture, and the jitter tile
+            // beside it — read from the upload path's own arithmetic, so the
+            // budget is checked against what actually allocates (`None` only
+            // on a `usize` overflow, which no shipped or synthetic bracket
+            // reaches). Spelled here rather than as a `Budgets` method — the
+            // exact shape `for_target` above already uses — because the
+            // resolver moved below the raymarch at WO-RD and must not call up
+            // into it.
+            grid: crate::volume::raymarch::resident_grid_bytes(budgets.grid_cells)
+                .unwrap_or(usize::MAX),
             render_budget: budgets.loop_render_budget,
         }
     }
@@ -450,7 +461,7 @@ impl LoopPool {
     /// The class is the only signal [`Self::for_device`] has, and on the web it
     /// says `Unknown` whatever the silicon is — so a desktop browser and a
     /// phone browser both took the floor, which is one half of the complaint
-    /// this stage answers. `crate::budget::DeviceProfile::promotion` folds the
+    /// this stage answers. `rustdar_device_profile::budget::DeviceProfile::promotion` folds the
     /// adapter's own reported ceilings in beside the class, so a browser that
     /// reports desktop-class figures reaches this ceiling on exactly the rung
     /// every other budget it gets was resolved at, and one that does not is

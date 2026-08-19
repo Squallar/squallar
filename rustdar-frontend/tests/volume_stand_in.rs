@@ -28,11 +28,11 @@
 
 use std::sync::Arc;
 
+use rustdar_device_profile::quality::VolumeQuality;
 use rustdar_egui::pane::{OrbitCamera, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode};
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter};
 use rustdar_frontend::volume::VolumeSupport;
 use rustdar_frontend::volume::bridge::{BridgeVolumePainter, VolumeEntry, VolumeStore};
-use rustdar_frontend::volume::quality::VolumeQuality;
 use rustdar_geo::GeoPoint;
 use rustdar_radar::types::RadarProduct;
 
@@ -192,8 +192,9 @@ fn frame(target: &VolumeTarget) -> VolumeFrameState {
 fn painter(store: Arc<VolumeStore>) -> BridgeVolumePainter {
     // The offscreen budget this build resolves, so a stand-in fits its panes
     // against the same figure the application would.
-    let budgets =
-        rustdar_frontend::budget::resolve(&rustdar_frontend::budget::DeviceProfile::for_target());
+    let budgets = rustdar_device_profile::budget::resolve(
+        &rustdar_device_profile::budget::DeviceProfile::for_target(),
+    );
     BridgeVolumePainter::new(
         store,
         VolumeQuality::BEST,

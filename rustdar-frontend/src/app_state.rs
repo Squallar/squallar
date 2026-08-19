@@ -126,7 +126,7 @@ pub struct AppState {
     /// `max_texture_dimension_2d >= 4096` — which is the only question the
     /// whole raster path ever asked the device, and it threw the answer away:
     /// whether the adapter said 4096 or 32768, the raster was 4096. This box
-    /// says 32768. [`crate::budget::Budgets::raster_side_for_adapter`] is what turns
+    /// says 32768. [`rustdar_device_profile::budget::Budgets::raster_side_for_adapter`] is what turns
     /// the reading into a side, and why it does not simply believe it.
     ///
     /// Read off the device once, here, rather than probed per render: it is a
@@ -151,7 +151,7 @@ impl AppState {
         // The resolved budgets, so the long-range gate below compares the
         // device against the figure the rest of the application is spending
         // rather than against a `cfg` constant read here.
-        budgets: &crate::budget::Budgets,
+        budgets: &rustdar_device_profile::budget::Budgets,
         surface: wgpu::Surface<'static>,
         // The `Arc`, not a bare `&Window`: `EguiRenderer::new` keeps a handle
         // so egui's own repaint requests can reach the event loop — see

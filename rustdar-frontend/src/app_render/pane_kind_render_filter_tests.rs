@@ -85,7 +85,7 @@ fn finished_pixels() -> Arc<egui::ColorImage> {
 /// A loop frame's pixels, which are the *loop* size and not the static one —
 /// see `constants::LOOP_IMAGE_SIZE`.
 fn loop_frame_pixels() -> egui::ColorImage {
-    let side = crate::constants::LOOP_IMAGE_SIZE;
+    let side = rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
     egui::ColorImage::from_rgba_unmultiplied([side, side], &vec![0u8; side * side * 4])
 }
 

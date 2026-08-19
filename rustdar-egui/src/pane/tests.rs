@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use std::collections::HashSet;
 
 /// A panel `w` by `h` logical pixels.

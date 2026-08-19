@@ -3353,7 +3353,7 @@ fn a_toggle_flipped_in_the_dropdown_reaches_the_dispatcher() {
 ///     the click.
 #[test]
 fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
-    use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+    use rustdar_device_profile::budget::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
     let enabled_counts = |h: &InputHarness| -> Vec<usize> {
         h.pane_options()
@@ -3889,10 +3889,10 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         crate::ui_layout::WidthClass::Medium,
         "precondition: 600pt is Medium's floor"
     );
-    h.set_pane_count(crate::pane::MAX_PANES_DESKTOP);
+    h.set_pane_count(rustdar_device_profile::budget::MAX_PANES_DESKTOP);
     assert_eq!(
         h.pane_count(),
-        crate::pane::MAX_PANES_DESKTOP,
+        rustdar_device_profile::budget::MAX_PANES_DESKTOP,
         "precondition: the widest segment row the bar can be asked for"
     );
 

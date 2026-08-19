@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "rustdar-platform",
     "rustdar-frontend",
+    "rustdar-device-profile",
     "rustdar-web",
     "rustdar-android",
     "rustdar-egui",
@@ -43,6 +44,7 @@ edition = "2024"
 
 [workspace.dependencies]
 nexrad-level3 = { path = "nexrad-level3" }
+rustdar-device-profile = { path = "rustdar-device-profile" }
 rustdar-egui = { path = "rustdar-egui" }
 rustdar-frontend = { path = "rustdar-frontend" }
 rustdar-geo = { path = "rustdar-geo" }

@@ -1326,7 +1326,7 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
         ..
     } = rustdar_radar::render::render_from_sized(
         input,
-        rustdar_frontend::constants::LONG_RANGE_IMAGE_SIZE,
+        rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE,
     )?;
     let side = (image.len() / 4).isqrt();
     assert_eq!(

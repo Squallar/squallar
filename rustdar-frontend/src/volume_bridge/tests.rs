@@ -945,12 +945,12 @@ const DISCRETE_DESKTOP_MAX_AXIS: u32 = 2048;
 ///
 /// Both rules are therefore called rather than quoted: the half-width from
 /// [`rustdar_radar::voxel::box_half_width_km`], the shape from
-/// [`crate::constants::volume_grid_shape`]. A change to either now moves this
+/// [`rustdar_device_profile::constants::volume_grid_shape`]. A change to either now moves this
 /// fixture with production, and the assertions below say what the consequence
 /// is rather than restating the arithmetic.
 fn whole_volume_uniform(reach_km: f64) -> VolumeUniform {
     let half_width_km = rustdar_radar::voxel::box_half_width_km(reach_km) as f32;
-    let shape = crate::constants::volume_grid_shape(DISCRETE_DESKTOP_MAX_AXIS);
+    let shape = rustdar_device_profile::constants::volume_grid_shape(DISCRETE_DESKTOP_MAX_AXIS);
     let height_km = (rustdar_radar::voxel::DEFAULT_TOP_KM_MSL
         - rustdar_radar::voxel::DEFAULT_BASE_KM_MSL) as f32;
     VolumeUniform::new(
@@ -1066,7 +1066,9 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
 /// now, and [`crate::volume::raymarch::CoarseLevel`]'s own doc says the same.
 #[test]
 fn the_coarse_level_is_built_only_where_something_will_sample_it() {
-    use crate::volume::quality::{MOBILE_PLATFORM_CEILING, VolumeQuality, WASM_PLATFORM_CEILING};
+    use rustdar_device_profile::quality::{
+        MOBILE_PLATFORM_CEILING, VolumeQuality, WASM_PLATFORM_CEILING,
+    };
 
     // Live: a discrete desktop GPU, lit volume, region box.
     for cell_km in [60.0 / 256.0, 160.0 / 256.0] {

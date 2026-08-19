@@ -1781,8 +1781,8 @@ fn a_scan_no_pane_is_watching_neither_moves_a_map_nor_spends_the_latch() {
 /// 4 and was written back as 4 on the next save.
 #[test]
 fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
-    use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
     use crate::ui_layout::WidthClass;
+    use rustdar_device_profile::budget::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
     assert!(
         MAX_PANES_DESKTOP > WidthClass::Compact.max_panes(),

@@ -228,28 +228,6 @@ fn no_class_that_gave_up_resolution_keeps_the_cloud_rung() {
     }
 }
 
-/// Every `DeviceType` classifies, and no two collapse that must not.
-///
-/// `Cpu` mapping to anything but `Software` is the one that matters: a
-/// software rasteriser given the discrete GPU's quality is a frame time in
-/// seconds, and a browser falling back to SwiftShader is a real path.
-#[test]
-fn every_adapter_device_type_maps_to_its_own_class() {
-    for (device_type, expected) in [
-        (wgpu::DeviceType::DiscreteGpu, DeviceClass::Discrete),
-        (wgpu::DeviceType::IntegratedGpu, DeviceClass::Integrated),
-        (wgpu::DeviceType::VirtualGpu, DeviceClass::Virtual),
-        (wgpu::DeviceType::Cpu, DeviceClass::Software),
-        (wgpu::DeviceType::Other, DeviceClass::Unknown),
-    ] {
-        assert_eq!(
-            DeviceClass::from_device_type(device_type),
-            expected,
-            "{device_type:?} no longer classifies as {expected:?}"
-        );
-    }
-}
-
 /// All three platform ceilings, checked from whichever target compiles this.
 ///
 /// The earlier version of this test built a **local literal** Half/Off and
@@ -479,7 +457,7 @@ const CASCADE_ARMS: [(&str, &str); 3] = [
 /// at another class's constant dies only on this one.
 #[test]
 fn each_ceiling_arm_selects_its_own_classs_constant() {
-    let source = include_str!("../volume_quality.rs");
+    let source = include_str!("../quality.rs");
     for (cfg, class) in CASCADE_ARMS {
         let expected = format!("{class}_PLATFORM_CEILING");
         assert_eq!(
@@ -556,25 +534,4 @@ fn a_discrete_adapter_reaches_whatever_ceiling_it_is_given() {
             "a discrete adapter did not reach the {ceiling:?} ceiling"
         );
     }
-}
-
-/// A pixel costs what the offscreen's format actually costs.
-///
-/// Tied to nothing until now: `OFFSCREEN_BYTES_PER_PIXEL` is a 4 in this
-/// module and `OFFSCREEN_FORMAT` is an `Rgba8Unorm` in another, and every
-/// budget figure in this crate is the product of the two. Moving the format
-/// to sixteen bits a channel would leave every budget test passing while
-/// under-counting the real allocation by half.
-#[test]
-fn a_pixel_costs_what_the_offscreen_format_costs() {
-    let format_bytes = crate::volume::raymarch::OFFSCREEN_FORMAT
-        .block_copy_size(None)
-        .expect("the offscreen format has no single-aspect copy size");
-    assert_eq!(
-        OFFSCREEN_BYTES_PER_PIXEL,
-        format_bytes as usize,
-        "an offscreen pixel is budgeted at {OFFSCREEN_BYTES_PER_PIXEL} B \
-             but {:?} costs {format_bytes} B",
-        crate::volume::raymarch::OFFSCREEN_FORMAT
-    );
 }

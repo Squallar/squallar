@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use egui_wgpu::wgpu;
-use rustdar_frontend::constants::VOLUME_LUT_BYTES;
+use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::raymarch::{CoarseLevel, FLOOR_FORMAT, PaneMirror, VolumePipelines};

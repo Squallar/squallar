@@ -22,7 +22,7 @@
 
 use egui_wgpu::wgpu;
 
-use crate::constants::VOLUME_GRID_CELLS;
+use rustdar_device_profile::constants::VOLUME_GRID_CELLS;
 
 #[path = "volume_blue_noise.rs"]
 pub mod blue_noise;
@@ -30,8 +30,6 @@ pub mod blue_noise;
 pub mod bridge;
 #[path = "volume_degrade.rs"]
 pub mod degrade;
-#[path = "volume_quality.rs"]
-pub mod quality;
 #[path = "volume_raymarch.rs"]
 pub mod raymarch;
 #[path = "volume_uniform.rs"]
@@ -441,7 +439,7 @@ fn disposition(rendered: &str, debug_build: bool) -> ErrorDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D;
+    use rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D;
 
     /// What the raymarch's two bind groups declare, counted out of the shader.
     ///

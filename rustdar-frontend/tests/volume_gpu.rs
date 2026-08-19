@@ -58,7 +58,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
-use rustdar_frontend::constants::VOLUME_LUT_BYTES;
+use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::volume::raymarch::{
     CoarseLevel, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, GRID_BYTES_PER_CELL, GRID_MIP_LEVELS,
     OffscreenTarget, VolumePipelines, mirror_is_gamma_encoded,
@@ -2307,8 +2307,8 @@ fn blitted(
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of() {
+    use rustdar_device_profile::quality::offscreen_bytes;
     use rustdar_frontend::volume::bridge::VolumeResources;
-    use rustdar_frontend::volume::quality::offscreen_bytes;
     use rustdar_frontend::volume::raymarch::resident_grid_bytes_at;
 
     let _serialised = gpu_lock();

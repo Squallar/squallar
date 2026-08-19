@@ -304,7 +304,7 @@ fn a_placed_render_describes_what_it_depicts() {
 /// and nothing anywhere to notice.
 #[test]
 fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
-    let side = crate::constants::LONG_RANGE_IMAGE_SIZE;
+    let side = rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE;
     // The same limit the device gate is read from, told to egui the way
     // `egui_winit::State::new` tells it: `Context::load_texture` asserts the
     // image against `max_texture_side`, and a bare `Context` defaults it to

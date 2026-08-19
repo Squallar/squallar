@@ -10,7 +10,7 @@ use crate::platform_double::TestBridge;
 /// budget into the same request. The tests below are about the axis limit
 /// rather than about the budget, so they pin the unpromoted one deliberately —
 /// `budget::tests` is where the promoted rows are checked.
-const SHIPPED_CELLS: [u32; 3] = crate::constants::VOLUME_GRID_CELLS;
+const SHIPPED_CELLS: [u32; 3] = rustdar_device_profile::constants::VOLUME_GRID_CELLS;
 
 fn at(minute: u32) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
@@ -243,7 +243,7 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
         let request = voxel_request_for(&target, 35.33, -97.28, SHIPPED_CELLS, axis);
         assert_eq!(
             request.shape,
-            crate::constants::volume_grid_shape(axis),
+            rustdar_device_profile::constants::volume_grid_shape(axis),
             "a {axis}-reporting device must be asked for the shape its own \
              limit and this target's budget produce",
         );
@@ -267,10 +267,10 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
             35.33,
             -97.28,
             SHIPPED_CELLS,
-            crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+            rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
         )
         .shape,
-        crate::constants::VOLUME_GRID_FLOOR_SHAPE,
+        rustdar_device_profile::constants::VOLUME_GRID_FLOOR_SHAPE,
     );
 }
 
@@ -549,7 +549,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
 /// paid exactly when a slot is actually taken.
 #[test]
 fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
-    use crate::constants::MAX_CONCURRENT_RENDERS;
+    use rustdar_device_profile::constants::MAX_CONCURRENT_RENDERS;
     use std::sync::atomic::Ordering;
 
     let target = rustdar_egui::pane::VolumeTarget {
@@ -1318,23 +1318,23 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
     // A browser at the WebGL2 guarantee against one reporting what a measured
     // desktop machine reports: the pair a `cfg` cascade cannot tell apart.
     let web = |two_d: u32, three_d: u32| {
-        crate::budget::resolve(&crate::budget::DeviceProfile {
-            limits: crate::budget::BudgetLimits::WASM,
-            platform: crate::budget::Platform::Web,
-            adapter: crate::budget::AdapterCeilings {
+        rustdar_device_profile::budget::resolve(&rustdar_device_profile::budget::DeviceProfile {
+            limits: rustdar_device_profile::budget::BudgetLimits::WASM,
+            platform: rustdar_device_profile::budget::Platform::Web,
+            adapter: rustdar_device_profile::budget::AdapterCeilings {
                 max_texture_dimension_2d: two_d,
                 max_texture_dimension_3d: three_d,
             },
-            ..crate::budget::DeviceProfile::for_target()
+            ..rustdar_device_profile::budget::DeviceProfile::for_target()
         })
     };
     let phone = web(2048, 256);
     let desktop = web(
-        crate::budget::DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
-        crate::budget::DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
+        rustdar_device_profile::budget::DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
+        rustdar_device_profile::budget::DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
     );
 
-    let cells_on = |budgets: crate::budget::Budgets, axis: u32| {
+    let cells_on = |budgets: rustdar_device_profile::budget::Budgets, axis: u32| {
         voxel_request_for(&target, 35.33, -97.28, budgets.grid_cells, axis)
             .shape
             .cells()
@@ -1409,7 +1409,7 @@ fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
 /// rather than left to the 3 s autosave a crashing session may not survive.
 #[test]
 fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
-    use crate::volume::quality::GradientShading;
+    use rustdar_device_profile::quality::GradientShading;
     use rustdar_kv::KvStore;
 
     let platform = TestBridge::desktop();
@@ -1421,7 +1421,7 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
     // and the rung are two independent halves of one event, and a test that saw
     // only the rung would pass with the pool half deleted.
     app.loop_pool = crate::loop_pool::LoopPool::for_promotion(
-        crate::budget::Promotion::Ceiling,
+        rustdar_device_profile::budget::Promotion::Ceiling,
         None,
         crate::loop_pool::LoopPoolLimits::from_budgets(&app.budgets),
     );
@@ -1451,7 +1451,7 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
         "the pool did not halve beside it",
     );
     assert_eq!(
-        store.load(crate::budget::BUDGET_MEMO_KEY).as_deref(),
+        store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
         Some("1"),
         "the rung was not persisted at the moment of the decision",
     );
@@ -1467,7 +1467,7 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
 /// than never having promoted it at all.
 #[test]
 fn a_backed_off_machine_reopens_where_it_left_off() {
-    use crate::volume::quality::GradientShading;
+    use rustdar_device_profile::quality::GradientShading;
 
     let first = TestBridge::desktop();
     let store = first.store();
@@ -1517,12 +1517,12 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
          ladder at all or a failure counter wearing one as a hat",
     );
     assert_eq!(
-        store.load(crate::budget::BUDGET_MEMO_KEY).as_deref(),
+        store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
         Some(settled.to_string().as_str()),
     );
     // And the floor is the configuration this build already shipped, reached
     // rather than crossed.
-    let shipped = crate::budget::BudgetLimits::for_target();
+    let shipped = rustdar_device_profile::budget::BudgetLimits::for_target();
     assert_eq!(app.budgets.grid_cells, shipped.grid_cells.floor);
     assert_eq!(app.budgets.offscreen_bytes, shipped.offscreen_bytes.floor);
     assert_eq!(

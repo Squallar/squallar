@@ -1,0 +1,22 @@
+# The device-class policy floor: what class of machine this is and what it may
+# spend — the compile-time budget cascades and the runtime profile→budgets
+# resolver, pure data/policy denominated in rustdar-radar's size vocabulary.
+[package]
+name = "rustdar-device-profile"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately this and NOTHING else normal: `tests/charter.rs` holds the
+# ceiling. In particular never wgpu (the WebGL2 3D floor is a pinned literal,
+# held to wgpu by rustdar-frontend's agreement test) and never rustdar-egui
+# (the pane caps moved down HERE so the UI could sit above the floor). A
+# dependency lands here only after the charter test and the plan change first,
+# in writing.
+[dependencies]
+rustdar-radar = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# `tests/charter.rs` parses `cargo metadata` output to pin this crate's
+# dependency ceiling and the floor-under-the-app-side graph edges.
+serde_json = { workspace = true }

@@ -22,6 +22,10 @@ gps-serial = ["rustdar-gps/serial"]
 web-time = { workspace = true }
 rustdar-geo = { workspace = true }
 rustdar-kv = { workspace = true }
+# The pane caps (MAX_PANES_DESKTOP/MOBILE) live in the device-class policy
+# floor since WO-RD -- the UI narrows at runtime by width class and reads the
+# caps from below rather than defining them.
+rustdar-device-profile = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 rustdar-units = { workspace = true }
