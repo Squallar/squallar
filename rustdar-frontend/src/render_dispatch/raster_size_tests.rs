@@ -14,18 +14,23 @@ use super::*;
 #[test]
 fn every_raster_size_this_build_renders_converts_at_its_own_side() {
     for (side, what) in [
-        (crate::constants::LOOP_IMAGE_SIZE, "a loop frame"),
+        (
+            rustdar_device_profile::constants::LOOP_IMAGE_SIZE,
+            "a loop frame",
+        ),
         (rustdar_radar::types::IMAGE_SIZE, "a render at the floor"),
         (
-            crate::constants::LONG_RANGE_IMAGE_SIZE,
+            rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE,
             "a long-range render",
         ),
         (
-            crate::budget::BudgetLimits::for_target().raster_side_ceiling_px,
+            rustdar_device_profile::budget::BudgetLimits::for_target().raster_side_ceiling_px,
             "a render at the largest side this build's bracket allows",
         ),
         (
-            (crate::budget::BudgetLimits::for_target().raster_side_ceiling_px * 9 / 10) | 1,
+            (rustdar_device_profile::budget::BudgetLimits::for_target().raster_side_ceiling_px * 9
+                / 10)
+                | 1,
             "an odd side no constant names",
         ),
     ] {
@@ -50,7 +55,7 @@ fn every_raster_size_this_build_renders_converts_at_its_own_side() {
 /// a multiple of four is not even a whole number of pixels.
 #[test]
 fn a_length_no_render_produces_is_refused_rather_than_asserted_on() {
-    let long_range = crate::constants::LONG_RANGE_IMAGE_SIZE;
+    let long_range = rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE;
     let base = rustdar_radar::types::IMAGE_SIZE;
     for (len, why) in [
         (0, "an empty buffer"),
@@ -98,7 +103,7 @@ fn a_static_render_takes_the_ceiling_the_device_reported_and_no_other() {
 
     for side in [
         rustdar_radar::types::IMAGE_SIZE,
-        crate::constants::LONG_RANGE_IMAGE_SIZE,
+        rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE,
         8192,
     ] {
         dispatcher.set_raster_side_ceiling_px(side);

@@ -111,9 +111,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
+use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
-use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::volume::raymarch::{VOLUME_SHADER_WGSL, VolumePipelines};
 use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
 

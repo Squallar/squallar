@@ -1,14 +1,14 @@
 use super::frame_pump::PumpPhase;
-use crate::constants::{
-    DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
-    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MIN_LOOP_SPEED_FPS,
-};
 use crate::loop_downloads::{
     FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
 };
 use crate::loop_pool::{LoopAllocation, LoopDemand, LoopFrameModel};
 use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
+use rustdar_device_profile::constants::{
+    DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
+    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MIN_LOOP_SPEED_FPS,
+};
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use std::collections::VecDeque;
@@ -3080,11 +3080,11 @@ impl super::App {
             .get_or_insert_with(Default::default);
         let stepped = memo.steps_back.saturating_add(1);
         memo.steps_back = stepped;
-        let resolved = crate::budget::resolve(&self.device_profile);
+        let resolved = rustdar_device_profile::budget::resolve(&self.device_profile);
         // Compared with the count itself held equal, because the count is a
         // field of what is being compared: `steps_back` always differs after an
         // increment, and what is being asked is whether *the budgets* moved.
-        let same_but_for_the_count = crate::budget::Budgets {
+        let same_but_for_the_count = rustdar_device_profile::budget::Budgets {
             steps_back: self.budgets.steps_back,
             ..resolved
         };
@@ -3105,7 +3105,7 @@ impl super::App {
             resolved.grid_cells,
         );
         self.budgets = resolved;
-        crate::budget::remember_steps(self.platform.kv().as_deref(), stepped);
+        crate::budget_memo::remember_steps(self.platform.kv().as_deref(), stepped);
     }
 
     fn dispatch_loop_renders(&mut self) {
@@ -4033,7 +4033,7 @@ fn section_source_refusal(
 /// [`crate::loop_downloads::LoopDownloadManager::plan_downloads_for`].
 fn accept_scan_listing(
     allocation: LoopAllocation,
-    budgets: &crate::budget::Budgets,
+    budgets: &rustdar_device_profile::budget::Budgets,
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     site: &str,
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
@@ -4636,8 +4636,10 @@ pub(crate) fn test_loop_allocation() -> LoopAllocation {
 /// The same resolution `App::with_instance` performs, so a test and the
 /// application it stands in for spend the same figures.
 #[cfg(test)]
-pub(crate) fn test_budgets() -> crate::budget::Budgets {
-    crate::budget::resolve(&crate::budget::DeviceProfile::for_target())
+pub(crate) fn test_budgets() -> rustdar_device_profile::budget::Budgets {
+    rustdar_device_profile::budget::resolve(
+        &rustdar_device_profile::budget::DeviceProfile::for_target(),
+    )
 }
 
 /// Frames this loop may keep **textured**, which is the term that bounds memory.
@@ -4680,7 +4682,7 @@ pub(crate) fn test_budgets() -> crate::budget::Budgets {
 fn loop_render_budget(
     allocation: LoopAllocation,
     ls: &rustdar_egui::pane::LoopPlaybackState,
-    budgets: &crate::budget::Budgets,
+    budgets: &rustdar_device_profile::budget::Budgets,
 ) -> usize {
     allocation
         .frames_for(ls.view)
@@ -4710,7 +4712,7 @@ fn loop_render_budget(
 pub(super) fn loop_frames_held(
     allocation: LoopAllocation,
     ls: &rustdar_egui::pane::LoopPlaybackState,
-    budgets: &crate::budget::Budgets,
+    budgets: &rustdar_device_profile::budget::Budgets,
 ) -> usize {
     match ls.view {
         rustdar_radar::types::RenderView::Volume => loop_render_budget(allocation, ls, budgets),

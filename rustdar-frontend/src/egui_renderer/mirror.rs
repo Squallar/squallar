@@ -51,19 +51,9 @@
 //! is wasted, which is why [`MirrorRungs::tile_zoom_bias`] is derived from the
 //! rung that was *applied* rather than the one that was wanted.
 
-/// The largest side the pane mirror is allowed when nothing better is known.
-///
-/// 2048 because that is the smallest `max_texture_dimension_2d` the targets this
-/// application runs on may legitimately report: it is what
-/// `wgpu::Limits::downlevel_webgl2_defaults()` guarantees, and the wasm arm is
-/// held to that floor. A mirror at this cap allocates on every device the rest
-/// of the application already runs on.
-///
-/// It is a **fallback, not the cap**. [`MirrorLimits::for_device`] raises it to
-/// whatever the adapter actually reports, which on any desktop is 8192 or more
-/// — and without that raise a 4K desktop frame would go on being mirrored at
-/// half its own density, which is the reduction this constant used to force.
-pub const MIRROR_MAX_SIDE: u32 = 2048;
+// The side cap is device-class policy and lives on the floor since WO-RD;
+// `MirrorLimits::for_device` here is what spends it.
+use rustdar_device_profile::constants::MIRROR_MAX_SIDE;
 
 /// The highest rung the mirror is ever asked for, as a multiple of the frame's
 /// own texel density.
@@ -80,7 +70,7 @@ pub const MIRROR_MAX_SIDE: u32 = 2048;
 ///   bias 2 — so bias 2 cannot fit however the window is arranged, while bias 1
 ///   fits some windows and not others.
 /// * **Memory.** 4x the frame's texels is 16x its bytes — 126 MiB for a 1080p
-///   frame — which no arm of [`crate::constants::VOLUME_MIRROR_BYTES_MAX`]
+///   frame — which no arm of [`rustdar_device_profile::constants::VOLUME_MIRROR_BYTES_MAX`]
 ///   admits anyway.
 ///
 /// So the byte budget would refuse rung 4 on its own; the cap is written down
@@ -190,7 +180,7 @@ pub struct MirrorLimits {
     /// [`MIRROR_MAX_SIDE`].
     pub max_side: u32,
     /// The resolved `Budgets::mirror_bytes` — this build's arm of
-    /// [`crate::constants::VOLUME_MIRROR_BYTES_MAX`].
+    /// [`rustdar_device_profile::constants::VOLUME_MIRROR_BYTES_MAX`].
     pub max_bytes: usize,
 }
 
@@ -353,7 +343,10 @@ pub fn mirror_size_for(size_in_points: [f32; 2], pixels_per_point: f32) -> ([u32
         size_in_points,
         pixels_per_point,
         1.0,
-        MirrorLimits::for_device(MIRROR_MAX_SIDE, crate::constants::VOLUME_MIRROR_BYTES_MAX),
+        MirrorLimits::for_device(
+            MIRROR_MAX_SIDE,
+            rustdar_device_profile::constants::VOLUME_MIRROR_BYTES_MAX,
+        ),
     );
     (plan.size_in_pixels, plan.pixels_per_point)
 }

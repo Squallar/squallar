@@ -274,7 +274,7 @@ pub(crate) fn has_deferred_drops() -> bool {
 /// the overrun is if anything larger than the numbers here suggest. Sixty
 /// volumes freed a few per frame instead of sixty on one frame is the win;
 /// a frame-time guarantee is not on offer, and
-/// [`crate::constants::DEFERRED_DROP_BUDGET_PER_FRAME`] says so where a reader
+/// [`rustdar_device_profile::constants::DEFERRED_DROP_BUDGET_PER_FRAME`] says so where a reader
 /// looking for the bound will land.
 pub(crate) fn drain_deferred_drops(budget: std::time::Duration) -> usize {
     // Nothing to do, and nothing measured: this runs on every frame of every
@@ -391,11 +391,11 @@ pub struct JobRequest {
     /// texture is this result allowed to become", and there are two callers
     /// who know one:
     ///
-    ///   * **A loop frame** says [`crate::constants::LOOP_IMAGE_SIZE`]. A loop
+    ///   * **A loop frame** says [`rustdar_device_profile::constants::LOOP_IMAGE_SIZE`]. A loop
     ///     holds frames by the dozen, so it renders leaner by policy — it
     ///     already drops the value grid for the same reason.
     ///   * **A static render** says what the device can hold,
-    ///     `crate::constants::raster_side_ceiling_px` of this adapter's
+    ///     `rustdar_device_profile::constants::raster_side_ceiling_px` of this adapter's
     ///     `max_texture_dimension_2d`, which is a real measurement of a real
     ///     device rather than a class the build guessed at. A handheld that
     ///     reports the GLES floor still says the base size and still gets a
@@ -576,7 +576,7 @@ impl JobRequest {
             // kinds legitimately say 0 × 0 — nothing on those rows reads the
             // pair — so the guard is the overlay rows' own, judged by the
             // same label prefix the pool's lane routing already routes on.
-            let ceiling = crate::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
+            let ceiling = rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
             let pixels = u64::from(width) * u64::from(height);
             if width == 0 || height == 0 || pixels > ceiling * ceiling {
                 return None;

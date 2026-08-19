@@ -52,7 +52,7 @@
 //! lane that is never written is a stale value waiting for the day someone adds
 //! a field and reads it before writing it.
 
-use crate::constants::VOLUME_LUT_BYTES;
+use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 
 /// Bytes in the uniform block. One `mat4x4<f32>` + ten `vec4<f32>`.
 pub const VOLUME_UNIFORM_BYTES: usize = 224;

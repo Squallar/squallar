@@ -130,7 +130,7 @@ pub const STAGING_RING_FEATURE: wgpu::Features = wgpu::Features::MAPPABLE_PRIMAR
 /// [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] is 1, so a slot used on one frame is
 /// ready on the next and the second slot covers the frame in between.
 ///
-/// [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`]: crate::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME
+/// [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`]: rustdar_device_profile::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME
 pub const STAGING_RING_DEPTH: usize = 2;
 
 /// Whether `device` can have a ring at all.

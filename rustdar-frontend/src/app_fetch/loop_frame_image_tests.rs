@@ -28,7 +28,7 @@ fn a_malformed_buffer_is_rejected_rather_than_panicking() {
     );
     assert!(loop_frame_image(&vec![0u8; long]).is_none(), "long buffer");
     assert!(loop_frame_image(&[]).is_none(), "empty buffer");
-    let long_range = crate::constants::LONG_RANGE_IMAGE_SIZE;
+    let long_range = rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE;
     assert!(
         loop_frame_image(&vec![0u8; long_range * long_range * 4]).is_none(),
         "a long-range static raster is not a loop frame",

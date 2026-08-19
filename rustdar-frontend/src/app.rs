@@ -14,13 +14,13 @@ use crate::channels::ChannelHub;
 // Only the default window size is used here, and only by the native arm of
 // `create_window` — the web build takes its size from the canvas. A glob import
 // would go unused on wasm32 and warn.
-#[cfg(not(target_arch = "wasm32"))]
-use crate::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use crate::input::InputHandler;
 use crate::location_permission::LocationGate;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
+#[cfg(not(target_arch = "wasm32"))]
+use rustdar_device_profile::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_egui::{Gui, actions::GuiAction};
 use rustdar_radar::site_position::SitePositionSource;
@@ -259,7 +259,7 @@ pub struct App {
     /// surface sets `self.state = None`, and a pool that backed off *because* of
     /// a lost surface would be destroyed by the event it just learned from.
     /// Every per-target number this build spends, resolved once from a
-    /// [`crate::budget::DeviceProfile`] and threaded from here.
+    /// [`rustdar_device_profile::budget::DeviceProfile`] and threaded from here.
     ///
     /// On `App` rather than on `AppState` for the reason
     /// [`Self::loop_pool`] is: a lost surface sets `self.state = None`, and a
@@ -270,7 +270,7 @@ pub struct App {
     /// its most conservative reading, which is exactly what the `cfg` constants
     /// said — and is re-resolved once, in [`Self::install_volume_bridge`], from
     /// the adapter that has just appeared. See [`Self::device_profile`].
-    budgets: crate::budget::Budgets,
+    budgets: rustdar_device_profile::budget::Budgets,
     /// Everything known about the machine, and the only input [`Self::budgets`]
     /// has.
     ///
@@ -280,7 +280,7 @@ pub struct App {
     /// same profile, which is what keeps *one* statement of how a machine's
     /// budgets are decided rather than one for the first resolve and another
     /// for every subsequent one.
-    device_profile: crate::budget::DeviceProfile,
+    device_profile: rustdar_device_profile::budget::DeviceProfile,
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,
@@ -736,7 +736,7 @@ pub(crate) enum VolumePrepare {
 ///
 /// `max_axis` is the device's `max_texture_dimension_3d`, which decides how that
 /// budget is spent over the three axes — see
-/// [`crate::constants::volume_grid_shape_of`]. Both arrive as arguments rather
+/// [`rustdar_device_profile::constants::volume_grid_shape_of`]. Both arrive as arguments rather
 /// than being read in here, for the reason everything else does: this function
 /// is pure, and its tests want to name a device rather than have one.
 fn voxel_request_for(
@@ -777,7 +777,7 @@ fn voxel_request_for(
         // build budget 192³ and request 256³ — and the second is the `cfg`
         // constant, which is one answer for every machine that compiled this
         // binary.
-        shape: crate::constants::volume_grid_shape_of(cells, max_axis),
+        shape: rustdar_device_profile::constants::volume_grid_shape_of(cells, max_axis),
         // The raymarch reads indices only. The value plane is four times larger
         // and exists for a hover readout, which a 3D pane does not have yet.
         values_wanted: false,
@@ -897,22 +897,22 @@ impl App {
         // static pane render paths (see `RenderDispatcher::renders_in_flight`).
         // Resolved here and threaded from this point on. Every field is this
         // build's own bracket floor, which is the `cfg` constant it replaces —
-        // see `crate::budget`, where the reproduction is asserted field for
+        // see `rustdar_device_profile::budget`, where the reproduction is asserted field for
         // field rather than claimed. There is no adapter yet, so there is
         // nothing to promote on; `install_volume_bridge` re-resolves the moment
         // there is.
-        let mut device_profile = crate::budget::DeviceProfile::for_target();
+        let mut device_profile = rustdar_device_profile::budget::DeviceProfile::for_target();
         // Before the first frame, for the reason the site table is resolved
         // before it: what a session learned by *failing* has to be in force
         // from the first paint, or a user who had backed off would watch the
         // application come up at a quality it has already been unable to serve
         // and then fall out of it. The pool half of the memo is filled in
         // below, once the bracket it is held inside exists.
-        device_profile.memo = Some(crate::budget::BudgetMemo {
+        device_profile.memo = Some(rustdar_device_profile::budget::BudgetMemo {
             loop_pool_bytes: None,
-            steps_back: crate::budget::remembered_steps(platform.kv().as_deref()).unwrap_or(0),
+            steps_back: crate::budget_memo::remembered_steps(platform.kv().as_deref()).unwrap_or(0),
         });
-        let budgets = crate::budget::resolve(&device_profile);
+        let budgets = rustdar_device_profile::budget::resolve(&device_profile);
         let render = RenderDispatcher::with_budgets(&budgets);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -1130,7 +1130,7 @@ impl App {
     /// Create surface and initialize AppState for a given window and dimensions.
     async fn initialize_rendering_state(
         instance: &wgpu::Instance,
-        budgets: crate::budget::Budgets,
+        budgets: rustdar_device_profile::budget::Budgets,
         window: &WindowRef,
         width: u32,
         height: u32,
@@ -1213,7 +1213,9 @@ impl App {
         // what keeps the rest of the queue from waiting on the user. Natively
         // this is usually an empty-queue check: `discard` hands the pool's free
         // lane the payload, and only a lane with no worker lands here.
-        crate::offload::drain_deferred_drops(crate::constants::DEFERRED_DROP_BUDGET_PER_FRAME);
+        crate::offload::drain_deferred_drops(
+            rustdar_device_profile::constants::DEFERRED_DROP_BUDGET_PER_FRAME,
+        );
         // Ahead of the minimized and zero-area early returns below: a window
         // that is minimized or still sizing is exactly one whose session might
         // be about to end, and skipping the save there is how the last change
@@ -1557,7 +1559,7 @@ impl App {
     /// Fold what the adapter says about itself into the profile, and re-resolve.
     ///
     /// **The one place a real device meets the budgets**, and the seam the whole
-    /// of `crate::budget` was extracted to have. Two readings go in and nothing
+    /// of `rustdar_device_profile::budget` was extracted to have. Two readings go in and nothing
     /// else does:
     ///
     /// * the **class** the driver names, which is honest on Vulkan/Metal/DX12
@@ -1579,17 +1581,17 @@ impl App {
     /// profile, so running it again on an unchanged profile is the same answer —
     /// which is also what keeps a reopen 1:1 rather than showing a different
     /// loop length every time a display comes back.
-    fn update_device_profile(&mut self, class: crate::volume::quality::DeviceClass) {
+    fn update_device_profile(&mut self, class: rustdar_device_profile::quality::DeviceClass) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
         let limits = state.device.limits();
         self.device_profile.class = class;
-        self.device_profile.adapter = crate::budget::AdapterCeilings {
+        self.device_profile.adapter = rustdar_device_profile::budget::AdapterCeilings {
             max_texture_dimension_2d: limits.max_texture_dimension_2d,
             max_texture_dimension_3d: limits.max_texture_dimension_3d,
         };
-        let resolved = crate::budget::resolve(&self.device_profile);
+        let resolved = rustdar_device_profile::budget::resolve(&self.device_profile);
         if resolved != self.budgets {
             log::info!(
                 "Budgets: {:?} on a {class:?} adapter reporting {} px 2D and {} px 3D textures: \
@@ -1606,13 +1608,15 @@ impl App {
     }
 
     fn install_volume_bridge(&mut self) {
-        use crate::volume::quality;
+        use rustdar_device_profile::quality;
 
         // Read before the `&mut` borrow below, because the pool it also decides
         // lives on `App` rather than on `AppState` — see `Self::loop_pool`.
-        let Some(class) = self.state.as_ref().map(|state| {
-            quality::DeviceClass::from_device_type(state.adapter.get_info().device_type)
-        }) else {
+        let Some(class) = self
+            .state
+            .as_ref()
+            .map(|state| device_class_of(state.adapter.get_info().device_type))
+        else {
             return;
         };
 
@@ -1722,7 +1726,7 @@ impl App {
     /// The largest 3D texture axis this device will hold, or the WebGL2
     /// guarantee when there is no device yet.
     ///
-    /// The one runtime capability `crate::constants::volume_grid_shape` needs,
+    /// The one runtime capability `rustdar_device_profile::constants::volume_grid_shape` needs,
     /// read off the device this app actually got — `device_limits`' web arm has
     /// already reconciled it with what the browser reports, so this is the real
     /// figure on every target rather than a portable floor.
@@ -1732,11 +1736,10 @@ impl App {
     /// a request formed before the renderer exists asks for the shape that
     /// shipped rather than one nothing has agreed to.
     fn volume_grid_axis_limit(&self) -> u32 {
-        self.state
-            .as_ref()
-            .map_or(crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D, |state| {
-                state.device.limits().max_texture_dimension_3d
-            })
+        self.state.as_ref().map_or(
+            rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+            |state| state.device.limits().max_texture_dimension_3d,
+        )
     }
 
     fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
@@ -2769,7 +2772,7 @@ impl App {
     /// realtime while data may lag: the alternative is a cache bounded by
     /// nothing, which costs the session rather than one re-fetch.
     ///
-    /// [`LOOP_LISTING_GRACE`]: crate::constants::LOOP_LISTING_GRACE
+    /// [`LOOP_LISTING_GRACE`]: rustdar_device_profile::constants::LOOP_LISTING_GRACE
     fn evict_unneeded_loop_scans(&mut self) {
         // Borrowed from `self.gui` and read against `self.loop_mgr`: two
         // disjoint fields, so no clone of a site name is needed per frame.
@@ -2812,10 +2815,9 @@ impl App {
             // a loop that is not fetching, so a loop past the bound is treated
             // exactly like one that never asked — see this function's doc for
             // why an unbounded exemption is a wasm32 leak rather than a nicety.
-            if ls
-                .listing_wait(now)
-                .is_some_and(|waited| waited < crate::constants::LOOP_LISTING_GRACE)
-            {
+            if ls.listing_wait(now).is_some_and(|waited| {
+                waited < rustdar_device_profile::constants::LOOP_LISTING_GRACE
+            }) {
                 settling.insert(ls.site.as_str());
             }
             let frames = needed.entry(ls.site.as_str()).or_default();
@@ -3548,6 +3550,58 @@ impl App {
         // This keeps resumed() fast on Android, preventing ANRs during
         // configuration changes (e.g. folding/unfolding the device).
         window.request_redraw();
+    }
+}
+
+/// Classify what the adapter says it is.
+///
+/// Exhaustive on purpose: a new `DeviceType` variant should be a compile
+/// error here, not a silent fall into `Unknown`.
+///
+/// A free fn beside its only caller rather than an inherent method on
+/// `DeviceClass`: the class moved down into rustdar-device-profile at WO-RD,
+/// an inherent impl can only live in the defining crate, and the floor's
+/// charter forbids it a wgpu dependency — so the one wgpu-touching line stays
+/// up here. WO-RG re-homes this into rustdar-gpu.
+fn device_class_of(device_type: wgpu::DeviceType) -> rustdar_device_profile::quality::DeviceClass {
+    use rustdar_device_profile::quality::DeviceClass;
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => DeviceClass::Discrete,
+        wgpu::DeviceType::IntegratedGpu => DeviceClass::Integrated,
+        wgpu::DeviceType::VirtualGpu => DeviceClass::Virtual,
+        wgpu::DeviceType::Cpu => DeviceClass::Software,
+        wgpu::DeviceType::Other => DeviceClass::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod device_class_tests {
+    use super::device_class_of;
+    use rustdar_device_profile::quality::DeviceClass;
+
+    /// Every `DeviceType` classifies, and no two collapse that must not.
+    ///
+    /// `Cpu` mapping to anything but `Software` is the one that matters: a
+    /// software rasteriser given the discrete GPU's quality is a frame time in
+    /// seconds, and a browser falling back to SwiftShader is a real path.
+    /// (Travelled here from the floor crate's quality tests at WO-RD, with
+    /// the classifier itself.)
+    #[test]
+    fn every_adapter_device_type_maps_to_its_own_class() {
+        use egui_wgpu::wgpu;
+        for (device_type, expected) in [
+            (wgpu::DeviceType::DiscreteGpu, DeviceClass::Discrete),
+            (wgpu::DeviceType::IntegratedGpu, DeviceClass::Integrated),
+            (wgpu::DeviceType::VirtualGpu, DeviceClass::Virtual),
+            (wgpu::DeviceType::Cpu, DeviceClass::Software),
+            (wgpu::DeviceType::Other, DeviceClass::Unknown),
+        ] {
+            assert_eq!(
+                device_class_of(device_type),
+                expected,
+                "{device_type:?} no longer classifies as {expected:?}"
+            );
+        }
     }
 }
 

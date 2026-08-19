@@ -1,5 +1,5 @@
 use super::*;
-use crate::constants::MAX_RENDER_CACHE_ENTRIES;
+use rustdar_device_profile::constants::MAX_RENDER_CACHE_ENTRIES;
 
 fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
     (
@@ -191,9 +191,9 @@ fn capacity_is_floored_at_one() {
 #[test]
 fn the_dispatchers_own_cache_holds_every_pane_on_screen() {
     let max_panes = if cfg!(target_os = "android") {
-        rustdar_egui::pane::MAX_PANES_MOBILE
+        rustdar_device_profile::budget::MAX_PANES_MOBILE
     } else {
-        rustdar_egui::pane::MAX_PANES_DESKTOP
+        rustdar_device_profile::budget::MAX_PANES_DESKTOP
     };
     let sites: Vec<String> = (0..max_panes).map(|i| format!("SITE{i}")).collect();
     assert!(

@@ -1,11 +1,3 @@
-// Reached only for `wgpu::Limits::downlevel_webgl2_defaults()`, so that the
-// WebGL2 3D-texture floor below is the value the device request is held to
-// rather than a 256 written out by hand. Deliberately the `egui_wgpu` re-export
-// and not the direct `wgpu` dependency: `tests/wgpu_guard.rs` asserts that
-// `app.rs` is the only file naming `::wgpu`, because a second copy configured by
-// this crate is a copy nothing renders through.
-use egui_wgpu::wgpu;
-
 /// Default width for the application window in pixels
 pub const RENDER_WIDTH: u32 = 1920;
 
@@ -200,8 +192,9 @@ pub const fn raster_bytes(side: usize) -> usize {
 /// asked to give.
 ///
 /// **The web arm is a third of the way down, at 1024, and that is the constant
-/// this whole cascade exists for.** A browser's per-pane loop budget is 56 MiB
-/// ([`WASM_LOOP_TEXTURE_BUDGET_BYTES`]) and it textures fourteen frames at
+/// this whole cascade exists for.** A browser's loop share is a 56 MiB pool
+/// floor ([`WASM_LOOP_POOL_FLOOR_BYTES`] — the per-pane budget this sentence
+/// was written against became the pool) and one loop textures fourteen frames at
 /// once; 2048² frames are 16 MiB apiece, so following the static size would
 /// need a 224 MiB loop budget — and [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is an
 /// alias of that one, so the volume-store term rises with it. Even holding the
@@ -239,7 +232,7 @@ pub const LOOP_IMAGE_SIZE: usize = DESKTOP_LOOP_IMAGE_SIZE;
 /// [`LOOP_IMAGE_SIZE`] and a static render is anywhere from
 /// [`rustdar_radar::types::IMAGE_SIZE`] up to whatever
 /// `budget::Budgets::raster_side_for_adapter` found this device good for, spent
-/// as far as the sweep's own gates justify. Deriving it keeps `offload`'s rule that a job's
+/// as far as the sweep's own gates justify. Deriving it keeps rustdar-frontend `offload`'s rule that a job's
 /// output carries no dimensions — the bytes are the statement.
 ///
 /// # Why this is no longer a closed set
@@ -288,7 +281,7 @@ pub fn raster_side_from_rgba_len(rgba_len: usize) -> Option<usize> {
 ///
 /// # What a second browser worker would cost, measured
 ///
-/// The native arm's pool (`crate::offload`) is the same architecture on a
+/// The native arm's pool (rustdar-frontend's `offload`) is the same architecture on a
 /// target that has threads, and it does **not** move this number: the browser
 /// still has exactly one instance, so the sentence above still holds. What has
 /// changed is that the price of a second one is no longer unknown.
@@ -552,11 +545,11 @@ pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 
 /// How long a frame keeps *starting* frees of what
-/// [`crate::offload::discard`] handed it.
+/// rustdar-frontend's `offload::discard` handed it.
 ///
 /// # It paces; it does not bound the frame, and the difference matters here
 ///
-/// [`crate::offload::drain_deferred_drops`] checks the clock **after** each
+/// `offload::drain_deferred_drops` checks the clock **after** each
 /// free, because a check before one would let a zero budget — or a clock too
 /// coarse to resolve a free — stop the queue entirely. The cost of that choice
 /// is that a frame's real spend is this budget *plus one whole payload*, and on
@@ -603,7 +596,7 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// asks for another frame while anything is queued — so a teardown is paced at
 /// this budget *plus a rendered frame* apiece, at whatever rate the display
 /// runs. That is the price of draining without waiting for the user, and
-/// `crate::offload::drain_deferred_drops` is where it is argued.
+/// rustdar-frontend's `offload::drain_deferred_drops` is where it is argued.
 ///
 /// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`]'s ~1.0 ms is the nearest measured figure
 /// in this file, and it is cited as a scale rather than as a precedent: that
@@ -630,7 +623,7 @@ pub const DEFERRED_DROP_BUDGET_PER_FRAME: std::time::Duration = std::time::Durat
 /// no test put them side by side until [`APP_TEXTURE_BUDGET_BYTES`] did.
 ///
 /// It is one pool now, divided among the loops that want one, by
-/// [`crate::loop_pool`]. What the number is chosen to be is the interesting
+/// rustdar-frontend's `loop_pool`. What the number is chosen to be is the interesting
 /// part:
 ///
 /// **The floor is exactly what one loop's span budget costs.** Not slack and
@@ -680,7 +673,7 @@ pub const DEFERRED_DROP_BUDGET_PER_FRAME: std::time::Duration = std::time::Durat
 /// single application-wide `VolumeStore`, so two 3D panes orbiting one volume
 /// from two angles are one loop and cost one share. See
 /// [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] and
-/// `crate::loop_pool::LoopDemand::volume_sets`.
+/// rustdar-frontend's `loop_pool::LoopDemand::volume_sets`.
 ///
 /// # The floor also has to seat a full screen without blanking anything
 ///
@@ -733,8 +726,8 @@ pub const DEFERRED_DROP_BUDGET_PER_FRAME: std::time::Duration = std::time::Durat
 /// So there is no measuring and no graceful degradation to be had: the wasm
 /// arm's safety is staying well under, plus learning from the one event that
 /// does arrive. That event is a lost surface, which
-/// `crate::volume::degrade::MAX_SURFACE_LOSSES_WITH_VOLUME` already counts two
-/// of before retiring the 3D view — and which `App::back_off_budgets` now
+/// rustdar-frontend's `volume::degrade::MAX_SURFACE_LOSSES_WITH_VOLUME` already counts two
+/// of before retiring the 3D view — and which rustdar-frontend's `App::back_off_budgets` now
 /// also halves the pool on, so a machine that has lost a context once starts
 /// its next session smaller instead of walking into the same wall.
 ///
@@ -764,7 +757,7 @@ pub const DESKTOP_LOOP_POOL_FLOOR_BYTES: usize = 576 * 1024 * 1024;
 /// the device claims to have.
 ///
 /// The other half of the pair [`LOOP_POOL_FLOOR_BYTES`] opens.
-/// `crate::loop_pool::LoopPool::for_device` picks a value between the two from
+/// rustdar-frontend's `loop_pool::LoopPool::for_device` picks a value between the two from
 /// `AdapterInfo::device_type`, and this is what stops a misread — or a device
 /// that lies — from claiming the whole GPU.
 ///
@@ -880,7 +873,7 @@ pub const DESKTOP_LOOP_POOL_CEILING_BYTES: usize = 3072 * 1024 * 1024;
 pub const MIN_LOOP_FRAMES_PER_PANE: usize = 2;
 
 /// How long a loop waiting on its scan listing keeps its site exempt from
-/// `App::evict_unneeded_loop_scans`.
+/// rustdar-frontend's `App::evict_unneeded_loop_scans`.
 ///
 /// # Why the exemption needs a clock at all
 ///
@@ -923,7 +916,7 @@ pub const LOOP_LISTING_GRACE: std::time::Duration = std::time::Duration::from_se
 /// to use it.
 ///
 /// The dead band on the *optional* direction. Deliberately the same 1.25 as
-/// `crate::egui_renderer::MIRROR_RUNG_HYSTERESIS`, and the same idea one level
+/// rustdar-frontend's `egui_renderer::MIRROR_RUNG_HYSTERESIS`, and the same idea one level
 /// up: there, a camera drifting across a rung boundary would re-render the
 /// mirror and re-fetch a tile pyramid on alternate frames; here, a pane opening
 /// and closing would re-fetch and re-render every loop on screen.
@@ -934,14 +927,14 @@ pub const LOOP_LISTING_GRACE: std::time::Duration = std::time::Duration::from_se
 /// sixth of six panes buys each survivor 20 % more share — a frame or two of
 /// history — which is not worth re-fetching the world for. Closing the second of
 /// two doubles the share and is taken. See
-/// `crate::loop_pool::LoopPoolState::observe`.
+/// rustdar-frontend's `loop_pool::LoopPoolState::observe`.
 pub const LOOP_POOL_HYSTERESIS: f64 = 1.25;
 
 /// How many consecutive frames the panes must ask for a different division
 /// before they get one.
 ///
 /// 15 frames is a quarter-second at 60 Hz, and it is
-/// `crate::egui_renderer::MIRROR_RUNG_DWELL_FRAMES`' figure for that constant's
+/// rustdar-frontend's `egui_renderer::MIRROR_RUNG_DWELL_FRAMES`' figure for that constant's
 /// reason: the dead band above stops an oscillation at a fixed demand, and this
 /// stops a *transient* — a pane being dragged into existence, a layout settling
 /// after a rotation, a pane closed and immediately reopened. Under this rule
@@ -993,7 +986,7 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// cost one set, and the bound that matters is the store's total.
 ///
 /// That is why the pool is divided per **loop** rather than per pane, and why
-/// `crate::loop_pool::LoopDemand::volume_sets` counts distinct volume keys: a
+/// rustdar-frontend's `loop_pool::LoopDemand::volume_sets` counts distinct volume keys: a
 /// naive per-pane split would charge one resident set twice and under-serve the
 /// one loop kind that cannot re-render its way out of being short.
 ///
@@ -1002,7 +995,7 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// oldest-first until the resident grids fit, every frame, and
 /// `the_store_eviction_actually_bounds` drives it past the line. What it is
 /// held to at runtime is `LoopAllocation::volume_reserve_bytes` **floored at
-/// this constant** — `App::setup_egui_frame` takes the `max` of the two, so a
+/// this constant** — rustdar-frontend's `App::setup_egui_frame` takes the `max` of the two, so a
 /// session with no 3D loop still has room for the live grids ordinary 3D panes
 /// need — one share per distinct set — and
 /// the frame count that share buys is chosen so the eviction never has to fire
@@ -1011,12 +1004,12 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` is why every row of
 /// it is at least one grid wide.
 ///
-/// The `3D texture` column is `volume::raymarch::resident_grid_bytes` — every
+/// The `3D texture` column is `rustdar_frontend::volume::raymarch::resident_grid_bytes` — every
 /// mip level the device lays the grid out with, plus the colour table's own
 /// texture and the jitter tile created beside it — not the packed product of
 /// the two levels the descriptor names. The difference is 1.6% and it is the
 /// difference between twelve frames and thirteen; see
-/// `volume::raymarch::grid_bytes_at`.
+/// `rustdar_frontend::volume::raymarch::grid_bytes_at`.
 ///
 /// ## What that column costs on a backend that does not lay the pyramid out
 ///
@@ -1049,7 +1042,7 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// no AMD hardware was available to read it on. Charging what the device
 /// actually reserves rather than the worst case is the fix if one turns up, and
 /// it is a change to this budget's architecture rather than to the arithmetic —
-/// see `volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES`.
+/// see `rustdar_frontend::volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES`.
 ///
 /// Every figure below is derived and checked — `the_loop_budget_table_is_the
 /// _one_the_constants_derive` reads these rows back out of this doc comment and
@@ -1140,7 +1133,7 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// The correction below was made against a per-grid figure that charged the
 /// two mip levels the descriptor names. A two-level descriptor is laid out
 /// with **every** level down to 1×1×1, measured — see
-/// `volume::raymarch::grid_bytes_at` — so a desktop grid costs 36.6 MiB and
+/// `rustdar_frontend::volume::raymarch::grid_bytes_at` — so a desktop grid costs 36.6 MiB and
 /// not 36.0, and 13 of them beside a live one was 512.4 MiB of the 512 MiB
 /// budget of the day. That is the treadmill described below, arrived at from
 /// 1.6% of accounting rather than from a missing subtraction, and it is why the
@@ -1180,8 +1173,8 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 ///
 /// The resample (~89 ms) is off the frame thread — it is the offload job's
 /// whole body. **The upload is not**, and saying it was is what let a CPU pass
-/// over 8 MiB of index bytes sit in `egui_wgpu::CallbackTrait::prepare`
-/// unexamined. `volume::raymarch::upload_volume_at` runs there, on the frame
+/// over 8 MiB of index bytes sit in egui-wgpu's `CallbackTrait::prepare`
+/// unexamined. `rustdar_frontend::volume::raymarch::upload_volume_at` runs there, on the frame
 /// thread, once per grid that becomes resident — which under this constant is
 /// once per frame while a loop set fills.
 ///
@@ -1193,12 +1186,12 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// threshold can never grow to cover, so it was `mmap`ed, faulted in a page at
 /// a time and `munmap`ed on every upload — **8193 minor faults a call, and
 /// 10.1 of the pass's 11.95 ms**, for a buffer whose life ended when
-/// `write_texture` returned. `volume::raymarch::coverage_premultiplied_into`
+/// `write_texture` returned. `rustdar_frontend::volume::raymarch::coverage_premultiplied_into`
 /// has the syscall evidence, and `volume::bridge::VolumeResources::widening` is
 /// the buffer that replaced it. The coarse level was **35.9 ms** on top and is
 /// **5.9 ms** when it is built at all — which at reflectivity's whole-volume
 /// box is never, and at the other five products' is every time (see
-/// `volume::raymarch::CoarseLevel`). Its own 4 MiB allocation is
+/// `rustdar_frontend::volume::raymarch::CoarseLevel`). Its own 4 MiB allocation is
 /// well under that cap, does recycle — 0 faults a call, measured — and was
 /// therefore left alone.
 ///
@@ -1262,7 +1255,7 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 ///
 /// The other end of it — fusing the widening into a pooled mapped staging
 /// buffer, so the pass and the BAR copy become one write — has since been done,
-/// and it is `volume::raymarch::staging`. On a device with
+/// and it is `rustdar_frontend::volume::raymarch::staging`. On a device with
 /// `staging::STAGING_RING_FEATURE` the plane is widened **straight into a
 /// host-memory buffer the copy engine reads**, which removes both the second
 /// pass and the blocking BAR copy: the two together were **17.56 ms best /
@@ -1272,7 +1265,7 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 ///
 /// Its residency mostly replaces the figure above rather than adding to it, and
 /// "mostly" is the whole of what has to be said carefully. The ring is
-/// [`staging::STAGING_RING_DEPTH`] planes — **64.00 MiB** on
+/// `staging::STAGING_RING_DEPTH` planes — **64.00 MiB** on
 /// [`DESKTOP_VOLUME_GRID_CELLS`], 27.00 MiB on [`MOBILE_VOLUME_GRID_CELLS`] —
 /// and while every upload finds a free slot the widening `Vec` above is never
 /// touched and stays at zero length. That is the steady state and it is
@@ -1285,7 +1278,7 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// only ever growing, keeps it for the session. The two then coexist:
 /// **96.00 MiB on desktop, +64.00 MiB**, and 40.50 MiB on the mobile rung. Both
 /// figures and the condition between them are stated on
-/// `volume::raymarch::staging::VolumeStaging` and pinned by a test there.
+/// `rustdar_frontend::volume::raymarch::staging::VolumeStaging` and pinned by a test there.
 ///
 /// Either way it is still outside every budget here for the same reason, and
 /// still nothing at all for a session that never opens a 3D pane.
@@ -1302,8 +1295,6 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// under a quarter of a second at 60 fps — and every grid that lands is shown
 /// as it lands rather than the pane blocking on the batch.
 ///
-/// [`staging::STAGING_RING_DEPTH`]: crate::volume::raymarch::staging::STAGING_RING_DEPTH
-/// [`staging::STAGING_RING_FEATURE`]: crate::volume::raymarch::staging::STAGING_RING_FEATURE
 pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 
 /// Ceiling on the GPU texture memory the **whole application** budgets, in
@@ -1313,8 +1304,9 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 ///
 /// The loop budget and [`VOLUME_TEXTURE_BUDGET_BYTES`] were both *per pane*,
 /// and nothing multiplied either of them by the pane count. The two halves of
-/// that multiplication even live in different crates — `MAX_PANES_DESKTOP` is
-/// `rustdar_egui::pane`'s — so no test could have noticed. This is that missing
+/// that multiplication even lived in different crates — `MAX_PANES_DESKTOP`
+/// was `rustdar_egui::pane`'s until WO-RD moved the caps into
+/// [`crate::budget`] — so no test could have noticed. This is that missing
 /// line, and writing it down is what made the loop budget a pool.
 ///
 /// The worst case is stated as a sum rather than a maximum, and deliberately
@@ -1350,7 +1342,7 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 ///
 /// # The `store floor` column, and the two ceilings it moved
 ///
-/// `App::setup_egui_frame` bounds the volume store at
+/// rustdar-frontend's `App::setup_egui_frame` bounds the volume store at
 /// `loop_allocation().volume_reserve_bytes().max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES)`.
 /// That `max` is **outside** the pool, not inside it: with `v` volume sets out
 /// of `shares` loops the raster kinds hold at most `pool − v·share` while the
@@ -1408,7 +1400,7 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 /// else, `ActivityManager.getMemoryClass()` bounds only the Java heap, and
 /// nothing in Vulkan, GLES or wgpu reports what is actually available. That is
 /// why the pool is a floor, a ceiling and a runtime classification rather than
-/// a single number: see [`LOOP_POOL_FLOOR_BYTES`] and `crate::loop_pool`.
+/// a single number: see [`LOOP_POOL_FLOOR_BYTES`] and rustdar-frontend's `loop_pool`.
 ///
 /// A budget *statement*: the enforcement points are the per-subsystem ones, and
 /// for the loop pool it is `LoopPool::plan`.
@@ -1652,24 +1644,27 @@ pub const VOLUME_LUT_BYTES: usize = 256 * 4;
 
 /// The largest 3D texture WebGL2 is *guaranteed* to accept, per axis.
 ///
-/// Taken from wgpu's own WebGL2 downlevel limits rather than written as 256, so
-/// it cannot drift from the value the device request is actually held to
-/// (`app_state::device_limits`). Note the web arm of that function calls
-/// `using_resolution`, which *lifts* `max_texture_dimension_3d` to whatever the
-/// adapter reports (wgpu-types 29.0.4 `limits.rs:603-610`) — so this is a floor
-/// the grid must fit, not a ceiling it is held to.
+/// The value is wgpu's own `Limits::downlevel_webgl2_defaults()
+/// .max_texture_dimension_3d`, written as a literal here because this crate is
+/// the policy floor and never names wgpu; rustdar-frontend's
+/// `the_webgl2_3d_floor_is_wgpus_downlevel_default` is the agreement test that
+/// holds this literal to wgpu's figure, so a wgpu revision that moved the
+/// floor is a visible failure to review rather than a drift. Note the web arm
+/// of rustdar-frontend's `app_state::device_limits` calls `using_resolution`,
+/// which *lifts* `max_texture_dimension_3d` to whatever the adapter reports
+/// (wgpu-types 29.0.4 `limits.rs:603-610`) — so this is a floor the grid must
+/// fit, not a ceiling it is held to.
 ///
 /// It is also the answer [`volume_grid_shape`] is given when there is no device
 /// to ask, which is what makes [`VOLUME_GRID_FLOOR_SHAPE`] a constant: a device
 /// reporting exactly the guarantee needs no step-down, because the shape it is
 /// handed is derived against that very figure.
-pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
-    wgpu::Limits::downlevel_webgl2_defaults().max_texture_dimension_3d;
+pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 = 256;
 
 /// Ceiling on what one pane's 3D volume textures may occupy, in bytes.
 ///
 /// Not a runtime check — the only things that read it are the `const _: () =
-/// assert!` beside `crate::volume::raymarch::GRID_MIP_LEVELS` and the tests
+/// assert!` beside rustdar-frontend's `rustdar_frontend::volume::raymarch::GRID_MIP_LEVELS` and the tests
 /// below. It is the budget [`VOLUME_GRID_CELLS`] was chosen to fit, written
 /// down so that growing an axis has to be a deliberate decision about memory.
 /// `the_volume_grid_fits_the_target_texture_budget` enforces it and
@@ -1677,7 +1672,7 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 ///
 /// **Not "like [`LOOP_POOL_FLOOR_BYTES`]", which this used to say.** That one
 /// *is* measured against, twice: `LoopPoolLimits::for_target` makes it the
-/// floor a discovered pool is clamped to, and `App::setup_egui_frame` floors
+/// floor a discovered pool is clamped to, and rustdar-frontend's `App::setup_egui_frame` floors
 /// the volume store's eviction bound at it through
 /// [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
 /// The self-claim here was right and the comparison was not, which is the
@@ -1685,14 +1680,14 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// treat an enforced bound as prose.
 ///
 /// One pane shows one volume, so the figure is one grid texture plus its LUT.
-/// The grid is [`crate::volume::VOLUME_TEXTURE_FORMAT`] — `Rg16Float`,
+/// The grid is rustdar-frontend's `volume::VOLUME_TEXTURE_FORMAT` — `Rg16Float`,
 /// **four** bytes a cell: `R = coverage × index`, `G = coverage`, a half float
-/// each — and it carries `volume::raymarch::GRID_MIP_LEVELS` levels, the raw
+/// each — and it carries `rustdar_frontend::volume::raymarch::GRID_MIP_LEVELS` levels, the raw
 /// field and the hand-built box mean below it:
 ///
 /// The table is what the device **reserves**, not what the levels pack into:
 /// naming a second mip level buys the whole pyramid down to 1x1x1, measured,
-/// and the tail is charged. See `volume::raymarch::grid_bytes_at`.
+/// and the tail is charged. See `rustdar_frontend::volume::raymarch::grid_bytes_at`.
 ///
 /// | target  | cell budget | mip 0     | + pyramid | + LUT, jitter | budget |
 /// |---------|-------------|----------:|----------:|--------------:|-------:|
@@ -1717,7 +1712,7 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// few 255ths, the error arrives at the palette index multiplied by 255 and
 /// the shell around every echo paints bands the data never held. A float
 /// channel's error is relative instead, which is the whole reason for the
-/// second byte; [`crate::volume::VOLUME_TEXTURE_FORMAT`] carries the
+/// second byte; rustdar-frontend's `volume::VOLUME_TEXTURE_FORMAT` carries the
 /// measurement and the derivation.
 ///
 /// The wasm32 arm is the one worth arguing rather than asserting, because it
@@ -1762,7 +1757,7 @@ pub const DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
 /// Not a cascade, deliberately. A phone in landscape is about 2.6 Mpx and a
 /// browser canvas on a 1440p display is 3.7 Mpx, so one figure bounds every
 /// target; what differs per target is the *rung* applied to it
-/// (`volume::quality::PLATFORM_CEILING`), and that is where the per-target
+/// ([`quality::PLATFORM_CEILING`](crate::quality::PLATFORM_CEILING)), and that is where the per-target
 /// judgement belongs. Splitting it into two constants that both vary would let
 /// them drift against each other with nothing to notice.
 ///
@@ -1830,7 +1825,7 @@ pub const DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 20 * 1024 * 1024;
 ///
 /// # The fill rate, measured rather than assumed
 ///
-/// `volume::quality`'s own table is 0.766 ms for the cloud rung at 1440 x 900
+/// [`crate::quality`]'s own table is 0.766 ms for the cloud rung at 1440 x 900
 /// over a dense real volume on this exact class of device, and the cost model
 /// behind it is fetch-bound and linear in covered pixels. 4K is 6.4x that area,
 /// so about **4.9 ms** of a 16.7 ms frame for one pane — which is what a
@@ -1852,6 +1847,21 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = WASM_VOLUME_OFFSCREEN_BUDGET_BY
 pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES;
+
+/// The largest side the pane mirror is allowed when nothing better is known.
+///
+/// 2048 because that is the smallest `max_texture_dimension_2d` the targets this
+/// application runs on may legitimately report: it is what
+/// `wgpu::Limits::downlevel_webgl2_defaults()` guarantees, and the wasm arm is
+/// held to that floor. A mirror at this cap allocates on every device the rest
+/// of the application already runs on.
+///
+/// It is a **fallback, not the cap**. rustdar-frontend's
+/// `MirrorLimits::for_device` raises it to whatever the adapter actually
+/// reports, which on any desktop is 8192 or more — and without that raise a 4K
+/// desktop frame would go on being mirrored at half its own density, which is
+/// the reduction this constant used to force.
+pub const MIRROR_MAX_SIDE: u32 = 2048;
 
 /// What the 3D view's map floor costs: **one** frame-sized colour target, for
 /// the whole application, worst case.
@@ -1956,8 +1966,7 @@ pub const VOLUME_MIRROR_BYTES_MAX: usize = DESKTOP_VOLUME_MIRROR_BYTES_MAX;
 
 /// The wasm32 arm of [`VOLUME_MIRROR_BYTES_MAX`]: the guaranteed side cap
 /// squared, four bytes a texel — the figure the whole constant used to be.
-pub const WASM_VOLUME_MIRROR_BYTES_MAX: usize =
-    (crate::egui_renderer::MIRROR_MAX_SIDE as usize).pow(2) * 4;
+pub const WASM_VOLUME_MIRROR_BYTES_MAX: usize = (MIRROR_MAX_SIDE as usize).pow(2) * 4;
 /// The mobile arm. See [`VOLUME_MIRROR_BYTES_MAX`].
 pub const MOBILE_VOLUME_MIRROR_BYTES_MAX: usize = WASM_VOLUME_MIRROR_BYTES_MAX;
 /// The desktop arm. See [`VOLUME_MIRROR_BYTES_MAX`].
@@ -2000,7 +2009,7 @@ pub const DEFAULT_LOOP_SPEED_FPS: f32 = 5.0;
 /// does not depend on CI — the build simply stops.
 #[cfg(all(any(target_os = "android", target_os = "ios"), not(mobile)))]
 compile_error!(
-    "the `mobile` cfg is not set on a handheld target: rustdar-frontend's \
+    "the `mobile` cfg is not set on a handheld target: rustdar-device-profile's \
      build.rs did not run, or its target list is wrong. Without it this crate \
      would compile desktop memory budgets into a mobile build."
 );

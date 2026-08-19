@@ -4,7 +4,7 @@
 //!
 //! The raymarch renders into an `Rgba8Unorm` target of its own and `paint` then
 //! draws one textured quad. That costs a pane-sized texture — budgeted at
-//! [`crate::constants::VOLUME_OFFSCREEN_BUDGET_BYTES`] — and buys two things a
+//! [`rustdar_device_profile::constants::VOLUME_OFFSCREEN_BUDGET_BYTES`] — and buys two things a
 //! callback rendering inside egui's own pass cannot have:
 //!
 //! 1. **Resolution independent of pane size.** Fill rate, not shader
@@ -63,11 +63,11 @@
 
 use egui_wgpu::wgpu;
 
-use crate::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
 use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VOLUME_TEXTURE_FORMAT;
 use crate::volume::blue_noise::{BLUE_NOISE_EDGE, blue_noise_tile};
 use crate::volume::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
+use rustdar_device_profile::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
 use staging::VolumeStaging;
 
 /// The WGSL every volume pipeline is built from.
@@ -909,7 +909,7 @@ impl VolumePipelines {
     /// win is not "allocation is slow", it is this one block never being
     /// reusable.
     ///
-    /// See [`crate::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME`].
+    /// See [`rustdar_device_profile::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME`].
     #[allow(clippy::too_many_arguments)]
     pub fn upload_volume_at(
         &self,
@@ -1947,7 +1947,7 @@ fn coarse_cells(cells: [u32; 3]) -> [u32; 3] {
 /// settles at the largest shape the process has uploaded and no upload after
 /// the first pays for pages again. That makes the residency permanent rather
 /// than transient, which
-/// [`crate::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] states as the cost.
+/// [`rustdar_device_profile::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] states as the cost.
 ///
 /// The returned slice is the **used prefix**, not the whole buffer: a grid
 /// smaller than its predecessor leaves that predecessor's texels in the tail,

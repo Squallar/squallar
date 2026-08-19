@@ -1,6 +1,6 @@
 use super::*;
 use crate::budget::{self, Budgets, DeviceProfile};
-use rustdar_radar::types::{IMAGE_SIZE, WASM_IMAGE_SIZE};
+use rustdar_radar::types::IMAGE_SIZE;
 use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// Every device class this workspace builds for, exactly once — as the
@@ -34,39 +34,6 @@ fn profiles() -> [DeviceProfile; 3] {
 fn arms() -> [Budgets; 3] {
     profiles().map(|profile| budget::resolve(&profile))
 }
-
-/// Bytes one resident voxel grid costs on this arm.
-///
-/// Read from `volume::raymarch::resident_grid_bytes` rather than recomputed, so
-/// the budget is checked against the arithmetic the upload path allocates by —
-/// every mip level the device lays the texture out with, the colour table's own
-/// texture, and the jitter tile created beside it. The earlier hand-written
-/// product left the coarse level out of the budget entirely, and the version
-/// after that charged the two levels the descriptor names rather than the whole
-/// pyramid the driver reserves.
-///
-/// Four bytes per cell is not an assumption to be tidied away: the format is
-/// `Rg16Float` because the march reconstructs `R̄ / Ḡ` from a
-/// coverage-premultiplied index and a coverage channel — which needs a filter
-/// error that scales with the sample rather than with the format, or the
-/// quotient is wrong by the whole palette at an echo edge — and because
-/// `Rg16Float` is *filterable* under `Features::empty()` where `R32Float` is
-/// not.
-fn volume_bytes(arm: &Budgets) -> usize {
-    Budgets::volume_bytes(arm).expect("a shipped grid shape cannot overflow")
-}
-
-/// Frames — and so resident voxel grids — a 3D loop holds, per arm, in
-/// [`profiles`] order.
-///
-/// **Literals.** They used to be `MAX_LOOP_VOLUME_FRAMES`, a `cfg` cascade with
-/// no runtime consumer that restated what `LoopPool::plan` already computes.
-/// The constant is retired; the count is the planner's answer,
-/// `loop_pool::tests::the_pool_reproduces_the_shipped_3d_frame_count` binds the
-/// planner to these same figures, and
-/// [`the_3d_loop_holds_exactly_what_it_marches`] binds them to the budget
-/// arithmetic they came out of.
-const SHIPPED_VOLUME_LOOP_FRAMES: [usize; 3] = [11, 17, 14];
 
 /// The section raster is `SECTION_WIDTH` by half of it, which is what makes
 /// [`Budgets::section_frame_bytes`] a reconstruction rather than a guess.
@@ -211,114 +178,6 @@ fn a_section_loop_frame_is_half_a_plan_view_one() {
     }
 }
 
-/// The **3D volume** row of the loop table, executed.
-///
-/// The third loop kind, and the one whose frames are resident inputs rather
-/// than cached pictures — so this is a claim about GPU texture memory that is
-/// actually enforced at runtime by `VolumeStore::enforce_budget`, unlike the
-/// two rows above.
-#[test]
-fn volume_loop_grids_fit_the_application_texture_budget() {
-    for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
-        let total = frames * volume_bytes(&arm);
-        assert!(
-            total <= arm.volume_loop_bytes(),
-            "{}: {} resident grids x {} B = {:.1} MiB, over the {} MiB budget",
-            arm.name,
-            frames,
-            volume_bytes(&arm),
-            total as f64 / (1024.0 * 1024.0),
-            arm.volume_loop_bytes() / (1024 * 1024),
-        );
-    }
-}
-
-/// **A full 3D loop leaves room for one live 3D grid beside it.**
-///
-/// Fitting the set alone is not enough, and the ~1.5% of headroom desktop had
-/// under it was not slack — it was a defect one ordinary layout away. A second
-/// 3D pane showing a live volume is one more grid in the same
-/// application-wide store, and `VolumeStore::enforce_budget` evicts **oldest
-/// first**: the loop started first, so what goes is the loop's frame 0, not
-/// the live grid that pushed the store over. The dispatcher then re-plans that
-/// frame on the very next pass, rebuilds it (a frame-thread extraction and an
-/// ~89 ms worker resample), and the store evicts frame 1 to make room. That is
-/// a permanent rebuild treadmill with a hot CPU and a loop visibly missing a
-/// frame as its only symptoms.
-///
-/// So the frame count is chosen against `budget − one grid`, which
-/// `the_3d_loop_holds_exactly_what_it_marches` computes. This is the same
-/// claim stated as the property rather than as the formula, because it is the
-/// property that is load-bearing: the formula could be changed to agree with a
-/// wrong count and this would still fail.
-///
-/// It bounds the *reachable* layouts rather than every conceivable one — a
-/// third distinct live grid is over the line again, and the eviction's answer
-/// there is the same. What it buys is that the common two-pane case never
-/// reaches the eviction at all.
-#[test]
-fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
-    for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
-        let resident = frames * volume_bytes(&arm);
-        assert!(
-            resident + volume_bytes(&arm) <= arm.volume_loop_bytes(),
-            "{}: {} resident grids + one live grid = {:.1} MiB against a {} MiB \
-             budget, so a 3D loop beside a live 3D pane makes the store evict \
-             the loop's own oldest frame and rebuild it for ever",
-            arm.name,
-            frames,
-            (resident + volume_bytes(&arm)) as f64 / (1024.0 * 1024.0),
-            arm.volume_loop_bytes() / (1024 * 1024),
-        );
-    }
-}
-
-/// A 3D loop holds exactly what it marches: the frame list **is** the resident
-/// set.
-///
-/// The other two loop kinds hold `MAX_LOOP_FRAMES` and texture
-/// `MAX_LOOP_RENDER_BUDGET` of them, re-rendering as the playhead walks back
-/// into a window it had left. Re-entering a resident 3D window costs ~140 ms
-/// against a 200 ms interval at `DEFAULT_LOOP_SPEED_FPS` and 33 ms at
-/// `MAX_LOOP_SPEED_FPS`, so that treadmill does not close here.
-///
-/// What this pins is that a 3D loop's count is *one* number rather than a held
-/// count and a resident count that could drift apart — and that it is at or
-/// under the budget the arm above just checked, with no second number in
-/// between. The dispatcher reads `LoopAllocation::volume_frames` for both, and
-/// `app_render::volume_loop_tests` drives it end to end.
-#[test]
-fn the_3d_loop_holds_exactly_what_it_marches() {
-    for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
-        assert!(frames >= 2, "{}: a one-frame loop is not a loop", arm.name,);
-        // The frame count is the tighter of two bounds, computed rather than
-        // restated, and it is an *equality* — a list shorter than both bounds
-        // allow is history thrown away for nothing, and a longer one is the
-        // treadmill this loop kind cannot afford.
-        //
-        //  * what the byte budget admits **beside one live grid**, which binds
-        //    desktop (14 of the 36 frames a plan-view loop may texture). The
-        //    subtracted grid is not padding: see
-        //    `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` for the
-        //    layout it is there for and what happens without it.
-        //  * `MAX_LOOP_RENDER_BUDGET`, which binds wasm32 and mobile — a 3D
-        //    loop is not licensed to hold *more* history than the plan-view
-        //    loop beside it on the same device just because its grids happen
-        //    to be small there.
-        let admits =
-            arm.volume_loop_bytes().saturating_sub(volume_bytes(&arm)) / volume_bytes(&arm);
-        assert_eq!(
-            frames,
-            admits.min(arm.loop_render_budget),
-            "{}: the budget admits {admits} grids and the loop render budget is \
-             {}, so the frame list should be their minimum, not {}",
-            arm.name,
-            arm.loop_render_budget,
-            frames,
-        );
-    }
-}
-
 /// The whole application's GPU texture memory, against a ceiling — the line
 /// nothing drew before, because the pane count and the per-pane budgets live in
 /// different crates.
@@ -360,69 +219,6 @@ fn the_whole_application_fits_its_gpu_ceiling() {
             total / (1024 * 1024),
             arm.app_texture_ceiling_bytes / (1024 * 1024),
         );
-    }
-}
-
-/// The store's bound is what the sum above charges, on the arithmetic the
-/// application actually runs rather than on the reading of it.
-///
-/// `the_whole_application_fits_its_gpu_ceiling` charges `pool + floor` because
-/// that is the maximum of `pool − v·share + max(v·share, floor)` over the
-/// reachable `v`. A closed-form claim like that is exactly the kind that stays
-/// written down while the code underneath it moves, so it is swept here against
-/// `LoopPool::plan` and `LoopAllocation::volume_reserve_bytes` themselves, over
-/// every mix of loop kinds each arm's pane count admits and at both ends of the
-/// pool.
-#[test]
-fn the_volume_store_floor_is_the_widest_the_override_can_open() {
-    use crate::loop_pool::{LoopDemand, LoopFrameModel, LoopPool, LoopPoolLimits};
-
-    for arm in arms() {
-        let model = LoopFrameModel {
-            plan_view: arm.loop_frame_bytes(),
-            section: arm.section_frame_bytes(),
-            grid: volume_bytes(&arm),
-            render_budget: arm.loop_render_budget,
-        };
-        let limits = LoopPoolLimits {
-            floor: arm.loop_pool_floor_bytes,
-            ceiling: arm.loop_pool_ceiling_bytes,
-        };
-        for pool_bytes in [arm.loop_pool_floor_bytes, arm.loop_pool_ceiling_bytes] {
-            let pool = LoopPool::new(pool_bytes, limits);
-            for plan_view_loops in 0..=arm.max_panes {
-                for section_loops in 0..=(arm.max_panes - plan_view_loops) {
-                    for volume_sets in 0..=(arm.max_panes - plan_view_loops - section_loops) {
-                        let demand = LoopDemand {
-                            plan_view_loops,
-                            section_loops,
-                            volume_sets,
-                        };
-                        let allocation = pool.plan(model, demand);
-                        // What `setup_egui_frame` hands `enforce_budget`.
-                        let store = allocation
-                            .volume_reserve_bytes()
-                            .max(arm.volume_loop_bytes());
-                        // What the raster loops may cache beside it. Nothing at
-                        // runtime takes these back, so the division is the bound.
-                        let raster =
-                            plan_view_loops * allocation.plan_view_frames * model.plan_view
-                                + section_loops * allocation.section_frames * model.section;
-                        assert!(
-                            raster + store <= arm.loop_pool_ceiling_bytes + arm.volume_loop_bytes(),
-                            "{}: {demand:?} at a {} MiB pool caches {} MiB of raster \
-                             frames beside a {} MiB store bound — over the \
-                             `pool ceiling + volume-store floor` the app ceiling \
-                             charges",
-                            arm.name,
-                            pool.bytes() / (1024 * 1024),
-                            raster / (1024 * 1024),
-                            store / (1024 * 1024),
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -708,56 +504,6 @@ fn the_render_budget_is_what_bounds_the_textured_frames() {
         // the compile-time block next to the constants only sees one arm.
         assert!(arm.loop_render_budget > 0, "{}", arm.name);
         assert!(arm.concurrent_renders > 0, "{}", arm.name);
-    }
-}
-
-/// Every arm is held to its own volume budget, exactly as
-/// `one_loop_at_the_floor_gets_the_whole_span_budget` holds it to its
-/// loop budget.
-#[test]
-fn the_volume_grid_fits_the_target_texture_budget() {
-    for arm in arms() {
-        let total = volume_bytes(&arm);
-        assert!(
-            total <= arm.volume_texture_bytes,
-            "{}: a {:?} grid plus a {VOLUME_LUT_BYTES} B table is {total} B, \
-                 over the {} B budget",
-            arm.name,
-            arm.grid_cells,
-            arm.volume_texture_bytes,
-        );
-    }
-}
-
-/// The sibling of `the_budget_is_not_slack_enough_to_hide_a_doubling`, and for
-/// the same reason: a ceiling several times the real figure passes the check
-/// above while permitting any axis to be silently doubled.
-///
-/// Doubling one axis is the realistic regression here, not doubling the whole
-/// grid — and it is exactly what this catches, because doubling any single
-/// axis doubles the total.
-///
-/// **What it no longer covers, since the grid's shape became a runtime
-/// answer.** `arm.grid_cells` is the *budget* triple now, not the shape the frontend
-/// requests, so this is a claim about two constants: that the ceiling is snug
-/// against the budget. It is still worth making — a loose ceiling is how a term
-/// inside it doubles unnoticed — but the tripwire half, the one that would have
-/// caught the Android build asking for 2.4× what it budgeted, has moved to
-/// [`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`],
-/// which sweeps what a device is actually asked for against what its arm was
-/// sized at. Neither is redundant: this one binds the ceiling to the budget,
-/// that one binds the request to the budget.
-#[test]
-fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
-    for arm in arms() {
-        let total = volume_bytes(&arm);
-        assert!(
-            total * 2 > arm.volume_texture_bytes,
-            "{}: budget {} B is more than twice the actual {total} B — it \
-                 would not catch a doubled grid axis",
-            arm.name,
-            arm.volume_texture_bytes,
-        );
     }
 }
 
@@ -1130,50 +876,6 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
     }
 }
 
-/// The web image fits what a browser is *guaranteed* to accept.
-///
-/// `rustdar_radar` states the 2048 floor as a literal because it has no wgpu
-/// dependency and must not grow one — it hands finished RGBA buffers to the
-/// crate that owns the GPU. This is that crate, so this is where the floor
-/// gets checked against wgpu's own downlevel limits rather than against a
-/// number someone typed. Without it, `WEBGL2_MAX_TEXTURE_DIMENSION_2D` could
-/// be raised to accommodate an over-large image instead of the image being
-/// the thing that gives.
-#[test]
-fn the_web_image_fits_the_texture_size_webgl2_guarantees() {
-    let guaranteed = wgpu::Limits::downlevel_webgl2_defaults().max_texture_dimension_2d;
-    assert_eq!(
-        rustdar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D as u32,
-        guaranteed,
-        "rustdar_radar's copy of the WebGL2 2D floor has drifted from wgpu's"
-    );
-    assert!(
-        WASM_IMAGE_SIZE as u32 <= guaranteed,
-        "the web radar image is {WASM_IMAGE_SIZE} px, over the {guaranteed} px \
-             2D texture WebGL2 guarantees — every browser render would fail"
-    );
-    // The web arm sits *on* the guarantee rather than under it, and that is
-    // the decision: `max_texture_dimension_2d` bounds each texture's each
-    // axis, not a frame's total, and the overlay textures beside the radar
-    // frame are sized from the viewport and clamped against the same limit
-    // independently (`plan_overlay_texture`). The earlier ×2 headroom rule
-    // was a policy resting on a misreading of the limit.
-    assert_eq!(WASM_IMAGE_SIZE as u32, guaranteed);
-    // Which is also why the web arm's long-range ceiling has to *be* the
-    // guarantee: there is nothing above it to grow into, so `raster_side_px`
-    // answers one size on the web and every browser render is exactly the size
-    // every browser must accept. Inert in the *side* only — the extent is the
-    // data's on every target, so a browser draws a 300.11 km Doppler cut on
-    // these 2048 pixels at 3.4121 px/km rather than the floor's 4.4522.
-    assert_eq!(
-        WASM_LONG_RANGE_IMAGE_SIZE as u32, guaranteed,
-        "the web long-range ceiling is over what WebGL2 guarantees, so a \
-             long-reaching sweep would fail to upload in some browser"
-    );
-    // And the web loop frame is under it by construction.
-    assert!(WASM_LOOP_IMAGE_SIZE as u32 <= guaranteed);
-}
-
 /// The reference pane fits this target's offscreen budget **at its own
 /// quality ceiling**, i.e. without being degraded to get there.
 ///
@@ -1185,7 +887,7 @@ fn the_web_image_fits_the_texture_size_webgl2_guarantees() {
 /// this target is meant to render at full size.
 #[test]
 fn the_reference_pane_fits_the_target_offscreen_budget_undegraded() {
-    let fitted = crate::volume::quality::reference_offscreen();
+    let fitted = crate::quality::reference_offscreen();
     assert!(
         fitted.bytes() <= VOLUME_OFFSCREEN_BUDGET_BYTES,
         "a {:?} offscreen is {} B, over the {VOLUME_OFFSCREEN_BUDGET_BYTES} \
@@ -1195,7 +897,7 @@ fn the_reference_pane_fits_the_target_offscreen_budget_undegraded() {
     );
     assert_eq!(
         fitted.quality,
-        crate::volume::quality::PLATFORM_CEILING,
+        crate::quality::PLATFORM_CEILING,
         "the {VOLUME_OFFSCREEN_REFERENCE_PANE_PX:?} reference pane cannot be \
              rendered at this target's own quality ceiling within a \
              {VOLUME_OFFSCREEN_BUDGET_BYTES} B budget, so the ceiling describes \
@@ -1210,7 +912,7 @@ fn the_reference_pane_fits_the_target_offscreen_budget_undegraded() {
 /// budget several times the real number would absorb without a word.
 #[test]
 fn the_offscreen_budget_is_not_slack_enough_to_hide_a_doubling() {
-    let total = crate::volume::quality::reference_offscreen().bytes();
+    let total = crate::quality::reference_offscreen().bytes();
     assert!(
         total * 2 > VOLUME_OFFSCREEN_BUDGET_BYTES,
         "budget {VOLUME_OFFSCREEN_BUDGET_BYTES} B is more than twice the \
@@ -1234,7 +936,7 @@ fn the_offscreen_budget_is_not_slack_enough_to_hide_a_doubling() {
 /// reference pane costs there.
 #[test]
 fn every_offscreen_budget_arm_pays_for_its_own_reference_pane() {
-    use crate::volume::quality::{
+    use crate::quality::{
         DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING,
     };
 
@@ -1337,39 +1039,6 @@ fn the_compiled_offscreen_budget_is_one_of_the_named_arms() {
         "VOLUME_OFFSCREEN_BUDGET_BYTES is {VOLUME_OFFSCREEN_BUDGET_BYTES}, \
              which is none of the three named arms"
     );
-}
-
-/// The WebGL2 3D-texture floor is wgpu's figure, not a hand-written 256.
-///
-/// Comparing the *value* against wgpu proves nothing on its own: a
-/// `= 256;` literal satisfies that assertion exactly, because 256 is what
-/// wgpu says today. What makes the constant honest is where it comes from, and
-/// only the source says that. The realistic regression is someone replacing
-/// the derivation with the literal in order to drop the `wgpu` import from
-/// this file — at which point the doc comment above becomes false and the
-/// bound stops tracking the limits the device request is held to.
-#[test]
-fn the_webgl2_3d_limit_is_derived_from_wgpu_rather_than_written_out() {
-    let source = include_str!("../constants.rs");
-    let definition = source
-        .split_once("pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =")
-        .and_then(|(_, rest)| rest.split_once(';'))
-        .map(|(value, _)| value)
-        .expect("WEBGL2_MAX_TEXTURE_DIMENSION_3D is no longer defined here");
-    assert!(
-        definition.contains("downlevel_webgl2_defaults()")
-            && definition.contains("max_texture_dimension_3d"),
-        "WEBGL2_MAX_TEXTURE_DIMENSION_3D is defined as `{}`, which does not \
-             read wgpu's own WebGL2 downlevel limits. A literal cannot drift \
-             *with* wgpu, so it stops describing what the device request is held \
-             to the moment wgpu revises the figure.",
-        definition.trim()
-    );
-
-    // And 256 is still what that derivation yields. Separate assertion so a
-    // wgpu bump that raised the floor is a visible failure to be reviewed,
-    // rather than a grid bound that silently loosened.
-    assert_eq!(WEBGL2_MAX_TEXTURE_DIMENSION_3D, 256);
 }
 
 /// [`VOLUME_GRID_CELLS`] and `rustdar_radar::voxel`'s named shapes are two
@@ -1527,54 +1196,6 @@ const ALL_ARMS: [(&str, [u32; 3]); 3] = [
     ("desktop", DESKTOP_VOLUME_GRID_CELLS),
 ];
 
-/// **The shape the frontend requests never costs more than the budget it was
-/// computed against — on any device.**
-///
-/// # What this replaces, and why it is stronger
-///
-/// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` asserted that
-/// each arm's ceiling was under twice what it bounds, so a silently doubled
-/// grid axis could not hide inside the headroom. That test is the tripwire for
-/// the shipped Android overrun — a build budgeting 192×192×96 while the radar
-/// was asked for 256×256×128, 2.4× over — and it went **vacuous** the moment
-/// the shape stopped being a constant: it compares two constants, and the thing
-/// that can now be wrong is a *function of the device*.
-///
-/// So it is re-expressed rather than deleted, against the property the whole
-/// rebalance rests on: rearranging a budget's cells is free because there are
-/// never more of them. For every arm and every limit an adapter might report,
-/// what is requested must fit the budget every allocation was sized against —
-/// in cells, and in the bytes those cells actually cost with the coarse level
-/// beside them. That is stronger than the doubling test in two directions: it
-/// catches any overrun rather than only a factor of two, and it catches one
-/// that only appears on some devices.
-#[test]
-fn the_requested_shape_never_outgrows_the_budget_it_was_computed_against() {
-    for (name, budget) in ALL_ARMS {
-        let budget_cells = budget.iter().map(|&n| n as usize).product::<usize>();
-        let budget_bytes = crate::volume::raymarch::grid_bytes_with_mips(budget)
-            .expect("a shipped budget cannot overflow");
-        for limit in REPORTED_LIMITS {
-            let shape = rustdar_radar::voxel::shape_for_budget(shape_of(budget), limit as usize);
-            let cells = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
-            assert!(
-                shape.cells() <= budget_cells,
-                "{name} on a {limit}-reporting device: {cells:?} is {} cells \
-                 against the {budget_cells} this target budgeted for",
-                shape.cells(),
-            );
-            let bytes = crate::volume::raymarch::grid_bytes_with_mips(cells)
-                .expect("a derived shape cannot overflow");
-            assert!(
-                bytes <= budget_bytes,
-                "{name} on a {limit}-reporting device: {cells:?} costs \
-                 {bytes} B of texture against the {budget_bytes} B \
-                 {budget:?} was budgeted at",
-            );
-        }
-    }
-}
-
 /// A device is never asked for an axis it did not say it could hold.
 ///
 /// The runtime half of the guarantee the const assert in `constants.rs` used to
@@ -1628,190 +1249,6 @@ fn a_shape_derived_for_a_device_at_the_guarantee_stays_within_it() {
             );
         }
     }
-}
-
-/// `voxel::HORIZONTAL_AXIS_MULTIPLE` is the copy alignment expressed in cells,
-/// and this is the only crate that can say so.
-///
-/// `rustdar-radar` rounds the grid's horizontal axis to 64 and documents why —
-/// `copy_buffer_to_texture` holds every row to
-/// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`, and the staging ring's `PlaneLayout`
-/// pads to it — but it has no `wgpu` to check the arithmetic against. This is
-/// the binding, in the shape `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
-/// already uses for the triples: a number in two crates, tied by name so a
-/// drift fails here rather than as 6% of a permanently resident staging ring
-/// spent on padding.
-#[test]
-fn the_horizontal_axis_multiple_is_the_copy_alignment_in_cells() {
-    assert_eq!(
-        rustdar_radar::voxel::HORIZONTAL_AXIS_MULTIPLE,
-        wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
-            / crate::volume::raymarch::GRID_BYTES_PER_CELL as usize,
-    );
-    // And that the two it is a quotient of are what the doc says, so a change
-    // to either fails by name rather than by cancelling out.
-    assert_eq!(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 256);
-    assert_eq!(crate::volume::raymarch::GRID_BYTES_PER_CELL, 4);
-}
-
-/// `voxel::VERTICAL_AXIS_MULTIPLE` is the depth block a 3D texture is laid out
-/// in, and this is the only crate that can say so.
-///
-/// The twin of the test above, and tied the same way: `rustdar-radar` rounds
-/// the vertical down to 16 and documents why, but it has no texture arithmetic
-/// to check itself against. The binding is deliberately made against the
-/// *charging function* rather than against a second constant — what has to
-/// stay true is that a vertical on the multiple costs what it asks for and one
-/// off it costs a whole block more, which is a property a renamed or retuned
-/// tile constant cannot quietly satisfy.
-#[test]
-fn the_vertical_axis_multiple_is_the_texture_depth_block() {
-    use crate::volume::raymarch::{CoarseLevel, grid_bytes, grid_bytes_at};
-    let multiple = rustdar_radar::voxel::VERTICAL_AXIS_MULTIPLE;
-    // One level, so this is mip 0's own layout with nothing else folded in.
-    let padding = |nz: usize| {
-        let cells = [320, 320, nz as u32];
-        grid_bytes_at(cells, CoarseLevel::Omitted).expect("a swept shape fits")
-            - grid_bytes(cells).expect("a swept shape fits")
-    };
-    let block = 320 * 320 * (multiple - 1) * crate::volume::raymarch::GRID_BYTES_PER_CELL as usize;
-    for k in 1..=4 {
-        assert!(
-            padding(multiple * k) < block,
-            "{} layers is a multiple of {multiple} and is still being padded by \
-             {} B, so the multiple does not describe the layout",
-            multiple * k,
-            padding(multiple * k),
-        );
-        assert!(
-            padding(multiple * k + 1) >= block,
-            "{} layers is one over the multiple and is padded by only {} B, so \
-             rounding the vertical down to {multiple} buys nothing",
-            multiple * k + 1,
-            padding(multiple * k + 1),
-        );
-    }
-    // Both rungs the vertical is chosen at already sit on it, which is what
-    // makes the rounding a constraint on the *leftover* alone.
-    assert_eq!(rustdar_radar::voxel::NZ_PREFERRED % multiple, 0);
-    assert_eq!(rustdar_radar::voxel::NZ_MIN % multiple, 0);
-}
-
-/// The pane mirror's ceiling is the cap squared, four bytes a texel — and the
-/// cap is the one the renderer actually applies.
-///
-/// Three numbers that have to agree across two crates: `MIRROR_MAX_SIDE` is the
-/// side cap the fit falls back to, `VOLUME_MIRROR_BYTES_MAX`'s arms are what the
-/// budget prose claims a mirror costs, and `mirror_plan` is what enforces both.
-/// Spelling the products here means the documented figures cannot drift from the
-/// enforced ones — the failure mode a budget written as a literal always has.
-///
-/// The lower bounds are the real content: these are single allocations for the
-/// whole application, so a future raise has to come past this line rather than
-/// land as a silently bigger texture.
-#[test]
-fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
-    let side = crate::egui_renderer::MIRROR_MAX_SIDE as usize;
-    assert_eq!(
-        WASM_VOLUME_MIRROR_BYTES_MAX,
-        side * side * 4,
-        "the wasm32 budget is not the guaranteed cap squared at four bytes a texel",
-    );
-    assert_eq!(
-        WASM_VOLUME_MIRROR_BYTES_MAX,
-        16 * 1024 * 1024,
-        "the wasm32 mirror's worst case moved. WebGL2 guarantees only a 2048 \
-         side, so this arm is pinned by the device as well as by the budget.",
-    );
-    assert_eq!(
-        MOBILE_VOLUME_MIRROR_BYTES_MAX, WASM_VOLUME_MIRROR_BYTES_MAX,
-        "mobile is held to the same 16 MiB the pre-adaptive design cost, so \
-         landing the rung moved no phone's floor-on memory",
-    );
-    assert_eq!(
-        DESKTOP_VOLUME_MIRROR_BYTES_MAX,
-        64 * 1024 * 1024,
-        "the desktop mirror's worst case moved. It is one allocation for the \
-         whole application, so a change here is a change to the application's \
-         floor-on memory, not to a per-pane cost.",
-    );
-
-    // The tight row of the desktop table: 1440p at the top rung, with no floor
-    // strip under it. If this stops fitting, the prose's headroom claim is
-    // wrong. *With* a strip it no longer fits and the rung is given up — the
-    // deliberate loss `the_strips_verdict_is_the_one_the_table_states` pins.
-    let bytes = |w: usize, h: usize| w * h * 4;
-    assert!(
-        bytes(5120, 2880) <= DESKTOP_VOLUME_MIRROR_BYTES_MAX,
-        "1440p at rung 2 no longer fits the desktop budget",
-    );
-    assert!(
-        bytes(3840 * 4, 2160 * 4) > DESKTOP_VOLUME_MIRROR_BYTES_MAX,
-        "the desktop budget is slack enough to hide a rung-4 4K mirror",
-    );
-
-    // The scale is the only reduction that leaves egui's geometry alone —
-    // `screen_size_in_points` is `size_in_pixels / pixels_per_point`, so both
-    // must move together. A cap applied to one and not the other would scale
-    // the frame's vertices instead of its sampling rate. That argument is about
-    // a quotient, so it is direction-free: the rows below check it upwards too.
-    let desktop = crate::egui_renderer::MirrorLimits {
-        max_side: 8192,
-        max_bytes: DESKTOP_VOLUME_MIRROR_BYTES_MAX,
-    };
-    // Points, not pixels: `mirror_plan` sizes a region of egui's own space.
-    // 1280x720 points at 1.5 is a 1920x1080 frame.
-    let plan = crate::egui_renderer::mirror_plan([1280.0, 720.0], 1.5, 2.0, desktop);
-    assert_eq!(
-        (plan.size_in_pixels, plan.pixels_per_point),
-        ([3840, 2160], 3.0),
-        "a desktop 1080p frame asked for rung 2 must get it, both halves moved",
-    );
-    assert!(!plan.is_degraded() && plan.tile_zoom_bias() == 1);
-    let plan = crate::egui_renderer::mirror_plan([1920.0, 1080.0], 2.0, 2.0, desktop);
-    assert_eq!(
-        (
-            plan.size_in_pixels,
-            plan.pixels_per_point,
-            plan.applied_scale
-        ),
-        ([3840, 2160], 2.0, 1.0),
-        "a 4K frame cannot afford rung 2 and falls back to its own size — an \
-         improvement on the old cap, which halved it to 1920x1080",
-    );
-    assert!(
-        plan.is_degraded() && plan.tile_zoom_bias() == 0,
-        "a degraded plan must not go on fetching a slippy level it cannot show",
-    );
-
-    // The wasm32 arm, where the device's own guarantee binds before the budget.
-    let web = crate::egui_renderer::MirrorLimits {
-        max_side: crate::egui_renderer::MIRROR_MAX_SIDE,
-        max_bytes: WASM_VOLUME_MIRROR_BYTES_MAX,
-    };
-    let plan = crate::egui_renderer::mirror_plan([1280.0, 720.0], 2.0, 2.0, web);
-    assert_eq!(
-        (plan.size_in_pixels, plan.applied_scale),
-        ([1280, 720], 0.5),
-        "the WebGL2 floor still halves a 1440p frame twice, rung or no rung",
-    );
-    assert!(plan.is_degraded() && plan.tile_zoom_bias() == 0);
-
-    // The pre-adaptive helper, unchanged for every frame with no 3D pane on it.
-    let (size, scale) = crate::egui_renderer::mirror_size_for([1920.0, 1080.0], 2.0);
-    assert_eq!((size, scale), ([1920, 1080], 1.0), "a 4K frame halves once");
-    let (size, scale) = crate::egui_renderer::mirror_size_for([1280.0, 720.0], 1.5);
-    assert_eq!(
-        (size, scale),
-        ([1920, 1080], 1.5),
-        "a frame already under the cap is mirrored at its own size",
-    );
-    let (size, _) = crate::egui_renderer::mirror_size_for([8192.0, 8192.0], 1.0);
-    assert!(
-        size[0].max(size[1]) <= crate::egui_renderer::MIRROR_MAX_SIDE
-            && size[0] * size[1] * 4 <= WASM_VOLUME_MIRROR_BYTES_MAX as u32,
-        "a frame far over the cap must halve until it fits, got {size:?}",
-    );
 }
 
 /// The static pane textures the app ceiling does **not** count, named so the
@@ -1905,84 +1342,6 @@ fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
         ),
     ] {
         assert_eq!(raster_side_from_rgba_len(len), None, "{why}");
-    }
-}
-
-/// **The budget table in `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`'s doc is the one
-/// the constants derive.**
-///
-/// Because it stopped being. The desktop row went on reading `13 | 36.001 MiB |
-/// 468.0 MiB | 44.0 MiB` after the mip pyramid was charged for and the frame
-/// count became 12 — prose and code contradicting each other inside one file,
-/// with the prose the half a reader reaches for when deciding whether a frame
-/// count is safe to move. Every other figure in that row was pre-fix too, on
-/// every row.
-///
-/// So the doc is parsed rather than trusted. A figure that drifts fails here
-/// with both numbers, which is the only thing that keeps a hand-written table
-/// honest against a constant it is not computed from.
-///
-/// The `frames` column is compared against [`SHIPPED_VOLUME_LOOP_FRAMES`]
-/// rather than against a constant of its own, because there is no longer a
-/// constant of its own: `MAX_LOOP_VOLUME_FRAMES` and its three named arms had
-/// no runtime consumer — `LoopPool::plan` computed the number and the cascade
-/// restated it — and are retired. This test and
-/// `the_3d_loop_holds_exactly_what_it_marches` are between them what hold those
-/// literals to the budget arithmetic they came out of.
-///
-/// The decimals are load-bearing rather than cosmetic: the cells are compared
-/// as **strings**, so `{:.3}` on the texture column and `{:.2}` on the two
-/// derived from it are part of what the table has to say, and a row rounded to
-/// one place fails here.
-#[test]
-fn the_loop_budget_table_is_the_one_the_constants_derive() {
-    const MIB: f64 = 1024.0 * 1024.0;
-    // Anchored on this table's own header: `constants.rs` carries a dozen
-    // tables keyed by target name, and matching on the names alone reads all of
-    // them.
-    const HEADER: &str = "| target  | frames | 3D texture | resident  | headroom | share   |";
-    let source = include_str!("../constants.rs");
-    let rows: Vec<Vec<String>> = source
-        .lines()
-        .map(|line| line.trim().trim_start_matches("///").trim())
-        .skip_while(|line| *line != HEADER)
-        .skip(2) // the header and the alignment rule
-        .take_while(|line| line.starts_with('|'))
-        .map(|row| {
-            row.split('|')
-                .map(|cell| cell.trim().replace(" MiB", ""))
-                .filter(|cell| !cell.is_empty())
-                .collect()
-        })
-        .collect();
-    assert_eq!(
-        rows.len(),
-        3,
-        "the budget table is no longer three target rows this can read: {rows:?}",
-    );
-
-    for ((arm, frames), row) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES).zip(rows) {
-        assert_eq!(
-            row[0], arm.name,
-            "the table's rows are out of order: {row:?}"
-        );
-        let grid = volume_bytes(&arm);
-        let resident = grid * frames;
-        let expected = [
-            arm.name.to_string(),
-            frames.to_string(),
-            format!("{:.3}", grid as f64 / MIB),
-            format!("{:.2}", resident as f64 / MIB),
-            format!("{:.2}", (arm.volume_loop_bytes() - resident) as f64 / MIB),
-            format!("{}", arm.volume_loop_bytes() / (1024 * 1024)),
-        ];
-        assert_eq!(
-            row, expected,
-            "the {} row of the budget table has drifted from what the constants \
-             derive — the table is what a reader consults before moving a frame \
-             count, so it is the half that has to be right",
-            arm.name,
-        );
     }
 }
 

@@ -1,8 +1,8 @@
 use crate::channels::{Level3Response, OverlayRenderResponse, ScanData, ScanResponse};
-use crate::constants::LOOP_IMAGE_SIZE;
 use crate::render_dispatch::RenderGuard;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
+use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
@@ -2001,7 +2001,7 @@ impl super::App {
                             // loop budget.
                             // See `JobRequest::geometry`.
                             crate::offload::ceiling_only_geometry(
-                                crate::constants::LOOP_IMAGE_SIZE as u32,
+                                rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
                             ),
                         ))
                     }
@@ -2029,7 +2029,7 @@ impl super::App {
                         },
                         // A loop frame, so the loop size — see the Level II arm.
                         crate::offload::ceiling_only_geometry(
-                            crate::constants::LOOP_IMAGE_SIZE as u32,
+                            rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
                         ),
                     ))
                 }
@@ -2281,7 +2281,7 @@ impl super::App {
     /// `extract` closure inline for the same reason: on wasm the volume is only
     /// reachable from the main thread, and the job wire carries a `RenderInput`,
     /// not a `Scan`). What is new is the *count*, and that is why the caller
-    /// dispatches at most [`crate::constants::MAX_LOOP_SECTION_CUTS_PER_FRAME`]
+    /// dispatches at most [`rustdar_device_profile::constants::MAX_LOOP_SECTION_CUTS_PER_FRAME`]
     /// of these per frame: measured on a real VCP-212 volume the extraction is
     /// ~1.0 ms and the rasterization ~6.1 ms, so the frame thread pays about
     /// what one live re-cut already costs it and the expensive half is off it
@@ -2570,7 +2570,7 @@ fn append_polled_frame_to_loops(
     site: &str,
     timestamp: chrono::NaiveDateTime,
     allocation: crate::loop_pool::LoopAllocation,
-    budgets: &crate::budget::Budgets,
+    budgets: &rustdar_device_profile::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
         let held = super::render::loop_frames_held(allocation, &pane.loop_state, budgets);

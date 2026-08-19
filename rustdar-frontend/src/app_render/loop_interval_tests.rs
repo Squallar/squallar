@@ -1,5 +1,7 @@
 use super::loop_interval;
-use crate::constants::{DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS};
+use rustdar_device_profile::constants::{
+    DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS,
+};
 
 /// A stored speed the UI cannot produce must not take the app down.
 ///

@@ -54,7 +54,8 @@
 //!
 //! [`GradientShading::On`] now selects the whole **cloud look**: gradient
 //! lighting, the mip-blended smooth reconstruction, and half-cell steps
-//! (`volume::bridge::{CLOUD_RECONSTRUCTION_LOD, CLOUD_STEP_CELLS}`). The
+//! (rustdar-frontend's `volume::bridge::{CLOUD_RECONSTRUCTION_LOD,
+//! CLOUD_STEP_CELLS}`). The
 //! half-cell step is the expensive part — roughly twice the samples — and it
 //! is what takes the jitter's per-step opacity residual below the eight-bit
 //! level. `Off` is unchanged: the raw trilinear field at one-cell steps, the
@@ -91,10 +92,8 @@
 //! `cfg!` inside it can only ever be tested on the arm the test runner was
 //! built for — and the arms that matter most here are the two no CI row runs a
 //! test binary for. Passing the ceiling in makes every arm reachable from one
-//! host test. `volume::disposition` already uses this shape for the same
-//! reason.
-
-use egui_wgpu::wgpu;
+//! host test. rustdar-frontend's `volume::disposition` already uses this
+//! shape for the same reason.
 
 use crate::constants::{VOLUME_OFFSCREEN_BUDGET_BYTES, VOLUME_OFFSCREEN_REFERENCE_PANE_PX};
 
@@ -235,20 +234,6 @@ pub enum DeviceClass {
 }
 
 impl DeviceClass {
-    /// Classify what the adapter says it is.
-    ///
-    /// Exhaustive on purpose: a new `DeviceType` variant should be a compile
-    /// error here, not a silent fall into `Unknown`.
-    pub fn from_device_type(device_type: wgpu::DeviceType) -> Self {
-        match device_type {
-            wgpu::DeviceType::DiscreteGpu => Self::Discrete,
-            wgpu::DeviceType::IntegratedGpu => Self::Integrated,
-            wgpu::DeviceType::VirtualGpu => Self::Virtual,
-            wgpu::DeviceType::Cpu => Self::Software,
-            wgpu::DeviceType::Other => Self::Unknown,
-        }
-    }
-
     /// What this class would pick with no platform ceiling over it.
     ///
     /// The numbers behind each row are in the module doc, and every degraded
@@ -339,9 +324,11 @@ pub const PLATFORM_CEILING: VolumeQuality = DESKTOP_PLATFORM_CEILING;
 /// `ceiling` is a parameter rather than [`PLATFORM_CEILING`] read inline — see
 /// the module doc for why.
 ///
-/// Called once per renderer, from `App::install_volume_bridge`, as
-/// `select(DeviceClass::from_device_type(adapter.get_info().device_type),
-/// PLATFORM_CEILING)`. The result is fixed for the life of that renderer — a
+/// Called once per renderer, from rustdar-frontend's
+/// `App::install_volume_bridge`, as `select(device_class_of(adapter
+/// .get_info().device_type), PLATFORM_CEILING)` — `device_class_of` is the
+/// frontend's wgpu-touching classifier, kept above this crate so the floor
+/// never names wgpu. The result is fixed for the life of that renderer — a
 /// device does not change class — and what varies per frame is the pane's size,
 /// which [`VolumeQuality::fit`] applies on top and which may step the
 /// resolution rung down again.
@@ -459,6 +446,6 @@ pub fn reference_offscreen() -> FittedOffscreen {
     )
 }
 
-#[path = "volume_quality/tests.rs"]
+#[path = "quality/tests.rs"]
 #[cfg(test)]
 mod tests;

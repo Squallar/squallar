@@ -1,6 +1,6 @@
 //! What one raymarched frame costs on this GPU, measured rather than modelled.
 //!
-//! `volume_quality.rs` carries Spike 0a's cost table (0.774 ms at 1440 x 900 on
+//! rustdar-device-profile's `quality.rs` carries Spike 0a's cost table (0.774 ms at 1440 x 900 on
 //! an RTX 3090, 96 steps, shaded) and extrapolates every other device from it.
 //! This harness is how such a number is measured again after the march changes:
 //! it renders **a real Level II volume** through the production pipeline with

@@ -87,7 +87,7 @@ fn a_real_plan_view_render_lands_on_the_same_picture() {
     let straight = rustdar_radar::render::render_from_sized(&plan.input, side_ceiling_px)
         .expect("the fixture sweep rasterizes")
         .image;
-    let side = crate::constants::raster_side_from_rgba_len(straight.len())
+    let side = rustdar_device_profile::constants::raster_side_from_rgba_len(straight.len())
         .expect("the rasterizer answers at a side this build makes");
 
     let frame = execute(&request)

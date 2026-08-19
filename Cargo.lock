@@ -4183,6 +4183,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustdar-device-profile"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rustdar-radar",
+ "serde_json",
+]
+
+[[package]]
 name = "rustdar-egui"
 version = "0.1.0"
 dependencies = [
@@ -4193,6 +4202,7 @@ dependencies = [
  "log",
  "lru",
  "reqwest 0.13.4",
+ "rustdar-device-profile",
  "rustdar-geo",
  "rustdar-gps",
  "rustdar-kv",
@@ -4223,6 +4233,7 @@ dependencies = [
  "nexrad-model",
  "pollster",
  "reqwest 0.13.4",
+ "rustdar-device-profile",
  "rustdar-egui",
  "rustdar-geo",
  "rustdar-gps",

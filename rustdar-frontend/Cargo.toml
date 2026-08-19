@@ -15,6 +15,9 @@ edition.workspace = true
 [dependencies]
 web-time = { workspace = true }
 rustdar-egui = { workspace = true }
+# The device-class policy floor: budget cascades + the profile->budgets
+# resolver moved down at WO-RD; this crate reads its budgets from below.
+rustdar-device-profile = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 # The job-boundary vocabulary (DescribedJob, JobCodec, JobGeometry) and the

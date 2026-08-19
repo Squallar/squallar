@@ -485,7 +485,10 @@ fn a_listing_that_never_returns_stops_exempting_its_site() {
     }
 
     // Just inside the bound: still exempt.
-    age_listing(&mut app, crate::constants::LOOP_LISTING_GRACE.as_secs() / 2);
+    age_listing(
+        &mut app,
+        rustdar_device_profile::constants::LOOP_LISTING_GRACE.as_secs() / 2,
+    );
     app.evict_unshown_scans();
     assert_eq!(
         app.loop_mgr.cached_scan_count(SITE),
@@ -495,7 +498,10 @@ fn a_listing_that_never_returns_stops_exempting_its_site() {
     );
 
     // Past it: the exemption is gone, and the loop still names no frame.
-    age_listing(&mut app, crate::constants::LOOP_LISTING_GRACE.as_secs() + 1);
+    age_listing(
+        &mut app,
+        rustdar_device_profile::constants::LOOP_LISTING_GRACE.as_secs() + 1,
+    );
     app.evict_unshown_scans();
     assert!(
         app.gui

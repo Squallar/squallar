@@ -1,7 +1,5 @@
 use super::*;
-use crate::volume::quality::{
-    DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING,
-};
+use crate::quality::{DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING};
 
 /// A profile for one shipped bracket, with every runtime field at its most
 /// conservative reading.
@@ -76,7 +74,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             mirror_bytes: WASM_VOLUME_MIRROR_BYTES_MAX,
             render_cache_entries: NON_MOBILE_MAX_RENDER_CACHE_ENTRIES,
             quality_ceiling: WASM_PLATFORM_CEILING,
-            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
+            max_panes: MAX_PANES_DESKTOP,
             app_texture_ceiling_bytes: WASM_APP_TEXTURE_BUDGET_BYTES,
             raster_side_ceiling_px: WASM_RASTER_SIDE_CEILING,
         },
@@ -101,7 +99,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             mirror_bytes: MOBILE_VOLUME_MIRROR_BYTES_MAX,
             render_cache_entries: MOBILE_MAX_RENDER_CACHE_ENTRIES,
             quality_ceiling: MOBILE_PLATFORM_CEILING,
-            max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
+            max_panes: MAX_PANES_MOBILE,
             app_texture_ceiling_bytes: MOBILE_APP_TEXTURE_BUDGET_BYTES,
             raster_side_ceiling_px: MOBILE_RASTER_SIDE_CEILING,
         },
@@ -126,7 +124,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             mirror_bytes: DESKTOP_VOLUME_MIRROR_BYTES_MAX,
             render_cache_entries: NON_MOBILE_MAX_RENDER_CACHE_ENTRIES,
             quality_ceiling: DESKTOP_PLATFORM_CEILING,
-            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
+            max_panes: MAX_PANES_DESKTOP,
             app_texture_ceiling_bytes: DESKTOP_APP_TEXTURE_BUDGET_BYTES,
             raster_side_ceiling_px: DESKTOP_RASTER_SIDE_CEILING,
         },
@@ -174,7 +172,7 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
     assert_eq!(b.offscreen_bytes, VOLUME_OFFSCREEN_BUDGET_BYTES);
     assert_eq!(b.mirror_bytes, VOLUME_MIRROR_BYTES_MAX);
     assert_eq!(b.render_cache_entries, MAX_RENDER_CACHE_ENTRIES);
-    assert_eq!(b.quality_ceiling, crate::volume::quality::PLATFORM_CEILING);
+    assert_eq!(b.quality_ceiling, crate::quality::PLATFORM_CEILING);
     assert_eq!(b.app_texture_ceiling_bytes, APP_TEXTURE_BUDGET_BYTES);
     // And the shape a device at the guarantee is asked for is the one the
     // wasm `cargo check` row's const-assert guards.
@@ -386,35 +384,20 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         total / (1024 * 1024),
     );
 
-    // The grid fits its own budget, in bytes as well as in cells.
-    let grid = b.volume_bytes().expect("a bracketed grid cannot overflow");
-    assert!(
-        grid <= b.volume_texture_bytes,
-        "{from} / {}: a {:?} grid is {grid} B against a {} B budget",
-        b.name,
-        b.grid_cells,
-        b.volume_texture_bytes,
-    );
+    // The grid fits its own budget **in bytes** is no longer asserted here:
+    // the byte figure is the raymarch's arithmetic (`resident_grid_bytes`),
+    // which sits above this crate, so that proof moved to rustdar-frontend's
+    // `volume_raymarch::tests::budget_agreement` at WO-RD
+    // (`the_volume_grid_fits_the_target_texture_budget`). Nothing is lost by
+    // the move: `resolve` spends one promotion on both brackets and `demote`'s
+    // grid rung resets both together, so every reachable
+    // `(grid_cells, volume_texture_bytes)` pair — synthetic and random sweeps
+    // included — is one of the three shipped pairs that test executes.
 
-    // **One live 3D grid beside a looping one, at every grid size a promotion
-    // can reach.** The never-degrade rule `LoopPool::plan` already subtracts a
-    // grid for, and the one a promotion is most likely to break: a grid that
-    // grew without the store growing under it means `enforce_budget` evicts the
-    // loop's own frame 0, which the dispatcher re-plans at ~89 ms of resample,
-    // for ever. The bound is the store's own floor — `volume_loop_bytes` —
-    // because that is what `App::setup_egui_frame` floors the eviction at
-    // whatever the pool has already promised the raster loops beside it.
-    let live_beside_a_loop = (crate::constants::MIN_LOOP_FRAMES_PER_PANE + 1) * grid;
-    assert!(
-        live_beside_a_loop <= b.volume_loop_bytes(),
-        "{from} / {}: a loop at the {}-frame minimum plus one live grid is {} \
-         MiB of {:?} grids against a {} MiB store floor",
-        b.name,
-        crate::constants::MIN_LOOP_FRAMES_PER_PANE,
-        live_beside_a_loop / (1024 * 1024),
-        b.grid_cells,
-        b.volume_loop_bytes() / (1024 * 1024),
-    );
+    // **One live 3D grid beside a looping one** is the other grid-byte
+    // invariant that moved with it: both halves are swept — at every
+    // promotion a bracket can reach, not only the shipped floors — by
+    // `every_reachable_grid_fits_its_budgets_in_bytes` beside the raymarch.
 
     // The raster ceiling is a ceiling and never a *regression*: whatever a
     // promotion or a back-off did to it, a plan view may still reach the size
@@ -812,20 +795,10 @@ fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
          getting this wrong: a handheld browser that reports desktop-class \
          figures is handed a budget handheld hardware already runs",
     );
-    // And the pool it is divided out of moves with it, on the same rung.
-    let pool = |b: &Budgets, p: Promotion| {
-        crate::loop_pool::LoopPool::for_promotion(
-            p,
-            None,
-            crate::loop_pool::LoopPoolLimits::from_budgets(b),
-        )
-        .bytes()
-    };
-    assert!(
-        pool(&promoted, promoted.promotion) > pool(&floor, floor.promotion),
-        "a promoted browser's grids came out of an unpromoted pool, so the \
-         loop pays for the detail in history",
-    );
+    // "And the pool it is divided out of moves with it, on the same rung" is
+    // asserted beside the pool: `LoopPool` sits above this crate, so that half
+    // lives in rustdar-frontend's `loop_pool::tests::budget_agreement`
+    // (`a_promoted_browsers_pool_moves_on_the_same_rung`, WO-RD).
 
     // Neither is promoted past the bracket, and both satisfy every invariant.
     for profile in [&at_the_guarantee, &desktop_class] {
@@ -866,7 +839,7 @@ fn a_software_rasteriser_is_not_promoted_by_what_it_reports() {
 /// blit.
 #[test]
 fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
-    use crate::volume::quality::{ResolutionRung, VolumeQuality};
+    use crate::quality::{ResolutionRung, VolumeQuality};
 
     const FOUR_K: [u32; 2] = [3840, 2160];
     let unpromoted = resolve(&shipped_profile(BudgetLimits::DESKTOP));
@@ -976,7 +949,7 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
 /// only after both.
 #[test]
 fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
-    use crate::volume::quality::{GradientShading, ResolutionRung};
+    use crate::quality::{GradientShading, ResolutionRung};
 
     let stepped = |steps: u32| {
         resolve(&DeviceProfile {
@@ -1067,114 +1040,4 @@ fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
             }
         }
     }
-}
-
-/// **What a machine learned by crashing survives the restart, and reads back as
-/// the same budgets.**
-///
-/// The 1:1 reopen rule, on the one value that must not be lost to the 3 s
-/// autosave timer. A decimal count of rungs in its own key, so a corrupt entry
-/// costs one integer rather than every setting on the next load — and an
-/// unreadable one is the same answer a first launch gets.
-#[test]
-fn a_ladder_position_survives_its_own_config_entry() {
-    use rustdar_kv::MemoryKvStore;
-
-    let store = MemoryKvStore::default();
-    assert_eq!(remembered_steps(Some(&store)), None, "nothing learned yet");
-
-    remember_steps(Some(&store), 2);
-    assert_eq!(remembered_steps(Some(&store)), Some(2));
-    assert_eq!(store.load(BUDGET_MEMO_KEY).as_deref(), Some("2"));
-
-    let reopened = DeviceProfile {
-        class: DeviceClass::Discrete,
-        memo: Some(BudgetMemo {
-            loop_pool_bytes: None,
-            steps_back: remembered_steps(Some(&store)).unwrap_or(0),
-        }),
-        ..shipped_profile(BudgetLimits::DESKTOP)
-    };
-    assert_eq!(resolve(&reopened).steps_back, 2);
-
-    // Anything unreadable is a re-probe rather than a panic or a zero written
-    // over the top of what the machine actually said.
-    store
-        .store(BUDGET_MEMO_KEY, "not a number")
-        .expect("the memory store cannot fail");
-    assert_eq!(remembered_steps(Some(&store)), None);
-    assert_eq!(remembered_steps(None), None);
-}
-
-/// **What five machines get, in the units a user would notice.**
-///
-/// The stage's whole answer on one page, pinned so that a change to any rule
-/// has to come past a table someone can read. Four of the five are real: two
-/// adapters on this project's own RTX 3090 (Vulkan naming it `DiscreteGpu`, GL
-/// naming it `Other`), the Radeon 890M whose browser reading was measured, and
-/// Firefox 153 on the 3090 at its **allocatable** 16384 rather than its
-/// reported 32768. The fifth is the WebGL2 guarantee, which is what the web
-/// budgets were derived from and is the honest stand-in for a device this
-/// project has not measured.
-///
-/// The two rows that carry the point are the last two: same binary, same
-/// origin, same backend, same `DeviceClass::Unknown`, and 3.4x the voxels
-/// between them. No `cfg` can express the difference — not coarsely, none.
-#[test]
-fn what_five_real_machines_get() {
-    let row = |limits, class, two_d, three_d| {
-        let profile = DeviceProfile {
-            class,
-            adapter: AdapterCeilings {
-                max_texture_dimension_2d: two_d,
-                max_texture_dimension_3d: three_d,
-            },
-            ..shipped_profile(limits)
-        };
-        let b = resolve(&profile);
-        let pool = crate::loop_pool::LoopPool::for_promotion(
-            b.promotion,
-            None,
-            crate::loop_pool::LoopPoolLimits::from_budgets(&b),
-        )
-        .bytes();
-        (
-            b.promotion,
-            b.grid_cells.iter().map(|&n| n as usize).product::<usize>(),
-            b.offscreen_bytes / (1024 * 1024),
-            pool / (1024 * 1024),
-            b.raster_side_for_adapter(two_d),
-        )
-    };
-    let d = BudgetLimits::DESKTOP;
-    let w = BudgetLimits::WASM;
-
-    // machine                       | rung     | cells     | offscreen | pool | raster
-    assert_eq!(
-        row(d, DeviceClass::Discrete, 32768, 16384),
-        (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
-        "RTX 3090 over Vulkan",
-    );
-    assert_eq!(
-        row(d, DeviceClass::Unknown, 32768, 16384),
-        (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
-        "the same RTX 3090 over GL, where the driver names it `Other` — the \
-         case a class-only rule gets wrong on real hardware",
-    );
-    assert_eq!(
-        row(d, DeviceClass::Integrated, 16384, 8192),
-        (Promotion::Step, 8_388_608, 20, 1152, 8192),
-        "a desktop integrated GPU: promoted by nothing it reports, because \
-         what it reports is capacity and what holds it back is fill rate",
-    );
-    assert_eq!(
-        row(w, DeviceClass::Unknown, 16384, 16384),
-        (Promotion::Ceiling, 3_538_944, 5, 192, 2048),
-        "Firefox 153 on the RTX 3090, at what it will actually allocate",
-    );
-    assert_eq!(
-        row(w, DeviceClass::Unknown, 2048, 256),
-        (Promotion::Floor, 1_048_576, 5, 56, 2048),
-        "a browser at the WebGL2 guarantee, which keeps every byte it had",
-    );
 }
