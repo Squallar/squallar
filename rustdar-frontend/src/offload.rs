@@ -368,17 +368,18 @@ pub(crate) fn drain_deferred_drops(budget: std::time::Duration) -> usize {
 /// payload and its own slice of the envelope. The kinds live with their
 /// pipelines now — the radar and overlays crates' `jobs` modules each
 /// publish their rows as [`rustdar_source::job::JobCodec`]s, composed by
-/// [`crate::job_registry::job_codecs`] — and what remains here is exactly the
+/// `crate::job_registry::job_codecs` — and what remains here is exactly the
 /// pair every kind shares: the type-erased input and the run envelope. The
-/// codec row that owns `job`'s input type ([`row_for`]) is what encodes,
-/// decodes and runs it; this crate's judgment about a described job begins
-/// and ends at that lookup.
+/// codec row that owns `job`'s input type (the private `row_for` lookup) is
+/// what encodes, decodes and runs it; this crate's judgment about a
+/// described job begins and ends at that lookup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobRequest {
     /// What the kind's renderer reads, behind the one type-erased seam: the
     /// kind's own input struct (`RadarPlanJob`, `SitesInput` and their
-    /// siblings), and the codec row that owns it — [`row_for`] finds the row
-    /// by the input's type; the row carries the encode/decode/run bodies.
+    /// siblings), and the codec row that owns it — the private `row_for`
+    /// lookup finds the row by the input's type; the row carries the
+    /// encode/decode/run bodies.
     pub job: rustdar_source::job::DescribedJob,
     /// The run envelope — the one statement of the raster's size and ground.
     ///
@@ -392,7 +393,8 @@ pub struct JobRequest {
     ///
     /// For the **radar** kinds the envelope carries only `side_ceiling_px` —
     /// the largest raster side the render may produce — and the rest is
-    /// zeroed ([`ceiling_only_geometry`]). **Four bytes on the wire, and a
+    /// zeroed (the private `ceiling_only_geometry` spells the shape once).
+    /// **Four bytes on the wire, and a
     /// size rather than a flag.** It used to be one `full_res` byte selecting
     /// between two constants, which could only ever answer "the long-range
     /// size" or "the base size" — and the long-range size was itself a
@@ -440,9 +442,9 @@ impl JobRequest {
 
 /// The envelope of a job with no raster geometry of its own — the radar
 /// kinds, whose rows read only `side_ceiling_px` off it. Width, height and
-/// bounds are zeroed: nothing on those rows reads them (they are the overlay
-/// half of the envelope until WO-M7b's canonical envelope), and the decode
-/// side fills the same zeroes, so a round trip is the identity.
+/// bounds are zeroed: nothing on those rows reads them, the canonical
+/// envelope carries the zeroes across the wire verbatim, and so a round trip
+/// is the identity.
 pub(crate) fn ceiling_only_geometry(side_ceiling_px: u32) -> rustdar_source::job::JobGeometry {
     rustdar_source::job::JobGeometry {
         width: 0,
@@ -795,63 +797,63 @@ impl Job {
 }
 
 impl JobRequest {
-    /// Encode for a worker. The framing is the row's legacy code and then the
-    /// row's own bytes, so one kind cannot be mistaken for another.
+    /// Encode for a worker. **One shape for every row** (WO-M7b): the row's
+    /// dense wire code, the canonical envelope, and then the row's own bytes
+    /// — so one kind cannot be mistaken for another and no row spells the
+    /// envelope for itself.
     ///
-    /// **The sparse era, byte for byte** ([`LegacyCode`]): a radar-family row
-    /// writes its one `TAG_*` byte and then the row's payload — the row
-    /// itself writes its legacy `side_ceiling_px` interleave off the
-    /// [`EncodeCtx`](rustdar_source::job::EncodeCtx), row-owned until WO-M7b
-    /// canonicalises the envelope — and an overlay row writes [`TAG_OVERLAY`],
-    /// the shared geometry header, its sparse sub-code and then the row's
-    /// payload. WO-M7b's dense flip is where every row gains the one
-    /// canonical envelope and the two-level overlay framing dies.
+    /// The framing, byte for byte:
+    /// `[code u8 = composed-index + 1][width u32][height u32][min_lat f64]`
+    /// `[max_lat f64][min_lon f64][max_lon f64][side_ceiling_px u32][row bytes]`.
+    /// The envelope is [`JobRequest::geometry`] in its declaration order,
+    /// spelled here and in the decoder and nowhere else; a row whose kind
+    /// reads none of a field still carries the field, zeroed — a decode job
+    /// hauls 44 zero envelope bytes ahead of a ~16 MB archive, which is
+    /// nothing, and variant framing would put a second shape on a wire whose
+    /// whole point is having one.
+    ///
+    /// The geometry ALSO rides in the [`EncodeCtx`](rustdar_source::job::EncodeCtx)
+    /// because one input — the model grid — is *cut to it* on the way out, at
+    /// the one moment that knows what ground the texture covers; every other
+    /// row ignores it and writes no envelope bytes of its own.
     pub fn to_bytes(&self) -> Vec<u8> {
         let row = row_for(&self.job);
         let ctx = rustdar_source::job::EncodeCtx {
             geometry: self.geometry,
         };
         let mut out = Vec::new();
-        match legacy_code(row) {
-            LegacyCode::Tag(tag) => {
-                out.push(tag);
-                (row.encode)(&self.job, &ctx, &mut out);
-            }
-            LegacyCode::OverlaySub(sub) => {
-                out.push(TAG_OVERLAY);
-                out.extend_from_slice(&self.geometry.width.to_le_bytes());
-                out.extend_from_slice(&self.geometry.height.to_le_bytes());
-                // The box in its declaration order, spelled here and in the
-                // decoder and nowhere else.
-                out.extend_from_slice(&self.geometry.bounds.min_lat.to_le_bytes());
-                out.extend_from_slice(&self.geometry.bounds.max_lat.to_le_bytes());
-                out.extend_from_slice(&self.geometry.bounds.min_lon.to_le_bytes());
-                out.extend_from_slice(&self.geometry.bounds.max_lon.to_le_bytes());
-                // The kind *within* the overlay: this crate's sparse
-                // sub-code, written by the caller — the rows' payloads start
-                // after it. See [`LegacyCode`].
-                out.push(sub);
-                // The geometry rides in the `EncodeCtx` because one input —
-                // the model grid — is *cut to it* on the way out, at the one
-                // moment that knows what ground the texture covers; every
-                // other overlay row ignores it. The row's payload is the
-                // kind's own bytes: scalars first, then the count-prefixed
-                // lists.
-                (row.encode)(&self.job, &ctx, &mut out);
-            }
-        }
+        out.push(wire_code(row));
+        out.extend_from_slice(&self.geometry.width.to_le_bytes());
+        out.extend_from_slice(&self.geometry.height.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.min_lat.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.max_lat.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.min_lon.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.max_lon.to_le_bytes());
+        out.extend_from_slice(&self.geometry.side_ceiling_px.to_le_bytes());
+        (row.encode)(&self.job, &ctx, &mut out);
         out
     }
 
-    /// `None` on an unknown code or a payload this build cannot read — the two
-    /// ends of a message port can be different builds, so that has to be a
-    /// clean refusal rather than a misparse.
+    /// `None` on an unallocated code or a payload this build cannot read —
+    /// the two ends of a message port can be different builds, so that has to
+    /// be a clean refusal rather than a misparse.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let (tag, rest) = bytes.split_first()?;
+        let (code, rest) = bytes.split_first()?;
+        // The code selects the row — `None` for a code this build does not
+        // have, including 0, which a zeroed buffer is made of.
+        let row = row_for_code(*code)?;
         let mut r = rustdar_source::wire::Reader::new(rest);
-        if *tag == TAG_OVERLAY {
-            let width = r.u32()?;
-            let height = r.u32()?;
+        // The canonical envelope, mirroring `to_bytes` field for field.
+        let width = r.u32()?;
+        let height = r.u32()?;
+        let bounds = rustdar_source::geo::GeoBounds {
+            min_lat: r.f64()?,
+            max_lat: r.f64()?,
+            min_lon: r.f64()?,
+            max_lon: r.f64()?,
+        };
+        let side_ceiling_px = r.u32()?;
+        if row.label.starts_with("overlay/") {
             // Refused at the boundary for the voxel affordability guard's
             // reason: these bytes arrive on a message port and the two
             // numbers are what [`execute`]'s output allocates a
@@ -863,47 +865,36 @@ impl JobRequest {
             // adapter's texture limit, and its pixel count is the viewport
             // plus a quarter overdraw). A zero side is refused with it:
             // the rasterizer would answer a zero-length buffer whose
-            // "success" no consumer could tell from a failure.
+            // "success" no consumer could tell from a failure. The radar
+            // kinds legitimately say 0 × 0 — nothing on those rows reads the
+            // pair — so the guard is the overlay rows' own, judged by the
+            // same label prefix the pool's lane routing already routes on.
             let ceiling = crate::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
             let pixels = u64::from(width) * u64::from(height);
             if width == 0 || height == 0 || pixels > ceiling * ceiling {
                 return None;
             }
-            let bounds = rustdar_source::geo::GeoBounds {
-                min_lat: r.f64()?,
-                max_lat: r.f64()?,
-                min_lon: r.f64()?,
-                max_lon: r.f64()?,
-            };
-            // An overlay's raster is never ceiling-sized; see
-            // [`JobRequest::geometry`].
-            let geometry = rustdar_source::job::JobGeometry {
-                width,
-                height,
-                bounds,
-                side_ceiling_px: 0,
-            };
-            // The sub-code selects the row (`None` for a code this build
-            // does not have), and the row decodes its own payload — geo
-            // passes through the row unchanged on every overlay kind.
-            let row = overlay_row_for_code(r.u8()?)?;
-            let (job, geometry) = (row.decode)(&mut r, geometry)?;
-            // Every overlay input's lists are length-counted rather than
-            // "the rest", so unlike the radar-family tails nothing may
-            // follow the payload: trailing bytes mean the two builds'
-            // layouts disagree.
-            r.rest().is_empty().then_some(())?;
-            Some(Self { job, geometry })
-        } else {
-            // A radar-family row. The envelope starts zeroed — these rows'
-            // wire form carries no geometry header — and a row whose legacy
-            // layout interleaves `side_ceiling_px` in its payload fills it in
-            // and returns the amended envelope; the rest pass it through, so
-            // their effective ceiling is the 0 their dispatch sites say.
-            let row = radar_row_for_tag(*tag)?;
-            let (job, geometry) = (row.decode)(&mut r, ceiling_only_geometry(0))?;
-            Some(Self { job, geometry })
         }
+        let geometry = rustdar_source::job::JobGeometry {
+            width,
+            height,
+            bounds,
+            side_ceiling_px,
+        };
+        // The row decodes its own payload; the envelope passes through the
+        // row unchanged on every kind — no row's wire form carries envelope
+        // bytes of its own since WO-M7b.
+        let (job, geometry) = (row.decode)(&mut r, geometry)?;
+        if row.label.starts_with("overlay/") {
+            // Every overlay input's lists are length-counted rather than
+            // "the rest", so nothing may follow the payload: trailing bytes
+            // mean the two builds' layouts disagree. The radar-family tails
+            // ARE the rest — a `RenderInput` refuses trailing bytes itself,
+            // and the opaque archives absorb them by design — so there is
+            // nothing to check on those rows.
+            r.rest().is_empty().then_some(())?;
+        }
+        Some(Self { job, geometry })
     }
 
     /// For the timing log, so a slow job says which kind it was: the codec
@@ -913,36 +904,6 @@ impl JobRequest {
     }
 }
 
-const TAG_RADAR: u8 = 1;
-const TAG_LEVEL3: u8 = 2;
-/// Tag 3 was the Level III SRM derivation job, retired when storm-relative
-/// velocity became a Level II product; the number stays reserved so a stale
-/// worker's job cannot be misread as a future kind.
-#[allow(dead_code)]
-const TAG_SRM_RETIRED: u8 = 3;
-/// The two-object Level III derivation: VIL density. Its product is not on the
-/// wire — the tag names it, because there is exactly one such product and a
-/// wire code would let a mismatched pair claim to be another one.
-const TAG_LEVEL3_PAIR: u8 = 4;
-/// A vertical cross-section. **5, not 4** — the next free number, not the next
-/// one that looks free. Posted as tag 4 a section lands in the
-/// [`TAG_LEVEL3_PAIR`] arm, which reads two `f64`s and a `u32` length and takes
-/// the rest: on a section's plausible bytes that *succeeds*, and renders a
-/// VIL-density product out of cross-section geometry. The number is pinned as
-/// a literal in `offload::tests`, and the pin feeds the build token — a
-/// renumbered tag re-pins the test and changes the token, so two builds that
-/// disagree refuse each other at the handshake instead of decoding each
-/// other's bytes.
-const TAG_SECTION: u8 = 5;
-/// A Cartesian voxel grid.
-const TAG_VOXELS: u8 = 6;
-/// A Level II archive volume to decode. The one job that is not a render.
-const TAG_DECODE: u8 = 7;
-/// An overlay rasterization. The kind *within* the overlay is a second byte —
-/// [`OVERLAY_INPUT_SITES`] — inside the payload, so overlay kinds can be added
-/// without spending a job tag each.
-const TAG_OVERLAY: u8 = 8;
-
 /// The composed codec registry this crate frames jobs against — the six
 /// radar rows and then the seven overlay rows, each half in its own
 /// load-bearing order. The composition itself lives in
@@ -951,78 +912,42 @@ const TAG_OVERLAY: u8 = 8;
 /// crates.
 pub(crate) use crate::job_registry::job_codecs;
 
-/// The wire code a row ships under in the sparse era — **frontend-owned, and
-/// a literal map CHOSEN to reproduce today's bytes** until WO-M7b's dense
-/// registry-index flip collapses the two levels into one code space.
+/// The dense wire code of `row`: its index in the composed registry, **plus
+/// one** — codes `1..=13`, `radar` = 1 … `overlay/model` = 13.
 ///
-/// A radar-family row is `Tag(t)`: its payload rides directly under one
-/// `TAG_*` byte. An overlay row is `OverlaySub(s)`: its payload rides under
-/// [`TAG_OVERLAY`], the shared geometry header and then `s` — the numbers
-/// the deleted `OVERLAY_INPUT_*` constants shipped, starting at 1 so 0 stays
-/// unallocated on the inner wire exactly as the outer tag space leaves it (a
-/// zeroed buffer must never decode). Renumbering is no longer forbidden by
-/// cross-build compatibility — the wire is same-build-only by construction —
-/// but it re-pins the literal test in `offload::tests` and thereby changes
-/// the build token, which is the correct consequence: two builds that
-/// disagree refuse each other and respawn rather than misread a byte.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum LegacyCode {
-    /// A radar-family row's own tag byte.
-    Tag(u8),
-    /// An overlay row's sub-code inside a [`TAG_OVERLAY`] job.
-    OverlaySub(u8),
-}
-
-/// The sparse-era code of `row` — the one map from the composed registry to
-/// today's bytes, pinned literal-by-literal in `offload::tests`.
+/// Plus one, never the bare index: **0 stays unallocated so a zeroed buffer
+/// never decodes** — a stale or corrupt message must be a refusal, not a
+/// misparse into whatever kind index 0 happens to be. There is no number to
+/// choose here anymore: the code IS the composition order, so "renumbering"
+/// is recomposing the registry, which re-pins the literal table in
+/// `offload::tests`, moves the framing rows, and thereby changes the build
+/// token — the correct consequence: two builds that disagree refuse each
+/// other at the handshake and respawn rather than misread a byte.
 ///
 /// Panics on a row outside the composed registry: the caller resolved the
-/// row with [`row_for`], whose registry this map spells out — an unmapped
-/// row is a registry this build does not have, and a silently-wrong code
-/// byte would be a payload decoded as another kind.
-fn legacy_code(row: &rustdar_source::job::JobCodec) -> LegacyCode {
-    match row.label {
-        "radar" => LegacyCode::Tag(TAG_RADAR),
-        "level3" => LegacyCode::Tag(TAG_LEVEL3),
-        "level3/vild" => LegacyCode::Tag(TAG_LEVEL3_PAIR),
-        "section" => LegacyCode::Tag(TAG_SECTION),
-        "voxels" => LegacyCode::Tag(TAG_VOXELS),
-        "decode" => LegacyCode::Tag(TAG_DECODE),
-        "overlay/sites" => LegacyCode::OverlaySub(1),
-        "overlay/alerts" => LegacyCode::OverlaySub(2),
-        "overlay/outlooks" => LegacyCode::OverlaySub(3),
-        "overlay/discussions" => LegacyCode::OverlaySub(4),
-        "overlay/reports" => LegacyCode::OverlaySub(5),
-        "overlay/glm" => LegacyCode::OverlaySub(6),
-        "overlay/model" => LegacyCode::OverlaySub(7),
-        other => panic!("the codec row {other:?} has no legacy wire code in this build"),
-    }
+/// row with [`row_for`], which draws from the same registry — a miss is a
+/// build defect, and a silently-wrong code byte would be a payload decoded
+/// as another kind.
+fn wire_code(row: &rustdar_source::job::JobCodec) -> u8 {
+    let index = job_codecs()
+        .position(|candidate| std::ptr::eq(candidate, row))
+        .unwrap_or_else(|| {
+            panic!(
+                "the codec row {:?} is not in the composed registry",
+                row.label
+            )
+        });
+    u8::try_from(index + 1).expect("the composed registry outgrew the u8 code space")
 }
 
-/// The radar-family row a decoded tag byte selects, or `None` for a tag this
-/// build does not have — including [`TAG_SRM_RETIRED`], which no row claims,
-/// and [`TAG_OVERLAY`], which is the two-level framing's own and never a
-/// row's.
-fn radar_row_for_tag(tag: u8) -> Option<&'static rustdar_source::job::JobCodec> {
-    job_codecs().find(|row| legacy_code(row) == LegacyCode::Tag(tag))
-}
-
-/// The inverse of [`overlay_sub_code`]: the row a decoded sub-code selects,
-/// or `None` for a code this build does not have — the two ends of a message
-/// port can be different builds, so that has to be a clean refusal rather
-/// than a misparse.
-fn overlay_row_for_code(code: u8) -> Option<&'static rustdar_source::job::JobCodec> {
-    let label = match code {
-        1 => "overlay/sites",
-        2 => "overlay/alerts",
-        3 => "overlay/outlooks",
-        4 => "overlay/discussions",
-        5 => "overlay/reports",
-        6 => "overlay/glm",
-        7 => "overlay/model",
-        _ => return None,
-    };
-    job_codecs().find(|row| row.label == label)
+/// The inverse of [`wire_code`]: the row a decoded code byte selects, or
+/// `None` for a code this build does not have — 0 (a zeroed buffer), 14 and
+/// beyond (a kind this composition does not carry). The two ends of a
+/// message port can be different builds, so that has to be a clean refusal
+/// rather than a misparse.
+fn row_for_code(code: u8) -> Option<&'static rustdar_source::job::JobCodec> {
+    let index = usize::from(code.checked_sub(1)?);
+    job_codecs().nth(index)
 }
 
 /// The codec row that owns `job`'s input type — a scan of [`job_codecs`] by
@@ -1035,9 +960,8 @@ fn overlay_row_for_code(code: u8) -> Option<&'static rustdar_source::job::JobCod
 /// handlers' `prepare_job`, this file's own decode — draws from the
 /// registry, so a miss is a build defect and a silent skip here would be a
 /// job encoded as zero bytes or logged under no name (silent partial
-/// success). The refusal-shaped paths are [`radar_row_for_tag`] and
-/// [`overlay_row_for_code`], on the decode side, where the bytes may
-/// genuinely be another build's.
+/// success). The refusal-shaped path is [`row_for_code`], on the decode
+/// side, where the bytes may genuinely be another build's.
 fn row_for(job: &rustdar_source::job::DescribedJob) -> &'static rustdar_source::job::JobCodec {
     let input_type = job.0.as_any().type_id();
     job_codecs()
@@ -1045,26 +969,6 @@ fn row_for(job: &rustdar_source::job::DescribedJob) -> &'static rustdar_source::
         .unwrap_or_else(|| {
             panic!("no codec row owns the input type of {job:?}; the registry is incomplete")
         })
-}
-
-/// The job-tag table as data, for [`crate::wire_identity::wire_digest`].
-///
-/// Built FROM the constants — the single statement of the numbers stays the
-/// `TAG_*` block above, and `offload::tests` still pins their values as
-/// literals. This is how a renumbered tag reaches the build token: the
-/// literal test goes red, the re-pin changes this table's fold, and two
-/// builds that disagree refuse each other at the handshake.
-pub(crate) fn wire_tags() -> [(&'static str, u8); 8] {
-    [
-        ("TAG_RADAR", TAG_RADAR),
-        ("TAG_LEVEL3", TAG_LEVEL3),
-        ("TAG_SRM_RETIRED", TAG_SRM_RETIRED),
-        ("TAG_LEVEL3_PAIR", TAG_LEVEL3_PAIR),
-        ("TAG_SECTION", TAG_SECTION),
-        ("TAG_VOXELS", TAG_VOXELS),
-        ("TAG_DECODE", TAG_DECODE),
-        ("TAG_OVERLAY", TAG_OVERLAY),
-    ]
 }
 
 /// Rewrite an RGBA8 raster from the rasterizers' straight alpha into the

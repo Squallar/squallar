@@ -19,6 +19,17 @@ pub const JOB: &str = "job";
 pub const DONE: &str = "done";
 
 pub const ID: &str = "id";
+/// Page → worker: the framed job, as `rustdar_frontend`'s
+/// `JobRequest::to_bytes` writes it.
+///
+/// As of WO-M7b the leading byte of that payload is a **composed-registry
+/// index plus one** (`rustdar_frontend::job_registry`, codes 1..=13 with 0
+/// unallocated), followed by the one canonical envelope every kind shares.
+/// The sparse `TAG_*` era — its per-tag numbering and the retired-tag holes
+/// — and the hand-versioned changelog that once narrated it are git history
+/// (the changelog was deleted with the protocol's version number at WO-M5);
+/// what stands over the framing now is the [`build_token`] below, never a
+/// hand-kept number.
 pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
