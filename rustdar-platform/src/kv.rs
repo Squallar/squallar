@@ -1,9 +1,9 @@
-//! Filesystem-backed [`ConfigStore`], shared by desktop, Android and iOS. The
+//! Filesystem-backed [`KvStore`], shared by desktop, Android and iOS. The
 //! web build never compiles it and supplies a `localStorage` one instead.
 //!
 //! # The write does not happen on the calling thread
 //!
-//! Every caller of [`store`](ConfigStore::store) here is the frame thread:
+//! Every caller of [`store`](KvStore::store) here is the frame thread:
 //! `autosave_config` on its 3 s timer, `site_positions` learning where a radar
 //! really is, the site catalogue landing from a fetch, the location memo. The
 //! payloads are kilobytes, so `create_dir_all` plus `write` is usually well
@@ -30,14 +30,14 @@
 //! A single consumer can, and cheaply. The producers are all one thread, so
 //! the order requests enter the queue is the order the calls were made, and a
 //! FIFO drained by exactly one thread preserves it end to end. That also makes
-//! [`store_now`](ConfigStore::store_now) a flush of everything queued ahead of
+//! [`store_now`](KvStore::store_now) a flush of everything queued ahead of
 //! it, since its own write cannot start until the earlier ones have finished.
 //!
 //! "The producers are all one thread" is an invariant the type system enforces,
-//! not an observation about today's call sites: `PlatformBridge::config_store`
-//! hands out a `Box<dyn ConfigStore>`, which is neither `Send` nor `Sync`, so a
+//! not an observation about today's call sites: `PlatformBridge::kv`
+//! hands out a `Box<dyn KvStore>`, which is neither `Send` nor `Sync`, so a
 //! store cannot reach a second thread to be called from. Anyone widening that
-//! to `Arc<dyn ConfigStore + Send + Sync>` takes the ordering guarantee with
+//! to `Arc<dyn KvStore + Send + Sync>` takes the ordering guarantee with
 //! it — the queue would then be interleaving two producers, and which of two
 //! writes to a key is "second" would stop being defined.
 //!
@@ -52,14 +52,14 @@
 //!
 //! # Why the web build is not fixed the same way
 //!
-//! `rustdar-web`'s `LocalStorageConfigStore` writes with
+//! `rustdar-web`'s `LocalStorageKvStore` writes with
 //! `localStorage.set_item`, which is synchronous by specification and reachable
 //! only from the main thread — a worker has no `window` and therefore no
 //! `localStorage` at all. There is no thread to hand that write to, so the wasm
 //! arm keeps writing inline. That is the platform refusing, not an arm left
 //! half-done.
 
-use rustdar_egui::config_store::ConfigStore;
+use rustdar_kv::KvStore;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc::{Sender, channel};
@@ -92,7 +92,7 @@ enum WriteRequest {
     Block(std::sync::mpsc::Receiver<()>),
 }
 
-/// How long [`store_now`](ConfigStore::store_now) waits for the writer.
+/// How long [`store_now`](KvStore::store_now) waits for the writer.
 ///
 /// Bounded, because `store_now` waits for everything queued ahead of it as well
 /// as its own write: at an Android suspend that can be the UI config, the
@@ -105,8 +105,8 @@ const STORE_NOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// The one thread that touches config files, started on first use.
 ///
-/// Process-wide rather than per-store because `config_store()` hands out a
-/// fresh `FileConfigStore` on every call — a thread per instance would be a
+/// Process-wide rather than per-store because `kv()` hands out a
+/// fresh `FileKvStore` on every call — a thread per instance would be a
 /// thread per call, and worse, would put concurrent writers back on the same
 /// directory and lose the ordering the single consumer exists to provide.
 ///
@@ -226,11 +226,11 @@ fn flush_writes() {
 }
 
 /// Stores each key as `<dir>/<key>.json`.
-pub struct FileConfigStore {
+pub struct FileKvStore {
     dir: PathBuf,
 }
 
-impl FileConfigStore {
+impl FileKvStore {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
@@ -244,7 +244,7 @@ impl FileConfigStore {
     }
 }
 
-impl ConfigStore for FileConfigStore {
+impl KvStore for FileKvStore {
     fn load(&self, key: &str) -> Option<String> {
         let path = self.path_for(key);
         match std::fs::read_to_string(&path) {
@@ -354,7 +354,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             let mut path = std::env::temp_dir();
             path.push(format!(
-                "rustdar-config-store-{}-{}-{:?}",
+                "rustdar-kv-{}-{}-{:?}",
                 tag,
                 std::process::id(),
                 std::thread::current().id()
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn a_stored_value_reads_back() {
         let dir = TempDir::new("roundtrip");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         assert_eq!(store.load("ui"), None, "nothing stored yet");
         store
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn different_keys_do_not_collide() {
         let dir = TempDir::new("keys");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         store.store("ui", "first").unwrap();
         store.store("other", "second").unwrap();
@@ -400,10 +400,8 @@ mod tests {
     #[test]
     fn the_ui_key_maps_to_ui_json() {
         let dir = TempDir::new("filename");
-        let store = FileConfigStore::new(dir.0.clone());
-        store
-            .store(rustdar_egui::config_store::UI_CONFIG_KEY, "payload")
-            .unwrap();
+        let store = FileKvStore::new(dir.0.clone());
+        store.store(rustdar_egui::UI_CONFIG_KEY, "payload").unwrap();
         flush_writes();
 
         let on_disk = dir.0.join("ui.json");
@@ -418,7 +416,7 @@ mod tests {
         let nested = dir.0.join("deeper");
         assert!(!nested.exists());
 
-        let store = FileConfigStore::new(nested.clone());
+        let store = FileKvStore::new(nested.clone());
         store.store("ui", "x").expect("store should create the dir");
         flush_writes();
         assert!(nested.join("ui.json").exists());
@@ -435,7 +433,7 @@ mod tests {
     #[test]
     fn store_returns_before_the_bytes_land() {
         let dir = TempDir::new("deferred");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
         let writer = writer().expect("this test is about the writer thread");
 
         // Parked before anything is queued. Dropping `release` — including by
@@ -467,7 +465,7 @@ mod tests {
     #[test]
     fn a_queued_write_lands_by_the_time_the_queue_is_drained() {
         let dir = TempDir::new("queued");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         store.store("ui", "queued").expect("store should queue");
         flush_writes();
@@ -488,7 +486,7 @@ mod tests {
     #[test]
     fn two_writes_to_one_key_land_in_order() {
         let dir = TempDir::new("ordering");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         store.store("ui", "first").unwrap();
         store.store("ui", "second").unwrap();
@@ -509,7 +507,7 @@ mod tests {
     #[test]
     fn store_now_has_written_before_it_returns() {
         let dir = TempDir::new("storenow");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         store.store_now("ui", "durable").expect("store_now");
 
@@ -532,7 +530,7 @@ mod tests {
     #[test]
     fn store_now_does_not_overtake_a_queued_write() {
         let dir = TempDir::new("overtake");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         store.store("ui", "early").unwrap();
         store.store_now("ui", "late").expect("store_now");
@@ -575,7 +573,7 @@ mod tests {
         let occupied = dir.0.join("occupied");
         std::fs::write(&occupied, "not a directory").expect("occupy the path");
 
-        let store = FileConfigStore::new(occupied);
+        let store = FileKvStore::new(occupied);
         assert_eq!(
             store.store("ui", "doomed"),
             Ok(()),
@@ -597,7 +595,7 @@ mod tests {
         let occupied = dir.0.join("occupied");
         std::fs::write(&occupied, "not a directory").expect("occupy the path");
 
-        let store = FileConfigStore::new(occupied);
+        let store = FileKvStore::new(occupied);
         assert!(
             store.store_now("ui", "doomed").is_err(),
             "store_now waited for this write, so it must report the failure"
@@ -610,7 +608,7 @@ mod tests {
     #[test]
     fn a_write_replaces_the_file_without_leaving_a_temp_behind() {
         let dir = TempDir::new("atomic");
-        let store = FileConfigStore::new(dir.0.clone());
+        let store = FileKvStore::new(dir.0.clone());
 
         store.store_now("ui", "first").expect("store_now");
         store.store_now("ui", "second").expect("store_now");

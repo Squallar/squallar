@@ -65,12 +65,12 @@
 //!
 //! [`PlatformBridge`]: rustdar_frontend::platform::PlatformBridge
 
-pub mod config_store;
 pub mod geolocation;
+pub mod kv;
 
 /// How long the page waits before starting another rasterization worker.
 ///
-/// Not wasm32-gated, for the reason `config_store` and `geolocation` are not:
+/// Not wasm32-gated, for the reason `kv` and `geolocation` are not:
 /// the ladder is pure arithmetic, `worker_port` is gated, and a retry policy
 /// that only a browser can walk is a retry policy no test ever checks.
 pub mod worker_retry;

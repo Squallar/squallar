@@ -34,7 +34,7 @@
 //! 2. **A `previously_asked` bool loses Android's middle state** and hangs a
 //!    permanent decision off a return value three bridges have to invent.
 //!    Resolved with an attempt counter written before the call.
-//! 3. **No `ConfigStore` must not mean "never ask".** Resolved by degrading to
+//! 3. **No `KvStore` must not mean "never ask".** Resolved by degrading to
 //!    "ask, don't remember".
 //! 4. **A revoked permission must stop the stream**, or a blue dot sits on the
 //!    map at a position the user has withdrawn consent for.
@@ -42,14 +42,14 @@
 //! [`PlatformBridge::request_location`]: crate::platform::PlatformBridge::request_location
 
 use crate::platform::PlatformBridge;
-use rustdar_egui::config_store::ConfigStore;
 use rustdar_gps::LocationPermission;
+use rustdar_kv::KvStore;
 use std::time::Duration;
 use web_time::Instant;
 
 /// Key the memo is persisted under.
 ///
-/// Its own `ConfigStore` entry rather than a field on `UiConfig`, and that is
+/// Its own `KvStore` entry rather than a field on `UiConfig`, and that is
 /// not tidiness. `autosave_config` writes on a 3 s timer behind a JSON compare,
 /// and the case that matters most — the user opens settings, turns location
 /// off, and closes the app — lands inside that window and would be lost. This
@@ -143,15 +143,15 @@ pub struct LocationGate {
     memo: LocationMemo,
     /// Where the memo is persisted, resolved once.
     ///
-    /// Cached because `PlatformBridge::config_store` allocates a fresh
-    /// `Box<FileConfigStore>` on every call and this sits on the frame path.
+    /// Cached because `PlatformBridge::kv` allocates a fresh
+    /// `Box<FileKvStore>` on every call and this sits on the frame path.
     ///
     /// Resolved once and never retried, which is safe because every bridge that
     /// has a store has it before the first frame: Android's `set_config_dir`
     /// runs during `android_main`, ahead of `run_app`; desktop and iOS derive
     /// one in their constructors; `localStorage` is available to the browser
     /// from the start. The cases that answer `None` answer it permanently.
-    store: Option<Box<dyn ConfigStore>>,
+    store: Option<Box<dyn KvStore>>,
     /// Whether [`store`](Self::store) has been resolved yet. Not `store
     /// .is_some()`: `None` is a legitimate resolved answer.
     store_resolved: bool,
@@ -471,7 +471,7 @@ impl LocationGate {
             return;
         }
         self.store_resolved = true;
-        self.store = platform.config_store();
+        self.store = platform.kv();
         match self.store.as_ref().and_then(|s| s.load(LOCATION_MEMO_KEY)) {
             Some(raw) => match serde_json::from_str::<LocationMemo>(&raw) {
                 Ok(memo) => self.memo = memo,
@@ -490,7 +490,7 @@ impl LocationGate {
 
     /// Write the memo now, not on the autosave timer.
     ///
-    /// [`ConfigStore::store_now`], because "now" is the claim: the ordinary
+    /// [`KvStore::store_now`], because "now" is the claim: the ordinary
     /// `store` hands the bytes to a writer thread, and a session that ends
     /// before that thread runs loses the memo exactly as if it had waited for
     /// the timer this deliberately does not use.

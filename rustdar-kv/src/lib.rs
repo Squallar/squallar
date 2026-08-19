@@ -1,18 +1,39 @@
-//! Where persisted UI configuration goes.
+//! A place to keep small named blobs across sessions.
 //!
-//! The UI layer knows *what* to persist and in what format; it deliberately
-//! knows nothing about *where*. Desktop, Android and iOS all land on a file;
-//! the web build has to land in `localStorage`, which is not a file and has no
-//! directory to put one in.
+//! String keys, string blobs, never load-bearing. The keys are logical names,
+//! not paths: desktop, Android and iOS back this with a file per key, the web
+//! build lands in `localStorage`, which is not a file and has no directory to
+//! put one in, and tests hold everything in memory. Backends that *do* have a
+//! filesystem map the key onto a filename themselves.
+//!
+//! # Three methods on purpose
+//!
+//! [`KvStore`] is `load`, `store`, `store_now` — and deliberately nothing
+//! more. No enumeration, no deletion, no transactions; a backend that cannot
+//! tell "absent" from "unreadable" answers `None` for both. If a consumer
+//! needs a fourth verb it is asking for a database, and this crate is
+//! deliberately not one — the fence guards against the database connotation
+//! the moment a key-value trait grows a query surface.
+//!
+//! # Today's keys and their owners
+//!
+//! | key                | owner                                          |
+//! |--------------------|------------------------------------------------|
+//! | `"ui"`             | rustdar-egui `ui_config` (the UI layout)       |
+//! | `"location"`       | rustdar-frontend `location_permission` (memo)  |
+//! | `"loop_pool"`      | rustdar-frontend `loop_pool` (device memo)     |
+//! | `"site_catalogue"` | rustdar-frontend `site_catalogue`              |
+//! | `"site_positions"` | rustdar-frontend `site_positions`              |
+//! | `"budget_steps"`   | rustdar-frontend `budget` (device memo)        |
+//!
+//! The key *strings* are on-disk compatibility: a changed string silently
+//! orphans every config or memo an existing install has saved. Each constant
+//! lives beside its owner; this table is the map, not the definition.
+//!
+//! Future consumers noted: rustdar-location (the `LocationGate` memo) arrives
+//! at the location split.
 
-/// Key the UI layout is persisted under.
-///
-/// The filesystem backend turns this into `ui.json`, which is the name the
-/// config has always had on disk — the key was chosen to keep it that way so
-/// existing configs keep loading.
-pub const UI_CONFIG_KEY: &str = "ui";
-
-/// A place to keep small named blobs of UI configuration across sessions.
+/// A place to keep small named blobs of configuration across sessions.
 ///
 /// Blobs are addressed by a short logical key, not a path. `localStorage` has
 /// no paths and no directories, so a `&Path` here would force every
@@ -24,7 +45,7 @@ pub const UI_CONFIG_KEY: &str = "ui";
 /// back to defaults, and a failed write is reported but never propagated into
 /// a frame or an exit path. Losing a saved window layout must not lose data or
 /// stop the app.
-pub trait ConfigStore {
+pub trait KvStore {
     /// Read the blob previously stored under `key`, or `None` if there is none.
     ///
     /// A backend that cannot distinguish "absent" from "unreadable" should
@@ -59,17 +80,17 @@ pub trait ConfigStore {
     }
 }
 
-/// A [`ConfigStore`] held entirely in memory.
+/// A [`KvStore`] held entirely in memory.
 ///
 /// Nothing survives the process. That makes it the right backend for tests,
 /// which need the round trip without touching the user's real config, and a
 /// usable fallback for a platform that has not told us where to persist yet.
 #[derive(Default)]
-pub struct MemoryConfigStore {
+pub struct MemoryKvStore {
     entries: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-impl ConfigStore for MemoryConfigStore {
+impl KvStore for MemoryKvStore {
     fn load(&self, key: &str) -> Option<String> {
         self.entries.lock().ok()?.get(key).cloned()
     }
@@ -78,7 +99,7 @@ impl ConfigStore for MemoryConfigStore {
         let mut entries = self
             .entries
             .lock()
-            .map_err(|_| "config store mutex poisoned".to_string())?;
+            .map_err(|_| "kv store mutex poisoned".to_string())?;
         entries.insert(key.to_owned(), value.to_owned());
         Ok(())
     }

@@ -1,13 +1,13 @@
 use super::*;
 use crate::Gui;
-use crate::config_store::{ConfigStore, MemoryConfigStore};
+use rustdar_kv::{KvStore, MemoryKvStore};
 
 /// The storm-motion override survives a save/load cycle — the audit's known
 /// persistence gap, closed in M4: the state existed and the settings pane
 /// edited it, but every restart silently reset it.
 #[test]
 fn the_storm_motion_override_round_trips() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = Gui::new();
     gui.storm_motion_override.enabled = true;
     gui.storm_motion_override.speed_kt = 42.0;
@@ -61,7 +61,7 @@ fn a_non_finite_override_is_written_as_the_default() {
 /// field loads every pane linked — which is how every pane behaved.
 #[test]
 fn the_time_link_round_trips_and_defaults_on() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
     gui.pane_mut(1).expect("pane 1").time_link = false;
@@ -76,19 +76,17 @@ fn the_time_link_round_trips_and_defaults_on() {
     );
 
     // Strip the field, as an older writer would have.
-    let json = store
-        .load(crate::config_store::UI_CONFIG_KEY)
-        .expect("just saved");
+    let json = store.load(crate::UI_CONFIG_KEY).expect("just saved");
     let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
     for pane in value["panes"].as_array_mut().expect("a pane list") {
         pane.as_object_mut()
             .expect("a pane object")
             .remove("time_link");
     }
-    let older_store = MemoryConfigStore::default();
+    let older_store = MemoryKvStore::default();
     older_store
         .store(
-            crate::config_store::UI_CONFIG_KEY,
+            crate::UI_CONFIG_KEY,
             &serde_json::to_string(&value).expect("serializable"),
         )
         .expect("storable");

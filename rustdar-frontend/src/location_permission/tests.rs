@@ -1,6 +1,6 @@
 use super::*;
 use crate::platform_double::TestBridge;
-use rustdar_egui::config_store::MemoryConfigStore;
+use rustdar_kv::MemoryKvStore;
 use std::rc::Rc;
 
 /// A gate and the bridge it drives, with the clock in the test's hands.
@@ -51,7 +51,7 @@ impl Fixture {
 
 /// A desktop bridge whose store the test keeps, so a "restart" can hand the
 /// same blobs to a fresh gate.
-fn desktop_with_store(store: Rc<MemoryConfigStore>) -> TestBridge {
+fn desktop_with_store(store: Rc<MemoryKvStore>) -> TestBridge {
     TestBridge::desktop().with_store(store)
 }
 
@@ -101,7 +101,7 @@ fn a_platform_without_location_is_never_asked_and_never_polled() {
 /// The user said no. Nothing this app does may produce another dialog.
 #[test]
 fn a_remembered_denial_is_never_prompted_again() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     let mut f = Fixture::new(
         desktop_with_store(Rc::clone(&store)).with_permission(LocationPermission::Denied),
     );
@@ -199,7 +199,7 @@ fn a_grant_that_arrives_after_the_ask_still_starts_delivery() {
 /// people to hit Deny.
 #[test]
 fn a_prompt_the_user_walked_away_from_is_not_repeated_on_the_next_run() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
 
     let mut first = Fixture::new(
         desktop_with_store(Rc::clone(&store)).with_permission(LocationPermission::Prompt),
@@ -225,10 +225,10 @@ fn a_prompt_the_user_walked_away_from_is_not_repeated_on_the_next_run() {
 /// platforms where location itself works fine. Silently disabling it there
 /// is worse than forgetting the answer.
 #[test]
-fn a_device_with_no_config_store_is_still_asked() {
+fn a_device_with_no_kv_is_still_asked() {
     let mut f = Fixture::new(
         TestBridge::web()
-            .without_config_store()
+            .without_kv()
             .with_permission(LocationPermission::Prompt),
     );
 
@@ -278,7 +278,7 @@ fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
 /// the stream at the moment of the click, not at the next poll.
 #[test]
 fn turning_location_off_in_settings_survives_a_restart() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     let mut f = Fixture::new(
         desktop_with_store(Rc::clone(&store)).with_permission(LocationPermission::Granted),
     );
@@ -309,7 +309,7 @@ fn turning_location_off_in_settings_survives_a_restart() {
 /// prompt back. Without this the bound is permanent and there is no way in.
 #[test]
 fn enabling_location_in_settings_asks_again_after_a_dismissal() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     let mut f = Fixture::new(
         desktop_with_store(Rc::clone(&store)).with_permission(LocationPermission::Prompt),
     );
@@ -437,7 +437,7 @@ fn a_default_memo_leaves_location_enabled() {
 /// timer — the dismiss-and-close case lands inside that window.
 #[test]
 fn an_attempt_is_persisted_before_the_ask_rather_than_at_shutdown() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     let mut f = Fixture::new(
         desktop_with_store(Rc::clone(&store)).with_permission(LocationPermission::Prompt),
     );
@@ -458,7 +458,7 @@ fn an_attempt_is_persisted_before_the_ask_rather_than_at_shutdown() {
 /// they have since reversed.
 #[test]
 fn a_definite_answer_clears_the_attempt_counter() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     let mut f = Fixture::new(
         desktop_with_store(Rc::clone(&store)).with_permission(LocationPermission::Prompt),
     );
@@ -485,7 +485,7 @@ fn a_definite_answer_clears_the_attempt_counter() {
 /// refuses to show.
 #[test]
 fn a_bridge_is_told_what_this_install_has_already_asked_before_it_is_queried() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     store
         .store(LOCATION_MEMO_KEY, r#"{"attempts":1,"enabled":true}"#)
         .unwrap();
@@ -508,7 +508,7 @@ fn a_bridge_is_told_what_this_install_has_already_asked_before_it_is_queried() {
 /// edited.
 #[test]
 fn an_unreadable_memo_falls_back_to_asking() {
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     store.store(LOCATION_MEMO_KEY, "not json").unwrap();
     let mut f = Fixture::new(desktop_with_store(store).with_permission(LocationPermission::Prompt));
 

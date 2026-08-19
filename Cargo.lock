@@ -4195,6 +4195,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rustdar-geo",
  "rustdar-gps",
+ "rustdar-kv",
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-units",
@@ -4225,6 +4226,7 @@ dependencies = [
  "rustdar-egui",
  "rustdar-geo",
  "rustdar-gps",
+ "rustdar-kv",
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-source",
@@ -4255,6 +4257,13 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+]
+
+[[package]]
+name = "rustdar-kv"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -4298,6 +4307,7 @@ dependencies = [
  "rustdar-egui",
  "rustdar-frontend",
  "rustdar-gps",
+ "rustdar-kv",
  "rustdar-radar",
  "walkers",
  "windows",
@@ -4358,8 +4368,11 @@ dependencies = [
  "log",
  "rustdar-egui",
  "rustdar-frontend",
+ "rustdar-geo",
  "rustdar-gps",
+ "rustdar-kv",
  "rustdar-radar",
+ "rustdar-source",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",

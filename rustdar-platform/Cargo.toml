@@ -24,6 +24,7 @@ path = "src/lib.rs"
 [dependencies]
 rustdar-frontend = { workspace = true }
 rustdar-egui = { workspace = true }
+rustdar-kv = { workspace = true }
 # Types only here (GpsFix, GpsConfig). `serial` is requested per target below.
 rustdar-gps = { workspace = true }
 iana-time-zone = { workspace = true }

@@ -10,6 +10,7 @@ members = [
     "rustdar-overlays",
     "rustdar-source",
     "rustdar-geo",
+    "rustdar-kv",
     "rustdar-units",
     "rustdar-gps",
     "nexrad-level3",
@@ -45,6 +46,7 @@ nexrad-level3 = { path = "nexrad-level3" }
 rustdar-egui = { path = "rustdar-egui" }
 rustdar-frontend = { path = "rustdar-frontend" }
 rustdar-geo = { path = "rustdar-geo" }
+rustdar-kv = { path = "rustdar-kv" }
 rustdar-overlays = { path = "rustdar-overlays" }
 rustdar-platform = { path = "rustdar-platform" }
 rustdar-radar = { path = "rustdar-radar" }

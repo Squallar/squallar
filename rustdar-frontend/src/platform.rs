@@ -381,7 +381,7 @@ pub trait PlatformBridge {
     /// Returns a store rather than a directory so the trait carries no
     /// filesystem assumption: a web bridge hands back a `localStorage` backend,
     /// which has no path to return.
-    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>>;
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>>;
 
     /// This device's IANA timezone name, e.g. `"America/Denver"`.
     ///

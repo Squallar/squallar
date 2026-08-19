@@ -1,8 +1,8 @@
 use super::*;
 use crate::platform_double::TestBridge;
-use rustdar_egui::config_store::MemoryConfigStore;
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
+use rustdar_kv::MemoryKvStore;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -672,7 +672,7 @@ const STORED_FPS: f32 = 9.25;
 /// Write a config the way the app writes one, rather than by hand: a
 /// literal blob would stop matching the format the moment it changed and
 /// would then be testing nothing.
-fn seed_config(store: &MemoryConfigStore, fps: f32) {
+fn seed_config(store: &MemoryKvStore, fps: f32) {
     let mut gui = Gui::new();
     gui.loop_speed_fps = fps;
     gui.save_ui_config(store);
@@ -680,7 +680,7 @@ fn seed_config(store: &MemoryConfigStore, fps: f32) {
 
 /// What a bridge's store holds, read back through the same parser the app
 /// loads with.
-fn stored_fps(store: &MemoryConfigStore) -> f32 {
+fn stored_fps(store: &MemoryKvStore) -> f32 {
     let mut reloaded = Gui::new();
     reloaded.load_ui_config(store);
     reloaded.loop_speed_fps
@@ -2138,10 +2138,11 @@ fn every_queued_scan_response_is_spent_in_the_frame_it_arrives_in() {
 /// on their single-pane branches. Going through the config loader is not a
 /// workaround either: it is the path a returning user's saved layout takes.
 pub(super) fn two_pane_app(first: &str, second: &str) -> App {
-    use rustdar_egui::config_store::{ConfigStore, UI_CONFIG_KEY};
+    use rustdar_egui::UI_CONFIG_KEY;
+    use rustdar_kv::KvStore;
 
     let mut app = headless(TestBridge::desktop());
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -2172,14 +2173,15 @@ pub(super) fn two_pane_app(first: &str, second: &str) -> App {
 /// case is what a split usually is, and the one-site case is what makes a
 /// *shared* render observable. Both are one pane list either way.
 pub(super) fn n_pane_app(n: usize, site: &str) -> App {
-    use rustdar_egui::config_store::{ConfigStore, UI_CONFIG_KEY};
+    use rustdar_egui::UI_CONFIG_KEY;
+    use rustdar_kv::KvStore;
 
     let mut app = headless(TestBridge::desktop());
     let panes = (0..n)
         .map(|_| format!(r#"{{"site":"{site}"}}"#))
         .collect::<Vec<_>>()
         .join(",");
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -2995,7 +2997,7 @@ fn scan_stating(lat: f32, lon: f32) -> nexrad_model::data::Scan {
 fn a_position_a_volume_taught_survives_a_restart() {
     use rustdar_radar::site_position::SitePositionSource;
 
-    let store = std::rc::Rc::new(MemoryConfigStore::default());
+    let store = std::rc::Rc::new(MemoryKvStore::default());
     // Before the read, not merely before the app: `headless` installs the
     // fixture, and it is not called until further down. Without this the read
     // below found whatever a *sibling* test's `headless` had left in the
@@ -3026,11 +3028,8 @@ fn a_position_a_volume_taught_survives_a_restart() {
         );
         // Written already, with no autosave tick having run.
         assert!(
-            rustdar_egui::config_store::ConfigStore::load(
-                store.as_ref(),
-                crate::site_positions::SITE_POSITIONS_KEY,
-            )
-            .is_some(),
+            rustdar_kv::KvStore::load(store.as_ref(), crate::site_positions::SITE_POSITIONS_KEY,)
+                .is_some(),
             "the learned position must be durable the moment it is learned",
         );
         info.site.lat
@@ -3077,7 +3076,7 @@ fn a_position_a_volume_taught_survives_a_restart() {
 /// # `KMQT`
 ///
 /// Load-bearing, exactly as `KMBX` is for
-/// [`a_run_with_no_config_store_still_applies_the_volumes_own_position`]: a fix
+/// [`a_run_with_no_kv_still_applies_the_volumes_own_position`]: a fix
 /// displaces the row it lands on for the whole process, so this test moves
 /// `KMQT` for every test that runs after it. It must stay an identifier no
 /// other test in the workspace names, and it is placed here rather than by
@@ -3089,7 +3088,7 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
     use rustdar_radar::site_position::SitePositionSource;
 
     const SITE: &str = "KMQT";
-    let store = std::rc::Rc::new(MemoryConfigStore::default());
+    let store = std::rc::Rc::new(MemoryKvStore::default());
     // Marquette, Michigan, at the position and heights its own volume reports —
     // the row this test starts from, because nothing is compiled in.
     rustdar_radar::sites::resolve([(
@@ -3260,7 +3259,7 @@ fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
 /// With nowhere to write, the app still works and simply forgets.
 ///
 /// This is the degradation `LocationGate` chose for the same reason: no
-/// `ConfigStore` must never mean "refuse", it means "ask again next time".
+/// `KvStore` must never mean "refuse", it means "ask again next time".
 ///
 /// # Why not `KTLX`
 ///
@@ -3282,7 +3281,7 @@ fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
 /// from has to come from somewhere, and a shared fixture would be a row other
 /// tests could read after this one had moved it.
 #[test]
-fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
+fn a_run_with_no_kv_still_applies_the_volumes_own_position() {
     use rustdar_radar::site_position::SitePositionSource;
 
     const SITE: &str = "KMBX";
@@ -3307,7 +3306,7 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
         .and_hms_opt(1, 48, 0)
         .unwrap();
 
-    let mut app = headless(TestBridge::desktop().without_config_store());
+    let mut app = headless(TestBridge::desktop().without_kv());
     let info =
         app.scan_info_learning_position(&scan_stating(stated_lat, table.lon as f32), SITE, at);
     assert_eq!(info.site_source, SitePositionSource::Volume);
@@ -3332,7 +3331,7 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     // no store, nothing outlived the process" really means is that this app has
     // nothing to recall, and `Table` is exactly the answer that says so —
     // `Learned` is the one it would give if anything had been read back.
-    let mut next_run = headless(TestBridge::desktop().without_config_store());
+    let mut next_run = headless(TestBridge::desktop().without_kv());
     assert!(
         next_run.site_positions.is_empty(),
         "a run with nowhere to read from came up remembering {} positions",
@@ -3375,11 +3374,11 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
 /// nearest-search elsewhere can answer with it.
 #[test]
 fn a_learned_radar_the_seed_never_had_is_in_the_table_before_the_first_frame() {
-    use rustdar_egui::config_store::ConfigStore;
+    use rustdar_kv::KvStore;
 
     const SITE: &str = "ZZZF";
 
-    let store = std::rc::Rc::new(MemoryConfigStore::default());
+    let store = std::rc::Rc::new(MemoryKvStore::default());
     // A previous session learned this radar from its own volume. The blob is
     // written in the shape `SitePositions` persists, because going through the
     // real load is the point: a hand-installed table would not show that the
@@ -3435,7 +3434,7 @@ fn a_learned_radar_the_seed_never_had_is_in_the_table_before_the_first_frame() {
 /// ahead of the event loop.
 #[test]
 fn android_resolves_the_table_when_the_config_directory_arrives() {
-    use rustdar_egui::config_store::ConfigStore;
+    use rustdar_kv::KvStore;
 
     const SITE: &str = "ZZZG";
 

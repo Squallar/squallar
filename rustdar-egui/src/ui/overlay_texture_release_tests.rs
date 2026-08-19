@@ -27,11 +27,12 @@
 //! why both are asserted rather than commented.
 
 use super::*;
-use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
+use crate::UI_CONFIG_KEY;
 use crate::overlay_cache::{
     OverlayTextureCache, OverlayTextureData, OverlayTexturePlan, current_quantized_zoom,
 };
 use rustdar_geo::GeoBounds;
+use rustdar_kv::{KvStore, MemoryKvStore};
 
 /// The layer switched off in most of these — a texture-mode overlay that is on
 /// by default, so the fixture below starts from the state a real pane is in.
@@ -358,7 +359,7 @@ fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
 ///
 /// `Gui::load_ui_config` assigns `enabled_overlays` from the blob. On web and
 /// Android the store is unreadable when `App::new` runs, so
-/// `App::apply_config_store` reaches it after frames have been drawn and
+/// `App::set_config_dir`'s reload reaches it after frames have been drawn and
 /// textures cached — a restore that turns a layer off has to release it like a
 /// toggle would.
 ///
@@ -377,7 +378,7 @@ fn a_config_restored_mid_session_releases_what_it_switches_off() {
          assertion below is about a cache that was never populated",
     );
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,

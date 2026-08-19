@@ -80,11 +80,11 @@
 
 use crate::constants;
 use crate::volume::quality::{DeviceClass, GradientShading, VolumeQuality};
-use rustdar_egui::config_store::ConfigStore;
+use rustdar_kv::KvStore;
 
 /// Key the ladder position [`BudgetMemo::steps_back`] is persisted under.
 ///
-/// Its own `ConfigStore` entry, beside `crate::loop_pool::LOOP_POOL_KEY` and
+/// Its own `KvStore` entry, beside `crate::loop_pool::LOOP_POOL_KEY` and
 /// for the identical reason: `autosave_config` writes the `UiConfig` blob on a
 /// 3 s timer behind a string compare, so a value learned in the last three
 /// seconds of a session is lost — and a session that has just lost its
@@ -107,7 +107,7 @@ pub const BUDGET_MEMO_KEY: &str = "budget_steps";
 /// almost-readable. Anything unreadable is `None`, which is the same answer a
 /// first launch gets — the cost of losing it is one re-probe, and configuration
 /// is never allowed to be load-bearing.
-pub fn remembered_steps(store: Option<&dyn ConfigStore>) -> Option<u32> {
+pub fn remembered_steps(store: Option<&dyn KvStore>) -> Option<u32> {
     let raw = store?.load(BUDGET_MEMO_KEY)?;
     raw.trim().parse().ok().or_else(|| {
         log::warn!("budget memo is not a number ({raw:?}); starting this device at its ladder top");
@@ -117,14 +117,14 @@ pub fn remembered_steps(store: Option<&dyn ConfigStore>) -> Option<u32> {
 
 /// Write what this session settled on, synchronously. See [`BUDGET_MEMO_KEY`].
 ///
-/// [`ConfigStore::store_now`] is what makes "synchronously" true. The ordinary
+/// [`KvStore::store_now`] is what makes "synchronously" true. The ordinary
 /// `store` hands the bytes to a writer thread that a dying process never gets
 /// back to, and this is called off a lost rendering surface — the moment the
 /// process is most likely to be killed. A dropped memo means the next session
 /// opens at the top rung and loses the same surface again: the ladder would
 /// never descend, which is the entire guarantee this key exists to provide. One
 /// integer costs nothing to wait for.
-pub fn remember_steps(store: Option<&dyn ConfigStore>, steps: u32) {
+pub fn remember_steps(store: Option<&dyn KvStore>, steps: u32) {
     let Some(store) = store else {
         return;
     };
@@ -282,7 +282,7 @@ impl Promotion {
 /// refuse an allocation is better than any guess from a device type, and
 /// honouring it is also what keeps a reopen 1:1 rather than showing a different
 /// loop length on every start. Both fields are persisted in their own
-/// `ConfigStore` entries, written synchronously — `crate::loop_pool::LOOP_POOL_KEY`
+/// `KvStore` entries, written synchronously — `crate::loop_pool::LOOP_POOL_KEY`
 /// for the pool and `crate::budget::BUDGET_MEMO_KEY` for the ladder — because a
 /// value learned by crashing the GPU is exactly the value that must not be lost
 /// to a 3 s autosave timer.
