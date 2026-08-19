@@ -34,20 +34,22 @@ pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
 
-/// Worker → page: **the whole answer to a job**, every kind alike, as one
-/// transferred `Uint8Array` in the dispatched codec row's own `encode_out`
-/// form — or null for a job that produced nothing (a `None` result writes
-/// both fields null explicitly, because the page holds a slot per id and
-/// silence would strand it).
+/// Worker → page: **the answer's HEAD** — scalars and framing in the
+/// dispatched codec row's own `encode_out` form, every kind alike, as one
+/// transferred `Uint8Array` — or null for a job that produced nothing (a
+/// `None` result writes all three reply fields null explicitly, because
+/// the page holds a slot per id and silence would strand it).
 ///
-/// One field for every kind since WO-M7c closed the reply direction onto
+/// One head for every kind since WO-M7c closed the reply direction onto
 /// the codec table: the plan-view frame, whose reply used to ride eight
-/// named fields beside this one, travels in its own wire form
-/// (`rustdar_radar::frame::RenderedFrame::to_bytes`) like every other
-/// output. One array rather than one per buffer because each payload's
-/// codec carries its own counts and refusals; a second description of the
-/// same lengths on this message could disagree with the first in a way the
-/// receiving side would have to invent an answer for.
+/// named fields beside this one, travels in its own wire form like every
+/// other output. Since WO-M7d the row's nominated LARGE buffers ride
+/// [`TAILS`] beside the head rather than being concatenated into it (the
+/// frame's polar block and image — a 21 MiB concatenating memcpy per
+/// widest still frame, gone). The head's payload still carries its own
+/// counts and refusals — no second description of its lengths rides this
+/// message — and the tail COUNT is judged by the row's own decoder, which
+/// refuses a count it did not write.
 pub const OUT: &str = "out";
 /// Worker → page: which codec row's `encode_out` wrote [`OUT`] — the row's
 /// **dense composed-registry code** (index plus one), the same one code
@@ -60,6 +62,17 @@ pub const OUT: &str = "out";
 /// corrupt message or another build's reply, refused as "nothing to draw"
 /// rather than decoded as whatever the tag claims.
 pub const OUT_KIND: &str = "outkind";
+/// Worker → page: the row's nominated large flat buffers — the frame's
+/// `[polar, image]`, an empty array for every current non-frame row — as a
+/// `js_sys::Array` of per-tail `Uint8Array`s, EACH transferred, so the
+/// page adopts every big buffer instead of copying it out of a
+/// concatenation (WO-M7d); null on the nothing arm (the both-arms-write
+/// posture, see `worker::post_result`).
+///
+/// Order within the array is the row's own convention — the frame-reply
+/// digest rows (`rustdar_frontend::wire_identity`) are what pin it, and a
+/// count the dispatched row's decoder did not write is refused whole.
+pub const TAILS: &str = "tails";
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

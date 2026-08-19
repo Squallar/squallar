@@ -184,11 +184,16 @@ pub struct JobCodec {
     pub run: fn(&DescribedJob, &JobGeometry) -> Option<DescribedOut>,
     /// Reply-direction encoder. De-Optioned at WO-M7c: every row states its
     /// reply codec or the workspace does not compile — there is no
-    /// named-field reply path left for a row to ride instead.
-    pub encode_out: fn(&DescribedOut, &mut Vec<u8>),
+    /// named-field reply path left for a row to ride instead. CONSUMES the
+    /// out (the one caller, the worker's `execute_encoded`, owns it) and
+    /// splits it across a head sink and a tails sink (WO-M7d) — see
+    /// [`JobOutCodec`] for the head/tails convention.
+    pub encode_out: fn(DescribedOut, &mut Vec<u8>, &mut Vec<Vec<u8>>),
     /// Reply-direction decoder; the `Option` in its return is the decode
-    /// failing, never absence.
-    pub decode_out: fn(&[u8]) -> Option<DescribedOut>,
+    /// failing, never absence. Takes the tails **by value** so a decoder
+    /// can ADOPT a buffer — the page-side image copy WO-M7d killed lived
+    /// exactly in a decoder that could only borrow.
+    pub decode_out: fn(&[u8], Vec<Vec<u8>>) -> Option<DescribedOut>,
     pub cost: JobCost,
 }
 
@@ -211,9 +216,26 @@ pub trait JobSpec: 'static {
 /// — since WO-M7c closed the reply direction, a row cannot be built without
 /// this half ([`JobCodec::of`] bounds on it), so every kind states both
 /// directions or does not exist.
+///
+/// # Heads and tails (WO-M7d)
+///
+/// A reply is one `head` plus zero or more `tails`. The tails are the row's
+/// LARGE FLAT buffers, nominated by the encoder to ride the browser's
+/// transfer list as separate buffers instead of being concatenated into the
+/// head — each concatenation was a multi-MiB memcpy where the job ran, and
+/// the page paid another to carve the buffer back out. A row with no large
+/// buffers writes everything into `head` and leaves `tails` empty.
+/// `encode_out` consumes the output so a tail can be the output's own
+/// buffer, moved, never copied; `decode_out` takes the tails by value so it
+/// can adopt a buffer the same way.
+///
+/// **Decoders REFUSE a tail count they did not write.** The wire is
+/// same-build-only (the build token refuses every other pairing at the
+/// handshake), so a wrong count is a corrupt or foreign message — and half
+/// a frame believed is worse than none.
 pub trait JobOutCodec: JobSpec {
-    fn encode_out(v: &Self::Out, out: &mut Vec<u8>);
-    fn decode_out(bytes: &[u8]) -> Option<Self::Out>;
+    fn encode_out(v: Self::Out, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>);
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<Self::Out>;
 }
 
 impl JobCodec {
@@ -270,20 +292,23 @@ fn run_shim<S: JobSpec>(job: &DescribedJob, geo: &JobGeometry) -> Option<Describ
     Some(DescribedOut(Box::new(out)))
 }
 
-/// Panics on a mismatch on the same grounds as the encode shim.
-fn encode_out_shim<S: JobOutCodec>(v: &DescribedOut, out: &mut Vec<u8>) {
-    let v = v.downcast_ref::<S::Out>().unwrap_or_else(|| {
+/// Panics on a mismatch on the same grounds as the encode shim. The typed
+/// check runs BEFORE the consuming `take` so the panic can still print the
+/// foreign reply it refused to encode.
+fn encode_out_shim<S: JobOutCodec>(v: DescribedOut, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>) {
+    if v.downcast_ref::<S::Out>().is_none() {
         panic!(
             "a `{}` codec row was asked to encode the reply {v:?} — the \
              registry routed a reply to the wrong row",
             S::LABEL,
-        )
-    });
-    S::encode_out(v, out);
+        );
+    }
+    let v = v.take::<S::Out>().expect("the downcast above succeeded");
+    S::encode_out(v, head, tails);
 }
 
-fn decode_out_shim<S: JobOutCodec>(bytes: &[u8]) -> Option<DescribedOut> {
-    let v = S::decode_out(bytes)?;
+fn decode_out_shim<S: JobOutCodec>(head: &[u8], tails: Vec<Vec<u8>>) -> Option<DescribedOut> {
+    let v = S::decode_out(head, tails)?;
     Some(DescribedOut(Box::new(v)))
 }
 
@@ -422,12 +447,17 @@ mod tests {
         }
     }
     impl JobOutCodec for DoublingSpec {
-        fn encode_out(v: &Self::Out, out: &mut Vec<u8>) {
-            out.extend_from_slice(&v.value.to_le_bytes());
+        fn encode_out(v: Self::Out, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+            head.extend_from_slice(&v.value.to_le_bytes());
         }
 
-        fn decode_out(bytes: &[u8]) -> Option<Self::Out> {
-            let mut r = Reader::new(bytes);
+        // No large buffers: everything rides the head, and a tail count
+        // this spec never writes is refused per the trait's convention.
+        fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<Self::Out> {
+            if !tails.is_empty() {
+                return None;
+            }
+            let mut r = Reader::new(head);
             let v = AlphaOut { value: r.u32()? };
             r.at_end().then_some(v)
         }
@@ -491,10 +521,15 @@ mod tests {
 
         // The reply half round-trips the same way — carried by every row,
         // not an optional half, since WO-M7c closed the reply direction.
+        // Encode consumes the out and splits head/tails (WO-M7d); this spec
+        // nominates no tails, and its decoder refuses any it is handed, so
+        // handing the tails straight back through is itself the check.
         let reply = DescribedOut(Box::new(AlphaOut { value: 42 }));
-        let mut reply_bytes = Vec::new();
-        (DOUBLING_ROW.encode_out)(&reply, &mut reply_bytes);
-        let back = (DOUBLING_ROW.decode_out)(&reply_bytes).expect("the reply round-trips");
+        let mut reply_head = Vec::new();
+        let mut reply_tails = Vec::new();
+        (DOUBLING_ROW.encode_out)(reply, &mut reply_head, &mut reply_tails);
+        let back =
+            (DOUBLING_ROW.decode_out)(&reply_head, reply_tails).expect("the reply round-trips");
         assert_eq!(back.take::<AlphaOut>(), Some(AlphaOut { value: 42 }));
     }
 }

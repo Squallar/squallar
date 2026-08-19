@@ -801,8 +801,9 @@ pub fn execute_bytes(bytes: &[u8]) -> JobResult {
 }
 
 /// [`execute_bytes`] plus the reply's own wire form: the row's registry
-/// code and its `encode_out` bytes — exactly what the worker posts back as
-/// the `OUT`/`OUT_KIND` pair (WO-M7c; `rustdar_web::worker` is the one
+/// code, its `encode_out` HEAD, and the row's nominated TAILS — exactly
+/// what the worker posts back as the `OUT`/`OUT_KIND`/`TAILS` trio
+/// (WO-M7c; head/tails split at WO-M7d; `rustdar_web::worker` is the one
 /// production caller).
 ///
 /// Here rather than in `rustdar-web` for the reason [`execute_bytes`] is
@@ -817,18 +818,32 @@ pub fn execute_bytes(bytes: &[u8]) -> JobResult {
 /// nothing — the page cannot tell them apart and does not need to: both
 /// mean "nothing to draw", and the caller still posts the explicit-null
 /// reply that keeps the pane from wedging.
-pub fn execute_encoded(bytes: &[u8]) -> Option<(u8, Vec<u8>)> {
+pub fn execute_encoded(bytes: &[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
     let request = JobRequest::from_bytes(bytes)?;
     let row = row_for(&request.job);
     let out = execute(&request)?;
-    // One buffer for the whole reply — for a frame this concatenates the
-    // image and the polar block that used to transfer separately, one extra
-    // memcpy (up to ~20 MiB for the widest still frame) paid HERE, where the
-    // job ran: in the worker, off the frame thread, accepted by design for
-    // one payload shape on the whole reply direction (M-B).
-    let mut encoded = Vec::new();
-    (row.encode_out)(&out, &mut encoded);
-    Some((wire_code(row), encoded))
+    // The head is scalars and framing — 64 covers every current row's
+    // fixed prefix, and an encoder that writes a big head (the delegating
+    // section/voxel/decode rows, the overlay raster) reserves its own
+    // exact need on top. A row's LARGE FLAT buffers do not land in the
+    // head at all: they ride `tails`, each transferred to the page as its
+    // own buffer (WO-M7d).
+    //
+    // The one-buffer shape this replaces cost this worker, per widest
+    // 2048² still frame (image 16.00 MiB + polar-with-values 5.04 MiB,
+    // derived by code reading), 5 memcpys / 68.16 MiB: polar `to_bytes`
+    // 5.04 + the head concat of polar 5.04 and image 16.00 + an UNCLAIMED
+    // whole-reply double-buffer 21.04 (this sink had no capacity and the
+    // frame codec extended it with a second finished Vec — the comment
+    // that stood here claimed "one extra memcpy, ~20 MiB" and
+    // under-claimed) + the wasm→JS crossing 21.04. The tails shape costs
+    // polar `to_bytes` 5.04 + the per-buffer wasm→JS crossings
+    // 5.04 + 16.00 = 26.08 MiB / 3 memcpys — parity with the pre-M7c
+    // wire. PX3 is the runtime measurement that judges these figures.
+    let mut head = Vec::with_capacity(64);
+    let mut tails = Vec::new();
+    (row.encode_out)(out, &mut head, &mut tails);
+    Some((wire_code(row), head, tails))
 }
 
 // ── The job sink ─────────────────────────────────────────────────────────────
@@ -1609,7 +1624,8 @@ pub fn deliver_job_reply(id: u64, result: JobResult) {
 }
 
 /// [`deliver_job_reply`] for a reply that arrived as bytes — the browser's
-/// `OUT`/`OUT_KIND` pair, or `None` for a worker that answered explicit
+/// `OUT`/`OUT_KIND`/`TAILS` trio (head, row code, and the row's nominated
+/// large buffers, WO-M7d), or `None` for a worker that answered explicit
 /// nulls (a job that produced nothing).
 ///
 /// The decode runs through **the row recorded at dispatch**
@@ -1627,12 +1643,12 @@ pub fn deliver_job_reply(id: u64, result: JobResult) {
 /// nothing can retire the entry between the read and the call; anywhere
 /// else the entry-less case is the already-abandoned job both functions
 /// already ignore.
-pub fn deliver_encoded_reply(id: u64, reply: Option<(u8, Vec<u8>)>) {
+pub fn deliver_encoded_reply(id: u64, reply: Option<(u8, Vec<u8>, Vec<Vec<u8>>)>) {
     let row = pending().get(&id).map(|job| job.row);
     let result = match (row, reply) {
-        (Some(row), Some((kind, bytes))) => {
+        (Some(row), Some((kind, head, tails))) => {
             if kind == wire_code(row) {
-                (row.decode_out)(&bytes)
+                (row.decode_out)(&head, tails)
             } else {
                 log::error!(
                     "a worker answered job {id} with out-kind {kind} where the \

@@ -28,12 +28,13 @@
 //! passes the envelope through unchanged.
 //!
 //! **Every row states both directions.** The three frame rows' replies ride
-//! [`RenderedFrame::to_bytes`]/[`from_bytes`](RenderedFrame::from_bytes) —
-//! the wire form WO-M7c gave the frame when the reply direction joined the
-//! codec table — and the section, voxel and decode rows' outputs already had
-//! wire forms of their own ([`CrossSection`], [`VoxelGrid`] and
-//! [`DecodedScan`] `to_bytes`/`from_bytes`), which their [`JobOutCodec`]
-//! halves delegate to unchanged.
+//! [`RenderedFrame::write_head`]/[`from_parts`](RenderedFrame::from_parts)
+//! — the wire form WO-M7c gave the frame when the reply direction joined
+//! the codec table, split at WO-M7d into a scalar head plus the two
+//! nominated tails `[polar, image]` — and the section, voxel and decode
+//! rows' outputs already had wire forms of their own ([`CrossSection`],
+//! [`VoxelGrid`] and [`DecodedScan`] `to_bytes`/`from_bytes`), which their
+//! [`JobOutCodec`] halves delegate to unchanged (all head, no tails).
 //!
 //! **The refusal contract**, shared by every `decode` here: `None` for a
 //! flag, product code or enum byte outside this build's values, a payload
@@ -75,19 +76,36 @@ pub static JOB_CODECS: &[JobCodec] = &[
 ];
 
 /// The frame rows' shared reply half: the wire form lives on the type
-/// ([`RenderedFrame::to_bytes`]), and the three rows delegate to it through
-/// one macro so a Level III frame and a Level II one cannot come to encode
-/// themselves differently — the same argument `From<SweepRender>` makes for
-/// the direct path.
+/// ([`RenderedFrame::write_head`]/[`from_parts`](RenderedFrame::from_parts)),
+/// and the three rows delegate to it through one macro so a Level III frame
+/// and a Level II one cannot come to encode themselves differently — the
+/// same argument `From<SweepRender>` makes for the direct path.
+///
+/// The frame nominates `[polar, image]` as its two tails (WO-M7d): the
+/// image `Vec` MOVES into the tails — zero worker-side copy of the 16 MiB
+/// widest-still buffer — and the polar block rides whole beside it, so
+/// neither is concatenated into the head (the concatenation this replaces
+/// was a 21.04 MiB memcpy per widest 2048² still frame, plus the encode
+/// sink's whole-reply double-buffer on top). The tail ORDER is load-bearing
+/// both ends and is pinned by the frame-reply digest rows
+/// (`rustdar_frontend::wire_identity::WIRE_FRAME_REPLY_ROWS`): a symmetric
+/// swap here and in `from_parts` keeps every round-trip green, and the
+/// digest is what goes red.
 macro_rules! frame_reply_codec {
     ($spec:ty) => {
         impl JobOutCodec for $spec {
-            fn encode_out(v: &RenderedFrame, out: &mut Vec<u8>) {
-                out.extend_from_slice(&v.to_bytes());
+            fn encode_out(v: RenderedFrame, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>) {
+                // The head is the scalar block alone: 29 bytes with every
+                // optional present (8 range + 9 nyquist + 2 melting +
+                // 10 storm), 11 with none — reserved exactly, once.
+                head.reserve_exact(29);
+                v.write_head(head);
+                tails.push(v.polar.to_bytes());
+                tails.push(v.image);
             }
 
-            fn decode_out(bytes: &[u8]) -> Option<RenderedFrame> {
-                RenderedFrame::from_bytes(bytes)
+            fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RenderedFrame> {
+                RenderedFrame::from_parts(head, tails)
             }
         }
     };
@@ -380,14 +398,23 @@ impl JobSpec for SectionJob {
 
 impl JobOutCodec for SectionJob {
     // Delegating to the type's own wire form keeps one description of the
-    // layout; the `to_bytes` Vec is copied into `out` to keep that moved
-    // signature exact — WO-M7c, which makes this path live, may flatten it.
-    fn encode_out(v: &CrossSection, out: &mut Vec<u8>) {
-        out.extend_from_slice(&v.to_bytes());
+    // layout; the `to_bytes` Vec is copied into `head`. WO-M7d — the order
+    // the note here once forecast as "WO-M7c may flatten it" — flattened
+    // the overlay adapter and split the frame reply into head+tails, and
+    // deliberately left this delegation and its one copy as they were: the
+    // copy ledger that drove that order measured the frame rows, not
+    // these.
+    fn encode_out(v: CrossSection, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        head.extend_from_slice(&v.to_bytes());
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<CrossSection> {
-        CrossSection::from_bytes(bytes)
+    // All head, no tails: a tail count this row did not write is refused
+    // per the `JobOutCodec` convention.
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<CrossSection> {
+        if !tails.is_empty() {
+            return None;
+        }
+        CrossSection::from_bytes(head)
     }
 }
 
@@ -458,12 +485,17 @@ impl JobSpec for VoxelJob {
 }
 
 impl JobOutCodec for VoxelJob {
-    fn encode_out(v: &VoxelGrid, out: &mut Vec<u8>) {
-        out.extend_from_slice(&v.to_bytes());
+    // Delegation kept whole at WO-M7d, `SectionJob`'s reasoning.
+    fn encode_out(v: VoxelGrid, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        head.extend_from_slice(&v.to_bytes());
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<VoxelGrid> {
-        VoxelGrid::from_bytes(bytes)
+    // All head, no tails: a foreign tail count refuses.
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<VoxelGrid> {
+        if !tails.is_empty() {
+            return None;
+        }
+        VoxelGrid::from_bytes(head)
     }
 }
 
@@ -563,12 +595,17 @@ impl JobSpec for DecodeJob {
 }
 
 impl JobOutCodec for DecodeJob {
-    fn encode_out(v: &DecodedScan, out: &mut Vec<u8>) {
-        out.extend_from_slice(&v.to_bytes());
+    // Delegation kept whole at WO-M7d, `SectionJob`'s reasoning.
+    fn encode_out(v: DecodedScan, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        head.extend_from_slice(&v.to_bytes());
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<DecodedScan> {
-        DecodedScan::from_bytes(bytes)
+    // All head, no tails: a foreign tail count refuses.
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<DecodedScan> {
+        if !tails.is_empty() {
+            return None;
+        }
+        DecodedScan::from_bytes(head)
     }
 }
 
@@ -957,14 +994,29 @@ mod tests {
                 melting_layer_source: None,
                 storm_motion: None,
             };
-            let mut bytes = Vec::new();
+            let mut head = Vec::new();
+            let mut tails = Vec::new();
             (row.encode_out)(
-                &rustdar_source::job::DescribedOut(Box::new(frame.clone())),
-                &mut bytes,
+                rustdar_source::job::DescribedOut(Box::new(frame.clone())),
+                &mut head,
+                &mut tails,
             );
-            assert_eq!(bytes, frame.to_bytes(), "`{}`", row.label);
+            let mut expected_head = Vec::new();
+            frame.write_head(&mut expected_head);
             assert_eq!(
-                (row.decode_out)(&bytes)
+                head, expected_head,
+                "`{}`: the head is not the frame's own",
+                row.label
+            );
+            assert_eq!(
+                tails.len(),
+                2,
+                "`{}`: the frame nominates two tails (which two, and in \
+                 what order, is the frame-reply digest rows' pin)",
+                row.label,
+            );
+            assert_eq!(
+                (row.decode_out)(&head, tails)
                     .expect("the frame reply decodes")
                     .take::<crate::frame::RenderedFrame>(),
                 Some(frame),
