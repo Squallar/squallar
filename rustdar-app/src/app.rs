@@ -2773,6 +2773,28 @@ impl App {
             evicted(&mut self.latest_cached_scans, &unshown),
         );
         self.evict_unneeded_loop_scans();
+        // And the derivation memo (WO-E4.8), pruned against what SURVIVED the
+        // passes above — every holder of a whole decoded volume contributes,
+        // the loop cache included, because a 3D loop derives per frame it
+        // revisits and a memo pruned against the plan-view stores alone would
+        // re-run those derivations once a frame. Native is where this call
+        // does the invalidating; on wasm the entries live in the worker's own
+        // instance of the memo (jobs run there), so this is a no-op on an
+        // empty map and the worker is bounded by the memo's LRU capacity plus
+        // its sealed-sweeps re-keying instead — `derive::retain_volumes` says
+        // so where the bound lives.
+        rustdar_radar::derive::retain_volumes(
+            self.scan_data
+                .values()
+                .map(|(scan, _)| scan.as_ref())
+                .chain(self.base_scans.values().map(|(scan, _, _)| scan.as_ref()))
+                .chain(
+                    self.latest_cached_scans
+                        .values()
+                        .map(|(scan, _, _, _)| scan.as_ref()),
+                )
+                .chain(self.loop_mgr.cached_scans()),
+        );
     }
 
     /// Drop the loop caches' data no live loop frame names — the decoded Level

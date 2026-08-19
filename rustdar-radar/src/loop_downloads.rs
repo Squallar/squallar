@@ -258,6 +258,17 @@ impl LoopDownloadManager {
         self.scan_cache.get(site)?.get(ts)
     }
 
+    /// Every cached loop volume, any site, any timestamp — the loop cache's
+    /// contribution to the set of live volumes [`crate::derive::retain_volumes`]
+    /// keeps derivation-memo entries for (WO-E4.8). A 3D loop derives NROT or
+    /// SRV per frame it revisits; pruning the memo against the plan-view
+    /// stores alone would drop and re-run those derivations once a frame.
+    pub fn cached_scans(&self) -> impl Iterator<Item = &nexrad_model::data::Scan> {
+        self.scan_cache
+            .values()
+            .flat_map(|scans| scans.values().map(|(scan, _)| scan.as_ref()))
+    }
+
     // ------------------------------------------------------------------
     // Test probes. `#[cfg(test)]` until the WO-RF2n fold; unconditional
     // since, because their consumers — the ten loop-pin suites — live

@@ -2549,7 +2549,7 @@ pub fn build_voxels_with_motion<'a>(
     // here, before anything samples, so a raw volume can never be resampled
     // under a derived label.
     let slot = crate::derive::volume_slot(req.product)?;
-    let prepared = crate::derive::prepare(volume, req.product, motion)?;
+    let prepared = crate::derive::prepare(volume, req.product, motion, lat, lon)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
     // scan's rungs are the same cuts flown at the same PRFs. `prepare` reads

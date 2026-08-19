@@ -810,7 +810,7 @@ pub fn render_section<'a>(
     // products are computed here, per sweep, before anything samples — so a
     // raw volume can never be sampled under a derived label (the sampler's
     // own gate still refuses that combination).
-    let prepared = crate::derive::prepare(volume, req.product, motion)?;
+    let prepared = crate::derive::prepare(volume, req.product, motion, lat, lon)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
     // scan's rungs are the same cuts flown at the same PRFs. `prepare` reads
