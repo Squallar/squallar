@@ -184,8 +184,8 @@ enum BackPress {
 /// | `pending_state` | root | cfg(wasm32); shell |
 /// | `http_client` | root | app_fetch residue |
 /// | `loop_mgr` | radar | EXECUTED at RF2n: loop_downloads.rs folded into rustdar-radar; field re-typed to `rustdar_radar::loop_downloads::LoopDownloadManager` |
-/// | `chunk_feeds` | radar | RF1: chunk_feed.rs moves; field re-types |
-/// | `chunk_notify` | radar | RF1: chunk_notify.rs moves; field re-types |
+/// | `chunk_feeds` | radar | EXECUTED at RF1: machinery in `rustdar_radar::chunk_feed`; field re-typed thin wiring |
+/// | `chunk_notify` | radar | EXECUTED at RF1: machinery in `rustdar_radar::chunk_notify`; field re-typed thin wiring |
 /// | `latest_cached_scans` | root | old VolumeInventory superseded |
 /// | `manual_nav_pending` | root | app_fetch residue; timeline-engine candidate post-E7 (named only) |
 /// | `last_viewport` | root | app_fetch residue |
@@ -217,13 +217,13 @@ enum BackPress {
 /// | app_state.rs | root | RG ruling: struct stays, fn-split only |
 /// | app_fetch.rs (2,748) + app_fetch/ (11 suites) | root | residue |
 /// | app_render.rs (5,191) + app_render/ (25 suites) | root | residue; later-phase orchestration is named, not moved |
-/// | app_chunks.rs (565) + app_chunks/ (3 suites) | radar (halves) | ONE `impl App` block; RF1 takes the radar-owned policy halves, the drains stay root — see RF1 list |
+/// | app_chunks.rs + app_chunks/ (3 suites) | radar (halves, EXECUTED at RF1) | drains + `apply_chunk_outcome` stay root, two policy bodies folded — see RF1 list |
 /// | frame_pump.rs (264) + frame_pump/tests.rs | root | the pump |
 /// | budget_arms.rs | root | pub(crate) fixtures for the upward-bridging budget agreement tests |
 /// | budget_memo.rs | root | kv-persisted ladder position; its own doc plans a WRITTEN re-home to rustdar-device-profile (d7) |
 /// | channels.rs (733) | root | ChannelHub |
-/// | chunk_feed.rs (551) + chunk_feed/ (4 suites) | radar | RF1; module suites are App-free |
-/// | chunk_notify.rs (797, inline tests) | radar | RF1 |
+/// | chunk_feed.rs + chunk_feed/ (4 suites) | radar | EXECUTED at RF1: moved whole (suites unedited) |
+/// | chunk_notify.rs (inline tests) | radar | EXECUTED at RF1: moved whole |
 /// | input.rs (272) | root | |
 /// | location_hint.rs | root | app-side residue post-RL-2 (site_for_timezone; anchors live in rustdar-location) |
 /// | loop_downloads.rs | radar | FOLDED at RF2n -> rustdar-radar/src/loop_downloads.rs (inline tests moved with it) |
@@ -241,22 +241,38 @@ enum BackPress {
 ///
 /// ## RF1/RF2 file lists (bound by this census)
 ///
-/// **WO-RF1 (live-chunk fold)**: chunk_feed.rs 551 + chunk_feed/{tests 314,
-/// due_tests 59, freshness_tests 68, status_tests 67} (App-free, move
-/// unedited); chunk_notify.rs 797 (inline tests, moves whole); app_chunks.rs
-/// 565 radar-owned halves = the policy bodies (`cut_selection_for`,
-/// `apply_chunk_outcome`, `record_tilt_freshness`) — the drains
-/// (`drive_chunk_feeds`, `poll_chunk_results`, `drive_chunk_notifications`,
-/// `check_archive_for`, `fetch_notified_chunk`, `fall_back_to_archive`,
-/// `any_pane_live_for_site`, `chunks_are_feeding`) stay root; app_chunks/
-/// tests.rs 146 is App-free, selection_tests.rs 86 + volume_close_tests.rs
-/// 557 drive App+TestBridge and stay with the wiring; the ewebsock dep
-/// (Cargo.toml) moves to radar's manifest target-gated as today. CAUTION
-/// (d9): app/chunk_feed_precedence_tests.rs 1,532 is App-MOUNTED (app.rs,
-/// `mod chunk_feed_precedence_tests`) and imports `super::tests::{empty_scan,
-/// headless}` + `crate::platform_double::TestBridge` — it cannot move
-/// verbatim; it exercises App drain precedence and stays root unless RF1's
-/// execution proves otherwise (an intent edit = STOP and report).
+/// **WO-RF1 (live-chunk fold) — EXECUTED 2026-08-19**: chunk_feed.rs +
+/// chunk_feed/{tests, due_tests, freshness_tests, status_tests} (App-free, 24
+/// tests) and chunk_notify.rs (15 inline tests) moved whole into rustdar-radar,
+/// assertions unedited. Of app_chunks.rs's three census-named policy bodies,
+/// TWO folded: `cut_selection_for`'s body + policy history ->
+/// `rustdar_radar::chunk_feed::cut_selection_for` (App keeps a thin delegate
+/// of the same name); `record_tilt_freshness`'s body ->
+/// `ChunkFeedManager::record_tilt_freshness` (App method deleted, call sites
+/// re-pointed). **`apply_chunk_outcome` STAYED root** — executor deviation
+/// from the census's fold list, surfaced at the land: it writes three
+/// census-ROOT stores (`scan_data`/`base_scans`/`latest_cached_scans`),
+/// drives the `Gui`, resets the `RenderDispatcher`, spawns Level III fetches
+/// and calls the stays-root drain `any_pane_live_for_site`; folding it needs
+/// the post-campaign RadarSource seam the M-H reconciliation defers, or a
+/// non-verbatim redesign. The drains (`drive_chunk_feeds`,
+/// `poll_chunk_results`, `drive_chunk_notifications`, `check_archive_for`,
+/// `fetch_notified_chunk`, `fall_back_to_archive`, `any_pane_live_for_site`,
+/// `chunks_are_feeding`) stay root as bound; app_chunks/ suites all stay
+/// (tests.rs is a source probe over app.rs; the other two drive
+/// App+TestBridge). Forced seam adaptations, each cycle-driven:
+/// `ChunkFeedStatus`/`TiltFreshness` definitions moved rustdar-egui -> radar
+/// chunk_feed with egui re-exporting at the published paths (radar cannot dep
+/// egui); `retain_live` returns the evicted `SiteFeed`s and the app drain
+/// hands them to `offload::discard_each` (radar cannot dep rustdar-worker;
+/// same shape as RF2's parameterization precedent); radar feature
+/// `test-support` compiles the three cross-crate test hooks
+/// (`force_retire_at`/`force_serving`/`backdate_handshake`) for the
+/// frontend's new dev-dependency edge. The ewebsock dep moved to radar's
+/// manifest exactly as it was — a PLAIN dep; the census's "target-gated as
+/// today" overstated it (it was never target-gated). d9 EXECUTED as ruled:
+/// app/chunk_feed_precedence_tests.rs stayed root and passes through the
+/// re-typed wiring unedited.
 ///
 /// **WO-RF2 (loop fold) — EXECUTED NARROWED as RF2n (seam ruling 5, 2026-08-19)**:
 /// loop_downloads.rs 1,683 (tests inline at `mod tests`) folded into
@@ -275,9 +291,9 @@ enum BackPress {
 /// overlays 16/6, source 2/2, geo 1/1) — 45 name the worker-moved
 /// offload/wire_identity family (WO-RW's "~45" was exactly this family), 5
 /// name volumetric-moved modules, 3 name device-profile-moved constants, 1
-/// names chunk_feed (radar chunks.rs — RF1 re-words in place when the module
-/// arrives), 1 names render_dispatch (overlays handlers/model.rs — still
-/// valid today, re-keys at WO-RA, not at RF1/RF2).
+/// named chunk_feed (radar chunks.rs — REPAIRED at RF1 to `crate::chunk_feed`
+/// when the module arrived), 1 names render_dispatch (overlays
+/// handlers/model.rs — still valid today, re-keys at WO-RA, not at RF1/RF2).
 ///
 /// ## Discrepancies vs the plan's expectations
 ///
@@ -311,7 +327,8 @@ enum BackPress {
 /// * d9 — RF1's trap "chunk suites (incl. chunk_feed_precedence_tests) move
 ///   with the code" cannot apply verbatim to that one suite (App-mounted,
 ///   app-double-coupled — see the RF1 list); the chunk_feed/chunk_notify
-///   module suites move unedited as the trap intends.
+///   module suites move unedited as the trap intends. EXECUTED at RF1 as the
+///   orchestrator ruled: the precedence suite stayed root, unedited.
 pub struct App {
     instance: wgpu::Instance,
     state: Option<app_state::AppState>,
@@ -540,10 +557,12 @@ pub struct App {
     // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
     loop_mgr: LoopDownloadManager,
     /// Per-site real-time chunk feeds. Empty until a live site starts one.
-    chunk_feeds: crate::chunk_feed::ChunkFeedManager,
+    /// The machinery lives in [`rustdar_radar::chunk_feed`] since WO-RF1; this
+    /// field is the wiring that owns it.
+    chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager,
     /// Push notification of new chunks. Purely an early wake-up for the feeds
-    /// above; see `chunk_notify`.
-    chunk_notify: crate::chunk_notify::ChunkNotifier,
+    /// above; see [`rustdar_radar::chunk_notify`] (moved there at WO-RF1).
+    chunk_notify: rustdar_radar::chunk_notify::ChunkNotifier,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
     /// `(volume, what its cuts declared, its product inventory, when it was
     /// collected)`. The declared table travels because `handle_jump_to_live`
@@ -938,12 +957,13 @@ fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
 /// the predicate sees the same `(&K, &mut V)` a `retain` predicate would — so
 /// converting a call site is a change of destination and not of rule.
 ///
-/// `pub(crate)` for the second holder of whole volumes that has to make the
-/// same move: [`crate::chunk_feed::ChunkFeedManager::retain_live`] drops a
-/// departing site's assembler, which is the *other* full copy of a live
-/// volume. One helper rather than the same three lines in two modules, so a
-/// change to how an eviction hands its values over cannot reach one caller and
-/// miss the other.
+/// The *other* holder of whole volumes makes the same move one crate down:
+/// [`rustdar_radar::chunk_feed::ChunkFeedManager::retain_live`] (moved there
+/// at WO-RF1) extracts a departing site's assembler — the second full copy of
+/// a live volume — and hands it back owned, and the drain in `app_chunks` is
+/// what passes those to `discard_each`. Radar keeps its own three-line copy of
+/// this move: a `pub(crate)` helper does not cross a crate boundary, so "one
+/// helper for both callers" ends where the crate does.
 pub(crate) fn evicted<V>(
     map: &mut HashMap<String, V>,
     doomed: &impl Fn(&String) -> bool,
@@ -1165,8 +1185,8 @@ impl App {
             #[cfg(target_arch = "wasm32")]
             pending_state: None,
             loop_mgr: LoopDownloadManager::new(),
-            chunk_feeds: crate::chunk_feed::ChunkFeedManager::new(),
-            chunk_notify: crate::chunk_notify::ChunkNotifier::new(),
+            chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager::new(),
+            chunk_notify: rustdar_radar::chunk_notify::ChunkNotifier::new(),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
             last_viewport: None,
@@ -3334,8 +3354,8 @@ impl App {
     ///
     /// [`Gui::auto_poll_delay`]: rustdar_egui::Gui::auto_poll_delay
     /// [`Gui::status_tick_delay`]: rustdar_egui::Gui::status_tick_delay
-    /// [`ChunkFeedManager::next_round_delay`]: crate::chunk_feed::ChunkFeedManager::next_round_delay
-    /// [`ChunkNotifier::next_retry_delay`]: crate::chunk_notify::ChunkNotifier::next_retry_delay
+    /// [`ChunkFeedManager::next_round_delay`]: rustdar_radar::chunk_feed::ChunkFeedManager::next_round_delay
+    /// [`ChunkNotifier::next_retry_delay`]: rustdar_radar::chunk_notify::ChunkNotifier::next_retry_delay
     /// [`wakeup_control_flow`]: App::wakeup_control_flow
     fn auto_poll_delay(&self) -> Option<std::time::Duration> {
         [

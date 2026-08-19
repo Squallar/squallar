@@ -99,19 +99,10 @@ impl AutoPollState {
 /// One second, for [`AutoPollState::countdown_tick_delay`]'s remainder.
 const NANOS_PER_SEC: u32 = 1_000_000_000;
 
-/// How fresh the tilt on screen is.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct TiltFreshness {
-    /// The elevation the active pane is actually rendering — the snapped angle,
-    /// not the one the user selected.
-    pub elevation: f32,
-    /// Seconds since the radar collected the newest radial in that sweep.
-    ///
-    /// Counts up between cuts and drops back when the beam returns, so it reads
-    /// as the real cadence of the tilt rather than as a countdown to a poll.
-    /// This is the number the feature exists to make small.
-    pub data_age_secs: u64,
-}
+/// The chunk-feed status vocabulary, defined beside its producer in
+/// `rustdar_radar::chunk_feed` since WO-RF1 and re-exported here at the paths
+/// this crate always published them at.
+pub use rustdar_radar::chunk_feed::{ChunkFeedStatus, TiltFreshness};
 
 /// One site's current-volume stamp, as the App publishes it each frame.
 ///
@@ -131,29 +122,6 @@ pub struct CurrentVolumeStamp {
     /// contributes at all. `None` while the site's first volume is still
     /// filling: there is no complete volume yet and the caption says so.
     pub base_started: Option<NaiveDateTime>,
-}
-
-/// What the real-time chunk feed is doing for the pane on screen.
-///
-/// Deliberately about *the tilt being shown* rather than about the feed's
-/// progress through the volume. A count of completed cuts is operator jargon and
-/// answers the wrong question: what a user needs to know is whether the image in
-/// front of them is current, and a volume can be most of the way assembled while
-/// their own tilt is still minutes old.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ChunkFeedStatus {
-    /// Some live site is being fed from the real-time bucket.
-    pub feeding: bool,
-    /// A live site had its feed retired and fell back to the archive. Worth
-    /// saying out loud: it is a silent drop from seconds of latency to minutes.
-    pub retired: bool,
-    /// The feed's own poll cadence, in seconds.
-    pub interval_secs: u64,
-    /// A push-notification socket is open, so chunks are fetched on arrival
-    /// rather than on the next tick.
-    pub pushed: bool,
-    /// The active pane's tilt, once the feed has delivered it at least once.
-    pub tilt: Option<TiltFreshness>,
 }
 
 pub struct Gui {

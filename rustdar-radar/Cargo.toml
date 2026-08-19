@@ -3,8 +3,23 @@ name = "rustdar-radar"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Compiles the handful of state-forcing test hooks on `ChunkFeedManager` and
+# `ChunkNotifier` (`force_retire_at`, `force_serving`, `backdate_handshake`)
+# for a dependent crate's tests. `#[cfg(test)]` is crate-local and invisible
+# downstream, so the app crate's drain-precedence suites — which retire a feed
+# or age a handshake without waiting out the real clocks — need this feature on
+# their dev-dependency. Never enabled by a normal dependency.
+test-support = []
+
 [dependencies]
 chrono = { workspace = true }
+# The chunk-notification WebSocket in `chunk_notify` (WO-RF1; the dep moved
+# here with the module from the frontend). Plain rather than target-gated:
+# ewebsock's reader lives on its own thread natively and on the browser's
+# event loop on wasm, which is exactly why the notifier drains without an
+# executor on both targets.
+ewebsock = { workspace = true }
 log = { workspace = true }
 rustdar-source = { workspace = true }
 rustdar-geo = { workspace = true }
@@ -18,6 +33,9 @@ nexrad-decode = { workspace = true }
 nexrad-level3 = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+# `Instant` for the feed/notifier clocks in `chunk_feed`/`chunk_notify`
+# (WO-RF1): std's on native, `performance.now()` on wasm.
+web-time = { workspace = true }
 # ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs).
 xml = "=1.4.0"
 

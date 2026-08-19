@@ -2,6 +2,8 @@ pub mod archive;
 pub(crate) mod azimuth;
 pub mod beam;
 pub mod catalogue;
+pub mod chunk_feed;
+pub mod chunk_notify;
 pub mod chunks;
 pub mod current;
 pub mod derive;

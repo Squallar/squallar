@@ -28,6 +28,9 @@ rustdar-gpu = { workspace = true }
 # The 3D volume stack: probe/latch, raymarch, staging, uniforms, blue noise,
 # degrade policy and the bridge moved down at WO-RV.
 rustdar-volumetric = { workspace = true }
+# The chunk-feed and chunk-notification machinery live in radar's
+# `chunk_feed`/`chunk_notify` since WO-RF1; this crate keeps the drains and
+# the `App` fields that own the managers.
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 # The job-boundary vocabulary (DescribedJob, JobCodec, JobGeometry) and the
@@ -70,7 +73,6 @@ nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
-ewebsock = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -118,3 +120,11 @@ egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"]
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.
 wasm-bindgen-futures = "=0.4.76"
+
+[dev-dependencies]
+# The state-forcing test hooks on radar's `ChunkFeedManager`/`ChunkNotifier`
+# (`force_retire_at`, `force_serving`, `backdate_handshake`), which this
+# crate's drain-precedence and re-arm suites drive. A `#[cfg(test)]` in a
+# dependency is invisible to this crate's tests, so the hooks ride a feature —
+# enabled here, on the dev-dependency only, never on the normal edge above.
+rustdar-radar = { workspace = true, features = ["test-support"] }
