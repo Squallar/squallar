@@ -5,7 +5,7 @@
 //! `rustdar-radar` carries no list of the network — see
 //! [`SiteTable`](rustdar_radar::sites::SiteTable). A process learns which
 //! radars exist from a volume it decoded or from the catalogue it fetched, and
-//! a headless `App` over a `MemoryConfigStore` with no network does neither. So
+//! a headless `App` over a `MemoryKvStore` with no network does neither. So
 //! without this every test here runs against an empty table: `get_radar_site`
 //! answers `None`, a pane names a site nothing can place, a timezone resolves
 //! to no radar and a cross-section is anchored at sea level.
@@ -29,7 +29,7 @@
 //!
 //! # What is deliberately absent
 //!
-//! `KMBX`, which `a_run_with_no_config_store_still_applies_the_volumes_own_position`
+//! `KMBX`, which `a_run_with_no_kv_still_applies_the_volumes_own_position`
 //! places itself so that no sibling can move it.
 
 use rustdar_radar::site_position::SitePosition;

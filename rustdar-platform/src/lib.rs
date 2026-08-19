@@ -8,7 +8,7 @@
 //! concrete [`platform::PlatformBridge`] implementations. The portable
 //! application lives in `rustdar-frontend`.
 
-pub mod config_store;
+pub mod kv;
 /// Test-only. See the module docs for why it lives in this crate.
 pub mod network_security_config;
 /// The OS location providers, behind exactly the `cfg` that selects a bridge

@@ -35,6 +35,7 @@ wasm-opt = [
 # wasm test runner here, so gating the crate would make those tests never run.
 [dependencies]
 rustdar-egui = { workspace = true }
+rustdar-kv = { workspace = true }
 # Types only (GpsFix). The browser's Geolocation replaces the serial reader, so
 # the `serial` feature stays off, as in rustdar-frontend.
 rustdar-gps = { workspace = true }

@@ -158,7 +158,7 @@
 //!
 //! # What is discovered is remembered
 //!
-//! Under [`LOOP_POOL_KEY`], its own `ConfigStore` entry, written synchronously,
+//! Under [`LOOP_POOL_KEY`], its own `KvStore` entry, written synchronously,
 //! encoded as a decimal count of MiB. Not a field on `UiConfig`, for the reason
 //! `crate::site_positions` and `crate::location_permission::LOCATION_MEMO_KEY`
 //! both give: `autosave_config` writes that blob on a 3 s timer behind a string
@@ -177,7 +177,7 @@ use crate::constants::{
     LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
 };
 use crate::volume::quality::DeviceClass;
-use rustdar_egui::config_store::ConfigStore;
+use rustdar_kv::KvStore;
 use rustdar_radar::types::RenderView;
 
 /// Key the discovered pool size is persisted under.
@@ -657,7 +657,7 @@ impl LoopPoolState {
 /// outside the target's bounds is *held* to them rather than rejected: the
 /// bounds are this build's decision and a config written by an older build is
 /// still evidence about the machine.
-pub fn remembered(store: Option<&dyn ConfigStore>, limits: LoopPoolLimits) -> Option<usize> {
+pub fn remembered(store: Option<&dyn KvStore>, limits: LoopPoolLimits) -> Option<usize> {
     let raw = store?.load(LOOP_POOL_KEY)?;
     let mib: usize = raw.trim().parse().ok().or_else(|| {
         log::warn!("loop pool memo is not a number ({raw:?}); re-probing this device");
@@ -678,11 +678,11 @@ pub fn remembered(store: Option<&dyn ConfigStore>, limits: LoopPoolLimits) -> Op
 /// three more seconds. A failed write is logged and dropped: losing the memo
 /// costs one re-probe, and configuration is never allowed to be load-bearing.
 ///
-/// [`ConfigStore::store_now`] is what keeps that true. The ordinary `store`
+/// [`KvStore::store_now`] is what keeps that true. The ordinary `store`
 /// defers to a writer thread, and a process killed moments later drops the memo
 /// exactly as if it had waited for the timer — which is the outcome this
 /// function was written to rule out.
-pub fn remember(store: Option<&dyn ConfigStore>, bytes: usize) {
+pub fn remember(store: Option<&dyn KvStore>, bytes: usize) {
     let Some(store) = store else {
         return;
     };

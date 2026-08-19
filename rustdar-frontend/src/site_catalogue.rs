@@ -3,7 +3,7 @@
 //! [`rustdar_radar::catalogue`] decides *what* the catalogue is; this decides
 //! where it lives on each platform and when it is read and written. The split
 //! is the one [`crate::site_positions`] already makes and for the same reason:
-//! [`ConfigStore`] is a `rustdar-egui` type, and `rustdar-radar` must not learn
+//! [`KvStore`] is a `rustdar-kv` type, and `rustdar-radar` must not learn
 //! that this crate exists.
 //!
 //! # The cache is what the app actually runs on
@@ -55,7 +55,7 @@
 //! decade, and the fetch already refreshes the cache on every launch that has a
 //! network — so a TTL could only ever throw away a good answer for a worse one.
 
-use rustdar_egui::config_store::ConfigStore;
+use rustdar_kv::KvStore;
 use rustdar_radar::catalogue::SiteCatalogue;
 
 /// Key the fetched catalogue is persisted under.
@@ -76,7 +76,7 @@ const MAX_CATALOGUE_SITES: usize = 800;
 /// dropped rather than propagated, and an empty result is not a degraded mode:
 /// it is what arms `App::catalogue_pending`, so this session adopts the
 /// catalogue it fetches rather than waiting for the next launch.
-pub fn load(store: Option<&dyn ConfigStore>) -> SiteCatalogue {
+pub fn load(store: Option<&dyn KvStore>) -> SiteCatalogue {
     let Some(raw) = store.and_then(|store| store.load(SITE_CATALOGUE_KEY)) else {
         return SiteCatalogue::default();
     };
@@ -120,7 +120,7 @@ pub fn load(store: Option<&dyn ConfigStore>) -> SiteCatalogue {
 /// catalogue: it did once, and a store that could not be written then discarded
 /// a catalogue already in hand. See `App::poll_site_catalogue`.
 pub fn store_if_changed(
-    store: Option<&dyn ConfigStore>,
+    store: Option<&dyn KvStore>,
     cached: &SiteCatalogue,
     fetched: &SiteCatalogue,
 ) -> bool {

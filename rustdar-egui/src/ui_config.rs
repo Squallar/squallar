@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-use crate::config_store::{ConfigStore, UI_CONFIG_KEY};
+use rustdar_kv::KvStore;
+
+/// Key the UI layout is persisted under.
+///
+/// The filesystem backend turns this into `ui.json`, which is the name the
+/// config has always had on disk — the key was chosen to keep it that way so
+/// existing configs keep loading.
+pub const UI_CONFIG_KEY: &str = "ui";
 
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::spc::outlook::OutlookDay;
@@ -992,13 +999,13 @@ impl Default for UiConfig {
 impl super::Gui {
     /// Save UI layout configuration to `store`, waiting for the write.
     ///
-    /// [`ConfigStore::store_now`] rather than `store`, because both callers are
+    /// [`KvStore::store_now`] rather than `store`, because both callers are
     /// save points where the process may be gone a moment later — the exit
     /// path, and the Android suspend that the system is free to follow with a
     /// kill. A backend that defers writes to another thread would never get to
     /// run this one. The periodic autosave, which is on the frame thread and
     /// has a next tick to fall back on, deliberately uses `store` instead.
-    pub fn save_ui_config(&self, store: &dyn ConfigStore) {
+    pub fn save_ui_config(&self, store: &dyn KvStore) {
         let Some(json) = self.ui_config_json() else {
             return;
         };
@@ -1256,7 +1263,7 @@ impl super::Gui {
     /// An unparseable config counts as *not* loaded. That is the honest answer —
     /// nothing was applied — and it means a corrupted store still gets a sensibly
     /// located default rather than the compiled-in one.
-    pub fn load_ui_config(&mut self, store: &dyn ConfigStore) -> bool {
+    pub fn load_ui_config(&mut self, store: &dyn KvStore) -> bool {
         let Some(content) = store.load(UI_CONFIG_KEY) else {
             return false;
         };
@@ -1542,8 +1549,8 @@ impl super::Gui {
         self.initialize_pane_enabled();
         // The third wholesale writer of a pane's enabled map, and the one it is
         // easiest to assume is startup-only. It is not: on web and Android the
-        // config store is not readable when `App::new` runs, so
-        // `App::apply_config_store` reaches here **mid-session**, after frames
+        // kv store is not readable when `App::new` runs, so
+        // `App::set_config_dir`'s reload reaches here **mid-session**, after frames
         // have been drawn and overlay textures cached. A restored config that
         // turns a layer off has to release it exactly as the toggle would — and
         // `ui_map_pane`'s per-frame clear is no backstop here, because the same

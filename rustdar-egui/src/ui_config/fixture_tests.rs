@@ -9,13 +9,14 @@
 //! test reading it would pin nothing.
 
 use crate::Gui;
-use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
+use crate::UI_CONFIG_KEY;
+use rustdar_kv::{KvStore, MemoryKvStore};
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
 
 /// A store holding exactly one era's file, as the disk would.
-fn store_with(fixture: &str) -> MemoryConfigStore {
-    let store = MemoryConfigStore::default();
+fn store_with(fixture: &str) -> MemoryKvStore {
+    let store = MemoryKvStore::default();
     store
         .store(UI_CONFIG_KEY, fixture)
         .expect("the memory store accepts a write");

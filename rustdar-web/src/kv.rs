@@ -1,8 +1,8 @@
-//! [`ConfigStore`] backed by the browser's `localStorage`.
+//! [`rustdar_kv::KvStore`] backed by the browser's `localStorage`.
 //!
-//! This is the reason [`ConfigStore`] addresses blobs by logical key rather than
-//! by path: `localStorage` is a flat string-to-string map with no directories
-//! and no filenames, so there is nothing here for a `&Path` to mean.
+//! This is the reason [`rustdar_kv::KvStore`] addresses blobs by logical key
+//! rather than by path: `localStorage` is a flat string-to-string map with no
+//! directories and no filenames, so there is nothing here for a `&Path` to mean.
 
 /// Namespacing, not security: a shared origin (project page, preview deploy,
 /// reused `localhost` port) sees one `localStorage` for every app on it, and a
@@ -17,18 +17,18 @@ pub fn storage_key(key: &str) -> String {
     format!("{KEY_PREFIX}{key}")
 }
 
-/// A [`ConfigStore`] that persists into `window.localStorage`.
+/// A [`rustdar_kv::KvStore`] that persists into `window.localStorage`.
 ///
-/// The handle is obtained once in [`LocalStorageConfigStore::new`], which is
+/// The handle is obtained once in [`LocalStorageKvStore::new`], which is
 /// also where failure is absorbed: `localStorage` *throws* rather than returning
 /// null when site data is blocked or the page is a sandboxed iframe.
 #[cfg(target_arch = "wasm32")]
-pub struct LocalStorageConfigStore {
+pub struct LocalStorageKvStore {
     storage: web_sys::Storage,
 }
 
 #[cfg(target_arch = "wasm32")]
-impl LocalStorageConfigStore {
+impl LocalStorageKvStore {
     /// Obtain the backing store, or `None` where the browser refuses access.
     pub fn new() -> Option<Self> {
         // Three distinct failures, all meaning "nowhere to persist": no window,
@@ -40,7 +40,7 @@ impl LocalStorageConfigStore {
 }
 
 #[cfg(target_arch = "wasm32")]
-impl rustdar_egui::config_store::ConfigStore for LocalStorageConfigStore {
+impl rustdar_kv::KvStore for LocalStorageKvStore {
     fn load(&self, key: &str) -> Option<String> {
         // Err (store became inaccessible) and Ok(None) (never written) both
         // report as None per the trait, so the chain folds.
@@ -59,7 +59,7 @@ impl rustdar_egui::config_store::ConfigStore for LocalStorageConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_egui::config_store::UI_CONFIG_KEY;
+    use rustdar_egui::UI_CONFIG_KEY;
 
     #[test]
     fn keys_are_namespaced_to_rustdar() {

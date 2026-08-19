@@ -910,8 +910,7 @@ impl App {
         // below, once the bracket it is held inside exists.
         device_profile.memo = Some(crate::budget::BudgetMemo {
             loop_pool_bytes: None,
-            steps_back: crate::budget::remembered_steps(platform.config_store().as_deref())
-                .unwrap_or(0),
+            steps_back: crate::budget::remembered_steps(platform.kv().as_deref()).unwrap_or(0),
         });
         let budgets = crate::budget::resolve(&device_profile);
         let render = RenderDispatcher::with_budgets(&budgets);
@@ -938,7 +937,7 @@ impl App {
         let loop_frame_budget = budgets.loop_frames_held;
         let location_settings_available = platform.location_settings_available();
         let restored = platform
-            .config_store()
+            .kv()
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));
         // Android has no config dir yet at this point and loads later in
         // `set_config_dir`, so `restored` is false there even for a returning
@@ -950,8 +949,7 @@ impl App {
         // the first volume decodes, so a corrected site is drawn corrected
         // from the first frame rather than shifting under the user later.
         // Reloaded in `set_config_dir` for Android, which has no store yet.
-        let site_positions =
-            crate::site_positions::SitePositions::load(platform.config_store().as_deref());
+        let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
         // And the network catalogue this install last fetched, which is where
         // *every* radar comes from on an install that has not opened one yet.
         // Read from the cache and never from the network on this path: a fetch
@@ -959,7 +957,7 @@ impl App {
         // would move a marker under the user. The refresh is spawned below and
         // is applied on the *next* launch — with one exception, below. See
         // `crate::site_catalogue`.
-        let site_catalogue = crate::site_catalogue::load(platform.config_store().as_deref());
+        let site_catalogue = crate::site_catalogue::load(platform.kv().as_deref());
         // The same reasoning one level down: the *table* is resolved here too,
         // not on first use. A radar only becomes nameable and drawable once
         // this runs, so if it ran after the first frame the map would gain a
@@ -1012,7 +1010,7 @@ impl App {
         // only when nothing was remembered.
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool_memo =
-            crate::loop_pool::remembered(platform.config_store().as_deref(), loop_pool_limits);
+            crate::loop_pool::remembered(platform.kv().as_deref(), loop_pool_limits);
         let loop_pool = crate::loop_pool::LoopPool::new(
             loop_pool_memo.unwrap_or(loop_pool_limits.floor),
             loop_pool_limits,
@@ -2918,10 +2916,10 @@ impl App {
         if self.autosave.last_written.as_deref() == Some(json.as_str()) {
             return;
         }
-        let Some(store) = self.platform.config_store() else {
+        let Some(store) = self.platform.kv() else {
             return;
         };
-        match store.store(rustdar_egui::config_store::UI_CONFIG_KEY, &json) {
+        match store.store(rustdar_egui::UI_CONFIG_KEY, &json) {
             // For a backend that queues, this says "accepted", not "written" —
             // a write that then fails is reported where it failed. The cost is
             // that a failing disk waits for the next genuine change rather than
@@ -3003,7 +3001,7 @@ impl App {
         if info.site_source == SitePositionSource::Volume
             && let Some(position) = info.site_position
         {
-            let store = self.platform.config_store();
+            let store = self.platform.kv();
             let learned = self.site_positions.learn(store.as_deref(), site, position);
             // `store` borrows `self.platform`; the resolve below wants two other
             // fields and the bump wants `self.gui`.
@@ -3262,7 +3260,7 @@ impl App {
     /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
         // Persist UI config before exiting
-        if let Some(store) = self.platform.config_store() {
+        if let Some(store) = self.platform.kv() {
             self.gui.save_ui_config(store.as_ref());
         }
         if !self.platform.supports_exit() {
@@ -3291,7 +3289,7 @@ impl App {
     /// getting a turn. So the last change a user makes — in the very redraw
     /// that processed the menu's Exit — would be the one lost. Writing the file
     /// twice on the way out is much the cheaper mistake, and
-    /// [`ConfigStore::store_now`] is what makes this one the last word.
+    /// [`KvStore::store_now`] is what makes this one the last word.
     ///
     /// `process::exit` is not redundant beside `event_loop.exit()`. On Android
     /// the loop never unwinds, so nothing after `exit()` ever runs and the
@@ -3303,7 +3301,7 @@ impl App {
         log::info!("Exiting application");
         // Last, and synchronously: see the note above. Anything the writer
         // thread still holds dies with the process a few lines down.
-        if let Some(store) = self.platform.config_store() {
+        if let Some(store) = self.platform.kv() {
             self.gui.save_ui_config(store.as_ref());
         }
         event_loop.exit();
@@ -3327,7 +3325,7 @@ impl App {
         self.platform.set_config_dir(dir);
         // Load config now — on Android this is called after App::new(),
         // so the initial load in new() had no config dir yet.
-        if let Some(store) = self.platform.config_store() {
+        if let Some(store) = self.platform.kv() {
             // Same reason, and still before the first paint: this runs inside
             // `android_main`, ahead of the event loop and so ahead of any
             // volume. Unconditional rather than folded into the branch below —
@@ -3703,7 +3701,7 @@ impl ApplicationHandler for App {
         log::info!("App suspended - clearing graphics state");
         // Save config on suspend — on Android this is the only reliable save
         // point before the system may kill the process.
-        if let Some(store) = self.platform.config_store() {
+        if let Some(store) = self.platform.kv() {
             self.gui.save_ui_config(store.as_ref());
         }
         self.render.clear_last_rendered();

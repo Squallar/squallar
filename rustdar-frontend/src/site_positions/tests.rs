@@ -1,5 +1,5 @@
 use super::*;
-use rustdar_egui::config_store::MemoryConfigStore;
+use rustdar_kv::MemoryKvStore;
 
 fn position(lat_udeg: i32, lon_udeg: i32) -> SitePosition {
     SitePosition {
@@ -18,7 +18,7 @@ fn position(lat_udeg: i32, lon_udeg: i32) -> SitePosition {
 /// most is the one that ends immediately afterwards.
 #[test]
 fn a_learned_position_is_written_at_once_and_read_back_next_run() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let ktlx = position(35_333_060, -97_277_500);
 
     let mut learning = SitePositions::default();
@@ -45,7 +45,7 @@ fn a_learned_position_is_written_at_once_and_read_back_next_run() {
 /// — a run later, with nothing pointing at the cause.
 #[test]
 fn the_persisted_blob_is_integers_all_the_way_down() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut learning = SitePositions::default();
     learning.learn(Some(&store), "KTLX", position(35_333_060, -97_277_500));
     learning.learn(Some(&store), "KABR", position(45_455_830, -98_413_330));
@@ -60,7 +60,7 @@ fn the_persisted_blob_is_integers_all_the_way_down() {
     let mut other = SitePositions::default();
     other.learn(None, "KABR", position(45_455_830, -98_413_330));
     other.learn(None, "KTLX", position(35_333_060, -97_277_500));
-    let other_store = MemoryConfigStore::default();
+    let other_store = MemoryKvStore::default();
     other.persist(Some(&other_store));
     assert_eq!(other_store.load(SITE_POSITIONS_KEY), Some(raw));
 }
@@ -74,7 +74,7 @@ fn the_persisted_blob_is_integers_all_the_way_down() {
 /// value that has not moved.
 #[test]
 fn a_fresh_volume_wins_and_a_repeat_writes_nothing() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut learning = SitePositions::default();
 
     let before = position(35_333_060, -97_277_500);
@@ -101,7 +101,7 @@ fn a_fresh_volume_wins_and_a_repeat_writes_nothing() {
 /// in this blob.
 #[test]
 fn an_unreadable_blob_degrades_to_the_table_rather_than_failing() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store.store(SITE_POSITIONS_KEY, "not json at all").unwrap();
     assert!(SitePositions::load(Some(&store)).is_empty());
 

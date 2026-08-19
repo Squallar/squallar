@@ -32,7 +32,7 @@
 //! `nws::zones` caches to a TTL'd directory, which is `None` on wasm — and
 //! wasm is exactly where this matters most, because a browser tab has no
 //! filesystem to fall back on and re-downloads everything on every visit. A
-//! [`ConfigStore`] is the one persistence every platform has.
+//! [`KvStore`] is the one persistence every platform has.
 //!
 //! There is also no TTL here, and that is deliberate: a reported position does
 //! not go stale. It is a step function that steps once a decade, and the
@@ -62,7 +62,7 @@
 //! argument holds however noisy the corpus turns out to be. The policy itself
 //! is pinned in-tree by `a_fresh_volume_wins_and_a_repeat_writes_nothing`.
 
-use rustdar_egui::config_store::ConfigStore;
+use rustdar_kv::KvStore;
 use rustdar_radar::site_position::SitePosition;
 use rustdar_radar::sites::SiteFix;
 use std::collections::BTreeMap;
@@ -104,7 +104,7 @@ impl SitePositions {
     /// An unreadable blob is logged and dropped rather than propagated. The
     /// cost is one session on the compiled-in table, which is where the app
     /// was before this existed.
-    pub fn load(store: Option<&dyn ConfigStore>) -> Self {
+    pub fn load(store: Option<&dyn KvStore>) -> Self {
         let Some(raw) = store.and_then(|store| store.load(SITE_POSITIONS_KEY)) else {
             return Self::default();
         };
@@ -187,7 +187,7 @@ impl SitePositions {
     /// is learned again the next time it is opened.
     pub fn learn(
         &mut self,
-        store: Option<&dyn ConfigStore>,
+        store: Option<&dyn KvStore>,
         site: &str,
         position: SitePosition,
     ) -> bool {
@@ -206,7 +206,7 @@ impl SitePositions {
         true
     }
 
-    fn persist(&self, store: Option<&dyn ConfigStore>) {
+    fn persist(&self, store: Option<&dyn KvStore>) {
         let Some(store) = store else {
             return;
         };

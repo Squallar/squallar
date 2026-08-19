@@ -18,8 +18,9 @@ use crate::app::tests::{headless, two_pane_app};
 use crate::platform_double::TestBridge;
 use crate::volume::bridge::tests::ready_grid;
 use crate::volume::bridge::{Hold, VolumeEntry};
-use rustdar_egui::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
+use rustdar_egui::UI_CONFIG_KEY;
 use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
+use rustdar_kv::{KvStore, MemoryKvStore};
 use rustdar_radar::types::RadarProduct;
 
 const SITE: &str = "KTLX";
@@ -85,7 +86,7 @@ fn make_resident(app: &crate::app::App, pane_idx: usize, t: &VolumeTarget, hold:
 /// every assertion below about pane 1's state is about state this transition
 /// left alone.
 fn hide_the_second_pane(app: &mut crate::app::App) {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,

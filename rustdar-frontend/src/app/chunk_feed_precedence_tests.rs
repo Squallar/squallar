@@ -1410,7 +1410,7 @@ fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
 #[test]
 fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
     use crate::volume::quality::GradientShading;
-    use rustdar_egui::config_store::ConfigStore;
+    use rustdar_kv::KvStore;
 
     let platform = TestBridge::desktop();
     let store = platform.store();
@@ -1501,7 +1501,7 @@ fn a_backed_off_machine_reopens_where_it_left_off() {
 /// retiring the 3D view, which latches after two such losses.
 #[test]
 fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
-    use rustdar_egui::config_store::ConfigStore;
+    use rustdar_kv::KvStore;
 
     let platform = TestBridge::desktop();
     let store = platform.store();

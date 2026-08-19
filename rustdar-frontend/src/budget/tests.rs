@@ -1078,9 +1078,9 @@ fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
 /// unreadable one is the same answer a first launch gets.
 #[test]
 fn a_ladder_position_survives_its_own_config_entry() {
-    use rustdar_egui::config_store::MemoryConfigStore;
+    use rustdar_kv::MemoryKvStore;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     assert_eq!(remembered_steps(Some(&store)), None, "nothing learned yet");
 
     remember_steps(Some(&store), 2);

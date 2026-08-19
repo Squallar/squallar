@@ -30,7 +30,7 @@ mod ui_inspector;
 #[cfg(test)]
 pub(crate) use ui_inspector::InspectorProbe;
 #[path = "ui_config.rs"]
-mod config;
+pub(crate) mod config;
 #[path = "ui_map_overlays.rs"]
 mod map_overlays;
 #[path = "ui_popups.rs"]

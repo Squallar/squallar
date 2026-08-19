@@ -34,8 +34,8 @@
 //! the shared handles cheap.
 
 use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
-use rustdar_egui::config_store::{ConfigStore, MemoryConfigStore};
 use rustdar_gps::LocationPermission;
+use rustdar_kv::{KvStore, MemoryKvStore};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -44,16 +44,16 @@ use std::sync::mpsc::Receiver;
 /// System bar insets as `(top, bottom, left, right)`, as the trait carries them.
 pub(crate) type Insets = (f32, f32, f32, f32);
 
-/// A [`ConfigStore`] over a [`MemoryConfigStore`] the test still holds.
+/// A [`KvStore`] over a [`MemoryKvStore`] the test still holds.
 ///
-/// `config_store` hands out a fresh `Box` per call, so the backing store has to
+/// `kv` hands out a fresh `Box` per call, so the backing store has to
 /// outlive the box for a test to read back what the app persisted through it.
 pub(crate) struct SharedStore {
-    inner: Rc<MemoryConfigStore>,
+    inner: Rc<MemoryKvStore>,
     writes: Rc<std::cell::Cell<usize>>,
 }
 
-impl ConfigStore for SharedStore {
+impl KvStore for SharedStore {
     fn load(&self, key: &str) -> Option<String> {
         self.inner.load(key)
     }
@@ -96,7 +96,7 @@ pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_gps::GpsConfig>>>;
 /// the fixture and the assertion.
 pub(crate) type WakerRecord = Rc<RefCell<RedrawWaker>>;
 
-/// When [`TestBridge::config_store`] answers with a store.
+/// When [`TestBridge::kv`] answers with a store.
 ///
 /// Three real cases, not two: the third is the one the location memo cares
 /// about, and it used to be unreachable through this double.
@@ -166,7 +166,7 @@ pub(crate) struct TestBridge {
     /// after startup; desktop and iOS derive one at construction.
     config_dir: Option<PathBuf>,
     zone_cache_dir: Option<PathBuf>,
-    store: Rc<MemoryConfigStore>,
+    store: Rc<MemoryKvStore>,
     /// Installed by `set_back_handler`. Android installs one at startup and the
     /// others never do, which is the whole of why back minimises there and
     /// quits everywhere else.
@@ -209,7 +209,7 @@ impl TestBridge {
             needs_process_exit: false,
             config_dir: None,
             zone_cache_dir: None,
-            store: Rc::new(MemoryConfigStore::default()),
+            store: Rc::new(MemoryKvStore::default()),
             back_handler: None,
             back_press_taker: None,
             insets_querier: None,
@@ -270,25 +270,25 @@ impl TestBridge {
         }
     }
 
-    /// A handle on the blobs `config_store` hands out, for seeding a config
+    /// A handle on the blobs `kv` hands out, for seeding a config
     /// before the app loads it and for reading back what the app saved.
-    pub(crate) fn store(&self) -> Rc<MemoryConfigStore> {
+    pub(crate) fn store(&self) -> Rc<MemoryKvStore> {
         Rc::clone(&self.store)
     }
 
     /// Persist into `store` rather than into a fresh one, so a test can close
     /// an app and open another over the same blobs — which is the only way to
     /// exercise anything the app is supposed to remember across restarts.
-    pub(crate) fn with_store(mut self, store: Rc<MemoryConfigStore>) -> Self {
+    pub(crate) fn with_store(mut self, store: Rc<MemoryKvStore>) -> Self {
         self.store = store;
         self
     }
 
-    /// Answer `config_store` with `None`, permanently.
+    /// Answer `kv` with `None`, permanently.
     ///
     /// See [`StoreAvailability::Never`] for the two shipping configurations
     /// this stands for.
-    pub(crate) fn without_config_store(mut self) -> Self {
+    pub(crate) fn without_kv(mut self) -> Self {
         self.store_availability = StoreAvailability::Never;
         self
     }
@@ -437,7 +437,7 @@ impl PlatformBridge for TestBridge {
     /// what makes `App::set_config_dir` observable: before it, there is no
     /// store to load from. See [`StoreAvailability`] for the two bridges that
     /// do not work that way.
-    fn config_store(&self) -> Option<Box<dyn ConfigStore>> {
+    fn kv(&self) -> Option<Box<dyn KvStore>> {
         let available = match self.store_availability {
             StoreAvailability::WhenToldADirectory => self.config_dir.is_some(),
             StoreAvailability::Always => true,

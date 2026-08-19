@@ -872,7 +872,7 @@ impl super::App {
             let Some(fetched) = response.catalogue else {
                 continue;
             };
-            let store = self.platform.config_store();
+            let store = self.platform.kv();
             crate::site_catalogue::store_if_changed(
                 store.as_deref(),
                 &self.site_catalogue,
@@ -3071,7 +3071,7 @@ impl super::App {
             if let Some(memo) = self.device_profile.memo.as_mut() {
                 memo.loop_pool_bytes = Some(bytes);
             }
-            crate::loop_pool::remember(self.platform.config_store().as_deref(), bytes);
+            crate::loop_pool::remember(self.platform.kv().as_deref(), bytes);
         }
 
         let memo = self
@@ -3105,7 +3105,7 @@ impl super::App {
             resolved.grid_cells,
         );
         self.budgets = resolved;
-        crate::budget::remember_steps(self.platform.config_store().as_deref(), stepped);
+        crate::budget::remember_steps(self.platform.kv().as_deref(), stepped);
     }
 
     fn dispatch_loop_renders(&mut self) {

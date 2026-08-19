@@ -27,7 +27,7 @@
 
 use crate::app::tests::headless;
 use crate::platform_double::TestBridge;
-use rustdar_egui::config_store::{ConfigStore, MemoryConfigStore};
+use rustdar_kv::{KvStore, MemoryKvStore};
 use rustdar_radar::catalogue::{CataloguePosition, SiteCatalogue};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -79,8 +79,8 @@ fn landed(catalogue: Option<SiteCatalogue>) -> crate::channels::SiteCatalogueRes
 /// the format the moment it changes and then tests nothing. What matters here
 /// is only that `load_ui_config` answers `true` — that is the `restored` half
 /// of the predicate that used to suppress the catalogue.
-fn store_of_a_returning_user() -> Rc<MemoryConfigStore> {
-    let store = Rc::new(MemoryConfigStore::default());
+fn store_of_a_returning_user() -> Rc<MemoryKvStore> {
+    let store = Rc::new(MemoryKvStore::default());
     let mut gui = rustdar_egui::Gui::new();
     gui.loop_speed_fps = 9.25;
     gui.save_ui_config(store.as_ref());
@@ -266,9 +266,9 @@ fn a_launch_that_already_knows_the_network_still_waits_for_the_next_one() {
     // A store that already holds a catalogue, written through the same
     // function the app writes one with. This is the launch the next-launch
     // policy is *for*, and it only exists if something was cached.
-    let store = Rc::new(MemoryConfigStore::default());
+    let store = Rc::new(MemoryKvStore::default());
     crate::site_catalogue::store_if_changed(
-        Some(store.as_ref() as &dyn ConfigStore),
+        Some(store.as_ref() as &dyn KvStore),
         &SiteCatalogue::default(),
         &catalogue_naming(CACHED, -35_000_000),
     );
@@ -306,7 +306,7 @@ fn a_launch_that_already_knows_the_network_still_waits_for_the_next_one() {
 #[test]
 fn a_catalogue_that_cannot_be_persisted_is_still_applied_to_this_session() {
     const UNSTORABLE: &str = "ZZQF";
-    let mut app = headless(TestBridge::desktop().without_config_store());
+    let mut app = headless(TestBridge::desktop().without_kv());
     app.catalogue_pending = true;
 
     app.channels

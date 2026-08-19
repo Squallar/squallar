@@ -1,7 +1,7 @@
 use super::*;
 use crate::Gui;
-use crate::config_store::MemoryConfigStore;
 use crate::ui::catalog::PresetPane;
+use rustdar_kv::MemoryKvStore;
 
 /// A user preset that exercises every field.
 fn preset() -> super::super::PresetConfig {
@@ -27,7 +27,7 @@ fn preset() -> super::super::PresetConfig {
 /// populated catalog.
 #[test]
 fn user_presets_round_trip_and_an_older_config_has_none() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = Gui::new();
     gui.presets.push(preset());
     gui.save_ui_config(&store);
@@ -50,20 +50,18 @@ fn user_presets_round_trip_and_an_older_config_has_none() {
 /// tolerance the pane configs carry, through the same deserializer.
 #[test]
 fn an_unknown_preset_product_costs_the_product_not_the_file() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = Gui::new();
     gui.presets.push(preset());
     gui.save_ui_config(&store);
 
-    let saved = store
-        .load(crate::config_store::UI_CONFIG_KEY)
-        .expect("just saved");
+    let saved = store.load(crate::UI_CONFIG_KEY).expect("just saved");
     let mut value: serde_json::Value = serde_json::from_str(&saved).expect("valid json");
     value["presets"][0]["panes"][0]["product"] = serde_json::json!("FutureProduct");
-    let newer_store = MemoryConfigStore::default();
+    let newer_store = MemoryKvStore::default();
     newer_store
         .store(
-            crate::config_store::UI_CONFIG_KEY,
+            crate::UI_CONFIG_KEY,
             &serde_json::to_string(&value).expect("serializable"),
         )
         .expect("storable");

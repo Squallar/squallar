@@ -153,13 +153,13 @@ impl PlatformBridge for WebPlatform {
     }
 
     /// Inert, not an oversight: `localStorage` is available from the first
-    /// frame, which is why `config_store` never returns `None` for "not told
+    /// frame, which is why `kv` never returns `None` for "not told
     /// where yet" the way the Android bridge does.
     fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
 
-    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
-        crate::config_store::LocalStorageConfigStore::new()
-            .map(|store| Box::new(store) as Box<dyn rustdar_egui::config_store::ConfigStore>)
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
+        crate::kv::LocalStorageKvStore::new()
+            .map(|store| Box::new(store) as Box<dyn rustdar_kv::KvStore>)
     }
 
     fn iana_timezone(&self) -> Option<String> {

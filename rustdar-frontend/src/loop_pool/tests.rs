@@ -6,7 +6,7 @@ use crate::constants::{
     MOBILE_VOLUME_GRID_CELLS, WASM_LOOP_IMAGE_SIZE, WASM_LOOP_POOL_CEILING_BYTES,
     WASM_LOOP_POOL_FLOOR_BYTES, WASM_MAX_LOOP_RENDER_BUDGET, WASM_VOLUME_GRID_CELLS,
 };
-use rustdar_egui::config_store::MemoryConfigStore;
+use rustdar_kv::MemoryKvStore;
 use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// One device class, with both halves of every question a host build cannot
@@ -694,7 +694,7 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
 
 /// The memo round-trips, and anything unreadable is simply absent.
 ///
-/// A decimal count of MiB and nothing else, in its own `ConfigStore` key — not
+/// A decimal count of MiB and nothing else, in its own `KvStore` key — not
 /// a field on `UiConfig`, where one bad value costs *every* setting on the next
 /// load. The blast radius of a corrupt entry here is one integer and one
 /// re-probe.
@@ -704,7 +704,7 @@ fn the_pool_memo_round_trips_and_survives_a_corrupt_entry() {
         floor: 64 * 1024 * 1024,
         ceiling: 512 * 1024 * 1024,
     };
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     assert_eq!(remembered(Some(&store), limits), None, "nothing yet");
 
     remember(Some(&store), 128 * 1024 * 1024);

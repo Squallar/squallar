@@ -1,5 +1,5 @@
 use super::*;
-use rustdar_egui::config_store::MemoryConfigStore;
+use rustdar_kv::MemoryKvStore;
 use rustdar_radar::catalogue::CataloguePosition;
 use std::collections::BTreeMap;
 
@@ -27,7 +27,7 @@ fn catalogue() -> SiteCatalogue {
 /// point of the cache is that the *next* launch has it.
 #[test]
 fn a_fetched_catalogue_is_written_at_once_and_read_back_next_run() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let fetched = catalogue();
 
     assert!(store_if_changed(
@@ -59,7 +59,7 @@ fn a_fetched_catalogue_is_written_at_once_and_read_back_next_run() {
 /// the bug that produced it.
 #[test]
 fn the_persisted_form_is_integers() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store_if_changed(Some(&store), &SiteCatalogue::default(), &catalogue());
 
     let raw = store.load(SITE_CATALOGUE_KEY).expect("just written");
@@ -81,7 +81,7 @@ fn the_persisted_form_is_integers() {
 /// a cost with no benefit.
 #[test]
 fn an_unchanged_catalogue_is_not_rewritten() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let cached = catalogue();
     assert!(store_if_changed(
         Some(&store),
@@ -103,7 +103,7 @@ fn an_unchanged_catalogue_is_not_rewritten() {
 /// that happened to start in a tunnel.
 #[test]
 fn a_failed_fetch_leaves_the_cache_intact() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let cached = catalogue();
     store_if_changed(Some(&store), &SiteCatalogue::default(), &cached);
 
@@ -125,7 +125,7 @@ fn a_failed_fetch_leaves_the_cache_intact() {
 #[test]
 fn an_unreadable_blob_is_dropped() {
     for raw in ["", "not json", "[1,2,3]", r#"{"KTLX":{"lat_udeg":1}}"#] {
-        let store = MemoryConfigStore::default();
+        let store = MemoryKvStore::default();
         store
             .store(SITE_CATALOGUE_KEY, raw)
             .expect("the double's store cannot fail");
@@ -139,7 +139,7 @@ fn an_unreadable_blob_is_dropped() {
 /// times the size of the real network is junk rather than growth.
 #[test]
 fn an_absurdly_large_catalogue_is_refused() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let positions = BTreeMap::new();
     let huge = SiteCatalogue::union(
         (0..MAX_CATALOGUE_SITES + 1).map(|n| format!("Z{n:03}")),

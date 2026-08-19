@@ -4543,7 +4543,7 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     // fresh session.
     let reordered = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
     assert_ne!(reordered, before, "precondition: a real reorder to persist");
-    let store = crate::config_store::MemoryConfigStore::default();
+    let store = rustdar_kv::MemoryKvStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut fresh = crate::Gui::new();
     assert!(fresh.load_ui_config(&store), "the saved config must load");
@@ -8004,7 +8004,7 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
 /// pane would fail here even with the field-level test green.
 #[test]
 fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
-    use crate::config_store::MemoryConfigStore;
+    use rustdar_kv::MemoryKvStore;
 
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KDMX");
@@ -8029,7 +8029,7 @@ fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
 
     // The restart, from the click's own result: save, load into a fresh
     // Gui, and the floor is still off.
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));
@@ -8058,7 +8058,7 @@ fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
 /// steers the camera" without restating the rail's geometry.
 #[test]
 fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
-    use crate::config_store::MemoryConfigStore;
+    use rustdar_kv::MemoryKvStore;
 
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KDMX");
@@ -8110,7 +8110,7 @@ fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
     );
 
     // The restart: the eased value, not the default, is what comes back.
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));

@@ -361,10 +361,10 @@ impl PlatformBridge for DesktopPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
         self.config_dir
             .clone()
-            .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
+            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
     }
 
     fn iana_timezone(&self) -> Option<String> {
@@ -584,10 +584,10 @@ impl PlatformBridge for AndroidPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
         self.config_dir
             .clone()
-            .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
+            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
     }
 
     fn iana_timezone(&self) -> Option<String> {
@@ -804,10 +804,10 @@ impl PlatformBridge for IosPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
         self.config_dir
             .clone()
-            .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
+            .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
     }
 
     fn iana_timezone(&self) -> Option<String> {

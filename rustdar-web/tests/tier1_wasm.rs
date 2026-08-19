@@ -158,17 +158,17 @@ fn the_token_compare_reads_real_js_values() {
     }
 }
 
-/// A config value stored through [`LocalStorageConfigStore`] lands under the
+/// A config value stored through [`LocalStorageKvStore`] lands under the
 /// raw browser key exactly `rustdar.ui` -- read back through
 /// `window.localStorage` directly, which pins `storage_key`'s prefix mapping
 /// against the real `Storage` object rather than against itself.
 ///
-/// [`LocalStorageConfigStore`]: rustdar_web::config_store::LocalStorageConfigStore
+/// [`LocalStorageKvStore`]: rustdar_web::kv::LocalStorageKvStore
 #[wasm_bindgen_test]
-fn local_storage_round_trips_through_the_config_store() {
-    use rustdar_egui::config_store::ConfigStore;
+fn local_storage_round_trips_through_the_kv_store() {
+    use rustdar_kv::KvStore;
 
-    let store = rustdar_web::config_store::LocalStorageConfigStore::new()
+    let store = rustdar_web::kv::LocalStorageKvStore::new()
         .expect("the test browser must expose localStorage");
     let sentinel = r#"{"tier1":"wasm-gate"}"#;
     store.store("ui", sentinel).expect("store must succeed");

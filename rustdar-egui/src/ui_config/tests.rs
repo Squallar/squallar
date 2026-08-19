@@ -1,4 +1,5 @@
-use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
+use crate::UI_CONFIG_KEY;
+use rustdar_kv::{KvStore, MemoryKvStore};
 
 /// Settings the user changed must come back after a save/load cycle.
 ///
@@ -10,7 +11,7 @@ use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
 fn changed_settings_survive_a_save_and_load() {
     use crate::pane::{OrbitDelta, PaneKind};
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
 
     let baseline = crate::Gui::new();
     assert_ne!(baseline.loop_lookback_secs, 7200);
@@ -86,7 +87,7 @@ fn changed_settings_survive_a_save_and_load() {
 /// it observably did — no fan-out.
 #[test]
 fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -109,7 +110,7 @@ fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
         );
     }
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -144,7 +145,7 @@ fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
 /// AND stale globals into links the user has since changed.
 #[test]
 fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -186,7 +187,7 @@ fn volume_alpha_curves_survive_a_save_and_load() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     let mut alphas = [0u8; CURVE_LEN];
     for (i, slot) in alphas.iter_mut().enumerate() {
@@ -217,7 +218,7 @@ fn volume_alpha_curves_survive_a_save_and_load() {
 fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     // A minimal pre-feature config: every field the format has ever had is
     // `#[serde(default)]`-covered, so `{}` is exactly what an old file
     // looks like to the new deserializer.
@@ -244,7 +245,7 @@ fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
 fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     // Entry one: three alphas where 256 are required. Entry two: a full
     // curve whose entry 0 claims opaque no-data.
     let mut full: Vec<String> = vec!["255".to_owned(); 256];
@@ -297,7 +298,7 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
     use crate::pane::VolumeViewMode;
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     gui.pane_mut(0)
         .unwrap()
@@ -340,7 +341,7 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
 /// a one-sided test sees only one of them.
 #[test]
 fn a_hidden_map_floor_survives_a_save_and_load() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     gui.set_pane_count_for_test(2);
     gui.pane_mut(0)
@@ -379,7 +380,7 @@ fn a_hidden_map_floor_survives_a_save_and_load() {
 fn the_storm_motion_fallback_survives_a_save_and_load() {
     use rustdar_radar::srv::SrvFallback;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     assert_eq!(
         gui.srv_fallback,
@@ -426,7 +427,7 @@ fn a_config_from_another_build_still_loads_its_storm_motion_fallback() {
             "a rung from a newer build must not cost the file",
         ),
     ] {
-        let store = MemoryConfigStore::default();
+        let store = MemoryKvStore::default();
         store
             .store(UI_CONFIG_KEY, json)
             .expect("the memory store accepts a write");
@@ -453,7 +454,7 @@ fn a_config_from_another_build_still_loads_its_storm_motion_fallback() {
 /// test would catch because a round trip never sees an absent key.
 #[test]
 fn a_config_written_before_the_floor_toggle_keeps_its_floor() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -492,7 +493,7 @@ fn a_config_written_before_the_floor_toggle_keeps_its_floor() {
 fn a_config_naming_the_old_3d_pane_kind_comes_back_as_a_3d_render_mode() {
     use crate::pane::{MapRender, OrbitCamera, PaneKind};
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -593,7 +594,7 @@ fn a_config_naming_the_old_3d_pane_kind_comes_back_as_a_3d_render_mode() {
 fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
     use crate::pane::MapRender;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -615,7 +616,7 @@ fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
     );
 
     // And it round-trips through the new spelling.
-    let again = MemoryConfigStore::default();
+    let again = MemoryKvStore::default();
     again.store(UI_CONFIG_KEY, &json).expect("storable");
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&again));
@@ -633,7 +634,7 @@ fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
     use crate::pane::VolumeViewMode;
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -689,7 +690,7 @@ fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
 fn a_config_naming_a_product_from_the_future_still_loads() {
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -733,7 +734,7 @@ fn a_config_naming_a_product_from_the_future_still_loads() {
 /// failed load cannot pass by looking like a fresh one.
 #[test]
 fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -794,7 +795,7 @@ fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
 /// so a load that failed outright cannot pass this by looking like a fresh one.
 #[test]
 fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -862,7 +863,7 @@ fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
 fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
     use rustdar_radar::types::RadarProduct;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let full: Vec<String> = vec!["128".to_owned(); 256];
     let json = format!(
         r#"{{"volume_alpha":[
@@ -906,7 +907,7 @@ fn a_drawn_section_line_survives_a_save_and_load() {
     use crate::pane::{PaneKind, SectionLine};
     use rustdar_geo::GeoPoint;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let a = GeoPoint {
         lat: 35.0,
         lon: -97.8,
@@ -988,7 +989,7 @@ fn a_pane_config_that_cannot_be_a_pane_loads_as_a_map() {
                    {"a_lat":35.0,"a_lon":-97.8,"b_lat":35.0,"b_lon":-97.8}}}"#,
         ),
     ] {
-        let store = MemoryConfigStore::default();
+        let store = MemoryKvStore::default();
         store
             .store(
                 UI_CONFIG_KEY,
@@ -1025,7 +1026,7 @@ fn a_pane_config_that_cannot_be_a_pane_loads_as_a_map() {
 fn a_section_pane_with_no_line_yet_comes_back_as_a_section() {
     use crate::pane::PaneKind;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -1059,7 +1060,7 @@ fn a_section_pane_with_no_line_yet_comes_back_as_a_section() {
 fn a_section_sourced_from_a_pane_that_is_gone_forgets_where_it_came_from() {
     use crate::pane::PaneKind;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -1100,7 +1101,7 @@ fn a_section_sourced_from_a_pane_that_is_gone_forgets_where_it_came_from() {
 fn a_config_predating_pane_kinds_loads_as_maps() {
     use crate::pane::PaneKind;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -1139,7 +1140,7 @@ fn a_config_predating_pane_kinds_loads_as_maps() {
 fn a_restored_non_map_pane_has_no_running_loop() {
     use crate::pane::LoopPhase;
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -1179,7 +1180,7 @@ fn a_restored_non_map_pane_has_no_running_loop() {
 /// the nearest legal camera beats discarding the pane over a number.
 #[test]
 fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -1255,7 +1256,7 @@ fn a_picked_region_survives_a_save_and_load() {
         .expect("a 3D pane")
         .region = Some(picked);
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     gui.save_ui_config(&store);
     let mut restored = crate::Gui::new();
     restored.load_ui_config(&store);
@@ -1305,7 +1306,7 @@ fn the_map_a_region_was_picked_on_survives_a_save_and_load() {
         volume.source_pane = Some(0);
     }
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     gui.save_ui_config(&store);
     let mut restored = crate::Gui::new();
     restored.load_ui_config(&store);
@@ -1371,7 +1372,7 @@ fn a_dangling_source_pane_is_forgotten_and_the_region_kept() {
         volume.source_pane = Some(3);
     }
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     wide.save_ui_config(&store);
 
     // Reopened into a layout that does not reach index 3.
@@ -1456,7 +1457,7 @@ fn a_non_finite_float_would_poison_the_config_file_permanently() {
         );
     }
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store.store(UI_CONFIG_KEY, &json).unwrap();
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));
@@ -1470,7 +1471,7 @@ fn a_non_finite_float_would_poison_the_config_file_permanently() {
 /// neither was persisted before.
 #[test]
 fn a_panned_and_zoomed_map_comes_back_where_it_was_left() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
 
     let baseline = crate::Gui::new();
     let default_zoom = baseline.pane(0).unwrap().map_memory.zoom();
@@ -1509,7 +1510,7 @@ fn a_panned_and_zoomed_map_comes_back_where_it_was_left() {
 /// does not. A round trip must not silently convert the first into the second.
 #[test]
 fn a_map_following_its_site_does_not_come_back_pinned() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
 
     let mut gui = crate::Gui::new();
     gui.pane_mut(0).unwrap().map_memory.set_zoom(7.0).unwrap();
@@ -1530,7 +1531,7 @@ fn a_map_following_its_site_does_not_come_back_pinned() {
 /// default zoom rather than being read as "saved zoom 0".
 #[test]
 fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let default_zoom = crate::Gui::new().pane(0).unwrap().map_memory.zoom();
 
     // A config with panes but no `zoom`/`center` keys at all — exactly the
@@ -1596,7 +1597,7 @@ fn a_scan() -> rustdar_radar::types::ScanInfo {
 /// without touching anything.
 #[test]
 fn a_restored_zoom_survives_the_sessions_first_scan() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
 
     let mut gui = crate::Gui::new();
     let site = gui.pane(0).unwrap().site.clone();
@@ -1629,7 +1630,7 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
 
     // The destructive half: whatever is on the pane now is what the next
     // autosave commits to disk.
-    let second = MemoryConfigStore::default();
+    let second = MemoryKvStore::default();
     restored.save_ui_config(&second);
     let mut again = crate::Gui::new();
     assert!(again.load_ui_config(&second));
@@ -1645,7 +1646,7 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
 /// it claims the same latch.
 #[test]
 fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
 
     let mut gui = crate::Gui::new();
     let site = gui.pane(0).unwrap().site.clone();
@@ -1674,7 +1675,7 @@ fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
 /// that a radar view. That must keep happening.
 #[test]
 fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
 
     let mut gui = crate::Gui::new();
     assert!(
@@ -1707,7 +1708,7 @@ fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
 /// continental default as a first run and the latch must still fire.
 #[test]
 fn a_config_without_a_saved_zoom_still_zooms_to_the_radar_on_its_first_scan() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store
         .store(
             UI_CONFIG_KEY,
@@ -1789,7 +1790,7 @@ fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
              would offer, or the clamp under test is never reached"
     );
 
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     gui.set_pane_count_for_test(MAX_PANES_DESKTOP);
     gui.save_ui_config(&store);
@@ -1805,7 +1806,7 @@ fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
 
     // Saving it again must not quietly narrow it either — the round trip
     // is what turns a one-off clamp into permanent data loss.
-    let second = MemoryConfigStore::default();
+    let second = MemoryKvStore::default();
     restored.save_ui_config(&second);
     let mut again = crate::Gui::new();
     again.load_ui_config(&second);
@@ -1822,7 +1823,7 @@ fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
 /// rather than zeroing them — this is every first run.
 #[test]
 fn an_empty_store_leaves_defaults_untouched() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     let expected = gui.loop_lookback_secs;
 
@@ -1834,7 +1835,7 @@ fn an_empty_store_leaves_defaults_untouched() {
 /// A corrupt config must not wipe the user's session or panic.
 #[test]
 fn unparseable_config_is_ignored() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     store.store(UI_CONFIG_KEY, "{ not json").unwrap();
 
     let mut gui = crate::Gui::new();
@@ -1859,7 +1860,7 @@ fn unparseable_config_is_ignored() {
 /// and the pane that comes back out of it answers `None`.
 #[test]
 fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     gui.pane_mut(0).unwrap().selected_product = rustdar_radar::types::RadarProduct::Velocity;
     gui.save_ui_config(&store);
@@ -1892,7 +1893,7 @@ fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
 /// maps onto `ui.json`.
 #[test]
 fn save_writes_under_the_ui_key() {
-    let store = MemoryConfigStore::default();
+    let store = MemoryKvStore::default();
     assert!(store.load(UI_CONFIG_KEY).is_none());
 
     crate::Gui::new().save_ui_config(&store);

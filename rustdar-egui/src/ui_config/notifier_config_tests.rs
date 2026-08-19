@@ -50,7 +50,7 @@ fn an_empty_endpoint_falls_back_to_the_default() {
 fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
     use crate::pane::{MapRender, OrbitCamera};
 
-    let store = crate::config_store::MemoryConfigStore::default();
+    let store = rustdar_kv::MemoryKvStore::default();
     let mut gui = crate::Gui::new();
     let pane = gui.pane_mut(0).expect("pane 0");
     assert!(pane.set_map_render(MapRender::Volume));
@@ -68,9 +68,7 @@ fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
 
     // Strip the two fields that did not exist, and put back the one that no
     // longer does — an older writer's file exactly.
-    let json = store
-        .load(crate::config_store::UI_CONFIG_KEY)
-        .expect("just saved");
+    let json = store.load(crate::UI_CONFIG_KEY).expect("just saved");
     let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
     let volume = value["panes"][0]["volume"]
         .as_object_mut()
@@ -82,9 +80,9 @@ fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
         serde_json::json!({ "centre_lat": 35.3, "centre_lon": -97.3, "half_width_km": 40.0 }),
     );
     let older = serde_json::to_string(&value).expect("serializable");
-    let older_store = crate::config_store::MemoryConfigStore::default();
+    let older_store = rustdar_kv::MemoryKvStore::default();
     older_store
-        .store(crate::config_store::UI_CONFIG_KEY, &older)
+        .store(crate::UI_CONFIG_KEY, &older)
         .expect("storable");
 
     let mut restored = crate::Gui::new();

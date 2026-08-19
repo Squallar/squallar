@@ -1,5 +1,4 @@
 pub mod actions;
-pub mod config_store;
 pub mod overlay_cache;
 pub mod pane;
 pub(crate) mod point_painter;
@@ -28,5 +27,9 @@ mod ui_glyphs;
 
 pub const DEFAULT_NOTIFIER_ENDPOINT: &str = "wss://nexrad-aws-notifier.mcswain.dev";
 
+/// Where the UI layout's persistence key lives (`ui_config.rs`, mounted as
+/// `ui::config`); surfaced here the way `Gui` is, so consumers spell it
+/// `rustdar_egui::UI_CONFIG_KEY`.
+pub use ui::config::UI_CONFIG_KEY;
 pub use ui::{ChunkFeedStatus, CurrentVolumeStamp, Gui, StormMotionOverride, TiltFreshness};
 pub use ui_input::{normalize_touch_devices, normalize_wheel_units};
