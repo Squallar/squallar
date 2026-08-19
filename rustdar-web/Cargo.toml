@@ -45,6 +45,10 @@ log = { workspace = true }
 # wasm-bindgen into the graph at all.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rustdar-frontend = { workspace = true }
+# The job engine: `worker` runs `execute_encoded`, `worker_port` feeds the
+# funnel, and `worker_protocol` folds `wire_identity`'s digest into the build
+# token (extracted from rustdar-frontend at WO-RW).
+rustdar-worker = { workspace = true }
 winit = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
 # have to agree with the copy egui-winit and wgpu link against or the generated

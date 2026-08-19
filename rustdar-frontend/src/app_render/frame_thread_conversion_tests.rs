@@ -18,7 +18,7 @@
 
 const APP_RENDER: &str = include_str!("../app_render.rs");
 const APP_FETCH: &str = include_str!("../app_fetch.rs");
-const OFFLOAD: &str = include_str!("../offload.rs");
+const OFFLOAD: &str = include_str!("../../../rustdar-worker/src/offload.rs");
 
 /// The body of the function `signature` opens, up to its closing brace at
 /// method indentation.

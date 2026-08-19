@@ -159,7 +159,7 @@ impl super::App {
     ///
     /// The network half has to stay on the async task, because that is where the
     /// fetch stack is. The CPU half does not, and now does not: it goes through
-    /// [`crate::offload::offload_job`] as a
+    /// [`rustdar_worker::offload::offload_job`] as a
     /// described [`DecodeJob`](rustdar_radar::jobs::DecodeJob), which means a
     /// Web Worker where there is one and this thread where there is not — the same
     /// fallback every render already has, and the same behaviour the build had
@@ -177,15 +177,15 @@ impl super::App {
         archive: Vec<u8>,
         respond: impl FnOnce(Option<rustdar_radar::scan::DecodedScan>) -> Option<T> + Send + 'static,
     ) {
-        crate::offload::offload_job(
+        rustdar_worker::offload::offload_job(
             "level2-decode",
-            crate::offload::Job::Described(crate::offload::JobRequest::describe(
+            rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
                 rustdar_radar::jobs::DecodeJob {
                     archive: std::sync::Arc::new(archive),
                 },
                 // A decode draws nothing, so its envelope carries no ceiling —
                 // the same effective 0 it has always had.
-                crate::offload::ceiling_only_geometry(0),
+                rustdar_worker::offload::ceiling_only_geometry(0),
             )),
             move |result| {
                 // `None` here is an archive that did not decode, which
@@ -1097,7 +1097,7 @@ impl super::App {
         mut response: OverlayRenderResponse,
         sender: Sender<OverlayRenderResponse>,
         window: Option<crate::WindowRef>,
-    ) -> impl FnOnce(crate::offload::JobResult) + Send + 'static {
+    ) -> impl FnOnce(rustdar_worker::offload::JobResult) + Send + 'static {
         move |result| {
             let expected = (width as usize) * (height as usize) * 4;
             if let Some(rustdar_overlays::render::rasterize::RasterizeOutput {
@@ -1306,10 +1306,10 @@ impl super::App {
                     bounds: render_bounds,
                     side_ceiling_px: 0,
                 };
-                let request = crate::offload::JobRequest { geometry, job };
-                crate::offload::offload_job(
+                let request = rustdar_worker::offload::JobRequest { geometry, job };
+                rustdar_worker::offload::offload_job(
                     row.label,
-                    crate::offload::Job::Described(request),
+                    rustdar_worker::offload::Job::Described(request),
                     Self::overlay_job_deliver(
                         row.label,
                         width,
@@ -1375,7 +1375,7 @@ impl super::App {
                     bounds: render_bounds,
                     side_ceiling_px: 0,
                 };
-                let request = crate::offload::JobRequest {
+                let request = rustdar_worker::offload::JobRequest {
                     geometry,
                     job: rustdar_source::job::DescribedJob::new(rasterize::SitesInput {
                         sites,
@@ -1384,9 +1384,9 @@ impl super::App {
                         device_scale,
                     }),
                 };
-                crate::offload::offload_job(
+                rustdar_worker::offload::offload_job(
                     row.label,
-                    crate::offload::Job::Described(request),
+                    rustdar_worker::offload::Job::Described(request),
                     Self::overlay_job_deliver(
                         row.label,
                         width,
@@ -1972,40 +1972,42 @@ impl super::App {
                     env_heights,
                 ) {
                     Some(input) => {
-                        crate::offload::Job::Described(crate::offload::JobRequest::describe(
-                            rustdar_radar::jobs::RadarPlanJob {
-                                // The same stamp the still frame takes, off this
-                                // frame's own volume. Without it a loop of NROT or
-                                // SRV would fold around whatever each frame's
-                                // calmest sector estimated while the static render
-                                // of the newest frame folded around the RDA's
-                                // declaration — one storm, two pictures, no error.
-                                input: Box::new(
-                                    input
-                                        .with_declared_nyquist(&declared)
-                                        .with_srv_fallback(self.render.srv_fallback())
-                                        .with_melting_layer_product(melting_layer)
-                                        .with_rpg_storm_motion(rpg_storm_motion),
+                        rustdar_worker::offload::Job::Described(
+                            rustdar_worker::offload::JobRequest::describe(
+                                rustdar_radar::jobs::RadarPlanJob {
+                                    // The same stamp the still frame takes, off this
+                                    // frame's own volume. Without it a loop of NROT or
+                                    // SRV would fold around whatever each frame's
+                                    // calmest sector estimated while the static render
+                                    // of the newest frame folded around the RDA's
+                                    // declaration — one storm, two pictures, no error.
+                                    input: Box::new(
+                                        input
+                                            .with_declared_nyquist(&declared)
+                                            .with_srv_fallback(self.render.srv_fallback())
+                                            .with_melting_layer_product(melting_layer)
+                                            .with_rpg_storm_motion(rpg_storm_motion),
+                                    ),
+                                    // Loop frames store an empty value grid, so asking
+                                    // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
+                                    // per frame to be dropped on arrival — and copied
+                                    // across a worker boundary first.
+                                    values_wanted: false,
+                                },
+                                // The same policy in the other dimension: a loop
+                                // renders at `LOOP_IMAGE_SIZE` however far its
+                                // sweep reaches. A desktop loop textures up to 36
+                                // frames at once, and at 4096² that is
+                                // 36 × 64 MiB = 2.3 GiB a pane against a 576 MiB
+                                // loop budget.
+                                // See `JobRequest::geometry`.
+                                rustdar_worker::offload::ceiling_only_geometry(
+                                    rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
                                 ),
-                                // Loop frames store an empty value grid, so asking
-                                // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
-                                // per frame to be dropped on arrival — and copied
-                                // across a worker boundary first.
-                                values_wanted: false,
-                            },
-                            // The same policy in the other dimension: a loop
-                            // renders at `LOOP_IMAGE_SIZE` however far its
-                            // sweep reaches. A desktop loop textures up to 36
-                            // frames at once, and at 4096² that is
-                            // 36 × 64 MiB = 2.3 GiB a pane against a 576 MiB
-                            // loop budget.
-                            // See `JobRequest::geometry`.
-                            crate::offload::ceiling_only_geometry(
-                                rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
                             ),
-                        ))
+                        )
                     }
-                    None => crate::offload::Job::renders_nothing(),
+                    None => rustdar_worker::offload::Job::renders_nothing(),
                 }
             }
             // The object's *bytes*, exactly as the static Level III pane render
@@ -2020,23 +2022,25 @@ impl super::App {
             // kind that reads more than one, not a different loop path.
             crate::loop_downloads::LoopFrameData::Products(products) => match products.first() {
                 Some(first) => {
-                    crate::offload::Job::Described(crate::offload::JobRequest::describe(
-                        rustdar_radar::jobs::Level3Job {
-                            bytes: std::sync::Arc::clone(&first.bytes),
-                            product,
-                            radar_lat: lat,
-                            radar_lon: lon,
-                        },
-                        // A loop frame, so the loop size — see the Level II arm.
-                        crate::offload::ceiling_only_geometry(
-                            rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
+                    rustdar_worker::offload::Job::Described(
+                        rustdar_worker::offload::JobRequest::describe(
+                            rustdar_radar::jobs::Level3Job {
+                                bytes: std::sync::Arc::clone(&first.bytes),
+                                product,
+                                radar_lat: lat,
+                                radar_lon: lon,
+                            },
+                            // A loop frame, so the loop size — see the Level II arm.
+                            rustdar_worker::offload::ceiling_only_geometry(
+                                rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
+                            ),
                         ),
-                    ))
+                    )
                 }
-                None => crate::offload::Job::renders_nothing(),
+                None => rustdar_worker::offload::Job::renders_nothing(),
             },
         };
-        crate::offload::offload_job("loop-render", job, move |output| {
+        rustdar_worker::offload::offload_job("loop-render", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` here, which is the same
             // "nothing to draw" a failed render has always been — this consumer
@@ -2370,18 +2374,19 @@ impl super::App {
             top_km_msl: None,
             product,
         };
-        let job = crate::offload::Job::Described(crate::offload::JobRequest::describe(
-            rustdar_radar::jobs::SectionJob {
-                input: Box::new(input),
-                request,
-            },
-            // A section's raster is a constant of the view, so its envelope
-            // carries no ceiling — the same effective 0 it has always had.
-            crate::offload::ceiling_only_geometry(0),
-        ));
+        let job =
+            rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
+                rustdar_radar::jobs::SectionJob {
+                    input: Box::new(input),
+                    request,
+                },
+                // A section's raster is a constant of the view, so its envelope
+                // carries no ceiling — the same effective 0 it has always had.
+                rustdar_worker::offload::ceiling_only_geometry(0),
+            ));
         let sender = self.channels.loop_section_sender.clone();
         let window = self.window.clone();
-        crate::offload::offload_job("loop-section", job, move |output| {
+        rustdar_worker::offload::offload_job("loop-section", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None`, which takes the same
             // "nothing to draw" path a refused cut does. This consumer is

@@ -1,5 +1,5 @@
-//! The composed job-codec registry: the one frontend module that names the
-//! source crates' registries.
+//! The composed job-codec registry: the one module in this crate that names
+//! the source crates' registries.
 //!
 //! Since WO-M7.2 the REQUEST direction of [`crate::offload`] is
 //! source-type-free — the funnel frames, routes and runs jobs entirely

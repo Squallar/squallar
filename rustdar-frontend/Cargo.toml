@@ -26,6 +26,10 @@ rustdar-overlays = { workspace = true }
 # substrate's own envelope types, and the frontend frames codec rows whose
 # signatures speak them.
 rustdar-source = { workspace = true }
+# The job engine: the offload funnel this crate's dispatch sites feed, the
+# composed codec registry and the wire identity — moved down at WO-RW so the
+# engine sits below the app side.
+rustdar-worker = { workspace = true }
 rustdar-geo = { workspace = true }
 rustdar-kv = { workspace = true }
 # SerialConfig only — the reader stays behind nmea-serial's `serial` feature,

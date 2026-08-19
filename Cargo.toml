@@ -4,6 +4,7 @@ members = [
     "rustdar-platform",
     "rustdar-frontend",
     "rustdar-device-profile",
+    "rustdar-worker",
     "rustdar-web",
     "rustdar-android",
     "rustdar-egui",
@@ -56,6 +57,7 @@ rustdar-radar = { path = "rustdar-radar" }
 rustdar-source = { path = "rustdar-source" }
 rustdar-units = { path = "rustdar-units" }
 rustdar-web = { path = "rustdar-web" }
+rustdar-worker = { path = "rustdar-worker" }
 rustdar-location = { path = "rustdar-location" }
 rustdar-nmea-serial = { path = "rustdar-nmea-serial", default-features = false }
 

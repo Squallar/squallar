@@ -3,7 +3,7 @@
 //! This runs inside a dedicated Web Worker started by [`crate::worker_port`].
 //! It is the *same wasm module* the page runs, instantiated a second time —
 //! see `worker.js` — so it can call
-//! `rustdar_frontend::offload::execute_encoded` directly and there is
+//! `rustdar_worker::offload::execute_encoded` directly and there is
 //! exactly one rasterizer in the deployment.
 //!
 //! A second module would have meant a second `(glue, wasm)` pair for `sw.js`'s
@@ -91,7 +91,7 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
         .map(|v| v.to_vec())
         .unwrap_or_default();
 
-    let result = rustdar_frontend::offload::execute_encoded(&request);
+    let result = rustdar_worker::offload::execute_encoded(&request);
     if result.is_none() {
         // Either the payload was unreadable or the renderer found no sweep. The
         // page cannot tell them apart and does not need to: both mean "no

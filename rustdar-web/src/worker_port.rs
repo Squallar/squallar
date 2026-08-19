@@ -1,6 +1,6 @@
 //! The page's side of the rasterization worker.
 //!
-//! `rustdar_frontend::offload` owns the decision about where a CPU-bound job
+//! `rustdar_worker::offload` owns the decision about where a CPU-bound job
 //! runs, and knows nothing about the browser: the dependency runs
 //! `rustdar-web` → `rustdar-frontend`, and adding `web-sys` to the frontend to
 //! close the loop would put browser types in the crate desktop, Android and iOS
@@ -18,7 +18,7 @@
 
 use crate::worker_protocol as proto;
 use crate::worker_retry::Backoff;
-use rustdar_frontend::offload::{self, JobRequest, JobSink};
+use rustdar_worker::offload::{self, JobRequest, JobSink};
 use std::cell::Cell;
 use wasm_bindgen::prelude::*;
 

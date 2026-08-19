@@ -60,7 +60,7 @@
 //! before quoting a ratio.
 //!
 //! The hot spot on both browsers is
-//! `rustdar_radar::types::lat_rad_to_mercator_y`; see `rustdar_radar::render`'s
+//! `rustdar_geo::lat_rad_to_mercator_y`; see `rustdar_radar::render`'s
 //! `RenderBuffers`.
 //!
 //! [`PlatformBridge`]: rustdar_frontend::platform::PlatformBridge
@@ -83,7 +83,7 @@ mod entry;
 
 /// The rasterization worker. `worker` is the module `worker.js` boots inside a
 /// dedicated Worker; `worker_port` is the page's half, which installs it into
-/// `rustdar_frontend::offload`. Both are the same wasm module, instantiated
+/// `rustdar_worker::offload`. Both are the same wasm module, instantiated
 /// twice — see [`worker`] for why.
 #[cfg(target_arch = "wasm32")]
 mod worker;

@@ -23,7 +23,7 @@ pub const ID: &str = "id";
 /// `JobRequest::to_bytes` writes it.
 ///
 /// As of WO-M7b the leading byte of that payload is a **composed-registry
-/// index plus one** (`rustdar_frontend::job_registry`, codes 1..=13 with 0
+/// index plus one** (`rustdar_worker::job_registry`, codes 1..=13 with 0
 /// unallocated), followed by the one canonical envelope every kind shares.
 /// The sparse `TAG_*` era — its per-tag numbering and the retired-tag holes
 /// — and the hand-versioned changelog that once narrated it are git history
@@ -70,7 +70,7 @@ pub const OUT_KIND: &str = "outkind";
 /// posture, see `worker::post_result`).
 ///
 /// Order within the array is the row's own convention — the frame-reply
-/// digest rows (`rustdar_frontend::wire_identity`) are what pin it, and a
+/// digest rows (`rustdar_worker::wire_identity`) are what pin it, and a
 /// count the dispatched row's decoder did not write is refused whole.
 pub const TAILS: &str = "tails";
 
@@ -87,7 +87,7 @@ pub const TAILS: &str = "tails";
 /// `GITHUB_SHA` is what actually distinguishes two deploys; it is present in
 /// CI and absent locally, where the token's second segment is a digest of the
 /// wire's pinned identity rows instead
-/// (`rustdar_frontend::wire_identity::wire_digest`). Both halves of one build
+/// (`rustdar_worker::wire_identity::wire_digest`). Both halves of one build
 /// digest the same module, so the fallback cannot false-mismatch a matched
 /// pair — and a local pair whose pinned wire rows differ now diverges, where
 /// the deleted hand-kept protocol number matched any two local builds alike.
@@ -104,11 +104,11 @@ pub fn build_token() -> String {
         // hand-kept number, and it cannot be forgotten.
         Some(sha) => format!("{}/{}", env!("CARGO_PKG_VERSION"), sha),
         // Local dev: no SHA. Digest the wire's pinned identity rows instead —
-        // see rustdar_frontend::wire_identity for scope and residuals.
+        // see rustdar_worker::wire_identity for scope and residuals.
         None => format!(
             "{}/wire-{:016x}",
             env!("CARGO_PKG_VERSION"),
-            rustdar_frontend::wire_identity::wire_digest()
+            rustdar_worker::wire_identity::wire_digest()
         ),
     }
 }

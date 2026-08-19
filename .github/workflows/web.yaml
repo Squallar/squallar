@@ -13,7 +13,7 @@ name: Web
 #           # frame" reply, and the doctored-token -> respawn leg
 #
 # CI enforces the same on every push to main and every PR. Required-green
-# scope: any change under rustdar-frontend/src/offload* or pump/renderer
+# scope: any change under rustdar-worker/src/offload* or pump/renderer
 # surfaces, rustdar-web/src/worker_*, or rustdar-web at all.
 #
 # Tier 2 runs against LIVE network (campaign-resolved posture): 180 s poll for

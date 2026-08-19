@@ -2020,7 +2020,7 @@ fn the_platforms_sensors_reach_the_map() {
 fn a_deferred_teardown_is_freed_by_the_frame_loop() {
     let mut app = headless(TestBridge::android());
     // Emptied first: the queue is thread-local and the harness reuses threads.
-    while crate::offload::drain_deferred_drops(std::time::Duration::from_secs(30)) > 0 {}
+    while rustdar_worker::offload::drain_deferred_drops(std::time::Duration::from_secs(30)) > 0 {}
 
     let held: Vec<std::sync::Arc<()>> = (0..3).map(|_| std::sync::Arc::new(())).collect();
     let watched: Vec<std::sync::Arc<()>> = held.iter().map(std::sync::Arc::clone).collect();
@@ -2028,9 +2028,9 @@ fn a_deferred_teardown_is_freed_by_the_frame_loop() {
     // payload — the native routing would hand these to the pool instead, and
     // the frame loop is what this test is about.
     for payload in held {
-        crate::offload::defer_drop("test-teardown", Box::new(payload));
+        rustdar_worker::offload::defer_drop("test-teardown", Box::new(payload));
     }
-    assert!(crate::offload::has_deferred_drops());
+    assert!(rustdar_worker::offload::has_deferred_drops());
 
     for _ in 0..3 {
         app.handle_redraw();
@@ -2043,7 +2043,7 @@ fn a_deferred_teardown_is_freed_by_the_frame_loop() {
          drains the queue is not being reached",
     );
     assert!(
-        !crate::offload::has_deferred_drops(),
+        !rustdar_worker::offload::has_deferred_drops(),
         "the queue outlived the frames that were supposed to empty it",
     );
 }
@@ -2406,7 +2406,8 @@ fn an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame() {
     // function's own prose mentions `offload::discard_each` and a substring
     // count would have counted the sentence.
     assert_eq!(
-        body.matches("crate::offload::discard_each(").count(),
+        body.matches("rustdar_worker::offload::discard_each(")
+            .count(),
         3,
         "one of the three volume holders stopped handing its evictions over \
          to the deferred-drop path: {body}"
@@ -2433,7 +2434,8 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
     );
     let body = fn_body("fn evict_unneeded_loop_scans(");
     assert_eq!(
-        body.matches("crate::offload::discard_each(").count(),
+        body.matches("rustdar_worker::offload::discard_each(")
+            .count(),
         3,
         "one of the loop's three holders frees its evictions where it evicted \
          them — on the frame thread, 47–69 MiB apiece for a volume, a decoded \

@@ -23,8 +23,8 @@
 //! volumes on different ones.
 
 use super::*;
-use crate::offload::{JobRequest, JobSink};
 use crate::platform_double::TestBridge;
+use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
@@ -188,7 +188,8 @@ fn dispatched_objects(posted: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<Option<Vec<u8>>>
 #[test]
 fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+    let _worker =
+        rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)
@@ -291,7 +292,8 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
 #[test]
 fn a_product_that_classifies_nothing_carries_no_melting_layer() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+    let _worker =
+        rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)
@@ -373,7 +375,8 @@ const MOTION: (f32, f32) = (37.5, 218.5);
 #[test]
 fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+    let _worker =
+        rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)
@@ -477,7 +480,8 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
 #[test]
 fn a_product_that_applies_no_storm_motion_carries_none() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
+    let _worker =
+        rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)

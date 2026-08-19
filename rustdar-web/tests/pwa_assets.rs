@@ -835,7 +835,7 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///     for the decoded volume `OUT` carries under the decode row's registry
 ///     code (the section and voxel payloads were already pinned by their
 ///     own crates);
-///   * `rustdar_frontend::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
+///   * `rustdar_worker::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
 ///     for the page->worker direction named below,
 ///     `..._the_overlay_reply_framing_is_the_one_this_protocol_ships` for
 ///     the overlay reply payloads (hit-map cells riding ahead of raw RGBA;
@@ -848,7 +848,7 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///     moved the frame's two big buffers onto `TAILS`).
 ///
 /// Those framing rows do double duty since M5: they live in
-/// `rustdar_frontend::wire_identity` as production consts, and the local
+/// `rustdar_worker::wire_identity` as production consts, and the local
 /// build token digests them — so the layout change this field-set pin cannot
 /// see is exactly the change that now diverges two local builds' tokens.
 ///

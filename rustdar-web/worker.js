@@ -4,7 +4,7 @@
  * Radar rasterization is ~160-190 ms per Level II frame at the browser's
  * 1024x1024 (see `rustdar-web/src/lib.rs`), and it used to run on the main
  * thread because wasm32-unknown-unknown has no threads. It runs here instead;
- * `rustdar_frontend::offload` posts the work and falls back to running it
+ * `rustdar_worker::offload` posts the work and falls back to running it
  * inline whenever this file, or the module it loads, does not come up.
  *
  * This is a MODULE worker (`new Worker(url, { type: "module" })`), because

@@ -34,15 +34,10 @@ pub mod chunk_feed;
 pub mod chunk_notify;
 pub mod egui_renderer;
 pub mod input;
-/// The composed job-codec registry — the one module that names the source
-/// crates' `JOB_CODECS`; `offload`'s request direction consumes it and names
-/// neither crate (WO-M7.2).
-pub(crate) mod job_registry;
 pub mod location_hint;
 pub mod location_permission;
 pub mod loop_downloads;
 pub mod loop_pool;
-pub mod offload;
 pub mod platform;
 /// The [`PlatformBridge`](platform::PlatformBridge) test double. Compiled only
 /// for tests; it is the seam every `App`-level test is driven through.
@@ -57,4 +52,3 @@ pub mod staging_ring;
 #[cfg(test)]
 pub(crate) mod test_sites;
 pub mod volume;
-pub mod wire_identity;
