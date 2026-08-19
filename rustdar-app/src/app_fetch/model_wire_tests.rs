@@ -114,7 +114,7 @@ fn seed(app: &mut crate::app::App) {
         rustdar_overlays::hrrr::HrrrFetchResult(Ok(a_seedable_grid())),
     );
     app.gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OverlayKind::ModelData,
+        kind: OverlayKind::ModelData.id(),
         data,
     });
     let configs = app.gui.overlays.save_pane_configs();

@@ -60,7 +60,7 @@ fn failing_frame(gui: &mut Gui) -> usize {
             started += 1;
             gui.overlays.set_fetching(kind, true);
             gui.overlays.apply_fetch_result(OverlayFetchResult {
-                kind,
+                kind: kind.id(),
                 data: OverlayRegistry::spc_discussions_failure_payload(FetchError::transient(
                     "SPC MD RSS request failed: connection refused",
                 )),
@@ -200,7 +200,7 @@ fn a_user_fetch_is_answered_immediately_however_deep_the_backoff() {
 fn refuse(gui: &mut Gui) {
     gui.overlays.set_fetching(KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
+        kind: KIND.id(),
         data: OverlayRegistry::spc_discussions_failure_payload(FetchError::permanent(
             "SPC returned HTTP 400 for MD RSS feed",
         )),
@@ -301,7 +301,7 @@ fn a_broken_layer_recovers_on_its_own_once_the_heartbeat_comes_due() {
     // the old `None` made unreachable.
     gui.overlays.set_fetching(KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
+        kind: KIND.id(),
         data: OverlayRegistry::spc_discussions_payload(Vec::new()),
     });
     assert_eq!(
@@ -351,7 +351,7 @@ fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
 
     // A layer with data on screen — the case the old guard skipped.
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
+        kind: KIND.id(),
         data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
     });
     assert!(gui.overlays.has_data(KIND), "premise: something is drawn");
@@ -389,7 +389,7 @@ fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
     // spend a request on being switched on. This is what keeps a preset that
     // enables eight layers on four panes from being thirty-two requests.
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
+        kind: KIND.id(),
         data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
     });
     let mut actions = Vec::new();
@@ -441,7 +441,7 @@ fn an_absent_product_polls_at_the_ordinary_interval() {
     gui.check_auto_polls(&mut actions);
     gui.overlays.set_fetching(KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
+        kind: KIND.id(),
         data: OverlayRegistry::spc_discussions_failure_payload(FetchError::absent(
             "SPC returned HTTP 404",
         )),
@@ -472,7 +472,7 @@ fn a_success_clears_the_backoff() {
 
     gui.overlays.set_fetching(KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
+        kind: KIND.id(),
         data: OverlayRegistry::spc_discussions_payload(Vec::new()),
     });
 

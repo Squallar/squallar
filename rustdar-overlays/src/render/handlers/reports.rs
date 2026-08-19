@@ -8,12 +8,14 @@ use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
 };
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 // `pub`, not `pub(crate)`, for `alert::NwsAlertFetchResult`'s reason: the
@@ -202,6 +204,15 @@ impl OverlayHandler for StormReportsHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::StormReports
     }
+    fn id(&self) -> LayerId {
+        known::STORM_REPORTS
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        60
+    }
 
     fn display_name(&self) -> &str {
         "SPC Storm Reports"
@@ -361,7 +372,7 @@ impl OverlayHandler for StormReportsHandler {
         };
         let sources = ctx.sources.clone();
         vec![FetchTask {
-            kind: OverlayKind::StormReports,
+            kind: known::STORM_REPORTS,
             future: Box::pin(async move {
                 let result = crate::spc::reports::fetch_storm_reports(&client, &sources).await;
                 Box::new(StormReportsFetchResult(result)) as FetchPayload
@@ -654,7 +665,7 @@ mod round_tests {
         let mut registry = OverlayRegistry::default();
         registry.set_enabled(kind, true);
         registry.apply_fetch_result(OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: Box::new(StormReportsFetchResult(result)) as FetchPayload,
         });
         let ctx = PaneControlContext {

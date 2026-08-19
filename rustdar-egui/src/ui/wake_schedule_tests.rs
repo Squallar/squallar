@@ -183,7 +183,7 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
     // the timer this reads is the one a real fetch would leave behind.
     gui.overlays.apply_fetch_result(
         rustdar_overlays::render::overlay_state::OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: OverlayRegistry::nws_alerts_payload(Vec::new()),
         },
     );

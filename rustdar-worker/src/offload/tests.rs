@@ -2638,7 +2638,7 @@ fn a_seeded_reports_registry() -> rustdar_overlays::render::overlay_state::Overl
         true,
     );
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: rustdar_overlays::render::overlay_state::OverlayKind::StormReports,
+        kind: rustdar_overlays::render::overlay_state::OverlayKind::StormReports.id(),
         data: Box::new(StormReportsFetchResult(Ok(StormReportRound {
             reports: vec![
                 report(StormReportKind::Tornado, 35.33, -97.28),
@@ -2674,7 +2674,7 @@ fn a_seeded_glm_registry() -> rustdar_overlays::render::overlay_state::OverlayRe
         true,
     );
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: rustdar_overlays::render::overlay_state::OverlayKind::Lightning,
+        kind: rustdar_overlays::render::overlay_state::OverlayKind::Lightning.id(),
         data: Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
             flashes: vec![
                 flash(30, 35.3, -97.3),

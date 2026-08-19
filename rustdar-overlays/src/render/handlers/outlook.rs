@@ -7,12 +7,14 @@ use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
 };
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
@@ -589,6 +591,15 @@ impl OverlayHandler for SpcOutlookHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::SpcOutlook
     }
+    fn id(&self) -> LayerId {
+        known::SPC_OUTLOOK
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        20
+    }
 
     fn display_name(&self) -> &str {
         "SPC Outlooks"
@@ -858,7 +869,7 @@ impl OverlayHandler for SpcOutlookHandler {
                 let client = client.clone();
                 let sources = ctx.sources.clone();
                 FetchTask {
-                    kind: OverlayKind::SpcOutlook,
+                    kind: known::SPC_OUTLOOK,
                     future: Box::pin(async move {
                         let result =
                             crate::spc::fetch::fetch_outlook(&client, &sources, day, product).await;

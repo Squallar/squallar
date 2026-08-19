@@ -62,7 +62,7 @@ fn gui_with_an_outlook() -> Gui {
         HatchPattern::None,
     );
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OUTLOOK,
+        kind: OUTLOOK.id(),
         data: Box::new(SpcOutlookFetchResult {
             day: OutlookDay::Day1,
             product: OutlookProduct::Categorical,

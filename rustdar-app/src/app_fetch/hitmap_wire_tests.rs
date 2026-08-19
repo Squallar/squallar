@@ -164,9 +164,10 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
         }
         other => panic!("{other:?} is not a hit-map kind this fixture seeds"),
     };
-    app.gui
-        .overlays
-        .apply_fetch_result(OverlayFetchResult { kind, data });
+    app.gui.overlays.apply_fetch_result(OverlayFetchResult {
+        kind: kind.id(),
+        data,
+    });
     // Keep the pane's stored per-layer config in step with the handler —
     // `polygon_wire_tests::seed` says why.
     let configs = app.gui.overlays.save_pane_configs();

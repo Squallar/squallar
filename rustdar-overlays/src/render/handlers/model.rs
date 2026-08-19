@@ -8,11 +8,13 @@ use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
 };
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
     RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// How many parameters' grids stay resident at once.
@@ -221,6 +223,15 @@ impl OverlayHandler for ModelDataHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::ModelData
     }
+    fn id(&self) -> LayerId {
+        known::MODEL_DATA
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        10
+    }
 
     fn display_name(&self) -> &str {
         "Model Data"
@@ -399,7 +410,7 @@ impl OverlayHandler for ModelDataHandler {
         let sources = ctx.sources.clone();
         let param = self.selected_param;
         vec![FetchTask {
-            kind: OverlayKind::ModelData,
+            kind: known::MODEL_DATA,
             future: Box::pin(async move {
                 let result = if param.is_composite() {
                     crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &sources, &param).await
