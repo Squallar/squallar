@@ -2,11 +2,12 @@ use chrono::NaiveDateTime;
 use nexrad_model::data::Scan;
 use rustdar_egui::pane::RenderTarget;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::level3::Level3Product;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::LayerId;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -263,7 +264,10 @@ pub struct OverlayRenderResponse {
     /// exactly as for a kept result, and places nothing.
     pub image: Option<Arc<egui::ColorImage>>,
     pub geo_bounds: GeoBounds,
-    pub overlay_kind: OverlayKind,
+    /// Which layer this raster is for — the id
+    /// [`spawn_overlay_render`](crate::app_fetch) was dispatched with, carried
+    /// back so the poller can find each named pane's texture cache for it.
+    pub overlay_kind: LayerId,
     pub generation: u64,
     pub pane_indices: Vec<usize>,
     pub zoom: i32,

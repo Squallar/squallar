@@ -10,9 +10,8 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
-    RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
+    PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
@@ -71,8 +70,8 @@ pub(crate) struct AlertItem {
 }
 
 impl OverlayItem for AlertItem {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::NwsAlerts
+    fn layer_id(&self) -> LayerId {
+        known::NWS_ALERTS
     }
 
     fn popup_content(&self, prefs: &rustdar_units::UserPreferences) -> PopupContent {
@@ -255,9 +254,6 @@ impl NwsAlertHandler {
 }
 
 impl OverlayHandler for NwsAlertHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::NwsAlerts
-    }
     fn id(&self) -> LayerId {
         known::NWS_ALERTS
     }
@@ -490,7 +486,7 @@ impl OverlayHandler for NwsAlertHandler {
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         selections.retain(|sel| {
-            if sel.kind() != OverlayKind::NwsAlerts {
+            if sel.layer_id() != known::NWS_ALERTS {
                 return true;
             }
             self.state

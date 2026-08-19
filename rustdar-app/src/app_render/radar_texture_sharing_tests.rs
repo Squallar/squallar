@@ -8,8 +8,8 @@
 
 use super::*;
 use crate::app::tests::{drain_uploads, n_pane_app};
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::known;
 
 const SITE: &str = "KTLX";
 const OTHER_SITE: &str = "KMPX";
@@ -152,7 +152,7 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(&OverlayKind::Radar.id())
+        .overlay_cache_mut(&known::RADAR)
         .current()
         .expect("this pane was served a radar texture")
         .texture
@@ -385,7 +385,7 @@ fn stamped_elevation(app: &mut crate::app::App, pane_idx: usize) -> f32 {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(&OverlayKind::Radar.id())
+        .overlay_cache_mut(&known::RADAR)
         .current()
         .expect("this pane was served a radar texture")
         .radar_meta

@@ -2,10 +2,10 @@ use super::*;
 use crate::app::tests::{empty_scan, headless, two_pane_app};
 use crate::platform_double::TestBridge;
 use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::known;
 
 const SITE: &str = "KTLX";
 const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
@@ -109,7 +109,7 @@ fn holds_radar_texture(app: &mut crate::app::App, pane_idx: usize) -> bool {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(&OverlayKind::Radar.id())
+        .overlay_cache_mut(&known::RADAR)
         .current()
         .is_some()
 }
@@ -691,7 +691,7 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
         app.gui
             .pane_mut(0)
             .unwrap()
-            .overlay_cache_mut(&OverlayKind::Radar.id())
+            .overlay_cache_mut(&known::RADAR)
             .clear();
 
         app.restore_cached_render(&egui::Context::default());

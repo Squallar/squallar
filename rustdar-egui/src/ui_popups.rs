@@ -311,8 +311,9 @@ fn render_pager_nav(ui: &mut egui::Ui, page: usize, count: usize, current_page: 
 mod tests {
     use crate::input_harness::InputHarness;
     use rustdar_overlays::render::overlay_state::{
-        OverlayItem, OverlayKind, PopupAction, PopupActionKind, PopupContent, PopupSection,
+        OverlayItem, PopupAction, PopupActionKind, PopupContent, PopupSection,
     };
+    use rustdar_source::id::{LayerId, known};
     use std::sync::Arc;
 
     /// An overlay item whose popup is whatever the test says it is. The
@@ -321,8 +322,8 @@ mod tests {
     struct StubItem(fn() -> PopupContent);
 
     impl OverlayItem for StubItem {
-        fn kind(&self) -> OverlayKind {
-            OverlayKind::NwsAlerts
+        fn layer_id(&self) -> LayerId {
+            known::NWS_ALERTS
         }
         fn popup_content(&self, _prefs: &rustdar_units::UserPreferences) -> PopupContent {
             (self.0)()

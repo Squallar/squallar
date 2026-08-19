@@ -4,9 +4,7 @@ use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
 use crate::render::overlay_state::Surface;
-use crate::render::overlay_state::{
-    FetchPayload, OverlayHandler, OverlayItem, OverlayKind, RenderMode,
-};
+use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use rustdar_source::id::{LayerId, known};
 
 /// Toggle state only: the legend is a screen-space HUD element, not
@@ -22,9 +20,6 @@ impl ColorScaleHandler {
 }
 
 impl OverlayHandler for ColorScaleHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::ColorScale
-    }
     fn id(&self) -> LayerId {
         known::COLOR_SCALE
     }

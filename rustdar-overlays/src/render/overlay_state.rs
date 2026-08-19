@@ -432,7 +432,12 @@ pub enum Surface {
 /// Handlers store `Vec<Arc<T>>`; a click clones the `Arc` into the selection
 /// list as `Arc<dyn OverlayItem>`.
 pub trait OverlayItem: Send + Sync + Debug {
-    fn kind(&self) -> OverlayKind;
+    /// Which layer this item came from — the same [`known`] const its
+    /// handler's [`OverlayHandler::id`] answers. A selection list mixes
+    /// items from every layer, so routing a popup action back to the
+    /// handler that owns it ([`OverlayRegistry::handle_popup_action`]) and
+    /// filtering a handler's own selections out of it both ask this.
+    fn layer_id(&self) -> LayerId;
 
     fn popup_content(&self, prefs: &UserPreferences) -> PopupContent;
 
@@ -464,20 +469,20 @@ pub struct ClickableItem<'a> {
 // ── Overlay handler trait ─────────────────────────────────────────────────
 
 /// Adding an overlay means: implement this, register it in `create_handlers()`,
-/// add an `OverlayKind` variant. Nothing in `rustdar-egui` or
-/// the `rustdar` crate changes.
+/// give it a [`known`] const and append that spelling to
+/// [`LAYER_ID_LEDGER`](rustdar_source::id::LAYER_ID_LEDGER). Nothing in
+/// `rustdar-egui` or the `rustdar` crate changes.
 pub trait OverlayHandler: Send {
     // ── Identity & metadata ───────────────────────────────────────────
 
-    fn kind(&self) -> OverlayKind;
-
     /// This layer's open-string identity — one of the [`known`] consts,
-    /// spelled as a **literal** in each impl rather than derived through
-    /// [`kind`](Self::kind): the enum bridge closes at M8b-b3 and this
-    /// method is what survives it. The registry's identity tests pin
-    /// uniqueness and ledger membership across all twelve, and the
-    /// state-key tripwire holds each handler's id to its `kind`'s spelling
-    /// while both exist.
+    /// spelled as a **literal** in each impl. It is what every per-layer
+    /// map is keyed by (draw order, enabled flags, pane configs, saved
+    /// handler state) and therefore the bytes those maps put in the user's
+    /// config file, so it is derived from nothing: the registry's identity
+    /// tests pin uniqueness and ledger membership across all twelve, and
+    /// the state-key tripwire holds the live set to the literal twelve
+    /// names saved configs have always filed handler state under.
     fn id(&self) -> LayerId;
 
     /// Which pane surface this layer draws onto. See [`Surface`].
@@ -1256,8 +1261,8 @@ impl OverlayRegistry {
 
     /// Routes to the handler that owns `action.target`.
     pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
-        let kind = action.target.kind();
-        self.handler_mut(&kind.id())
+        let id = action.target.layer_id();
+        self.handler_mut(&id)
             .is_some_and(|h| h.handle_popup_action(action))
     }
 
@@ -1845,18 +1850,19 @@ mod retry_ledger_tests {
                 continue;
             };
             checked += 1;
-            let kind = handler.kind();
+            let id = handler.id();
+            let id = id.as_str();
 
             assert!(
                 handler.retry().is_some(),
-                "{kind:?} auto-polls every {interval}s but keeps no retry \
+                "{id} auto-polls every {interval}s but keeps no retry \
                  ledger, so a failed fetch leaves it due on every frame",
             );
 
             assert_eq!(
                 handler.auto_fetch_delay(),
                 Some(std::time::Duration::ZERO),
-                "{kind:?} has never been fetched, so it is due now",
+                "{id} has never been fetched, so it is due now",
             );
 
             handler
@@ -1869,12 +1875,12 @@ mod retry_ledger_tests {
                 .expect("a transient failure is still owed an eventual retry");
             assert!(
                 !delay.is_zero(),
-                "{kind:?} is due again immediately after a failed fetch — this \
+                "{id} is due again immediately after a failed fetch — this \
                  is the per-frame retry storm",
             );
             assert!(
                 delay <= std::time::Duration::from_secs(interval),
-                "{kind:?} backs off past its own {interval}s poll interval, so \
+                "{id} backs off past its own {interval}s poll interval, so \
                  a failure recovers slower than an ordinary refresh: {delay:?}",
             );
         }
@@ -2412,18 +2418,28 @@ mod state_key_tests {
         "ColorScale",
     ];
 
-    /// **The tripwire for the day `OverlayKind` stops being a plain enum.**
+    /// **The tripwire on the bytes saved handler state is filed under.**
     ///
     /// `serialize_handler_states` and `deserialize_handler_states` key the
-    /// saved handler state by `h.id().as_str()` since M8b-b1 (the two
+    /// saved state by `h.id().as_str()` since M8b-b1 (the two
     /// `format!("{:?}")` sites this test was written against are gone — m1).
-    /// That is safe only because every handler's `id()` spells exactly what
-    /// the `{:?}` key always spelled, which is the name already sitting in
-    /// every user's config file. A handler whose id drifts from its
-    /// `kind()`'s `Debug`/serde spelling — a typo, or two handlers' ids
-    /// swapped — silently stops matching the file, and that user's saved
-    /// handler state is orphaned without a single error. This test is what
-    /// fails instead.
+    /// Those keys are already sitting in every user's config file, so a
+    /// handler whose id drifts from the name below silently stops matching
+    /// the file and that user's saved state for the layer is orphaned
+    /// without a single error. This test is what fails instead: the live
+    /// twelve and the literal twelve are compared as sets in **both**
+    /// directions, so a rename fails on the live side and a retirement
+    /// fails on the pinned side.
+    ///
+    /// **What this test cannot see, and what does:** two handlers *swapping*
+    /// ids leaves this set equal. The cross-check that used to catch it read
+    /// each handler's `kind()` — a second, independent spelling of its
+    /// identity, deleted at M8b-b3 with the enum bridge. The pin that
+    /// catches a swap now is
+    /// `registry_identity_tests::draw_order_weights_encode_the_default_draw_order`:
+    /// weights are pinned unique and each id is pinned to its weight's
+    /// position in the literal draw order, so swapping any two ids moves
+    /// both in the weight-sorted list.
     ///
     /// New persistence code must key by [`LayerId::as_str`], never by a new
     /// `{:?}` site (`LayerId`'s derived `Debug` prints `LayerId("…")` —
@@ -2431,7 +2447,7 @@ mod state_key_tests {
     ///
     /// [`LayerId::as_str`]: rustdar_source::id::LayerId::as_str
     #[test]
-    fn handler_state_keys_are_the_twelve_debug_spellings_and_serde_agrees() {
+    fn handler_state_keys_are_the_twelve_names_saved_configs_file_state_under() {
         let handlers = create_handlers();
         assert_eq!(
             handlers.len(),
@@ -2439,33 +2455,19 @@ mod state_key_tests {
             "a handler was registered or retired without updating the literal \
              key list; saved state for it has no pinned spelling",
         );
-        for h in &handlers {
-            let kind = h.kind();
-            let debug_spelling = format!("{kind:?}");
-            let serde_spelling = serde_json::to_value(kind)
-                .expect("a fieldless enum serializes to its variant name");
-            let serde_spelling = serde_spelling
-                .as_str()
-                .expect("a unit variant is a JSON string on the wire");
-            assert_eq!(
-                debug_spelling, serde_spelling,
-                "the Debug and serde spellings of this kind disagree — the \
-                 historical key and the on-disk spelling just diverged",
-            );
-            assert_eq!(
-                h.id().as_str(),
-                debug_spelling,
-                "this handler's id() does not spell its kind()'s Debug name — \
-                 the id-keyed handler-state maps just orphaned its saved \
-                 state (a swap of two handlers' ids also fails here)",
-            );
-            assert!(
-                STATE_KEYS.contains(&debug_spelling.as_str()),
-                "{debug_spelling} is not one of the twelve names saved configs \
-                 file handler state under — a renamed variant orphans the \
-                 user's saved state for it",
-            );
-        }
+        let mut live: Vec<String> = handlers
+            .iter()
+            .map(|h| h.id().as_str().to_string())
+            .collect();
+        live.sort_unstable();
+        let mut pinned: Vec<String> = STATE_KEYS.iter().map(|k| (*k).to_string()).collect();
+        pinned.sort_unstable();
+        assert_eq!(
+            live, pinned,
+            "the registered ids are no longer exactly the twelve names saved \
+             configs file handler state under — a rename or a retirement \
+             orphans every user's saved state for that layer",
+        );
     }
 }
 

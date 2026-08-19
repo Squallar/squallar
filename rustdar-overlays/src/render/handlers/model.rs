@@ -10,7 +10,7 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
+    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayLegend, OverlayState,
     RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
@@ -220,9 +220,6 @@ impl ModelDataHandler {
 }
 
 impl OverlayHandler for ModelDataHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::ModelData
-    }
     fn id(&self) -> LayerId {
         known::MODEL_DATA
     }

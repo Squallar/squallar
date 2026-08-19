@@ -3,7 +3,7 @@ use crate::platform_double::TestBridge;
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_kv::MemoryKvStore;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::{LayerId, known};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn bounds() -> GeoBounds {
@@ -149,8 +149,8 @@ fn req(w: u32, h: u32, overdraw: f32, data_gen: u64, zoom: i32) -> fetch::Overla
     }
 }
 
-fn entry(pane: usize, kind: OverlayKind) -> (usize, OverlayKind, fetch::OverlayRenderRequest) {
-    (pane, kind, req(800, 600, 1.0, 1, 10))
+fn entry(pane: usize, id: LayerId) -> (usize, LayerId, fetch::OverlayRenderRequest) {
+    (pane, id, req(800, 600, 1.0, 1, 10))
 }
 
 #[test]
@@ -163,13 +163,13 @@ fn test_dedup_empty() {
 
 #[test]
 fn test_dedup_single_render() {
-    let result = deduplicate_overlay_renders(vec![entry(0, OverlayKind::Radar)], true);
+    let result = deduplicate_overlay_renders(vec![entry(0, known::RADAR)], true);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, vec![0]);
-    assert_eq!(result[0].1, OverlayKind::Radar);
+    assert_eq!(result[0].1, known::RADAR);
     assert_eq!(result[0].2.texture.width, 800);
 
-    let result = deduplicate_overlay_renders(vec![entry(0, OverlayKind::Radar)], false);
+    let result = deduplicate_overlay_renders(vec![entry(0, known::RADAR)], false);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, vec![0]);
 }
@@ -177,9 +177,9 @@ fn test_dedup_single_render() {
 #[test]
 fn test_dedup_no_grouping() {
     let input = vec![
-        entry(0, OverlayKind::Radar),
-        entry(1, OverlayKind::Radar),
-        entry(2, OverlayKind::NwsAlerts),
+        entry(0, known::RADAR),
+        entry(1, known::RADAR),
+        entry(2, known::NWS_ALERTS),
     ];
 
     let result = deduplicate_overlay_renders(input, false);
@@ -191,22 +191,19 @@ fn test_dedup_no_grouping() {
 
 #[test]
 fn test_dedup_groups_same_key() {
-    let input = vec![entry(0, OverlayKind::Radar), entry(1, OverlayKind::Radar)];
+    let input = vec![entry(0, known::RADAR), entry(1, known::RADAR)];
 
     let result = deduplicate_overlay_renders(input, true);
     assert_eq!(result.len(), 1);
     let mut panes = result[0].0.clone();
     panes.sort();
     assert_eq!(panes, vec![0, 1]);
-    assert_eq!(result[0].1, OverlayKind::Radar);
+    assert_eq!(result[0].1, known::RADAR);
 }
 
 #[test]
 fn test_dedup_different_keys() {
-    let input = vec![
-        entry(0, OverlayKind::Radar),
-        entry(1, OverlayKind::NwsAlerts),
-    ];
+    let input = vec![entry(0, known::RADAR), entry(1, known::NWS_ALERTS)];
 
     let result = deduplicate_overlay_renders(input, true);
     assert_eq!(result.len(), 2);
@@ -214,7 +211,7 @@ fn test_dedup_different_keys() {
 
 #[test]
 fn test_dedup_duplicate_pane_idx() {
-    let input = vec![entry(0, OverlayKind::Radar), entry(0, OverlayKind::Radar)];
+    let input = vec![entry(0, known::RADAR), entry(0, known::RADAR)];
 
     let result = deduplicate_overlay_renders(input, true);
     assert_eq!(result.len(), 1);
@@ -227,8 +224,8 @@ fn test_dedup_duplicate_pane_idx() {
 #[test]
 fn test_dedup_keeps_differently_sized_panes_apart() {
     let input = vec![
-        (0, OverlayKind::Radar, req(2048, 600, 0.28, 1, 10)),
-        (1, OverlayKind::Radar, req(2400, 600, 1.0, 1, 10)),
+        (0, known::RADAR, req(2048, 600, 0.28, 1, 10)),
+        (1, known::RADAR, req(2400, 600, 1.0, 1, 10)),
     ];
 
     let mut result = deduplicate_overlay_renders(input, true);
@@ -1655,8 +1652,8 @@ fn a_spent_poll_wakeup_lets_the_loop_sleep_again() {
 fn silence_the_other_timers(app: &mut App) {
     for idx in 0..app.gui.remembered_pane_count() {
         let pane = app.gui.pane_mut(idx).expect("a remembered pane");
-        for &kind in OverlayKind::all() {
-            pane.enabled_overlays.insert(kind.id(), false);
+        for id in rustdar_overlays::render::handlers::default_draw_order() {
+            pane.enabled_overlays.insert(id, false);
         }
     }
     assert_eq!(

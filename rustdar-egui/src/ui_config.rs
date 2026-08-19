@@ -185,8 +185,8 @@ pub(crate) struct KindList {
 impl KindList {
     /// The default draw order, wrapped — what a config with no `draw_order`
     /// key reads as: the registry weight order (M8b; byte-identical to the
-    /// pre-M8b `OverlayKind::all()` default — the weight pin holds them
-    /// equal).
+    /// enum-era default this replaced — the draw-weight order pin in
+    /// rustdar-overlays holds them equal).
     fn default_draw_order() -> Self {
         Self::from(rustdar_overlays::render::handlers::default_draw_order())
     }
@@ -727,10 +727,10 @@ struct VolumeAlphaConfig {
 /// permanently, because the autosave then rewrites the file from defaults.
 ///
 /// See [`kind_or_default`] for the same fallback on pane kinds, and
-/// [`KindList`] for the overlay kinds. (An earlier version of this comment
-/// claimed unknown `OverlayKind`s were "filtered out" — false: serde failed
+/// [`KindList`] for the layer ids. (An earlier version of this comment
+/// claimed unknown layer names were "filtered out" — false: serde failed
 /// the containing list or map before any filter downstream could run, and
-/// one unknown kind cost the whole file. The tolerance has to live in the
+/// one unknown name cost the whole file. The tolerance has to live in the
 /// deserializer itself, which is where `KindList` and the string-keyed
 /// overlay maps put it.) The worker wire's `from_wire_code` returning `None`
 /// covers that boundary on its own.
@@ -925,9 +925,9 @@ where
 }
 
 /// The wire key a layer's state is filed under — the id string
-/// ([`LayerId::as_str`]), which is byte-identical to the pre-M8b serde
-/// spelling of `OverlayKind` (the spelling-pin test in rustdar-overlays
-/// holds them equal). Never `format!("{:?}")`.
+/// ([`LayerId::as_str`]), which is byte-identical to the enum-era serde
+/// spelling this replaced (the spelling-pin test in rustdar-overlays holds
+/// them equal until the enum goes at M8c). Never `format!("{:?}")`.
 fn layer_key(id: &LayerId) -> String {
     id.as_str().to_string()
 }

@@ -2633,12 +2633,9 @@ fn a_seeded_reports_registry() -> rustdar_overlays::render::overlay_state::Overl
         comments: String::new(),
     };
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(
-        &rustdar_overlays::render::overlay_state::OverlayKind::StormReports.id(),
-        true,
-    );
+    registry.set_enabled(&rustdar_source::id::known::STORM_REPORTS, true);
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: rustdar_overlays::render::overlay_state::OverlayKind::StormReports.id(),
+        kind: rustdar_source::id::known::STORM_REPORTS,
         data: Box::new(StormReportsFetchResult(Ok(StormReportRound {
             reports: vec![
                 report(StormReportKind::Tornado, 35.33, -97.28),
@@ -2669,12 +2666,9 @@ fn a_seeded_glm_registry() -> rustdar_overlays::render::overlay_state::OverlayRe
         level: GlmDataLevel::Flash,
     };
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(
-        &rustdar_overlays::render::overlay_state::OverlayKind::Lightning.id(),
-        true,
-    );
+    registry.set_enabled(&rustdar_source::id::known::LIGHTNING, true);
     registry.apply_fetch_result(OverlayFetchResult {
-        kind: rustdar_overlays::render::overlay_state::OverlayKind::Lightning.id(),
+        kind: rustdar_source::id::known::LIGHTNING,
         data: Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
             flashes: vec![
                 flash(30, 35.3, -97.3),
@@ -2718,8 +2712,8 @@ fn a_zip_ctx() -> rustdar_overlays::render::overlay_state::RasterizeContext {
 /// fixture's.
 #[test]
 fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
-    use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::render::rasterize::HitMap;
+    use rustdar_source::id::known;
     let bounds = rustdar_geo::GeoBounds {
         min_lat: 33.0,
         max_lat: 37.0,
@@ -2730,14 +2724,14 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
     let ctx = a_zip_ctx();
 
     for (registry, kind) in [
-        (a_seeded_reports_registry(), OverlayKind::StormReports),
-        (a_seeded_glm_registry(), OverlayKind::Lightning),
+        (a_seeded_reports_registry(), known::STORM_REPORTS),
+        (a_seeded_glm_registry(), known::LIGHTNING),
     ] {
         let job = registry
-            .prepare_job(&kind.id(), &ctx)
+            .prepare_job(&kind, &ctx)
             .expect("the seeded registry describes a job");
         let items = registry
-            .hit_items(&kind.id())
+            .hit_items(&kind)
             .expect("a hit-map kind captures items beside its input");
         let direct = if let Some(input) =
             job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
@@ -2812,8 +2806,8 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
 /// report is worse than no hit map at all.
 #[test]
 fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
-    use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::render::rasterize::HitMap;
+    use rustdar_source::id::known;
     let bounds = rustdar_geo::GeoBounds {
         min_lat: 33.0,
         max_lat: 37.0,
@@ -2824,16 +2818,14 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
     let registry = a_seeded_reports_registry();
     let ctx = a_zip_ctx();
     let job = registry
-        .prepare_job(&OverlayKind::StormReports.id(), &ctx)
+        .prepare_job(&known::STORM_REPORTS, &ctx)
         .expect("the seeded registry describes a reports job");
     assert!(
         job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
             .is_some(),
         "the seeded registry described another kind's input: {job:?}",
     );
-    let items = registry
-        .hit_items(&OverlayKind::StormReports.id())
-        .expect("items");
+    let items = registry.hit_items(&known::STORM_REPORTS).expect("items");
     let (_, wire_cells) = overlay_reply_via_wire(&JobRequest {
         geometry: JobGeometry {
             width,

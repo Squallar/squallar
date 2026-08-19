@@ -740,8 +740,8 @@ mod tests {
     struct StubOverlayItem;
 
     impl rustdar_overlays::render::overlay_state::OverlayItem for StubOverlayItem {
-        fn kind(&self) -> rustdar_overlays::render::overlay_state::OverlayKind {
-            rustdar_overlays::render::overlay_state::OverlayKind::NwsAlerts
+        fn layer_id(&self) -> rustdar_source::id::LayerId {
+            rustdar_source::id::known::NWS_ALERTS
         }
         fn popup_content(
             &self,

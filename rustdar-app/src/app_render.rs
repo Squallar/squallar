@@ -1382,9 +1382,9 @@ impl super::App {
         use rustdar_egui::overlay_cache::OverlayTextureData;
 
         while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv() {
-            let kind = resp.overlay_kind;
+            let id = resp.overlay_kind.clone();
 
-            // Narrow the result to the panes that still draw this kind, and do
+            // Narrow the result to the panes that still draw this layer, and do
             // it **before the upload**.
             //
             // A render is dispatched a frame or more before it lands, and it
@@ -1407,7 +1407,7 @@ impl super::App {
             // exit that never reaches an `offload` — and it is the *only* half
             // that clears it. `release_disabled_overlay_textures` deliberately
             // leaves the mark alone, so a result dropped here is what lets that
-            // kind be dispatched again.
+            // layer be dispatched again.
             //
             // The radar raster never reaches this poller — `ui_map_pane`'s loop
             // skips `Radar` and the picture comes from `apply_render_to_pane` —
@@ -1420,8 +1420,8 @@ impl super::App {
                 let Some(pane) = gui.pane_mut(pane_idx) else {
                     return false;
                 };
-                let wanted = !pane.overlay_texture_is_releasable(&kind.id());
-                pane.overlay_cache_mut(&kind.id()).render_in_flight = false;
+                let wanted = !pane.overlay_texture_is_releasable(&id);
+                pane.overlay_cache_mut(&id).render_in_flight = false;
                 wanted
             });
             if resp.pane_indices.is_empty() {
@@ -1464,7 +1464,7 @@ impl super::App {
                     continue;
                 };
 
-                let cache = pane.overlay_cache_mut(&kind.id());
+                let cache = pane.overlay_cache_mut(&id);
 
                 // Every surviving result is stored, and the staleness question is asked
                 // next frame instead. `resp.generation` is a content token, not

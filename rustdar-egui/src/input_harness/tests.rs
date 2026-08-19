@@ -6045,7 +6045,6 @@ fn day_old_data_reads_in_hours() {
 // ── Overlay texture budget ───────────────────────────────────────────
 
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::OverlayKind;
 
 /// The texture plans the last frame asked for.
 fn requested_plans(h: &InputHarness) -> Vec<crate::overlay_cache::OverlayTexturePlan> {
@@ -11765,8 +11764,8 @@ fn phone() -> InputHarness {
 struct SheetStubFeature;
 
 impl rustdar_overlays::render::overlay_state::OverlayItem for SheetStubFeature {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::NwsAlerts
+    fn layer_id(&self) -> rustdar_source::id::LayerId {
+        rustdar_source::id::known::NWS_ALERTS
     }
     fn popup_content(
         &self,
@@ -14436,7 +14435,7 @@ fn zone_alert_over(
 fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert::NwsAlert>) {
     use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
     h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OverlayKind::NwsAlerts.id(),
+        kind: known::NWS_ALERTS,
         data: OverlayRegistry::nws_alerts_payload(alerts),
     });
 }
@@ -14549,7 +14548,7 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
         concerning: None,
     };
     h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OverlayKind::SpcDiscussions.id(),
+        kind: known::SPC_DISCUSSIONS,
         data: OverlayRegistry::spc_discussions_payload(vec![md]),
     });
 

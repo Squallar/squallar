@@ -23,8 +23,9 @@
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job —
@@ -113,10 +114,10 @@ fn a_feature() -> OverlayFeature {
 ///
 /// Through `apply_fetch_result` — the same door a live fetch uses — so the
 /// handler's own delivery path runs, not some test-only installer.
-fn seed(app: &mut crate::app::App, kind: OverlayKind) {
+fn seed(app: &mut crate::app::App, id: &LayerId) {
     use rustdar_overlays::render::handlers::{alert, discussion, outlook};
-    let data: rustdar_overlays::render::overlay_state::FetchPayload = match kind {
-        OverlayKind::NwsAlerts => {
+    let data: rustdar_overlays::render::overlay_state::FetchPayload = match id {
+        id if *id == known::NWS_ALERTS => {
             let alert = rustdar_overlays::nws::alert::NwsAlert {
                 id: "urn:test".into(),
                 event: "Tornado Warning".into(),
@@ -140,13 +141,13 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 rustdar_overlays::nws::fetch::ActiveAlerts::whole(vec![alert]),
             )))
         }
-        OverlayKind::SpcOutlook => {
+        id if *id == known::SPC_OUTLOOK => {
             use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
             // The outlook's "enabled" *is* its product set, and its data is
             // keyed by (day, product): the toggle has to precede the payload
             // for the two to meet — the same order `texture_tests::seed`
             // states.
-            app.gui.overlays.set_enabled(&kind.id(), true);
+            app.gui.overlays.set_enabled(id, true);
             Box::new(outlook::SpcOutlookFetchResult {
                 day: OutlookDay::Day1,
                 product: OutlookProduct::Categorical,
@@ -159,7 +160,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 }),
             })
         }
-        OverlayKind::SpcDiscussions => {
+        id if *id == known::SPC_DISCUSSIONS => {
             let md = rustdar_overlays::spc::discussion::SpcDiscussion {
                 number: 1,
                 title: "Mesoscale Discussion #0001".into(),
@@ -177,10 +178,13 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
             };
             Box::new(discussion::SpcDiscussionFetchResult(Ok(vec![md])))
         }
-        other => panic!("{other:?} is not a polygon kind this fixture seeds"),
+        other => panic!(
+            "{} is not a polygon layer this fixture seeds",
+            other.as_str()
+        ),
     };
     app.gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: kind.id(),
+        kind: id.clone(),
         data,
     });
     // Keep the pane's stored per-layer config in step with the handler, the
@@ -196,11 +200,11 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
     }
 }
 
-fn in_flight(app: &mut crate::app::App, kind: OverlayKind) -> bool {
+fn in_flight(app: &mut crate::app::App, id: &LayerId) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(&kind.id())
+        .overlay_cache_mut(id)
         .render_in_flight
 }
 
@@ -221,13 +225,13 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     for kind in [
-        OverlayKind::NwsAlerts,
-        OverlayKind::SpcOutlook,
-        OverlayKind::SpcDiscussions,
+        known::NWS_ALERTS,
+        known::SPC_OUTLOOK,
+        known::SPC_DISCUSSIONS,
     ] {
-        seed(&mut app, kind);
+        seed(&mut app, &kind);
         let before = taken.lock().unwrap().len();
-        app.spawn_overlay_render(vec![0], kind, a_render_request());
+        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request());
 
         let posted = taken.lock().unwrap();
         assert_eq!(
@@ -249,7 +253,7 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
         let own_label = app
             .gui
             .overlays
-            .job_codec(&kind.id())
+            .job_codec(&kind)
             .expect("every texture kind owns a codec row")
             .label;
         assert_eq!(
@@ -267,7 +271,7 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
         );
         drop(posted);
         assert!(
-            in_flight(&mut app, kind),
+            in_flight(&mut app, &kind),
             "the {kind:?} dispatch must have marked the pane in flight",
         );
     }
@@ -288,15 +292,15 @@ fn a_dead_worker_unwedges_an_alert_pane() {
     }));
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-    seed(&mut app, OverlayKind::NwsAlerts);
-    app.spawn_overlay_render(vec![0], OverlayKind::NwsAlerts, a_render_request());
+    seed(&mut app, &known::NWS_ALERTS);
+    app.spawn_overlay_render(vec![0], known::NWS_ALERTS, a_render_request());
     assert_eq!(
         taken.lock().unwrap().len(),
         1,
         "premise: the alert dispatch must have posted a described job",
     );
     assert!(
-        in_flight(&mut app, OverlayKind::NwsAlerts),
+        in_flight(&mut app, &known::NWS_ALERTS),
         "premise for the un-wedge below: the dispatch must have marked the \
          pane in flight",
     );
@@ -308,7 +312,7 @@ fn a_dead_worker_unwedges_an_alert_pane() {
          layer can never be asked for again",
     );
     assert!(resp.image.is_none(), "a failed job answered with a picture");
-    assert_eq!(resp.overlay_kind, OverlayKind::NwsAlerts);
+    assert_eq!(resp.overlay_kind, known::NWS_ALERTS);
     assert_eq!(
         resp.pane_indices,
         vec![0],

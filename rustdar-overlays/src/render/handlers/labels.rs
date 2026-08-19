@@ -4,9 +4,7 @@ use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
 use crate::render::overlay_state::Surface;
-use crate::render::overlay_state::{
-    FetchPayload, OverlayHandler, OverlayItem, OverlayKind, RenderMode,
-};
+use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use rustdar_source::id::{LayerId, known};
 
 /// Toggle state only: the tiles are rendered by the walkers integration in
@@ -22,9 +20,6 @@ impl CityLabelsHandler {
 }
 
 impl OverlayHandler for CityLabelsHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::CityLabels
-    }
     fn id(&self) -> LayerId {
         known::CITY_LABELS
     }

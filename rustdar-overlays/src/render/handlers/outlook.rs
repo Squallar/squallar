@@ -9,8 +9,8 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
+    PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
@@ -72,8 +72,8 @@ fn outlook_page_url(day: OutlookDay) -> String {
 }
 
 impl OverlayItem for OutlookItem {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::SpcOutlook
+    fn layer_id(&self) -> LayerId {
+        known::SPC_OUTLOOK
     }
 
     fn popup_content(&self, prefs: &rustdar_units::UserPreferences) -> PopupContent {
@@ -588,9 +588,6 @@ impl SpcOutlookHandler {
 }
 
 impl OverlayHandler for SpcOutlookHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::SpcOutlook
-    }
     fn id(&self) -> LayerId {
         known::SPC_OUTLOOK
     }

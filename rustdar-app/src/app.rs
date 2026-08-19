@@ -25,6 +25,7 @@ use rustdar_location::LocationFacade;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::site_position::SitePositionSource;
 use rustdar_radar::types::ScanInfo;
+use rustdar_source::id::LayerId;
 
 #[path = "app_fetch.rs"]
 mod fetch;
@@ -2350,11 +2351,8 @@ impl App {
 
     /// Process all GUI actions emitted during this frame.
     fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
-        use rustdar_overlays::render::overlay_state::OverlayKind;
-
         // Separate overlay render actions for deduplication
-        let mut overlay_renders: Vec<(usize, OverlayKind, fetch::OverlayRenderRequest)> =
-            Vec::new();
+        let mut overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)> = Vec::new();
 
         for action in actions {
             if let GuiAction::RenderOverlay {
@@ -2370,15 +2368,12 @@ impl App {
                 // wants — the renderer's overdraw margin is a rasterization
                 // concern and would over-fetch if it leaked into the request.
                 self.last_viewport = Some(geo_bounds);
-                // b2→b3 bridge: the action carries the open LayerId; the
-                // dispatch match below still speaks the enum until b3
-                // rewrites it. Render actions are only ever emitted for
-                // registered handlers (the emitting loop walks the
-                // registry), so an unmapped id here is a bug, not a state.
-                let Some(overlay_kind) = OverlayKind::from_id(&overlay_kind) else {
-                    log::warn!("RenderOverlay for unregistered id {overlay_kind:?}; dropped");
-                    continue;
-                };
+                // The action's id travels all the way to the dispatch: there
+                // is nothing between here and `spawn_overlay_render` that
+                // needs to know the layer by anything but its id, so an id
+                // no handler is registered for is not dropped on the way —
+                // it reaches the dispatch's own unregistered arm, which
+                // clears the marks it set.
                 overlay_renders.push((
                     pane_idx,
                     overlay_kind,
@@ -2402,15 +2397,15 @@ impl App {
             // its own.
             let should_group = self.gui.overlay_renders_groupable();
             let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
-            for (pane_indices, kind, req) in grouped {
+            for (pane_indices, id, req) in grouped {
                 if should_group {
                     log::debug!(
-                        "Spawning overlay render for {:?} targeting {} panes",
-                        kind,
+                        "Spawning overlay render for {} targeting {} panes",
+                        id.as_str(),
                         pane_indices.len()
                     );
                 }
-                self.spawn_overlay_render(pane_indices, kind, req);
+                self.spawn_overlay_render(pane_indices, id, req);
             }
         }
     }
@@ -3722,37 +3717,30 @@ impl App {
 /// and height cannot disagree about it — keying on it would only add a field that is
 /// always equal when the rest are.
 fn deduplicate_overlay_renders(
-    overlay_renders: Vec<(
-        usize,
-        rustdar_overlays::render::overlay_state::OverlayKind,
-        fetch::OverlayRenderRequest,
-    )>,
+    overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)>,
     should_group: bool,
-) -> Vec<(
-    Vec<usize>,
-    rustdar_overlays::render::overlay_state::OverlayKind,
-    fetch::OverlayRenderRequest,
-)> {
-    use rustdar_overlays::render::overlay_state::OverlayKind;
-
+) -> Vec<(Vec<usize>, LayerId, fetch::OverlayRenderRequest)> {
     if !should_group {
         return overlay_renders
             .into_iter()
-            .map(|(pane_idx, kind, req)| (vec![pane_idx], kind, req))
+            .map(|(pane_idx, id, req)| (vec![pane_idx], id, req))
             .collect();
     }
 
     struct GroupedRender {
-        kind: OverlayKind,
+        id: LayerId,
         req: fetch::OverlayRenderRequest,
         pane_indices: Vec<usize>,
     }
 
-    let mut grouped: HashMap<(OverlayKind, i32, u64, u32, u32), GroupedRender> = HashMap::new();
+    // The id is cloned into the key beside the group it names — a
+    // `Cow::Borrowed` clone is a pointer copy, and both halves are needed:
+    // the key to hash on and the group to hand back to the dispatch.
+    let mut grouped: HashMap<(LayerId, i32, u64, u32, u32), GroupedRender> = HashMap::new();
 
-    for (pane_idx, kind, req) in overlay_renders {
+    for (pane_idx, id, req) in overlay_renders {
         let key = (
-            kind,
+            id.clone(),
             req.zoom,
             req.data_generation,
             req.texture.width,
@@ -3766,7 +3754,7 @@ fn deduplicate_overlay_renders(
                 }
             })
             .or_insert_with(|| GroupedRender {
-                kind,
+                id,
                 req,
                 pane_indices: vec![pane_idx],
             });
@@ -3774,7 +3762,7 @@ fn deduplicate_overlay_renders(
 
     grouped
         .into_values()
-        .map(|g| (g.pane_indices, g.kind, g.req))
+        .map(|g| (g.pane_indices, g.id, g.req))
         .collect()
 }
 
