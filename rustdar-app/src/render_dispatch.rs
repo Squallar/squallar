@@ -662,6 +662,94 @@ pub struct RenderDispatcher {
     /// per-frame dispatch would not merely be wasteful but would queue behind
     /// itself.
     section_input: Option<SectionInput>,
+    /// Plan-view extraction payloads, populated at **volume arrival** for the
+    /// panes currently showing the site (their current product + elevation
+    /// only — AF2: never all products, never unshown panes) and read back by
+    /// [`spawn_level2_render`](Self::spawn_level2_render)'s dispatch (WO-E4.9).
+    ///
+    /// The payload is cached **unstamped**: the four `.with_*` stamps consume
+    /// `self` and are applied at dispatch on a clone, because the melting
+    /// layer and the RPG motion arrive asynchronously minutes after the
+    /// volume — a pre-stamped cache would go stale the moment they land,
+    /// while an unstamped one is exactly what those re-renders hit instead
+    /// of paying the extraction walk again on the frame thread.
+    ///
+    /// A miss falls back to the inline extraction — today's path, byte for
+    /// byte — so nothing here can make a render fail that used to succeed.
+    /// Bounded at [`EXTRACT_CACHE_CAP`] entries LRU; entries die with their
+    /// volume (the same eviction pass as the derive memo) and with each new
+    /// arrival for their site, which is what keeps a live volume's sealed
+    /// sweeps from being served out of the sweep before.
+    extract_cache: HashMap<ExtractKey, Arc<rustdar_radar::render_input::RenderInput>>,
+    /// The recency queue of `extract_cache`, oldest first — the same private
+    /// pairing [`RenderCache`] keeps, for the same reason.
+    extract_recency: VecDeque<ExtractKey>,
+    /// The dispatcher-local mpsc the native arrival-time extractions home
+    /// over (amendment C3: a RenderOrchestrator-local channel, NOT a
+    /// ChannelHub pair — the FRAME_PUMP row that drains it registers with
+    /// `drains: []`, an order-riding non-hub drain).
+    // On wasm the arrival drain populates inline and nothing sends — the
+    // pair still exists there so the pump row's drain has one shape on both
+    // targets (the cfg split selects the executor, not the machinery).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    extract_results_tx: std::sync::mpsc::Sender<ExtractResult>,
+    extract_results_rx: std::sync::mpsc::Receiver<ExtractResult>,
+    /// Frame-thread plan-view extractions performed at dispatch — the
+    /// frame-thread-payment probe for the plan view path, the sibling of
+    /// `App::volume_extractions` (which counts the whole-volume walks). A
+    /// cache hit performs zero; a miss exactly one.
+    #[cfg(test)]
+    pub(crate) plan_view_extractions: std::cell::Cell<u32>,
+}
+
+/// The identity of one plan-view extraction — **today's tuple, exactly the
+/// arguments [`rustdar_radar::render_input::RenderInput::extract`] takes**
+/// (the RenderKey re-key lands with E5/Phase 4; this is deliberately not a
+/// new identity). The site stands for the `(lat, lon)` pair the extraction
+/// reads; the float components are keyed by bits so the key is `Eq + Hash`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ExtractKey {
+    pub(crate) site: String,
+    pub(crate) volume_start: chrono::NaiveDateTime,
+    pub(crate) product: RadarProduct,
+    pub(crate) elevation_bits: u32,
+    pub(crate) storm_motion_bits: Option<(u32, u32)>,
+    pub(crate) env_heights_bits: Option<(u64, u64)>,
+}
+
+/// One homed arrival-time extraction: the key it was computed under and the
+/// unstamped payload (the four stamps are applied at dispatch — see
+/// `extract_cache`'s field doc).
+pub(crate) type ExtractResult = (ExtractKey, Arc<rustdar_radar::render_input::RenderInput>);
+
+/// The extract tuple the arrival hook and the dispatch share: the cache key
+/// plus the two extraction arguments its float bits came from.
+pub(crate) type ExtractTuple = (ExtractKey, Option<(f32, f32)>, Option<(f64, f64)>);
+
+/// At most this many extraction payloads stay resident (WO-E4.9's cap 8):
+/// one per pane a desktop split can show, roughly, and each is one sweep's
+/// gates rather than a volume — small beside the render cache it feeds.
+const EXTRACT_CACHE_CAP: usize = 8;
+
+/// The one place an [`ExtractKey`] is built, so the arrival-time populate and
+/// the dispatch lookup cannot key the same tuple two ways — the same
+/// single-definition argument [`render_cache_key`] makes.
+fn extract_key(
+    site: &str,
+    volume_start: chrono::NaiveDateTime,
+    product: RadarProduct,
+    elevation: f32,
+    storm_motion: Option<(f32, f32)>,
+    env_heights: Option<(f64, f64)>,
+) -> ExtractKey {
+    ExtractKey {
+        site: site.to_string(),
+        volume_start,
+        product,
+        elevation_bits: elevation.to_bits(),
+        storm_motion_bits: storm_motion.map(|(s, d)| (s.to_bits(), d.to_bits())),
+        env_heights_bits: env_heights.map(|(h0, hm20)| (h0.to_bits(), hm20.to_bits())),
+    }
 }
 
 /// One site's `N0M` object **and the volume start it names**.
@@ -918,6 +1006,9 @@ impl RenderDispatcher {
     /// parameters: this workspace runs `cargo test` on exactly one of three
     /// arms, and a budget read inline is a budget checkable on one row.
     pub fn with_budgets(budgets: &Budgets) -> Self {
+        // The extract-results pair is dispatcher-local by amendment C3: it is
+        // not a ChannelHub channel and never becomes one.
+        let (extract_results_tx, extract_results_rx) = std::sync::mpsc::channel();
         Self {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
@@ -937,6 +1028,12 @@ impl RenderDispatcher {
             last_storm_motion_override: None,
             last_srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             section_input: None,
+            extract_cache: HashMap::new(),
+            extract_recency: VecDeque::new(),
+            extract_results_tx,
+            extract_results_rx,
+            #[cfg(test)]
+            plan_view_extractions: std::cell::Cell::new(0),
         }
     }
 
@@ -1901,16 +1998,15 @@ impl RenderDispatcher {
         // reads, not passed by the caller — `dispatch_pane_renders` has no
         // test callers, so an argument it merely forwarded would be untested
         // by construction (the lesson the old Level III path's
-        // `storm_motion_for` note recorded).
-        let storm_motion = (product == RadarProduct::StormRelativeVelocity)
-            .then(|| self.storm_motion_override_kt())
-            .flatten();
-        // The environmental heights ride the same way for the hail pair and
-        // the classification, read from the field `set_env_heights`
-        // invalidates on. A missing or stale-kept entry means the product
-        // runs on its adaptation defaults, which is the documented
-        // no-sounding behavior, not an error.
-        let env_heights = self.env_heights_km_msl_for(product, site);
+        // `storm_motion_for` note recorded). The environmental heights ride
+        // the same way for the hail pair and the classification, read from
+        // the field `set_env_heights` invalidates on; a missing or stale-kept
+        // entry means the product runs on its adaptation defaults, which is
+        // the documented no-sounding behavior, not an error. Both reads live
+        // in `extract_tuple_for` since WO-E4.9, so this dispatch and the
+        // arrival-time populate cannot read the pair differently.
+        let (key, storm_motion, env_heights) =
+            self.extract_tuple_for(site, volume_start, product, elevation);
         // And the RPG's own melting layer for **this** volume, for the one
         // product that classifies. `volume_start` is a parameter and not a
         // field read because the dispatcher genuinely does not know which
@@ -1939,15 +2035,33 @@ impl RenderDispatcher {
         // renderer would have answered — so the job is dispatched anyway and
         // answers nothing, leaving the in-flight bookkeeping to unwind the way
         // a failed render always has.
-        let job = match rustdar_radar::render_input::RenderInput::extract(
-            &data,
-            elevation,
-            product,
-            lat,
-            lon,
-            storm_motion,
-            env_heights,
-        ) {
+        //
+        // Since WO-E4.9 the extraction is served from `extract_cache` when the
+        // volume's arrival populated this exact tuple — a hit is zero
+        // frame-thread extraction, and the four stamps below are applied at
+        // dispatch either way (clone-then-stamp: the melting layer and the
+        // RPG motion arrive asynchronously, and a pre-stamped cache would go
+        // stale the moment they land). A miss IS today's path, unchanged.
+        let cached = self
+            .extract_cache_lookup(&key)
+            .map(|input| (*input).clone());
+        #[cfg(test)]
+        if cached.is_none() {
+            self.plan_view_extractions
+                .set(self.plan_view_extractions.get() + 1);
+        }
+        let extracted = cached.or_else(|| {
+            rustdar_radar::render_input::RenderInput::extract(
+                &data,
+                elevation,
+                product,
+                lat,
+                lon,
+                storm_motion,
+                env_heights,
+            )
+        });
+        let job = match extracted {
             Some(input) => {
                 rustdar_worker::offload::Job::Described(
                     rustdar_worker::offload::JobRequest::describe(
@@ -1989,6 +2103,125 @@ impl RenderDispatcher {
             None => rustdar_worker::offload::Job::renders_nothing(),
         };
         self.spawn_render(pane_idx, site, product, elevation, sender, window, job);
+    }
+
+    /// The extract tuple a pane's arrival-time populate must build — **the
+    /// same reads the dispatch above makes**, off the same fields, so the key
+    /// written at arrival is the key looked up at dispatch. Returns the key
+    /// plus the two extraction arguments the key's bits came from.
+    pub(crate) fn extract_tuple_for(
+        &self,
+        site: &str,
+        volume_start: chrono::NaiveDateTime,
+        product: RadarProduct,
+        elevation: f32,
+    ) -> ExtractTuple {
+        let storm_motion = (product == RadarProduct::StormRelativeVelocity)
+            .then(|| self.storm_motion_override_kt())
+            .flatten();
+        let env_heights = self.env_heights_km_msl_for(product, site);
+        (
+            extract_key(
+                site,
+                volume_start,
+                product,
+                elevation,
+                storm_motion,
+                env_heights,
+            ),
+            storm_motion,
+            env_heights,
+        )
+    }
+
+    /// The cached extraction for `key`, marked most-recently-used.
+    fn extract_cache_lookup(
+        &mut self,
+        key: &ExtractKey,
+    ) -> Option<Arc<rustdar_radar::render_input::RenderInput>> {
+        if !self.extract_cache.contains_key(key) {
+            return None;
+        }
+        if let Some(pos) = self.extract_recency.iter().position(|k| k == key) {
+            let k = self
+                .extract_recency
+                .remove(pos)
+                .expect("position() just yielded it");
+            self.extract_recency.push_back(k);
+        }
+        self.extract_cache.get(key).map(Arc::clone)
+    }
+
+    /// File an arrival-time extraction under its key, evicting the least
+    /// recently used past [`EXTRACT_CACHE_CAP`]. The wasm arrival drain calls
+    /// this inline; the native results channel drains into it through
+    /// [`poll_extract_results`](Self::poll_extract_results).
+    pub(crate) fn populate_extract(
+        &mut self,
+        key: ExtractKey,
+        input: Arc<rustdar_radar::render_input::RenderInput>,
+    ) {
+        if self.extract_cache.insert(key.clone(), input).is_none() {
+            self.extract_recency.push_back(key);
+        } else if let Some(pos) = self.extract_recency.iter().position(|k| k == &key) {
+            let k = self
+                .extract_recency
+                .remove(pos)
+                .expect("position() just yielded it");
+            self.extract_recency.push_back(k);
+        }
+        while self.extract_cache.len() > EXTRACT_CACHE_CAP {
+            let Some(oldest) = self.extract_recency.pop_front() else {
+                break;
+            };
+            self.extract_cache.remove(&oldest);
+        }
+    }
+
+    /// Drain the extract-results channel into the cache — the body of the
+    /// `poll_extract_results` FRAME_PUMP row (Apply phase, `drains: []` per
+    /// amendment C3: this is a dispatcher-local mpsc, not a hub channel).
+    /// Positioned in Apply so an extraction that homed between frames serves
+    /// the same frame's dispatch.
+    pub(crate) fn poll_extract_results(&mut self) {
+        while let Ok((key, input)) = self.extract_results_rx.try_recv() {
+            self.populate_extract(key, input);
+        }
+    }
+
+    /// The sender the native arrival-time extraction homes over, cloned per
+    /// spawned walk. Unused on wasm, where the arrival drain populates
+    /// inline — see the `extract_results_tx` field note.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn extract_sender(&self) -> std::sync::mpsc::Sender<ExtractResult> {
+        self.extract_results_tx.clone()
+    }
+
+    /// Drop every cached extraction that fails `keep` — the volume-eviction
+    /// pass's hook (entries die with their volume, the same pass the derive
+    /// memo prunes under) and the arrival hook's site-wide invalidation.
+    pub(crate) fn retain_extracts(&mut self, keep: impl Fn(&ExtractKey) -> bool) {
+        self.extract_cache.retain(|k, _| keep(k));
+        self.extract_recency.retain(|k| keep(k));
+    }
+
+    /// How many extractions are resident — the populate tests' observable.
+    #[cfg(test)]
+    pub(crate) fn extract_cache_len(&self) -> usize {
+        debug_assert_eq!(
+            self.extract_cache.len(),
+            self.extract_recency.len(),
+            "extract recency queue out of step"
+        );
+        self.extract_cache.len()
+    }
+
+    /// The sites of the resident extractions — the shown-panes-only proof.
+    #[cfg(test)]
+    pub(crate) fn extract_cache_sites(&self) -> Vec<String> {
+        let mut sites: Vec<String> = self.extract_cache.keys().map(|k| k.site.clone()).collect();
+        sites.sort();
+        sites
     }
 
     /// The storm motion vector the cached section payload will be **derived**

@@ -188,6 +188,18 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &["loop_section_receiver"],
         run: super::render::pump_poll_loop_section_results,
     },
+    // The arrival-time extraction results (WO-E4.9). `drains: []` by
+    // amendment C3: the channel is a RenderDispatcher-local mpsc, not a
+    // ChannelHub pair — an order-riding non-hub drain like drive_chunk_feeds
+    // and publish_base_volumes. Last of the Apply rows and before every
+    // Dispatch row, so an extraction that homed between frames is in the
+    // cache before this frame's dispatch asks for it.
+    DrainEntry {
+        name: "poll_extract_results",
+        phase: PumpPhase::Apply,
+        drains: &[],
+        run: super::render::pump_poll_extract_results,
+    },
     // Results-apply before advance: a frame's last result is IN the frame
     // that advances onto it.
     DrainEntry {

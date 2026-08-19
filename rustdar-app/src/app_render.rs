@@ -386,11 +386,15 @@ impl super::App {
                 storm_motion: rendered.storm_motion,
             };
 
-            // Cache the render output for sharing with other panes on the same site
-            let origin_site = self
+            // Cache the render output for sharing with other panes on the same site.
+            // One pane read serves both the site and the is-it-still-a-map
+            // question asked below — `pane_has_no_plan_view` is exactly
+            // `!is_map()` of an existing pane, and `origin_pane` was bounds-
+            // checked against `pane_count` above, so the two spellings agree.
+            let (origin_site, origin_draws_plan) = self
                 .gui
                 .pane(origin_pane)
-                .map(|p| p.site.clone())
+                .map(|p| (p.site.clone(), p.is_map()))
                 .unwrap_or_default();
             // `RenderView::PlanView` because this is the plan-view path and
             // only the plan-view path: `dispatch_pane_renders` starts no render
@@ -420,7 +424,7 @@ impl super::App {
             // a pane that draws none. `render_in_flight` was already cleared
             // above, and `last_rendered` stays unset, so converting back
             // re-dispatches.
-            if !self.gui.pane_has_no_plan_view(origin_pane) {
+            if origin_draws_plan {
                 self.apply_render_to_pane(ctx, origin_pane, &render_result, &mut uploads);
             }
 
@@ -440,19 +444,18 @@ impl super::App {
                 if other_idx == origin_pane {
                     continue;
                 }
-                if self.gui.pane_has_no_plan_view(other_idx) {
+                // One pane read for the three questions this loop used to ask
+                // through three accessors (`pane_has_no_plan_view`, the site
+                // match, `get_rendering_params_for_pane` — each a projection
+                // of this same pane). A missing pane fails the site match
+                // either way: nothing is applied to it.
+                let Some(other) = self.gui.pane(other_idx) else {
+                    continue;
+                };
+                if !other.is_map() || other.site != origin_site {
                     continue;
                 }
-                let matches_site = self
-                    .gui
-                    .pane(other_idx)
-                    .is_some_and(|p| p.site == origin_site);
-                if !matches_site {
-                    continue;
-                }
-                let Some((other_product, other_elevation)) =
-                    self.gui.get_rendering_params_for_pane(other_idx)
-                else {
+                let Some((other_product, other_elevation)) = other.get_rendering_params() else {
                     continue;
                 };
                 if other_product == render_result.product
@@ -1414,6 +1417,112 @@ impl super::App {
             }
         }
         true
+    }
+
+    /// Move `RenderInput::extract` to volume arrival for `site` (WO-E4.9):
+    /// drop the site's now-stale cached extractions, then rebuild one payload
+    /// per pane **currently showing the site** — its current product and
+    /// elevation only, never the product registry, never an unshown pane
+    /// (AF2) — so the following dispatches serve the walk from the cache
+    /// instead of paying it on the frame thread.
+    ///
+    /// Called from every drain that installs a volume for display: the
+    /// archive scan drain and both arms of the chunk drain. (`JumpToLive`
+    /// installs a volume the app already held; its next dispatch takes the
+    /// miss fallback — today's inline extract — which is the deliberate shape
+    /// of every miss.)
+    ///
+    /// # The invalidation must come first
+    ///
+    /// A live volume keeps its `volume_start` while sweeps seal, so a cached
+    /// entry from the previous seal state carries the same key as this
+    /// arrival's — serving it would under-draw the newly sealed sweep with no
+    /// error anywhere (the silent-partial-success shape). Dropping the site's
+    /// entries before the async rebuild means the window between arrival and
+    /// the extraction homing is covered by the miss fallback, never by a
+    /// stale hit.
+    ///
+    /// # The cfg split selects the executor, not the behavior
+    ///
+    /// Native runs the walk off-thread (`spawn_blocking`) and homes the
+    /// result over the dispatcher-local channel the `poll_extract_results`
+    /// pump row drains (amendment C3). wasm has one thread — the win there is
+    /// arrival-time-not-gesture-time, at the measured 0.7–2.4 ms per tuple —
+    /// so it runs the same walk inline and files it directly.
+    pub(super) fn refresh_extract_cache_for_site(&mut self, site: &str) {
+        self.render.retain_extracts(|key| key.site != site);
+        for pane_idx in 0..self.gui.pane_count() {
+            // One pane read, projected locally — `pane_has_no_plan_view`,
+            // `get_rendering_params_for_pane` and `get_scan_info_for_pane`
+            // are these exact projections of the same pane (ui.rs), spelled
+            // off the one borrow here because the gui-seam ratchet holds
+            // this file's coupling count and an arrival hook must not grow
+            // it. A missing pane populates nothing either way.
+            let Some(pane) = self.gui.pane(pane_idx) else {
+                continue;
+            };
+            if !pane.is_map() || pane.site != site {
+                continue;
+            }
+            let Some((product, elevation)) = pane.get_rendering_params() else {
+                continue;
+            };
+            // Level III renders from fetched objects, not from the volume —
+            // there is no extraction to move.
+            if product.is_level3() {
+                continue;
+            }
+            let Some(scan_info) = pane.scan_info.as_ref() else {
+                continue;
+            };
+            // The same stores and the same names the dispatch reads: the key
+            // is the pane's site, the volume is looked up under the
+            // scan_info's, and the coordinates are the scan_info's.
+            let Some((data, _declared)) = self.scan_data.get(scan_info.site.name) else {
+                continue;
+            };
+            let data = std::sync::Arc::clone(data);
+            let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
+            let (key, storm_motion, env_heights) =
+                self.render
+                    .extract_tuple_for(site, scan_info.timestamp, product, elevation);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let sender = self.render.extract_sender();
+                let window = self.window.clone();
+                self.tokio_runtime.spawn_blocking(move || {
+                    if let Some(input) = rustdar_radar::render_input::RenderInput::extract(
+                        &data,
+                        elevation,
+                        product,
+                        lat,
+                        lon,
+                        storm_motion,
+                        env_heights,
+                    ) {
+                        let _ = sender.send((key, std::sync::Arc::new(input)));
+                        // Wake the pump so the Apply row drains this before
+                        // the next dispatch rather than on some later event.
+                        crate::app::notify_redraw(&window);
+                    }
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(input) = rustdar_radar::render_input::RenderInput::extract(
+                    &data,
+                    elevation,
+                    product,
+                    lat,
+                    lon,
+                    storm_motion,
+                    env_heights,
+                ) {
+                    self.render
+                        .populate_extract(key, std::sync::Arc::new(input));
+                }
+            }
+        }
     }
 
     /// Check all panes for needed background renders and spawn render threads.
@@ -5103,6 +5212,14 @@ mod stamping_tests;
 #[cfg(test)]
 mod one_render_per_sweep_tests;
 
+/// The arrival-time extraction cache (WO-E4.9): a volume's arrival performs
+/// the plan-view `RenderInput::extract` walks off-thread for the panes
+/// showing the site, and the dispatch serves them from the cache — zero
+/// frame-thread extraction on a hit, today's inline walk on a miss.
+#[path = "app_render/extract_cache_tests.rs"]
+#[cfg(test)]
+mod extract_cache_tests;
+
 /// The frames between a dispatched overlay render and the layer being switched
 /// off — where a result that cannot be recalled lands on a pane that no longer
 /// wants it.
@@ -5176,6 +5293,10 @@ pub(super) fn pump_poll_loop_section_results(app: &mut super::App, ctx: Option<&
 
 pub(super) fn pump_advance_loop_playback(app: &mut super::App, _ctx: Option<&egui::Context>) {
     app.advance_loop_playback();
+}
+
+pub(super) fn pump_poll_extract_results(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.render.poll_extract_results();
 }
 
 pub(super) fn pump_dispatch_pane_renders(app: &mut super::App, ctx: Option<&egui::Context>) {

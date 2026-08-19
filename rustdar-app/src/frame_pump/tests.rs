@@ -268,10 +268,10 @@ fn the_channel_hub_only_ever_shrinks() {
 ///
 /// A literal rather than anything derived, because the table IS the order:
 /// deriving the expectation from the code under test would make this the
-/// checker that agrees with whatever it checks. WO-E4.9 extends this to 22
-/// rows (its extract-results drain is an orchestrator-local mpsc, not a
-/// hub pair, and registers with `drains: &[]`); the hub list above stays
-/// at 18 through that land.
+/// checker that agrees with whatever it checks. WO-E4.9 extended this to 22
+/// rows as planned (its extract-results drain is a dispatcher-local mpsc,
+/// not a hub pair, and registers with `drains: &[]` — amendment C3); the
+/// hub list above stays at 18.
 const EXPECTED_ROWS: &[(&str, PumpPhase)] = &[
     ("poll_scan_results", PumpPhase::Ingest),
     ("poll_chunk_results", PumpPhase::Ingest),
@@ -290,6 +290,7 @@ const EXPECTED_ROWS: &[(&str, PumpPhase)] = &[
     ("poll_loop_l3_fetch_results", PumpPhase::Apply),
     ("poll_loop_render_results", PumpPhase::Apply),
     ("poll_loop_section_results", PumpPhase::Apply),
+    ("poll_extract_results", PumpPhase::Apply),
     ("advance_loop_playback", PumpPhase::Advance),
     ("dispatch_pane_renders", PumpPhase::Dispatch),
     ("dispatch_section_renders", PumpPhase::Dispatch),
