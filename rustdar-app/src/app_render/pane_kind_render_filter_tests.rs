@@ -138,6 +138,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
             elevation: TILT,
             generation: app.render.render_generation,
             pane_idx,
+            speculative_for: None,
         })
         .expect("the receiver lives on the App");
     app.poll_render_results(&egui::Context::default());

@@ -15,6 +15,21 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+/// What a speculative dispatch needs from the delivered result's own pane
+/// (WO-E4.10) — copied OUT of `poll_render_results`' one origin-pane read,
+/// because the borrow cannot span the apply calls and the hook must not
+/// re-read state its caller already read.
+struct SpeculationInputs {
+    volume_start: chrono::NaiveDateTime,
+    lat: f64,
+    lon: f64,
+    /// The name the volume is stored under — `ScanInfo::site` is the table's
+    /// row, so the name is the table's own `&'static str`.
+    scan_site: &'static str,
+    /// The pane's tilt ladder for the delivered product, if it has one.
+    ladder: Option<Vec<f32>>,
+}
+
 /// What the swapchain had for us this frame.
 pub(crate) enum SurfaceStatus {
     /// A texture to draw into.
@@ -338,6 +353,33 @@ impl super::App {
         // is what stops each of them turning it into 16 MiB of its own VRAM.
         let mut uploads = PlanViewUploads::default();
         while let Ok(rr) = self.channels.render_receiver.try_recv() {
+            // A speculative result (WO-E4.10) before any pane bookkeeping:
+            // it is pane-less, so its whole delivery is the RenderCache
+            // insert and the bool. The bool clears UNCONDITIONALLY — before
+            // the staleness gate — because a wedged bool is speculation off
+            // for the session, while a discarded stale raster costs nothing.
+            if let Some(site) = rr.speculative_for {
+                self.render.speculative_finished();
+                if !self.render.is_render_stale(rr.generation)
+                    && let Some(rendered) = rr.rendered
+                {
+                    self.render.cache_render(
+                        &site,
+                        rr.product,
+                        rustdar_radar::types::RenderView::PlanView,
+                        rr.elevation,
+                        crate::render_dispatch::CachedRenderOutput {
+                            image: rendered.image,
+                            max_range_km: rendered.max_range_km,
+                            hover: rendered.hover,
+                            nyquist_ms: rendered.nyquist_ms,
+                            melting_layer_source: rendered.melting_layer_source,
+                            storm_motion: rendered.storm_motion,
+                        },
+                    );
+                }
+                continue;
+            }
             if rr.pane_idx < self.render.pane_render.len() {
                 // Unconditionally, and before every gate below: a result that
                 // is stale, or for a pane that has since stopped drawing a plan
@@ -391,10 +433,27 @@ impl super::App {
             // question asked below — `pane_has_no_plan_view` is exactly
             // `!is_map()` of an existing pane, and `origin_pane` was bounds-
             // checked against `pane_count` above, so the two spellings agree.
-            let (origin_site, origin_draws_plan) = self
+            // The same read also carries out what a speculative dispatch
+            // would need (WO-E4.10) — owned, because the borrow cannot span
+            // the `apply_render_to_pane` calls below — so the speculation
+            // hook re-reads nothing: one pane read per delivered result.
+            let (origin_site, origin_draws_plan, speculate_from) = self
                 .gui
                 .pane(origin_pane)
-                .map(|p| (p.site.clone(), p.is_map()))
+                .map(|p| {
+                    let inputs = p
+                        .is_map()
+                        .then_some(p.scan_info.as_ref())
+                        .flatten()
+                        .map(|si| SpeculationInputs {
+                            volume_start: si.timestamp,
+                            lat: si.site.lat,
+                            lon: si.site.lon,
+                            scan_site: si.site.name,
+                            ladder: si.product_elevations.get(&rr.product).cloned(),
+                        });
+                    (p.site.clone(), p.is_map(), inputs)
+                })
                 .unwrap_or_default();
             // `RenderView::PlanView` because this is the plan-view path and
             // only the plan-view path: `dispatch_pane_renders` starts no render
@@ -474,7 +533,112 @@ impl super::App {
                     }
                 }
             }
+
+            // A static plan view just DELIVERED — the WO-E4.10 moment: with
+            // the machine idle and the budget wide, pre-render the adjacent
+            // tilt into the RenderCache so the user's next tilt-step is a
+            // cache hit instead of a render round-trip.
+            if let Some(inputs) = speculate_from {
+                self.maybe_spawn_speculative_render(
+                    &origin_site,
+                    render_result.product,
+                    render_result.elevation,
+                    inputs,
+                );
+            }
         }
+    }
+
+    /// Dispatch ONE adjacent-tilt pre-render after a delivered static plan
+    /// view (WO-E4.10), when ALL of: not wasm and the budget is wide
+    /// ([`crate::render_dispatch::speculative_render_allowed`] — desktop 6 /
+    /// mobile 3 qualify, wasm's 1 never, AF8); **no interactive render in
+    /// flight** (both the pane flags and the shared thread counter read
+    /// quiet — the counter covers section, loop and voxel work the pane
+    /// flags cannot see); and no speculative already out. "No interactive in
+    /// flight + one at a time" IS the whole policy — never widened to
+    /// fill-all-idle-lanes.
+    ///
+    /// The target is the nearest tilt above the delivered one in the pane's
+    /// own ladder, else the nearest below; a target already resident in the
+    /// RenderCache dispatches nothing (it IS the pre-render's goal state).
+    /// Refusals take nothing and mark nothing — the next delivery asks again.
+    ///
+    /// `inputs` came out of the caller's own origin-pane read — this hook
+    /// deliberately reads no pane state of its own.
+    fn maybe_spawn_speculative_render(
+        &mut self,
+        site: &str,
+        product: rustdar_radar::types::RadarProduct,
+        delivered_elevation: f32,
+        inputs: SpeculationInputs,
+    ) {
+        if !crate::render_dispatch::speculative_render_allowed(
+            super::WEB,
+            self.render.concurrent_renders(),
+        ) {
+            return;
+        }
+        if self.render.speculative_in_flight()
+            || self.render.any_render_in_flight()
+            || self
+                .render
+                .renders_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+        {
+            return;
+        }
+        // Level III panes render from fetched objects, not from the volume —
+        // there is no Level II job to speculate.
+        if product.is_level3() {
+            return;
+        }
+        let Some(ladder) = inputs.ladder else {
+            return;
+        };
+        let above = ladder
+            .iter()
+            .copied()
+            .filter(|e| *e > delivered_elevation + ELEVATION_TOLERANCE)
+            .min_by(|a, b| a.total_cmp(b));
+        let below = ladder
+            .iter()
+            .copied()
+            .filter(|e| *e < delivered_elevation - ELEVATION_TOLERANCE)
+            .max_by(|a, b| a.total_cmp(b));
+        let Some(target) = above.or(below) else {
+            return;
+        };
+        // Already resident: the goal state — nothing to pre-render.
+        if self
+            .render
+            .get_cached_render(
+                site,
+                product,
+                rustdar_radar::types::RenderView::PlanView,
+                target,
+            )
+            .is_some()
+        {
+            return;
+        }
+        let Some((data, declared)) = self.scan_data.get(inputs.scan_site) else {
+            return;
+        };
+        let (data, declared) = (std::sync::Arc::clone(data), std::sync::Arc::clone(declared));
+        self.render.spawn_speculative_render(
+            site,
+            product,
+            target,
+            inputs.volume_start,
+            inputs.lat,
+            inputs.lon,
+            data,
+            &declared,
+            self.channels.render_sender.clone(),
+            self.window.clone(),
+        );
     }
 
     /// Apply a rendered radar image to a specific pane (upload texture to overlay cache).
@@ -1555,12 +1719,16 @@ impl super::App {
                     .unwrap_or(true);
 
                 if needs_render && !prs.render_in_flight() {
-                    // Get the pane's site for cache lookups
-                    let pane_site = self
-                        .gui
-                        .pane(pane_idx)
-                        .map(|p| p.site.clone())
-                        .unwrap_or_default();
+                    // One pane read serves the site AND the scan_info below —
+                    // `get_scan_info_for_pane` is this pane's own projection
+                    // (ui.rs), and the gui-seam ratchet holds this crate's
+                    // coupling count. A missing pane dispatched nothing
+                    // before (empty site, no scan_info) and dispatches
+                    // nothing now.
+                    let Some(pane) = self.gui.pane(pane_idx) else {
+                        continue;
+                    };
+                    let pane_site = pane.site.clone();
 
                     // Check if another pane already rendered this site+product+elevation
                     // Plan view, and only plan view — see the matching
@@ -1620,7 +1788,7 @@ impl super::App {
                         continue;
                     }
 
-                    let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                    let Some(scan_info) = pane.scan_info.as_ref() else {
                         continue;
                     };
 
@@ -5219,6 +5387,13 @@ mod one_render_per_sweep_tests;
 #[path = "app_render/extract_cache_tests.rs"]
 #[cfg(test)]
 mod extract_cache_tests;
+
+/// The adjacent-tilt pre-render (WO-E4.10): one speculative render after a
+/// delivered plan view, into the existing RenderCache, gated off wasm and
+/// small budgets — never marking a pane, never more than one at a time.
+#[path = "app_render/speculative_render_tests.rs"]
+#[cfg(test)]
+mod speculative_render_tests;
 
 /// The frames between a dispatched overlay render and the layer being switched
 /// off — where a result that cannot be recalled lands on a pane that no longer
