@@ -36,7 +36,7 @@ use rustdar_kv::{KvStore, MemoryKvStore};
 
 /// The layer switched off in most of these — a texture-mode overlay that is on
 /// by default, so the fixture below starts from the state a real pane is in.
-const KIND: OverlayKind = OverlayKind::NwsAlerts;
+const KIND: rustdar_source::id::LayerId = rustdar_source::id::known::NWS_ALERTS;
 
 /// Pixel dimensions for the fixture textures. Small on purpose: what is under
 /// test is which cache entries survive, and the numbers only have to be
@@ -89,7 +89,7 @@ fn plan() -> OverlayTexturePlan {
 /// A texture parked in `kind`'s cache on `pane`, described so that a
 /// `needs_rerender` asked with [`plan`], [`viewport`] and [`ZOOM`] answers
 /// `false` — i.e. a cache that is *satisfied*.
-fn park_texture(ctx: &egui::Context, pane: &mut PaneState, kind: OverlayKind) {
+fn park_texture(ctx: &egui::Context, pane: &mut PaneState, kind: &rustdar_source::id::LayerId) {
     let image = egui::ColorImage::from_rgba_unmultiplied(
         [W as usize, H as usize],
         &vec![255u8; (W * H) as usize * 4],
@@ -111,7 +111,7 @@ fn park_texture(ctx: &egui::Context, pane: &mut PaneState, kind: OverlayKind) {
 }
 
 /// Whether `kind`'s cache on `pane` is holding pixels.
-fn has_texture(pane: &PaneState, kind: OverlayKind) -> bool {
+fn has_texture(pane: &PaneState, kind: &rustdar_source::id::LayerId) -> bool {
     pane.overlay_cache(kind)
         .and_then(OverlayTextureCache::current)
         .is_some()
@@ -126,9 +126,13 @@ fn has_texture(pane: &PaneState, kind: OverlayKind) -> bool {
 /// because it is still switched on. A fixture parking only the alerts texture
 /// could not tell "released the right one" from "released everything".
 fn park_three(ctx: &egui::Context, pane: &mut PaneState) {
-    for kind in [KIND, OverlayKind::Radar, OverlayKind::CityLabels] {
-        pane.set_overlay_enabled(kind, true);
-        park_texture(ctx, pane, kind);
+    for kind in [
+        KIND,
+        rustdar_source::id::known::RADAR,
+        rustdar_source::id::known::CITY_LABELS,
+    ] {
+        pane.set_overlay_enabled(kind.clone(), true);
+        park_texture(ctx, pane, &kind);
     }
 }
 
@@ -175,7 +179,7 @@ fn skewed_gui(ctx: &egui::Context) -> Gui {
 /// every eye, Show switch, catalog tile and preset routes through.
 fn toggle(gui: &mut Gui, on: bool) {
     let mut pane = std::mem::take(&mut gui.panes[0]);
-    Gui::write_pane_overlay(&mut gui.overlays, &mut pane, KIND, on);
+    Gui::write_pane_overlay(&mut gui.overlays, &mut pane, &KIND, on);
     gui.panes[0] = pane;
 }
 
@@ -190,9 +194,13 @@ fn switching_a_layer_off_releases_its_texture_and_not_the_others() {
     let ctx = egui::Context::default();
     let mut gui = gui_with_parked_textures(&ctx);
 
-    for kind in [KIND, OverlayKind::Radar, OverlayKind::CityLabels] {
+    for kind in [
+        KIND,
+        rustdar_source::id::known::RADAR,
+        rustdar_source::id::known::CITY_LABELS,
+    ] {
         assert!(
-            has_texture(gui.pane(0).expect("pane 0"), kind),
+            has_texture(gui.pane(0).expect("pane 0"), &kind),
             "premise: the fixture must really have parked a {kind:?} texture, \
              or the assertion about it after the toggle is satisfied by an \
              empty start",
@@ -203,19 +211,19 @@ fn switching_a_layer_off_releases_its_texture_and_not_the_others() {
 
     let pane = gui.pane(0).expect("pane 0");
     assert!(
-        !has_texture(pane, KIND),
+        !has_texture(pane, &KIND),
         "a layer switched off is still holding its full-size texture — this is \
          the per-kind, per-pane residency that survived the session",
     );
     assert!(
-        has_texture(pane, OverlayKind::Radar),
+        has_texture(pane, &rustdar_source::id::known::RADAR),
         "the radar raster was released by a layer-stack toggle. Nothing would \
          put it back: `ui_map_pane`'s viewport loop skips `Radar`, and \
          `dispatch_pane_renders` re-renders on a product/tilt/scan key, not on \
          an empty cache — so on a parked time this pane would show empty map",
     );
     assert!(
-        has_texture(pane, OverlayKind::CityLabels),
+        has_texture(pane, &rustdar_source::id::known::CITY_LABELS),
         "switching the alerts layer off released a texture belonging to a layer \
          that is still on: the release has become `clear on every write`",
     );
@@ -240,7 +248,7 @@ fn the_release_leaves_a_render_already_in_flight_marked() {
     let mut gui = gui_with_parked_textures(&ctx);
     gui.pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(KIND)
+        .overlay_cache_mut(&KIND)
         .render_in_flight = true;
 
     toggle(&mut gui, false);
@@ -249,7 +257,7 @@ fn the_release_leaves_a_render_already_in_flight_marked() {
     assert!(
         gui.pane(0)
             .expect("pane 0")
-            .overlay_cache(KIND)
+            .overlay_cache(&KIND)
             .expect("the cache entry survives; only its pixels go")
             .render_in_flight,
         "the release cleared the in-flight mark, so this off/on pair has opened \
@@ -271,7 +279,7 @@ fn re_enabling_asks_for_a_fresh_render() {
     let mut gui = gui_with_parked_textures(&ctx);
 
     {
-        let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(KIND);
+        let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&KIND);
         // Twice, a settle apart: `needs_rerender` records the zoom it was
         // asked about and calls the gesture settled once it has been still
         // for `SETTLE_REPAINT_DELAY`, so the second answer is the settled one
@@ -287,7 +295,7 @@ fn re_enabling_asks_for_a_fresh_render() {
     toggle(&mut gui, false);
     toggle(&mut gui, true);
 
-    let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(KIND);
+    let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&KIND);
     assert!(
         cache.needs_rerender(TOKEN, ZOOM, 101.0, &viewport(), &plan()),
         "a re-enabled layer is not asking for its picture back: the cache is \
@@ -321,7 +329,7 @@ fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
 
     for idx in [1, 2] {
         assert!(
-            has_texture(gui.pane(idx).expect("fixture pane"), KIND),
+            has_texture(gui.pane(idx).expect("fixture pane"), &KIND),
             "premise: pane {idx} must still be holding its own texture here — \
              the toggle above is about pane 0, and if this were already empty \
              the assertion after the fan-out would prove nothing",
@@ -333,21 +341,21 @@ fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
     for idx in [1, 2] {
         let target = gui.pane(idx).expect("fixture pane");
         assert!(
-            !target.is_overlay_enabled(KIND),
+            !target.is_overlay_enabled(&KIND),
             "premise: the fan-out must really have copied the off-switch onto \
              pane {idx}",
         );
         assert!(
-            !has_texture(target, KIND),
+            !has_texture(target, &KIND),
             "pane {idx} adopted the off-switch and kept the texture",
         );
         assert!(
-            has_texture(target, OverlayKind::Radar),
+            has_texture(target, &rustdar_source::id::known::RADAR),
             "the fan-out released pane {idx}'s radar raster",
         );
     }
     assert!(
-        !has_texture(gui.pane(2).expect("pane 2"), KIND),
+        !has_texture(gui.pane(2).expect("pane 2"), &KIND),
         "pane 2 is past `visible_pane_count`, so no frame will ever run \
          `render_pane_map_content` for it — if this release does not empty its \
          cache, nothing in the application will",
@@ -373,7 +381,7 @@ fn a_config_restored_mid_session_releases_what_it_switches_off() {
     let ctx = egui::Context::default();
     let mut gui = gui_with_parked_textures(&ctx);
     assert!(
-        has_texture(gui.pane(0).expect("pane 0"), KIND),
+        has_texture(gui.pane(0).expect("pane 0"), &KIND),
         "premise: the pane must be holding a texture before the restore, or the \
          assertion below is about a cache that was never populated",
     );
@@ -393,18 +401,18 @@ fn a_config_restored_mid_session_releases_what_it_switches_off() {
 
     let pane = gui.pane(0).expect("pane 0");
     assert!(
-        !pane.is_overlay_enabled(KIND),
+        !pane.is_overlay_enabled(&KIND),
         "premise: the restore must really have switched the layer off",
     );
     assert!(
-        !has_texture(pane, KIND),
+        !has_texture(pane, &KIND),
         "a config restored mid-session switched a layer off and left its \
          texture resident. This path can also convert the pane to a \
          cross-section, which `ui_map_pane`'s per-frame clear never runs for \
          again",
     );
     assert!(
-        has_texture(pane, OverlayKind::Radar),
+        has_texture(pane, &rustdar_source::id::known::RADAR),
         "the config restore released the radar raster",
     );
 }

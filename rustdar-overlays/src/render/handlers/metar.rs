@@ -679,11 +679,11 @@ mod round_tests {
             &plains(),
         ));
 
-        let kind = OverlayKind::Metar;
+        let kind = known::METAR;
         let mut registry = OverlayRegistry::default();
-        registry.set_enabled(kind, true);
+        registry.set_enabled(&kind, true);
         registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.id(),
+            kind: kind.clone(),
             data: Box::new(MetarFetchResult(result)) as FetchPayload,
         });
         let ctx = PaneControlContext {
@@ -691,13 +691,13 @@ mod round_tests {
             pane_state: None,
         };
         let note = registry
-            .controls(kind, &ctx)
+            .controls(&kind, &ctx)
             .into_iter()
             .find_map(|item| match item {
                 ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
                 _ => None,
             });
-        (registry.status_line(kind), note)
+        (registry.status_line(&kind), note)
     }
 
     /// **A state network that did not answer blanks that state.**

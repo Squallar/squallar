@@ -2634,7 +2634,7 @@ fn a_seeded_reports_registry() -> rustdar_overlays::render::overlay_state::Overl
     };
     let mut registry = OverlayRegistry::default();
     registry.set_enabled(
-        rustdar_overlays::render::overlay_state::OverlayKind::StormReports,
+        &rustdar_overlays::render::overlay_state::OverlayKind::StormReports.id(),
         true,
     );
     registry.apply_fetch_result(OverlayFetchResult {
@@ -2670,7 +2670,7 @@ fn a_seeded_glm_registry() -> rustdar_overlays::render::overlay_state::OverlayRe
     };
     let mut registry = OverlayRegistry::default();
     registry.set_enabled(
-        rustdar_overlays::render::overlay_state::OverlayKind::Lightning,
+        &rustdar_overlays::render::overlay_state::OverlayKind::Lightning.id(),
         true,
     );
     registry.apply_fetch_result(OverlayFetchResult {
@@ -2734,10 +2734,10 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
         (a_seeded_glm_registry(), OverlayKind::Lightning),
     ] {
         let job = registry
-            .prepare_job(kind, &ctx)
+            .prepare_job(&kind.id(), &ctx)
             .expect("the seeded registry describes a job");
         let items = registry
-            .hit_items(kind)
+            .hit_items(&kind.id())
             .expect("a hit-map kind captures items beside its input");
         let direct = if let Some(input) =
             job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
@@ -2824,7 +2824,7 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
     let registry = a_seeded_reports_registry();
     let ctx = a_zip_ctx();
     let job = registry
-        .prepare_job(OverlayKind::StormReports, &ctx)
+        .prepare_job(&OverlayKind::StormReports.id(), &ctx)
         .expect("the seeded registry describes a reports job");
     assert!(
         job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
@@ -2832,7 +2832,7 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
         "the seeded registry described another kind's input: {job:?}",
     );
     let items = registry
-        .hit_items(OverlayKind::StormReports)
+        .hit_items(&OverlayKind::StormReports.id())
         .expect("items");
     let (_, wire_cells) = overlay_reply_via_wire(&JobRequest {
         geometry: JobGeometry {

@@ -1,6 +1,7 @@
 use super::*;
 use crate::input_harness::InputHarness;
 use crate::volume_view::{Showing, StubVolumePainter, VolumeFrameState};
+use rustdar_source::id::known;
 use std::sync::Arc;
 
 const FRAME_DT: f64 = 1.0 / 60.0;
@@ -2081,7 +2082,7 @@ fn ground_witness_harness() -> (InputHarness, Arc<StubVolumePainter>) {
         .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
             painter.clone(),
         )));
-    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0")
@@ -2665,7 +2666,7 @@ fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
     // layer off reserves nothing and the free rect is the pane.
     landscape
         .gui_mut()
-        .enable_overlay_for_test(OverlayKind::ColorScale);
+        .enable_overlay_for_test(&known::COLOR_SCALE);
     landscape.make_pane_volume(0);
     landscape.make_pane_volume(1);
     landscape.frames_for(2, FRAME_DT);
@@ -2679,7 +2680,7 @@ fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
     portrait.set_pane_count(2);
     portrait
         .gui_mut()
-        .enable_overlay_for_test(OverlayKind::ColorScale);
+        .enable_overlay_for_test(&known::COLOR_SCALE);
     portrait.make_pane_volume(0);
     portrait.make_pane_volume(1);
     portrait.frames_for(2, FRAME_DT);

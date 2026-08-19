@@ -333,7 +333,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
             app.gui
                 .pane_mut(idx)
                 .expect("pane exists")
-                .overlay_cache_mut(OverlayKind::Radar)
+                .overlay_cache_mut(&OverlayKind::Radar.id())
                 .current()
                 .is_some(),
             "pane {idx} has no radar texture",

@@ -62,7 +62,7 @@ use crate::ui::DrawnMenuLeaf;
 use crate::ui_input::{MapPointerFrame, TouchGestures};
 use crate::ui_layout::PointerModality;
 use rustdar_geo::GeoPoint;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::LayerId;
 
 /// Viewport size used by the harness — a landscape desktop-ish window.
 const SCREEN_SIZE: egui::Vec2 = egui::vec2(1024.0, 768.0);
@@ -632,7 +632,7 @@ impl InputHarness {
     /// [`Self::control_items`], asked of the handler rather than the renderer.
     pub(crate) fn control_item_model(
         &self,
-        kind: OverlayKind,
+        kind: &LayerId,
     ) -> Vec<rustdar_overlays::render::controls::ControlItem> {
         self.gui.control_item_model_for_test(kind)
     }
@@ -739,8 +739,8 @@ impl InputHarness {
     }
 
     /// The stack row drawn for `kind`, if the last frame drew one.
-    pub(crate) fn stack_row(&self, kind: OverlayKind) -> Option<crate::ui::StackRowProbe> {
-        self.stack().rows.into_iter().find(|row| row.kind == kind)
+    pub(crate) fn stack_row(&self, kind: &LayerId) -> Option<crate::ui::StackRowProbe> {
+        self.stack().rows.into_iter().find(|row| row.kind == *kind)
     }
 
     /// What the last frame's inspector drew.
@@ -787,7 +787,7 @@ impl InputHarness {
     /// Select `kind`'s options in the inspector the user's way: open the
     /// stack, scroll its row on screen, click it. Asserts the inspector's
     /// body arm for exactly that layer drew.
-    pub(crate) fn open_layer_in_inspector(&mut self, kind: OverlayKind) {
+    pub(crate) fn open_layer_in_inspector(&mut self, kind: &LayerId) {
         // An inspector left open from a previous selection covers the rows —
         // as the right slide-over on Medium, and as the sheet's Inspector
         // page over its Layers page on Compact.
@@ -818,7 +818,7 @@ impl InputHarness {
         self.warm_up();
         assert_eq!(
             self.inspector().mode,
-            Some(crate::ui::InspectorSelection::Layer(kind)),
+            Some(crate::ui::InspectorSelection::Layer(kind.clone())),
             "clicking {kind:?}'s row did not put its layer body on screen"
         );
     }
@@ -1144,18 +1144,18 @@ impl InputHarness {
 
     /// The display name the registry gives `kind` — what the stack rows and
     /// the catalog's overlay tiles both print.
-    pub(crate) fn overlay_display_name(&self, kind: OverlayKind) -> &str {
+    pub(crate) fn overlay_display_name(&self, kind: &LayerId) -> &str {
         self.gui.overlays.display_name(kind)
     }
 
     /// Whether the **live** active pane has `kind` on — the state the menu
     /// checkbox claims to be showing.
-    pub(crate) fn overlay_enabled(&self, kind: OverlayKind) -> bool {
+    pub(crate) fn overlay_enabled(&self, kind: &LayerId) -> bool {
         self.gui.active_pane().is_overlay_enabled(kind)
     }
 
     /// Whether pane `idx` has `kind` on, whichever pane is active.
-    pub(crate) fn overlay_enabled_on(&self, idx: usize, kind: OverlayKind) -> bool {
+    pub(crate) fn overlay_enabled_on(&self, idx: usize, kind: &LayerId) -> bool {
         self.gui
             .pane(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"))
@@ -1185,7 +1185,7 @@ impl InputHarness {
     /// Set one pane's overlay state directly, writing both the enabled map and
     /// the config the layers panel reloads from each frame — otherwise the
     /// next frame undoes it.
-    pub(crate) fn set_overlay_on_pane(&mut self, idx: usize, kind: OverlayKind, on: bool) {
+    pub(crate) fn set_overlay_on_pane(&mut self, idx: usize, kind: &LayerId, on: bool) {
         self.gui.set_overlay_on_pane_for_test(idx, kind, on);
         self.warm_up();
     }
@@ -1488,7 +1488,7 @@ impl InputHarness {
 
     /// Pane `idx`'s dispatched kinds in paint order, with the layer each
     /// painted into — the draw-order pin's read side.
-    pub(crate) fn paint_order(&self, idx: usize) -> Vec<(OverlayKind, egui::LayerId)> {
+    pub(crate) fn paint_order(&self, idx: usize) -> Vec<(LayerId, egui::LayerId)> {
         self.gui.paint_order_for_test(idx)
     }
 
@@ -1696,7 +1696,7 @@ impl InputHarness {
             .gui
             .pane_mut(idx)
             .unwrap()
-            .overlay_cache_mut(OverlayKind::Radar);
+            .overlay_cache_mut(&rustdar_source::id::known::RADAR);
         cache.show(OverlayTextureData {
             texture,
             geo_bounds: rustdar_geo::GeoBounds {

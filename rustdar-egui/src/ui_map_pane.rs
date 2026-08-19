@@ -5,9 +5,7 @@ use crate::overlay_cache::{
 use crate::pane::{PaneState, RadarImageData};
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
-use rustdar_overlays::render::overlay_state::{
-    OverlayItem, OverlayKind, OverlayRegistry, RenderMode,
-};
+use rustdar_overlays::render::overlay_state::{OverlayItem, OverlayRegistry, RenderMode, Surface};
 use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
@@ -18,67 +16,9 @@ use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{ImageBounds, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
+use rustdar_source::id::{LayerId, known};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
-
-/// Which of the two surfaces a pane's content is drawn onto.
-///
-/// A pane's content divides in two, and the line between them is geography:
-///
-/// * [`Ground`](PaneSurface::Ground) — everything drawn **at** a latitude and
-///   longitude, through the projector. The basemap and city-label tiles, the
-///   radar raster and its range ring, SPC outlooks and mesoscale discussions,
-///   NWS alerts, storm reports, lightning, METARs, model data, the radar-site
-///   icons and their names, the location dot. All of it is a picture of the
-///   world, and all of it is still true when it is laid flat on the world.
-/// * [`Glass`](PaneSurface::Glass) — chrome, positioned against the pane's own
-///   **edges** rather than against the map underneath: the colour-scale
-///   legends and the stale-image notice. Neither has a latitude, and neither
-///   survives being laid flat — on a 3D pane's floor a legend is painted into
-///   the ground in perspective, shrinking with distance and swinging round
-///   with the camera.
-///
-/// For a plan-view pane the distinction is invisible, because its ground *is*
-/// its glass: one rect carries both. It becomes real for a 3D pane, whose
-/// ground goes into the off-screen strip the raymarcher mirrors onto the floor
-/// (`Gui::draw_floor_strip`) while its glass stays on the pane rect the volume
-/// occupies.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum PaneSurface {
-    /// Geography. Mirrors onto a 3D pane's floor.
-    Ground,
-    /// Chrome over geography. Never mirrors.
-    Glass,
-}
-
-/// Which surface a given overlay kind belongs on. See [`PaneSurface`].
-///
-/// Matched exhaustively on purpose: a new `OverlayKind` does not compile until
-/// somebody has said whether it is a picture of the world or chrome over one.
-/// That is what makes the split a stated rule rather than an `if` somebody
-/// happened to write in one arm — the previous spelling of it was no spelling
-/// at all, which is how the colour scale ended up painted onto the ground the
-/// day the ground arrived.
-pub(super) const fn surface_of(kind: OverlayKind) -> PaneSurface {
-    match kind {
-        // Chrome: bars pinned to the pane's bottom or right edge, labelled in
-        // the pane's own text sizes, describing a palette rather than a place.
-        OverlayKind::ColorScale => PaneSurface::Glass,
-        // Geography, every one of them: each is drawn through the projector,
-        // at the latitude and longitude it was fetched for.
-        OverlayKind::ModelData
-        | OverlayKind::SpcOutlook
-        | OverlayKind::Radar
-        | OverlayKind::SpcDiscussions
-        | OverlayKind::NwsAlerts
-        | OverlayKind::StormReports
-        | OverlayKind::Lightning
-        | OverlayKind::Metar
-        | OverlayKind::CityLabels
-        | OverlayKind::RadarSites
-        | OverlayKind::UserLocation => PaneSurface::Ground,
-    }
-}
 
 /// Which of a pane's surfaces one call to [`render_pane_map_content`] paints.
 ///
@@ -97,11 +37,14 @@ pub(super) enum PaneSurfaces {
 }
 
 impl PaneSurfaces {
-    /// Whether this pass paints `surface`.
-    const fn paints(self, surface: PaneSurface) -> bool {
+    /// Whether this pass paints `surface` — the handler-declared
+    /// [`Surface`] (see rustdar-overlays; the old egui-side per-kind
+    /// match is deleted, the handler is the one place the ground/glass call
+    /// is made).
+    const fn paints(self, surface: Surface) -> bool {
         match self {
             Self::GroundAndGlass => true,
-            Self::GroundOnly => matches!(surface, PaneSurface::Ground),
+            Self::GroundOnly => matches!(surface, Surface::Ground),
         }
     }
 }
@@ -185,7 +128,7 @@ pub(super) struct PaneRenderCtx<'a> {
     /// a paint helper that built its own layer painter *internally* would
     /// not be reflected here, and no test claims otherwise.
     #[cfg(test)]
-    pub paint_order: Vec<(OverlayKind, egui::LayerId)>,
+    pub paint_order: Vec<(LayerId, egui::LayerId)>,
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -250,17 +193,25 @@ pub(super) fn render_pane_map_content(
         let mut pending_notice: Option<(RadarProduct, f32)> = None;
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
 
-        let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
-        for &kind in &draw_order {
-            if !ctx.pane.is_overlay_enabled(kind) {
+        let draw_order: Vec<LayerId> = ctx.pane.draw_order.clone();
+        for id in &draw_order {
+            if !ctx.pane.is_overlay_enabled(id) {
                 continue;
             }
-            // The ground/glass split, applied where the kinds are dispatched
+            // An id with no registered handler is RETAINED in the list and
+            // skipped at draw (M8b's deliberate unknown-id behavior — the
+            // old reconcile dropped it from the list instead), so a newer
+            // build's layer keeps its place through a session here.
+            let Some(handler) = ctx.overlays.handler_by_id(id) else {
+                continue;
+            };
+            // The ground/glass split, applied where the layers are dispatched
             // rather than inside the arms: a pass that is not painting this
-            // kind's surface skips the arm entirely, so it also skips the
+            // layer's surface skips the arm entirely, so it also skips the
             // arm's paint-order record — which is the honest thing to record,
-            // because nothing was painted.
-            if !ctx.surfaces.paints(surface_of(kind)) {
+            // because nothing was painted. The surface is the HANDLER's
+            // declaration (`OverlayHandler::surface`) since M8b.
+            if !ctx.surfaces.paints(handler.surface()) {
                 continue;
             }
             // Every arm below paints through `ui.painter()` — the pane's own
@@ -273,9 +224,11 @@ pub(super) fn render_pane_map_content(
             // not reflected; see `PaneRenderCtx::paint_order`.
             #[cfg(test)]
             let mut painted_layer = ui.painter().layer_id();
-            match kind {
-                // Radar image layer — special handling for loop playback
-                OverlayKind::Radar => {
+            match id {
+                // Radar image layer — special handling for loop playback.
+                // Guards over the known:: consts rather than string-literal
+                // patterns: the consts are the ONE spelling of each id.
+                id if *id == known::RADAR => {
                     // Loop playback: draw the active loop frame instead
                     if ctx.pane.loop_state.is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
@@ -292,7 +245,7 @@ pub(super) fn render_pane_map_content(
                         // Extract metadata before drawing (avoids borrow conflict)
                         let meta_snapshot = ctx
                             .pane
-                            .overlay_cache(OverlayKind::Radar)
+                            .overlay_cache(id)
                             .and_then(|c| c.current())
                             .and_then(|tex| tex.radar_meta.as_ref())
                             .map(|m| {
@@ -304,11 +257,7 @@ pub(super) fn render_pane_map_content(
                                 )
                             });
 
-                        if let Some(tex) = ctx
-                            .pane
-                            .overlay_cache(OverlayKind::Radar)
-                            .and_then(|c| c.current())
-                        {
+                        if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {
                             let screen_rect = ui.max_rect();
                             draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                         }
@@ -370,21 +319,21 @@ pub(super) fn render_pane_map_content(
                 // City label tiles — the same projector-driven tile pass the
                 // basemap goes through, at the same bias, so the names sit on
                 // the roads they name at every level.
-                OverlayKind::CityLabels => {
+                id if *id == known::CITY_LABELS => {
                     if let Some(ltiles) = ctx.label_tiles.as_mut() {
                         draw_tile_layer(ui, projector, zoom, ltiles, ctx.tile_zoom_bias);
                     }
                 }
                 // Radar sites: texture + per-frame interactions (text labels, clicks)
-                OverlayKind::RadarSites => {
-                    if let Some(tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current()) {
+                id if *id == known::RADAR_SITES => {
+                    if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
                     handle_radar_site_interactions(ui, zoom, &visible_sites, ctx);
                 }
                 // User location blue dot
-                OverlayKind::UserLocation => {
+                id if *id == known::USER_LOCATION => {
                     if let Some((user_lat, user_lon)) = ctx.user_location {
                         render_user_location(
                             ui,
@@ -406,7 +355,7 @@ pub(super) fn render_pane_map_content(
                 // batches without reordering — so "later in `draw_order`"
                 // now means "on top" for the bars exactly as it does for a
                 // texture.
-                OverlayKind::ColorScale => {
+                id if *id == known::COLOR_SCALE => {
                     let painter = ui.painter().with_clip_rect(ctx.pane_rect);
                     #[cfg(test)]
                     {
@@ -422,26 +371,26 @@ pub(super) fn render_pane_map_content(
                     );
                 }
                 // All other overlays dispatched by render mode
-                _ => match ctx.overlays.render_mode(kind) {
-                    Some(RenderMode::Texture) => {
+                _ => match handler.render_mode() {
+                    RenderMode::Texture => {
                         // Shared, not mutable: the labels are borrowed out of
                         // the handler for the length of the draw, and the
                         // clickable set is only asked for if a click needs
                         // resolving — see `OverlayDrawContext::draw_overlay`.
                         let overlays = &*ctx.overlays;
                         selected.extend(overlay_ctx.draw_overlay(
-                            ctx.pane.overlay_cache(kind),
-                            overlays.map_labels(kind),
-                            || overlays.clickable_items(kind),
+                            ctx.pane.overlay_cache(id),
+                            overlays.map_labels(id),
+                            || overlays.clickable_items(id),
                         ));
                     }
-                    Some(RenderMode::PerFramePoint) => {
+                    RenderMode::PerFramePoint => {
                         selected.extend(render_per_frame_overlay(
                             ui,
                             projector,
                             &PerFrameOverlayCtx {
                                 overlays: ctx.overlays,
-                                kind,
+                                id,
                                 zoom,
                                 prefs: ctx.preferences,
                                 overlay_click_pos: ctx.overlay_click_pos,
@@ -454,19 +403,19 @@ pub(super) fn render_pane_map_content(
                 },
             }
             #[cfg(test)]
-            ctx.paint_order.push((kind, painted_layer));
+            ctx.paint_order.push((id.clone(), painted_layer));
         }
 
         // The deferred stale-image notice, submitted after every kind so
         // nothing in `draw_order` can paint over it — see the Radar arm.
         //
-        // Glass, by the rule in [`PaneSurface`]: a plate pinned to the top of
+        // Glass, by the rule in [`Surface`]: a plate pinned to the top of
         // the pane, cleared past the pane's *own* pill row, saying which
         // product the pixels are. It has no latitude, so a floor strip does
         // not draw it — a 3D pane gets it from `Gui::draw_volume_glass`
         // instead, over the volume where it can be read.
         if let Some((on_screen, elevation)) = pending_notice
-            && ctx.surfaces.paints(PaneSurface::Glass)
+            && ctx.surfaces.paints(Surface::Glass)
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
             draw_pending_render_notice(
@@ -484,7 +433,7 @@ pub(super) fn render_pane_map_content(
         // arm. Glass, and mutually exclusive with the notice above, so this is
         // the one place either sentence is drawn and they cannot stack.
         if let Some(source) = melting_layer_caveat
-            && ctx.surfaces.paints(PaneSurface::Glass)
+            && ctx.surfaces.paints(Surface::Glass)
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
             draw_melting_layer_notice(
@@ -517,9 +466,9 @@ pub(super) fn render_pane_map_content(
                 let map_pos = projector.unproject(egui::vec2(pos.x, pos.y));
                 let hover_lat = map_pos.y();
                 let hover_lon = map_pos.x();
-                for &kind in &draw_order {
-                    if ctx.pane.is_overlay_enabled(kind)
-                        && let Some(text) = ctx.overlays.hover_value_at(kind, hover_lat, hover_lon)
+                for id in &draw_order {
+                    if ctx.pane.is_overlay_enabled(id)
+                        && let Some(text) = ctx.overlays.hover_value_at(id, hover_lat, hover_lon)
                     {
                         ctx.pane.overlay_hover_value = Some(text);
                         break;
@@ -561,19 +510,22 @@ pub(super) fn render_pane_map_content(
         // token moves the moment the style does. See `overlay_cache_token`.
         let is_dark = ui.ctx().global_style().visuals.dark_mode;
 
-        for &kind in OverlayKind::all() {
-            if ctx.overlays.render_mode(kind) != Some(RenderMode::Texture) {
-                continue;
-            }
+        let texture_ids: Vec<LayerId> = ctx
+            .overlays
+            .handlers()
+            .filter(|h| h.render_mode() == RenderMode::Texture)
+            .map(|h| h.id())
+            .collect();
+        for id in &texture_ids {
             // Radar rendering is driven by product/elevation changes (not viewport),
             // handled by dispatch_pane_renders() in the platform crate.
-            if kind == OverlayKind::Radar {
+            if *id == known::RADAR {
                 continue;
             }
-            let enabled = ctx.pane.is_overlay_enabled(kind);
-            let token = overlay_cache_token(ctx.overlays, ctx.pane, kind, is_dark);
-            let has_data = ctx.overlays.has_data(kind);
-            let cache = ctx.pane.overlay_cache_mut(kind);
+            let enabled = ctx.pane.is_overlay_enabled(id);
+            let token = overlay_cache_token(ctx.overlays, ctx.pane, id, is_dark);
+            let has_data = ctx.overlays.has_data(id);
+            let cache = ctx.pane.overlay_cache_mut(id);
             // Asked on every frame the overlay is live, and *not* gated on
             // `render_in_flight` the way it used to be. `needs_rerender` is also
             // what records the zoom it was shown and when it last moved — so a
@@ -587,7 +539,7 @@ pub(super) fn render_pane_map_content(
             if stale && !cache.render_in_flight {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
-                    overlay_kind: kind,
+                    overlay_kind: id.clone(),
                     geo_bounds: viewport_bounds,
                     texture: tex_plan,
                     data_generation: token,
@@ -651,7 +603,7 @@ pub(super) fn render_pane_map_content(
         // Try overlay cache meta first (non-loop static render), then loop frame
         let raw_meta = ctx
             .pane
-            .overlay_cache(OverlayKind::Radar)
+            .overlay_cache(&known::RADAR)
             .and_then(|c| c.current())
             .and_then(|tex| tex.radar_meta.as_ref())
             .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.hover)));
@@ -728,13 +680,13 @@ pub(super) fn render_pane_map_content(
 fn overlay_cache_token(
     overlays: &OverlayRegistry,
     pane: &PaneState,
-    kind: OverlayKind,
+    id: &LayerId,
     is_dark: bool,
 ) -> u64 {
-    let base = if kind == OverlayKind::RadarSites {
+    let base = if *id == known::RADAR_SITES {
         pane.radar_sites_render_gen
     } else {
-        overlays.content_signature(kind)
+        overlays.content_signature(id)
     };
     base ^ if is_dark { 0x9E37_79B9_7F4A_7C15 } else { 0 }
 }
@@ -943,7 +895,7 @@ fn visible_radar_sites(
     zoom: f64,
     pane: &PaneState,
 ) -> Vec<VisibleSite> {
-    if !pane.is_overlay_enabled(OverlayKind::RadarSites) {
+    if !pane.is_overlay_enabled(&known::RADAR_SITES) {
         return Vec::new();
     }
     // The margin is what lets a site just off the edge still draw its label and
@@ -1311,7 +1263,7 @@ pub(super) fn color_scale_gutter(
 ) -> f32 {
     // The same gate `Gui::draw_volume_glass` and the `ColorScale` arm put in
     // front of `render_color_scales`: layer off, nothing painted, no gutter.
-    if !pane.is_overlay_enabled(OverlayKind::ColorScale) {
+    if !pane.is_overlay_enabled(&known::COLOR_SCALE) {
         return 0.0;
     }
     let product = pane.selected_product;
@@ -1337,11 +1289,11 @@ pub(super) fn color_scale_gutter(
     let ticks = legend_ticks(product, prefs);
     let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
     let mut offset = 0.0;
-    for &kind in &pane.draw_order {
-        if kind == OverlayKind::ColorScale || !pane.is_overlay_enabled(kind) {
+    for id in &pane.draw_order {
+        if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) {
             continue;
         }
-        let Some(overlay) = overlays.legend(kind) else {
+        let Some(overlay) = overlays.legend(id) else {
             continue;
         };
         if overlay.thresholds.len() < 2 {
@@ -2351,11 +2303,11 @@ fn render_overlay_color_scales(
     // (horizontal) the radar scale.
     let mut bar_offset = 0;
 
-    for &kind in &pane.draw_order {
-        if !pane.is_overlay_enabled(kind) || kind == OverlayKind::ColorScale {
+    for id in &pane.draw_order {
+        if !pane.is_overlay_enabled(id) || *id == known::COLOR_SCALE {
             continue;
         }
-        let Some(legend) = overlays.legend(kind) else {
+        let Some(legend) = overlays.legend(id) else {
             continue;
         };
         if legend.thresholds.len() < 2 {
@@ -2526,7 +2478,7 @@ fn interpolate_legend_color(thresholds: &[(f32, [u8; 3])], value: f32) -> [u8; 3
 /// Context for per-frame point overlay rendering.
 struct PerFrameOverlayCtx<'a> {
     overlays: &'a OverlayRegistry,
-    kind: OverlayKind,
+    id: &'a LayerId,
     zoom: f64,
     prefs: &'a UserPreferences,
     /// Pre-filtered click position (dialog clicks already stripped).
@@ -2546,7 +2498,7 @@ fn render_per_frame_overlay(
     projector: &walkers::Projector,
     pf: &PerFrameOverlayCtx<'_>,
 ) -> Vec<Arc<dyn OverlayItem>> {
-    let points = pf.overlays.per_frame_points(pf.kind);
+    let points = pf.overlays.per_frame_points(pf.id);
     if points.is_empty() {
         return Vec::new();
     }
@@ -2557,7 +2509,7 @@ fn render_per_frame_overlay(
         zoom: zoom_f32,
         is_dark,
     };
-    let hit_radius = pf.overlays.point_hit_radius(pf.kind, zoom_f32);
+    let hit_radius = pf.overlays.point_hit_radius(pf.id, zoom_f32);
     let hover_ctx = HoverContext { prefs: pf.prefs };
 
     let screen_rect = ui.max_rect();
@@ -2603,7 +2555,7 @@ fn render_per_frame_overlay(
             painter,
             center: screen,
         };
-        pf.overlays.draw_point(pf.kind, pt.id, &mut ep, &draw_ctx);
+        pf.overlays.draw_point(pf.id, pt.id, &mut ep, &draw_ctx);
 
         // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
         if let Some(click_pos) = click_pos {
@@ -2630,12 +2582,12 @@ fn render_per_frame_overlay(
     // Show tooltip for closest hovered point
     if let Some((_, id)) = closest_hover
         && let Some(hp) = hover_pos
-        && let Some(text) = pf.overlays.hover_text(pf.kind, id, &hover_ctx)
+        && let Some(text) = pf.overlays.hover_text(pf.id, id, &hover_ctx)
     {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         map_hover_tooltip(
             ui.ctx(),
-            egui::Id::new(("per_frame_overlay_hover", pf.kind as u8)),
+            egui::Id::new(("per_frame_overlay_hover", pf.id.as_str())),
             hp,
             Some(400.0),
             |tooltip_ui| {

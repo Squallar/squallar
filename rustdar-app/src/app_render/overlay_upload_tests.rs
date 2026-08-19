@@ -108,7 +108,7 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(OverlayKind::NwsAlerts)
+        .overlay_cache_mut(&OverlayKind::NwsAlerts.id())
         .current()
         .expect("the poller placed an overlay on this pane")
         .texture
@@ -155,7 +155,7 @@ fn the_placed_overlay_is_described_by_its_own_picture() {
         .gui
         .pane_mut(0)
         .expect("pane exists")
-        .overlay_cache_mut(OverlayKind::NwsAlerts)
+        .overlay_cache_mut(&OverlayKind::NwsAlerts.id())
         .current()
         .expect("the poller placed an overlay");
     assert_eq!((entry.width, entry.height), (W, H));

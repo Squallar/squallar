@@ -68,7 +68,7 @@ pub(in crate::ui) struct FrameProbes {
     /// Each map pane's dispatched kinds in paint order, with the layer each
     /// painted into. Only read by tests — the draw-order pin; see
     /// `PaneRenderCtx::paint_order` for why the layer is the honest half.
-    pub last_paint_order: Vec<(usize, Vec<(OverlayKind, egui::LayerId)>)>,
+    pub last_paint_order: Vec<(usize, Vec<(rustdar_source::id::LayerId, egui::LayerId)>)>,
     /// What the last frame's status bar actually drew. Only read by tests.
     pub last_status_bar: StatusBarProbe,
     /// What the last frame's timeline transport actually drew. Only read by
@@ -212,13 +212,13 @@ impl ControlProbe {
     #[inline]
     pub(super) fn record_item(
         &mut self,
-        handler: OverlayKind,
+        handler: &rustdar_source::id::LayerId,
         kind: DrawnControlKind,
         label: &str,
         rect: egui::Rect,
     ) {
         self.items.push(DrawnControlItem {
-            handler: Some(handler),
+            handler: Some(handler.clone()),
             label: label.to_owned(),
             kind,
             rect,

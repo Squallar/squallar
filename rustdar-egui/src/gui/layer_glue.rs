@@ -2,6 +2,7 @@
 //! split out of `ui.rs` at WO-E1 — the whole enclosing fn of each.
 //! Bodies are verbatim moves.
 use super::*;
+use rustdar_source::id::LayerId;
 
 impl Gui {
     /// Render **one** handler's controls — the only place handler
@@ -28,7 +29,7 @@ impl Gui {
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
-        kind: OverlayKind,
+        kind: &LayerId,
         actions: &mut Vec<GuiAction>,
     ) {
         #[cfg(test)]
@@ -44,7 +45,7 @@ impl Gui {
         let ctx = self.active_pane_control_context();
 
         // Render controls and collect updates.
-        let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
+        let mut updates: Vec<(LayerId, ControlUpdate)> = Vec::new();
         let mut probe = ControlProbe::default();
 
         let controls = self.overlays.controls(kind, &ctx);
@@ -72,7 +73,7 @@ impl Gui {
 
         let active_pane = self.active_pane;
         for (kind, update) in updates {
-            let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
+            let effect = self.overlays.apply_control(&kind, &update, &mut pane_ctx);
             if matches!(effect, ControlEffect::Fetch) {
                 // Refresh, and every option change that implies one. A user
                 // pressing Refresh on a layer that has been backing off — or
@@ -81,9 +82,9 @@ impl Gui {
             }
         }
 
-        // Save the (possibly mutated) handler state back to the pane.
-        pane.overlay_configs = self.overlays.save_pane_configs();
-        pane.enabled_overlays = self.overlays.save_enabled_map();
+        // Save the (possibly mutated) handler state back to the pane —
+        // keeping any unregistered ids' entries (`adopt_handler_state`).
+        pane.adopt_handler_state(&self.overlays);
     }
 
     /// [`Self::write_pane_overlay`] plus the enable-fetch rule, in one place
@@ -121,7 +122,7 @@ impl Gui {
         &mut self,
         pane: &mut PaneState,
         pane_idx: usize,
-        kind: OverlayKind,
+        kind: &LayerId,
         on: bool,
         actions: &mut Vec<GuiAction>,
     ) {
@@ -133,7 +134,7 @@ impl Gui {
         if on && (!self.overlays.has_data(kind) || stale) && !self.overlays.is_fetching(kind) {
             // Switching a layer on is a user action, so it clears whatever the
             // ladder had accumulated — see `push_user_overlay_fetch`.
-            push_user_overlay_fetch(&mut self.overlays, actions, kind, pane_idx);
+            push_user_overlay_fetch(&mut self.overlays, actions, kind.clone(), pane_idx);
         }
     }
 
@@ -147,8 +148,8 @@ impl Gui {
         let defaults = self.overlays.build_enabled_map();
         let default_configs = self.overlays.save_pane_configs();
         for pane in &mut self.panes {
-            for (&kind, &enabled) in &defaults {
-                pane.enabled_overlays.entry(kind).or_insert(enabled);
+            for (kind, &enabled) in &defaults {
+                pane.enabled_overlays.entry(kind.clone()).or_insert(enabled);
             }
             // Seed overlay configs from handler defaults for panes with empty configs.
             if pane.overlay_configs.is_empty() {
@@ -161,17 +162,14 @@ impl Gui {
     /// map — `render_overlay_controls_one` reloads the handlers from the config
     /// every frame it runs, so a write to `enabled_overlays` alone is undone.
     #[cfg(test)]
-    pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: OverlayKind, on: bool) {
+    pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: &LayerId, on: bool) {
         let configs = self.panes[idx].overlay_configs.clone();
         if !configs.is_empty() {
             self.overlays.load_pane_configs(&configs);
         }
         self.overlays.set_enabled(kind, on);
-        let configs = self.overlays.save_pane_configs();
-        let enabled = self.overlays.save_enabled_map();
         let pane = &mut self.panes[idx];
-        pane.overlay_configs = configs;
-        pane.enabled_overlays = enabled;
+        pane.adopt_handler_state(&self.overlays);
     }
 
     /// The [`ControlItem`] tree `kind`'s handler is currently offering — the
@@ -179,7 +177,7 @@ impl Gui {
     /// than of the renderer, exactly as [`Self::dropdown_model_for_test`] asks
     /// for one dropdown.
     #[cfg(test)]
-    pub(crate) fn control_item_model_for_test(&self, kind: OverlayKind) -> Vec<ControlItem> {
+    pub(crate) fn control_item_model_for_test(&self, kind: &LayerId) -> Vec<ControlItem> {
         let ctx = self.active_pane_control_context();
         self.overlays.controls(kind, &ctx)
     }
@@ -216,7 +214,7 @@ impl Gui {
         }
         OVERLAY_CONTROL_ORDER
             .iter()
-            .find_map(|&kind| find(&self.overlays.controls(kind, &ctx), label))
+            .find_map(|kind| find(&self.overlays.controls(kind, &ctx), label))
     }
 
     /// Turn a texture overlay on for every pane, as ticking its layer toggle does.
@@ -226,13 +224,10 @@ impl Gui {
     /// registry from the pane's configs and then saves the enabled map back out, so
     /// a pane whose config still says "off" turns itself off again on the next frame.
     #[cfg(test)]
-    pub(crate) fn enable_overlay_for_test(&mut self, kind: OverlayKind) {
+    pub(crate) fn enable_overlay_for_test(&mut self, kind: &LayerId) {
         self.overlays.set_enabled(kind, true);
-        let configs = self.overlays.save_pane_configs();
-        let enabled = self.overlays.save_enabled_map();
         for pane in &mut self.panes {
-            pane.overlay_configs = configs.clone();
-            pane.enabled_overlays = enabled.clone();
+            pane.adopt_handler_state(&self.overlays);
         }
     }
 
@@ -240,7 +235,7 @@ impl Gui {
     /// [`Self::auto_poll_delay`]. `None` when this layer does not auto-poll,
     /// when no pane on screen can draw it, or when its fetch is already in
     /// flight.
-    pub(super) fn overlay_poll_delay(&self, kind: OverlayKind) -> Option<std::time::Duration> {
+    pub(super) fn overlay_poll_delay(&self, kind: &LayerId) -> Option<std::time::Duration> {
         if !self.any_pane_has_overlay_enabled(kind) {
             return None;
         }

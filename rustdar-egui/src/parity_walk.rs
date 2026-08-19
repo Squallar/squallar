@@ -43,8 +43,8 @@ use crate::ui::{
 use crate::ui_layout::WidthClass;
 use rustdar_overlays::hrrr::ModelParameter;
 use rustdar_overlays::render::controls::ControlItem;
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::{LayerId, known};
 
 /// One wheel step of the walk's scrolling. Small enough that nothing can jump
 /// clean across the shortest screen under test between two frames.
@@ -67,7 +67,7 @@ fn inspector_scroll_pos(h: &InputHarness) -> egui::Pos2 {
 /// definition of "drawn": laid out somewhere a user could actually see it.
 fn control_on_screen(
     h: &InputHarness,
-    handler: OverlayKind,
+    handler: &LayerId,
     kind: DrawnControlKind,
     label: &str,
 ) -> bool {
@@ -80,7 +80,7 @@ fn control_on_screen(
 /// yet scrolled to" from "inside a collapsed section, not drawn at all".
 fn control_recorded(
     h: &InputHarness,
-    handler: OverlayKind,
+    handler: &LayerId,
     kind: DrawnControlKind,
     label: &str,
 ) -> bool {
@@ -91,11 +91,11 @@ fn control_recorded(
 
 fn matches(
     item: &DrawnControlItem,
-    handler: OverlayKind,
+    handler: &LayerId,
     kind: DrawnControlKind,
     label: &str,
 ) -> bool {
-    item.handler == Some(handler) && item.kind == kind && item.label == label
+    item.handler.as_ref() == Some(handler) && item.kind == kind && item.label == label
 }
 
 /// Scroll the inspector until `label` is drawn on screen, and fail naming it
@@ -103,7 +103,7 @@ fn matches(
 fn assert_control_reachable(
     h: &mut InputHarness,
     width: WidthClass,
-    handler: OverlayKind,
+    handler: &LayerId,
     kind: DrawnControlKind,
     label: &str,
 ) {
@@ -140,7 +140,7 @@ fn drawn_kind(item: &ControlItem) -> Option<DrawnControlKind> {
 fn assert_control_tree(
     h: &mut InputHarness,
     width: WidthClass,
-    handler: OverlayKind,
+    handler: &LayerId,
     items: &[ControlItem],
 ) {
     for item in items.iter().filter(|item| !is_master_control(item)) {
@@ -209,14 +209,14 @@ fn control_label(item: &ControlItem) -> &str {
 /// rather than trusting the handler's default, so a default flip cannot
 /// silently retire the coverage; the overlays crate's controls-parity test
 /// pins the model half of the same rule for all twelve kinds.
-const HIDDEN_WALK_HANDLER: OverlayKind = OverlayKind::Lightning;
+const HIDDEN_WALK_HANDLER: LayerId = known::LIGHTNING;
 
 /// Every handler's every control, reachable through its stack row and the
 /// inspector's layer body.
 fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
-    h.set_overlay_on_pane(0, HIDDEN_WALK_HANDLER, false);
-    for &handler in OVERLAY_CONTROL_ORDER {
-        if handler == HIDDEN_WALK_HANDLER {
+    h.set_overlay_on_pane(0, &HIDDEN_WALK_HANDLER, false);
+    for handler in OVERLAY_CONTROL_ORDER {
+        if *handler == HIDDEN_WALK_HANDLER {
             assert!(
                 !h.overlay_enabled_on(0, handler),
                 "precondition: {handler:?} walks its leg hidden, and nothing \
@@ -346,7 +346,7 @@ fn walk_settings(h: &mut InputHarness, width: WidthClass) {
 /// the modal above 600 pt, the sheet's Catalog page below it (M7's leg).
 ///
 /// The inventories are the models the renderer itself draws from: the
-/// compiled-in presets table, `OverlayKind::all()` under the registry's
+/// compiled-in presets table, the registry's own handler ids under its
 /// display names, `RadarProduct::all()` and `ModelParameter::all()` — never a
 /// restated name list, so a new product or parameter joins the audit by
 /// construction. User presets are deliberately absent: a fresh session has
@@ -361,10 +361,10 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     for preset in builtin_presets() {
         inventory.push((CatalogGroup::Presets, preset.name));
     }
-    for &kind in OverlayKind::all() {
+    for kind in rustdar_overlays::render::handlers::default_draw_order() {
         inventory.push((
             CatalogGroup::Overlays,
-            h.overlay_display_name(kind).to_owned(),
+            h.overlay_display_name(&kind).to_owned(),
         ));
     }
     for product in RadarProduct::all() {

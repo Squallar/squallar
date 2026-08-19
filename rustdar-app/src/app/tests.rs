@@ -1656,7 +1656,7 @@ fn silence_the_other_timers(app: &mut App) {
     for idx in 0..app.gui.remembered_pane_count() {
         let pane = app.gui.pane_mut(idx).expect("a remembered pane");
         for &kind in OverlayKind::all() {
-            pane.enabled_overlays.insert(kind, false);
+            pane.enabled_overlays.insert(kind.id(), false);
         }
     }
     assert_eq!(

@@ -525,7 +525,7 @@ pub struct Gui {
     /// The stack row being drag-reordered by its grip, if one is in flight.
     /// Session-only: a drag is a gesture, not a preference. The permute
     /// happens once, on release — see `ui_stack.rs`'s reorder note.
-    pub(super) stack_drag: Option<OverlayKind>,
+    pub(super) stack_drag: Option<rustdar_source::id::LayerId>,
     /// The pane whose pill row a first touch tap revealed, if any.
     /// Session-only: a reveal is a gesture in progress, not a preference.
     /// Cleared where the gestures that end it are resolved — a map click

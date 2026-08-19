@@ -12,8 +12,9 @@ use crate::ui_layout::{LayoutCtx, ModalityLatch};
 use chrono::{NaiveDateTime, Timelike};
 use egui::Context;
 use rustdar_overlays::fetch_policy::FetchHealth;
-use rustdar_overlays::render::overlay_state::{OverlayKind, OverlayRegistry};
+use rustdar_overlays::render::overlay_state::OverlayRegistry;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
+use rustdar_source::id::{LayerId, known};
 use rustdar_units::UserPreferences;
 use std::collections::HashMap;
 
@@ -297,7 +298,7 @@ impl Default for StatusBarProbe {
 /// and the three body arms dispatch on. `AppSettings` is the default and the
 /// state `✕` deselect returns to: it is the one body that is never about the
 /// active pane, so it is the one that can never be wrong about it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InspectorSelection {
     /// The app's own settings — units, location, GPS, storm motion.
     AppSettings,
@@ -305,7 +306,7 @@ pub(crate) enum InspectorSelection {
     /// kind-specific block.
     PaneProps,
     /// One layer's options, hosted by `render_overlay_controls_one`.
-    Layer(OverlayKind),
+    Layer(LayerId),
 }
 
 /// Radar fetch lifecycle state.
@@ -379,10 +380,10 @@ struct SectionAnchor {
 pub(crate) fn push_user_overlay_fetch(
     overlays: &mut OverlayRegistry,
     actions: &mut Vec<GuiAction>,
-    kind: OverlayKind,
+    kind: LayerId,
     pane_idx: usize,
 ) {
-    overlays.clear_retry(kind);
+    overlays.clear_retry(&kind);
     if !actions
         .iter()
         .any(|a| matches!(a, GuiAction::FetchOverlay { kind: k, .. } if *k == kind))
@@ -399,19 +400,19 @@ pub(crate) fn push_user_overlay_fetch(
 /// control must be reachable — which is why it is test-only now rather than
 /// deleted: a handler dropped from it would silently leave the audit.
 #[cfg(test)]
-pub(crate) const OVERLAY_CONTROL_ORDER: &[OverlayKind] = &[
-    OverlayKind::Radar,
-    OverlayKind::ModelData,
-    OverlayKind::SpcOutlook,
-    OverlayKind::SpcDiscussions,
-    OverlayKind::NwsAlerts,
-    OverlayKind::StormReports,
-    OverlayKind::Lightning,
-    OverlayKind::Metar,
-    OverlayKind::CityLabels,
-    OverlayKind::RadarSites,
-    OverlayKind::UserLocation,
-    OverlayKind::ColorScale,
+pub(crate) const OVERLAY_CONTROL_ORDER: &[LayerId] = &[
+    known::RADAR,
+    known::MODEL_DATA,
+    known::SPC_OUTLOOK,
+    known::SPC_DISCUSSIONS,
+    known::NWS_ALERTS,
+    known::STORM_REPORTS,
+    known::LIGHTNING,
+    known::METAR,
+    known::CITY_LABELS,
+    known::RADAR_SITES,
+    known::USER_LOCATION,
+    known::COLOR_SCALE,
 ];
 
 /// The label the open list puts against `value`, or the raw value for one the
@@ -472,7 +473,7 @@ pub(crate) struct DrawnControlItem {
     /// The handler whose tree this item came from. `Some` for every item the
     /// current renderer draws; an `Option` so a control drawn outside any
     /// handler's tree can share the probe when one exists.
-    pub handler: Option<OverlayKind>,
+    pub handler: Option<LayerId>,
     pub label: String,
     pub kind: DrawnControlKind,
     pub rect: egui::Rect,
@@ -530,9 +531,9 @@ fn render_pane_identity(ui: &mut egui::Ui, pane: &PaneState) {
 /// resulting [`ControlUpdate`]s into `updates`.
 fn render_control_item(
     ui: &mut egui::Ui,
-    kind: OverlayKind,
+    kind: &LayerId,
     item: &ControlItem,
-    updates: &mut Vec<(OverlayKind, ControlUpdate)>,
+    updates: &mut Vec<(LayerId, ControlUpdate)>,
     probe: &mut ControlProbe,
 ) {
     match item {
@@ -543,7 +544,7 @@ fn render_control_item(
             probe.record_item(kind, DrawnControlKind::Checkbox, label, response.rect);
             if response.changed() {
                 updates.push((
-                    kind,
+                    kind.clone(),
                     ControlUpdate {
                         id,
                         value: ControlValue::Bool(value),
@@ -581,7 +582,7 @@ fn render_control_item(
                     probe.record_item(kind, DrawnControlKind::Button, &btn.label, response.rect);
                     if response.clicked() {
                         updates.push((
-                            kind,
+                            kind.clone(),
                             ControlUpdate {
                                 id: btn.id,
                                 value: ControlValue::Action,
@@ -622,7 +623,7 @@ fn render_control_item(
             });
             if sel != original {
                 updates.push((
-                    kind,
+                    kind.clone(),
                     ControlUpdate {
                         id,
                         value: ControlValue::String(sel),
@@ -655,7 +656,7 @@ fn render_control_item(
             let _ = row;
             if (val - original).abs() > f64::EPSILON {
                 updates.push((
-                    kind,
+                    kind.clone(),
                     ControlUpdate {
                         id,
                         value: ControlValue::Float(val),
@@ -1143,7 +1144,7 @@ impl Gui {
         // Gated on it, a section or a volume pane converted while the toggle
         // happened to be off would have no way to choose a product at all — a
         // control that is simply absent, for a reason nothing on screen explains.
-        if pane.is_map() && !pane.is_overlay_enabled(OverlayKind::Radar) {
+        if pane.is_map() && !pane.is_overlay_enabled(&known::RADAR) {
             return;
         }
         // A whole-volume pane has no tilt to pick: it reads the entire ladder,
@@ -1295,22 +1296,21 @@ impl Gui {
     pub(super) fn write_pane_overlay(
         overlays: &mut OverlayRegistry,
         pane: &mut PaneState,
-        kind: OverlayKind,
+        kind: &LayerId,
         on: bool,
     ) {
         if !pane.overlay_configs.is_empty() {
             overlays.load_pane_configs(&pane.overlay_configs);
         }
         overlays.set_enabled(kind, on);
-        pane.overlay_configs = overlays.save_pane_configs();
-        pane.enabled_overlays = overlays.save_enabled_map();
+        pane.adopt_handler_state(overlays);
         // After the map is saved, not before: the reconciliation reads it.
         pane.release_disabled_overlay_textures();
     }
 
     /// [`Self::write_pane_overlay`] aimed at the active pane, for callers
     /// outside every `mem::take` window — the menu dispatcher, today.
-    fn set_active_pane_overlay(&mut self, kind: OverlayKind, on: bool) {
+    fn set_active_pane_overlay(&mut self, kind: &LayerId, on: bool) {
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
         Self::write_pane_overlay(&mut self.overlays, &mut pane, kind, on);
         self.panes[self.active_pane] = pane;
@@ -1318,8 +1318,8 @@ impl Gui {
 
     /// Select `kind`'s options in the inspector and make sure it is open —
     /// what a stack row click means (plan §3.8).
-    pub(super) fn select_layer(&mut self, kind: OverlayKind) {
-        self.insp_scroll_reset = self.inspector_sel != InspectorSelection::Layer(kind);
+    pub(super) fn select_layer(&mut self, kind: LayerId) {
+        self.insp_scroll_reset = self.inspector_sel != InspectorSelection::Layer(kind.clone());
         self.inspector_sel = InspectorSelection::Layer(kind);
         self.insp_open = true;
     }
@@ -1390,7 +1390,7 @@ impl Gui {
     /// before any pane is `mem::take`n, so reading the view through `self.panes`
     /// is safe here — see [`PaneContent`](crate::pane::PaneContent)'s module docs
     /// for why that is worth checking rather than assuming.
-    pub fn any_pane_has_overlay_enabled(&self, kind: OverlayKind) -> bool {
+    pub fn any_pane_has_overlay_enabled(&self, kind: &LayerId) -> bool {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
@@ -1402,7 +1402,7 @@ impl Gui {
     ///
     /// Panes with no ground to draw it on are skipped; see
     /// [`Self::any_pane_has_overlay_enabled`].
-    pub fn first_pane_with_overlay_enabled(&self, kind: OverlayKind) -> Option<usize> {
+    pub fn first_pane_with_overlay_enabled(&self, kind: &LayerId) -> Option<usize> {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
@@ -1549,7 +1549,7 @@ impl Gui {
             .filter(|(idx, _)| self.is_floor_source(*idx))
             .map(|(idx, pane)| {
                 // The basemap always, the label tiles only when the layer is on.
-                let layers = 1 + usize::from(pane.is_overlay_enabled(OverlayKind::CityLabels));
+                let layers = 1 + usize::from(pane.is_overlay_enabled(&known::CITY_LABELS));
                 let rect = self
                     .map_pane_geo
                     .get(&idx)
@@ -1856,7 +1856,7 @@ impl Gui {
     /// Pane `idx`'s dispatched kinds in paint order, with the layer each
     /// painted into — the draw-order pin's read side.
     #[cfg(test)]
-    pub(crate) fn paint_order_for_test(&self, idx: usize) -> Vec<(OverlayKind, egui::LayerId)> {
+    pub(crate) fn paint_order_for_test(&self, idx: usize) -> Vec<(LayerId, egui::LayerId)> {
         self.probes
             .last_paint_order
             .iter()
@@ -2448,9 +2448,10 @@ impl Gui {
         } else {
             None
         };
-        let overlays = OverlayKind::all()
-            .iter()
-            .filter_map(|&kind| self.overlay_poll_delay(kind))
+        let overlays = self
+            .overlays
+            .handlers()
+            .filter_map(|h| self.overlay_poll_delay(&h.id()))
             .min();
         [radar, overlays].into_iter().flatten().min()
     }

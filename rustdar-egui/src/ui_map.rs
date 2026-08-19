@@ -1,8 +1,8 @@
 use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_source::id::known;
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -117,7 +117,7 @@ impl super::Gui {
         let any_city_labels = self
             .panes()
             .iter()
-            .any(|p| p.draws_ground() && p.is_overlay_enabled(OverlayKind::CityLabels));
+            .any(|p| p.draws_ground() && p.is_overlay_enabled(&known::CITY_LABELS));
         if any_city_labels {
             self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
         }
@@ -1692,9 +1692,9 @@ impl super::Gui {
     /// edge is not — down here it would be painted into the ground in
     /// perspective, shrinking with distance and swinging round with the
     /// camera. The pane's glass is drawn on its own rect instead, by
-    /// [`Gui::draw_volume_glass`]. [`PaneSurface`](pane_render::PaneSurface)
-    /// is where the rule lives and `surface_of` is where every kind is
-    /// classified against it.
+    /// [`Gui::draw_volume_glass`]. The handler-declared
+    /// `rustdar_overlays::render::overlay_state::Surface` is where the rule
+    /// lives; `OverlayHandler::surface` classifies every layer against it.
     ///
     /// # Why a bare `Ui` rather than an `egui::Area`
     ///
@@ -1803,7 +1803,7 @@ impl super::Gui {
                     pane_rect: strip,
                     // Geography only. Everything down here is copied onto the
                     // floor, and chrome on a floor is chrome lying in the
-                    // grass — see `PaneSurface`. The pane's glass is painted
+                    // grass — see the handler-declared `Surface`. The pane's glass is painted
                     // by `draw_volume_glass`, on the pane's own rect.
                     surfaces: pane_render::PaneSurfaces::GroundOnly,
                     horizontal_color_scale,
@@ -1831,7 +1831,7 @@ impl super::Gui {
     /// [`GroundOnly`](pane_render::PaneSurfaces::GroundOnly). A 3D pane draws
     /// the same content a plan view does; it just draws it onto two surfaces
     /// instead of one, because only one of them is a floor. What belongs on
-    /// which is [`PaneSurface`](pane_render::PaneSurface), and this is the
+    /// which is the handler-declared `Surface`, and this is the
     /// list of everything on the glass side of it.
     ///
     /// Same helpers, same rects, same panel-wide orientation as a plan view —
@@ -1872,7 +1872,7 @@ impl super::Gui {
         pane: &crate::pane::PaneState,
     ) {
         let painter = ui.painter().with_clip_rect(pane_rect);
-        if pane.is_overlay_enabled(OverlayKind::ColorScale) {
+        if pane.is_overlay_enabled(&known::COLOR_SCALE) {
             pane_render::render_color_scales(
                 &painter,
                 pane_rect,
@@ -1890,7 +1890,7 @@ impl super::Gui {
         // layer for the same reason a map pane's is: the notice is produced
         // inside the Radar arm, and a pane with the radar switched off has no
         // image on screen to disown.
-        if pane.is_overlay_enabled(OverlayKind::Radar)
+        if pane.is_overlay_enabled(&known::RADAR)
             && let Some((on_screen, elevation)) = pane.stale_image_on_screen()
         {
             pane_render::draw_pending_render_notice(

@@ -10,9 +10,10 @@ use rustdar_kv::KvStore;
 /// existing configs keep loading.
 pub const UI_CONFIG_KEY: &str = "ui";
 
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_overlays::render::overlay_state::OverlayRegistry;
 use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::LayerId;
 use rustdar_units::UserPreferences;
 
 use super::PaneLayout;
@@ -73,14 +74,14 @@ struct PaneConfig {
     layer_link: bool,
     /// Visual stacking order for all map layers (bottom to top).
     ///
-    /// A [`KindList`], not a `Vec<OverlayKind>`: one kind name from a newer
+    /// A [`KindList`], not a bare `Vec`: one malformed entry from any build
     /// build used to fail this list, and with it the whole file. The unknown
     /// names ride in [`KindList::unknown`] and are written back on save.
     #[serde(default = "KindList::default_draw_order")]
     draw_order: KindList,
     /// Per-pane overlay enabled state (master visibility per overlay kind).
     ///
-    /// String-keyed on the wire: a `HashMap<OverlayKind, bool>` fails the
+    /// String-keyed on the wire: a typed-key map fails the
     /// *whole map* on one key it cannot name, which fails the whole file.
     /// Known keys are parsed on load; unknown ones ride in the pane's
     /// [`crate::pane::PaneConfigBaggage`] and are merged back on save. A
@@ -159,39 +160,40 @@ struct PaneConfig {
     unknown: serde_json::Map<String, serde_json::Value>,
 }
 
-/// A list of overlay kinds as it appears on the wire: the names this build
-/// can speak, plus — verbatim — the ones it cannot.
+/// A draw-order list as it appears on the wire: every layer id — a string
+/// entry names a layer whether or not this build has a handler for it —
+/// plus, verbatim, any list element that is not a string at all.
 ///
-/// A bare `Vec<OverlayKind>` refuses the whole list on the first name it
-/// does not know, and because `load_ui_config` used to have one `Result` for
-/// the whole file, one overlay kind from a newer build cost the user their
-/// entire configuration, permanently. Element-wise reading closes that: each
-/// name is tried alone, failures land in [`Self::unknown`] instead of in an
-/// error, and serialization writes the known names **through serde** — never
-/// `format!("{:?}")`, whose agreement with the wire spelling is a
-/// coincidence the spelling-pin test in rustdar-overlays merely holds in
-/// place — followed by the unknown values exactly as they arrived. A newer
-/// build reading the file back finds its kinds where it left them.
+/// Since M8b the ids are OPEN strings, so the old known/unknown partition of
+/// *names* is gone: a name from a newer build is an ordinary [`LayerId`] and
+/// rides IN [`Self::known`], keeping its position through load and save (the
+/// interleaved-position refinement the pre-M8b wrapper could not offer).
+/// Only a list element that is not a JSON string — malformed by every
+/// build's lights — lands in [`Self::unknown`], appended after the ids on
+/// the way back out. Serialization writes the ids **through serde** (a
+/// `LayerId` is `#[serde(transparent)]`, the bare string) — never
+/// `format!("{:?}")`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct KindList {
-    /// The kinds this build can name, in wire order.
-    pub(crate) known: Vec<OverlayKind>,
-    /// The list elements it cannot, verbatim and in wire order, appended
-    /// after the known ones on the way back out. (Interleaved positions are
-    /// not retained — M8's refinement; preservation is this type's bar.)
+    /// Every layer id in the list, in wire order — registered or not.
+    pub(crate) known: Vec<LayerId>,
+    /// The list elements that are not strings, verbatim, appended after the
+    /// ids on the way back out.
     pub(crate) unknown: Vec<serde_json::Value>,
 }
 
 impl KindList {
     /// The default draw order, wrapped — what a config with no `draw_order`
-    /// key reads as, exactly as before the wrapper existed.
+    /// key reads as: the registry weight order (M8b; byte-identical to the
+    /// pre-M8b `OverlayKind::all()` default — the weight pin holds them
+    /// equal).
     fn default_draw_order() -> Self {
-        Self::from(OverlayKind::default_draw_order())
+        Self::from(rustdar_overlays::render::handlers::default_draw_order())
     }
 }
 
-impl From<Vec<OverlayKind>> for KindList {
-    fn from(known: Vec<OverlayKind>) -> Self {
+impl From<Vec<LayerId>> for KindList {
+    fn from(known: Vec<LayerId>) -> Self {
         Self {
             known,
             unknown: Vec::new(),
@@ -225,18 +227,18 @@ impl<'de> Deserialize<'de> for KindList {
         let mut known = Vec::new();
         let mut unknown = Vec::new();
         for value in raw {
-            match OverlayKind::deserialize(&value) {
-                Ok(kind) => known.push(kind),
-                Err(_) => unknown.push(value),
+            match value {
+                serde_json::Value::String(name) => known.push(LayerId::new(name)),
+                other => unknown.push(other),
             }
         }
         if !unknown.is_empty() {
-            let names: Vec<String> = unknown.iter().map(ToString::to_string).collect();
+            let values: Vec<String> = unknown.iter().map(ToString::to_string).collect();
             log::warn!(
-                "config names {} overlay kind(s) this build does not know ({}); \
-                 keeping them for the build that does",
+                "draw_order carries {} non-string entr(y/ies) ({}); keeping \
+                 them verbatim for whatever wrote them",
                 unknown.len(),
-                names.join(", "),
+                values.join(", "),
             );
         }
         Ok(Self { known, unknown })
@@ -922,50 +924,12 @@ where
     }
 }
 
-/// The serde spelling of an `OverlayKind` — the name pane state and handler
-/// state are filed under on the wire.
-///
-/// Never `format!("{:?}")`: the `Debug` spelling only *happens* to agree
-/// with the wire today, and the spelling-pin test in rustdar-overlays
-/// (`handler_state_keys_are_the_twelve_debug_spellings_and_serde_agrees`) is
-/// what holds the two equal until the last `{:?}`-keyed site is gone. New
-/// code keys by this.
-fn overlay_kind_key(kind: OverlayKind) -> String {
-    match serde_json::to_value(kind) {
-        Ok(serde_json::Value::String(name)) => name,
-        // A fieldless enum variant serializes as its name, as a string, and
-        // serde_json has no I/O to fail on — nothing else can come back.
-        // Inventing a fallback spelling here would be a second copy free to
-        // disagree with the one already in the user's file.
-        _ => unreachable!("a fieldless OverlayKind variant serializes as a JSON string"),
-    }
-}
-
-/// The `OverlayKind` a wire key names, or `None` for one this build does
-/// not know — the caller carries those verbatim rather than dropping them.
-fn overlay_kind_from_key(name: &str) -> Option<OverlayKind> {
-    OverlayKind::deserialize(serde_json::Value::String(name.to_owned())).ok()
-}
-
-/// Merge entries carried for another build under the live ones: a name this
-/// build can serve is its live state's to describe, so a carried copy under
-/// the same name is stale by definition and is dropped with a warning rather
-/// than silently shadowing what the user is looking at.
-fn merge_carried<V>(
-    map: &mut BTreeMap<String, V>,
-    carried: &serde_json::Map<String, serde_json::Value>,
-    convert: impl Fn(&serde_json::Value) -> V,
-) {
-    for (name, value) in carried {
-        if map.contains_key(name) {
-            log::warn!(
-                "config carries \"{name}\" both as live state and as another \
-                 build's leftover; the live state wins"
-            );
-            continue;
-        }
-        map.insert(name.clone(), convert(value));
-    }
+/// The wire key a layer's state is filed under — the id string
+/// ([`LayerId::as_str`]), which is byte-identical to the pre-M8b serde
+/// spelling of `OverlayKind` (the spelling-pin test in rustdar-overlays
+/// holds them equal). Never `format!("{:?}")`.
+fn layer_key(id: &LayerId) -> String {
+    id.as_str().to_string()
 }
 
 impl Default for UiConfig {
@@ -1088,35 +1052,23 @@ impl super::Gui {
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
-                    // The live state plus whatever the load could not name,
-                    // in that precedence — see `PaneConfigBaggage`.
+                    // The live ids in place — an id with no handler rides in
+                    // `pane.draw_order` itself since M8b; the baggage half
+                    // carries only non-string residue (see `KindList`).
                     draw_order: KindList {
                         known: pane.draw_order.clone(),
                         unknown: pane.config_baggage.draw_order.clone(),
                     },
-                    enabled_overlays: {
-                        let mut map: BTreeMap<String, bool> = pane
-                            .enabled_overlays
-                            .iter()
-                            .map(|(&kind, &on)| (overlay_kind_key(kind), on))
-                            .collect();
-                        // By construction every carried value is a bool —
-                        // the load's partition only files bools here — so
-                        // the coercion cannot invent state.
-                        merge_carried(&mut map, &pane.config_baggage.enabled, |v| {
-                            v.as_bool().unwrap_or(false)
-                        });
-                        map
-                    },
-                    overlay_configs: {
-                        let mut map: BTreeMap<String, serde_json::Value> = pane
-                            .overlay_configs
-                            .iter()
-                            .map(|(&kind, val)| (overlay_kind_key(kind), val.clone()))
-                            .collect();
-                        merge_carried(&mut map, &pane.config_baggage.configs, Clone::clone);
-                        map
-                    },
+                    enabled_overlays: pane
+                        .enabled_overlays
+                        .iter()
+                        .map(|(id, &on)| (layer_key(id), on))
+                        .collect(),
+                    overlay_configs: pane
+                        .overlay_configs
+                        .iter()
+                        .map(|(id, val)| (layer_key(id), val.clone()))
+                        .collect(),
                     unknown: pane.config_baggage.fields.clone(),
                     // Same NaN guard as `loop_speed_fps` above, and for the same
                     // reason, stated there.
@@ -1448,62 +1400,61 @@ impl super::Gui {
             // the UI pass; `Gui::request_pane_view` exists for the writers *inside*
             // it, where the pane may be `mem::take`n.
             pane.set_content(restore_content(i, pc, count));
-            pane.draw_order = reconcile_draw_order(&pc.draw_order.known);
-            // Partition the string-keyed overlay maps into what this build
-            // can name — applied below — and what it cannot, which rides in
-            // the pane's baggage until the save writes it back. An unknown
-            // key used to fail the whole map, and with it the whole file.
-            let mut baggage = crate::pane::PaneConfigBaggage {
+            pane.draw_order = reconcile_draw_order(&pc.draw_order.known, &self.overlays);
+            // Every string key is an ordinary LayerId since M8b — an id with
+            // no registered handler rides IN the pane maps (applied to
+            // nothing, written back verbatim) instead of in a baggage
+            // sidecar. The baggage keeps only what no build could name: the
+            // non-string draw_order residue, and whole unknown pane fields.
+            pane.config_baggage = crate::pane::PaneConfigBaggage {
                 draw_order: pc.draw_order.unknown.clone(),
-                enabled: serde_json::Map::new(),
-                configs: serde_json::Map::new(),
                 fields: pc.unknown.clone(),
             };
-            let mut enabled_known: HashMap<OverlayKind, bool> = HashMap::new();
-            let mut configs_known: HashMap<OverlayKind, serde_json::Value> = HashMap::new();
-            let mut unknown_names: Vec<&str> = Vec::new();
-            for (name, &on) in &pc.enabled_overlays {
-                match overlay_kind_from_key(name) {
-                    Some(kind) => {
-                        enabled_known.insert(kind, on);
-                    }
-                    None => {
-                        unknown_names.push(name);
-                        baggage
-                            .enabled
-                            .insert(name.clone(), serde_json::Value::Bool(on));
-                    }
-                }
-            }
-            for (name, state) in &pc.overlay_configs {
-                match overlay_kind_from_key(name) {
-                    Some(kind) => {
-                        configs_known.insert(kind, state.clone());
-                    }
-                    None => {
-                        unknown_names.push(name);
-                        baggage.configs.insert(name.clone(), state.clone());
-                    }
-                }
-            }
-            if !unknown_names.is_empty() {
+            let enabled: HashMap<LayerId, bool> = pc
+                .enabled_overlays
+                .iter()
+                .map(|(name, &on)| (LayerId::new(name.clone()), on))
+                .collect();
+            let configs: HashMap<LayerId, serde_json::Value> = pc
+                .overlay_configs
+                .iter()
+                .map(|(name, state)| (LayerId::new(name.clone()), state.clone()))
+                .collect();
+            let unregistered: Vec<&str> = enabled
+                .keys()
+                .chain(configs.keys())
+                .filter(|id| self.overlays.handler_by_id(id).is_none())
+                .map(LayerId::as_str)
+                .collect();
+            if !unregistered.is_empty() {
                 log::warn!(
-                    "pane {i}'s config names overlay kind(s) this build does \
-                     not know ({}); keeping them for the build that does",
-                    unknown_names.join(", "),
+                    "pane {i}'s config names layer id(s) no handler serves \
+                     ({}); keeping them for the build that does",
+                    unregistered.join(", "),
                 );
             }
-            pane.config_baggage = baggage;
-            // Restore per-pane overlay enabled state. Gated on the *known*
-            // half: a map that names only kinds this build cannot serve says
-            // nothing about the ones it can, and must not blank their
-            // defaults.
-            if !enabled_known.is_empty() {
-                pane.enabled_overlays = enabled_known;
+            // Restore per-pane overlay enabled state. REPLACING gated on
+            // naming at least one REGISTERED id: a map that names only
+            // layers this build cannot serve says nothing about the ones it
+            // can, and must not blank their defaults — but its unregistered
+            // entries still land in the pane map either way, or the next
+            // save loses them (they have no other carrier since M8b).
+            if enabled
+                .keys()
+                .any(|id| self.overlays.handler_by_id(id).is_some())
+            {
+                pane.enabled_overlays = enabled;
+            } else {
+                pane.enabled_overlays.extend(enabled);
             }
             // Restore per-pane overlay handler configs, on the same gate.
-            if !configs_known.is_empty() {
-                pane.overlay_configs = configs_known;
+            if configs
+                .keys()
+                .any(|id| self.overlays.handler_by_id(id).is_some())
+            {
+                pane.overlay_configs = configs;
+            } else {
+                pane.overlay_configs.extend(configs);
             }
             zoom_restored |= restore_viewport(pane, pc);
         }
@@ -1531,7 +1482,7 @@ impl super::Gui {
         let handler_keys: std::collections::HashSet<String> = self
             .overlays
             .handlers()
-            .map(|h| overlay_kind_key(h.kind()))
+            .map(|h| layer_key(&h.id()))
             .collect();
         self.overlay_states_baggage = config
             .overlay_states
@@ -1547,7 +1498,8 @@ impl super::Gui {
         } else if let Some(enabled) = legacy_radar_enabled {
             // Migrating from legacy config: no overlay_states saved yet.
             // Apply the old per-pane Radar toggle to the global handler.
-            self.overlays.set_enabled(OverlayKind::Radar, enabled);
+            self.overlays
+                .set_enabled(&rustdar_source::id::known::RADAR, enabled);
         }
 
         // Fill in any overlay kinds not yet in per-pane enabled maps
@@ -2024,27 +1976,41 @@ fn sanitize_config_tree(value: &mut serde_json::Value) {
     }
 }
 
-/// Reconcile a saved draw order with the current set of known `OverlayKind` variants.
+/// Reconcile a saved draw order with the registered handlers.
 ///
-/// - Preserves the saved ordering for recognized variants.
-/// - Filters out any unknown/stale variants that no longer exist.
-/// - Appends any new variants (present in `default_draw_order` but missing from save)
-///   in their default relative order.
-fn reconcile_draw_order(saved: &[OverlayKind]) -> Vec<OverlayKind> {
-    let all_set: std::collections::HashSet<OverlayKind> =
-        OverlayKind::all().iter().copied().collect();
-
-    // Keep only recognized kinds, in saved order.
-    let mut result: Vec<OverlayKind> = saved
-        .iter()
-        .copied()
-        .filter(|k| all_set.contains(k))
+/// - Preserves the saved ordering — INCLUDING ids with no registered handler
+///   (M8b's deliberate change: the pre-M8b version filtered them out; an
+///   unknown id is retained in place and skipped at draw, so a newer build's
+///   layer keeps its position through a session under this build — the
+///   MysteryLayer fixture is the pin).
+/// - Inserts each registered-but-missing id at its weight position: before
+///   the first saved id whose handler weight is greater (unknown ids carry
+///   no weight and are skipped in that comparison); appended if none is.
+/// - An empty save therefore reconciles to exactly the registry weight
+///   order — the fresh-pane default.
+fn reconcile_draw_order(saved: &[LayerId], registry: &OverlayRegistry) -> Vec<LayerId> {
+    let mut result: Vec<LayerId> = saved.to_vec();
+    let mut registered: Vec<(LayerId, u32)> = registry
+        .handlers()
+        .map(|h| (h.id(), h.draw_order_weight()))
         .collect();
-
-    // Append any missing kinds (new variants added since save).
-    for &kind in OverlayKind::all() {
-        if !result.contains(&kind) {
-            result.push(kind);
+    registered.sort_by_key(|&(_, weight)| weight);
+    let weight_of = |id: &LayerId| {
+        registered
+            .iter()
+            .find(|(rid, _)| rid == id)
+            .map(|&(_, weight)| weight)
+    };
+    for (id, weight) in &registered {
+        if result.contains(id) {
+            continue;
+        }
+        let pos = result
+            .iter()
+            .position(|existing| weight_of(existing).is_some_and(|w| w > *weight));
+        match pos {
+            Some(pos) => result.insert(pos, id.clone()),
+            None => result.push(id.clone()),
         }
     }
     result

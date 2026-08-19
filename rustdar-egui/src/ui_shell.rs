@@ -67,7 +67,7 @@
 //! stored-state half of it.
 
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::{LayerId, known};
 
 use super::{InspectorSelection, PaneState};
 
@@ -256,7 +256,7 @@ impl super::Gui {
             self.overlays.load_pane_configs(&pane.overlay_configs);
         }
 
-        let statuses: Vec<(OverlayKind, Option<String>)> = if stack_slide > 0.0 {
+        let statuses: Vec<(LayerId, Option<String>)> = if stack_slide > 0.0 {
             self.stack_row_statuses(&pane)
         } else {
             Vec::new()
@@ -327,22 +327,19 @@ impl super::Gui {
     /// is read off the taken pane rather than asked of the registry. The
     /// caller must have loaded the pane's configs into the registry first;
     /// both the shell pass above and the sheet pass do.
-    pub(super) fn stack_row_statuses(
-        &self,
-        pane: &PaneState,
-    ) -> Vec<(OverlayKind, Option<String>)> {
+    pub(super) fn stack_row_statuses(&self, pane: &PaneState) -> Vec<(LayerId, Option<String>)> {
         if !pane.draws_map_layers() {
             return Vec::new();
         }
         pane.draw_order
             .iter()
-            .map(|&kind| {
-                let line = if kind == OverlayKind::Radar {
+            .map(|kind| {
+                let line = if *kind == known::RADAR {
                     radar_row_status(pane)
                 } else {
                     self.overlays.status_line(kind)
                 };
-                (kind, line)
+                (kind.clone(), line)
             })
             .collect()
     }
@@ -363,7 +360,7 @@ impl super::Gui {
 /// have the row name a cut the pane is not showing — the same reason
 /// `Gui::render_radar_controls` draws that pane no tilt picker.
 pub(super) fn radar_row_status(pane: &PaneState) -> Option<String> {
-    if !pane.is_overlay_enabled(OverlayKind::Radar) {
+    if !pane.is_overlay_enabled(&known::RADAR) {
         return None;
     }
     let (product, tilt) = pane

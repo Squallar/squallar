@@ -27,17 +27,18 @@ use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use std::time::Duration;
 
 /// The layer the storm was found on.
-const KIND: OverlayKind = OverlayKind::SpcDiscussions;
+const KIND: rustdar_source::id::LayerId = rustdar_source::id::known::SPC_DISCUSSIONS;
 
 /// A `Gui` with exactly one auto-polling layer on screen, so the attempt count
 /// is unambiguous.
 fn gui_with_only_discussions() -> Gui {
     let mut gui = Gui::new();
-    for &kind in OverlayKind::all() {
+    for kind in rustdar_overlays::render::handlers::default_draw_order() {
+        let on = kind == KIND;
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")
             .enabled_overlays
-            .insert(kind, kind == KIND);
+            .insert(kind, on);
     }
     gui
 }
@@ -58,9 +59,9 @@ fn failing_frame(gui: &mut Gui) -> usize {
             && kind == KIND
         {
             started += 1;
-            gui.overlays.set_fetching(kind, true);
+            gui.overlays.set_fetching(&kind, true);
             gui.overlays.apply_fetch_result(OverlayFetchResult {
-                kind: kind.id(),
+                kind,
                 data: OverlayRegistry::spc_discussions_failure_payload(FetchError::transient(
                     "SPC MD RSS request failed: connection refused",
                 )),
@@ -110,7 +111,7 @@ fn the_ladder_is_climbed_one_attempt_per_rung() {
     let mut gui = gui_with_only_discussions();
     let interval = gui
         .overlays
-        .auto_poll_interval(KIND)
+        .auto_poll_interval(&KIND)
         .expect("SPC discussions auto-poll; this test needs a layer that does");
 
     // The first attempt, and the failure that starts the ladder.
@@ -124,7 +125,7 @@ fn the_ladder_is_climbed_one_attempt_per_rung() {
 
         // A second short of the rung: still waiting.
         gui.overlays
-            .rewind_retry(KIND, Duration::from_secs(secs - 1));
+            .rewind_retry(&KIND, Duration::from_secs(secs - 1));
         assert_eq!(
             drive(&mut gui, 200),
             0,
@@ -133,7 +134,7 @@ fn the_ladder_is_climbed_one_attempt_per_rung() {
         );
 
         // The last second of it: exactly one attempt, however many frames run.
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(1));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(1));
         assert_eq!(
             drive(&mut gui, 200),
             1,
@@ -152,7 +153,7 @@ fn the_measured_storm_window_costs_six_attempts() {
     let mut gui = gui_with_only_discussions();
     let mut attempts = drive(&mut gui, 1);
     for _ in 0..105 {
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(1));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(1));
         attempts += drive(&mut gui, 1);
     }
     assert_eq!(
@@ -168,11 +169,11 @@ fn a_user_fetch_is_answered_immediately_however_deep_the_backoff() {
     drive(&mut gui, 1);
     // Climb to the ceiling.
     for secs in [2u64, 4, 8, 16, 32, 64] {
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(secs));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(secs));
         drive(&mut gui, 1);
     }
     let delay = gui
-        .overlay_poll_delay(KIND)
+        .overlay_poll_delay(&KIND)
         .expect("a failing layer is still owed an eventual poll");
     assert!(
         delay > Duration::from_secs(60),
@@ -190,7 +191,7 @@ fn a_user_fetch_is_answered_immediately_however_deep_the_backoff() {
         "pressing Refresh queued nothing",
     );
     assert_eq!(
-        gui.overlays.auto_fetch_delay(KIND),
+        gui.overlays.auto_fetch_delay(&KIND),
         Some(Duration::ZERO),
         "a user action left the layer waiting out its backoff",
     );
@@ -198,9 +199,9 @@ fn a_user_fetch_is_answered_immediately_however_deep_the_backoff() {
 
 /// Feed one refusal through the real ingest path.
 fn refuse(gui: &mut Gui) {
-    gui.overlays.set_fetching(KIND, true);
+    gui.overlays.set_fetching(&KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND.id(),
+        kind: KIND,
         data: OverlayRegistry::spc_discussions_failure_payload(FetchError::permanent(
             "SPC returned HTTP 400 for MD RSS feed",
         )),
@@ -221,14 +222,14 @@ fn one_refusal_leaves_the_layer_on_the_ordinary_ladder() {
     refuse(&mut gui);
 
     let delay = gui
-        .overlay_poll_delay(KIND)
+        .overlay_poll_delay(&KIND)
         .expect("one refusal must not end the schedule");
     assert!(
         delay <= Duration::from_secs(2),
         "a first refusal must sit on the first rung, not a long one: {delay:?}",
     );
     assert_eq!(drive(&mut gui, 200), 0, "premise: the rung has not elapsed");
-    gui.overlays.rewind_retry(KIND, Duration::from_secs(2));
+    gui.overlays.rewind_retry(&KIND, Duration::from_secs(2));
     assert_eq!(
         drive(&mut gui, 200),
         1,
@@ -245,12 +246,12 @@ fn a_run_of_refusals_drops_the_layer_to_a_heartbeat() {
     gui.check_auto_polls(&mut actions);
     for _ in 0..REFUSALS_BEFORE_BROKEN {
         refuse(&mut gui);
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(64));
     }
 
-    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(KIND).unwrap());
+    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(&KIND).unwrap());
     let delay = gui
-        .overlay_poll_delay(KIND)
+        .overlay_poll_delay(&KIND)
         .expect("broken is a slower poll, never a stopped one");
     assert!(
         delay > interval,
@@ -277,17 +278,17 @@ fn a_broken_layer_recovers_on_its_own_once_the_heartbeat_comes_due() {
     gui.check_auto_polls(&mut actions);
     for _ in 0..REFUSALS_BEFORE_BROKEN {
         refuse(&mut gui);
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(64));
     }
     assert!(
         gui.overlays
-            .fetch_health(KIND)
+            .fetch_health(&KIND)
             .is_some_and(FetchHealth::is_unhealthy),
         "premise: the layer is broken",
     );
 
     gui.overlays
-        .rewind_retry(KIND, Duration::from_secs(BROKEN_RETRY_SECS));
+        .rewind_retry(&KIND, Duration::from_secs(BROKEN_RETRY_SECS));
     let mut actions = Vec::new();
     gui.check_auto_polls(&mut actions);
     assert!(
@@ -299,13 +300,13 @@ fn a_broken_layer_recovers_on_its_own_once_the_heartbeat_comes_due() {
 
     // And the fetch it produced can clear the verdict, which is the property
     // the old `None` made unreachable.
-    gui.overlays.set_fetching(KIND, true);
+    gui.overlays.set_fetching(&KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND.id(),
+        kind: KIND,
         data: OverlayRegistry::spc_discussions_payload(Vec::new()),
     });
     assert_eq!(
-        gui.overlays.fetch_health(KIND),
+        gui.overlays.fetch_health(&KIND),
         Some(&FetchHealth::Ok),
         "a success on the heartbeat did not clear the verdict",
     );
@@ -320,14 +321,14 @@ fn refresh_revives_a_broken_layer_immediately() {
     gui.check_auto_polls(&mut actions);
     for _ in 0..REFUSALS_BEFORE_BROKEN {
         refuse(&mut gui);
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(64));
     }
     assert_eq!(drive(&mut gui, 500), 0, "premise: nothing automatic is due");
 
     let mut actions = Vec::new();
     push_user_overlay_fetch(&mut gui.overlays, &mut actions, KIND, 0);
     assert_eq!(
-        gui.overlays.auto_fetch_delay(KIND),
+        gui.overlays.auto_fetch_delay(&KIND),
         Some(Duration::ZERO),
         "Refresh must revive a layer that was given up on",
     );
@@ -351,24 +352,24 @@ fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
 
     // A layer with data on screen — the case the old guard skipped.
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND.id(),
+        kind: KIND,
         data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
     });
-    assert!(gui.overlays.has_data(KIND), "premise: something is drawn");
+    assert!(gui.overlays.has_data(&KIND), "premise: something is drawn");
 
     for _ in 0..REFUSALS_BEFORE_BROKEN {
         refuse(&mut gui);
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(64));
     }
     assert!(
-        gui.overlays.has_data(KIND),
+        gui.overlays.has_data(&KIND),
         "premise: the stale data is still on screen, which is the whole danger",
     );
 
     let mut actions = Vec::new();
     let mut pane = std::mem::take(gui.pane_mut(0).expect("a fresh Gui has one pane"));
-    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, false, &mut actions);
-    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, true, &mut actions);
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, &KIND, false, &mut actions);
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, &KIND, true, &mut actions);
     *gui.pane_mut(0).expect("one pane") = pane;
 
     assert!(
@@ -379,7 +380,7 @@ fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
          set stays frozen and the user has no other lever",
     );
     assert_eq!(
-        gui.overlays.fetch_health(KIND),
+        gui.overlays.fetch_health(&KIND),
         Some(&FetchHealth::Ok),
         "the toggle queued a fetch but left the ledger condemned, so the very \
          next automatic poll would still be on the heartbeat",
@@ -389,13 +390,13 @@ fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
     // spend a request on being switched on. This is what keeps a preset that
     // enables eight layers on four panes from being thirty-two requests.
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND.id(),
+        kind: KIND,
         data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
     });
     let mut actions = Vec::new();
     let mut pane = std::mem::take(gui.pane_mut(0).expect("one pane"));
-    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, false, &mut actions);
-    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, true, &mut actions);
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, &KIND, false, &mut actions);
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, &KIND, true, &mut actions);
     *gui.pane_mut(0).expect("one pane") = pane;
     assert!(
         !actions
@@ -439,16 +440,16 @@ fn an_absent_product_polls_at_the_ordinary_interval() {
     let mut gui = gui_with_only_discussions();
     let mut actions = Vec::new();
     gui.check_auto_polls(&mut actions);
-    gui.overlays.set_fetching(KIND, true);
+    gui.overlays.set_fetching(&KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND.id(),
+        kind: KIND,
         data: OverlayRegistry::spc_discussions_failure_payload(FetchError::absent(
             "SPC returned HTTP 404",
         )),
     });
 
-    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(KIND).unwrap());
-    let delay = gui.overlay_poll_delay(KIND).expect("still polling");
+    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(&KIND).unwrap());
+    let delay = gui.overlay_poll_delay(&KIND).expect("still polling");
     assert!(
         delay > interval - Duration::from_secs(2) && delay <= interval,
         "an absent product must resume the ordinary interval, not a backoff: {delay:?}",
@@ -466,18 +467,18 @@ fn a_success_clears_the_backoff() {
     let mut gui = gui_with_only_discussions();
     drive(&mut gui, 1);
     for secs in [2u64, 4, 8] {
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(secs));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(secs));
         drive(&mut gui, 1);
     }
 
-    gui.overlays.set_fetching(KIND, true);
+    gui.overlays.set_fetching(&KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND.id(),
+        kind: KIND,
         data: OverlayRegistry::spc_discussions_payload(Vec::new()),
     });
 
-    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(KIND).unwrap());
-    let delay = gui.overlay_poll_delay(KIND).expect("still polling");
+    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(&KIND).unwrap());
+    let delay = gui.overlay_poll_delay(&KIND).expect("still polling");
     assert!(
         delay > interval - Duration::from_secs(2) && delay <= interval,
         "a good answer must put the layer back on its interval: {delay:?}",
@@ -494,12 +495,12 @@ fn the_wake_and_the_poll_agree_on_a_failing_layer() {
     let mut gui = gui_with_only_discussions();
     drive(&mut gui, 1);
     for secs in [2u64, 4, 8, 16] {
-        let due = gui.overlay_poll_delay(KIND).expect("owed a poll");
+        let due = gui.overlay_poll_delay(&KIND).expect("owed a poll");
         assert_eq!(
             due.is_zero(),
             failing_frame(&mut gui) == 1,
             "the schedule and the gate disagree about whether a fetch is due",
         );
-        gui.overlays.rewind_retry(KIND, Duration::from_secs(secs));
+        gui.overlays.rewind_retry(&KIND, Duration::from_secs(secs));
     }
 }

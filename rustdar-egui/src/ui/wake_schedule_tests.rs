@@ -35,11 +35,11 @@ const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// one that has never been fetched is due *now* — a true answer, and the one
 /// the overlay test below is about, but not the one these are.
 fn only_the_radar_poll(gui: &mut Gui) {
-    for &kind in OverlayKind::all() {
+    for kind in rustdar_overlays::render::handlers::default_draw_order() {
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")
             .enabled_overlays
-            .insert(kind, false);
+            .insert(kind.clone(), false);
     }
 }
 
@@ -156,11 +156,11 @@ fn a_fetch_in_flight_yields_the_wake_to_whatever_ends_it() {
 /// while some pane on screen can draw it, and not otherwise.
 #[test]
 fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
-    let kind = OverlayKind::NwsAlerts;
+    let kind = rustdar_source::id::known::NWS_ALERTS;
     let mut gui = Gui::new();
     let interval = gui
         .overlays
-        .auto_poll_interval(kind)
+        .auto_poll_interval(&kind)
         .expect("NWS alerts auto-poll; this test needs a layer that does");
 
     // Nothing enables it, so nothing is owed — the old predicate answered
@@ -169,12 +169,15 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
     gui.pane_mut(0)
         .unwrap()
         .enabled_overlays
-        .insert(kind, false);
-    assert_eq!(gui.overlay_poll_delay(kind), None);
+        .insert(kind.clone(), false);
+    assert_eq!(gui.overlay_poll_delay(&kind), None);
 
-    gui.pane_mut(0).unwrap().enabled_overlays.insert(kind, true);
+    gui.pane_mut(0)
+        .unwrap()
+        .enabled_overlays
+        .insert(kind.clone(), true);
     assert_eq!(
-        gui.overlay_poll_delay(kind),
+        gui.overlay_poll_delay(&kind),
         Some(std::time::Duration::ZERO),
         "a layer that has never been fetched is due now"
     );
@@ -183,11 +186,11 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
     // the timer this reads is the one a real fetch would leave behind.
     gui.overlays.apply_fetch_result(
         rustdar_overlays::render::overlay_state::OverlayFetchResult {
-            kind: kind.id(),
+            kind: kind.clone(),
             data: OverlayRegistry::nws_alerts_payload(Vec::new()),
         },
     );
-    let delay = gui.overlay_poll_delay(kind).expect("still owed");
+    let delay = gui.overlay_poll_delay(&kind).expect("still owed");
     let interval = std::time::Duration::from_secs(interval);
     assert!(
         delay > interval - SLACK && delay <= interval,
@@ -195,9 +198,9 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
          not {delay:?}"
     );
 
-    gui.overlays.set_fetching(kind, true);
+    gui.overlays.set_fetching(&kind, true);
     assert_eq!(
-        gui.overlay_poll_delay(kind),
+        gui.overlay_poll_delay(&kind),
         None,
         "a refresh already in flight is being scheduled for a second time"
     );
