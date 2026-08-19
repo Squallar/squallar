@@ -5,7 +5,12 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use rustdar_source::id::{LayerId, known};
+use rustdar_source::id::LayerId;
+// Test-only since WO-M8c: the deleted layer enum's `id()` was this file's one
+// production use of the const registry. Handlers spell their own `known::`
+// const; this file only ever holds `LayerId`s handed to it.
+#[cfg(test)]
+use rustdar_source::id::known;
 use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_units::UserPreferences;
 
@@ -378,7 +383,9 @@ impl<T, S: RoundShape> OverlayState<T, S> {
     // `OverlayHandler::auto_fetch_delay`.
 }
 
-/// The draw loop dispatches on this rather than matching `OverlayKind`.
+/// How a layer gets onto the screen — declared by its handler
+/// ([`OverlayHandler::render_mode`]) and dispatched on by the draw loop, which
+/// therefore never needs to know *which* layer it is holding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
     /// Rasterized to RGBA on a background thread (SPC, NWS, Radar).
@@ -414,8 +421,8 @@ pub enum RenderMode {
 /// (`Gui::draw_floor_strip`) while its glass stays on the pane rect the volume
 /// occupies.
 ///
-/// Declared by the handler ([`OverlayHandler::surface`]) rather than matched
-/// over `OverlayKind` in the UI crate: a new layer does not compile until its
+/// Declared by the handler ([`OverlayHandler::surface`]) rather than decided
+/// layer-by-layer in the UI crate: a new layer does not compile until its
 /// author has said whether it is a picture of the world or chrome over one.
 /// That is what makes the split a stated rule rather than an `if` somebody
 /// happened to write in one arm — the previous spelling of it was no spelling
@@ -491,12 +498,12 @@ pub trait OverlayHandler: Send {
     /// This layer's position in the default draw order, **bottom to top** —
     /// a lower weight draws first and is occluded by higher ones.
     ///
-    /// The weights encode `OverlayKind::all()`'s order — the REAL default
-    /// draw order, which is neither the enum's declaration order nor
-    /// `create_handlers()`'s vec order (SpcOutlook sits BELOW Radar here;
-    /// the vec registers Radar second). The literal-list pin in
-    /// `registry_identity_tests` is what holds the weights to it. Spaced by
-    /// 10 so a future layer can sit between two without renumbering.
+    /// The weights are the ONE spelling of the default draw order, and it is
+    /// not `create_handlers()`'s registration order: SpcOutlook draws BELOW
+    /// Radar here, while the vec registers Radar second. The literal-list pin
+    /// in `registry_identity_tests` is what holds the weights to the order
+    /// users have always seen. Spaced by 10 so a future layer can sit between
+    /// two without renumbering.
     fn draw_order_weight(&self) -> u32;
 
     fn display_name(&self) -> &str;
@@ -990,8 +997,8 @@ impl OverlayRegistry {
     /// sorted by [`OverlayHandler::draw_order_weight`]. What a fresh pane
     /// starts from, and the order `reconcile_draw_order` inserts
     /// registered-but-missing ids by. The literal-list pin in
-    /// `registry_identity_tests` holds this to the historical
-    /// `OverlayKind::all()` order.
+    /// `registry_identity_tests` holds this to the order users have always
+    /// seen.
     pub fn default_draw_order(&self) -> Vec<LayerId> {
         let mut handlers: Vec<&dyn OverlayHandler> = self.handlers().collect();
         handlers.sort_by_key(|h| h.draw_order_weight());
@@ -1453,12 +1460,12 @@ impl OverlayRegistry {
 
     // ── Config persistence ────────────────────────────────────────────
 
-    /// Keyed by the layer id **string** ([`LayerId::as_str`]) — byte-identical
-    /// to the historical `Debug` spelling of `OverlayKind` these maps have
-    /// always been keyed by (the M8a spelling pin holds the two equal), so
-    /// every existing config file keeps matching. Renaming an id orphans its
-    /// saved state; the ledger is append-only for exactly that reason. Null
-    /// states are omitted.
+    /// Keyed by the layer id **string** ([`LayerId::as_str`]) — the exact
+    /// bytes these maps have always been keyed by, so every existing config
+    /// file keeps matching; `handler_state_keys_are_the_twelve_names_saved_configs_file_state_under`
+    /// pins the live ids against that literal twelve. Renaming an id orphans
+    /// its saved state; the ledger is append-only for exactly that reason.
+    /// Null states are omitted.
     pub fn serialize_handler_states(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut map = serde_json::Map::new();
         for h in &self.handlers {
@@ -1482,81 +1489,6 @@ impl OverlayRegistry {
                 h.deserialize_state(val.clone());
             }
         }
-    }
-}
-
-// ── Generic overlay kind ─────────────────────────────────────────────────
-
-/// Each map layer in the per-pane draw order. Also a `HashMap` key for the
-/// per-pane texture caches, and serialized by its `Debug` spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum OverlayKind {
-    ModelData,
-    SpcOutlook,
-    SpcDiscussions,
-    NwsAlerts,
-    StormReports,
-    Lightning,
-    Metar,
-    Radar,
-    CityLabels,
-    RadarSites,
-    UserLocation,
-    ColorScale,
-}
-
-impl OverlayKind {
-    /// **This order is the default draw order, bottom to top** — it is not the
-    /// declaration order above and reordering it changes what occludes what.
-    pub const fn all() -> &'static [OverlayKind] {
-        &[
-            OverlayKind::ModelData,
-            OverlayKind::SpcOutlook,
-            OverlayKind::Radar,
-            OverlayKind::SpcDiscussions,
-            OverlayKind::NwsAlerts,
-            OverlayKind::StormReports,
-            OverlayKind::Lightning,
-            OverlayKind::Metar,
-            OverlayKind::CityLabels,
-            OverlayKind::RadarSites,
-            OverlayKind::UserLocation,
-            OverlayKind::ColorScale,
-        ]
-    }
-
-    pub fn default_draw_order() -> Vec<OverlayKind> {
-        Self::all().to_vec()
-    }
-
-    /// The M8a bridge: this variant's open-string identity. Each arm hands
-    /// out the [`known`] const whose spelling equals the variant's `Debug`
-    /// spelling — the equality the spelling-pin test below holds, and the
-    /// reason M8's enum-to-string flip needs no config migration.
-    pub fn id(self) -> LayerId {
-        match self {
-            Self::ModelData => known::MODEL_DATA,
-            Self::SpcOutlook => known::SPC_OUTLOOK,
-            Self::SpcDiscussions => known::SPC_DISCUSSIONS,
-            Self::NwsAlerts => known::NWS_ALERTS,
-            Self::StormReports => known::STORM_REPORTS,
-            Self::Lightning => known::LIGHTNING,
-            Self::Metar => known::METAR,
-            Self::Radar => known::RADAR,
-            Self::CityLabels => known::CITY_LABELS,
-            Self::RadarSites => known::RADAR_SITES,
-            Self::UserLocation => known::USER_LOCATION,
-            Self::ColorScale => known::COLOR_SCALE,
-        }
-    }
-
-    /// The bridge's other direction: the variant whose [`Self::id`] equals
-    /// `id`, or `None` for an id no variant owns (open strings admit ids the
-    /// enum never will — callers keep unknowns, they don't invent variants).
-    /// Scans [`Self::all`] rather than matching a second literal spelling
-    /// table: `id()` stays the one enum-to-string spelling site.
-    pub fn from_id(id: &LayerId) -> Option<Self> {
-        Self::all().iter().copied().find(|kind| &kind.id() == id)
     }
 }
 
@@ -2514,12 +2446,16 @@ mod registry_identity_tests {
     /// `draw_order_weight` yields EXACTLY the historical default draw order,
     /// bottom to top, spelled out as literals.
     ///
-    /// Three orders exist in this crate and only this one is the draw order:
-    /// the enum's declaration order differs (SpcDiscussions before Radar),
-    /// and `create_handlers()`'s vec order differs (Radar second). The
-    /// weights encode `OverlayKind::all()`'s order — SpcOutlook BELOW Radar —
-    /// and this literal list is the pin that keeps a weight edit from
-    /// silently reordering what occludes what on every user's map.
+    /// Two orders exist in this crate and only this one is the draw order:
+    /// `create_handlers()`'s vec order differs (it registers Radar second,
+    /// while the draw order puts SpcOutlook BELOW Radar). This literal list
+    /// is the pin that keeps a weight edit from silently reordering what
+    /// occludes what on every user's map.
+    ///
+    /// Since WO-M8c it is also the anti-swap pin: weights are unique and each
+    /// id is pinned to its weight's position, so two handlers exchanging ids
+    /// move both in this list. Nothing else can see that swap — the second,
+    /// independent spelling of a handler's identity died with the layer enum.
     #[test]
     fn draw_order_weights_encode_the_default_draw_order() {
         let mut handlers = create_handlers();
@@ -2558,55 +2494,70 @@ mod registry_identity_tests {
     }
 }
 
+/// The closed enum of layer kinds stays deleted (WO-M8c).
+///
+/// It was the twelve-variant `enum` this file declared until M8c: a closed
+/// set that every consumer matched on, which is why adding a layer used to
+/// mean editing the UI crate, the dispatch and the config codec together. A
+/// layer's whole identity is now one open `LayerId` string, the registry is
+/// keyed by it, and the rigor the compiler used to supply — no duplicate
+/// variants, a fixed draw order, a spelling nothing can typo — is supplied
+/// instead by `registry_identity_tests` (`no_two_handlers_share_an_id`,
+/// `every_handlers_id_sits_in_the_ledger`,
+/// `draw_order_weights_encode_the_default_draw_order`).
+///
+/// This scrape is what stops the enum growing back here. It replaces the
+/// campaign's `KIND_MAX` occurrence ceiling (`rustdar-app/tests/
+/// arch_ratchets.rs`, row 5a), retired in the same land: a ceiling that can
+/// only be zero is an absence assertion wearing a number.
+///
+/// Needle hygiene, per the E0c discipline: both needles are built from split
+/// literals, so this module never contains contiguously what it searches for
+/// and the scrape cannot pass by matching its own source. The presence
+/// control is split for the same reason — an anchor spelled contiguously here
+/// would still be found after the trait itself moved away, which is a control
+/// that cannot fail.
 #[cfg(test)]
-mod layer_id_bridge_tests {
-    use rustdar_source::id::LAYER_ID_LEDGER;
+mod overlay_kind_stays_deleted_tests {
+    /// This file, read at compile time — the same self-scrape pattern as
+    /// `handlers::round_delivery_tests::every_handler_module_is_on_the_delivery_list`.
+    const OVERLAY_STATE: &str = include_str!("overlay_state.rs");
 
-    use super::OverlayKind;
+    /// The declaration that must never reappear.
+    const KIND_DEF: &str = concat!("enum Overlay", "Kind");
+    /// The type's bare name — the needle the retired `KIND_MAX` ceiling
+    /// counted, now asserted at zero for this file.
+    const KIND_NAME: &str = concat!("Overlay", "Kind");
+    /// Presence control: the trait whose implementors ARE the layer set, so
+    /// the scrape is demonstrably reading the file that would host the enum.
+    /// M9 renames this to `SourceHandler` and moves it to rustdar-source —
+    /// that land re-anchors this control rather than deleting it.
+    const TRAIT_ANCHOR: &str = concat!("pub trait Overlay", "Handler");
 
-    /// Test group 1 (spelling pin): every variant's `LayerId` is its own
-    /// `Debug` spelling, byte for byte — **THE zero-config-migration proof**.
-    /// Configs key on the Debug spellings today (the E0a corpus pins them);
-    /// M8b re-keys on `id().as_str()`; this equality is why nothing in any
-    /// user's file moves. A red here means a `known` const drifted from its
-    /// variant — fix the const, never the enum.
     #[test]
-    fn every_kinds_id_is_its_own_debug_spelling() {
-        assert_eq!(OverlayKind::all().len(), 12);
-        for &kind in OverlayKind::all() {
-            assert_eq!(
-                kind.id().as_str(),
-                format!("{kind:?}"),
-                "the known const for {kind:?} does not spell the Debug name — \
-                 M8b's re-key would orphan this layer's saved state",
-            );
-        }
-    }
+    fn the_overlay_kind_enum_stays_deleted() {
+        // Presence control first: an empty or moved haystack must fail here,
+        // never pass the absence checks below by reading nothing.
+        assert!(
+            OVERLAY_STATE.contains(TRAIT_ANCHOR),
+            "control: overlay_state.rs no longer declares {TRAIT_ANCHOR:?}, so \
+             the absence checks below are reading the wrong file — re-anchor \
+             this ratchet in the land that moved the trait",
+        );
 
-    /// Test group 2 (round-trip): the bridge inverts — `from_id(id())`
-    /// answers the variant it came from, for all twelve.
-    #[test]
-    fn the_bridge_round_trips_every_variant() {
-        for &kind in OverlayKind::all() {
-            assert_eq!(
-                OverlayKind::from_id(&kind.id()),
-                Some(kind),
-                "from_id(id()) failed to invert for {kind:?}",
-            );
-        }
-    }
-
-    /// Test group 3's bridge half: every variant's id appears in the
-    /// append-only ledger — the enum cannot register a spelling the ledger
-    /// does not carry.
-    #[test]
-    fn every_variants_id_sits_in_the_ledger() {
-        for &kind in OverlayKind::all() {
-            assert!(
-                LAYER_ID_LEDGER.contains(&kind.id().as_str()),
-                "{kind:?}'s id is missing from LAYER_ID_LEDGER — ledger rows \
-                 are append-only and this one was never appended",
-            );
-        }
+        assert!(
+            !OVERLAY_STATE.contains(KIND_DEF),
+            "overlay_state.rs declares `{KIND_DEF}` again. The closed layer \
+             enum was deleted at WO-M8c: a layer's identity is an open \
+             `LayerId` string, and a closed set here forces every consumer to \
+             match on it again. Register the layer's handler and append its \
+             spelling to `LAYER_ID_LEDGER` instead.",
+        );
+        assert!(
+            !OVERLAY_STATE.contains(KIND_NAME),
+            "overlay_state.rs names `{KIND_NAME}` again — the deleted layer \
+             enum. Nothing should reference it, including prose: it no longer \
+             exists to be read.",
+        );
     }
 }
