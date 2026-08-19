@@ -8,7 +8,7 @@ use crate::render::overlay_state::{
 };
 
 /// Toggle and config state only. Radar fetching, rendering and per-frame
-/// decorations live in `rustdar-platform` and `rustdar-egui`; this exists so
+/// decorations live in the `rustdar` crate and `rustdar-egui`; this exists so
 /// radar's toggle lives with every other layer's.
 pub(crate) struct RadarHandler {
     pub enabled: bool,

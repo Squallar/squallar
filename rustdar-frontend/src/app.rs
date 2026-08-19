@@ -1044,7 +1044,7 @@ impl App {
         // A resize is also the only signal available that a *layout* has
         // happened, which is what `getRootWindowInsets` needs before it has
         // anything but the previous frame's numbers to return; see
-        // `rustdar_android::get_system_insets`.
+        // `rustdar_native::android::insets::get_system_insets`.
         //
         // Only on a real size. Android cannot distinguish a failed read from a
         // genuine zero -- `get_system_insets` collapses every JNI failure,
@@ -3319,7 +3319,8 @@ impl App {
     /// [`PlatformBridge::set_location_hooks`]).
     ///
     /// The entry point installs these, not `App`, for the reason every other
-    /// setter here exists: they are JNI calls that live in `rustdar-android`,
+    /// setter here exists: they are JNI calls that live in the `rustdar`
+    /// crate's cfg(android) modules,
     /// which depends on this crate and can never be called from it. Handing
     /// them over before `run_app` is what closes the window in which
     /// `AndroidPlatform` answers `Unavailable` for want of them — a terminal

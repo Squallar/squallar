@@ -7,7 +7,7 @@
 //! app quit" to "where does config go" arrives through it. The three
 //! constructors below are named after the bridges they imitate, and their
 //! answers are taken from those bridges rather than invented — see
-//! `rustdar-platform`'s `platform.rs` and `rustdar-web`'s `bridge.rs`.
+//! the `rustdar` crate's `platform.rs` and `rustdar-web`'s `bridge.rs`.
 //!
 //! # Why it records in fields rather than in a call log
 //!

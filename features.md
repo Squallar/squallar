@@ -223,7 +223,7 @@ exists so the fetch can start immediately. Nothing notifies the user of weather.
 | Open API for developers     | ❌         | ❌           | Paid  | ❌                 |
 | GR2Analyst placefile compat | ✅         | ❌           | ❌    | ❌                 |
 
-- **Mobile** is Partial: Android ships (`rustdar-android`), and iOS builds an
+- **Mobile** is Partial: Android ships (the `rustdar` crate's android arm), and iOS builds an
   `.ipa` in CI (`packaging/ios/Makefile`, the `ios-aarch64` row of `build.yaml`), but it
   is unsigned and undistributed.
 - **Multi-pane** is up to six panes on desktop and four on mobile

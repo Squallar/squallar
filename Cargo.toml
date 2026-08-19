@@ -1,14 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "rustdar-platform",
+    "rustdar",
     "rustdar-frontend",
     "rustdar-device-profile",
     "rustdar-worker",
     "rustdar-gpu",
     "rustdar-volumetric",
     "rustdar-web",
-    "rustdar-android",
     "rustdar-egui",
     "rustdar-radar",
     "rustdar-overlays",
@@ -55,7 +54,6 @@ rustdar-geo = { path = "rustdar-geo" }
 rustdar-gpu = { path = "rustdar-gpu" }
 rustdar-kv = { path = "rustdar-kv" }
 rustdar-overlays = { path = "rustdar-overlays" }
-rustdar-platform = { path = "rustdar-platform" }
 rustdar-radar = { path = "rustdar-radar" }
 rustdar-source = { path = "rustdar-source" }
 rustdar-units = { path = "rustdar-units" }
@@ -224,7 +222,8 @@ nexrad-data = { path = "vendor/nexrad-data" }
 # attached on purpose.
 #
 # Not a rounding error, and the reason this is worth a setting:
-# `target/debug/rustdar-platform` was 604,417,120 bytes, of which 538,194,467
+# `target/debug/` app binary (the platform crate, renamed `rustdar` at the
+# fold) was 604,417,120 bytes, of which 538,194,467
 # was DWARF and 25,730,465 was `.text`. Nine tenths of the file described a
 # program that is one twentieth of it. With line tables the same binary is
 # 234,889,824 bytes.
@@ -248,7 +247,8 @@ debug = "line-tables-only"
 # during development and `target/` is under no size budget. `2` is the same
 # pass pipeline at the inlining and vectorization thresholds that make it fast.
 # It is not a compile-time regression either: with both settings in place a
-# cold dev build of `rustdar-platform` — all 449 crates — went 44.6 s to 38.4 s,
+# cold dev build of the app crate (`rustdar` today) — all 449 crates —
+# went 44.6 s to 38.4 s,
 # because the debug info that no longer has to be emitted and linked costs more
 # than the extra optimization does.
 [profile.dev.package."*"]

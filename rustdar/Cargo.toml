@@ -1,24 +1,38 @@
 [package]
-name = "rustdar-platform"
+name = "rustdar"
 version.workspace = true
 edition.workspace = true
 
+# The Android APK is built by Gradle, from `packaging/android/` -- package name,
+# SDK levels, theme, permissions, configChanges, signing all live in its
+# `app/build.gradle.kts` and `app/src/main/AndroidManifest.xml`.
+# Build with:  cd packaging/android && ./gradlew assembleRelease
+
 [[bin]]
-name = "rustdar-platform"
+name = "rustdar"
 path = "src/main.rs"
 
 [lib]
-# The `_lib` suffix keeps the lib name from colliding with the bin name, which
-# only breaks on Windows: https://github.com/rust-lang/cargo/issues/8519
-name = "rustdar_platform_lib"
-# rlib only. Adding `cdylib` makes cargo-ndk emit and copy
-# librustdar_platform_lib.so into jniLibs -- a dead 1.8 MB per ABI.
+# `rustdar_native`, not `rustdar`: the bin above already owns that name, and a
+# lib sharing it collides on Windows (https://github.com/rust-lang/cargo/issues/8519).
+# The pre-rename lib name's `_lib` suffix guarded the same collision; with
+# the rename the two names differ structurally, so no suffix convention is
+# needed.
+name = "rustdar_native"
+# `cdylib` beside `rlib` because the cdylib IS the Android app: cargo-ndk ships
+# it as `librustdar_native.so`, the library `android.app.lib_name` in
+# packaging/android's manifest names and NativeActivity dlsym()s `android_main`
+# out of. ACCEPTED COST (fold-in ruling, WO-RP-2): desktop
+# `--workspace --all-targets` rows now also emit a dead .so/.dll/.dylib,
+# ~1.8 MB per ABI -- exactly what the pre-fold comment here predicted when it
+# kept the list rlib-only.
 #
-# iOS needs a `staticlib` to link the .app against, but adding it here would
+# iOS is unaffected: it needs a `staticlib`, and `packaging/ios/Makefile` asks
+# for that per-build with `cargo rustc --crate-type staticlib`, which REPLACES
+# this list rather than appending to it. Adding `staticlib` here instead would
 # archive the whole graph on every desktop build and every `--all-targets`
-# clippy run too. `packaging/ios/Makefile` asks for it per-build with
-# `cargo rustc --crate-type staticlib` instead.
-crate-type = ["rlib"]
+# clippy run.
+crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
@@ -27,6 +41,13 @@ rustdar-egui = { workspace = true }
 rustdar-kv = { workspace = true }
 # The domain vocabulary (Fix, LocationPermission). `serial` is requested per target below.
 rustdar-location = { workspace = true }
+# `GeoPoint`, which the android module's fix literal spells
+# (`src/android/location.rs`). Unconditional rather than android-gated: the
+# crate is already in every one of this package's graphs via rustdar-frontend,
+# so gating it would buy nothing but a second copy of the `jni-typecheck`
+# feature plumbing. (Import-forced; the fold order's dep list predates
+# WO-RL-1's `point: rustdar_geo::GeoPoint` re-type.)
+rustdar-geo = { workspace = true }
 iana-time-zone = { workspace = true }
 log = { workspace = true }
 pollster = { workspace = true }
@@ -37,6 +58,72 @@ env_logger = "=0.11.11"
 # Both only for src/network_security_config.rs, which is `#[cfg(test)]`.
 rustdar-radar = { workspace = true }
 walkers = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "=0.15.1"
+# The JNI layer in `src/android/`. NB: no `ndk-context`. That module tree
+# deliberately does not use it -- android-activity 0.6 registers
+# `Activity.getApplication()` as the ndk_context "context" (0.5 registered the
+# Activity), and `getWindow`, `moveTaskToBack` and `requestPermissions` are all
+# Activity-only: reached through the Application they silently do nothing.
+# `android_main` has the real Activity and stashes a global ref to it; see the
+# `JAVA` static in src/android/mod.rs.
+jni = { workspace = true }
+# MUST stay on the major that reqwest resolves. reqwest 0.13.4 accepts
+# `rustls-platform-verifier >=0.6.0, <0.8.0`, so 0.7.0 is the single copy today.
+# Pinning this away from what reqwest resolves does not replace the verifier --
+# it adds a second copy. `android::init_with_env` would then initialize one
+# instance while every reqwest client keeps reading the other, uninitialized one,
+# and Android TLS setup silently becomes a no-op. Nothing fails at build time;
+# the first symptom is an HTTPS request failing on-device, which is exactly the
+# api.weather.gov path the Network Security Config in `packaging/android/`
+# exists to keep working. `cargo tree -i rustls-platform-verifier` must show
+# exactly one root.
+#
+# The jni pin travels with it (0.7.x wants jni ^0.22) and is equally not to be
+# taken alone -- see the `jni` entry in the workspace Cargo.toml. Both halves
+# landed together in c213e46 + 634bfad; the `dep-unification` row in
+# `.github/workflows/build.yaml` now guards the split.
+#
+# Its Kotlin half ships as an AAR inside the `rustls-platform-verifier-android`
+# crate's registry checkout; `packaging/android/app/build.gradle.kts` locates
+# that via `cargo metadata` and adds it as a Maven repo.
+rustls-platform-verifier = "=0.7.0"
+# A target-gated FEATURE addition on the normal `winit` dep above.
+# native-activity, deliberately, not game-activity. GameActivity exists to provide
+# mobile text input, which rustdar has none of, and it forces an AppCompat theme --
+# which changes what getRootWindowInsets() reports, shifting the map's
+# excluded_rects and breaking click hit-testing against overlays. It would also add
+# a C++ build. Both backends hand `android_main` the same `AndroidApp`, so the
+# Activity the JNI bridges reach through works either way; there is simply
+# nothing to gain.
+winit = { workspace = true, features = ["android-native-activity"] }
+
+# Host-only, opt-in copy of the one dependency the JNI helpers need that is not
+# already unconditional here. See the `jni-typecheck` feature below.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+jni = { workspace = true, optional = true }
+
+[features]
+# Type-check the JNI layer on the *host*, with no NDK and no C toolchain.
+#
+# Everything in `src/android/` is behind `cfg(target_os = "android")` at the
+# module mount in lib.rs, so a host `cargo check` compiles none of it -- which
+# is how the jni 0.21->0.22 break once shipped green through Build, Clippy and
+# Test. This feature widens that cfg so every android module *except*
+# `android::entry` (which names winit's AndroidApp) compiles for the host,
+# inside the full app graph, where rustc checks each `env.call_method`,
+# `jni_sig!` and pointer wrap against the real jni API in seconds:
+#
+#     cargo check -p rustdar --features jni-typecheck
+#
+# One dep to add and nothing else: `jni` 0.22 is `default = []` and pure Rust,
+# and everything else the android modules read -- log, rustdar-location,
+# rustdar-geo, rustdar-frontend -- is already an unconditional dependency of
+# this crate since the fold. It does not replace the cargo-ndk job:
+# `android_main`, the winit Android backend and the linked `.so` are still only
+# exercised there.
+jni-typecheck = ["dep:jni"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The OS location provider in `src/os_location/windows.rs`.
@@ -101,7 +188,8 @@ objc2-core-location = { version = "=0.3.2", default-features = false, features =
 ] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-# Android's theme is a JNI call injected by `rustdar-android`. iOS is excluded
+# Android's theme is a JNI call injected by the android module
+# (`src/android/theme.rs`). iOS is excluded
 # because `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally *and*
 # returns `Mode`, not `Result<Mode>`, so it does not even typecheck here.
 dark-light = "=2.0.0"
@@ -127,7 +215,7 @@ rustdar-nmea-serial = { workspace = true, features = ["serial"] }
 # and test rows, and adding a tokio runtime to a crate that starts no runtime.
 # `async-std` selects `zbus/async-io`, which is what is already compiled.
 #
-# Measured, with `cargo tree -p rustdar-platform --target
+# Measured, with `cargo tree -p rustdar --target
 # x86_64-unknown-linux-gnu -e normal -f "{p} {f}"`: the graph is 437 packages
 # before and after with an identical set, and zbus's own features **shrink**
 # from `…,blocking,blocking-api,default,url` to `…,blocking,url`. Naming zbus

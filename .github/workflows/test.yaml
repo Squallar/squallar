@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system deps
         # libudev-dev for the same reason the `test` job needs it:
-        # rustdar-platform enables rustdar-nmea-serial/serial unconditionally off
+        # the rustdar crate enables rustdar-nmea-serial/serial unconditionally off
         # Android and iOS. mesa-vulkan-drivers is what carries lavapipe.
         run: |
           sudo apt-get update
@@ -74,7 +74,7 @@ jobs:
         with:
           key: gpu
       # No `--all-features` on either step below, and not an oversight: the only
-      # feature it adds on Linux is rustdar-android's `jni-typecheck`, which is
+      # feature it adds on Linux is rustdar's `jni-typecheck`, which is
       # the `test` job's reason for the flag and builds nothing this job runs.
       #
       # `--nocapture` is load-bearing. Each test binary prints the adapter it
@@ -177,21 +177,21 @@ jobs:
           rustup default stable
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov --locked --version ^0.8
-      # `--all-features` is the only reason `rustdar-android`'s tests exist
-      # here. That crate is `#![cfg(any(target_os = "android", feature =
-      # "jni-typecheck"))]`, so without the flag it compiles to an empty lib and
-      # its test binary still runs, still passes, and reports `0 tests` -- a
-      # green row that covered nothing, and green is why nobody looked. Build
-      # and Clippy have been passing `--all-features` for their own reasons the
-      # whole time, so the JNI layer was compiled and linted on every PR and
-      # never once executed. It is worth nine tests today: the permission
-      # tri-state decision table, the provider -> FixQuality mapping and
-      # activity-reachability.
+      # `--all-features` is the only reason the `rustdar` package's android
+      # module tests exist here. That module tree is mounted `#[cfg(any(
+      # target_os = "android", feature = "jni-typecheck"))]`, so without the
+      # flag none of it compiles on a host -- a green row that covered nothing,
+      # and green is why nobody looked, is exactly how the jni 0.21->0.22 break
+      # once shipped. Build and Clippy have been passing `--all-features` for
+      # their own reasons the whole time, so the JNI layer was compiled and
+      # linted on every PR and never once executed. It is worth nine tests
+      # today: the permission tri-state decision table, the provider ->
+      # FixQuality mapping and activity-reachability.
       #
       # Cheap here in a way it is not on the cross rows in build.yaml:
       # `jni-typecheck` is the only feature this actually adds on Linux. The
       # workspace's other two, rustdar-nmea-serial/serial and rustdar-egui/gps-serial,
-      # rustdar-platform already enables unconditionally for
+      # the rustdar crate already enables unconditionally for
       # `cfg(not(any(target_os = "android", target_os = "ios")))` -- which is
       # what the libudev-dev above is for, with or without this flag.
       - name: Run tests
@@ -203,7 +203,7 @@ jobs:
       # Adding it to match the step above fails this job on the first run. It
       # needs none of them: it re-reads the .profraw and the object files that
       # step left in target/llvm-cov-target, so it already reports exactly what
-      # ran -- rustdar-android/src/lib.rs included.
+      # ran -- rustdar/src/android/ included.
       - name: Generate coverage reports
         if: always()
         run: |

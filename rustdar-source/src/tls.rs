@@ -74,7 +74,7 @@ pub fn init() {}
 /// `https_only` is set here, not per call site: on Android it removes cleartext
 /// as a downgrade target for the plain-HTTP CRL and OCSP URLs embedded in the
 /// certificates we talk to (see
-/// `rustdar-android/android/network_security_config.xml`).
+/// `packaging/android/app/src/main/res/xml/network_security_config.xml`).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn client(user_agent: &str, timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();

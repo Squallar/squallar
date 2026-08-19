@@ -1,7 +1,7 @@
 //! The seam between the portable app and whatever OS it is running on.
 //!
 //! Only the *trait* lives here. Every concrete implementation lives beside the
-//! entry point that constructs it (`rustdar-platform` for desktop and Android),
+//! entry point that constructs it (the `rustdar` crate for desktop and Android),
 //! because this crate must build for targets whose bridges it has never heard
 //! of — and because a crate that named them would have to depend on the crate
 //! that depends on it.
@@ -33,8 +33,9 @@ type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 ///
 /// # Why a redraw request and not the event-loop proxy
 ///
-/// `rustdar-android` already keeps an [`EventLoopProxy`] for predictive back,
-/// and it is right there. It stays there, and this is not it:
+/// The `rustdar` crate's android back module (`rustdar/src/android/back.rs`)
+/// already keeps an `EventLoopProxy` for predictive back, and it is right
+/// there. It stays there, and this is not it:
 ///
 /// * `EventLoopProxy::send_event` (winit 0.30 has no `wake_up`; that is 0.31)
 ///   delivers to `ApplicationHandler::user_event`, which `App` does not
@@ -42,7 +43,7 @@ type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 ///   channel drain lives on the frame. Back gets away with this because
 ///   `about_to_wait` is where it is collected; a sensor value is not.
 /// * A proxy belongs to one `EventLoop`, and only the entry point that built
-///   the loop has one. `rustdar-platform`, `rustdar-web` and this crate would
+///   the loop has one. `rustdar`, `rustdar-web` and this crate would
 ///   each need their own plumbing for it. `Window` is `Send + Sync` on every
 ///   backend and `App` already holds one.
 /// * `Window::request_redraw` wakes a parked loop everywhere: an X11 redraw
@@ -158,7 +159,8 @@ impl RedrawWaker {
     /// The `unwrap_or_else` is then belt to that braces, and deliberately not
     /// removed as unreachable: it is what keeps a *future* panic under the lock
     /// from re-introducing the same silence. Same reasoning as
-    /// `rustdar_android::event_loop_proxy`, which recovers for the same reason.
+    /// the android back module's `event_loop_proxy` (`rustdar/src/android/back.rs`),
+    /// which recovers for the same reason.
     pub fn wake(&self) {
         let wake = self
             .slot
@@ -265,10 +267,10 @@ where
 /// [`PlatformBridge`], as plain `fn` pointers.
 ///
 /// The same inversion [`PlatformBridge::set_theme_detector`] uses, and for the
-/// same reason: on Android all four are JNI calls, JNI needs `unsafe` and the
-/// process `JavaVM`, and both live in `rustdar-android` — the cdylib entry
-/// point, which *depends on* the crate holding the bridge and so can never be
-/// called from it.
+/// same reason: on Android all four are JNI calls, and JNI stays confined to
+/// the `rustdar` crate's cfg(android) modules — this trait must compile for
+/// targets that have never heard of JNI, so the calls are injected rather than
+/// named (the full rule lives in `rustdar/src/android/mod.rs`).
 ///
 /// **One setter carrying all four, not four setters.** A half-installed set has
 /// no symptom: a bridge with `query` but no `request` reports `Prompt` forever
@@ -337,7 +339,8 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// a Java callback on the UI thread instead, which is not the thread `App`
     /// lives on. The callback therefore parks the press and wakes the loop, and
     /// this is where the loop picks it up; from there it takes the same route
-    /// as Escape and as legacy back. See `BackHandler.java`.
+    /// as Escape and as legacy back. See
+    /// `packaging/android/app/src/main/java/com/rustdar/BackHandler.java`.
     ///
     /// Consuming, like [`InputHandler::take_back_out_press`]: this is polled
     /// every loop iteration, and a non-consuming read would spend one press on
@@ -356,8 +359,11 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// only, no-op elsewhere).
     ///
     /// Injected for the same reason [`set_theme_detector`](Self::set_theme_detector)
-    /// is: the flag it reads is written by a JNI entry point, and that lives in
-    /// `rustdar-android`, a crate this one cannot depend on.
+    /// is: the flag it reads is written by a JNI entry point, which lives in
+    /// the `rustdar` crate's cfg(android) back module. The injection is the
+    /// frontend portability contract, not a crate-graph workaround — this
+    /// crate must compile for targets that have never heard of JNI (the full
+    /// rule lives in `rustdar/src/android/mod.rs`).
     fn set_back_press_taker(&mut self, _taker: fn() -> bool) {}
 
     /// Detect the current system dark theme preference.
@@ -455,12 +461,15 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// no-op elsewhere).
     ///
     /// Android reads this over JNI, which needs `unsafe` and the process
-    /// `JavaVM`. Both live in `rustdar-android`, the cdylib entry point — which
-    /// depends on the bridge's own crate, so the bridge can never call into it
-    /// directly. Injecting the reader is the same inversion `set_insets_querier`
-    /// and `set_back_handler` already use, and it is what keeps JNI out of
-    /// `rustdar-platform`: that crate is `#![deny(unsafe_code)]`, and its one
-    /// scoped `allow` is the iOS entry symbol, not this.
+    /// `JavaVM`. Both live in the `rustdar` crate's cfg(android) modules, and
+    /// they STAY there by rule, not by crate graph: the injection is the
+    /// frontend portability contract — `PlatformBridge` is declared in this
+    /// crate, which must compile for targets that have never heard of JNI; the
+    /// bridge structs stay `deny(unsafe_code)`-clean and host-testable
+    /// (TestBridge injects the same fn pointers). Injecting the reader is the
+    /// same inversion `set_insets_querier` and `set_back_handler` use; the
+    /// full rule lives in `rustdar/src/android/mod.rs`. Do not "simplify" the
+    /// `set_*` family into direct calls.
     ///
     /// Desktop and web answer `detect_dark_theme` themselves and ignore this.
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}

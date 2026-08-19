@@ -7,7 +7,7 @@
 //! the fetch and render dispatch, and the app state they operate on. The
 //! wgpu/egui renderer itself lives below, in `rustdar-gpu` (WO-RG). The
 //! per-OS entry points and the concrete [`platform::PlatformBridge`]
-//! implementations live in `rustdar-platform`, which depends on this crate —
+//! implementations live in the `rustdar` crate, which depends on this crate —
 //! never the other way round.
 
 use std::sync::Arc;

@@ -5,9 +5,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- LocationHelper's requestLocationUpdates() subscription, and the
-         getLastKnownLocation() poll on rustdar-android's GPS thread that it
-         feeds. Both are requested at runtime together; COARSE alone (the
-         "approximate only" dialog answer) still serves the network provider. -->
+         getLastKnownLocation() poll on the GPS thread in rustdar's android
+         location module that it feeds. Both are requested at runtime together;
+         COARSE alone (the "approximate only" dialog answer) still serves the
+         network provider. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
@@ -81,14 +82,14 @@
               tears down and recreates the Activity underneath a running native
               event loop, which deadlocks and ANRs instead of relaunching cleanly.
               The Rust side handles all of these in-app: theme via the polling
-              thread in rustdar-platform, size via the normal resize path.
+              thread in the rustdar crate, size via the normal resize path.
             -->
 
             <!-- NativeActivity dlsym()s android_main out of this .so. The name is
-                 rustdar-android's [lib] name, i.e. librustdar_android.so. -->
+                 the rustdar crate's [lib] name, i.e. librustdar_native.so. -->
             <meta-data
                 android:name="android.app.lib_name"
-                android:value="rustdar_android" />
+                android:value="rustdar_native" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

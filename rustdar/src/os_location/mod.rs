@@ -14,7 +14,7 @@
 //! build ends up compiling two providers, or none, on a target nobody tested.
 //!
 //! Landing a provider touches this file, the provider's own file, and that
-//! target's dependency block in `rustdar-platform/Cargo.toml`. **Nothing else**
+//! target's dependency block in `rustdar/Cargo.toml`. **Nothing else**
 //! — not `platform.rs`, not `lib.rs`. The three providers that landed here each
 //! discovered independently that the older wording ("a one-line change here")
 //! was false, because the older contract was not one contract: each of them had

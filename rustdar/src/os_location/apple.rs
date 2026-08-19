@@ -31,7 +31,7 @@
 //!
 //! # What this provider does not do
 //!
-//! iOS has no `UIBackgroundModes: location` in `ios/Info.plist`, so the OS
+//! iOS has no `UIBackgroundModes: location` in `packaging/ios/Info.plist`, so the OS
 //! stops delivering the moment the app backgrounds and resumes when it
 //! foregrounds. Nothing here can observe that: `-locationManager:
 //! didUpdateLocations:` simply stops being called, and there is no "paused"

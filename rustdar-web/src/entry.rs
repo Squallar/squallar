@@ -1,4 +1,4 @@
-//! The browser entry point; the counterpart of `rustdar_platform::run::run`.
+//! The browser entry point; the counterpart of `rustdar_native::run::run`.
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;

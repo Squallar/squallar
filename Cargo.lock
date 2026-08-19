@@ -4168,18 +4168,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustdar-android"
+name = "rustdar"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "ashpd",
+ "chrono",
+ "dark-light",
+ "env_logger",
+ "futures-channel",
+ "futures-lite",
+ "iana-time-zone",
  "jni",
  "log",
+ "objc2 0.6.4",
+ "objc2-core-location 0.3.2",
+ "objc2-foundation 0.3.2",
  "pollster",
+ "rustdar-egui",
  "rustdar-frontend",
  "rustdar-geo",
+ "rustdar-kv",
  "rustdar-location",
- "rustdar-platform",
+ "rustdar-nmea-serial",
+ "rustdar-radar",
  "rustls-platform-verifier",
+ "walkers",
+ "windows",
  "winit",
 ]
 
@@ -4335,33 +4350,6 @@ dependencies = [
  "tiny-skia 0.12.0",
  "tokio",
  "web-time",
-]
-
-[[package]]
-name = "rustdar-platform"
-version = "0.1.0"
-dependencies = [
- "ashpd",
- "chrono",
- "dark-light",
- "env_logger",
- "futures-channel",
- "futures-lite",
- "iana-time-zone",
- "log",
- "objc2 0.6.4",
- "objc2-core-location 0.3.2",
- "objc2-foundation 0.3.2",
- "pollster",
- "rustdar-egui",
- "rustdar-frontend",
- "rustdar-kv",
- "rustdar-location",
- "rustdar-nmea-serial",
- "rustdar-radar",
- "walkers",
- "windows",
- "winit",
 ]
 
 [[package]]
