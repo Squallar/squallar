@@ -1,5 +1,5 @@
 use super::*;
-use rustdar_location::FixQuality;
+use crate::FixQuality;
 use std::sync::{Arc, Mutex, PoisonError};
 
 // Every test here runs with no session bus, no portal and no geoclue. That

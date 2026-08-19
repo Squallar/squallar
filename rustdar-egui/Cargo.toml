@@ -29,7 +29,10 @@ rustdar-device-profile = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 rustdar-units = { workspace = true }
-rustdar-location = { workspace = true }
+# Vocabulary only (default-features = false, re-declared deliberately): the
+# facade's provider arms (`os-providers`, `serial`) and their OS dependencies
+# must never enter the UI crate's graph — the shell turns them on per target.
+rustdar-location = { workspace = true, default-features = false }
 rustdar-nmea-serial = { workspace = true }
 chrono = { workspace = true }
 egui = { workspace = true }

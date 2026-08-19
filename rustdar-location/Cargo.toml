@@ -1,15 +1,160 @@
-# The location domain's common vocabulary; providers depend on it, it depends
-# on no provider. Ceiling held by tests/charter.rs.
+# The location facade: everything between "where am I" and the operating
+# system (seam ruling 6). Default features = the domain vocabulary on the lean
+# dependency set below; every provider arm is feature-fenced and pulls only
+# its own target-gated dependencies. Ceiling held by tests/charter.rs.
+#
+# Per-feature dependency table (the charter test pins it):
+#   (default)      rustdar-geo, rustdar-kv, chrono, log, serde, serde_json,
+#                  web-time — vocabulary consumers (egui/frontend/web) pay
+#                  exactly this and nothing more.
+#   os-providers   linux:   ashpd, futures-lite, futures-channel
+#                  windows: windows
+#                  apple:   objc2, objc2-foundation, objc2-core-location
+#   serial         rustdar-nmea-serial (forwarding its `serial` gate, which is
+#                  what pulls serialport — kept off iOS: it links IOKit).
 [package]
 name = "rustdar-location"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# The desktop/mobile OS location arms in src/os_location/.
+os-providers = [
+    "dep:ashpd",
+    "dep:futures-lite",
+    "dep:futures-channel",
+    "dep:windows",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-core-location",
+]
+# The NMEA serial provider in src/serial.rs, wrapping rustdar-nmea-serial.
+serial = ["dep:rustdar-nmea-serial", "rustdar-nmea-serial?/serial"]
+
 [dependencies]
 rustdar-geo = { workspace = true }
 rustdar-kv = { workspace = true }
+# The parser/transport this facade's `serial` module translates for. The edge
+# points THIS way since WO-RL-3 (the facade stands on the provider): the
+# parser does not know the fix model.
+rustdar-nmea-serial = { workspace = true, optional = true }
 chrono = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 web-time = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `org.freedesktop.portal.Location`, for `os_location/linux.rs`. **Zero new
+# packages** workspace-wide: the `rustdar` shell's `dark-light` already puts
+# ashpd 0.10.3 in every Linux app graph; this entry (feature-fenced behind
+# `os-providers`, so vocabulary-only consumers never resolve it) names the
+# same pin.
+#
+# The features are not tidiness, they are the whole reason this line is
+# spelled out. `dark-light` asks for exactly `default-features = false,
+# features = ["async-std"]`, and matching it is load-bearing: ashpd's default
+# feature is `tokio`, which selects `zbus/tokio` *and* pulls `dep:tokio`.
+# Features are additive across the graph, so taking the default here would
+# union `zbus/tokio` into every Linux row -- recompiling `zbus` and
+# `zbus_macros` with a larger surface on the linux, `standalone`, clippy-host
+# and test rows, and adding a tokio runtime to a crate that starts no runtime.
+# `async-std` selects `zbus/async-io`, which is what is already compiled.
+#
+# Measured at the pre-move home (the rustdar shell, WO-RP-2 era), with
+# `cargo tree --target x86_64-unknown-linux-gnu -e normal -f "{p} {f}"`: the
+# graph is 437 packages before and after with an identical set, and zbus's own
+# features **shrink** from `…,blocking,blocking-api,default,url` to
+# `…,blocking,url`. Naming zbus directly is what used to turn `blocking-api`
+# on; this provider is async and does not need it, so dropping the direct
+# dependency hands that back.
+#
+# That also retires the `zbus = "=…"` pin this block used to carry, and the
+# Renovate PRs that bumped it: nothing here constrains zbus any more, so it
+# resolves to whatever `ashpd` asks for.
+#
+# NB the feature is named for async-std and does not pull it: it is
+# `zbus/async-io` plus `async-fs`, `async-net` and `futures-util/io`. The
+# provider drives its own futures with `futures_lite::future::block_on`; the
+# `async-io` reactor those calls need starts itself on first use.
+ashpd = { version = "=0.10.3", default-features = false, features = [
+    "async-std",
+], optional = true }
+# `block_on` and `StreamExt::next` for the session thread, and `oneshot` for
+# the cancellation the thread parks on. Both are already in the Linux app
+# graph -- futures-lite via `ashpd -> zbus/async-io -> async-io`,
+# futures-channel as a direct dependency of `ashpd` -- and each resolves to
+# exactly one version, so naming them adds **zero packages** and no second
+# version constraint.
+#
+# Neither is an executor. `block_on` parks the calling thread on one future;
+# nothing here spawns.
+futures-lite = { version = "=2.6.1", optional = true }
+futures-channel = { version = "=0.3.34", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The OS location provider in `src/os_location/windows.rs`.
+#
+# All four features are load-bearing: `Devices_Geolocation` alone fails to
+# compile with `could not find 'Security' in 'windows'` and `unresolved import
+# 'windows::System'`. `Foundation` is implied by each of the other three, and is
+# named anyway as documentation of what `TypedEventHandler` and `Uri` come from.
+# Do NOT add `default-features = false` — it drops the `std` plumbing the
+# generated bindings need.
+#
+# Zero new *packages*: `wgpu-hal -> gpu-allocator` and `walkers -> cacache`
+# already put `windows 0.62` in the graph, so this only widens which namespaces
+# are generated. Verified to compile *and link* for `x86_64-pc-windows-gnullvm`;
+# `windows-link` declares every extern `kind = "raw-dylib"` and the 0.62 graph
+# has no `windows-targets` import-lib crates, so gnullvm has no `.lib` to miss.
+windows = { version = "=0.62.2", features = [
+    "Devices_Geolocation",
+    "Security_Authorization_AppCapabilityAccess",
+    "System",
+    "Foundation",
+], optional = true }
+
+# CoreLocation, for `os_location/apple.rs`. One target block for both Apple
+# platforms because it is one provider.
+#
+# `default-features = false` is not tidiness: the defaults pull 26 `CL*`
+# modules plus `block2`, `dispatch2` and `objc2-contacts`, and the last two are
+# in neither Apple graph today. With the lists below, `objc2-core-location` is
+# the only new *compiled* package in either graph — `objc2` and
+# `objc2-foundation` are already there via `arboard`, `wgpu-hal` and
+# `objc2-ui-kit`.
+#
+# Version-pinned with `=` like every other dependency here. Note for anyone
+# reaching for the `dep-unification` check: `objc2` resolves to two versions
+# workspace-wide (0.5.2 under the older stack, 0.6.4 here), so a bare
+# `cargo tree -i objc2` answers "specification is ambiguous". Spell the version
+# — `objc2@0.6.4` — or check `objc2-core-location@0.3.2`, which is unique.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = { version = "=0.6.4", default-features = false, features = [
+    "std",
+], optional = true }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "alloc",
+    "NSArray",
+    "NSDate",
+    "NSError",
+    "NSString",
+    "NSBundle",
+    # `NSArray::iter()` is `#[cfg(feature = "NSEnumerator")]`, so without this
+    # the `didUpdateLocations:` delegate method cannot walk its own argument.
+    # The feature is `NSEnumerator = []`: no dependencies, no new package.
+    "NSEnumerator",
+], optional = true }
+objc2-core-location = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "CLLocation",
+    "CLLocationManager",
+    "CLLocationManagerDelegate",
+    # `CLError` is the enum; `kCLErrorDomain` — which is what says an error
+    # code may be read as one — is a separate feature.
+    "CLError",
+    "CLErrorDomain",
+], optional = true }

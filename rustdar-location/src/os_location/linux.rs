@@ -46,7 +46,7 @@
 //! Measured on the development machine, through the portal: **25 km** accuracy,
 //! described by geoclue as `GeoIP (ichnaea)`. That is an IP lookup, not a GPS
 //! one. Every fix therefore leaves here as
-//! [`FixQuality::Device`](rustdar_location::FixQuality::Device) carrying its
+//! [`FixQuality::Device`](crate::FixQuality::Device) carrying its
 //! [`accuracy_m`](Fix::accuracy_m): the site-upgrade gate reads that field,
 //! and a 25 km circle is comfortably good enough to pick between WSR-88D sites
 //! ~200 km apart while being useless for anything finer.
@@ -87,7 +87,7 @@ use ashpd::desktop::location::{Accuracy, Location, LocationProxy};
 /// graph shares, in exchange for no code at all.
 use ashpd::zbus;
 
-use rustdar_location::{Fix, LocationPermission};
+use crate::{Fix, LocationPermission};
 
 use super::{OsLocationProvider, OsLocationSink};
 
@@ -121,7 +121,7 @@ const ALTITUDE_UNKNOWN: f64 = f64::MIN;
 ///
 /// [`start`]: OsLocationProvider::start
 /// [`request`]: OsLocationProvider::request
-/// [`Prompt`]: rustdar_location::LocationPermission::Prompt
+/// [`Prompt`]: crate::LocationPermission::Prompt
 pub struct OsLocationReader {
     /// Cloned into each session. Cheap: a `Sender` and two `Arc`s.
     sink: OsLocationSink,
@@ -130,9 +130,8 @@ pub struct OsLocationReader {
 
 /// A running portal location session, stopped by dropping it.
 ///
-/// Same shape as [`SerialGpsReader`]: a value whose drop is the off switch.
-///
-/// [`SerialGpsReader`]: rustdar_nmea_serial::SerialGpsReader
+/// Same shape as rustdar-nmea-serial's `SerialGpsReader`: a value whose drop
+/// is the off switch.
 struct Session {
     /// The reader's end of the session thread's cancellation.
     ///

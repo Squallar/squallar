@@ -80,7 +80,7 @@
 //! `Launcher` — is safe Rust in windows-rs 0.62, which matters because this
 //! crate is `#![deny(unsafe_code)]`.
 
-use rustdar_location::{Fix, FixQuality, LocationPermission};
+use crate::{Fix, FixQuality, LocationPermission};
 
 // ── The values this file maps between ───────────────────────────────────
 //
@@ -405,7 +405,7 @@ mod live {
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
     use std::time::Duration;
 
-    use rustdar_location::Fix;
+    use crate::Fix;
     // `::windows`, because this module's own parent is called `windows` too.
     use ::windows::Devices::Geolocation::{
         Geolocator, PositionAccuracy, PositionChangedEventArgs, StatusChangedEventArgs,
@@ -562,7 +562,7 @@ mod live {
         ///
         /// Returns immediately, and the first `CheckAccess` has not happened
         /// yet, so the bridge's permission stays
-        /// [`Unknown`](rustdar_location::LocationPermission::Unknown) for a moment — which the
+        /// [`Unknown`](crate::LocationPermission::Unknown) for a moment — which the
         /// gate is built to wait through, and is why `Unknown` is a state at
         /// all. This is the one arm that deliberately leaves the initial report
         /// unmade.

@@ -5,8 +5,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::config::SerialConfig;
-use crate::nmea_parser::NmeaState;
-use rustdar_location::Fix;
+use crate::nmea_parser::{NmeaState, ParsedFix};
 
 /// USB VID/PIDs of common GPS chipsets and the USB-serial adapters GPS modules
 /// are usually wired through. `None` PID matches every product from that vendor.
@@ -123,26 +122,26 @@ impl SerialGpsReader {
     /// before any port is confirmed; if none ever turns up, the thread keeps
     /// retrying detection until the reader is dropped.
     ///
-    /// # `wake`
+    /// # `on_fix`
     ///
-    /// Called after every fix that reaches `fix_sender`, and it is what makes
-    /// the fix *visible*. The frontend runs its event loop on
-    /// `ControlFlow::Wait` and drains this channel only while rendering a
-    /// frame, so a fix pushed from this thread while the app is idle waits for
-    /// some unrelated event to produce one — with auto-refresh off, that can be
-    /// the next mouse move, or never.
+    /// Called on the reader thread with every parsed position-bearing
+    /// sentence. Returning `false` means the consumer is gone and stops the
+    /// thread — which holds the port open exclusively, so a consumer that
+    /// vanishes without stopping the reader would pin the device forever.
     ///
-    /// A bare `impl Fn()` rather than the frontend's `RedrawWaker`: this crate
-    /// is a *dependency* of the frontend and cannot name its types. The desktop
-    /// bridge passes one through; the shape matches
-    /// `ChunkNotifier::sync_sites`, which takes a `wake` for the same reason.
+    /// A callback rather than a channel of this crate's own, because what a
+    /// consumer does with a parsed fix — translate it into an app fix model,
+    /// send it somewhere, wake an event loop so the send is *seen* — is the
+    /// consumer's business, and since WO-RL-3 that consumer is
+    /// `rustdar_location`'s `serial` module, which this crate deliberately
+    /// knows nothing about.
     ///
     /// `Send` and not `Sync`, because the closure is moved into one thread and
-    /// shared with none.
+    /// shared with none. `FnMut`, because a translating consumer may keep
+    /// state.
     pub fn start(
         config: &SerialConfig,
-        fix_sender: mpsc::Sender<Fix>,
-        wake: impl Fn() + Send + 'static,
+        on_fix: impl FnMut(ParsedFix) -> bool + Send + 'static,
     ) -> Option<Self> {
         let configured_port = config.port_path.clone();
         let auto_baud = config.auto_baud();
@@ -162,7 +161,8 @@ impl SerialGpsReader {
                     configured_baud
                 };
                 log::info!("Starting GPS reader on {} @ {} baud", port_name, baud);
-                gps_read_loop(&port_name, baud, &fix_sender, &stop_rx, &wake);
+                let mut on_fix = on_fix;
+                gps_read_loop(&port_name, baud, &stop_rx, &mut on_fix);
             })
             .expect("failed to spawn gps-serial thread");
 
@@ -170,22 +170,6 @@ impl SerialGpsReader {
             _stop_signal: stop_tx,
         })
     }
-}
-
-/// Hand one parsed sentence's outcome to the consumer, and say whether the
-/// reader may keep going.
-///
-/// Split out of [`gps_read_loop`]'s inner match so the pairing can be tested
-/// without a serial port: the send and the wake are one step, and a wake that
-/// gets separated from its send is a fix that sits in the channel until
-/// something else draws a frame — the exact failure this parameter exists for.
-/// `false` means the consumer is gone and the thread should stop.
-fn deliver(fix: Fix, fix_sender: &mpsc::Sender<Fix>, wake: &impl Fn()) -> bool {
-    if fix_sender.send(fix).is_err() {
-        return false;
-    }
-    wake();
-    true
 }
 
 /// The configured port when set, otherwise the first detected port — retrying
@@ -222,9 +206,8 @@ fn should_stop(stop_rx: &mpsc::Receiver<()>) -> bool {
 fn gps_read_loop(
     port_name: &str,
     baud: u32,
-    fix_sender: &mpsc::Sender<Fix>,
     stop_rx: &mpsc::Receiver<()>,
-    wake: &impl Fn(),
+    on_fix: &mut impl FnMut(ParsedFix) -> bool,
 ) {
     loop {
         if should_stop(stop_rx) {
@@ -277,9 +260,9 @@ fn gps_read_loop(
                 Ok(_) => {
                     let trimmed = line.trim();
                     if let Some(fix) = nmea.feed_sentence(trimmed)
-                        && !deliver(fix, fix_sender, wake)
+                        && !on_fix(fix)
                     {
-                        log::info!("GPS fix channel closed, stopping reader");
+                        log::info!("GPS fix consumer gone, stopping reader");
                         return;
                     }
                 }
@@ -331,54 +314,8 @@ mod tests {
         assert!(should_stop(&stop_rx));
     }
 
-    /// A counting wake, and the count.
-    fn counted() -> (
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        impl Fn() + Send,
-    ) {
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let probe = std::sync::Arc::clone(&count);
-        (count, move || {
-            probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        })
-    }
-
-    fn woke(count: &std::sync::atomic::AtomicUsize) -> usize {
-        count.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// The bug this parameter exists for. The consumer drains this channel only
-    /// while drawing a frame, and its loop runs on `ControlFlow::Wait`: a fix
-    /// that lands with nothing else happening sits there until some unrelated
-    /// event draws one.
-    #[test]
-    fn a_fix_arriving_while_the_app_is_idle_asks_for_the_frame_that_shows_it() {
-        let (tx, rx) = mpsc::channel();
-        let (woken, wake) = counted();
-
-        assert!(deliver(Fix::from_lat_lon(35.25, -97.5), &tx, &wake));
-
-        assert_eq!(rx.try_recv().map(|f| f.point.lat), Ok(35.25));
-        assert_eq!(
-            woke(&woken),
-            1,
-            "the fix reached the channel and nothing asked for the frame that \
-             would read it"
-        );
-    }
-
-    /// The reader stops when the app is gone, and must not wake something that
-    /// no longer exists on the way out.
-    #[test]
-    fn a_fix_with_no_consumer_left_stops_the_reader_without_waking() {
-        let (tx, rx) = mpsc::channel();
-        drop(rx);
-        let (woken, wake) = counted();
-
-        assert!(
-            !deliver(Fix::from_lat_lon(35.25, -97.5), &tx, &wake),
-            "a closed channel must stop the reader"
-        );
-        assert_eq!(woke(&woken), 0, "woke the loop for a fix nothing received");
-    }
+    // The send-plus-wake delivery pairing and its two tests moved to
+    // `rustdar_location::serial` at WO-RL-3 with the `deliver` fn they test:
+    // sending an app fix and waking an event loop are the *consumer's* step,
+    // and the consumer of this transport is the facade's serial module.
 }

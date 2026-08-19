@@ -34,8 +34,10 @@ pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    /// Active serial GPS reader (dropped to stop).
-    gps_reader: Option<rustdar_nmea_serial::SerialGpsReader>,
+    /// Active serial GPS source (dropped to stop). The facade's wrapper since
+    /// WO-RL-3: the transport parses in its own vocabulary, and
+    /// `rustdar_location::serial` is where sentences become fixes.
+    gps_reader: Option<rustdar_location::serial::SerialFixReader>,
     /// Receives GPS fixes from the serial reader thread.
     gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
     /// The OS location service and everything the bridge keeps beside it. See
@@ -50,15 +52,17 @@ pub struct DesktopPlatform {
 //
 // Written here rather than inside each bridge because `DesktopPlatform` and
 // `IosPlatform` want exactly the same thing from it, and get it from the same
-// provider: `crate::os_location`'s arm table chooses, and that table is the
+// provider: `rustdar_location::os_location`'s arm table chooses, and that table is the
 // entire `cfg` surface.
 //
 // **No `cfg` in this file decides how location is done.** Every `target_os`
 // left below says which *bridge* exists — Android's, iOS's, the desktop one —
-// or, on `OsLocation` and the two permission codecs, whether the `os_location`
-// module is compiled at all, which `lib.rs` gates on the same axis and for the
-// same reason: Android reaches its location service over JNI from another crate
-// entirely. That is checkable, and it is worth checking, because it was false
+// or, on `OsLocation` and the two permission codecs, whether the facade's
+// `os_location` module is reachable at all, which this crate's manifest gates
+// on the same axis (the `os-providers` feature is enabled for
+// `cfg(not(target_os = "android"))` and nowhere else) and for the same reason:
+// Android reaches its location service over JNI from the `android` module
+// beside this file. That is checkable, and it is worth checking, because it was false
 // twice: `platform.rs` carried a four-armed table of inherent `impl`s that every
 // landing provider had to edit, and a `#[cfg(target_os = "windows")]` field
 // beside it.
@@ -75,7 +79,7 @@ struct OsLocation {
     /// in system settings while delivery is off would go unnoticed if it were
     /// torn down with the stream. `None` means this target has no provider at
     /// all, which the bridge renders as `Unavailable`.
-    provider: Option<crate::os_location::OsLocationReader>,
+    provider: Option<rustdar_location::os_location::OsLocationReader>,
     /// What the provider last reported.
     ///
     /// An atomic and not a `Cell`, because it is written from whatever thread
@@ -104,7 +108,7 @@ struct OsLocation {
     /// provider keeps the matching `Sender` for the life of the bridge, so the
     /// channel survives a stop and is reused by the next start.
     ///
-    /// [`prefer_fix`]: crate::os_location::prefer_fix
+    /// [`prefer_fix`]: rustdar_location::prefer_fix
     fixes: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
 }
 
@@ -134,16 +138,16 @@ impl OsLocation {
     /// fills.
     ///
     /// Prompts nobody. That is the contract's first phase; see
-    /// [`OsLocationProvider::start`](crate::os_location::OsLocationProvider::start).
+    /// [`OsLocationProvider::start`](rustdar_location::os_location::OsLocationProvider::start).
     fn start(&mut self, waker: &RedrawWaker) {
-        use crate::os_location::OsLocationProvider as _;
+        use rustdar_location::os_location::OsLocationProvider as _;
 
         let (fixes, receiver) = std::sync::mpsc::channel();
         let wake = waker.clone();
         let reported = std::sync::Arc::clone(&self.state);
         let report_waker = waker.clone();
-        self.provider =
-            crate::os_location::OsLocationReader::start(crate::os_location::OsLocationSink {
+        self.provider = rustdar_location::os_location::OsLocationReader::start(
+            rustdar_location::os_location::OsLocationSink {
                 fixes,
                 wake: std::sync::Arc::new(move || wake.wake()),
                 // Store *and* wake. The store is what the frame path reads; the
@@ -158,7 +162,8 @@ impl OsLocation {
                     );
                     report_waker.wake();
                 }),
-            });
+            },
+        );
         // Only keep the receiver if something is going to push into it; an open
         // one would make `poll_gps_fix` drain a channel forever.
         self.fixes = self.provider.is_some().then_some(receiver);
@@ -183,10 +188,10 @@ impl OsLocation {
     }
 
     fn request(&mut self) -> bool {
-        use crate::os_location::OsLocationProvider as _;
+        use rustdar_location::os_location::OsLocationProvider as _;
         self.provider
             .as_mut()
-            .is_some_and(crate::os_location::OsLocationReader::request)
+            .is_some_and(rustdar_location::os_location::OsLocationReader::request)
     }
 
     /// Stop the stream and discard anything already in it.
@@ -201,7 +206,7 @@ impl OsLocation {
     /// an off switch, not a revocation, and no platform lets an app hand a
     /// permission back.
     fn stop(&mut self) {
-        use crate::os_location::OsLocationProvider as _;
+        use rustdar_location::os_location::OsLocationProvider as _;
 
         let was_active = self.active();
         if let Some(provider) = self.provider.as_mut() {
@@ -216,14 +221,14 @@ impl OsLocation {
     }
 
     fn active(&self) -> bool {
-        use crate::os_location::OsLocationProvider as _;
+        use rustdar_location::os_location::OsLocationProvider as _;
         self.provider
             .as_ref()
-            .is_some_and(crate::os_location::OsLocationReader::active)
+            .is_some_and(rustdar_location::os_location::OsLocationReader::active)
     }
 
     fn open_settings(&mut self) {
-        use crate::os_location::OsLocationProvider as _;
+        use rustdar_location::os_location::OsLocationProvider as _;
         if let Some(provider) = self.provider.as_mut() {
             provider.open_settings();
         }
@@ -359,7 +364,7 @@ impl PlatformBridge for DesktopPlatform {
         // idle is invisible until something else happens to draw one.
         let wake = self.redraw_waker.clone();
         if let Some(reader) =
-            rustdar_nmea_serial::SerialGpsReader::start(config, tx, move || wake.wake())
+            rustdar_location::serial::SerialFixReader::start(config, tx, move || wake.wake())
         {
             self.gps_reader = Some(reader);
             self.gps_fix_receiver = Some(rx);
@@ -384,15 +389,15 @@ impl PlatformBridge for DesktopPlatform {
     //
     // Six one-line forwards to [`OsLocation`], and not one of them names a
     // target. Everything per-OS — the location portal over ashpd, `AppCapability` +
-    // `Geolocator`, `CLLocationManager` — is behind `crate::os_location`, which
+    // `Geolocator`, `CLLocationManager` — is behind `rustdar_location::os_location`, which
     // is the entire `cfg` surface, and every arm of it implements the same
     // trait.
 
     /// Asked once, at startup, and before any provider exists — which is why
     /// the trait's is an associated function rather than a method.
     fn location_settings_available(&self) -> bool {
-        use crate::os_location::OsLocationProvider as _;
-        crate::os_location::OsLocationReader::settings_available()
+        use rustdar_location::os_location::OsLocationProvider as _;
+        rustdar_location::os_location::OsLocationReader::settings_available()
     }
 
     fn open_location_settings(&mut self) {
@@ -814,8 +819,8 @@ impl PlatformBridge for IosPlatform {
     // running the same provider.
 
     fn location_settings_available(&self) -> bool {
-        use crate::os_location::OsLocationProvider as _;
-        crate::os_location::OsLocationReader::settings_available()
+        use rustdar_location::os_location::OsLocationProvider as _;
+        rustdar_location::os_location::OsLocationReader::settings_available()
     }
 
     fn open_location_settings(&mut self) {

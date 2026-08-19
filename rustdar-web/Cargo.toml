@@ -38,7 +38,10 @@ rustdar-egui = { workspace = true }
 rustdar-kv = { workspace = true }
 # Types only (Fix). The browser's Geolocation replaces the serial reader, so
 # the `serial` feature stays off, as in rustdar-frontend.
-rustdar-location = { workspace = true }
+# Vocabulary only (default-features = false, re-declared deliberately): the
+# facade's provider arms must never enter the web graph — the browser's own
+# geolocation is the web bridge's business (its facade arm lands at WO-RL-4).
+rustdar-location = { workspace = true, default-features = false }
 log = { workspace = true }
 
 # Browser-only, and gated so a native `cargo build` does not pull web-sys and

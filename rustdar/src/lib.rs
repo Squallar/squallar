@@ -22,17 +22,12 @@ pub mod android;
 pub mod kv;
 /// Test-only. See the module docs for why it lives in this crate.
 pub mod network_security_config;
-/// The OS location providers, behind exactly the `cfg` that selects a bridge
-/// with one: [`platform::DesktopPlatform`] or [`platform::IosPlatform`].
-///
-/// Not unconditional. Android compiles this crate but cfgs both of those
-/// bridges out and reaches its own location service over JNI from the
-/// `android` module -- the fourth OS arm BESIDE this one, not inside it -- so
-/// an ungated `os_location` there would be a module nothing references and a
-/// wall of dead-code warnings on the one target whose lint row is hardest to
-/// run.
-#[cfg(not(target_os = "android"))]
-pub mod os_location;
+// The OS location providers moved to `rustdar_location::os_location` at
+// WO-RL-3 (seam ruling 6: every remote location arm lives in the facade).
+// This crate turns the facade's `os-providers` feature on for exactly the
+// targets that mount a bridge with one -- `platform::DesktopPlatform` or
+// `platform::IosPlatform`; Android reaches its own location service over JNI
+// from the `android` module and never enables it.
 pub mod platform;
 pub mod run;
 

@@ -225,7 +225,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          use instead of the permanent form.",
     ),
     (
-        "rustdar/src/os_location/linux.rs",
+        "rustdar-location/src/os_location/linux.rs",
         "xdp_app_info_is_host",
         "An xdg-desktop-portal D-Bus predicate. Names the portal-side check \
          this code depends on for the un-sandboxed case.",

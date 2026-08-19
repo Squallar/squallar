@@ -4172,18 +4172,11 @@ name = "rustdar"
 version = "0.1.0"
 dependencies = [
  "android_logger",
- "ashpd",
- "chrono",
  "dark-light",
  "env_logger",
- "futures-channel",
- "futures-lite",
  "iana-time-zone",
  "jni",
  "log",
- "objc2 0.6.4",
- "objc2-core-location 0.3.2",
- "objc2-foundation 0.3.2",
  "pollster",
  "rustdar-egui",
  "rustdar-frontend",
@@ -4194,7 +4187,6 @@ dependencies = [
  "rustdar-radar",
  "rustls-platform-verifier",
  "walkers",
- "windows",
  "winit",
 ]
 
@@ -4307,13 +4299,21 @@ dependencies = [
 name = "rustdar-location"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "chrono",
+ "futures-channel",
+ "futures-lite",
  "log",
+ "objc2 0.6.4",
+ "objc2-core-location 0.3.2",
+ "objc2-foundation 0.3.2",
  "rustdar-geo",
  "rustdar-kv",
+ "rustdar-nmea-serial",
  "serde",
  "serde_json",
  "web-time",
+ "windows",
 ]
 
 [[package]]
@@ -4323,7 +4323,6 @@ dependencies = [
  "chrono",
  "log",
  "nmea",
- "rustdar-location",
  "serde",
  "serde_json",
  "serialport",

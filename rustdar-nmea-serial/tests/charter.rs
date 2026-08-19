@@ -1,6 +1,8 @@
-//! The crate's charter, held as tests: the provider's dependency ceiling and
-//! the graph position it exists to hold — one provider of
-//! `rustdar_location::Fix`, standing ON the domain crate.
+//! The crate's charter, held as tests: the parser's dependency ceiling and
+//! the graph position it exists to hold — a parser/transport that does NOT
+//! know the app's fix model. WO-RL-3 flipped the RL-1 edge: rustdar-location
+//! (the facade) now depends on this crate behind its `serial` feature, and
+//! this crate names no rustdar-* package at all.
 //!
 //! Both helpers read `cargo metadata --no-deps --format-version 1` from the
 //! workspace root. `packages[].dependencies` there are *declared*
@@ -67,20 +69,13 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
         .collect()
 }
 
-/// The provider's allowance: the domain it provides for, the NMEA grammar, the
-/// serial transport (optional, behind `serial`), time, logging and serde.
-/// Nothing UI-side, nothing radar-side — a transport crate that could name
-/// either would stop being a leaf providers can share.
+/// The parser's allowance: the NMEA grammar, the serial transport (optional,
+/// behind `serial`), time, logging and serde. No rustdar-* name of any kind —
+/// a parser that could name the fix model would let the RL-1 edge grow back,
+/// and a transport that could name UI or radar would stop being a leaf.
 #[test]
 fn the_dependency_ceiling_holds() {
-    const NORMAL_CEILING: &[&str] = &[
-        "rustdar-location",
-        "chrono",
-        "log",
-        "nmea",
-        "serde",
-        "serialport",
-    ];
+    const NORMAL_CEILING: &[&str] = &["chrono", "log", "nmea", "serde", "serialport"];
 
     let meta = metadata();
     let deps = declared_deps(&meta, "rustdar-nmea-serial");
@@ -97,10 +92,11 @@ fn the_dependency_ceiling_holds() {
         assert!(
             allowed,
             "rustdar-nmea-serial declares {name} ({kind}). rustdar-nmea-serial \
-             is NMEA parsing and the serial-port transport — one provider of \
-             rustdar_location::Fix; if a step genuinely needs a new \
-             dependency, the charter in this test and the plan must change \
-             first, in writing.",
+             is NMEA parsing and the serial-port transport in its own parsed \
+             vocabulary — it does not know the app's fix model (WO-RL-3 \
+             flipped that edge; rustdar_location::serial owns the \
+             translation); if a step genuinely needs a new dependency, the \
+             charter in this test and the plan must change first, in writing.",
         );
     }
 
@@ -111,23 +107,5 @@ fn the_dependency_ceiling_holds() {
         "rustdar-nmea-serial no longer declares nmea (normal) — either the \
          crate changed shape or this test is reading the wrong package: \
          {deps:?}",
-    );
-}
-
-/// The graph shape WO-RL-1 created stays: the provider stands on the domain
-/// crate, so every consumer of a fix reaches the one vocabulary rather than a
-/// transport's private restatement of it.
-///
-/// Presence, not absence, so it doubles as this file's second falsifiability
-/// floor: a renamed package or a broken parse cannot pass it.
-#[test]
-fn the_provider_sits_on_the_domain() {
-    let meta = metadata();
-    let deps = declared_deps(&meta, "rustdar-nmea-serial");
-
-    assert!(
-        deps.iter()
-            .any(|(kind, name)| kind == "normal" && name == "rustdar-location"),
-        "rustdar-nmea-serial no longer stands on rustdar-location: {deps:?}",
     );
 }
