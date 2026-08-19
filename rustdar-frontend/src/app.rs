@@ -21,7 +21,7 @@ use crate::render_dispatch::RenderDispatcher;
 use rustdar_device_profile::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_egui::{Gui, actions::GuiAction};
-use rustdar_location::LocationGate;
+use rustdar_location::LocationFacade;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::site_position::SitePositionSource;
 use rustdar_radar::types::ScanInfo;
@@ -700,9 +700,11 @@ pub struct App {
     /// exactly — see [`RedrawWaker`] for why a slot rather than a snapshot, and
     /// why the emptying is the load-bearing half.
     redraw_waker: RedrawWaker,
-    /// The only thing in this application that can raise a location permission
-    /// prompt. See [`rustdar_location::LocationGate`].
-    location: LocationGate,
+    /// Everything between "where am I" and the operating system, as one value
+    /// (WO-RL-4): the permission gate composed with this platform's provider
+    /// arm. The only thing in this application that can raise a location
+    /// permission prompt. See [`rustdar_location::LocationFacade`].
+    location: LocationFacade,
     /// Where earlier volumes said their radars are.
     ///
     /// Loaded once, in [`App::new`], because a learned position may only be
@@ -980,11 +982,15 @@ impl App {
     /// stays free of any per-OS code: the concrete [`PlatformBridge`] impls
     /// live alongside their entry points, and only the entry point knows which
     /// one to build. Without that inversion the app layer and the platform
-    /// layer would have to depend on each other.
-    pub fn new(platform: Box<dyn PlatformBridge>) -> Self {
+    /// layer would have to depend on each other. The location facade arrives
+    /// the same way and for the same reason (WO-RL-4): its provider arm is
+    /// per-OS, feature-fenced inside rustdar-location, and only the entry
+    /// point knows which arm to construct.
+    pub fn new(platform: Box<dyn PlatformBridge>, location: LocationFacade) -> Self {
         Self::with_instance(
             egui_wgpu::wgpu::Instance::new(instance_descriptor()),
             platform,
+            location,
         )
     }
 
@@ -997,7 +1003,11 @@ impl App {
     /// window ever asks it for a surface. The split is here rather than at the
     /// field so that everything else `new` wires up, `set_supports_exit` and
     /// the initial config load included, is on the tested side of it.
-    fn with_instance(instance: wgpu::Instance, platform: Box<dyn PlatformBridge>) -> Self {
+    fn with_instance(
+        instance: wgpu::Instance,
+        platform: Box<dyn PlatformBridge>,
+        location: LocationFacade,
+    ) -> Self {
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         // Owns the single shared render-budget counter used by both the loop and
@@ -1042,7 +1052,7 @@ impl App {
         // property of the build, not of anything that changes while it runs.
         let supports_exit = platform.supports_exit();
         let loop_frame_budget = budgets.loop_frames_held;
-        let location_settings_available = platform.location_settings_available();
+        let location_settings_available = location.settings_available();
         let restored = platform
             .kv()
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));
@@ -1191,11 +1201,11 @@ impl App {
             manual_nav_pending: false,
             last_viewport: None,
             redraw_waker: RedrawWaker::new(),
-            // Inert until the first `poll_platform_state`, which is inside the
-            // first frame — deliberately after `set_config_dir`, so the gate
-            // finds the memo Android only learns the path to during
-            // `android_main`.
-            location: LocationGate::new(),
+            // The gate inside is inert until the first `poll_platform_state`,
+            // which is inside the first frame — deliberately after
+            // `set_config_dir`, so it finds the memo Android only learns the
+            // path to during `android_main`.
+            location,
             site_positions,
             site_catalogue,
         };
@@ -1208,12 +1218,19 @@ impl App {
         app.spawn_site_catalogue_refresh();
 
         // Here, and not later, because "later" does not exist for two of the
-        // bridge's producers: Android starts its theme poller from
-        // `set_theme_detector`, which `android_main` calls before `run_app`, and
-        // `DesktopPlatform::start_gps` needs the waker already in hand when a
-        // menu toggle reaches it. Both are before any window, which is the
-        // situation `RedrawWaker`'s slot exists for.
+        // producers: Android starts its theme poller from `set_theme_detector`,
+        // which `android_main` calls before `run_app`, and the facade's serial
+        // arm needs the wake already in hand when a menu toggle reaches
+        // `start_serial`. Both are before any window, which is the situation
+        // `RedrawWaker`'s slot exists for.
         app.platform.set_redraw_waker(app.redraw_waker.clone());
+        // The facade's arm gets the same wake at the same moment, for the same
+        // reasons — and this is also what brings the OS location provider up
+        // (prompting nobody; the two-phase contract in
+        // rustdar_location::os_location).
+        let location_wake = app.redraw_waker.clone();
+        app.location
+            .set_wake(std::sync::Arc::new(move || location_wake.wake()));
         // The first compose, so the startup-constant facts — supports_exit,
         // the loop frame budget, the settings-page offer, catalogue_pending —
         // are in the `Gui` from the first read, exactly as the setter pushes
@@ -1502,9 +1519,10 @@ impl App {
         // starts delivery in the first place, so on the frame after a grant
         // lands the fix it produces is drained in the same pass rather than the
         // next one.
+        let platform = &self.platform;
         let step = self
             .location
-            .step(self.platform.as_mut(), self.gui.settings_visible());
+            .step(&|| platform.kv(), self.gui.settings_visible());
         if step.changed {
             // The location facts themselves are composed from the gate every
             // frame (`push_frame_inputs`); what a *change* still owes is the
@@ -1514,10 +1532,10 @@ impl App {
         // Consent for the position on screen has gone away. The serial reader
         // is deliberately exempt: a dongle the user plugged in is not covered
         // by this permission and its dot must survive a location denial.
-        if step.revoked && !self.platform.gps_active() {
+        if step.revoked && !self.location.serial_active() {
             self.user_gps = None;
         }
-        if let Some(fix) = self.platform.poll_gps_fix() {
+        if let Some(fix) = self.location.poll_fix() {
             self.upgrade_provisional_site(&fix);
             // Stamped once, at arrival — the instant travels with the fix.
             self.user_gps = Some((fix, web_time::Instant::now()));
@@ -3506,14 +3524,9 @@ impl App {
     // switched to injecting a querier; the live route is `set_insets_querier`
     // -> `query_insets` -> `refresh_safe_area_insets`.
 
-    /// Set a receiver for GPS fix updates. Android and the web send fixes this
-    /// way; desktop reads a serial port instead, through `start_gps`.
-    pub fn set_gps_fix_receiver(
-        &mut self,
-        receiver: std::sync::mpsc::Receiver<rustdar_location::Fix>,
-    ) {
-        self.platform.set_gps_fix_receiver(receiver);
-    }
+    // `set_gps_fix_receiver` and `set_location_hooks` sat here until WO-RL-4:
+    // fixes and the permission calls now flow inside the LocationFacade's own
+    // arm, which the entry point constructs and hands to `App::new`.
 
     /// Set a receiver for compass heading updates (Android only).
     pub fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {
@@ -3528,20 +3541,6 @@ impl App {
     /// Set a callback that reads the OS dark-theme preference (Android only).
     pub fn set_theme_detector(&mut self, detector: fn() -> bool) {
         self.platform.set_theme_detector(detector);
-    }
-
-    /// Install the four location calls (Android only; see
-    /// [`PlatformBridge::set_location_hooks`]).
-    ///
-    /// The entry point installs these, not `App`, for the reason every other
-    /// setter here exists: they are JNI calls that live in the `rustdar`
-    /// crate's cfg(android) modules,
-    /// which depends on this crate and can never be called from it. Handing
-    /// them over before `run_app` is what closes the window in which
-    /// `AndroidPlatform` answers `Unavailable` for want of them — a terminal
-    /// state the gate would stop polling out of.
-    pub fn set_location_hooks(&mut self, hooks: crate::platform::LocationHooks) {
-        self.platform.set_location_hooks(hooks);
     }
 
     /// Set a callback that takes a back press delivered outside the input

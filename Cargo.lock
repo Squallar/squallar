@@ -4303,6 +4303,8 @@ dependencies = [
  "chrono",
  "futures-channel",
  "futures-lite",
+ "jni",
+ "js-sys",
  "log",
  "objc2 0.6.4",
  "objc2-core-location 0.3.2",
@@ -4312,6 +4314,9 @@ dependencies = [
  "rustdar-nmea-serial",
  "serde",
  "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
  "windows",
 ]

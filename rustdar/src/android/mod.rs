@@ -4,31 +4,46 @@
 //! beside the `os_location` providers the other three share.
 //!
 //! Shared JNI plumbing lives here; each concern has its own file:
-//! [`permissions`], [`location`], [`insets`], [`density`], [`theme`],
-//! [`task_to_back`], [`back`], [`compass`], and the [`entry`] point.
+//! [`insets`], [`density`], [`theme`], [`task_to_back`], [`back`],
+//! [`compass`], and the [`entry`] point. The location concern — the runtime
+//! permission and the LocationHelper fix path — moved WHOLE to
+//! `rustdar_location::android` at WO-RL-4 (seam ruling 6: every remote
+//! location arm lives in the facade); `entry` initialises it once through
+//! `rustdar_location::android::init`.
 //!
 //! # The injection is a rule, not a leftover (READ BEFORE "SIMPLIFYING")
 //!
 //! `android_main` installs `set_theme_detector` / `set_insets_querier` /
-//! `set_back_handler` / `set_back_press_taker` / `set_location_hooks` as
-//! injected `fn` pointers even though, since the fold, callee and caller share
-//! this crate. The injection is the frontend portability contract, not a
-//! crate-graph workaround: `PlatformBridge` is declared in rustdar-frontend,
-//! which must compile for targets that have never heard of JNI; the bridge
-//! structs stay `deny(unsafe_code)`-clean and host-testable (TestBridge
-//! injects the same fn pointers); and the JNI surface stays confined to these
-//! cfg(android) modules. Do NOT "simplify" `set_*` into direct calls from
+//! `set_back_handler` / `set_back_press_taker` as injected `fn` pointers even
+//! though, since the fold, callee and caller share this crate. The injection
+//! is the frontend portability contract, not a crate-graph workaround:
+//! `PlatformBridge` is declared in rustdar-frontend, which must compile for
+//! targets that have never heard of JNI; the bridge structs stay
+//! `deny(unsafe_code)`-clean and host-testable (TestBridge injects the same
+//! fn pointers); and the JNI surface stays confined to these cfg(android)
+//! modules. Do NOT "simplify" `set_*` into direct calls from
 //! `AndroidPlatform` -- that couples the bridge to JNI symbols, breaks the
 //! host double's parity with production wiring, and un-writes the
 //! one-setter-carries-all-four half-install guard.
+//!
+//! # Why the rule no longer names location (WO-RL-4)
+//!
+//! `set_location_hooks` was the fifth injection until the location arm moved
+//! into rustdar-location. The rule STANDS for insets, theme and back, whose
+//! consumer is still the frontend-declared `PlatformBridge` — but location's
+//! consumer is the facade's own gate now, IN the same crate as the JNI arm,
+//! so there is no portability contract left for an injection to carry there:
+//! the crate boundary itself is the fence (the facade's default build has no
+//! `jni`; the arm is feature-fenced; the app holds only a `LocationFacade`).
+//! Un-inverting insets/theme/back the same way would NOT be the same move —
+//! their consumer still lives below this crate. The distinction, not the
+//! shortcut, is what this paragraph exists to record.
 
 pub mod back;
 pub mod compass;
 pub mod density;
 mod entry;
 pub mod insets;
-pub mod location;
-pub mod permissions;
 pub mod task_to_back;
 pub mod theme;
 

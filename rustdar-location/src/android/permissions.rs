@@ -64,7 +64,7 @@ pub(super) fn has_location_permission() -> bool {
 /// **That is why the caller retries, and why the retry must not be
 /// "simplified" to a single attempt.** A `false` here is a request that did not
 /// happen; treating it as a request the user declined is exactly the bug this
-/// replaced. See the bounded retry in `rustdar_frontend::location_permission`,
+/// replaced. See the bounded retry in [`crate::LocationGate`],
 /// which is what the return value below feeds.
 ///
 /// (Only two nouns in the paragraph above have moved since it was written: the
@@ -165,10 +165,11 @@ fn should_show_permission_rationale() -> Option<bool> {
 
 /// What Android currently says about this app's access to the user's location.
 ///
-/// Backs [`PlatformBridge::location_permission`] through [`LocationHooks`].
-/// `attempts` is what the app has told the bridge about how many times this
-/// *install* has asked; see the tri-state below for why it is needed and
-/// `PlatformBridge::set_location_attempts` for where it comes from.
+/// Backs the arm's `permission` (the gate's `location_permission`, driven
+/// in-crate since WO-RL-4 — the `LocationHooks` fn-pointer hop died with the
+/// bridge verbs). `attempts` is what the gate has said about how many times
+/// this *install* has asked; see the tri-state below for why it is needed and
+/// the gate seam's `set_location_attempts` for where it comes from.
 ///
 /// # Android's states are three, and its API names two of them
 ///
@@ -199,11 +200,9 @@ fn should_show_permission_rationale() -> Option<bool> {
 /// pane says location is not available on this platform, and the feature is
 /// gone for the life of the process on a phone that has it.
 ///
-/// [`PlatformBridge::location_permission`]: rustdar_frontend::platform::PlatformBridge::location_permission
-/// [`LocationHooks`]: rustdar_frontend::platform::LocationHooks
-pub(super) fn location_permission_status(attempts: u8) -> rustdar_location::LocationPermission {
+pub(super) fn location_permission_status(attempts: u8) -> crate::LocationPermission {
     if has_location_permission() {
-        return rustdar_location::LocationPermission::Granted;
+        return crate::LocationPermission::Granted;
     }
     // `has_location_permission` folds "no" and "could not ask" into the same
     // `false`, so the rationale call below doubles as the reachability probe. It
@@ -220,12 +219,9 @@ pub(super) fn location_permission_status(attempts: u8) -> rustdar_location::Loca
 /// Split out for the same reason [`provider_fix_quality`] is: everything above
 /// it is JNI and everything in it is a table, and the table is where the three
 /// mistakes live. See [`location_permission_status`] for what each row means and
-/// why `None` is [`Unknown`](rustdar_location::LocationPermission::Unknown).
-fn permission_from_rationale(
-    rationale: Option<bool>,
-    attempts: u8,
-) -> rustdar_location::LocationPermission {
-    use rustdar_location::LocationPermission;
+/// why `None` is [`Unknown`](crate::LocationPermission::Unknown).
+fn permission_from_rationale(rationale: Option<bool>, attempts: u8) -> crate::LocationPermission {
+    use crate::LocationPermission;
 
     match (rationale, attempts) {
         // Could not ask. First frames of every launch; means "wait".
@@ -246,8 +242,8 @@ fn permission_from_rationale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LocationPermission;
     use crate::android::java_context;
-    use rustdar_location::LocationPermission;
 
     // Everything here runs on the *host*, under the `jni-typecheck` feature that
     // widens this crate's own `cfg` (see the top of the file), so it needs

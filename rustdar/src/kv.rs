@@ -34,7 +34,7 @@
 //! it, since its own write cannot start until the earlier ones have finished.
 //!
 //! "The producers are all one thread" is an invariant the type system enforces,
-//! not an observation about today's call sites: `LocationBridge::kv`
+//! not an observation about today's call sites: `PlatformBridge::kv`
 //! hands out a `Box<dyn KvStore>`, which is neither `Send` nor `Sync`, so a
 //! store cannot reach a second thread to be called from. Anyone widening that
 //! to `Arc<dyn KvStore + Send + Sync>` takes the ordering guarantee with

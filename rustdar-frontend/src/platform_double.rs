@@ -18,8 +18,8 @@
 //! instead what `query_insets` *now answers*, and then what the UI *now shows*,
 //! puts production code between the fixture and the assertion. Every probe in
 //! the suite is written that way; where a call really has no downstream
-//! observable — `start_gps` is the only one — the argument is kept behind a
-//! handle the test shares, and that is stated at the field.
+//! observable — the provider's `start_serial` is the only one — the argument
+//! is kept behind a handle the test shares, and that is stated at the field.
 //!
 //! # Where it stops short of the real bridges
 //!
@@ -32,6 +32,17 @@
 //!
 //! Nothing here is `Send`: `App` never requires it of a bridge, and `Rc` keeps
 //! the shared handles cheap.
+//!
+//! # The location half (WO-RL-4)
+//!
+//! The bridge lost its location verbs when `App` started holding a
+//! [`rustdar_location::LocationFacade`] directly, so the double split the same
+//! way the production wiring did: [`TestBridge`] keeps the platform surface
+//! (kv included — where blobs persist is a platform question), and
+//! [`TestLocationProvider`] — sharing the same [`LocationRecord`] cells —
+//! implements the facade's arm seam. `headless()` wires one facade over the
+//! provider the bridge mints, so a test still configures everything on the
+//! bridge and reads everything back through the same records.
 
 use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
 use rustdar_kv::{KvStore, MemoryKvStore};
@@ -76,12 +87,13 @@ impl KvStore for SharedStore {
     }
 }
 
-/// The GPS config the bridge was last started with, or `None` when stopped.
+/// The serial config the provider was last started with, or `None` when
+/// stopped.
 ///
-/// The one thing here with no downstream observable: `start_gps` opens a serial
-/// port and nothing about the app changes. Shared so a test can see *which*
-/// config reached it — passing the wrong one is the failure that matters, and
-/// `gps_active` alone cannot tell.
+/// The one thing here with no downstream observable: `start_serial` opens a
+/// serial port and nothing about the app changes. Shared so a test can see
+/// *which* config reached it — passing the wrong one is the failure that
+/// matters, and `serial_active` alone cannot tell.
 pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_nmea_serial::SerialConfig>>>;
 
 /// The [`RedrawWaker`] the app handed this bridge, or a fresh empty one if it
@@ -89,7 +101,7 @@ pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_nmea_serial::SerialConfig>
 ///
 /// The second thing here kept behind a shared handle rather than read back
 /// through a getter, and for the same reason as [`GpsRecord`]: the real bridges
-/// spend a waker on threads (`DesktopPlatform::start_gps`,
+/// spend a waker on threads (the facade arms' serial reader,
 /// `AndroidPlatform::set_theme_detector`) that this double deliberately does not
 /// start, so there is no downstream observable to ask. Waking through it and
 /// watching what the *app* installed fire is what puts production code between
@@ -333,12 +345,25 @@ impl TestBridge {
         self
     }
 
-    /// Feed `poll_gps_fix`, standing in for the browser's geolocation watch and
-    /// Android's location callbacks.
+    /// Feed the provider's `poll_fix`, standing in for the browser's
+    /// geolocation watch and Android's location poll. Handed over to the
+    /// [`TestLocationProvider`] when [`location_provider`](Self::location_provider)
+    /// mints it.
     pub(crate) fn gps_channel(&mut self) -> std::sync::mpsc::Sender<rustdar_location::Fix> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.gps_fix_receiver = Some(rx);
         tx
+    }
+
+    /// Mint the facade arm this bridge's records back. Called by `headless()`
+    /// after the test has configured the bridge; takes the fix channel with it
+    /// (the bridge lost `poll_gps_fix` to the facade at WO-RL-4).
+    pub(crate) fn location_provider(&mut self) -> TestLocationProvider {
+        TestLocationProvider {
+            record: self.location.clone(),
+            gps: Rc::clone(&self.gps),
+            fixes: self.gps_fix_receiver.take(),
+        }
     }
 
     /// Feed `poll_theme`, standing in for Android's polling thread.
@@ -352,10 +377,6 @@ impl TestBridge {
 impl PlatformBridge for TestBridge {
     fn poll_theme(&mut self) -> Option<bool> {
         self.theme_receiver.as_ref().and_then(drain_latest)
-    }
-
-    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
-        self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -433,10 +454,6 @@ impl PlatformBridge for TestBridge {
         *self.waker.borrow_mut() = waker;
     }
 
-    fn set_gps_fix_receiver(&mut self, receiver: Receiver<rustdar_location::Fix>) {
-        self.gps_fix_receiver = Some(receiver);
-    }
-
     fn set_heading_receiver(&mut self, receiver: Receiver<f32>) {
         self.heading_receiver = Some(receiver);
     }
@@ -455,20 +472,6 @@ impl PlatformBridge for TestBridge {
         self.theme_detector = Some(detector);
     }
 
-    fn start_gps(&mut self, config: &rustdar_nmea_serial::SerialConfig) {
-        *self.gps.borrow_mut() = Some(config.clone());
-    }
-
-    fn stop_gps(&mut self) {
-        *self.gps.borrow_mut() = None;
-    }
-
-    fn gps_active(&self) -> bool {
-        self.gps.borrow().is_some()
-    }
-}
-
-impl rustdar_location::LocationBridge for TestBridge {
     /// `None` until this platform has been told where config lives, which is
     /// what makes `App::set_config_dir` observable: before it, there is no
     /// store to load from. See [`StoreAvailability`] for the two bridges that
@@ -486,36 +489,67 @@ impl rustdar_location::LocationBridge for TestBridge {
             }) as Box<_>
         })
     }
+}
 
-    fn location_permission(&self) -> LocationPermission {
-        self.location.queries.set(self.location.queries.get() + 1);
-        self.location.permission.get()
+/// The facade's arm, for tests: the location half of the old `TestBridge`,
+/// answering from the same [`LocationRecord`] cells the bridge minted it with
+/// — so a test keeps one set of handles whichever side of the WO-RL-4 split
+/// it is asserting on.
+pub(crate) struct TestLocationProvider {
+    record: LocationRecord,
+    /// See [`GpsRecord`].
+    gps: GpsRecord,
+    /// Fixes the test pushes through [`TestBridge::gps_channel`], standing in
+    /// for the browser's geolocation watch and Android's location poll.
+    fixes: Option<Receiver<rustdar_location::Fix>>,
+}
+
+impl rustdar_location::LocationProvider for TestLocationProvider {
+    fn permission(&self) -> LocationPermission {
+        self.record.queries.set(self.record.queries.get() + 1);
+        self.record.permission.get()
     }
 
-    /// Starts delivery, as every real bridge does — the web's `watchPosition`
+    /// Starts delivery, as every real arm does — the web's `watchPosition`
     /// is literally the same call as the prompt.
     ///
     /// Deliberately starts even from `Prompt`: on a platform where the ask and
     /// the subscription are one call there is no other order available, and a
     /// double that refused would hide the case the gate has to handle.
-    fn request_location(&mut self) -> bool {
-        self.location.requests.set(self.location.requests.get() + 1);
-        let reached = self.location.reaches_the_os.get();
-        if reached && self.location.permission.get() == LocationPermission::Granted {
-            self.location.active.set(true);
+    fn request(&mut self) -> bool {
+        self.record.requests.set(self.record.requests.get() + 1);
+        let reached = self.record.reaches_the_os.get();
+        if reached && self.record.permission.get() == LocationPermission::Granted {
+            self.record.active.set(true);
         }
         reached
     }
 
-    fn stop_location(&mut self) {
-        self.location.active.set(false);
+    fn stop(&mut self) {
+        self.record.active.set(false);
     }
 
-    fn location_active(&self) -> bool {
-        self.location.active.get()
+    fn active(&self) -> bool {
+        self.record.active.get()
     }
 
-    fn set_location_attempts(&mut self, attempts: u8) {
-        self.location.attempts.set(Some(attempts));
+    fn set_attempts(&mut self, attempts: u8) {
+        self.record.attempts.set(Some(attempts));
+    }
+
+    fn poll_fix(&mut self) -> Option<rustdar_location::Fix> {
+        self.fixes.as_ref().and_then(drain_latest)
+    }
+
+    fn start_serial(&mut self, config: &rustdar_nmea_serial::SerialConfig) {
+        *self.gps.borrow_mut() = Some(config.clone());
+    }
+
+    fn stop_serial(&mut self) {
+        *self.gps.borrow_mut() = None;
+    }
+
+    fn serial_active(&self) -> bool {
+        self.gps.borrow().is_some()
     }
 }

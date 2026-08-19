@@ -119,7 +119,8 @@ impl Default for LocationMemo {
     }
 }
 
-/// What one [`LocationGate::step`] changed.
+/// What one `LocationGate::step` (driven through the facade since WO-RL-4)
+/// changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LocationStep {
     /// The reported state moved, so the UI's cached copy is stale and a frame
@@ -208,7 +209,11 @@ impl LocationGate {
     /// `settings_open` tightens the cadence rather than gating it, because the
     /// state has to be current whether or not anyone is looking — the blue dot
     /// is drawn on the map, not in the settings window.
-    pub fn step(&mut self, platform: &mut dyn LocationBridge, settings_open: bool) -> LocationStep {
+    pub(crate) fn step(
+        &mut self,
+        platform: &mut dyn LocationBridge,
+        settings_open: bool,
+    ) -> LocationStep {
         self.step_at(Instant::now(), platform, settings_open)
     }
 
@@ -309,7 +314,7 @@ impl LocationGate {
     /// [`step`](Self::step), so the same guards apply. In particular a user who
     /// has already been refused by the OS gets no new dialog out of this, and
     /// the settings pane does not offer them the button in the first place.
-    pub fn enable(&mut self, platform: &mut dyn LocationBridge) {
+    pub(crate) fn enable(&mut self, platform: &mut dyn LocationBridge) {
         self.memo.enabled = true;
         self.memo.attempts = 0;
         self.persist();
@@ -328,7 +333,7 @@ impl LocationGate {
     /// this is the button that says "off", and up to [`POLL_INTERVAL`] of the
     /// dot continuing to move afterwards is the app disagreeing with its own
     /// control.
-    pub fn disable(&mut self, platform: &mut dyn LocationBridge) {
+    pub(crate) fn disable(&mut self, platform: &mut dyn LocationBridge) {
         self.memo.enabled = false;
         self.persist();
         platform.stop_location();

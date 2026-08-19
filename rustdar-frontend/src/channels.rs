@@ -612,7 +612,7 @@ pub struct StormMotionResponse {
 /// resolved from the cached catalogue before the first frame and is
 /// deliberately not re-resolved from this. See [`crate::site_catalogue`].
 ///
-/// The trip through a channel is not ceremony. `LocationBridge::kv`
+/// The trip through a channel is not ceremony. `PlatformBridge::kv`
 /// hands out a `Box<dyn KvStore>`, which is neither `Send` nor something a
 /// detached future can hold, so the persist has to happen back on the thread
 /// that owns the app — which is also the thread holding the cached copy the
