@@ -1209,7 +1209,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     registry.set_enabled(kind, true);
 
     registry.apply_fetch_result(OverlayFetchResult {
-        kind,
+        kind: kind.id(),
         data: half_listed_round(),
     });
 
@@ -1255,7 +1255,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
 
     // Both listings answer next poll: the mark clears itself.
     registry.apply_fetch_result(OverlayFetchResult {
-        kind,
+        kind: kind.id(),
         data: outcome(
             vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
             Vec::new(),
@@ -1313,7 +1313,7 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
     let mut registry = OverlayRegistry::default();
     registry.set_enabled(kind, true);
     registry.apply_fetch_result(OverlayFetchResult {
-        kind,
+        kind: kind.id(),
         data: payload,
     });
     let ctx = PaneControlContext {

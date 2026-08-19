@@ -14451,7 +14451,7 @@ fn zone_alert_over(
 fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert::NwsAlert>) {
     use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
     h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OverlayKind::NwsAlerts,
+        kind: OverlayKind::NwsAlerts.id(),
         data: OverlayRegistry::nws_alerts_payload(alerts),
     });
 }
@@ -14565,7 +14565,7 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
         concerning: None,
     };
     h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OverlayKind::SpcDiscussions,
+        kind: OverlayKind::SpcDiscussions.id(),
         data: OverlayRegistry::spc_discussions_payload(vec![md]),
     });
 

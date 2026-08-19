@@ -10,11 +10,13 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RenderMode,
 };
 use crate::render::station_model;
+use rustdar_source::id::{LayerId, known};
 
 pub(crate) struct MetarFetchResult(
     pub Result<crate::metar::fetch::MetarRound, crate::fetch_policy::FetchError>,
@@ -231,6 +233,15 @@ impl OverlayHandler for MetarHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::Metar
     }
+    fn id(&self) -> LayerId {
+        known::METAR
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        80
+    }
 
     fn display_name(&self) -> &str {
         "METAR Observations"
@@ -360,7 +371,7 @@ impl OverlayHandler for MetarHandler {
             .unwrap_or(crate::metar::networks::DEFAULT_VIEWPORT);
         log::info!("Fetching METAR observations for {viewport:?}");
         vec![FetchTask {
-            kind: OverlayKind::Metar,
+            kind: known::METAR,
             future: Box::pin(async move {
                 let result =
                     crate::metar::fetch::fetch_current_metars(&client, &sources, &viewport).await;
@@ -672,7 +683,7 @@ mod round_tests {
         let mut registry = OverlayRegistry::default();
         registry.set_enabled(kind, true);
         registry.apply_fetch_result(OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: Box::new(MetarFetchResult(result)) as FetchPayload,
         });
         let ctx = PaneControlContext {

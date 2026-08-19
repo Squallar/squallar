@@ -5,6 +5,7 @@ use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
 };
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
@@ -13,6 +14,7 @@ use crate::render::rasterize;
 use crate::spc::colors::md_stroke_color;
 use crate::spc::discussion::SpcDiscussion;
 use crate::types::OverlayLabel;
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
@@ -158,6 +160,15 @@ fn md_label(md: &SpcDiscussion) -> Option<OverlayLabel> {
 impl OverlayHandler for SpcDiscussionHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::SpcDiscussions
+    }
+    fn id(&self) -> LayerId {
+        known::SPC_DISCUSSIONS
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        40
     }
 
     fn display_name(&self) -> &str {
@@ -333,7 +344,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         };
         let sources = ctx.sources.clone();
         vec![FetchTask {
-            kind: OverlayKind::SpcDiscussions,
+            kind: known::SPC_DISCUSSIONS,
             future: Box::pin(async move {
                 let result = crate::spc::fetch::fetch_active_discussions(&client, &sources).await;
                 Box::new(SpcDiscussionFetchResult(result)) as FetchPayload

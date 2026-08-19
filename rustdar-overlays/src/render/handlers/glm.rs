@@ -13,11 +13,13 @@ use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
 };
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// What a poll's listings covered, in the layer-agnostic terms the UI renders.
@@ -738,6 +740,15 @@ impl OverlayHandler for GlmHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::Lightning
     }
+    fn id(&self) -> LayerId {
+        known::LIGHTNING
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        70
+    }
 
     fn display_name(&self) -> &str {
         "GLM Lightning"
@@ -919,7 +930,7 @@ impl OverlayHandler for GlmHandler {
         let levels = self.active_levels();
         let cache = Arc::clone(&self.cache);
         vec![FetchTask {
-            kind: OverlayKind::Lightning,
+            kind: known::LIGHTNING,
             future: Box::pin(async move {
                 // Clone the cache out so we don't hold a std::sync::Mutex across await
                 let mut local_cache = {

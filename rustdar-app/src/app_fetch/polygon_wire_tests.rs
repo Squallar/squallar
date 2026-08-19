@@ -179,9 +179,10 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
         }
         other => panic!("{other:?} is not a polygon kind this fixture seeds"),
     };
-    app.gui
-        .overlays
-        .apply_fetch_result(OverlayFetchResult { kind, data });
+    app.gui.overlays.apply_fetch_result(OverlayFetchResult {
+        kind: kind.id(),
+        data,
+    });
     // Keep the pane's stored per-layer config in step with the handler, the
     // way the UI does after every control change (`Gui::initialize_pane_enabled`
     // seeded pane defaults at startup, and `spawn_overlay_render` reloads

@@ -391,6 +391,44 @@ pub enum RenderMode {
     Tile,
 }
 
+/// Which of a pane's two content surfaces a layer draws onto.
+///
+/// A pane's content divides in two, and the line between them is geography:
+///
+/// * [`Ground`](Surface::Ground) — everything drawn **at** a latitude and
+///   longitude, through the projector. The basemap and city-label tiles, the
+///   radar raster and its range ring, SPC outlooks and mesoscale discussions,
+///   NWS alerts, storm reports, lightning, METARs, model data, the radar-site
+///   icons and their names, the location dot. All of it is a picture of the
+///   world, and all of it is still true when it is laid flat on the world.
+/// * [`Glass`](Surface::Glass) — chrome, positioned against the pane's own
+///   **edges** rather than against the map underneath: the colour-scale
+///   legends and the stale-image notice. Neither has a latitude, and neither
+///   survives being laid flat — on a 3D pane's floor a legend is painted into
+///   the ground in perspective, shrinking with distance and swinging round
+///   with the camera.
+///
+/// For a plan-view pane the distinction is invisible, because its ground *is*
+/// its glass: one rect carries both. It becomes real for a 3D pane, whose
+/// ground goes into the off-screen strip the raymarcher mirrors onto the floor
+/// (`Gui::draw_floor_strip`) while its glass stays on the pane rect the volume
+/// occupies.
+///
+/// Declared by the handler ([`OverlayHandler::surface`]) rather than matched
+/// over `OverlayKind` in the UI crate: a new layer does not compile until its
+/// author has said whether it is a picture of the world or chrome over one.
+/// That is what makes the split a stated rule rather than an `if` somebody
+/// happened to write in one arm — the previous spelling of it was no spelling
+/// at all, which is how the colour scale ended up painted onto the ground the
+/// day the ground arrived.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Surface {
+    /// Geography. Mirrors onto a 3D pane's floor.
+    Ground,
+    /// Chrome over geography. Never mirrors.
+    Glass,
+}
+
 /// Handlers store `Vec<Arc<T>>`; a click clones the `Arc` into the selection
 /// list as `Arc<dyn OverlayItem>`.
 pub trait OverlayItem: Send + Sync + Debug {
@@ -432,6 +470,29 @@ pub trait OverlayHandler: Send {
     // ── Identity & metadata ───────────────────────────────────────────
 
     fn kind(&self) -> OverlayKind;
+
+    /// This layer's open-string identity — one of the [`known`] consts,
+    /// spelled as a **literal** in each impl rather than derived through
+    /// [`kind`](Self::kind): the enum bridge closes at M8b-b3 and this
+    /// method is what survives it. The registry's identity tests pin
+    /// uniqueness and ledger membership across all twelve, and the
+    /// state-key tripwire holds each handler's id to its `kind`'s spelling
+    /// while both exist.
+    fn id(&self) -> LayerId;
+
+    /// Which pane surface this layer draws onto. See [`Surface`].
+    fn surface(&self) -> Surface;
+
+    /// This layer's position in the default draw order, **bottom to top** —
+    /// a lower weight draws first and is occluded by higher ones.
+    ///
+    /// The weights encode `OverlayKind::all()`'s order — the REAL default
+    /// draw order, which is neither the enum's declaration order nor
+    /// `create_handlers()`'s vec order (SpcOutlook sits BELOW Radar here;
+    /// the vec registers Radar second). The literal-list pin in
+    /// `registry_identity_tests` is what holds the weights to it. Spaced by
+    /// 10 so a future layer can sit between two without renumbering.
+    fn draw_order_weight(&self) -> u32;
 
     fn display_name(&self) -> &str;
 
@@ -849,7 +910,7 @@ pub type TaskFuture = Pin<Box<dyn Future<Output = FetchPayload> + Send>>;
 pub type TaskFuture = Pin<Box<dyn Future<Output = FetchPayload>>>;
 
 pub struct FetchTask {
-    pub kind: OverlayKind,
+    pub kind: LayerId,
     pub future: TaskFuture,
 }
 
@@ -875,7 +936,7 @@ pub struct OverlayRegistry {
     ///
     /// [`load_pane_configs`]: OverlayRegistry::load_pane_configs
     /// [`forget_loaded_config`]: OverlayRegistry::forget_loaded_config
-    loaded_configs: std::collections::HashMap<OverlayKind, serde_json::Value>,
+    loaded_configs: std::collections::HashMap<LayerId, serde_json::Value>,
 }
 
 impl Default for OverlayRegistry {
@@ -890,24 +951,21 @@ impl Default for OverlayRegistry {
 }
 
 impl OverlayRegistry {
-    fn handler(&self, kind: OverlayKind) -> Option<&dyn OverlayHandler> {
-        self.handlers
-            .iter()
-            .find(|h| h.kind() == kind)
-            .map(|h| &**h)
+    fn handler(&self, id: &LayerId) -> Option<&dyn OverlayHandler> {
+        self.handlers.iter().find(|h| &h.id() == id).map(|h| &**h)
     }
 
-    fn handler_mut(&mut self, kind: OverlayKind) -> Option<&mut dyn OverlayHandler> {
-        self.forget_loaded_config(kind);
+    fn handler_mut(&mut self, id: &LayerId) -> Option<&mut dyn OverlayHandler> {
+        self.forget_loaded_config(id);
         for handler in &mut self.handlers {
-            if handler.kind() == kind {
+            if &handler.id() == id {
                 return Some(&mut **handler);
             }
         }
         None
     }
 
-    /// Drop `kind`'s "already loaded" note, so the next
+    /// Drop `id`'s "already loaded" note, so the next
     /// [`load_pane_configs`](OverlayRegistry::load_pane_configs) re-applies
     /// its config rather than skipping it.
     ///
@@ -915,8 +973,8 @@ impl OverlayRegistry {
     /// ([`handler_mut`](OverlayRegistry::handler_mut)), so it cannot be
     /// forgotten by a new mutator: whatever a caller does with the borrow, the
     /// note is already gone.
-    fn forget_loaded_config(&mut self, kind: OverlayKind) {
-        self.loaded_configs.remove(&kind);
+    fn forget_loaded_config(&mut self, id: &LayerId) {
+        self.loaded_configs.remove(id);
     }
 
     pub fn handlers(&self) -> impl Iterator<Item = &dyn OverlayHandler> {
@@ -924,21 +982,36 @@ impl OverlayRegistry {
     }
 
     pub fn get_handler(&self, kind: OverlayKind) -> Option<&dyn OverlayHandler> {
-        self.handler(kind)
+        self.handler(&kind.id())
     }
 
     pub fn get_handler_mut(&mut self, kind: OverlayKind) -> Option<&mut dyn OverlayHandler> {
-        self.handler_mut(kind)
+        self.handler_mut(&kind.id())
+    }
+
+    /// The handler registered under `id`, if any — the open-string primary
+    /// the M8b draw loop asks; an id no handler owns answers `None` (unknown
+    /// ids are retained by callers and skipped at draw, never resolved here).
+    pub fn handler_by_id(&self, id: &LayerId) -> Option<&dyn OverlayHandler> {
+        self.handler(id)
+    }
+
+    /// The mutable half of [`handler_by_id`](Self::handler_by_id); routes
+    /// through [`handler_mut`](Self::handler_mut), so the loaded-config note
+    /// is dropped exactly as for every other mutable borrow.
+    pub fn handler_by_id_mut(&mut self, id: &LayerId) -> Option<&mut dyn OverlayHandler> {
+        self.handler_mut(id)
     }
 
     pub fn data_generation(&self, kind: OverlayKind) -> u64 {
-        self.handler(kind).map_or(0, |h| h.data_generation())
+        self.handler(&kind.id()).map_or(0, |h| h.data_generation())
     }
 
     /// [`OverlayHandler::content_signature`] for `kind`; `0` for a kind with
     /// no handler.
     pub fn content_signature(&self, kind: OverlayKind) -> u64 {
-        self.handler(kind).map_or(0, |h| h.content_signature())
+        self.handler(&kind.id())
+            .map_or(0, |h| h.content_signature())
     }
 
     /// The NWS alert fetch payload for a known alert list, exactly as the
@@ -1005,37 +1078,38 @@ impl OverlayRegistry {
     /// Age `kind`'s retry ledger — see [`FetchRetry::rewind`].
     #[doc(hidden)]
     pub fn rewind_retry(&mut self, kind: OverlayKind, by: std::time::Duration) {
-        if let Some(r) = self.handler_mut(kind).and_then(|h| h.retry_mut()) {
+        if let Some(r) = self.handler_mut(&kind.id()).and_then(|h| h.retry_mut()) {
             r.rewind(by);
         }
     }
 
     pub fn has_data(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).is_some_and(|h| h.has_data())
+        self.handler(&kind.id()).is_some_and(|h| h.has_data())
     }
 
     pub fn is_fetching(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).is_some_and(|h| h.is_fetching())
+        self.handler(&kind.id()).is_some_and(|h| h.is_fetching())
     }
 
     pub fn set_fetching(&mut self, kind: OverlayKind, fetching: bool) {
-        if let Some(h) = self.handler_mut(kind) {
+        if let Some(h) = self.handler_mut(&kind.id()) {
             h.set_fetching(fetching);
         }
     }
 
     pub fn fetch_time(&self, kind: OverlayKind) -> Option<web_time::Instant> {
-        self.handler(kind).and_then(|h| h.fetch_time())
+        self.handler(&kind.id()).and_then(|h| h.fetch_time())
     }
 
     pub fn auto_poll_interval(&self, kind: OverlayKind) -> Option<u64> {
-        self.handler(kind).and_then(|h| h.auto_poll_interval())
+        self.handler(&kind.id())
+            .and_then(|h| h.auto_poll_interval())
     }
 
     /// [`OverlayHandler::auto_fetch_delay`] for `kind` — the one gate the
     /// automatic poll consults, and the only caller that may.
     pub fn auto_fetch_delay(&self, kind: OverlayKind) -> Option<std::time::Duration> {
-        self.handler(kind).and_then(|h| h.auto_fetch_delay())
+        self.handler(&kind.id()).and_then(|h| h.auto_fetch_delay())
     }
 
     /// Wipe `kind`'s retry ledger because the **user** asked for a fetch.
@@ -1043,7 +1117,7 @@ impl OverlayRegistry {
     /// Called from `push_user_overlay_fetch` and nowhere else, so that "a user
     /// action is never made to wait out a backoff" holds by construction.
     pub fn clear_retry(&mut self, kind: OverlayKind) {
-        if let Some(r) = self.handler_mut(kind).and_then(|h| h.retry_mut()) {
+        if let Some(r) = self.handler_mut(&kind.id()).and_then(|h| h.retry_mut()) {
             r.clear();
         }
     }
@@ -1054,7 +1128,7 @@ impl OverlayRegistry {
     /// because no task was ever built — see
     /// [`OverlayHandler::create_fetch_tasks`] returning empty.
     pub fn record_fetch_failure(&mut self, kind: OverlayKind, error: &FetchError) {
-        if let Some(h) = self.handler_mut(kind) {
+        if let Some(h) = self.handler_mut(&kind.id()) {
             h.set_fetching(false);
             if let Some(r) = h.retry_mut() {
                 r.record_failure(error);
@@ -1070,21 +1144,21 @@ impl OverlayRegistry {
     /// [`FetchRetry::status_note`](crate::fetch_policy::FetchRetry::status_note)
     /// for every layer rather than trusting handlers to remember.
     pub fn fetch_health(&self, kind: OverlayKind) -> Option<&FetchHealth> {
-        self.handler(kind)
+        self.handler(&kind.id())
             .and_then(|h| h.retry())
             .map(|r| r.health())
     }
 
     pub fn item_count(&self, kind: OverlayKind) -> usize {
-        self.handler(kind).map_or(0, |h| h.item_count())
+        self.handler(&kind.id()).map_or(0, |h| h.item_count())
     }
 
     pub fn is_enabled(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).is_some_and(|h| h.is_enabled())
+        self.handler(&kind.id()).is_some_and(|h| h.is_enabled())
     }
 
     pub fn set_enabled(&mut self, kind: OverlayKind, enabled: bool) {
-        if let Some(h) = self.handler_mut(kind) {
+        if let Some(h) = self.handler_mut(&kind.id()) {
             h.set_enabled(enabled);
         }
     }
@@ -1125,7 +1199,7 @@ impl OverlayRegistry {
     /// already standing right beside this saying how much of it drew —
     /// `! incomplete - 85 of 297 shown - W/Wa/Adv/Oth`.
     pub fn status_line(&self, kind: OverlayKind) -> Option<String> {
-        let handler = self.handler(kind)?;
+        let handler = self.handler(&kind.id())?;
         let line = handler.status_line();
         if !handler.is_enabled() {
             return line;
@@ -1146,22 +1220,23 @@ impl OverlayRegistry {
     }
 
     pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem<'_>> {
-        self.handler(kind)
+        self.handler(&kind.id())
             .map_or_else(Vec::new, |h| h.clickable_items())
     }
 
     /// [`OverlayHandler::map_labels`] for `kind`; empty for a kind with no
     /// handler.
     pub fn map_labels(&self, kind: OverlayKind) -> &[OverlayLabel] {
-        self.handler(kind).map_or(&[], |h| h.map_labels())
+        self.handler(&kind.id()).map_or(&[], |h| h.map_labels())
     }
 
     pub fn hover_value_at(&self, kind: OverlayKind, lat: f64, lon: f64) -> Option<String> {
-        self.handler(kind).and_then(|h| h.hover_value_at(lat, lon))
+        self.handler(&kind.id())
+            .and_then(|h| h.hover_value_at(lat, lon))
     }
 
     pub fn legend(&self, kind: OverlayKind) -> Option<OverlayLegend> {
-        self.handler(kind).and_then(|h| h.legend())
+        self.handler(&kind.id()).and_then(|h| h.legend())
     }
 
     pub fn popup_content(
@@ -1175,13 +1250,13 @@ impl OverlayRegistry {
     /// Routes to the handler that owns `action.target`.
     pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
         let kind = action.target.kind();
-        self.handler_mut(kind)
+        self.handler_mut(&kind.id())
             .is_some_and(|h| h.handle_popup_action(action))
     }
 
     /// Re-runs `retain_selections` afterwards, since the data just changed.
     pub fn apply_fetch_result(&mut self, result: OverlayFetchResult) {
-        let kind = result.kind;
+        let id = result.kind;
         // The one mutation route that reaches a handler without going through
         // `handler_mut` — it indexes, so that `retain_selections` can borrow
         // `selected_overlays` beside it. No shipped handler's
@@ -1189,8 +1264,8 @@ impl OverlayRegistry {
         // is belt-and-braces rather than a fix for a live bug; it is here so
         // "a handler's state moved ⇒ its note is gone" holds by construction
         // instead of by auditing twelve `apply_fetch_result` bodies.
-        self.forget_loaded_config(kind);
-        if let Some(idx) = self.handlers.iter().position(|h| h.kind() == kind) {
+        self.forget_loaded_config(&id);
+        if let Some(idx) = self.handlers.iter().position(|h| h.id() == id) {
             self.handlers[idx].apply_fetch_result(result.data);
             self.handlers[idx].retain_selections(&mut self.selected_overlays);
         }
@@ -1203,24 +1278,24 @@ impl OverlayRegistry {
     /// handler's raster is reached; the closure twin this sat beside is
     /// deleted.
     pub fn prepare_job(&self, kind: OverlayKind, ctx: &RasterizeContext) -> Option<DescribedJob> {
-        self.handler(kind).and_then(|h| h.prepare_job(ctx))
+        self.handler(&kind.id()).and_then(|h| h.prepare_job(ctx))
     }
 
     /// [`OverlayHandler::job_codec`] through the registry — the codec row the
     /// dispatch frames and labels `kind`'s described job with.
     pub fn job_codec(&self, kind: OverlayKind) -> Option<&'static JobCodec> {
-        self.handler(kind).and_then(|h| h.job_codec())
+        self.handler(&kind.id()).and_then(|h| h.job_codec())
     }
 
     /// [`OverlayHandler::hit_items`] through the registry — the page-side
     /// half of a hit-map kind's described render, captured at the dispatch
     /// beside [`prepare_job`](Self::prepare_job).
     pub fn hit_items(&self, kind: OverlayKind) -> Option<Vec<Arc<dyn OverlayItem>>> {
-        self.handler(kind).and_then(|h| h.hit_items())
+        self.handler(&kind.id()).and_then(|h| h.hit_items())
     }
 
     pub fn create_fetch_tasks(&self, kind: OverlayKind, ctx: &FetchConfig) -> Vec<FetchTask> {
-        self.handler(kind)
+        self.handler(&kind.id())
             .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
     }
 
@@ -1244,7 +1319,7 @@ impl OverlayRegistry {
     /// it and above everything else, because `212 of 297 alerts missing` also
     /// changes what `85 alerts shown` beneath it means.
     pub fn controls(&self, kind: OverlayKind, ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        let Some(handler) = self.handler(kind) else {
+        let Some(handler) = self.handler(&kind.id()) else {
             return Vec::new();
         };
         let mut items = handler.controls(ctx);
@@ -1264,7 +1339,7 @@ impl OverlayRegistry {
         update: &ControlUpdate,
         ctx: &mut PaneControlContextMut<'_>,
     ) -> ControlEffect {
-        if let Some(h) = self.handler_mut(kind) {
+        if let Some(h) = self.handler_mut(&kind.id()) {
             h.apply_control(update, ctx)
         } else {
             ControlEffect::None
@@ -1272,15 +1347,17 @@ impl OverlayRegistry {
     }
 
     pub fn render_mode(&self, kind: OverlayKind) -> Option<RenderMode> {
-        self.handler(kind).map(|h| h.render_mode())
+        self.handler(&kind.id()).map(|h| h.render_mode())
     }
 
     pub fn display_name(&self, kind: OverlayKind) -> &str {
-        self.handler(kind).map_or("Unknown", |h| h.display_name())
+        self.handler(&kind.id())
+            .map_or("Unknown", |h| h.display_name())
     }
 
     pub fn default_enabled(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).is_some_and(|h| h.default_enabled())
+        self.handler(&kind.id())
+            .is_some_and(|h| h.default_enabled())
     }
 
     /// Seeds a new pane's `enabled_overlays`; call after config deserialization.
@@ -1319,15 +1396,15 @@ impl OverlayRegistry {
             ..
         } = self;
         for h in handlers {
-            let kind = h.kind();
-            let Some(val) = configs.get(&kind) else {
+            let Some(val) = configs.get(&h.kind()) else {
                 continue;
             };
-            if loaded_configs.get(&kind).is_some_and(|seen| seen == val) {
+            let id = h.id();
+            if loaded_configs.get(&id).is_some_and(|seen| seen == val) {
                 continue;
             }
             h.deserialize_state(val.clone());
-            loaded_configs.insert(kind, val.clone());
+            loaded_configs.insert(id, val.clone());
         }
     }
 
@@ -1341,7 +1418,8 @@ impl OverlayRegistry {
     // ── Per-frame point rendering delegates ───────────────────────────
 
     pub fn per_frame_points(&self, kind: OverlayKind) -> &[MapPoint] {
-        self.handler(kind).map_or(&[], |h| h.per_frame_points())
+        self.handler(&kind.id())
+            .map_or(&[], |h| h.per_frame_points())
     }
 
     pub fn draw_point(
@@ -1351,29 +1429,34 @@ impl OverlayRegistry {
         painter: &mut dyn PointPainter,
         ctx: &DrawPointContext,
     ) {
-        if let Some(h) = self.handler(kind) {
+        if let Some(h) = self.handler(&kind.id()) {
             h.draw_point(id, painter, ctx);
         }
     }
 
     pub fn point_hit_radius(&self, kind: OverlayKind, zoom: f32) -> f32 {
-        self.handler(kind).map_or(0.0, |h| h.point_hit_radius(zoom))
+        self.handler(&kind.id())
+            .map_or(0.0, |h| h.point_hit_radius(zoom))
     }
 
     pub fn hover_text(&self, kind: OverlayKind, id: u32, ctx: &HoverContext<'_>) -> Option<String> {
-        self.handler(kind).and_then(|h| h.hover_text(id, ctx))
+        self.handler(&kind.id()).and_then(|h| h.hover_text(id, ctx))
     }
 
     // ── Config persistence ────────────────────────────────────────────
 
-    /// Keyed by the `Debug` spelling of `OverlayKind`, so renaming a variant
-    /// orphans its saved state. Null states are omitted.
+    /// Keyed by the layer id **string** ([`LayerId::as_str`]) — byte-identical
+    /// to the historical `Debug` spelling of `OverlayKind` these maps have
+    /// always been keyed by (the M8a spelling pin holds the two equal), so
+    /// every existing config file keeps matching. Renaming an id orphans its
+    /// saved state; the ledger is append-only for exactly that reason. Null
+    /// states are omitted.
     pub fn serialize_handler_states(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut map = serde_json::Map::new();
         for h in &self.handlers {
             let val = h.serialize_state();
             if !val.is_null() {
-                map.insert(format!("{:?}", h.kind()), val);
+                map.insert(h.id().as_str().to_string(), val);
             }
         }
         map
@@ -1387,8 +1470,7 @@ impl OverlayRegistry {
         // there is no longer what the handlers hold.
         self.loaded_configs.clear();
         for h in &mut self.handlers {
-            let key = format!("{:?}", h.kind());
-            if let Some(val) = states.get(&key) {
+            if let Some(val) = states.get(h.id().as_str()) {
                 h.deserialize_state(val.clone());
             }
         }
@@ -1473,7 +1555,7 @@ impl OverlayKind {
 // ── Unified overlay fetch result ──────────────────────────────────────────
 
 pub struct OverlayFetchResult {
-    pub kind: OverlayKind,
+    pub kind: LayerId,
     pub data: FetchPayload,
 }
 
@@ -1584,19 +1666,19 @@ mod pane_config_tests {
         assert!(
             registry
                 .loaded_configs
-                .contains_key(&OverlayKind::SpcDiscussions),
+                .contains_key(&OverlayKind::SpcDiscussions.id()),
             "fixture: a load has to record what it read for the skip to exist",
         );
 
         registry.apply_fetch_result(OverlayFetchResult {
-            kind: OverlayKind::SpcDiscussions,
+            kind: known::SPC_DISCUSSIONS,
             data: OverlayRegistry::spc_discussions_payload(Vec::new()),
         });
 
         assert!(
             !registry
                 .loaded_configs
-                .contains_key(&OverlayKind::SpcDiscussions),
+                .contains_key(&OverlayKind::SpcDiscussions.id()),
             "a fetch may move what `serialize_state` reports, so the next load \
              has to run rather than be skipped",
         );
@@ -2071,7 +2153,7 @@ mod retry_ledger_tests {
         // Healthy first, so the difference below is this poll's and not the
         // fixture's.
         registry.apply_fetch_result(OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
         });
         assert_eq!(
@@ -2082,7 +2164,7 @@ mod retry_ledger_tests {
         let quiet = registry.controls(kind, &ctx).len();
 
         registry.apply_fetch_result(OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: OverlayRegistry::nws_alerts_partial_payload(
                 alerts_where_only_some_resolved(297, 85),
                 ZoneResolution {
@@ -2160,7 +2242,7 @@ mod retry_ledger_tests {
 
         // A recovered poll clears the mark without the handler saying so.
         registry.apply_fetch_result(OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
         });
         assert_eq!(
@@ -2185,7 +2267,7 @@ mod retry_ledger_tests {
         let kind = OverlayKind::NwsAlerts;
         let mut registry = OverlayRegistry::default();
         registry.apply_fetch_result(OverlayFetchResult {
-            kind,
+            kind: kind.id(),
             data: OverlayRegistry::nws_alerts_partial_payload(
                 alerts_where_only_some_resolved(297, 85),
                 ZoneResolution {
@@ -2330,18 +2412,21 @@ mod state_key_tests {
     /// **The tripwire for the day `OverlayKind` stops being a plain enum.**
     ///
     /// `serialize_handler_states` and `deserialize_handler_states` key the
-    /// saved handler state by `format!("{:?}", kind)`. Today that is safe only
-    /// because the `Debug` spelling of every variant happens to equal its
-    /// serde spelling, which is the name already sitting in every user's
-    /// config file. The moment the type changes shape — M8 replaces the enum
-    /// with a `LayerId` newtype, whose derived `Debug` prints
-    /// `LayerId("NwsAlerts")` — the `{:?}` key silently stops matching the
-    /// file, and every user's saved handler state is orphaned without a
-    /// single error. This test is what fails instead.
+    /// saved handler state by `h.id().as_str()` since M8b-b1 (the two
+    /// `format!("{:?}")` sites this test was written against are gone — m1).
+    /// That is safe only because every handler's `id()` spells exactly what
+    /// the `{:?}` key always spelled, which is the name already sitting in
+    /// every user's config file. A handler whose id drifts from its
+    /// `kind()`'s `Debug`/serde spelling — a typo, or two handlers' ids
+    /// swapped — silently stops matching the file, and that user's saved
+    /// handler state is orphaned without a single error. This test is what
+    /// fails instead.
     ///
-    /// New persistence code must key by the **serde** spelling, never by a
-    /// new `{:?}` site; the two existing sites stay only because this pin
-    /// holds the spellings equal.
+    /// New persistence code must key by [`LayerId::as_str`], never by a new
+    /// `{:?}` site (`LayerId`'s derived `Debug` prints `LayerId("…")` —
+    /// visibly wrong on purpose).
+    ///
+    /// [`LayerId::as_str`]: rustdar_source::id::LayerId::as_str
     #[test]
     fn handler_state_keys_are_the_twelve_debug_spellings_and_serde_agrees() {
         let handlers = create_handlers();
@@ -2362,7 +2447,14 @@ mod state_key_tests {
             assert_eq!(
                 debug_spelling, serde_spelling,
                 "the Debug and serde spellings of this kind disagree — the \
-                 {{:?}}-keyed handler-state maps just orphaned its saved state",
+                 historical key and the on-disk spelling just diverged",
+            );
+            assert_eq!(
+                h.id().as_str(),
+                debug_spelling,
+                "this handler's id() does not spell its kind()'s Debug name — \
+                 the id-keyed handler-state maps just orphaned its saved \
+                 state (a swap of two handlers' ids also fails here)",
             );
             assert!(
                 STATE_KEYS.contains(&debug_spelling.as_str()),
@@ -2371,6 +2463,93 @@ mod state_key_tests {
                  user's saved state for it",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_identity_tests {
+    use rustdar_source::id::LAYER_ID_LEDGER;
+
+    use crate::render::handlers::create_handlers;
+
+    /// b1 pin: no two handlers answer the same id. The open string has no
+    /// compiler to refuse a duplicate the way the enum's match arms did, so
+    /// the registry pins uniqueness instead — the replacement rigor the M8c
+    /// enum deletion depends on.
+    #[test]
+    fn no_two_handlers_share_an_id() {
+        let handlers = create_handlers();
+        assert_eq!(handlers.len(), 12, "the walk below must cover all twelve");
+        let mut seen = std::collections::HashSet::new();
+        for h in &handlers {
+            assert!(
+                seen.insert(h.id()),
+                "two handlers both register {:?} — the second shadows the \
+                 first at every registry lookup",
+                h.id(),
+            );
+        }
+    }
+
+    /// b1 pin: every handler's id sits in the append-only ledger — a handler
+    /// cannot register a spelling `LAYER_ID_LEDGER` does not carry.
+    #[test]
+    fn every_handlers_id_sits_in_the_ledger() {
+        for h in &create_handlers() {
+            assert!(
+                LAYER_ID_LEDGER.contains(&h.id().as_str()),
+                "{}'s id is missing from LAYER_ID_LEDGER — ledger rows are \
+                 append-only and this one was never appended",
+                h.display_name(),
+            );
+        }
+    }
+
+    /// **The draw-weight order pin.** Sorting the registered handlers by
+    /// `draw_order_weight` yields EXACTLY the historical default draw order,
+    /// bottom to top, spelled out as literals.
+    ///
+    /// Three orders exist in this crate and only this one is the draw order:
+    /// the enum's declaration order differs (SpcDiscussions before Radar),
+    /// and `create_handlers()`'s vec order differs (Radar second). The
+    /// weights encode `OverlayKind::all()`'s order — SpcOutlook BELOW Radar —
+    /// and this literal list is the pin that keeps a weight edit from
+    /// silently reordering what occludes what on every user's map.
+    #[test]
+    fn draw_order_weights_encode_the_default_draw_order() {
+        let mut handlers = create_handlers();
+        let mut weights: Vec<u32> = handlers.iter().map(|h| h.draw_order_weight()).collect();
+        weights.sort_unstable();
+        weights.dedup();
+        assert_eq!(
+            weights.len(),
+            handlers.len(),
+            "two handlers share a draw-order weight — their relative order \
+             would be an accident of registration order",
+        );
+        handlers.sort_by_key(|h| h.draw_order_weight());
+        let ids: Vec<String> = handlers
+            .iter()
+            .map(|h| h.id().as_str().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "ModelData",
+                "SpcOutlook",
+                "Radar",
+                "SpcDiscussions",
+                "NwsAlerts",
+                "StormReports",
+                "Lightning",
+                "Metar",
+                "CityLabels",
+                "RadarSites",
+                "UserLocation",
+                "ColorScale",
+            ],
+            "the weight order drifted from the historical default draw order",
+        );
     }
 }
 

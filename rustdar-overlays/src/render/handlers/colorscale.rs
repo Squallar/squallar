@@ -3,9 +3,11 @@ use std::sync::Arc;
 use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
+use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     FetchPayload, OverlayHandler, OverlayItem, OverlayKind, RenderMode,
 };
+use rustdar_source::id::{LayerId, known};
 
 /// Toggle state only: the legend is a screen-space HUD element, not
 /// geo-projected, so the draw loop renders it directly.
@@ -22,6 +24,15 @@ impl ColorScaleHandler {
 impl OverlayHandler for ColorScaleHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::ColorScale
+    }
+    fn id(&self) -> LayerId {
+        known::COLOR_SCALE
+    }
+    fn surface(&self) -> Surface {
+        Surface::Glass
+    }
+    fn draw_order_weight(&self) -> u32 {
+        120
     }
     fn display_name(&self) -> &str {
         "Color Scale"
