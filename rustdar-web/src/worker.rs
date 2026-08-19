@@ -78,8 +78,17 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     };
     let id = id as u64;
 
+    // A checked cast, not a Uint8Array-from-view construction: that
+    // constructor is the JS `new Uint8Array(typedArray)` COPY constructor,
+    // so the old spelling paid a hidden JS→JS copy of the whole request
+    // (up to the ~47-69 MiB decode archive) before `to_vec`'s unavoidable
+    // JS→wasm crossing (WO-M7d, the same latent class as the page's
+    // deliver). A payload that is not a typed array refuses to the empty
+    // request, which `execute_encoded` answers as a failed job — the
+    // refusal posture every malformed message already has.
     let request = proto::field(data, proto::REQUEST)
-        .map(|v| js_sys::Uint8Array::new(&v).to_vec())
+        .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok())
+        .map(|v| v.to_vec())
         .unwrap_or_default();
 
     let result = rustdar_frontend::offload::execute_encoded(&request);
@@ -94,18 +103,22 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     }
 }
 
-/// Post the answer, moving the buffer rather than copying it.
+/// Post the answer, moving the buffers rather than copying them.
 ///
-/// The whole reply is **one** payload pair since WO-M7c: `OUT` carries the
-/// row's own `encode_out` bytes as a single transferred `Uint8Array` (built
-/// as one copy out of this instance's linear memory, which is unavoidable
-/// without a `SharedArrayBuffer` this deployment cannot have, and then
-/// *transferred*, so the page adopts it instead of receiving a second copy),
-/// and `OUT_KIND` says which registry row encoded it — the dense
-/// composed-registry code, the same code space the request direction
-/// speaks. A frame is 16 MiB of image plus about 5 MiB of gates at the
-/// browser's still ceiling, concatenated by the codec where this runs — in
-/// the worker, off the frame thread.
+/// The reply is the `OUT`/`OUT_KIND`/`TAILS` trio since WO-M7d: `OUT`
+/// carries the row's `encode_out` HEAD (scalars and framing — 29 bytes for
+/// a full frame) as one transferred `Uint8Array`; `TAILS` carries the
+/// row's nominated large flat buffers (the frame's polar block and image)
+/// as an array of per-tail `Uint8Array`s, each transferred; and `OUT_KIND`
+/// says which registry row encoded them — the dense composed-registry
+/// code, the same code space the request direction speaks. Every buffer is
+/// built as one copy out of this instance's linear memory (unavoidable
+/// without a `SharedArrayBuffer` this deployment cannot have) and then
+/// *transferred*, so the page adopts it instead of receiving a second
+/// copy: 26.08 MiB of worker-side traffic per widest 2048² still frame
+/// where the one-buffer WO-M7c shape paid 68.16 (the concatenation and the
+/// encode sink's double-buffer are gone — `execute_encoded`'s comment
+/// carries the derivation).
 ///
 /// `None` writes explicit nulls rather than posting nothing, because the page
 /// holds a render slot, a pane's in-flight mark and a pending-map entry against
@@ -114,7 +127,7 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
 fn post_result(
     scope: &web_sys::DedicatedWorkerGlobalScope,
     id: u64,
-    result: Option<(u8, Vec<u8>)>,
+    result: Option<(u8, Vec<u8>, Vec<Vec<u8>>)>,
 ) -> Result<(), JsValue> {
     let message = js_sys::Object::new();
     proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::DONE));
@@ -127,9 +140,10 @@ fn post_result(
     // construction.
     proto::set_field(&message, proto::OUT, &JsValue::NULL);
     proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
+    proto::set_field(&message, proto::TAILS, &JsValue::NULL);
 
-    if let Some((kind, bytes)) = result {
-        let out = js_sys::Uint8Array::from(bytes.as_slice());
+    if let Some((kind, head, tails)) = result {
+        let out = js_sys::Uint8Array::from(head.as_slice());
         transfer.push(&out.buffer());
         proto::set_field(&message, proto::OUT, &out);
         proto::set_field(
@@ -137,6 +151,16 @@ fn post_result(
             proto::OUT_KIND,
             &JsValue::from_f64(f64::from(kind)),
         );
+        // Each tail is its own Uint8Array over its own ArrayBuffer, and each
+        // buffer rides the transfer list — the page adopts them; nothing
+        // multi-MiB is structured-cloned.
+        let tails_array = js_sys::Array::new();
+        for tail in tails {
+            let t = js_sys::Uint8Array::from(tail.as_slice());
+            transfer.push(&t.buffer());
+            tails_array.push(&t);
+        }
+        proto::set_field(&message, proto::TAILS, &tails_array);
     }
     scope.post_message_with_transfer(&message, &transfer)
 }

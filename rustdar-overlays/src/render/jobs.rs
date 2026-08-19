@@ -132,12 +132,12 @@ impl JobSpec for SitesJob {
 }
 
 impl JobOutCodec for SitesJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
@@ -233,12 +233,12 @@ impl JobSpec for AlertsJob {
 }
 
 impl JobOutCodec for AlertsJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
@@ -289,12 +289,12 @@ impl JobSpec for OutlooksJob {
 }
 
 impl JobOutCodec for OutlooksJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
@@ -345,12 +345,12 @@ impl JobSpec for DiscussionsJob {
 }
 
 impl JobOutCodec for DiscussionsJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
@@ -417,12 +417,12 @@ impl JobSpec for ReportsJob {
 }
 
 impl JobOutCodec for ReportsJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
@@ -512,12 +512,12 @@ impl JobSpec for GlmJob {
 }
 
 impl JobOutCodec for GlmJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
@@ -615,34 +615,44 @@ impl JobSpec for ModelJob {
 }
 
 impl JobOutCodec for ModelJob {
-    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
-        encode_raster_reply(v, out);
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
     }
 
-    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
-        decode_raster_reply(bytes)
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
     }
 }
 
 // ── The shared reply pair ────────────────────────────────────────────────
 
-/// The reply adapter every row's [`JobOutCodec::encode_out`] shares, over the
-/// moved codec body below. (The intermediate `Vec` is the cost of keeping
-/// [`encode_overlay_out`]'s moved signature exact for WO-M6.3's delegation;
-/// WO-M7c, which makes this path live, may flatten it.)
-fn encode_raster_reply(v: &RasterizeOutput, out: &mut Vec<u8>) {
-    out.extend_from_slice(&encode_overlay_out(&v.rgba, v.hit_cells.as_ref()));
+/// The reply adapter every row's [`JobOutCodec::encode_out`] shares, over
+/// the codec body below — writing straight into the codec's `head` sink
+/// since WO-M7d: the intermediate whole-reply `Vec` (one extra memcpy of
+/// the raster, kept at WO-M6.3 to hold [`encode_overlay_out`]'s moved
+/// signature exact) died as the note here forecast. The overlay reply
+/// nominates NO tails: its byte stream is exactly what it was, one framed
+/// head.
+fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
+    encode_overlay_out(&v.rgba, v.hit_cells.as_ref(), head);
 }
 
 /// The reply adapter every row's [`JobOutCodec::decode_out`] shares.
+///
+/// Refuses a non-empty `tails` first: this adapter writes none, and on a
+/// same-build wire a tail count the encoder did not write is a corrupt or
+/// foreign message (the `JobOutCodec` convention, WO-M7d).
 ///
 /// `alpha` is not on the reply wire because only one convention ever crosses
 /// it: `rustdar_frontend::offload::execute`'s output stage converts the one
 /// straight-alpha producer (the model grid) to premultiplied before any
 /// reply is encoded, so a decoded reply states [`AlphaMode::Premultiplied`]
 /// — the only value that is ever true of these bytes.
-fn decode_raster_reply(bytes: &[u8]) -> Option<RasterizeOutput> {
-    let (rgba, hit_cells) = decode_overlay_out(bytes)?;
+fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+    if !tails.is_empty() {
+        return None;
+    }
+    let (rgba, hit_cells) = decode_overlay_out(head)?;
     Some(RasterizeOutput {
         rgba,
         hit_cells,
@@ -659,8 +669,12 @@ fn decode_raster_reply(bytes: &[u8]) -> Option<RasterizeOutput> {
 /// `rustdar_frontend::offload::tests` to pin them. The RGBA takes the rest,
 /// so no length prefix can lie about it; its one guard stays the dispatch's
 /// length check.
-pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() + 64);
+///
+/// Writes into `out` rather than returning a `Vec` since WO-M7d, reserving
+/// the raster plus framing up front — the reply adapter hands it the
+/// codec's head sink directly, which is what killed the whole-reply copy.
+pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>, out: &mut Vec<u8>) {
+    out.reserve(rgba.len() + 64);
     match hit_cells {
         None => out.push(0),
         Some(cells) => {
@@ -680,7 +694,6 @@ pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>) -> Vec<u8> 
         }
     }
     out.extend_from_slice(rgba);
-    out
 }
 
 /// The inverse of [`encode_overlay_out`]. `None` for a tag outside `{0, 1}`,
@@ -1482,9 +1495,13 @@ mod tests {
             hit_cells: hit_cells.clone(),
             alpha: AlphaMode::Premultiplied,
         }));
-        let mut bytes = Vec::new();
-        (row.encode_out)(&reply, &mut bytes);
-        let back = (row.decode_out)(&bytes)
+        let mut head = Vec::new();
+        let mut tails = Vec::new();
+        (row.encode_out)(reply, &mut head, &mut tails);
+        // Handing the tails straight back through is itself the emptiness
+        // check: the shared decoder refuses any tail this adapter never
+        // writes, so a stray push here would fail the expect below.
+        let back = (row.decode_out)(&head, tails)
             .expect("a row must decode its own reply encode")
             .take::<RasterizeOutput>()
             .expect("the reply is a raster");
@@ -1534,21 +1551,25 @@ mod tests {
             .map(|&idx| (idx, vec![idx * 2]))
             .collect();
         let rgba = [0u8; 4];
-        let a = encode_overlay_out(
+        let mut a = Vec::new();
+        encode_overlay_out(
             &rgba,
             Some(&HitCells {
                 width: 8,
                 height: 4,
                 cells: forward,
             }),
+            &mut a,
         );
-        let b = encode_overlay_out(
+        let mut b = Vec::new();
+        encode_overlay_out(
             &rgba,
             Some(&HitCells {
                 width: 8,
                 height: 4,
                 cells: backward,
             }),
+            &mut b,
         );
         assert_eq!(
             a, b,

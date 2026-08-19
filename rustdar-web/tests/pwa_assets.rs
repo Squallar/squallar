@@ -604,8 +604,9 @@ fn the_worker_protocol_is_versionless_and_the_token_names_the_build() {
 /// of the shape rather than of the arms agreeing; this pins that shape,
 /// because the function is `wasm32`-only and no host test can run it.
 ///
-/// Two fields since WO-M7c: the whole reply is the `OUT`/`OUT_KIND` pair
-/// (the eight frame fields died with the named-field frame path).
+/// Three fields since WO-M7d: the whole reply is the `OUT`/`OUT_KIND`/
+/// `TAILS` trio (the eight frame fields died with the named-field frame
+/// path at WO-M7c; the tails joined at WO-M7d).
 #[test]
 fn the_worker_reply_writes_every_field_on_every_arm() {
     let body = RASTER_WORKER_RS
@@ -613,7 +614,7 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         .expect("worker.rs no longer has a post_result")
         .1;
     let defaults = body
-        .split_once("if let Some((kind, bytes)) = result")
+        .split_once("if let Some((kind, head, tails)) = result")
         .expect("post_result no longer branches on the result")
         .0;
     for field in [
@@ -623,6 +624,7 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         // survived this test's first draft.
         "proto::OUT,",
         "proto::OUT_KIND,",
+        "proto::TAILS,",
     ] {
         assert!(
             defaults.contains(field),
@@ -633,31 +635,38 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
     }
 }
 
-/// The frame reply rides the `OUT`/`OUT_KIND` pair and its one buffer is
-/// **transferred** — the reply direction's shape since WO-M7c, pinned at
-/// the source because `post_result` is `wasm32`-only and no host test can
-/// run it.
+/// The frame reply rides the `OUT`/`OUT_KIND`/`TAILS` trio and **every**
+/// reply buffer is **transferred** — the head once, each nominated tail
+/// inside the tails loop — the reply direction's shape since WO-M7d,
+/// pinned at the source because `post_result` is `wasm32`-only and no host
+/// test can run it.
 ///
 /// Three claims, each of which would fail silently at runtime:
 ///
-/// * **Exactly one `transfer.push` on the answering arm.** The reply is one
-///   payload buffer, moved, not copied — a lost push would structured-clone
-///   up to ~21 MiB per still frame instead of transferring it, and nothing
-///   else would fail; a second push would mean a second payload this
-///   protocol does not have.
-/// * **`OUT` and `OUT_KIND` are written on the answering arm.** The pair is
-///   the whole answer; an arm that wrote only one would post a payload the
-///   page refuses (the kind verification) or a kind with no payload.
+/// * **Exactly two literal `transfer.push(` sites on the answering arm** —
+///   the `OUT` head push and the per-tail push inside the tails loop
+///   (which transfers EVERY tail: the loop is one site however many
+///   buffers ride it). A lost push would structured-clone up to ~16 MiB
+///   per still-frame image tail instead of transferring it, and nothing
+///   else would fail; a third site would mean a payload this protocol
+///   does not have.
+/// * **`OUT`, `OUT_KIND` and `TAILS` are written on the answering arm.**
+///   The trio is the whole answer; an arm that dropped one would post a
+///   payload the page refuses (the kind verification, the frame decoder's
+///   tail count) or a kind with no payload.
 /// * **The eight frame-field idents are GONE from worker.rs** — the
 ///   deletion pin. `proto::IMAGE`/`proto::POLAR` and the six beside them
 ///   were the frame's named-field path; a write that came back would be a
 ///   second reply shape beside the codec's, and the page would have to
-///   arbitrate between two outputs for one job.
+///   arbitrate between two outputs for one job. (The frame's polar and
+///   image ride `TAILS` as codec-nominated buffers, not as named fields —
+///   no field name says what a tail is, the dispatched row's decoder
+///   does.)
 #[test]
 fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
     let body = without_line_comments(RASTER_WORKER_RS);
     let answering_arm = body
-        .split_once("if let Some((kind, bytes)) = result")
+        .split_once("if let Some((kind, head, tails)) = result")
         .expect("post_result no longer branches on the result")
         .1
         .split_once("scope.post_message_with_transfer")
@@ -666,15 +675,16 @@ fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
 
     assert_eq!(
         answering_arm.matches("transfer.push(").count(),
-        1,
-        "the answering arm must transfer exactly one buffer — the whole \
-         reply is one `OUT` payload, moved rather than copied",
+        2,
+        "the answering arm must transfer through exactly two literal push \
+         sites — the `OUT` head and the per-tail loop push; every reply \
+         buffer is moved rather than copied",
     );
-    for needle in ["proto::OUT,", "proto::OUT_KIND,"] {
+    for needle in ["proto::OUT,", "proto::OUT_KIND,", "proto::TAILS,"] {
         assert!(
             answering_arm.contains(needle),
-            "the answering arm no longer writes {needle} — the OUT/OUT_KIND \
-             pair is the whole answer since WO-M7c",
+            "the answering arm no longer writes {needle} — the \
+             OUT/OUT_KIND/TAILS trio is the whole answer since WO-M7d",
         );
     }
 
@@ -692,9 +702,9 @@ fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
         assert!(
             !body.contains(ident),
             "worker.rs names {ident} again. The frame reply rides the \
-             OUT/OUT_KIND pair in `RenderedFrame::to_bytes` form since \
-             WO-M7c; a named frame field beside it is a second reply shape \
-             the page would have to arbitrate against the codec's",
+             OUT/OUT_KIND/TAILS trio in the frame codec's head+tails form \
+             since WO-M7d; a named frame field beside it is a second reply \
+             shape the page would have to arbitrate against the codec's",
         );
     }
 }
@@ -766,7 +776,7 @@ fn post_result_body() -> String {
 fn post_result_arms() -> Vec<(&'static str, String)> {
     let body = post_result_body();
     let (head, answer) = body
-        .split_once("if let Some((kind, bytes)) = result")
+        .split_once("if let Some((kind, head, tails)) = result")
         .expect("post_result no longer branches on the result");
     vec![("head", head.to_string()), ("answer", answer.to_string())]
 }
@@ -832,9 +842,10 @@ fn message_field_idents(arm: &str) -> Vec<String> {
 ///     the RGBA tail has no layout to digest, and its guard is the
 ///     dispatching page's own `width × height × 4` length check), and
 ///     `..._the_frame_reply_framing_is_the_one_this_registry_ships` for the
-///     frame reply's `RenderedFrame::to_bytes` form (WO-M7c — the layout
-///     change that retired the eight named frame fields this list once
-///     pinned).
+///     frame reply's head+tails form — six rows since WO-M7d: head, polar
+///     tail and image tail per fixture (WO-M7c is the layout change that
+///     retired the eight named frame fields this list once pinned; WO-M7d
+///     moved the frame's two big buffers onto `TAILS`).
 ///
 /// Those framing rows do double duty since M5: they live in
 /// `rustdar_frontend::wire_identity` as production consts, and the local
@@ -913,10 +924,12 @@ fn the_worker_reply_shape_is_the_one_this_build_ships() {
         [
             "answer | OUT | out",
             "answer | OUT_KIND | outkind",
+            "answer | TAILS | tails",
             "head | ID | id",
             "head | KIND | kind",
             "head | OUT | out",
             "head | OUT_KIND | outkind",
+            "head | TAILS | tails",
         ]
         .map(str::to_string),
         "the shape of a `done` reply is not the shape this list was last \

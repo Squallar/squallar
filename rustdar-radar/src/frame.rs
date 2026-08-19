@@ -6,9 +6,10 @@
 //! what lets the radar codec rows ([`crate::jobs`]) name their own output
 //! type in their `run` bodies. WO-M7c closed the reply direction: the frame
 //! stopped crossing the browser's reply port as eight hand-written JS
-//! fields and rides the job registry's `OUT` payload in the
-//! [`to_bytes`](RenderedFrame::to_bytes)/[`from_bytes`](RenderedFrame::from_bytes)
-//! form below, so the two wire newtypes that spell its provenance enums as
+//! fields and rides the job registry's `OUT` payload — since WO-M7d as a
+//! scalar head plus two transferred tails, in the
+//! [`write_head`](RenderedFrame::write_head)/[`from_parts`](RenderedFrame::from_parts)
+//! form below — so the two wire newtypes that spell its provenance enums as
 //! numbers ([`MeltingLayerWire`]/[`StormMotionWire`]) moved here beside the
 //! codec that is now their one consumer.
 
@@ -107,8 +108,8 @@ impl From<crate::render::SweepRender> for RenderedFrame {
 
 /// The reply half of the job boundary's erasure seam: a described frame
 /// render answers this type through the codec rows in [`crate::jobs`] —
-/// erased on the direct path, and on the wire in the form
-/// [`RenderedFrame::to_bytes`] writes.
+/// erased on the direct path, and on the wire in the head-plus-tails form
+/// [`RenderedFrame::write_head`]/[`RenderedFrame::from_parts`] spell.
 impl rustdar_source::job::JobOut for RenderedFrame {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -126,16 +127,32 @@ impl rustdar_source::job::JobOut for RenderedFrame {
 }
 
 impl RenderedFrame {
-    /// The frame's wire form — the bytes the reply direction's `OUT`
-    /// payload carries for the three frame rows (WO-M7c).
+    /// The frame's wire HEAD — the scalar block the reply direction's `OUT`
+    /// payload carries for the three frame rows (WO-M7c; head/tails split
+    /// at WO-M7d).
     ///
-    /// Layout, in the house shape (scalars first, count-prefixed blocks,
-    /// the unbounded tail last):
+    /// Layout, in the house shape (scalars first, framed blocks after):
     /// `[max_range_km f64]`
     /// `[nyquist tag u8][nyquist_ms f64 when the tag says so]`
     /// `[melting tag u8][melting code u8 when the tag says so]`
     /// `[storm tag u8][storm code u8 + speed_kt f32 + direction_deg f32 when the tag says so]`
-    /// `[polar_len u32][polar bytes]` and then **the image as the rest**.
+    /// — and nothing after. The polar block and the image are NOT here:
+    /// they are the frame's two nominated **tails**, `[polar, image]` in
+    /// that order, riding the browser's transfer list as separate buffers
+    /// ([`crate::jobs`]' frame reply codec is where the encode side spells
+    /// that order, [`Self::from_parts`] the decode side, and the
+    /// frame-reply digest rows in `rustdar_frontend::wire_identity` are
+    /// what catch a symmetric swap).
+    ///
+    /// Until WO-M7d both were concatenated after this block —
+    /// `[polar_len u32][polar bytes]` + the image as the rest — which cost
+    /// the worker one concatenating memcpy of both (21.04 MiB for the
+    /// widest 2048² still frame: 5.04 polar + 16.00 image, derived by code
+    /// reading) plus a second whole-reply copy in the encode sink, and
+    /// cost the page a 16.00 MiB rest-of-buffer copy to re-own the image.
+    /// The tails ride the transfer list instead and the page ADOPTS the
+    /// image buffer, so all three of those copies are gone; PX3 is the
+    /// runtime measurement that judges the figures.
     ///
     /// Each optional rides behind a one-byte presence tag rather than a
     /// sentinel, because every one of these fields has honest absent states
@@ -147,22 +164,7 @@ impl RenderedFrame {
     /// vector — a real source beside a zeroed speed, the confident lie the
     /// old field-per-value reply had to fend off with a `?`-chain at the
     /// reader — is now unrepresentable on the wire.
-    ///
-    /// The image is deliberately **the rest, with no self-described shape**:
-    /// nothing on this port describes its own dimensions, and the guard
-    /// that stands between a malformed payload and a wrong-shaped texture
-    /// is unchanged — the consumer derives the side from the buffer's own
-    /// length and refuses anything that is not a square this build makes
-    /// (`raster_side_from_rgba_len`). See the type's own doc.
-    ///
-    /// One buffer where the browser reply used to transfer the image and
-    /// the polar block separately, which costs one concatenating memcpy of
-    /// both (up to ~20 MiB for the widest still frame) **where the job ran**
-    /// — in the worker, off the frame thread — accepted by design for one
-    /// payload shape on the whole reply direction (WO-M7c).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let polar = self.polar.to_bytes();
-        let mut out = Vec::with_capacity(8 + 2 + 2 + 10 + 4 + polar.len() + self.image.len());
+    pub fn write_head(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.max_range_km.to_le_bytes());
         match self.nyquist_ms {
             None => out.push(0),
@@ -187,29 +189,38 @@ impl RenderedFrame {
                 out.extend_from_slice(&motion.direction_deg.to_le_bytes());
             }
         }
-        out.extend_from_slice(&(polar.len() as u32).to_le_bytes());
-        out.extend_from_slice(&polar);
-        out.extend_from_slice(&self.image);
-        out
     }
 
-    /// The inverse of [`Self::to_bytes`], or `None` for anything this build
-    /// did not write: a buffer truncated anywhere inside the framed prefix,
-    /// a presence tag outside `{0, 1}`, a provenance code outside this
-    /// build's maps, or a polar block its own codec refuses — including one
-    /// whose stated length disagrees with its content, which
-    /// `PolarField::from_bytes` checks against the exact slice. All of them
-    /// are a clean refusal that reads as "nothing to draw", never a
-    /// misparse: on a same-build wire (the M5 token refuses every other
-    /// pairing) such bytes can only be a corrupt buffer, and half a frame
-    /// believed is worse than none.
+    /// The inverse of [`Self::write_head`] over the head plus the two
+    /// nominated tails, or `None` for anything this build did not write: a
+    /// wrong TAIL COUNT (this codec writes exactly two), a head truncated
+    /// anywhere inside its framed prefix, a head with TRAILING bytes
+    /// (everything in the head is framed now that the image no longer
+    /// takes the rest, so a longer head is not this build's — the WO-M7d
+    /// inversion of the old "no trailing-bytes case" contract), a presence
+    /// tag outside `{0, 1}`, a provenance code outside this build's maps,
+    /// or a polar tail its own codec refuses — including one whose stated
+    /// counts disagree with its content, which `PolarField::from_bytes`
+    /// checks against the exact slice. All of them are a clean refusal
+    /// that reads as "nothing to draw", never a misparse: on a same-build
+    /// wire (the M5 token refuses every other pairing) such bytes can only
+    /// be a corrupt buffer, and half a frame believed is worse than none.
     ///
-    /// The image takes the rest, so there is no trailing-bytes case to
-    /// refuse — every byte after the polar block **is** payload, and its
-    /// one guard is the consumer's own length arithmetic, exactly as on
-    /// the direct path.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut r = rustdar_source::wire::Reader::new(bytes);
+    /// The image tail is **adopted**, never copied: the buffer the page
+    /// re-owned from the transfer list becomes `self.image` as it stands —
+    /// the adoption is where the old page-side rest-of-buffer copy
+    /// (16.00 MiB per widest 2048² still frame) died at WO-M7d. It carries
+    /// no self-described shape, deliberately: its one guard is the
+    /// consumer's own length arithmetic (`raster_side_from_rgba_len`),
+    /// exactly as on the direct path.
+    pub fn from_parts(head: &[u8], tails: Vec<Vec<u8>>) -> Option<Self> {
+        // The tail-count refusal and the [polar, image] destructure are one
+        // move: any count but the two this codec writes fails the
+        // conversion, before a byte of either is read.
+        let Ok([polar_bytes, image]) = <[Vec<u8>; 2]>::try_from(tails) else {
+            return None;
+        };
+        let mut r = rustdar_source::wire::Reader::new(head);
         let max_range_km = r.f64()?;
         let nyquist_ms = match r.u8()? {
             0 => None,
@@ -222,7 +233,7 @@ impl RenderedFrame {
             _ => return None,
         };
         // The trio decodes under its one tag — all three or none, the
-        // atomicity `to_bytes` promises, with no reader-side chain needed
+        // atomicity `write_head` promises, with no reader-side chain needed
         // to enforce it.
         let storm_motion = match r.u8()? {
             0 => None,
@@ -238,10 +249,12 @@ impl RenderedFrame {
             }
             _ => return None,
         };
-        let polar_len = r.u32()? as usize;
-        let polar = crate::render::polar::PolarField::from_bytes(r.take(polar_len)?)?;
+        if !r.at_end() {
+            return None;
+        }
+        let polar = crate::render::polar::PolarField::from_bytes(&polar_bytes)?;
         Some(Self {
-            image: r.rest().to_vec(),
+            image,
             max_range_km,
             polar,
             nyquist_ms,
@@ -253,7 +266,7 @@ impl RenderedFrame {
 
 /// A [`MeltingLayerSource`](crate::hca::MeltingLayerSource) as a number, for
 /// the one boundary that can only carry numbers — which is
-/// [`RenderedFrame::to_bytes`], the frame's wire form, since WO-M7c. (The
+/// [`RenderedFrame::write_head`], the frame's wire head, since WO-M7c. (The
 /// pair spent its earlier life in `rustdar_frontend::offload`, spelling the
 /// same bytes into a named JS field on the browser's reply port; the codec
 /// is that boundary's one descendant, so the pair moved here beside it.)
@@ -404,11 +417,25 @@ mod tests {
         }
     }
 
+    /// Encode `frame` as the frame reply codec does — head via
+    /// [`RenderedFrame::write_head`], tails `[polar, image]` — cloning
+    /// where the codec moves, because these tests still hold the frame
+    /// afterward. (A test-side mirror of `crate::jobs`' encode,
+    /// deliberately: the frame-reply digest rows in
+    /// `rustdar_frontend::wire_identity` run the production encoder and
+    /// are the cross-check that the two spellings agree.)
+    fn encode_parts(frame: &RenderedFrame) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut head = Vec::new();
+        frame.write_head(&mut head);
+        (head, vec![frame.polar.to_bytes(), frame.image.clone()])
+    }
+
     #[test]
     fn the_frame_survives_its_own_codec_with_and_without_the_optionals() {
         for frame in [a_full_frame(), a_bare_frame()] {
+            let (head, tails) = encode_parts(&frame);
             assert_eq!(
-                RenderedFrame::from_bytes(&frame.to_bytes()),
+                RenderedFrame::from_parts(&head, tails),
                 Some(frame.clone()),
                 "the frame did not survive its own codec",
             );
@@ -417,50 +444,57 @@ mod tests {
 
     /// The malformed shapes, each a clean refusal — the reply-codec walk
     /// (`a_malformed_overlay_reply_is_refused_rather_than_misread`'s shape):
-    /// a truncation walk over everything ahead of the image, then each
-    /// judged byte mutated to a *valid different value* first, read back as
-    /// a positive control, and only then to the refused one.
+    /// a truncation walk over the head (plus the trailing byte the WO-M7d
+    /// inversion now refuses), each judged byte mutated to a *valid
+    /// different value* first, read back as a positive control, and only
+    /// then to the refused one — and the tail-count refusals (0, 1, 3)
+    /// with a doctored polar tail, the tails-shape cases WO-M7d added.
     #[test]
     fn a_malformed_frame_reply_is_refused_rather_than_misread() {
         let frame = a_full_frame();
-        let encoded = frame.to_bytes();
-        // Everything ahead of the image is framed; the image is the rest by
-        // design, so a cut inside it still decodes and its guard is the
-        // consumer's own length arithmetic (`raster_side_from_rgba_len`).
-        let image_at = encoded.len() - frame.image.len();
+        let (head, tails) = encode_parts(&frame);
 
-        // Control first: untouched bytes decode, so every refusal below is
+        // Control first: untouched parts decode, so every refusal below is
         // the mutation's doing.
-        assert!(RenderedFrame::from_bytes(&encoded).is_some());
+        assert!(RenderedFrame::from_parts(&head, tails.clone()).is_some());
 
         // Layout, stated once — the premise behind every offset below:
         // max_range 0..8, nyquist tag 8 (+ f64 9..17), melting tag 17
-        // (+ code 18), storm tag 19 (+ code 20, speed 21..25, dir 25..29),
-        // polar_len 29..33, polar 33..image_at.
+        // (+ code 18), storm tag 19 (+ code 20, speed 21..25, dir 25..29).
         assert_eq!(
-            image_at,
-            33 + 40 + 2 * 8 + 6 * 4,
-            "the fixture's framed prefix moved; re-derive the offsets",
+            head.len(),
+            8 + (1 + 8) + (1 + 1) + (1 + 1 + 4 + 4),
+            "the fixture's head moved; re-derive the offsets",
         );
 
-        for cut in 1..image_at {
+        // Everything in the head is framed, so a cut anywhere is a refusal
+        // — and so is a trailing byte, now that the image no longer takes
+        // the rest (the inverted contract `from_parts` documents).
+        for cut in 1..head.len() {
             assert_eq!(
-                RenderedFrame::from_bytes(&encoded[..cut]),
+                RenderedFrame::from_parts(&head[..cut], tails.clone()),
                 None,
-                "the frame reply truncated to {cut} bytes was accepted",
+                "the frame head truncated to {cut} bytes was accepted",
             );
         }
+        let mut trailing = head.clone();
+        trailing.push(0);
+        assert_eq!(
+            RenderedFrame::from_parts(&trailing, tails.clone()),
+            None,
+            "a head with a trailing byte was accepted",
+        );
 
         // Presence tags outside {0, 1}. The three offsets are the layout
         // above; the read-back controls prove each one is the tag this test
         // believes, so the refusals are about the tag and not some other
         // byte.
         for (at, what) in [(8usize, "nyquist"), (17, "melting"), (19, "storm")] {
-            assert_eq!(encoded[at], 1, "premise: the {what} tag is at {at}");
-            let mut bad_tag = encoded.clone();
+            assert_eq!(head[at], 1, "premise: the {what} tag is at {at}");
+            let mut bad_tag = head.clone();
             bad_tag[at] = 2;
             assert_eq!(
-                RenderedFrame::from_bytes(&bad_tag),
+                RenderedFrame::from_parts(&bad_tag, tails.clone()),
                 None,
                 "a {what} presence tag of 2 was accepted",
             );
@@ -470,29 +504,29 @@ mod tests {
         // moved — the control that byte 18 is the code — then 4, a byte
         // this build does not have, refuses the frame (same-build wire; a
         // foreign byte is a corrupt buffer).
-        let mut remapped = encoded.clone();
+        let mut remapped = head.clone();
         remapped[18] = 3;
         assert_eq!(
-            RenderedFrame::from_bytes(&remapped)
+            RenderedFrame::from_parts(&remapped, tails.clone())
                 .expect("code 3 is a real rung")
                 .melting_layer_source,
             Some(crate::hca::MeltingLayerSource::FleetDefault),
             "byte 18 is not the melting code; the refusal below would be \
              about some other field",
         );
-        let mut bad_code = encoded.clone();
+        let mut bad_code = head.clone();
         bad_code[18] = 4;
         assert_eq!(
-            RenderedFrame::from_bytes(&bad_code),
+            RenderedFrame::from_parts(&bad_code, tails.clone()),
             None,
             "melting-layer code 4 was accepted",
         );
 
         // The storm code, same pair.
-        let mut remapped = encoded.clone();
+        let mut remapped = head.clone();
         remapped[20] = 3;
         assert_eq!(
-            RenderedFrame::from_bytes(&remapped)
+            RenderedFrame::from_parts(&remapped, tails.clone())
                 .expect("code 3 is a real rung")
                 .storm_motion
                 .expect("the trio is present")
@@ -501,31 +535,41 @@ mod tests {
             "byte 20 is not the storm code; the refusal below would be \
              about some other field",
         );
-        let mut bad_code = encoded.clone();
+        let mut bad_code = head.clone();
         bad_code[20] = 4;
         assert_eq!(
-            RenderedFrame::from_bytes(&bad_code),
+            RenderedFrame::from_parts(&bad_code, tails.clone()),
             None,
             "storm-motion code 4 was accepted",
         );
 
-        // A polar length that lies into the image: the polar codec checks
-        // its stated counts against the exact slice it is handed, so the
-        // stolen bytes are a refusal rather than four image bytes read as a
-        // value.
-        let stated = u32::from_le_bytes(encoded[29..33].try_into().unwrap());
+        // The tail-count refusals: 0, 1 and 3 around the valid 2. This
+        // codec wrote exactly two, and on a same-build wire any other
+        // count is a corrupt or foreign message — half a frame believed
+        // is worse than none.
+        for (count, wrong) in [
+            (0usize, Vec::new()),
+            (1, vec![tails[0].clone()]),
+            (3, vec![tails[0].clone(), tails[1].clone(), Vec::new()]),
+        ] {
+            assert_eq!(
+                RenderedFrame::from_parts(&head, wrong),
+                None,
+                "a frame reply with {count} tails was accepted",
+            );
+        }
+
+        // A doctored polar tail: the polar codec checks its stated counts
+        // against the exact slice it is handed, so a truncated tails[0] is
+        // a refusal rather than a shorter polar believed. (This replaces
+        // the old lying-length guard — there is no polar length in the
+        // head left to lie with.)
+        let mut cut_polar = tails.clone();
+        cut_polar[0].pop();
         assert_eq!(
-            stated as usize,
-            image_at - 33,
-            "bytes 29..33 are not the polar length; the refusal below would \
-             be about some other field",
-        );
-        let mut lying = encoded.clone();
-        lying[29..33].copy_from_slice(&(stated + 4).to_le_bytes());
-        assert_eq!(
-            RenderedFrame::from_bytes(&lying),
+            RenderedFrame::from_parts(&head, cut_polar),
             None,
-            "a polar block that annexed four image bytes was accepted",
+            "a doctored polar tail was accepted",
         );
     }
 
@@ -539,21 +583,23 @@ mod tests {
     fn the_storm_trio_is_absent_together_or_present_together() {
         let mut frame = a_full_frame();
         frame.storm_motion = None;
-        let encoded = frame.to_bytes();
+        let (head, tails) = encode_parts(&frame);
         // With the tag at 0, the code/speed/direction bytes do not exist at
-        // all: the polar length follows the tag directly.
-        assert_eq!(encoded[19], 0, "the storm tag encodes the absence");
+        // all: the head ends at the tag directly (the polar and image ride
+        // as tails, never after it).
+        assert_eq!(head[19], 0, "the storm tag encodes the absence");
         assert_eq!(
-            u32::from_le_bytes(encoded[20..24].try_into().unwrap()) as usize,
-            40 + 2 * 8 + 6 * 4,
-            "nothing rides between an absent trio's tag and the polar length",
+            head.len(),
+            20,
+            "nothing rides between an absent trio's tag and the head's end",
         );
-        let back = RenderedFrame::from_bytes(&encoded).expect("the absent form decodes");
+        let back = RenderedFrame::from_parts(&head, tails).expect("the absent form decodes");
         assert_eq!(back.storm_motion, None);
         // And the present form answers the whole vector — the two fixtures'
         // round-trips above are the rest of the claim.
+        let (head, tails) = encode_parts(&a_full_frame());
         assert_eq!(
-            RenderedFrame::from_bytes(&a_full_frame().to_bytes())
+            RenderedFrame::from_parts(&head, tails)
                 .expect("the present form decodes")
                 .storm_motion,
             a_full_frame().storm_motion,

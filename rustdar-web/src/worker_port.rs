@@ -268,20 +268,29 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
 
 /// Hand a `done` message to the job that asked for it.
 ///
-/// The reply is the `OUT`/`OUT_KIND` pair — one transferred `Uint8Array` in
-/// the dispatched row's own `encode_out` form, plus the registry code naming
-/// the row that wrote it — or explicit nulls for a job that produced
-/// nothing. Reading the buffer here is the first copy back into this
-/// instance's linear memory; there is no way around that one without a
-/// `SharedArrayBuffer`, which needs COOP/COEP headers GitHub Pages does not
-/// let this deployment set.
+/// The reply is the `OUT`/`OUT_KIND`/`TAILS` trio — the head, the registry
+/// code naming the row that wrote it, and the row's nominated large
+/// buffers, each transferred (WO-M7d) — or explicit nulls for a job that
+/// produced nothing. Reading each buffer below is ONE copy into this
+/// instance's linear memory (`to_vec`), unavoidable without a
+/// `SharedArrayBuffer`, which needs COOP/COEP headers GitHub Pages does
+/// not let this deployment set. It used to be two: the old spelling — a
+/// Uint8Array-from-view construction over the arriving payload — is the JS
+/// `new Uint8Array(typedArray)` COPY constructor, a hidden whole-payload
+/// JS→JS copy AHEAD of the crossing, ~21 MiB per widest still frame, which
+/// the prose that stood here then under-claimed as "the first copy... no
+/// way around that one". The checked `dyn_into` cast constructs nothing; a
+/// value that is not a typed array refuses to `None`, the posture every
+/// malformed reply already has.
 ///
-/// Everything after the copy is `offload::deliver_encoded_reply`'s: it holds
-/// the codec row recorded when the job was dispatched, verifies the reply's
-/// kind against that row's code (a mismatch is another build's reply or a
-/// corrupt message, delivered as "nothing to draw"), and decodes through the
-/// row — so this crate stays the browser adapter and the payload codecs are
-/// reachable from a host test rather than only from a browser.
+/// Everything after the copies is `offload::deliver_encoded_reply`'s: it
+/// holds the codec row recorded when the job was dispatched, verifies the
+/// reply's kind against that row's code (a mismatch is another build's
+/// reply or a corrupt message, delivered as "nothing to draw"), and decodes
+/// through the row — which also judges the tail COUNT and ADOPTS the
+/// frame's image tail whole, the page-side copy WO-M7d killed — so this
+/// crate stays the browser adapter and the payload codecs are reachable
+/// from a host test rather than only from a browser.
 fn deliver(data: &JsValue) {
     let Some(id) = proto::field(data, proto::ID).and_then(|v| v.as_f64()) else {
         log::error!("worker answered with no job id");
@@ -293,7 +302,24 @@ fn deliver(data: &JsValue) {
         let kind = proto::field(data, proto::OUT_KIND)
             .and_then(|v| v.as_f64())
             .map(|v| v as u8)?;
-        Some((kind, js_sys::Uint8Array::new(&out).to_vec()))
+        let head = out.dyn_into::<js_sys::Uint8Array>().ok()?.to_vec();
+        // TAILS null or absent reads as no tails: a frame row then refuses
+        // at its tail count — correctly — and every tail-less row decodes
+        // exactly as it always did.
+        let tails = match proto::field(data, proto::TAILS).filter(|v| !v.is_null()) {
+            None => Vec::new(),
+            Some(v) => {
+                let array = v.dyn_into::<js_sys::Array>().ok()?;
+                let mut tails = Vec::with_capacity(array.length() as usize);
+                for tail in array.iter() {
+                    // The same checked cast per tail — one copy each, no
+                    // constructor.
+                    tails.push(tail.dyn_into::<js_sys::Uint8Array>().ok()?.to_vec());
+                }
+                tails
+            }
+        };
+        Some((kind, head, tails))
     })();
     // `None` — a missing payload, a missing kind, a job that produced
     // nothing — still delivers: the caller's slot is released either way.

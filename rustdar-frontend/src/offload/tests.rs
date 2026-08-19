@@ -1163,26 +1163,29 @@ fn a_reply_payload_of_the_wrong_kind_is_refused_by_the_rows_codec() {
     let grid_bytes = grid.to_bytes();
 
     // Each row decodes its own payload — the control that the refusals
-    // below are about the pairing, not the bytes.
+    // below are about the pairing, not the bytes. These rows ride the head
+    // alone (no tails, WO-M7d), so the tails argument is empty throughout.
     assert_eq!(
-        row_decode_out("section")(&section_bytes).and_then(|out| out.take::<CrossSection>()),
+        row_decode_out("section")(&section_bytes, Vec::new())
+            .and_then(|out| out.take::<CrossSection>()),
         Some(section),
     );
     assert_eq!(
-        row_decode_out("voxels")(&grid_bytes).and_then(|out| out.take::<VoxelGrid>()),
+        row_decode_out("voxels")(&grid_bytes, Vec::new()).and_then(|out| out.take::<VoxelGrid>()),
         Some(grid),
     );
 
     // The payload codecs each have their own magic, so a decoder handed the
     // wrong kind's bytes is a refusal rather than a reinterpretation.
-    assert!(row_decode_out("voxels")(&section_bytes).is_none());
-    assert!(row_decode_out("section")(&grid_bytes).is_none());
-    assert!(row_decode_out("decode")(&section_bytes).is_none());
-    // The frame codec refuses both — neither opens with a shape its walk
-    // accepts end to end — and empty bytes refuse everywhere.
-    assert!(row_decode_out("radar")(&section_bytes).is_none());
-    assert!(row_decode_out("section")(&[]).is_none());
-    assert!(row_decode_out("radar")(&[]).is_none());
+    assert!(row_decode_out("voxels")(&section_bytes, Vec::new()).is_none());
+    assert!(row_decode_out("section")(&grid_bytes, Vec::new()).is_none());
+    assert!(row_decode_out("decode")(&section_bytes, Vec::new()).is_none());
+    // The frame codec refuses too — a tail-less frame reply is refused at
+    // its tail count before a byte is read (WO-M7d) — and empty bytes
+    // refuse everywhere.
+    assert!(row_decode_out("radar")(&section_bytes, Vec::new()).is_none());
+    assert!(row_decode_out("section")(&[], Vec::new()).is_none());
+    assert!(row_decode_out("radar")(&[], Vec::new()).is_none());
 }
 
 /// The deliver-side half of the reply pairing: the funnel decodes a reply
@@ -1204,7 +1207,8 @@ fn a_reply_of_the_wrong_kind_is_refused_at_the_deliver() {
             .and_then(|out| out.take::<CrossSection>())
             .expect("the section job draws")
             .to_bytes();
-        deliver_encoded_reply(id, Some((delivered_kind, bytes)));
+        // The section reply rides the head alone — no tails (WO-M7d).
+        deliver_encoded_reply(id, Some((delivered_kind, bytes, Vec::new())));
         assert_eq!(
             rx.try_recv(),
             Ok(decodes),
@@ -1613,7 +1617,7 @@ fn a_decoded_volume_comes_back_under_its_own_out_kind() {
             .expect("the label names a composed row")
             .decode_out
     };
-    let back = row_decode_out("decode")(&bytes)
+    let back = row_decode_out("decode")(&bytes, Vec::new())
         .expect("a volume payload under the decode row")
         .take::<DecodedScan>()
         .expect("it is a volume");
@@ -1623,7 +1627,7 @@ fn a_decoded_volume_comes_back_under_its_own_out_kind() {
     // types' own magic rather than half-decoded into something plausible.
     for label in ["section", "voxels"] {
         assert!(
-            row_decode_out(label)(&bytes).is_none(),
+            row_decode_out(label)(&bytes, Vec::new()).is_none(),
             "the {label} row accepted a volume payload"
         );
     }
@@ -2902,17 +2906,23 @@ fn a_hit_cells_fixture() -> rustdar_overlays::render::rasterize::HitCells {
 #[test]
 fn the_overlay_reply_round_trips_and_is_canonical() {
     let rgba: Vec<u8> = (0..32).collect();
+    // `encode_overlay_out` writes into a sink since WO-M7d (the codec's
+    // head); these constructions changed shape, the bytes did not.
+    let encode = |cells: Option<&rustdar_overlays::render::rasterize::HitCells>| {
+        let mut out = Vec::new();
+        encode_overlay_out(&rgba, cells, &mut out);
+        out
+    };
     for cells in [None, Some(a_hit_cells_fixture())] {
-        let encoded = encode_overlay_out(&rgba, cells.as_ref());
         assert_eq!(
-            decode_overlay_out(&encoded),
+            decode_overlay_out(&encode(cells.as_ref())),
             Some((rgba.clone(), cells.clone())),
             "the overlay reply did not survive its own codec",
         );
     }
     assert_eq!(
-        encode_overlay_out(&rgba, Some(&a_hit_cells_fixture())),
-        encode_overlay_out(&rgba, Some(&a_hit_cells_fixture())),
+        encode(Some(&a_hit_cells_fixture())),
+        encode(Some(&a_hit_cells_fixture())),
         "two encodes of one reply disagree: the cell walk is not canonical",
     );
 }
@@ -2933,8 +2943,12 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
 #[test]
 fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     let rgba: Vec<u8> = (0..16).collect();
-    let bare = encode_overlay_out(&rgba, None);
-    let with_cells = encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()));
+    // Sink-shaped construction since WO-M7d; the byte VALUES these rows pin
+    // are the proof the flatten changed no stream.
+    let mut bare = Vec::new();
+    encode_overlay_out(&rgba, None, &mut bare);
+    let mut with_cells = Vec::new();
+    encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()), &mut with_cells);
     let rows = vec![
         format!("bare | {} | {:#018x}", bare.len(), layout_digest(&bare)),
         format!(
@@ -2962,15 +2976,22 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
 }
 
 /// The framing the FRAME reply ships is **this** framing — the rows of
-/// [`crate::wire_identity::WIRE_FRAME_REPLY_ROWS`], over
-/// `rustdar_radar::frame::RenderedFrame::to_bytes` on two literal fixtures:
-/// one with all three optional trios present (Nyquist, melting-layer code,
-/// the atomic storm trio), one with none. The frame reply rides the
-/// `OUT`/`OUT_KIND` pair since WO-M7c, so this is the digest the eight
-/// named JS fields never needed and the byte layout now demands — the
-/// reply-shape scrape in `rustdar-web/tests/pwa_assets.rs` watches field
-/// names, and no field name moves when this layout does. The rows feed the
-/// build token beside the overlay reply rows — same suite, same mechanism.
+/// [`crate::wire_identity::WIRE_FRAME_REPLY_ROWS`]: since WO-M7d six rows
+/// (head, polar tail, image tail, per fixture) over the SAME two literal
+/// fixtures WO-M7c pinned as one buffer each — one with all three optional
+/// trios present (Nyquist, melting-layer code, the atomic storm trio), one
+/// with none. The frame reply rides the `OUT`/`OUT_KIND`/`TAILS` trio, so
+/// this is the digest the eight named JS fields never needed and the byte
+/// layout still demands — the reply-shape scrape in
+/// `rustdar-web/tests/pwa_assets.rs` watches field names, and no field
+/// name moves when this layout does. The rows feed the build token beside
+/// the overlay reply rows — same suite, same mechanism.
+///
+/// The encode runs through the PRODUCTION radar row (`encode_out`), not a
+/// test-side spelling, so the tail ORDER is this test's to catch: a
+/// symmetric [polar, image] swap in the codec and `from_parts` keeps every
+/// round-trip green, and these rows alone go red (the polar-row digest
+/// becomes the image's and vice versa).
 ///
 /// The polar block is built from literal bytes (not an extract, whose gates
 /// would be whatever the platform's libm said), so these digests are a
@@ -3016,24 +3037,38 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
         melting_layer_source: None,
         storm_motion: None,
     };
-    let full_bytes = full.to_bytes();
-    let bare_bytes = bare.to_bytes();
+    let radar_row = job_codecs()
+        .find(|row| row.label == "radar")
+        .expect("the radar row is composed");
+    let encode = |frame: &RenderedFrame| {
+        let mut head = Vec::new();
+        let mut tails = Vec::new();
+        (radar_row.encode_out)(DescribedOut(Box::new(frame.clone())), &mut head, &mut tails);
+        assert_eq!(
+            tails.len(),
+            2,
+            "the frame reply rides exactly two tails; a third would need \
+             its own digest row",
+        );
+        (head, tails)
+    };
+    let (full_head, full_tails) = encode(&full);
+    let (bare_head, bare_tails) = encode(&bare);
+    let row = |name: &str, bytes: &[u8]| {
+        format!("{name} | {} | {:#018x}", bytes.len(), layout_digest(bytes))
+    };
     let rows = vec![
-        format!(
-            "frame/full | {} | {:#018x}",
-            full_bytes.len(),
-            layout_digest(&full_bytes)
-        ),
-        format!(
-            "frame/bare | {} | {:#018x}",
-            bare_bytes.len(),
-            layout_digest(&bare_bytes)
-        ),
+        row("frame/full/head", &full_head),
+        row("frame/full/polar", &full_tails[0]),
+        row("frame/full/image", &full_tails[1]),
+        row("frame/bare/head", &bare_head),
+        row("frame/bare/polar", &bare_tails[0]),
+        row("frame/bare/image", &bare_tails[1]),
     ];
     assert_eq!(
         rows,
         crate::wire_identity::WIRE_FRAME_REPLY_ROWS,
-        "the framing `RenderedFrame::to_bytes` writes is not the framing \
+        "the framing the frame rows' `encode_out` writes is not the framing \
          `wire_identity::WIRE_FRAME_REPLY_ROWS` pins. Left is what this \
          build posts; right is what that list was last told. If the change \
          was deliberate, re-pin the row in `wire_identity.rs`: the row feeds \
@@ -3055,7 +3090,8 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
 #[test]
 fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     let rgba: Vec<u8> = (0..16).collect();
-    let encoded = encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()));
+    let mut encoded = Vec::new();
+    encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()), &mut encoded);
     let prefix = encoded.len() - rgba.len();
 
     // Control first: untouched bytes decode, so every refusal below is the
@@ -3618,26 +3654,33 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
     );
 
     // The payload round-trips through the sites row's own reply codec: the
-    // hit-cells block is framed, the RGBA is still the raw rest, and
-    // acceptance of the tail is still the dispatcher's length check rather
-    // than a magic.
+    // hit-cells block is framed, the RGBA is still the raw rest of the
+    // HEAD (the overlay reply nominates no tails, WO-M7d), and acceptance
+    // of the tail is still the dispatcher's length check rather than a
+    // magic.
     let RasterizeOutput {
         rgba, hit_cells, ..
     } = output.take::<RasterizeOutput>().expect("an overlay raster");
     let sites_row = job_codecs()
         .find(|row| row.label == "overlay/sites")
         .expect("the sites row is composed");
-    let mut encoded = Vec::new();
+    let mut head = Vec::new();
+    let mut tails = Vec::new();
     (sites_row.encode_out)(
-        &DescribedOut(Box::new(RasterizeOutput {
+        DescribedOut(Box::new(RasterizeOutput {
             rgba: rgba.clone(),
             hit_cells: hit_cells.clone(),
             alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
         })),
-        &mut encoded,
+        &mut head,
+        &mut tails,
     );
-    assert_eq!(encoded, encode_overlay_out(&rgba, hit_cells.as_ref()));
-    let back = (sites_row.decode_out)(&encoded)
+    let mut expected = Vec::new();
+    encode_overlay_out(&rgba, hit_cells.as_ref(), &mut expected);
+    assert_eq!(head, expected);
+    // Handing the (empty) tails straight back through is the emptiness
+    // check: the shared decoder refuses any tail this adapter never writes.
+    let back = (sites_row.decode_out)(&head, tails)
         .expect("the sites reply decodes")
         .take::<RasterizeOutput>()
         .expect("the sites reply is a raster");

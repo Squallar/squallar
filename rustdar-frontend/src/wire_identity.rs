@@ -13,8 +13,11 @@
 //! [`WIRE_FRAMING_ROWS`] paired with the composed-registry index of the row's
 //! kind — the index IS the wire code minus one, so a recomposed registry
 //! moves the fold even before any row's bytes do — then the canonical
-//! envelope's layout ([`CANONICAL_ENVELOPE_LAYOUT`]), and then every row of
-//! [`WIRE_REPLY_ROWS`]. The row digests are the same values the framing test
+//! envelope's layout ([`CANONICAL_ENVELOPE_LAYOUT`]), then every row of
+//! [`WIRE_REPLY_ROWS`], and then every row of [`WIRE_FRAME_REPLY_ROWS`]
+//! (folded since WO-M7c; six head/tail rows since WO-M7d — this sentence
+//! had omitted the frame rows since their fold, repaired in passing). The
+//! row digests are the same values the framing test
 //! pins — so the two halves of one build are equal by construction (same
 //! module, same constants), and two local builds diverge exactly when a
 //! re-pinned row, the composition, or the envelope's shape differs between
@@ -74,18 +77,33 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
     "cells | 69 | 0x6637c90fa10e397a",
 ];
 
-/// The 2 frame-reply framing rows, exactly as
+/// The 6 frame-reply framing rows, exactly as
 /// `offload::tests::the_frame_reply_framing_is_the_one_this_registry_ships`
-/// asserts them: the frame's wire form
-/// (`rustdar_radar::frame::RenderedFrame::to_bytes`, WO-M7c) over one
-/// fixture with all three optional trios present and one with none, folded
-/// into the token beside the overlay reply rows on the M5 seam ruling's own
-/// grounds — same suite, same mechanism, strictly better local detection:
-/// a local page/worker pair differing only in the frame reply's layout
-/// would otherwise still pair, and misread every frame.
+/// asserts them: the frame's head+tails wire form
+/// (`rustdar_radar::frame::RenderedFrame::write_head` + the nominated
+/// `[polar, image]` tails, WO-M7d — re-pinned from WO-M7c's two one-buffer
+/// rows over the SAME two literal fixtures) — head, polar tail and image
+/// tail for one fixture with all three optional trios present and one with
+/// none, folded into the token beside the overlay reply rows on the M5
+/// seam ruling's own grounds — same suite, same mechanism, strictly better
+/// local detection: a local page/worker pair differing only in the frame
+/// reply's layout would otherwise still pair, and misread every frame. The
+/// per-tail rows also pin the tail ORDER — the one guard a symmetric
+/// [polar, image] swap cannot slip past.
+///
+/// Row-length arithmetic (independent of the encoder): head/full
+/// 8 + (1+8) + (1+1) + (1+1+4+4) = 29; head/bare 8+1+1+1 = 11; polar/full
+/// 80 = 16 header + 3×8 + 2×8 + 6×4; polar/bare 40 = 16 header + 3×8
+/// (the default field); image 8/4 = the fixture Vecs. (The retired
+/// one-buffer rows reconcile: 121 = 29+4+80+8, 59 = 11+4+40+4 — the 4 was
+/// the polar_len u32 the head no longer carries.)
 pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
-    "frame/full | 121 | 0x2d1d072668c28197",
-    "frame/bare | 59 | 0x29c0bfe9f51ad71e",
+    "frame/full/head | 29 | 0x89dc568e54cf7abb",
+    "frame/full/polar | 80 | 0x9f0c3f4e5dce8435",
+    "frame/full/image | 8 | 0x0363b2a3926bce45",
+    "frame/bare/head | 11 | 0xc813d3185b023723",
+    "frame/bare/polar | 40 | 0x3f3ecf0cef9be2c0",
+    "frame/bare/image | 4 | 0xbe7a5e775165785d",
 ];
 
 /// The canonical envelope's layout as one literal sentence, folded into
@@ -116,8 +134,10 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// (WO-M7b): FNV-1a 64 over, in order, each row of [`WIRE_FRAMING_ROWS`]
 /// prefixed by the composed-registry index of the row's kind, then
 /// [`CANONICAL_ENVELOPE_LAYOUT`], then every row of [`WIRE_REPLY_ROWS`],
-/// then every row of [`WIRE_FRAME_REPLY_ROWS`] (WO-M7c — the reply
-/// direction's framing is registry-shipped in both payload families now).
+/// then every row of [`WIRE_FRAME_REPLY_ROWS`] in list order (WO-M7c — the
+/// reply direction's framing is registry-shipped in both payload families;
+/// six rows since WO-M7d's head+tails split, so the tail order and both
+/// tail layouts move the token too).
 ///
 /// The index prefix is resolved against the crate-private
 /// `job_registry::job_codecs` composition by the row's own kind label — the
