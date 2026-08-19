@@ -2034,7 +2034,7 @@ impl InputHarness {
     ///
     /// No integration in this workspace actually produces this:
     /// `egui-winit`'s `on_mouse_motion` (`lib.rs:759`) is reachable only from
-    /// `DeviceEvent`, and `rustdar-frontend/src/egui_renderer.rs:79` forwards
+    /// `DeviceEvent`, and `rustdar-gpu/src/egui_renderer.rs:79` forwards
     /// `on_window_event` only. It is here to exercise the tracker's defensive
     /// position fallback, and to prove a delta with no coordinates cannot
     /// resurrect a cancelled touch.

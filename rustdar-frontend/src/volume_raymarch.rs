@@ -63,11 +63,11 @@
 
 use egui_wgpu::wgpu;
 
-use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VOLUME_TEXTURE_FORMAT;
 use crate::volume::blue_noise::{BLUE_NOISE_EDGE, blue_noise_tile};
 use crate::volume::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
 use rustdar_device_profile::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
+use rustdar_gpu::egui_renderer::AttachmentConfig;
 use staging::VolumeStaging;
 
 /// The WGSL every volume pipeline is built from.
@@ -1274,7 +1274,7 @@ impl PaneMirror {
 /// a `PaneMirror` needs a `wgpu::Device` to exist, which CI rows do not have.
 ///
 /// Both arms are live, but they are not equally common.
-/// `app_state::preferred_surface_format` prefers a non-sRGB format on wasm, and
+/// `rustdar_gpu::device::preferred_surface_format` prefers a non-sRGB format on wasm, and
 /// natively prefers `Bgra8Unorm` — also non-sRGB — falling back to
 /// `capabilities.formats[0]` only on an adapter that does not offer it. So the
 /// gamma-encoded arm is the ordinary one on both platforms, and the sRGB arm is

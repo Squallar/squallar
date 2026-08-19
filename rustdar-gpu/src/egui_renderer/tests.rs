@@ -79,24 +79,29 @@ fn a_timed_repaint_request_is_left_to_the_frames_own_schedule() {
 }
 
 /// The wiring itself: the one place a `Context` is built has to install it,
-/// and what it installs has to be the redraw request.
+/// and what it installs has to be the caller's injected wake — nothing else.
 ///
 /// A source probe because `EguiRenderer::new` needs a real `Window` — the
 /// same reason `attachment_config_is_built_from_new_s_own_parameters` is one.
 /// The behavioural tests above drive `install_repaint_wake` directly and stay
-/// green with nothing calling it.
+/// green with nothing calling it. The old assertion's other half — that the
+/// wake ends in a redraw request — travelled to the app side with the closure
+/// at WO-RG: rustdar-frontend's `egui_frame_pin_tests` pins that the wake
+/// `AppState::new` builds calls its `notify_redraw`.
 #[test]
 fn the_renderer_installs_that_wake_on_the_context_it_builds() {
     let body = body_of(include_str!("../egui_renderer.rs"), "    pub fn new(");
-    assert!(
-        body.contains("install_repaint_wake(&egui_context"),
-        "the context is built without a repaint wake, so every off-frame \
-             `ctx.request_repaint()` in the app is a no-op: {body}"
+    let installs = body.matches("install_repaint_wake(&egui_context").count();
+    assert_eq!(
+        installs, 1,
+        "`new` must install a repaint wake on the context it builds exactly \
+             once; found {installs}: {body}"
     );
     assert!(
-        body.contains("notify_redraw("),
-        "the wake no longer ends in a redraw request, so it produces a loop \
-             iteration rather than the frame egui asked for: {body}"
+        body.contains("install_repaint_wake(&egui_context, wake)"),
+        "the context is built with something other than the caller's injected \
+             wake, so the app loop's redraw request is no longer what an \
+             off-frame `ctx.request_repaint()` reaches: {body}"
     );
 }
 
@@ -169,37 +174,9 @@ fn end_pass_and_upload_carries_the_callback_command_buffers() {
     );
 }
 
-/// The frame path must submit through [`super::PreparedFrame::submit`].
-///
-/// `submit` takes the encoder by value, so it is impossible to submit egui's
-/// buffer *through it* without the callbacks' — but that only closes the door
-/// on the type level for callers that use it. A caller can still write
-/// `queue.submit(Some(encoder.finish()))` itself, which is exactly the
-/// pre-fix code and compiles clean. There are two submit sites (the frame
-/// that acquired a surface and the frame that did not) and both matter: a
-/// callback that recorded work for a frame nobody draws still has to be
-/// flushed rather than leaked.
-#[test]
-fn the_frame_path_submits_only_through_prepared_frame() {
-    let body = body_of(
-        include_str!("../app_render.rs"),
-        "pub(super) fn present_frame(",
-    );
-
-    let submits = body.matches("frame.submit(").count();
-    assert_eq!(
-        submits, 2,
-        "present_frame should submit through PreparedFrame::submit exactly \
-             twice — once for the frame that got a surface and once for the \
-             frame that did not — found {submits}"
-    );
-    assert!(
-        !body.contains("encoder.finish()"),
-        "present_frame finishes the encoder itself instead of handing it to \
-             PreparedFrame::submit, which skips the paint callbacks' command \
-             buffers entirely"
-    );
-}
+// `the_frame_path_submits_only_through_prepared_frame` pins rustdar-frontend's
+// `present_frame` and stayed behind at WO-RG: it lives in the app side's
+// `app_render/egui_frame_pin_tests.rs`, beside the file it scrapes.
 
 /// `attachment_config` must report the pass, not a guess at it.
 ///
@@ -231,45 +208,10 @@ fn attachment_config_is_built_from_new_s_own_parameters() {
     }
 }
 
-/// The pass `draw` opens must be the pass `attachment_config` describes.
-///
-/// `draw` hard-codes `depth_stencil_attachment: None` and
-/// `resolve_target: None`, while `new` accepts *any* depth format and sample
-/// count and forwards them to egui's own pipeline. Those two are already one
-/// call-site edit away from disagreeing, and the failure mode is a pipeline
-/// that declares depth (or MSAA) for a pass that has neither: a validation
-/// error at draw time, from a `create_render_pipeline` that returns no
-/// `Result`. Publishing `attachment_config()` makes the disagreement
-/// reachable by anything building a pipeline, so pin both halves.
-#[test]
-fn the_pass_draw_opens_matches_what_attachment_config_promises() {
-    let draw = body_of(include_str!("../egui_renderer.rs"), "    pub fn draw(");
-    assert!(
-        draw.contains("depth_stencil_attachment: None"),
-        "draw now attaches a depth buffer, so `AttachmentConfig::depth_format` \
-             must stop being able to disagree with it"
-    );
-    assert!(
-        draw.contains("resolve_target: None"),
-        "draw now resolves MSAA, so a single-sampled `msaa_samples` no longer \
-             describes this pass"
-    );
-
-    // The only production construction, and what makes the two consistent.
-    let state = include_str!("../app_state.rs");
-    let call = state
-        .split_once("EguiRenderer::new(")
-        .map(|(_, rest)| rest)
-        .and_then(|rest| rest.split_once(')'))
-        .map(|(args, _)| args)
-        .expect("app_state no longer constructs an EguiRenderer");
-    assert!(
-        call.contains("None") && call.contains(", 1,"),
-        "app_state constructs the EguiRenderer with `{call}` — a depth format \
-             or a sample count that `draw`'s render pass does not provide, so \
-             egui's own pipeline no longer matches its own pass"
-    );
-}
+// `the_pass_draw_opens_matches_what_attachment_config_promises` scrapes BOTH
+// this crate's `egui_renderer.rs` and rustdar-frontend's `app_state.rs` (the
+// only production construction), so it stayed on the app side at WO-RG — in
+// `app_render/egui_frame_pin_tests.rs`, where the same-crate half lives.
 
 /// A callback's own command buffer reaches the queue, on a real device.
 ///
@@ -293,7 +235,7 @@ fn the_pass_draw_opens_matches_what_attachment_config_promises() {
 /// with no graphics hardware. Locally:
 ///
 /// ```text
-/// cargo test -p rustdar-frontend --lib \
+/// cargo test -p rustdar-gpu --lib \
 ///     egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
 ///     -- --ignored --exact --nocapture
 /// ```

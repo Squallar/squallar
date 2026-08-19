@@ -96,12 +96,12 @@ use rustdar_egui::volume_alpha::AlphaCurve;
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter, view_for};
 use rustdar_radar::voxel::VoxelGrid;
 
-use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VolumeSupport;
 use crate::volume::raymarch::staging::VolumeStaging;
 use crate::volume::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
 use crate::volume::uniform::VolumeUniform;
 use rustdar_device_profile::quality::VolumeQuality;
+use rustdar_gpu::egui_renderer::AttachmentConfig;
 
 /// The fewest see-through entries a grid's table may have, anywhere on its
 /// ramp, before this renderer refuses to draw a volume through it.

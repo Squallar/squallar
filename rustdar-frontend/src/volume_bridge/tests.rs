@@ -557,7 +557,7 @@ fn a_released_id_is_never_handed_out_again() {
 /// taken from the frame again.
 ///
 /// The gamma lane gets both arms because **both are live** — though not
-/// equally common. `app_state::preferred_surface_format` prefers a non-sRGB
+/// equally common. `rustdar_gpu::device::preferred_surface_format` prefers a non-sRGB
 /// format on wasm and prefers `Bgra8Unorm` (also non-sRGB) natively, taking
 /// `capabilities.formats[0]` only as a fallback. The sRGB arm is therefore the
 /// rare one, reached on an adapter that does not offer `Bgra8Unorm` —

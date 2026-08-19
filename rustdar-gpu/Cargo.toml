@@ -1,55 +1,18 @@
+# The wgpu boundary: the one egui/wgpu renderer every target draws through —
+# frame prepare/submit, texture upload, the pane mirror, the staging ring, and
+# the device-request policy.
 [package]
-name = "rustdar-frontend"
+name = "rustdar-gpu"
 version.workspace = true
 edition.workspace = true
 
-# The portable half of the application: windowing, rendering, fetching and app
-# state. "Portable" here means winit-portable, not windowing-free — this crate
-# owns the single renderer that desktop, web (wasm32 + WebGL2), Android and iOS
-# all share, so depending on winit/wgpu/egui is expected.
-#
-# What it deliberately does NOT contain is any per-OS code: no entry point, no
-# concrete PlatformBridge. Those live in rustdar-platform, which depends on this
-# crate. Adding a dependency back on rustdar-platform would be a cycle.
+# NOTE (WO-RG interim): rustdar-frontend still carries its own copies of the
+# wgpu feature-chooser and per-target backend blocks below — app.rs still owns
+# the instance creation and the single-wgpu guard until WO-RV land 3 moves
+# them here. The redundancy is deliberate and temporary; at land 3 this
+# manifest becomes the one feature-chooser for the whole graph.
 
 [dependencies]
-web-time = { workspace = true }
-rustdar-egui = { workspace = true }
-# The device-class policy floor: budget cascades + the profile->budgets
-# resolver moved down at WO-RD; this crate reads its budgets from below.
-rustdar-device-profile = { workspace = true }
-# The wgpu boundary: the egui renderer, texture upload, pane mirror, staging
-# ring and device-request policy moved down at WO-RG. NOTE (interim): this
-# crate still carries its own wgpu feature-chooser and per-target backend
-# blocks below — app.rs still owns the instance creation and the single-wgpu
-# guard until WO-RV land 3 moves them into rustdar-gpu. The redundancy is
-# deliberate and temporary.
-rustdar-gpu = { workspace = true }
-rustdar-radar = { workspace = true }
-rustdar-overlays = { workspace = true }
-# The job-boundary vocabulary (DescribedJob, JobCodec, JobGeometry) and the
-# substrate wire Reader the codec rows decode with. The overlay wire flip
-# (WO-M6.3) is what forced the edge: `JobRequest::Overlay` carries the
-# substrate's own envelope types, and the frontend frames codec rows whose
-# signatures speak them.
-rustdar-source = { workspace = true }
-# The job engine: the offload funnel this crate's dispatch sites feed, the
-# composed codec registry and the wire identity — moved down at WO-RW so the
-# engine sits below the app side.
-rustdar-worker = { workspace = true }
-rustdar-geo = { workspace = true }
-rustdar-kv = { workspace = true }
-# SerialConfig only — the reader stays behind nmea-serial's `serial` feature,
-# which rustdar-egui/gps-serial turns on. The settings pane that does use the
-# reader is where the gate belongs; this crate stays free of it.
-rustdar-location = { workspace = true }
-rustdar-nmea-serial = { workspace = true }
-# `json` only -- see the note in rustdar-overlays: `default` would re-enable
-# `default-tls` (= platform verifier + aws-lc-rs) and undo the aws-lc-sys removal.
-reqwest = { workspace = true, features = ["json"] }
-chrono = { workspace = true }
-# The volume grid's texel encoder writes `Rg16Float`; see the workspace note.
-half = { workspace = true }
 egui = { workspace = true }
 # Defaults are off at the workspace level, because egui-wgpu's `default` set
 # contains `wgpu/default` -- and that contains `webgpu`, which this build must
@@ -60,14 +23,14 @@ egui = { workspace = true }
 # `cfg(all(target_os = "macos", feature = ...))`, and
 # `fragile-send-sync-non-atomic-wasm` only under `cfg(target_arch = "wasm32")`.
 egui-wgpu = { workspace = true, features = ["winit"] }
-log = { workspace = true }
-# No `nexrad-data` here: the only thing this crate ever used from it was
-# `aws::archive::Identifier`, which now lives in `rustdar_radar::archive`
-# alongside the S3 access that produces it.
-nexrad-model = { workspace = true }
-nexrad-level3 = { workspace = true }
-pollster = { workspace = true }
 winit = { workspace = true }
+# Forced by real imports, not doc refs: `begin_frame` rewrites egui's raw input
+# through rustdar_egui::normalize_touch_devices / normalize_wheel_units, and
+# the mirror's tests read the tile-cache arithmetic.
+rustdar-egui = { workspace = true }
+# The device-class policy floor: MIRROR_MAX_SIDE and the mirror byte cascade
+# live there; `device_class_of` returns its DeviceClass.
+rustdar-device-profile = { workspace = true }
 # Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
 # re-export. This entry is not there to be imported from; it exists to *choose
 # wgpu's features*, which egui-wgpu cannot express (it offers only the blanket
@@ -80,18 +43,10 @@ winit = { workspace = true }
 # rendering path -- and, until the workspace pin was fixed, a duplicate set of
 # WebGPU bindings that broke `wasm-bindgen` outright.
 wgpu = { workspace = true, features = ["std", "wgsl"] }
-ewebsock = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
-# tokio's multi-threaded runtime is native-only -- wasm rejects
-# `rt-multi-thread` outright ("Only features sync,macros,io-util,rt,time are
-# supported on wasm"). The browser gives us one thread and its own event loop,
-# so the web build spawns onto that instead. See `App::spawn_detached`.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 # `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
 # anything where there are threads to contend, so the browser does not take it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { workspace = true, features = ["parking_lot"] }
 
 # `clipboard` pulls `arboard`, which has no wasm backend at all -- it fails to
@@ -150,24 +105,10 @@ egui-winit = { workspace = true, features = ["links"] }
 # threads to be unsound about. Without it the browser build stops compiling.
 wgpu = { workspace = true, features = ["webgl"] }
 egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
-# Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.126).
-# A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
-# rejects the pair outright, so this version moves when that stack moves.
-wasm-bindgen-futures = "=0.4.76"
 
-# Target-gated for the reason rustdar-web's dev-dependencies are: a plain
-# `[dev-dependencies]` entry is built for every target under `--all-targets`.
-#
-# `syn` parses `src/app.rs` in `tests/wgpu_guard.rs`. Same 3.0.3 the proc-macro
-# crates already resolve, so this adds no package -- and being a dev-dependency
-# it reaches no shipped artifact.
-#
-# `naga` translates `src/volume.wgsl` to GLSL ES 300 in `tests/volume_shader.rs`
-# -- the one check that says what a WebGL2 browser will actually be handed. See
-# the workspace manifest for why it is a direct dependency rather than reached
-# through wgpu. The gate here is the wasm32 clippy row: the test file is
-# `#![cfg(not(target_arch = "wasm32"))]`, so on that target the dependency would
-# be built and then used by nothing.
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-naga = { workspace = true }
-syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }
+[dev-dependencies]
+# The charter test parses `cargo metadata`.
+serde_json = { workspace = true }
+# `a_paint_callbacks_own_command_buffer_reaches_the_queue` blocks on a real
+# adapter request; the test is `#[ignore]`d by default and CI's gpu job opts in.
+pollster = { workspace = true }

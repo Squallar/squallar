@@ -13,7 +13,7 @@
 //!
 //! The ring itself — why `write_texture` is slow, why writing through a
 //! `MAP_READ` mapping is sound, what makes the mapping coherent, and why a
-//! claim never blocks — lives in [`crate::staging_ring`], because it is a
+//! claim never blocks — lives in [`rustdar_gpu::staging_ring`], because it is a
 //! mechanism rather than a property of voxel grids, and because a second caller
 //! would otherwise have to restate the argument. What is this module's is
 //! everything below: how a *plane* sits inside a buffer a copy can read, and
@@ -22,11 +22,11 @@
 use egui_wgpu::wgpu;
 
 use super::{GRID_BYTES_PER_CELL, label};
-use crate::staging_ring::Ring;
+use rustdar_gpu::staging_ring::Ring;
 
 /// Re-exported so the four GPU suites and `AppState::new` keep naming the same
-/// path they always have. The definitions are [`crate::staging_ring`]'s.
-pub use crate::staging_ring::{STAGING_RING_DEPTH, STAGING_RING_FEATURE};
+/// path they always have. The definitions are [`rustdar_gpu::staging_ring`]'s.
+pub use rustdar_gpu::staging_ring::{STAGING_RING_DEPTH, STAGING_RING_FEATURE};
 
 /// The host memory an upload borrows: a ring of GPU-readable staging buffers
 /// where the device has them, and the plain widening buffer everywhere else.
@@ -106,7 +106,7 @@ impl VolumeStaging {
     /// upload's plane, so a session that never opens a 3D pane pays for neither
     /// half.
     pub fn new(device: &wgpu::Device) -> Self {
-        let capable = crate::staging_ring::device_has_ring(device);
+        let capable = rustdar_gpu::staging_ring::device_has_ring(device);
         Self {
             widening: Vec::new(),
             ring: None,

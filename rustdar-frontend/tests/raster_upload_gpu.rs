@@ -26,14 +26,14 @@
 //!
 //! `#[ignore]`d, both of them: they need a real adapter, and CI has none.
 //!
-//! [`BandPlan`]: rustdar_frontend::egui_renderer::texture_upload
-//! [`UPLOAD_BAND_BYTES`]: rustdar_frontend::egui_renderer::texture_upload::UPLOAD_BAND_BYTES
+//! [`BandPlan`]: rustdar_gpu::egui_renderer::texture_upload
+//! [`UPLOAD_BAND_BYTES`]: rustdar_gpu::egui_renderer::texture_upload::UPLOAD_BAND_BYTES
 
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
-use rustdar_frontend::egui_renderer::texture_upload::TextureUploads;
-use rustdar_frontend::staging_ring::STAGING_RING_FEATURE;
+use rustdar_gpu::egui_renderer::texture_upload::TextureUploads;
+use rustdar_gpu::staging_ring::STAGING_RING_FEATURE;
 
 /// The odd, multi-band shape. See the module note.
 const SIDE: usize = 3000;

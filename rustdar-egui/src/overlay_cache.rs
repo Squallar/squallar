@@ -521,7 +521,7 @@ pub struct HeldOverlayTexture {
 ///
 /// [`Self::current`] is private, and that is what [`Self::held`] is for. A
 /// raster crosses PCIe in bands over several frames
-/// (`rustdar_frontend::egui_renderer::texture_upload`), so the pixels behind a
+/// (`rustdar_gpu::egui_renderer::texture_upload`), so the pixels behind a
 /// fresh `TextureHandle` are not all there on the frame it is minted. A cache
 /// that assigned the handle straight into `current` would draw a picture filling
 /// in top-down; one that assigned it and left the *placement* and the *caption*
@@ -670,7 +670,7 @@ impl OverlayTextureCache {
     ///
     /// The predicate is passed in because this crate has no renderer: the only
     /// thing that knows how far an upload has got is
-    /// `rustdar_frontend::egui_renderer::EguiRenderer::is_delivered`.
+    /// `rustdar_gpu::egui_renderer::EguiRenderer::is_delivered`.
     pub fn take_held_if_delivered(
         &mut self,
         delivered: impl Fn(egui::TextureId) -> bool,

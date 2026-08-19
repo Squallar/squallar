@@ -5,6 +5,7 @@ members = [
     "rustdar-frontend",
     "rustdar-device-profile",
     "rustdar-worker",
+    "rustdar-gpu",
     "rustdar-web",
     "rustdar-android",
     "rustdar-egui",
@@ -50,6 +51,7 @@ rustdar-device-profile = { path = "rustdar-device-profile" }
 rustdar-egui = { path = "rustdar-egui" }
 rustdar-frontend = { path = "rustdar-frontend" }
 rustdar-geo = { path = "rustdar-geo" }
+rustdar-gpu = { path = "rustdar-gpu" }
 rustdar-kv = { path = "rustdar-kv" }
 rustdar-overlays = { path = "rustdar-overlays" }
 rustdar-platform = { path = "rustdar-platform" }

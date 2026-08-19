@@ -157,7 +157,7 @@ fn the_quad_packs_its_corners_in_draw_order() {
 /// sRGB targets get the decoding blit and non-sRGB ones the pass-through.
 ///
 /// This is the whole of bug #2's mitigation on the Rust side, and both arms are
-/// reachable — `app_state::preferred_surface_format` prefers a non-sRGB format
+/// reachable — `rustdar_gpu::device::preferred_surface_format` prefers a non-sRGB format
 /// on wasm32 and prefers `Bgra8Unorm` natively, taking `capabilities.formats[0]`
 /// only as a fallback, so an sRGB surface is the rare case rather than the
 /// routine native one.

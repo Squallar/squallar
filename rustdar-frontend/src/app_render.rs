@@ -2169,7 +2169,7 @@ impl super::App {
     /// the pass open) compile cleanly again.
     fn get_surface_texture(
         surface: &wgpu::Surface,
-        _finished: &crate::egui_renderer::PreparedFrame,
+        _finished: &rustdar_gpu::egui_renderer::PreparedFrame,
     ) -> SurfaceStatus {
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
@@ -2254,7 +2254,7 @@ impl super::App {
                 demand,
                 [size_in_points.x, size_in_points.y],
                 points,
-                crate::egui_renderer::MirrorLimits::for_device(
+                rustdar_gpu::egui_renderer::MirrorLimits::for_device(
                     state.device.limits().max_texture_dimension_2d,
                     self.budgets.mirror_bytes,
                 ),
@@ -2283,7 +2283,7 @@ impl super::App {
         let mirror =
             mirror_target
                 .as_ref()
-                .map(|(view, plan)| crate::egui_renderer::MirrorRequest {
+                .map(|(view, plan)| rustdar_gpu::egui_renderer::MirrorRequest {
                     view,
                     size_in_pixels: plan.size_in_pixels,
                     pixels_per_point: plan.pixels_per_point,
@@ -4945,6 +4945,12 @@ mod radar_texture_sharing_tests;
 #[path = "app_render/frame_order_tests.rs"]
 #[cfg(test)]
 mod frame_order_tests;
+
+/// The renderer pins that stayed behind at WO-RG — each scrapes a file this
+/// crate owns (`present_frame`, the one `EguiRenderer::new` call, the wake).
+#[path = "app_render/egui_frame_pin_tests.rs"]
+#[cfg(test)]
+mod egui_frame_pin_tests;
 
 /// What `poll_level3_results` does with a channel holding more than one answer.
 ///
