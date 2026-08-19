@@ -28,8 +28,8 @@
 //! coarsened later. Both are guards worth keeping and neither is evidence that
 //! the suppression works.
 
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::known;
 use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
@@ -333,7 +333,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
             app.gui
                 .pane_mut(idx)
                 .expect("pane exists")
-                .overlay_cache_mut(&OverlayKind::Radar.id())
+                .overlay_cache_mut(&known::RADAR)
                 .current()
                 .is_some(),
             "pane {idx} has no radar texture",

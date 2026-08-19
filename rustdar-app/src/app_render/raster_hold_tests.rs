@@ -15,8 +15,8 @@
 
 use super::*;
 use crate::app::tests::n_pane_app;
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::known;
 
 const SITE: &str = "KTLX";
 const TILT: f32 = 0.5;
@@ -107,7 +107,7 @@ fn on_screen(app: &crate::app::App, idx: usize) -> Option<egui::TextureId> {
     Some(
         app.gui
             .pane(idx)?
-            .overlay_cache(&OverlayKind::Radar.id())?
+            .overlay_cache(&known::RADAR)?
             .current()?
             .texture
             .id(),

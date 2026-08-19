@@ -12,8 +12,8 @@ use crate::render::controls::{
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
+    PopupContent, PopupSection, RenderMode,
 };
 use crate::render::station_model;
 use rustdar_source::id::{LayerId, known};
@@ -54,8 +54,8 @@ pub(crate) struct MetarItem {
 }
 
 impl OverlayItem for MetarItem {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::Metar
+    fn layer_id(&self) -> LayerId {
+        known::METAR
     }
 
     fn popup_content(&self, prefs: &UserPreferences) -> PopupContent {
@@ -230,9 +230,6 @@ impl MetarHandler {
 }
 
 impl OverlayHandler for MetarHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::Metar
-    }
     fn id(&self) -> LayerId {
         known::METAR
     }
@@ -346,7 +343,7 @@ impl OverlayHandler for MetarHandler {
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         selections.retain(|sel| {
-            if sel.kind() != OverlayKind::Metar {
+            if sel.layer_id() != known::METAR {
                 return true;
             }
             self.state

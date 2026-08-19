@@ -7,8 +7,8 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
+    PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::colors::md_stroke_color;
@@ -37,8 +37,8 @@ pub(crate) struct DiscussionItem {
 }
 
 impl OverlayItem for DiscussionItem {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::SpcDiscussions
+    fn layer_id(&self) -> LayerId {
+        known::SPC_DISCUSSIONS
     }
 
     fn popup_content(&self, _prefs: &rustdar_units::UserPreferences) -> PopupContent {
@@ -158,9 +158,6 @@ fn md_label(md: &SpcDiscussion) -> Option<OverlayLabel> {
 }
 
 impl OverlayHandler for SpcDiscussionHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::SpcDiscussions
-    }
     fn id(&self) -> LayerId {
         known::SPC_DISCUSSIONS
     }
@@ -311,7 +308,7 @@ impl OverlayHandler for SpcDiscussionHandler {
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         selections.retain(|sel| {
-            if sel.kind() != OverlayKind::SpcDiscussions {
+            if sel.layer_id() != known::SPC_DISCUSSIONS {
                 return true;
             }
             self.state

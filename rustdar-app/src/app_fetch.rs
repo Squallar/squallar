@@ -5,8 +5,9 @@ use chrono::TimeZone;
 use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::shell_api::GuiEvent;
-use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::{LayerId, known};
 use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
 
@@ -1170,7 +1171,7 @@ impl super::App {
     pub(super) fn spawn_overlay_render(
         &mut self,
         pane_indices: Vec<usize>,
-        kind: OverlayKind,
+        id: LayerId,
         req: OverlayRenderRequest,
     ) {
         use rustdar_egui::overlay_cache::ZOOM_QUANTIZATION_FACTOR;
@@ -1188,12 +1189,15 @@ impl super::App {
             return;
         }
 
-        if self.gui.overlays.render_mode(&kind.id())
+        if self.gui.overlays.render_mode(&id)
             != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture)
         {
+            // Also the unregistered-id exit: `render_mode` answers `None` for
+            // an id no handler owns, so an id that reached the dispatch
+            // without a handler leaves here, before a mark is set.
             log::warn!(
-                "spawn_overlay_render called with non-texture kind: {:?}",
-                kind
+                "spawn_overlay_render called with a non-texture layer: {}",
+                id.as_str()
             );
             return;
         }
@@ -1203,7 +1207,7 @@ impl super::App {
         // with `clear_overlay_render_marks` — see it.
         for &pidx in &pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
-                pane.overlay_cache_mut(&kind.id()).render_in_flight = true;
+                pane.overlay_cache_mut(&id).render_in_flight = true;
             }
         }
 
@@ -1217,7 +1221,7 @@ impl super::App {
         let first_pane_idx = pane_indices[0];
         let pane_configs = {
             let Some(target_pane) = self.gui.pane(first_pane_idx) else {
-                self.clear_overlay_render_marks(&pane_indices, kind);
+                self.clear_overlay_render_marks(&pane_indices, &id);
                 return;
             };
             target_pane.overlay_configs.clone()
@@ -1231,16 +1235,21 @@ impl super::App {
 
         // Clone the data needed for the render job.
         //
-        // **The split below is a decision per kind, spelled as a match and
-        // not as a capability probe**: a kind is on the handler-backed path
-        // because this list says so, and a kind added to `OverlayKind` does
-        // not silently pick a path by whether its handler happens to answer
+        // **The split below is a decision per layer, spelled as a match and
+        // not as a capability probe**: a layer is on the handler-backed path
+        // because this list says so, and a newly registered layer does not
+        // silently pick a path by whether its handler happens to answer
         // `prepare_job`. The described list and the handlers that implement
-        // `prepare_job` must be the same six kinds —
+        // `prepare_job` must be the same six layers —
         // `rustdar-overlays`' texture tests pin that set, and
         // `app_fetch::polygon_wire_tests` / `model_wire_tests` pin this
         // routing.
-        match kind {
+        //
+        // Guards over the `known::` consts rather than string-literal
+        // patterns: a `LayerId` const cannot be a match pattern (it is not a
+        // structural constant), and the consts are the one place these
+        // spellings are written down.
+        match &id {
             // The handler-backed kinds — the three polygon kinds, the two
             // hit-map kinds and the model grid, which is every texture kind
             // a handler renders — are **described jobs** on their overlay
@@ -1253,12 +1262,13 @@ impl super::App {
             // pool's interactive lane, the same lane the closures rode. There
             // is no other path: the opaque closure arm this match used to
             // have is deleted, with the trait method that fed it.
-            OverlayKind::SpcOutlook
-            | OverlayKind::SpcDiscussions
-            | OverlayKind::NwsAlerts
-            | OverlayKind::StormReports
-            | OverlayKind::Lightning
-            | OverlayKind::ModelData => {
+            id if *id == known::SPC_OUTLOOK
+                || *id == known::SPC_DISCUSSIONS
+                || *id == known::NWS_ALERTS
+                || *id == known::STORM_REPORTS
+                || *id == known::LIGHTNING
+                || *id == known::MODEL_DATA =>
+            {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
@@ -1278,13 +1288,13 @@ impl super::App {
                 // the id_map and the codec row are one dispatch-moment
                 // snapshot of one handler.
                 let overlays = &self.gui.overlays;
-                let Some(job) = overlays.prepare_job(&kind.id(), &rctx) else {
+                let Some(job) = overlays.prepare_job(id, &rctx) else {
                     // Nothing to render — clear in-flight. `has_data()` and
                     // `prepare_job` agree in every reachable state
                     // (`texture_tests`' permanent-wakeup guard), so this
                     // decline is the no-data case and not a kind that lost
                     // its input.
-                    self.clear_overlay_render_marks(&pane_indices, kind);
+                    self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };
                 // The page-side half of a hit map, captured in the same
@@ -1292,14 +1302,14 @@ impl super::App {
                 // same data in the same order — `Some` for exactly the two
                 // hit-map kinds. It never touches the wire; the deliver zips
                 // it with the reply's cells.
-                let id_map = overlays.hit_items(&kind.id());
+                let id_map = overlays.hit_items(id);
                 // The codec row the handler registered — its label is the
                 // job's name in the timing log. Unreachable-`None` by the
                 // bidirectional pairing gate (`texture_tests::
                 // every_texture_handler_owns_exactly_one_codec_row`): a
                 // handler that answers a job answers a row.
-                let Some(row) = overlays.job_codec(&kind.id()) else {
-                    self.clear_overlay_render_marks(&pane_indices, kind);
+                let Some(row) = overlays.job_codec(id) else {
+                    self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };
                 let geometry = rustdar_source::job::JobGeometry {
@@ -1320,7 +1330,7 @@ impl super::App {
                         OverlayRenderResponse {
                             image: None,
                             geo_bounds: render_bounds,
-                            overlay_kind: kind,
+                            overlay_kind: id.clone(),
                             generation: data_generation,
                             pane_indices,
                             zoom,
@@ -1335,9 +1345,9 @@ impl super::App {
             // cannot see pane.site/loading_site, so the dispatch builds
             // SitesInput inline. Its codec row is registered like every
             // other; only prepare_job is stubbed. Remove this arm in M10.
-            OverlayKind::RadarSites => {
+            id if *id == known::RADAR_SITES => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else {
-                    self.clear_overlay_render_marks(&pane_indices, kind);
+                    self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };
                 let target_site = target_pane.site.clone();
@@ -1360,11 +1370,11 @@ impl super::App {
                 // The sites row, through the same registry accessor as the
                 // handler-backed kinds — registered by the sites handler even
                 // though the input above is dispatch-built.
-                let Some(row) = self.gui.overlays.job_codec(&kind.id()) else {
-                    self.clear_overlay_render_marks(&pane_indices, kind);
+                let Some(row) = self.gui.overlays.job_codec(id) else {
+                    self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };
-                // Described, not closed over: the first overlay kind whose
+                // Described, not closed over: the first overlay layer whose
                 // dispatch is a `JobRequest`, which is what lets it run in the
                 // web worker instead of inline on the browser's one thread
                 // (`offload`'s wasm arm, where the handler kinds above still
@@ -1397,7 +1407,7 @@ impl super::App {
                         OverlayRenderResponse {
                             image: None,
                             geo_bounds: render_bounds,
-                            overlay_kind: kind,
+                            overlay_kind: id.clone(),
                             generation: data_generation,
                             pane_indices,
                             zoom,
@@ -1408,17 +1418,19 @@ impl super::App {
                     ),
                 );
             }
-            // Non-texture overlay kinds are never dispatched for background rendering.
-            OverlayKind::Radar
-            | OverlayKind::CityLabels
-            | OverlayKind::UserLocation
-            | OverlayKind::Metar
-            | OverlayKind::ColorScale => {
+            // Everything else: the five non-texture layers, and any id no
+            // handler is registered for. The `render_mode` gate above turns
+            // both away before a mark is set, so this arm is the belt to that
+            // gate's braces — and it clears the marks regardless, because an
+            // arm that returned without clearing would strand every named
+            // pane exactly as the early exits above would.
+            _ => {
                 log::warn!(
-                    "spawn_overlay_render called with non-texture kind: {:?}",
-                    kind
+                    "spawn_overlay_render reached the dispatch with a layer it \
+                     cannot rasterize: {}",
+                    id.as_str()
                 );
-                self.clear_overlay_render_marks(&pane_indices, kind);
+                self.clear_overlay_render_marks(&pane_indices, &id);
             }
         }
     }
@@ -1434,10 +1446,10 @@ impl super::App {
     /// The marks are set for *all* `pane_indices`, so they must be cleared for
     /// all of them: the early exits below are reached by asking about one pane,
     /// which used to leave its siblings' marks behind.
-    fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], kind: OverlayKind) {
+    fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], id: &LayerId) {
         for &pidx in pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
-                pane.overlay_cache_mut(&kind.id()).render_in_flight = false;
+                pane.overlay_cache_mut(id).render_in_flight = false;
             }
         }
     }

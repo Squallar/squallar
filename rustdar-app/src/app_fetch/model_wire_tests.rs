@@ -23,7 +23,8 @@
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use rustdar_overlays::render::overlay_state::OverlayFetchResult;
+use rustdar_source::id::known;
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job —
@@ -114,7 +115,7 @@ fn seed(app: &mut crate::app::App) {
         rustdar_overlays::hrrr::HrrrFetchResult(Ok(a_seedable_grid())),
     );
     app.gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OverlayKind::ModelData.id(),
+        kind: known::MODEL_DATA,
         data,
     });
     let configs = app.gui.overlays.save_pane_configs();
@@ -127,7 +128,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(&OverlayKind::ModelData.id())
+        .overlay_cache_mut(&known::MODEL_DATA)
         .render_in_flight
 }
 
@@ -144,7 +145,7 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     seed(&mut app);
-    app.spawn_overlay_render(vec![0], OverlayKind::ModelData, a_render_request());
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request());
 
     let posted = taken.lock().unwrap();
     assert_eq!(
@@ -218,7 +219,7 @@ fn a_dead_worker_unwedges_a_model_pane() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     seed(&mut app);
-    app.spawn_overlay_render(vec![0], OverlayKind::ModelData, a_render_request());
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request());
     assert_eq!(
         taken.lock().unwrap().len(),
         1,
@@ -237,7 +238,7 @@ fn a_dead_worker_unwedges_a_model_pane() {
          layer can never be asked for again",
     );
     assert!(resp.image.is_none(), "a failed job answered with a picture");
-    assert_eq!(resp.overlay_kind, OverlayKind::ModelData);
+    assert_eq!(resp.overlay_kind, known::MODEL_DATA);
     assert_eq!(
         resp.pane_indices,
         vec![0],

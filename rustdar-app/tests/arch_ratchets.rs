@@ -158,11 +158,16 @@ const UI_SETTER_MAX: usize = 3;
 /// Row 4a. WO-E9 (FieldId adoption) reaches 0.
 const PRODUCT_IN_EGUI_MAX: usize = 444;
 /// Row 5a. WO-M8 shrinks it; WO-M8c deletes the enum and re-shapes the
-/// metric to enum-absent in the same land. Re-baselined 762 -> 766 per the
-/// 2026-08-18 KIND_MAX amendment in the campaign log: WO-THEME's
-/// plan-mandated regression tests name the enum (+4, minimized); the
-/// ceiling ratchets only downward from 766.
-const KIND_MAX: usize = 766;
+/// metric to enum-absent in the same land — this ceiling dies there.
+/// Re-baselined 762 -> 766 at WO-THEME per the 2026-08-18 KIND_MAX
+/// amendment in the campaign log; lowered 766 -> 29 at WO-M8b b3, the land
+/// that deleted `fn kind()` from the handler trait and its twelve impls and
+/// flipped every remaining consumer onto `LayerId`. The 29 that remain are
+/// the enum definition and its `impl` header (2), `all()` +
+/// `default_draw_order()` (14), the M8a bridge's own test group (6), and
+/// eight doc-prose mentions that record where today's spellings came from.
+/// If this ever fires, answer by shedding spellings, never by raising it.
+const KIND_MAX: usize = 29;
 /// Row 6. COUNT ceiling only — the shrink-only field-list pin lands at
 /// WO-E3 and is verified at WO-M13b; the hub stays at 18 (WO-E4.9's extract
 /// channel is orchestrator-local, not a hub pair).
@@ -353,9 +358,12 @@ fn the_product_enum_never_spreads_further_into_egui() {
 }
 
 /// Row 5 — occurrences of the overlay-kind enum's name across the five
-/// application crates (measured at land: equal to the whole-tree count).
-/// WO-M8 shrinks it; WO-M8c deletes the enum and re-shapes this metric to
-/// enum-absent in the same land.
+/// application crates. **Not** the whole-tree count since WO-M8b b3: the
+/// substrate's `rustdar-source/src/id.rs` carries 17 more, all doc-comment
+/// provenance for the `known` consts (each spelling was captured from the
+/// enum's `Debug` output), and rustdar-source is outside this haystack.
+/// WO-M8c deletes the enum and re-shapes this metric to enum-absent in the
+/// same land.
 #[test]
 fn the_overlay_kind_enum_never_spreads_further() {
     let root = Path::new(ROOT);

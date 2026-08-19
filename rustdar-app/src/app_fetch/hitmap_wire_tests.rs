@@ -18,8 +18,9 @@
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::render::rasterize::HitCells;
+use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job — each
@@ -106,10 +107,10 @@ fn a_render_request() -> super::OverlayRenderRequest {
 /// two rows at well-separated in-box positions, so both markers draw and the
 /// delivered hit map has two distinct identities to answer with. Through
 /// `apply_fetch_result` — the same door a live fetch uses.
-fn seed(app: &mut crate::app::App, kind: OverlayKind) {
+fn seed(app: &mut crate::app::App, id: &LayerId) {
     use rustdar_overlays::render::handlers::reports::StormReportsFetchResult;
-    let data: rustdar_overlays::render::overlay_state::FetchPayload = match kind {
-        OverlayKind::StormReports => {
+    let data: rustdar_overlays::render::overlay_state::FetchPayload = match id {
+        id if *id == known::STORM_REPORTS => {
             use rustdar_overlays::spc::reports::{StormReport, StormReportKind, StormReportRound};
             let report = |report_kind, lat, lon| StormReport {
                 kind: report_kind,
@@ -122,7 +123,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 lon,
                 comments: String::new(),
             };
-            app.gui.overlays.set_enabled(&kind.id(), true);
+            app.gui.overlays.set_enabled(id, true);
             Box::new(StormReportsFetchResult(Ok(StormReportRound {
                 reports: vec![
                     report(StormReportKind::Tornado, 34.0, -98.2),
@@ -131,7 +132,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 failed_kinds: Vec::new(),
             })))
         }
-        OverlayKind::Lightning => {
+        id if *id == known::LIGHTNING => {
             use rustdar_overlays::glm::{
                 GlmDataLevel, GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, RecordDrops,
             };
@@ -148,7 +149,7 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 satellite: GlmSatellite::GoesEast,
                 level: GlmDataLevel::Flash,
             };
-            app.gui.overlays.set_enabled(&kind.id(), true);
+            app.gui.overlays.set_enabled(id, true);
             Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
                 flashes: vec![flash(10, 34.0, -98.2), flash(20, 36.2, -96.8)],
                 dead_feeds: Vec::new(),
@@ -162,10 +163,13 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
                 record_drops: RecordDrops::default(),
             })))
         }
-        other => panic!("{other:?} is not a hit-map kind this fixture seeds"),
+        other => panic!(
+            "{} is not a hit-map layer this fixture seeds",
+            other.as_str()
+        ),
     };
     app.gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: kind.id(),
+        kind: id.clone(),
         data,
     });
     // Keep the pane's stored per-layer config in step with the handler —
@@ -176,11 +180,11 @@ fn seed(app: &mut crate::app::App, kind: OverlayKind) {
     }
 }
 
-fn in_flight(app: &mut crate::app::App, kind: OverlayKind) -> bool {
+fn in_flight(app: &mut crate::app::App, id: &LayerId) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(&kind.id())
+        .overlay_cache_mut(id)
         .render_in_flight
 }
 
@@ -196,10 +200,10 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
     }));
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-    for kind in [OverlayKind::StormReports, OverlayKind::Lightning] {
-        seed(&mut app, kind);
+    for kind in [known::STORM_REPORTS, known::LIGHTNING] {
+        seed(&mut app, &kind);
         let before = taken.lock().unwrap().len();
-        app.spawn_overlay_render(vec![0], kind, a_render_request());
+        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request());
 
         let posted = taken.lock().unwrap();
         assert_eq!(
@@ -221,7 +225,7 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
         let own_label = app
             .gui
             .overlays
-            .job_codec(&kind.id())
+            .job_codec(&kind)
             .expect("every texture kind owns a codec row")
             .label;
         assert_eq!(
@@ -237,7 +241,7 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
         );
         drop(posted);
         assert!(
-            in_flight(&mut app, kind),
+            in_flight(&mut app, &kind),
             "the {kind:?} dispatch must have marked the pane in flight",
         );
     }
@@ -252,17 +256,17 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
 fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
     let _guard = rustdar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
-    for kind in [OverlayKind::StormReports, OverlayKind::Lightning] {
+    for kind in [known::STORM_REPORTS, known::LIGHTNING] {
         let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-        seed(&mut app, kind);
+        seed(&mut app, &kind);
         let items = app
             .gui
             .overlays
-            .hit_items(&kind.id())
+            .hit_items(&kind)
             .expect("a seeded hit-map kind captures items");
         assert_eq!(items.len(), 2, "premise: two rows seeded");
 
-        app.spawn_overlay_render(vec![0], kind, a_render_request());
+        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request());
         let resp = app
             .channels
             .overlay_render_receiver
@@ -323,11 +327,11 @@ fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
 #[test]
 fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-    seed(&mut app, OverlayKind::StormReports);
+    seed(&mut app, &known::STORM_REPORTS);
     let items = app
         .gui
         .overlays
-        .hit_items(&OverlayKind::StormReports.id())
+        .hit_items(&known::STORM_REPORTS)
         .expect("items");
     let (width, height) = (64u32, 48u32);
     let rgba = vec![0u8; (width * height * 4) as usize];
@@ -347,7 +351,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
         let response = super::OverlayRenderResponse {
             image: None,
             geo_bounds: a_render_request().geo_bounds,
-            overlay_kind: OverlayKind::StormReports,
+            overlay_kind: known::STORM_REPORTS,
             generation: 5,
             pane_indices: vec![0],
             zoom: 32,
@@ -479,15 +483,15 @@ fn a_dead_worker_unwedges_a_reports_pane() {
     }));
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-    seed(&mut app, OverlayKind::StormReports);
-    app.spawn_overlay_render(vec![0], OverlayKind::StormReports, a_render_request());
+    seed(&mut app, &known::STORM_REPORTS);
+    app.spawn_overlay_render(vec![0], known::STORM_REPORTS, a_render_request());
     assert_eq!(
         taken.lock().unwrap().len(),
         1,
         "premise: the reports dispatch must have posted a described job",
     );
     assert!(
-        in_flight(&mut app, OverlayKind::StormReports),
+        in_flight(&mut app, &known::STORM_REPORTS),
         "premise for the un-wedge below",
     );
 
@@ -501,7 +505,7 @@ fn a_dead_worker_unwedges_a_reports_pane() {
         resp.hit_map.is_none(),
         "a failed job answered with a hit map"
     );
-    assert_eq!(resp.overlay_kind, OverlayKind::StormReports);
+    assert_eq!(resp.overlay_kind, known::STORM_REPORTS);
     assert_eq!(
         resp.pane_indices,
         vec![0],

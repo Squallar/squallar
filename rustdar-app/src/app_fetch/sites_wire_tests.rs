@@ -13,7 +13,7 @@
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::known;
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job, standing
@@ -58,7 +58,7 @@ fn in_flight(app: &mut crate::app::App) -> bool {
     app.gui
         .pane_mut(0)
         .expect("pane 0")
-        .overlay_cache_mut(&OverlayKind::RadarSites.id())
+        .overlay_cache_mut(&known::RADAR_SITES)
         .render_in_flight
 }
 
@@ -76,7 +76,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
     }));
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-    app.spawn_overlay_render(vec![0], OverlayKind::RadarSites, a_render_request());
+    app.spawn_overlay_render(vec![0], known::RADAR_SITES, a_render_request());
 
     {
         let posted = taken.lock().unwrap();
@@ -138,7 +138,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
          can never be asked for again",
     );
     assert!(resp.image.is_none(), "a failed job answered with a picture",);
-    assert_eq!(resp.overlay_kind, OverlayKind::RadarSites);
+    assert_eq!(resp.overlay_kind, known::RADAR_SITES);
     assert_eq!(
         resp.pane_indices,
         vec![0],

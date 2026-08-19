@@ -36,7 +36,7 @@
 use super::*;
 use crate::app::tests::drain_uploads;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::known;
 
 /// A small overlay, and small on purpose: this is about which bytes arrive, and
 /// a viewport-sized buffer would only make the comparison slower to run.
@@ -94,7 +94,7 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usi
         .send(crate::channels::OverlayRenderResponse {
             image: Some(image),
             geo_bounds: bounds(),
-            overlay_kind: OverlayKind::NwsAlerts,
+            overlay_kind: known::NWS_ALERTS,
             generation: 7,
             pane_indices,
             zoom: 32,
@@ -108,7 +108,7 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
     app.gui
         .pane_mut(pane_idx)
         .expect("pane exists")
-        .overlay_cache_mut(&OverlayKind::NwsAlerts.id())
+        .overlay_cache_mut(&known::NWS_ALERTS)
         .current()
         .expect("the poller placed an overlay on this pane")
         .texture
@@ -155,7 +155,7 @@ fn the_placed_overlay_is_described_by_its_own_picture() {
         .gui
         .pane_mut(0)
         .expect("pane exists")
-        .overlay_cache_mut(&OverlayKind::NwsAlerts.id())
+        .overlay_cache_mut(&known::NWS_ALERTS)
         .current()
         .expect("the poller placed an overlay");
     assert_eq!((entry.width, entry.height), (W, H));

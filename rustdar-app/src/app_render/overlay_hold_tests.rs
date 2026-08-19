@@ -17,9 +17,9 @@
 
 use super::*;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_source::id::{LayerId, known};
 
-const KIND: OverlayKind = OverlayKind::NwsAlerts;
+const KIND: LayerId = known::NWS_ALERTS;
 const W: usize = 8;
 const H: usize = 5;
 
@@ -74,7 +74,7 @@ fn on_screen(app: &crate::app::App, idx: usize) -> Option<egui::TextureId> {
     Some(
         app.gui
             .pane(idx)?
-            .overlay_cache(&KIND.id())?
+            .overlay_cache(&KIND)?
             .current()?
             .texture
             .id(),
@@ -86,7 +86,7 @@ fn generation_on_screen(app: &crate::app::App, idx: usize) -> u64 {
     app.gui
         .pane(idx)
         .expect("pane exists")
-        .overlay_cache(&KIND.id())
+        .overlay_cache(&KIND)
         .expect("cache exists")
         .current()
         .expect("a picture is on screen")
@@ -98,7 +98,7 @@ fn holding(app: &crate::app::App, idx: usize) -> bool {
     app.gui
         .pane(idx)
         .expect("pane exists")
-        .overlay_cache(&KIND.id())
+        .overlay_cache(&KIND)
         .is_some_and(rustdar_egui::overlay_cache::OverlayTextureCache::is_holding)
 }
 

@@ -4,9 +4,7 @@ use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
 use crate::render::overlay_state::Surface;
-use crate::render::overlay_state::{
-    FetchPayload, OverlayHandler, OverlayItem, OverlayKind, RenderMode,
-};
+use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use rustdar_source::id::{LayerId, known};
 
 /// Toggle and config state only. Radar fetching, rendering and per-frame
@@ -23,9 +21,6 @@ impl RadarHandler {
 }
 
 impl OverlayHandler for RadarHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::Radar
-    }
     fn id(&self) -> LayerId {
         known::RADAR
     }

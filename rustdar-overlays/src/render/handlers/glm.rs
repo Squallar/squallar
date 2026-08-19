@@ -15,8 +15,8 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
+    PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
@@ -229,8 +229,8 @@ pub(crate) struct GlmFlashItem {
 }
 
 impl OverlayItem for GlmFlashItem {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::Lightning
+    fn layer_id(&self) -> LayerId {
+        known::LIGHTNING
     }
 
     fn popup_content(&self, prefs: &UserPreferences) -> PopupContent {
@@ -737,9 +737,6 @@ impl GlmHandler {
 }
 
 impl OverlayHandler for GlmHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::Lightning
-    }
     fn id(&self) -> LayerId {
         known::LIGHTNING
     }
@@ -883,7 +880,7 @@ impl OverlayHandler for GlmHandler {
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         let count = self.state.data.len();
         selections.retain(|sel| {
-            if sel.kind() != OverlayKind::Lightning {
+            if sel.layer_id() != known::LIGHTNING {
                 return true;
             }
             sel.as_any()

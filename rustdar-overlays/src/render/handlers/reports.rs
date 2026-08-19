@@ -10,8 +10,8 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
+    PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
@@ -45,8 +45,8 @@ pub(crate) struct StormReportItem {
 }
 
 impl OverlayItem for StormReportItem {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::StormReports
+    fn layer_id(&self) -> LayerId {
+        known::STORM_REPORTS
     }
 
     fn popup_content(&self, prefs: &UserPreferences) -> PopupContent {
@@ -201,9 +201,6 @@ impl StormReportsHandler {
 }
 
 impl OverlayHandler for StormReportsHandler {
-    fn kind(&self) -> OverlayKind {
-        OverlayKind::StormReports
-    }
     fn id(&self) -> LayerId {
         known::STORM_REPORTS
     }
@@ -323,7 +320,7 @@ impl OverlayHandler for StormReportsHandler {
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         let count = self.state.data.len();
         selections.retain(|sel| {
-            if sel.kind() != OverlayKind::StormReports {
+            if sel.layer_id() != known::STORM_REPORTS {
                 return true;
             }
             sel.as_any()

@@ -19,12 +19,11 @@
 
 use std::collections::HashSet;
 
+use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::DescribedJob;
 
 use super::create_handlers;
-use crate::render::overlay_state::{
-    FetchPayload, OverlayHandler, OverlayKind, RasterizeContext, RenderMode,
-};
+use crate::render::overlay_state::{FetchPayload, OverlayHandler, RasterizeContext, RenderMode};
 use crate::render::rasterize::{
     self, AlphaMode, ModelDataInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
     rasterize_model_data, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
@@ -70,39 +69,30 @@ fn run_described(
     bounds: &GeoBounds,
     w: u32,
     h: u32,
-) -> (OverlayKind, RasterizeOutput) {
+) -> (LayerId, RasterizeOutput) {
     if let Some(input) = job.downcast_ref::<rasterize::AlertsInput>() {
-        (
-            OverlayKind::NwsAlerts,
-            rasterize_nws_alerts(input, bounds, w, h),
-        )
+        (known::NWS_ALERTS, rasterize_nws_alerts(input, bounds, w, h))
     } else if let Some(input) = job.downcast_ref::<rasterize::OutlooksInput>() {
         (
-            OverlayKind::SpcOutlook,
+            known::SPC_OUTLOOK,
             rasterize_spc_outlooks(input, bounds, w, h),
         )
     } else if let Some(input) = job.downcast_ref::<rasterize::DiscussionsInput>() {
         (
-            OverlayKind::SpcDiscussions,
+            known::SPC_DISCUSSIONS,
             rasterize_spc_discussions(input, bounds, w, h),
         )
     } else if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
         (
-            OverlayKind::StormReports,
+            known::STORM_REPORTS,
             rasterize_storm_reports(input, bounds, w, h),
         )
     } else if let Some(input) = job.downcast_ref::<rasterize::GlmStrikesInput>() {
-        (
-            OverlayKind::Lightning,
-            rasterize_glm_strikes(input, bounds, w, h),
-        )
+        (known::LIGHTNING, rasterize_glm_strikes(input, bounds, w, h))
     } else if let Some(input) = job.downcast_ref::<ModelDataInput>() {
-        (
-            OverlayKind::ModelData,
-            rasterize_model_data(input, bounds, w, h),
-        )
+        (known::MODEL_DATA, rasterize_model_data(input, bounds, w, h))
     } else {
-        panic!("a handler described an input no handler-backed texture kind claims: {job:?}")
+        panic!("a handler described an input no handler-backed texture layer claims: {job:?}")
     }
 }
 
@@ -286,21 +276,21 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     // is keyed by, so the toggle has to precede the payload for the two to meet.
     handler.set_enabled(true);
 
-    let payload: FetchPayload = match handler.kind() {
-        OverlayKind::NwsAlerts => Box::new(super::alert::NwsAlertFetchResult(Ok(
+    let payload: FetchPayload = match &handler.id() {
+        id if *id == known::NWS_ALERTS => Box::new(super::alert::NwsAlertFetchResult(Ok(
             crate::nws::fetch::ActiveAlerts::whole(vec![alert_fixture()]),
         ))),
-        OverlayKind::SpcDiscussions => {
+        id if *id == known::SPC_DISCUSSIONS => {
             Box::new(super::discussion::SpcDiscussionFetchResult(Ok(vec![
                 discussion_fixture(),
             ])))
         }
-        OverlayKind::SpcOutlook => Box::new(super::outlook::SpcOutlookFetchResult {
+        id if *id == known::SPC_OUTLOOK => Box::new(super::outlook::SpcOutlookFetchResult {
             day: OutlookDay::Day1,
             product: OutlookProduct::Categorical,
             result: Ok(outlook_fixture()),
         }),
-        OverlayKind::StormReports => Box::new(super::reports::StormReportsFetchResult(Ok(
+        id if *id == known::STORM_REPORTS => Box::new(super::reports::StormReportsFetchResult(Ok(
             crate::spc::reports::StormReportRound {
                 // Three, at distinct positions: a one-row seed cannot express
                 // order, and the alignment pin below reversed a one-item list
@@ -323,7 +313,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
                 failed_kinds: Vec::new(),
             },
         ))),
-        OverlayKind::Lightning => Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
+        id if *id == known::LIGHTNING => Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
             // Three, spread across the box, so the seeded layer clears the
             // painted-pixel floors the byte-parity walks stand on — one
             // ~14 px bolt is real ink but near-vacuous ink.
@@ -350,12 +340,13 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             window_gaps: Vec::new(),
             record_drops: crate::glm::RecordDrops::default(),
         }))),
-        OverlayKind::ModelData => Box::new(HrrrFetchResult(Ok(cin_grid()))),
-        OverlayKind::RadarSites | OverlayKind::Radar => return false,
+        id if *id == known::MODEL_DATA => Box::new(HrrrFetchResult(Ok(cin_grid()))),
+        id if *id == known::RADAR_SITES || *id == known::RADAR => return false,
         other => panic!(
-            "{other:?} is a texture overlay this fixture does not know how to \
+            "{} is a texture overlay this fixture does not know how to \
              seed. Add it here — the walks in this file are what stop a new \
-             layer from arriving with an unpinned alpha convention."
+             layer from arriving with an unpinned alpha convention.",
+            other.as_str()
         ),
     };
     handler.apply_fetch_result(payload);
@@ -435,33 +426,34 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         if !seed(handler.as_mut()) {
             continue;
         }
-        let kind = handler.kind();
+        let id = handler.id();
+        let name = id.as_str();
         let input = handler.prepare_job(&ctx).unwrap_or_else(|| {
-            panic!("{kind:?} was seeded with data it should draw and answered None")
+            panic!("{name} was seeded with data it should draw and answered None")
         });
         let (named, out) = run_described(&input, &BOUNDS, W, H);
         assert_eq!(
-            named, kind,
-            "{kind:?}'s `prepare_job` answered another kind's input variant, \
+            named, id,
+            "{name}'s `prepare_job` answered another layer's input variant, \
              so a worker would rasterize the wrong layer under its panes",
         );
-        assert_alpha_matches_bytes(&format!("{kind:?}"), &out);
+        assert_alpha_matches_bytes(name, &out);
         // The painted floor the deleted closure-parity walk used to hold,
         // kept now that the closure it compared against is gone: a described
         // fixture that paints almost nothing makes every downstream byte
         // comparison near-vacuous.
         assert!(
             drawn(&out.rgba).len() > 100,
-            "{kind:?}'s fixture painted almost nothing",
+            "{name}'s fixture painted almost nothing",
         );
-        if matches!(kind, OverlayKind::StormReports | OverlayKind::Lightning) {
+        if id == known::STORM_REPORTS || id == known::LIGHTNING {
             let cells = out
                 .hit_cells
                 .as_ref()
                 .expect("a hit-map kind answers cells on its drawing path");
             assert!(
                 !cells.cells.is_empty(),
-                "{kind:?}'s fixture recorded no hit cells, so nothing about \
+                "{name}'s fixture recorded no hit cells, so nothing about \
                  the id space is being exercised",
             );
         }
@@ -562,12 +554,12 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
 #[test]
 fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     let ctx = rctx();
-    let mut opaque_only: Vec<OverlayKind> = Vec::new();
+    let mut opaque_only: Vec<LayerId> = Vec::new();
     for handler in create_handlers().iter_mut() {
         if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
             continue;
         }
-        let kind = handler.kind();
+        let id = handler.id();
         let input = handler
             .prepare_job(&ctx)
             .expect("seeded above, and the walk next door asserts this");
@@ -580,7 +572,7 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
             .filter(|&a| a < 255)
             .collect();
         if translucent.is_empty() {
-            opaque_only.push(kind);
+            opaque_only.push(id);
         }
     }
     assert!(
@@ -622,8 +614,9 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         if handler.render_mode() != RenderMode::Texture {
             continue;
         }
-        let kind = handler.kind();
-        if matches!(kind, OverlayKind::RadarSites | OverlayKind::Radar) {
+        let id = handler.id();
+        let name = id.as_str();
+        if id == known::RADAR_SITES || id == known::RADAR {
             // The two exempt kinds: there is no `prepare_job` for their
             // `has_data` to agree *with*. Their `has_data` is an unconditional
             // `true` and their pixels come from elsewhere — `app_fetch`
@@ -633,7 +626,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
             // settle.
             assert!(
                 handler.prepare_job(&ctx).is_none(),
-                "{kind:?} grew a `prepare_job`; it now has this invariant \
+                "{name} grew a `prepare_job`; it now has this invariant \
                  to keep, so seed it in `seed` and drop it from this exemption",
             );
             continue;
@@ -643,7 +636,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
             assert_eq!(
                 h.has_data(),
                 h.prepare_job(&ctx).is_some(),
-                "{kind:?} disagrees with its own rasterizer while {state}. \
+                "{name} disagrees with its own rasterizer while {state}. \
                  `ui_map_pane` gates both the render dispatch and the settle \
                  repaint on `has_data`, so `true` here with `None` there is a \
                  render asked for on every frame and abandoned on every frame, \
@@ -656,7 +649,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
 
         assert!(
             seed(handler.as_mut()),
-            "{kind:?} is not exempt above, so it must be seedable",
+            "{name} is not exempt above, so it must be seedable",
         );
 
         // Seeded and on.
@@ -728,12 +721,12 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
 
 // ── The described-job set ────────────────────────────────────────────────
 
-/// Whether `kind` resolves clicks through a hit map, and therefore must
+/// Whether `id` resolves clicks through a hit map, and therefore must
 /// answer [`OverlayHandler::hit_items`] exactly when it answers
 /// `prepare_job` — an input with rows and no items is a layer whose every
 /// hover zips to nothing.
-fn has_hit_map(kind: OverlayKind) -> bool {
-    matches!(kind, OverlayKind::StormReports | OverlayKind::Lightning)
+fn has_hit_map(id: &LayerId) -> bool {
+    *id == known::STORM_REPORTS || *id == known::LIGHTNING
 }
 
 /// **Every texture kind that renders through a handler has a described job**
@@ -753,27 +746,29 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
     let ctx = rctx();
     let mut described = 0;
     for handler in create_handlers().iter_mut() {
-        let kind = handler.kind();
+        let id = handler.id();
+        let name = id.as_str();
         let handler_backed = handler.render_mode() == RenderMode::Texture
-            && !matches!(kind, OverlayKind::RadarSites | OverlayKind::Radar);
+            && id != known::RADAR_SITES
+            && id != known::RADAR;
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
             if !handler_backed {
                 assert!(
                     h.prepare_job(&ctx).is_none(),
-                    "{kind:?} grew a `prepare_job` while {state}. The \
+                    "{name} grew a `prepare_job` while {state}. The \
                      described set is stated twice — here and in \
-                     `spawn_overlay_render`'s match — so add the kind to the \
+                     `spawn_overlay_render`'s match — so add the layer to the \
                      dispatch's described arm and to the codec registry \
                      (`render::jobs::JOB_CODECS` + its `job_codec` row) \
                      together.",
                 );
             }
-            if has_hit_map(kind) {
+            if has_hit_map(&id) {
                 assert_eq!(
                     h.hit_items().is_some(),
                     h.prepare_job(&ctx).is_some(),
-                    "{kind:?}'s `hit_items` disagrees with its `prepare_job` \
+                    "{name}'s `hit_items` disagrees with its `prepare_job` \
                      while {state}. The dispatch captures the two together, \
                      and rows without items is a layer whose every hover \
                      resolves to nothing.",
@@ -782,7 +777,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
                     assert_eq!(
                         items.len(),
                         h.item_count(),
-                        "{kind:?}'s `hit_items` while {state} does not cover \
+                        "{name}'s `hit_items` while {state} does not cover \
                          its data one item per row; a shorter list truncates \
                          the id space the cells index into",
                     );
@@ -790,9 +785,9 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
             } else {
                 assert!(
                     h.hit_items().is_none(),
-                    "{kind:?} grew a `hit_items` while {state}; only the \
-                     hit-map kinds have an id_map to capture, and a stray one \
-                     here would make the dispatch zip cells of another kind",
+                    "{name} grew a `hit_items` while {state}; only the \
+                     hit-map layers have an id_map to capture, and a stray one \
+                     here would make the dispatch zip cells of another layer",
                 );
             }
         };
@@ -807,7 +802,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         }
         assert!(
             handler.prepare_job(&ctx).is_some(),
-            "{kind:?} is a seeded texture kind with no described job — the \
+            "{name} is a seeded texture layer with no described job — the \
              closure path it would have ridden is deleted, so this layer \
              cannot render at all",
         );
@@ -842,8 +837,9 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
     let ctx = rctx();
     let mut checked = 0;
     for handler in create_handlers().iter_mut() {
-        let kind = handler.kind();
-        if !has_hit_map(kind) || !seed(handler.as_mut()) {
+        let id = handler.id();
+        let name = id.as_str();
+        if !has_hit_map(&id) || !seed(handler.as_mut()) {
             continue;
         }
         let job = handler
@@ -859,12 +855,12 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
                     .expect("a reports handler captures report items");
                 assert_eq!(
                     item.index, i,
-                    "{kind:?} item {i} carries another position's index",
+                    "{name} item {i} carries another position's index",
                 );
                 assert_eq!(
                     (item.report.lat, item.report.lon),
                     (row.lat, row.lon),
-                    "{kind:?} row {i} and item {i} are different reports — \
+                    "{name} row {i} and item {i} are different reports — \
                      a hover here would name the wrong one, and no \
                      downstream test can see it because they all zip with \
                      this very list",
@@ -879,17 +875,17 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
                     .expect("a GLM handler captures flash items");
                 assert_eq!(
                     item.index, i,
-                    "{kind:?} item {i} carries another position's index",
+                    "{name} item {i} carries another position's index",
                 );
                 assert_eq!(
                     (item.flash.lat, item.flash.lon),
                     (row.lat, row.lon),
-                    "{kind:?} row {i} and item {i} are different flashes — \
+                    "{name} row {i} and item {i} are different flashes — \
                      a hover here would name the wrong one",
                 );
             }
         } else {
-            panic!("{kind:?} described {job:?}, another kind's input");
+            panic!("{name} described {job:?}, another layer's input");
         }
         checked += 1;
     }
@@ -917,29 +913,30 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
 
     // Deliberately spelled out. Do not regenerate this from the registry.
-    let expected: [(OverlayKind, &str); 7] = [
-        (OverlayKind::RadarSites, "overlay/sites"),
-        (OverlayKind::NwsAlerts, "overlay/alerts"),
-        (OverlayKind::SpcOutlook, "overlay/outlooks"),
-        (OverlayKind::SpcDiscussions, "overlay/discussions"),
-        (OverlayKind::StormReports, "overlay/reports"),
-        (OverlayKind::Lightning, "overlay/glm"),
-        (OverlayKind::ModelData, "overlay/model"),
+    let expected: [(LayerId, &str); 7] = [
+        (known::RADAR_SITES, "overlay/sites"),
+        (known::NWS_ALERTS, "overlay/alerts"),
+        (known::SPC_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_DISCUSSIONS, "overlay/discussions"),
+        (known::STORM_REPORTS, "overlay/reports"),
+        (known::LIGHTNING, "overlay/glm"),
+        (known::MODEL_DATA, "overlay/model"),
     ];
 
     let mut claimed: Vec<&'static str> = Vec::new();
     for handler in create_handlers() {
-        let kind = handler.kind();
+        let id = handler.id();
+        let name = id.as_str();
         if handler.render_mode() != RenderMode::Texture {
             assert!(
                 handler.job_codec().is_none(),
-                "{kind:?} is not a texture kind and has no raster to frame, \
+                "{name} is not a texture layer and has no raster to frame, \
                  but it answers a codec row — the dispatch would label and \
-                 encode a job this kind can never describe",
+                 encode a job this layer can never describe",
             );
             continue;
         }
-        if kind == OverlayKind::Radar {
+        if id == known::RADAR {
             assert!(
                 handler.job_codec().is_none(),
                 "Radar grew a codec row; its pixels come from the radar \
@@ -951,34 +948,34 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         }
         let row = handler.job_codec().unwrap_or_else(|| {
             panic!(
-                "{kind:?} is a texture handler with no codec row: its \
+                "{name} is a texture handler with no codec row: its \
                  described job has no encode, decode or label, so the \
                  dispatch cannot frame it for a worker at all",
             )
         });
         let expected_label = expected
             .iter()
-            .find(|(k, _)| *k == kind)
+            .find(|(k, _)| *k == id)
             .map(|(_, label)| *label)
             .unwrap_or_else(|| {
                 panic!(
-                    "{kind:?} answers a codec row but has no line in the \
-                     `expected` table above — a new texture kind must claim \
+                    "{name} answers a codec row but has no line in the \
+                     `expected` table above — a new texture layer must claim \
                      its row here, deliberately",
                 )
             });
         assert_eq!(
             row.label, expected_label,
-            "{kind:?} claims the row labelled {:?} where {expected_label:?} \
-             is its own — a swapped registration frames one kind's job with \
-             another kind's codec, and the timing log lies about which layer \
+            "{name} claims the row labelled {:?} where {expected_label:?} \
+             is its own — a swapped registration frames one layer's job with \
+             another layer's codec, and the timing log lies about which layer \
              was slow",
             row.label,
         );
         assert!(
             !claimed.contains(&row.label),
-            "{kind:?}'s row {:?} is already claimed by another handler; a \
-             row claimed twice means two kinds believe they own one wire \
+            "{name}'s row {:?} is already claimed by another handler; a \
+             row claimed twice means two layers believe they own one wire \
              form",
             row.label,
         );
