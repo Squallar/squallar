@@ -31,7 +31,7 @@
 /// measure — and they are chosen against those two costs rather than against a
 /// figure. What is measured is what the fallback costs when the ladder is at
 /// its top: 1021.9 ms in Firefox and 911.4 ms in Chrome for a 16.9 MB volume
-/// decode, quoted from `rustdar_frontend::offload::JobRequest::Decode`, which
+/// decode, quoted from `rustdar_radar::jobs::DecodeJob`, which
 /// is where the audit recorded it.
 pub const RESPAWN_BACKOFF_MS: [u32; 4] = [1_000, 4_000, 16_000, 60_000];
 

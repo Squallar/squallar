@@ -193,11 +193,14 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         .collect();
 
     assert_eq!(jobs.len(), 2, "one loop frame and one still frame");
-    let ceiling = |job: &JobRequest| match job {
-        JobRequest::Radar {
-            side_ceiling_px, ..
-        } => *side_ceiling_px as usize,
-        other => panic!("expected a Level II render job, got {other:?}"),
+    let ceiling = |job: &JobRequest| {
+        assert!(
+            job.job
+                .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+                .is_some(),
+            "expected a Level II render job, got {job:?}",
+        );
+        job.geometry.side_ceiling_px as usize
     };
     assert_eq!(
         ceiling(&jobs[0]),

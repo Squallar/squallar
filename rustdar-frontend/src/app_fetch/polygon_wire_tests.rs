@@ -236,9 +236,9 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
              the inline gesture-end rasterization this slice removed",
         );
         let (_, request) = &posted[before];
-        let crate::offload::JobRequest::Overlay { geometry, job } = request else {
-            panic!("the {kind:?} dispatch posted a job of another kind, not JobRequest::Overlay");
-        };
+        // The envelope destructure is irrefutable since WO-M7.2; the typed
+        // downcast below is what proves the dispatch posted this kind.
+        let crate::offload::JobRequest { geometry, job } = request;
         assert_eq!(
             (geometry.width, geometry.height),
             (64, 48),

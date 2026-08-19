@@ -242,7 +242,7 @@ pub struct OverlayRenderResponse {
     ///
     /// # `None` is a render that failed, and it must still be sent
     ///
-    /// The described overlay path (`offload::JobRequest::Overlay`) can answer
+    /// The described overlay path (an overlay codec row's `JobRequest`) can answer
     /// nothing — a worker died mid-job, a wait for one lapsed, a reply's
     /// buffer failed the dispatch's own length check — where the opaque
     /// closures always produced pixels. The empty response travels anyway,

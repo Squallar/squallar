@@ -88,9 +88,9 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
              rasterization this slice removed",
         );
         let (_, request) = &posted[0];
-        let crate::offload::JobRequest::Overlay { geometry, job } = request else {
-            panic!("the sites dispatch posted a job of another kind, not JobRequest::Overlay");
-        };
+        // The envelope destructure is irrefutable since WO-M7.2; the typed
+        // downcast below is what proves the dispatch posted this kind.
+        let crate::offload::JobRequest { geometry, job } = request;
         assert_eq!(
             (geometry.width, geometry.height),
             (64, 48),

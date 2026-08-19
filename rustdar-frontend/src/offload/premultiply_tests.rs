@@ -17,6 +17,7 @@
 
 use super::*;
 use egui::ColorImage;
+use rustdar_radar::jobs::{RadarPlanJob, SectionJob, VoxelJob};
 
 /// Every pixel that can exist reaches the same `Color32` by the new route as by
 /// the old one.
@@ -74,15 +75,16 @@ fn every_pixel_that_can_exist_reaches_the_same_color32() {
 #[test]
 fn a_real_plan_view_render_lands_on_the_same_picture() {
     let request = tests::a_job();
-    // The ceiling off the request itself, exactly as `execute` reads it, so the
-    // two rasterizations cannot come out at two sizes.
-    let side_ceiling_px = request.side_ceiling_px();
-    let JobRequest::Radar { input, .. } = &request else {
-        panic!("`a_job` is the radar job");
-    };
+    // The ceiling off the request's envelope, exactly as the row's `run`
+    // reads it, so the two rasterizations cannot come out at two sizes.
+    let side_ceiling_px = request.geometry.side_ceiling_px as usize;
+    let plan = request
+        .job
+        .downcast_ref::<RadarPlanJob>()
+        .expect("`a_job` is the radar job");
 
     // What the rasterizer writes, before the job's output stage touches it.
-    let straight = rustdar_radar::render::render_from_sized(input, side_ceiling_px)
+    let straight = rustdar_radar::render::render_from_sized(&plan.input, side_ceiling_px)
         .expect("the fixture sweep rasterizes")
         .image;
     let side = crate::constants::raster_side_from_rgba_len(straight.len())
@@ -107,13 +109,16 @@ fn a_real_plan_view_render_lands_on_the_same_picture() {
 fn a_real_section_cut_lands_on_the_same_picture() {
     use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH};
 
-    let JobRequest::Section { input, request } = tests::a_section_job() else {
-        panic!("`a_section_job` is the section job");
-    };
+    let section_job = tests::a_section_job();
+    let job = section_job
+        .job
+        .downcast_ref::<SectionJob>()
+        .expect("`a_section_job` is the section job");
+    let input = &job.input;
     let (scan, declared) = (input.to_scan(), input.declared_nyquist());
     let straight = rustdar_radar::xsect::render_section(
         rustdar_radar::nyquist::Volume::new(&scan, &declared),
-        &request,
+        &job.request,
         input.radar_lat(),
         input.radar_lon(),
         input.storm_motion(),
@@ -144,13 +149,16 @@ fn a_real_section_cut_lands_on_the_same_picture() {
 /// wrong for the next output kind that carries pixels.
 #[test]
 fn a_voxel_grid_passes_through_the_output_stage_untouched() {
-    let JobRequest::Voxels { input, request } = tests::a_voxel_job() else {
-        panic!("`a_voxel_job` is the voxel job");
-    };
+    let voxel_job = tests::a_voxel_job();
+    let job = voxel_job
+        .job
+        .downcast_ref::<VoxelJob>()
+        .expect("`a_voxel_job` is the voxel job");
+    let input = &job.input;
     let (scan, declared) = (input.to_scan(), input.declared_nyquist());
     let built = rustdar_radar::voxel::build_voxels_with_motion(
         rustdar_radar::nyquist::Volume::new(&scan, &declared),
-        &request,
+        &job.request,
         input.radar_lat(),
         input.radar_lon(),
         input.storm_motion(),

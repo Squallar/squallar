@@ -140,7 +140,7 @@ pub struct AppState {
     /// draws a Doppler cut's ±300.11 km at 3.4121 px/km against the calibrated
     /// 4.4522. `rustdar_radar::types::raster_side_px` is where that trade is
     /// argued and measured. The dispatch sites carry this number into
-    /// `JobRequest`'s `side_ceiling_px`.
+    /// the request envelope's `side_ceiling_px` (`offload::JobRequest::geometry`).
     pub raster_side_ceiling_px: usize,
     max_surface_dimension: u32,
 }

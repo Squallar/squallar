@@ -90,9 +90,12 @@ fn fixture() -> Fixture {
 fn a_numbered_job(n: u8) -> JobRequest {
     let mut archive = b"AR2V0006.001not-a-real-volume".to_vec();
     archive.push(n);
-    JobRequest::Decode {
-        archive: Arc::new(archive),
-    }
+    JobRequest::describe(
+        rustdar_radar::jobs::DecodeJob {
+            archive: Arc::new(archive),
+        },
+        ceiling_only_geometry(0),
+    )
 }
 
 /// Which numbered jobs a port was handed, in order.

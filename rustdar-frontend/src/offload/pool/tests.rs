@@ -6,6 +6,8 @@
 //! answers instead of taking a worker with it.
 
 use super::*;
+use crate::offload::ceiling_only_geometry;
+use rustdar_radar::jobs::DecodeJob;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// **The claim the whole convergence rests on: this arm copies nothing.**
@@ -39,23 +41,27 @@ fn the_native_transport_moves_a_request_rather_than_copying_it() {
     handle
         .send(
             17,
-            JobRequest::Decode {
-                archive: std::sync::Arc::clone(&archive),
-            },
+            JobRequest::describe(
+                DecodeJob {
+                    archive: std::sync::Arc::clone(&archive),
+                },
+                ceiling_only_geometry(0),
+            ),
         )
         .expect("the receiver is alive");
 
     let (id, arrived) = rx.recv().expect("the request crossed");
     assert_eq!(id, 17, "the id travels with the request, not beside it");
-    let JobRequest::Decode { archive: arrived } = arrived else {
-        panic!("the transport changed the request into something else");
-    };
+    let arrived = arrived
+        .job
+        .downcast_ref::<DecodeJob>()
+        .expect("the transport changed the request into something else");
     assert!(
-        std::ptr::eq(std::sync::Arc::as_ptr(&arrived), sent_to),
+        std::ptr::eq(std::sync::Arc::as_ptr(&arrived.archive), sent_to),
         "the request was copied across the transport, not moved",
     );
     assert!(
-        std::ptr::eq(arrived.as_ptr(), bytes_at),
+        std::ptr::eq(arrived.archive.as_ptr(), bytes_at),
         "the payload was reallocated, so something copied 4 MiB of it",
     );
 }
@@ -82,15 +88,22 @@ fn a_refusal_hands_the_request_back_whole() {
 
     let refused = handle.send(
         1,
-        JobRequest::Decode {
-            archive: std::sync::Arc::clone(&archive),
-        },
+        JobRequest::describe(
+            DecodeJob {
+                archive: std::sync::Arc::clone(&archive),
+            },
+            ceiling_only_geometry(0),
+        ),
     );
-    let Err(JobRequest::Decode { archive: back }) = refused else {
+    let Err(back) = refused else {
         panic!("a lane with no receiver must refuse, and must give the job back");
     };
+    let back = back
+        .job
+        .downcast_ref::<DecodeJob>()
+        .expect("the refused request came back as another kind");
     assert!(
-        std::ptr::eq(std::sync::Arc::as_ptr(&back), sent_to),
+        std::ptr::eq(std::sync::Arc::as_ptr(&back.archive), sent_to),
         "the refused request came back as a copy",
     );
 }
