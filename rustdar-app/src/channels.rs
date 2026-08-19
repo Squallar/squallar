@@ -130,6 +130,14 @@ pub struct RenderResponse {
     pub elevation: f32,
     pub generation: u64,
     pub pane_idx: usize,
+    /// `Some(site)` marks a **speculative** result (WO-E4.10): an
+    /// adjacent-tilt pre-render no pane asked for. It carries the site
+    /// because a speculative render is pane-less — `pane_idx` is a sentinel
+    /// the receiver never reads on this arm. Its whole delivery is: insert
+    /// into the RenderCache under the existing key, clear the dispatcher's
+    /// one-speculative-at-a-time bool, touch no pane state. `None` is every
+    /// interactive pane render — today's shape, unchanged.
+    pub speculative_for: Option<String>,
 }
 
 /// Result from a background cross-section cut.

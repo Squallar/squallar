@@ -700,6 +700,13 @@ pub struct RenderDispatcher {
     /// cache hit performs zero; a miss exactly one.
     #[cfg(test)]
     pub(crate) plan_view_extractions: std::cell::Cell<u32>,
+    /// Whether an adjacent-tilt pre-render is out (WO-E4.10). One at a time
+    /// IS the whole policy — together with "no interactive render in flight"
+    /// at the dispatch gate, deliberately NOT widened to fill-all-idle-lanes
+    /// (a scheduling change this phase does not make). Set by
+    /// [`spawn_speculative_render`](Self::spawn_speculative_render), cleared
+    /// by the speculative result's arrival, whatever it carried.
+    speculative_in_flight: bool,
 }
 
 /// The identity of one plan-view extraction — **today's tuple, exactly the
@@ -730,6 +737,54 @@ pub(crate) type ExtractTuple = (ExtractKey, Option<(f32, f32)>, Option<(f64, f64
 /// one per pane a desktop split can show, roughly, and each is one sweep's
 /// gates rather than a volume — small beside the render cache it feeds.
 const EXTRACT_CACHE_CAP: usize = 8;
+
+/// Whether this build may pre-render an adjacent tilt at all (WO-E4.10) —
+/// the platform/budget half of the speculative gate, as a parameterized
+/// function so a host `cargo test` exercises BOTH arms (the WEB-const
+/// pattern: the caller passes `crate::app::WEB`).
+///
+/// **Never on wasm (AF8)**: the browser has one worker, so speculation
+/// queues behind interactive work instead of beside it — the exact inversion
+/// of the point. And never under a small budget: `concurrent_renders > 2`
+/// admits desktop (6) and mobile (3), refuses wasm's 1 twice over, and keeps
+/// at least two slots free for interactive work while a speculative runs.
+pub(crate) fn speculative_render_allowed(web: bool, concurrent_renders: usize) -> bool {
+    !web && concurrent_renders > 2
+}
+
+/// One rendered frame's trip into the shape the frame thread applies — the
+/// deliver tail [`RenderDispatcher::spawn_render`] and
+/// [`RenderDispatcher::spawn_speculative_render`] share.
+///
+/// The RGBA bytes are finished with the moment they have been copied into
+/// the `ColorImage`, and this is the only place that copy happens for a
+/// static render — so this is where they go back to the renderer's slot
+/// rather than to the allocator. Recycled before the `?` so that a texture
+/// the display layer rejects gives its buffer up too. What goes back is a
+/// *premultiplied* buffer, which costs the slot nothing: `checkout_image`
+/// re-seeds every byte it lends, so the next render never sees this one's
+/// convention.
+///
+/// The raster value grid is already back in the renderer's slot —
+/// `From<SweepRender> for RenderedFrame` is where it dies, on every path —
+/// and what leaves here in its place is the gates, at the resolution the
+/// radar measured them. That is the whole of the residency change: the
+/// image `Arc` is held by the pane, the render cache and the suspend copy
+/// for as long as the picture is on screen, and it used to be 206.75 MiB.
+fn rendered_image_from(
+    frame: rustdar_radar::frame::RenderedFrame,
+) -> Option<crate::channels::RenderedImage> {
+    let picture = plan_view_image(&frame.image);
+    rustdar_radar::render::recycle_image(frame.image);
+    Some(crate::channels::RenderedImage {
+        image: Arc::new(picture?),
+        max_range_km: frame.max_range_km,
+        hover: Arc::new(rustdar_radar::hover::HoverSource::resident(frame.polar)),
+        nyquist_ms: frame.nyquist_ms,
+        melting_layer_source: frame.melting_layer_source,
+        storm_motion: frame.storm_motion,
+    })
+}
 
 /// The one place an [`ExtractKey`] is built, so the arrival-time populate and
 /// the dispatch lookup cannot key the same tuple two ways — the same
@@ -1034,6 +1089,7 @@ impl RenderDispatcher {
             extract_results_rx,
             #[cfg(test)]
             plan_view_extractions: std::cell::Cell::new(0),
+            speculative_in_flight: false,
         }
     }
 
@@ -2513,44 +2569,12 @@ impl RenderDispatcher {
             drop(wanted);
             if still_wanted {
                 let _ = sender.send(RenderResponse {
-                    rendered: frame.and_then(|frame| {
-                        // The RGBA bytes are finished with the moment they have
-                        // been copied into the `ColorImage`, and this is the
-                        // only place that copy happens for a static render — so
-                        // this is where they go back to the renderer's slot
-                        // rather than to the allocator. Recycled before the `?`
-                        // so that a texture the display layer rejects gives its
-                        // buffer up too. What goes back is a *premultiplied*
-                        // buffer, which costs the slot nothing: `checkout_image`
-                        // re-seeds every byte it lends, so the next render never
-                        // sees this one's convention.
-                        //
-                        // The raster value grid is already back in the
-                        // renderer's slot — `From<SweepRender> for
-                        // RenderedFrame` is where it dies, on every path — and
-                        // what leaves here in its place is the gates, at the
-                        // resolution the radar measured them. That is the whole
-                        // of the residency change: this `Arc` is held by the
-                        // pane, the render cache and the suspend copy for as
-                        // long as the picture is on screen, and it used to be
-                        // 206.75 MiB of it.
-                        let picture = plan_view_image(&frame.image);
-                        rustdar_radar::render::recycle_image(frame.image);
-                        Some(crate::channels::RenderedImage {
-                            image: Arc::new(picture?),
-                            max_range_km: frame.max_range_km,
-                            hover: Arc::new(rustdar_radar::hover::HoverSource::resident(
-                                frame.polar,
-                            )),
-                            nyquist_ms: frame.nyquist_ms,
-                            melting_layer_source: frame.melting_layer_source,
-                            storm_motion: frame.storm_motion,
-                        })
-                    }),
+                    rendered: frame.and_then(rendered_image_from),
                     product,
                     elevation,
                     generation,
                     pane_idx,
+                    speculative_for: None,
                 });
             }
             crate::app::notify_redraw(&window);
@@ -2566,6 +2590,129 @@ impl RenderDispatcher {
             RenderView::PlanView,
             elevation,
         )));
+    }
+
+    /// One adjacent-tilt pre-render into the existing [`RenderCache`]
+    /// (WO-E4.10). Pane-less by design: **never marks any pane in flight,
+    /// never takes a pane render slot** — the speculative deliver inserts
+    /// into the RenderCache ONLY and clears
+    /// [`speculative_in_flight`](Self::speculative_in_flight). The user's
+    /// tilt-step then hits the existing cache lookup — no new read path.
+    ///
+    /// Same job path as [`spawn_level2_render`](Self::spawn_level2_render):
+    /// the extraction is served from WO-E4.9's cache where the tuple is
+    /// resident and walked inline otherwise (one tilt, the measured
+    /// 0.1–1.0 ms band, on a machine the caller's gate has already proven
+    /// idle); `values_wanted: true` because this raster becomes the pane's
+    /// static render on tilt-step, and values-stripped would kill hover.
+    /// The result rides the ordinary render channel marked
+    /// [`speculative_for`](crate::channels::RenderResponse::speculative_for);
+    /// there is no `results_wanted` flag because no pane waits on it — a
+    /// stale one is discarded by the generation check like any other.
+    ///
+    /// Refusals take nothing: a busy budget, a speculative already out, or a
+    /// tilt the volume does not carry all return with no slot taken and the
+    /// bool untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_speculative_render(
+        &mut self,
+        site: &str,
+        product: RadarProduct,
+        elevation: f32,
+        volume_start: chrono::NaiveDateTime,
+        lat: f64,
+        lon: f64,
+        data: Arc<nexrad_model::data::Scan>,
+        declared: &rustdar_radar::nyquist::DeclaredNyquist,
+        sender: std::sync::mpsc::Sender<RenderResponse>,
+        window: Option<WindowRef>,
+    ) {
+        if self.speculative_in_flight {
+            return;
+        }
+        if self.renders_in_flight.load(Ordering::Relaxed) >= self.concurrent_renders {
+            return;
+        }
+        let (key, storm_motion, env_heights) =
+            self.extract_tuple_for(site, volume_start, product, elevation);
+        let cached = self
+            .extract_cache_lookup(&key)
+            .map(|input| (*input).clone());
+        let Some(input) = cached.or_else(|| {
+            rustdar_radar::render_input::RenderInput::extract(
+                &data,
+                elevation,
+                product,
+                lat,
+                lon,
+                storm_motion,
+                env_heights,
+            )
+        }) else {
+            // The volume does not carry this tilt — nothing taken, nothing
+            // marked, and nothing to retry: the ladder said it would.
+            return;
+        };
+        let melting_layer = self.melting_layer_product_for(product, site, volume_start);
+        let rpg_storm_motion = self.rpg_storm_motion_for(product, site, volume_start);
+        let job = rustdar_worker::offload::Job::Described(
+            rustdar_worker::offload::JobRequest::describe(
+                rustdar_radar::jobs::RadarPlanJob {
+                    // The same four stamps the interactive dispatch applies,
+                    // at the same moment, for the same reasons it documents.
+                    input: Box::new(
+                        input
+                            .with_declared_nyquist(declared)
+                            .with_srv_fallback(self.last_srv_fallback)
+                            .with_melting_layer_product(melting_layer)
+                            .with_rpg_storm_motion(rpg_storm_motion),
+                    ),
+                    // The body's trap, held: this raster becomes the pane's
+                    // static render on tilt-step, and a hover reads the grid.
+                    values_wanted: true,
+                },
+                rustdar_worker::offload::ceiling_only_geometry(self.static_side_ceiling_px() as u32),
+            ),
+        );
+        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
+        self.speculative_in_flight = true;
+        let generation = self.render_generation;
+        let speculative_for = Some(site.to_string());
+        rustdar_worker::offload::offload_job("radar-render", job, move |output| {
+            let _guard = guard;
+            let frame = output.and_then(|out| out.take::<rustdar_radar::frame::RenderedFrame>());
+            // Sent unconditionally: the receiver is what clears the
+            // one-speculative bool, and a speculative that stayed silent
+            // would wedge speculation for the session (the same shape as the
+            // pane-wedge hazard `plan_view_in_flight` documents, one bool
+            // wide instead of one key group).
+            let _ = sender.send(RenderResponse {
+                rendered: frame.and_then(rendered_image_from),
+                product,
+                elevation,
+                generation,
+                // Pane-less: the marker below is what routes this result, and
+                // the sentinel keeps every pane-indexed bound check refusing
+                // it if the marker were ever ignored.
+                pane_idx: usize::MAX,
+                speculative_for,
+            });
+            crate::app::notify_redraw(&window);
+        });
+        // Deliberately NO pane bookkeeping here — that is the whole point.
+    }
+
+    /// Whether a speculative render is out right now — the
+    /// one-at-a-time half of WO-E4.10's gate.
+    pub(crate) fn speculative_in_flight(&self) -> bool {
+        self.speculative_in_flight
+    }
+
+    /// The speculative render answered (with a raster or with nothing) —
+    /// speculation may dispatch again.
+    pub(crate) fn speculative_finished(&mut self) {
+        self.speculative_in_flight = false;
     }
 
     /// Whether some pane already has **this exact plan view** in flight.

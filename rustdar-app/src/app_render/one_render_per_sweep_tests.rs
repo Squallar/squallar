@@ -318,6 +318,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
             elevation: TILT,
             generation: app.render.render_generation,
             pane_idx: 0,
+            speculative_for: None,
         })
         .expect("the receiver lives on the App");
     app.poll_render_results(&ctx);
@@ -425,6 +426,7 @@ fn a_render_that_answers_with_nothing_releases_its_siblings() {
             elevation: TILT,
             generation: app.render.render_generation,
             pane_idx: 0,
+            speculative_for: None,
         })
         .expect("the receiver lives on the App");
     app.poll_render_results(&ctx);
