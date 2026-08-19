@@ -31,10 +31,10 @@ use std::sync::Arc;
 use rustdar_device_profile::quality::VolumeQuality;
 use rustdar_egui::pane::{OrbitCamera, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode};
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter};
-use rustdar_frontend::volume::VolumeSupport;
-use rustdar_frontend::volume::bridge::{BridgeVolumePainter, VolumeEntry, VolumeStore};
 use rustdar_geo::GeoPoint;
 use rustdar_radar::types::RadarProduct;
+use rustdar_volumetric::VolumeSupport;
+use rustdar_volumetric::bridge::{BridgeVolumePainter, VolumeEntry, VolumeStore};
 
 /// The fixture's radar, and the box the grid below is resampled over.
 const SITE: (f64, f64) = (35.33, -97.27);

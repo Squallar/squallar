@@ -114,8 +114,8 @@ use egui_wgpu::wgpu;
 use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
-use rustdar_frontend::volume::raymarch::{VOLUME_SHADER_WGSL, VolumePipelines};
-use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
+use rustdar_volumetric::raymarch::{VOLUME_SHADER_WGSL, VolumePipelines};
+use rustdar_volumetric::uniform::{ISO_OFF, VolumeUniform};
 
 mod gpu_harness;
 use gpu_harness::{
@@ -899,8 +899,8 @@ fn probe_lone_voxel_footprint(
     let raw = painted_fraction(&raymarch_once(
         device, queue, pipelines, cells, &indices, &lut, &uniform, size,
     ));
-    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
-    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.reconstruction_lod = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
+    uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
     let cloud = painted_fraction(&raymarch_once(
         device, queue, pipelines, cells, &indices, &lut, &uniform, size,
     ));

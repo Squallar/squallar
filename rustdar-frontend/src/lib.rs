@@ -49,4 +49,8 @@ pub mod site_positions;
 /// there is exactly one such list.
 #[cfg(test)]
 pub(crate) mod test_sites;
-pub mod volume;
+/// The `Ready` volume fixture the app-side store/release tests stand a pane
+/// on. rustdar-volumetric's bridge tests keep their own twin (a test helper
+/// does not cross a crate boundary).
+#[cfg(test)]
+pub(crate) mod volume_fixture;

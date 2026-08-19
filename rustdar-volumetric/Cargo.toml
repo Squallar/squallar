@@ -1,0 +1,45 @@
+# The 3D volume stack: raymarch pipelines and shader, voxel staging, uniforms,
+# blue noise, quality-degrade/probe policy, and the bridge egui's paint
+# callbacks march through.
+[package]
+name = "rustdar-volumetric"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The wgpu boundary below this crate: AttachmentConfig and the staging ring.
+# volumetric -> gpu is a NORMAL dependency; the reverse edge exists only as
+# rustdar-gpu's dev-dependency (WO-RV land 3, the hardware quarantine), which
+# is legal because dev-deps never enter the normal graph.
+rustdar-gpu = { workspace = true }
+# The device-class policy floor: grid cells, LUT/texture budgets, quality.
+rustdar-device-profile = { workspace = true }
+# The voxel vocabulary the bridge marches (VoxelGrid) and the product names
+# the store evicts by.
+rustdar-radar = { workspace = true }
+# The pane/paint vocabulary the bridge answers to: pane::VolumeTarget,
+# volume_alpha::AlphaCurve, volume_view::{VolumeFrameState, VolumePaint, ...}.
+rustdar-egui = { workspace = true }
+egui = { workspace = true }
+# Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
+# re-export. There is deliberately NO direct `wgpu` entry here: rustdar-gpu is
+# the one wgpu feature-chooser, and the single-copy guard at the boundary
+# depends on this crate never resolving `::wgpu` itself.
+egui-wgpu = { workspace = true }
+# The voxel upload packs Rg16Float texels: two `half::f16` per cell.
+half = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# serde_json parses `cargo metadata` in the charter test; pollster blocks on
+# the adapter/device requests in the `#[ignore]`d unit tests (the staging-ring
+# parity pair and the real-adapter probe check); nexrad-model builds the
+# synthetic scan the bridge tests feed the voxel builder.
+serde_json = { workspace = true }
+pollster = { workspace = true }
+nexrad-model = { workspace = true }
+# chrono stamps the synthetic scan fixtures in the bridge tests; rustdar-geo
+# feeds the uniform/bridge differential fixtures (KM_PER_DEGREE_LAT, GeoPoint)
+# -- both test-only, never in the normal graph.
+chrono = { workspace = true }
+rustdar-geo = { workspace = true }

@@ -2236,7 +2236,7 @@ impl super::App {
             if let Some(resources) = state
                 .egui_renderer
                 .callback_resources_mut()
-                .get_mut::<crate::volume::bridge::VolumeResources>()
+                .get_mut::<rustdar_volumetric::bridge::VolumeResources>()
             {
                 resources.release_mirror();
             }
@@ -2264,7 +2264,7 @@ impl super::App {
             state
                 .egui_renderer
                 .callback_resources_mut()
-                .get_mut::<crate::volume::bridge::VolumeResources>()
+                .get_mut::<rustdar_volumetric::bridge::VolumeResources>()
                 .map(|resources| {
                     (
                         resources.ensure_mirror(&device, plan.size_in_pixels, format),
@@ -2338,7 +2338,7 @@ impl super::App {
                             pane.render_view() == rustdar_radar::types::RenderView::Volume
                         });
                     if volume_on_screen {
-                        let losses = crate::volume::degrade::note_surface_loss_with_volume();
+                        let losses = rustdar_volumetric::degrade::note_surface_loss_with_volume();
                         log::warn!(
                             "wgpu surface lost with a 3D volume on screen ({losses} so far)"
                         );
@@ -3753,7 +3753,7 @@ impl super::App {
     ///   3D loop tells the store the whole list it holds — which drops the
     ///   grids of frames that have scrolled out of the loop, and the pane's own
     ///   live grid on the frame its loop takes over. That is
-    ///   [`crate::volume::bridge::VolumeStore::retain_set`], and it is what
+    ///   [`rustdar_volumetric::bridge::VolumeStore::retain_set`], and it is what
     ///   makes "the frame list is the resident set" a property rather than a
     ///   hope.
     ///
@@ -3766,7 +3766,7 @@ impl super::App {
     /// report turned out to be. The pacing above is what makes that affordable:
     /// planning a landed frame costs a probe and a lookup, never an extraction.
     fn make_volume_frames_resident(&mut self, to_build: Vec<LoopVolumeRequest>) {
-        use crate::volume::bridge::{Hold, VolumeEntry};
+        use rustdar_volumetric::bridge::{Hold, VolumeEntry};
 
         let mut dispatched = 0usize;
         // Every target still wanted, per pane, gathered as the pass goes so

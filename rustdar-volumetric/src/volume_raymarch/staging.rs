@@ -702,7 +702,7 @@ mod tests {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: crate::volume::VOLUME_TEXTURE_FORMAT,
+            format: crate::VOLUME_TEXTURE_FORMAT,
             // `COPY_SRC` beside the production pair, and only here: the shipped
             // grid does not carry it, so this is a texture of the test's own
             // rather than one borrowed from `upload_volume_at`. What is being

@@ -40,12 +40,12 @@
 use egui_wgpu::wgpu;
 use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
-use rustdar_frontend::volume::raymarch::VolumePipelines;
-use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_gpu::egui_renderer::AttachmentConfig;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{DESKTOP_SHAPE, HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels};
+use rustdar_volumetric::raymarch::VolumePipelines;
+use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
+use rustdar_volumetric::uniform::VolumeUniform;
 
 /// The volume reader and the site it learns, shared with the other two live
 /// instruments in this directory. See `live_volume/mod.rs` for why the site
@@ -129,9 +129,8 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             // the two ride one quality decision in the bridge — so the timed
             // pair is the shipped pair: cloud against the raw unlit floor.
             if shading {
-                uniform.reconstruction_lod =
-                    rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
-                uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+                uniform.reconstruction_lod = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
+                uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
             }
             uniform.vertical_exaggeration = camera.vertical_exaggeration();
             // The bridge's own transfer edge, imported rather than restated,
@@ -140,8 +139,8 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             // production behaviour. An anchor change in the bridge cannot
             // leave this instrument measuring a different threshold.
             uniform.empty_index_threshold =
-                rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
-            uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
+                rustdar_volumetric::bridge::empty_index_threshold_for(grid.fade_band());
+            uniform.edge_soft_width = rustdar_volumetric::bridge::EDGE_SOFT_WIDTH;
             volume.write_uniform(&queue, &uniform);
 
             let target = pipelines.create_offscreen(&device, size);
@@ -178,12 +177,12 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = true;
-            uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
-            uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+            uniform.reconstruction_lod = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
+            uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
             uniform.vertical_exaggeration = camera.vertical_exaggeration();
             uniform.empty_index_threshold =
-                rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
-            uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
+                rustdar_volumetric::bridge::empty_index_threshold_for(grid.fade_band());
+            uniform.edge_soft_width = rustdar_volumetric::bridge::EDGE_SOFT_WIDTH;
             volume.write_uniform(&queue, &uniform);
 
             let mut encoder = device.create_command_encoder(&Default::default());
@@ -201,8 +200,8 @@ fn timed_passes(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipelines: &VolumePipelines,
-    target: &rustdar_frontend::volume::raymarch::OffscreenTarget,
-    volume: &rustdar_frontend::volume::raymarch::VolumeTextures,
+    target: &rustdar_volumetric::raymarch::OffscreenTarget,
+    volume: &rustdar_volumetric::raymarch::VolumeTextures,
 ) -> (f64, f64) {
     let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("rustdar.volume.cost.queries"),

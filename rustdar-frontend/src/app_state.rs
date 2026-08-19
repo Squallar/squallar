@@ -1,6 +1,5 @@
 use egui_wgpu::wgpu;
 
-use crate::volume;
 use rustdar_gpu::egui_renderer;
 
 /// Minimum window dimension (width or height) in pixels
@@ -9,8 +8,9 @@ const MIN_SIZE: u32 = 1;
 // The device-request policy — the `WEB` fork, the surface-format and limit
 // choices, the present mode, and `request_device` itself — moved to
 // `rustdar_gpu::device` at WO-RG. What stays here is winit-coupled
-// (`request_adapter` needs the surface) or volumetric (the probe and the
-// error latch, which the gpu crate must not name).
+// (`request_adapter` needs the surface) or volumetric wiring (the probe and
+// the error latch, which the gpu crate must not name — since WO-RV they are
+// `rustdar_volumetric`'s, called from here).
 
 pub struct AppState {
     pub device: wgpu::Device,
@@ -26,14 +26,14 @@ pub struct AppState {
     /// view, and re-requesting an adapter to ask is not equivalent — a second
     /// `request_adapter` may legitimately return a *different* one.
     pub adapter: wgpu::Adapter,
-    /// What [`crate::volume::probe`] concluded about this device, before
+    /// What [`rustdar_volumetric::probe`] concluded about this device, before
     /// anything was created on it.
     ///
-    /// Read it through [`crate::volume::support`] rather than directly:
+    /// Read it through [`rustdar_volumetric::support`] rather than directly:
     /// failures recorded since the probe ran — a rejected resource, a twice-lost
     /// surface — outrank it, and they deliberately live outside this struct
-    /// because a lost surface destroys this struct. See `volume::degrade`.
-    pub volume_support: volume::VolumeSupport,
+    /// because a lost surface destroys this struct. See `rustdar_volumetric::degrade`.
+    pub volume_support: rustdar_volumetric::VolumeSupport,
     /// The largest side a static plan-view raster may have on this device.
     ///
     /// **A size and not a flag.** It used to be a `bool` —
@@ -89,7 +89,7 @@ impl AppState {
         // the device fn. See `rustdar_gpu::device::request_device` for the
         // full argument (the DMA staging route, the "footgun" caveat, and why
         // WebGL2 takes `Features::empty()`).
-        let features = adapter.features() & volume::raymarch::staging::STAGING_RING_FEATURE;
+        let features = adapter.features() & rustdar_gpu::staging_ring::STAGING_RING_FEATURE;
         let (device, queue) = rustdar_gpu::device::request_device(&adapter, features).await;
 
         // Before a single volume resource exists, and before anything can fail
@@ -99,15 +99,16 @@ impl AppState {
         // texture needs no feature, the staging ring is a route to the same
         // texture rather than a condition on having one, and the web arm's
         // `using_resolution` already lifts `max_texture_dimension_3d`.
-        let volume_support = volume::probe(&adapter, &device.limits());
+        let volume_support = rustdar_volumetric::probe(&adapter, &device.limits());
         if let Some(why) = volume_support.reason() {
             log::info!("3D volume view unavailable: {why}");
         }
         // Installed unconditionally, including when the probe already said no:
         // the handler's other job is to keep wgpu's panicking default from
         // taking a browser tab down over an error a release build could survive.
-        // Read the trade in `volume::install_error_latch` before moving this.
-        volume::install_error_latch(&device);
+        // Read the trade in `rustdar_volumetric::install_error_latch` before
+        // moving this.
+        rustdar_volumetric::install_error_latch(&device);
 
         let swapchain_capabilities = surface.get_capabilities(&adapter);
         let swapchain_format = rustdar_gpu::device::select_surface_format(&swapchain_capabilities);
@@ -187,55 +188,7 @@ impl AppState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use rustdar_gpu::device::device_limits;
-
-    use super::*;
-
-    // The six device-policy tests and the `WEB` scrape moved to
-    // `rustdar_gpu::device`'s own test module with their subjects at WO-RG.
-    // This one stays: it bridges to `crate::volume::limits_shortfall`, which
-    // is still this crate's until WO-RV.
-
-    /// The limits this app *requests* clear the floor the volume probe applies.
-    ///
-    /// `volume::limits_shortfall`'s doc says it is testable against
-    /// `downlevel_webgl2_defaults()`, and `volume.rs` does test it against that
-    /// — but nothing tied the figure the probe was exercised with to the figure
-    /// the device request actually produces. They are the same only because
-    /// `device_limits` happens to start from the same call, which is precisely
-    /// the kind of "obviously the same" that this campaign has already paid for
-    /// once. `AppState::new` requests these limits (through
-    /// `rustdar_gpu::device::request_device`), the device grants exactly them,
-    /// and `volume::probe` reads them back off the device — so this is the
-    /// real path, not a restatement.
-    #[test]
-    fn the_web_limits_this_app_requests_clear_the_volume_probes_floor() {
-        // The least capable browser this build targets: an adapter reporting
-        // exactly the WebGL2 guarantee and not a pixel more.
-        let barest = wgpu::Limits::downlevel_webgl2_defaults();
-        assert_eq!(
-            crate::volume::limits_shortfall(&device_limits(barest, true)),
-            None,
-            "the volume probe rejects the very limits this app asks a browser \
-             for, so the 3D view could never be available in one"
-        );
-
-        // And on a capable browser, where `using_resolution` lifts the 3D
-        // texture bound well past the grid.
-        assert_eq!(
-            crate::volume::limits_shortfall(&device_limits(wgpu::Limits::default(), true)),
-            None
-        );
-
-        // Native asks for the adapter's own limits, so any adapter that could
-        // run the app at all clears the floor too.
-        for adapter in [wgpu::Limits::default(), wgpu::Limits::downlevel_defaults()] {
-            assert_eq!(
-                crate::volume::limits_shortfall(&device_limits(adapter, false)),
-                None
-            );
-        }
-    }
-}
+// The one test that lived here — the_web_limits_this_app_requests_clear_the
+// _volume_probes_floor — moved into rustdar-volumetric's lib tests at WO-RV:
+// it composes `rustdar_gpu::device::device_limits` with
+// `rustdar_volumetric::limits_shortfall`, and that crate sees both.

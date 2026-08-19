@@ -1602,7 +1602,7 @@ mod budget_agreement {
     fn the_requested_shape_never_outgrows_the_budget_it_was_computed_against() {
         for (name, budget) in ALL_ARMS {
             let budget_cells = budget.iter().map(|&n| n as usize).product::<usize>();
-            let budget_bytes = crate::volume::raymarch::grid_bytes_with_mips(budget)
+            let budget_bytes = crate::raymarch::grid_bytes_with_mips(budget)
                 .expect("a shipped budget cannot overflow");
             for limit in REPORTED_LIMITS {
                 let shape =
@@ -1614,7 +1614,7 @@ mod budget_agreement {
                      against the {budget_cells} this target budgeted for",
                     shape.cells(),
                 );
-                let bytes = crate::volume::raymarch::grid_bytes_with_mips(cells)
+                let bytes = crate::raymarch::grid_bytes_with_mips(cells)
                     .expect("a derived shape cannot overflow");
                 assert!(
                     bytes <= budget_bytes,
@@ -1642,12 +1642,12 @@ mod budget_agreement {
         assert_eq!(
             rustdar_radar::voxel::HORIZONTAL_AXIS_MULTIPLE,
             wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
-                / crate::volume::raymarch::GRID_BYTES_PER_CELL as usize,
+                / crate::raymarch::GRID_BYTES_PER_CELL as usize,
         );
         // And that the two it is a quotient of are what the doc says, so a change
         // to either fails by name rather than by cancelling out.
         assert_eq!(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 256);
-        assert_eq!(crate::volume::raymarch::GRID_BYTES_PER_CELL, 4);
+        assert_eq!(crate::raymarch::GRID_BYTES_PER_CELL, 4);
     }
 
     /// `voxel::VERTICAL_AXIS_MULTIPLE` is the depth block a 3D texture is laid out
@@ -1662,7 +1662,7 @@ mod budget_agreement {
     /// tile constant cannot quietly satisfy.
     #[test]
     fn the_vertical_axis_multiple_is_the_texture_depth_block() {
-        use crate::volume::raymarch::{CoarseLevel, grid_bytes, grid_bytes_at};
+        use crate::raymarch::{CoarseLevel, grid_bytes, grid_bytes_at};
         let multiple = rustdar_radar::voxel::VERTICAL_AXIS_MULTIPLE;
         // One level, so this is mip 0's own layout with nothing else folded in.
         let padding = |nz: usize| {
@@ -1670,8 +1670,7 @@ mod budget_agreement {
             grid_bytes_at(cells, CoarseLevel::Omitted).expect("a swept shape fits")
                 - grid_bytes(cells).expect("a swept shape fits")
         };
-        let block =
-            320 * 320 * (multiple - 1) * crate::volume::raymarch::GRID_BYTES_PER_CELL as usize;
+        let block = 320 * 320 * (multiple - 1) * crate::raymarch::GRID_BYTES_PER_CELL as usize;
         for k in 1..=4 {
             assert!(
                 padding(multiple * k) < block,
@@ -1719,7 +1718,7 @@ mod budget_agreement {
                     class,
                     ..shipped_profile(limits)
                 });
-                let grid = crate::volume::raymarch::resident_grid_bytes(b.grid_cells)
+                let grid = crate::raymarch::resident_grid_bytes(b.grid_cells)
                     .expect("a bracketed grid cannot overflow");
                 // The grid fits its own budget, in bytes as well as in cells.
                 assert!(
@@ -1761,7 +1760,7 @@ mod budget_agreement {
     #[test]
     fn a_pixel_costs_what_the_offscreen_format_costs() {
         use rustdar_device_profile::quality::OFFSCREEN_BYTES_PER_PIXEL;
-        let format_bytes = crate::volume::raymarch::OFFSCREEN_FORMAT
+        let format_bytes = crate::raymarch::OFFSCREEN_FORMAT
             .block_copy_size(None)
             .expect("the offscreen format has no single-aspect copy size");
         assert_eq!(
@@ -1769,7 +1768,7 @@ mod budget_agreement {
             format_bytes as usize,
             "an offscreen pixel is budgeted at {OFFSCREEN_BYTES_PER_PIXEL} B \
              but {:?} costs {format_bytes} B",
-            crate::volume::raymarch::OFFSCREEN_FORMAT
+            crate::raymarch::OFFSCREEN_FORMAT
         );
     }
 }

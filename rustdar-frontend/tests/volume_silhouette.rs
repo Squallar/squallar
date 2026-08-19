@@ -78,12 +78,10 @@ use egui_wgpu::wgpu;
 use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
-use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use rustdar_frontend::volume::raymarch::{
-    RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS, VolumePipelines,
-};
-use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_gpu::egui_renderer::AttachmentConfig;
+use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
+use rustdar_volumetric::raymarch::{RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS, VolumePipelines};
+use rustdar_volumetric::uniform::VolumeUniform;
 
 // ---------------------------------------------------------------------------
 // GPU plumbing, lifted from tests/volume_gpu.rs

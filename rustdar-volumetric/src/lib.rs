@@ -1,4 +1,13 @@
-//! Deciding, before anything is created, whether a 3D volume can be rendered.
+#![warn(clippy::all)]
+#![forbid(unsafe_code)]
+
+//! The 3D volume stack: raymarch pipelines and shader ([`raymarch`]), voxel
+//! staging, uniforms ([`uniform`]), blue noise ([`blue_noise`]), the
+//! quality-degrade/probe policy ([`degrade`]) and the bridge egui's paint
+//! callbacks march through ([`bridge`]).
+//!
+//! The crate root itself decides, before anything is created, whether a 3D
+//! volume can be rendered at all.
 //!
 //! The volume view's failure mode is worse than a missing feature: the calls that
 //! would fail — `create_texture`, `create_render_pipeline` — return no `Result`,
@@ -34,6 +43,12 @@ pub mod degrade;
 pub mod raymarch;
 #[path = "volume_uniform.rs"]
 pub mod uniform;
+
+/// Shared per-arm fixtures for the budget agreement tests that ride with the
+/// raymarch. The frontend keeps its own twin for the tests that stayed
+/// app-side (WO-RD's rule: a test helper does not cross a crate boundary).
+#[cfg(test)]
+pub(crate) mod budget_arms;
 
 pub use degrade::VolumeSupport;
 
@@ -276,12 +291,14 @@ fn override_from_env_value(value: Option<&str>) -> Option<VolumeSupport> {
 /// ones — including `Limits::downlevel_webgl2_defaults()`, which is the floor the
 /// web build is actually held to.
 ///
-/// `pub(crate)` so `app_state` can hold the limits it *actually requests* to
-/// this floor rather than a hand-built approximation of them. That claim was
-/// prose in the sentence above until
-/// `the_web_limits_this_app_requests_clear_the_volume_probes_floor` connected
-/// the two functions.
-pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
+/// `pub` because the floor is pinned from outside this module by two external
+/// surfaces: `the_web_limits_this_app_requests_clear_the_volume_probes_floor`
+/// (below) composes it with `rustdar_gpu::device::device_limits` — so the
+/// limits the app side *actually requests* are held to this floor rather than
+/// a hand-built approximation of them — and the app side's `AppState::new`
+/// scrape pin holds `probe` (this function's one production caller) in that
+/// request path.
+pub fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
     let grid_axis = VOLUME_GRID_CELLS.iter().copied().max().unwrap_or(0);
     // The grid must fit as well as the floor, so that a device between the two is
     // reported honestly rather than failing later inside a callback. The web arm
@@ -477,7 +494,7 @@ mod tests {
     /// Text rather than a naga parse because this must fail when the *source*
     /// gains a line, including one no pipeline has been built from yet.
     fn declared_by_the_raymarch(wgsl: &str) -> Result<DeclaredBindings, String> {
-        use crate::volume::raymarch::{BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE};
+        use crate::raymarch::{BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE};
 
         let mut tally = DeclaredBindings::default();
         for line in wgsl.lines() {
@@ -572,7 +589,7 @@ mod tests {
     /// the texture-only count that preceded it did to the sampler.
     #[test]
     fn the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares() {
-        use crate::volume::raymarch::VOLUME_SHADER_WGSL;
+        use crate::raymarch::VOLUME_SHADER_WGSL;
 
         let declared = declared_by_the_raymarch(VOLUME_SHADER_WGSL)
             .unwrap_or_else(|why| panic!("the raymarch's bindings do not read: {why}"));
@@ -605,7 +622,7 @@ mod tests {
     /// assertion above fail.
     #[test]
     fn one_more_binding_in_the_shader_is_one_more_in_the_tally() {
-        use crate::volume::raymarch::VOLUME_SHADER_WGSL;
+        use crate::raymarch::VOLUME_SHADER_WGSL;
 
         let shipped = declared_by_the_raymarch(VOLUME_SHADER_WGSL).expect("the shipped shader");
         for (added, expected) in [
@@ -650,7 +667,7 @@ mod tests {
     /// same shape of hole, one class over.
     #[test]
     fn a_binding_the_probe_prices_no_limit_for_fails_the_scan() {
-        use crate::volume::raymarch::VOLUME_SHADER_WGSL;
+        use crate::raymarch::VOLUME_SHADER_WGSL;
 
         for unpriced in [
             "@group(1) @binding(2) var<storage, read> extra: array<f32>;",
@@ -675,9 +692,7 @@ mod tests {
     /// actually needs — refusing devices that can render one perfectly well.
     #[test]
     fn the_blits_own_pair_is_left_out_of_the_raymarchs_tally() {
-        use crate::volume::raymarch::{
-            BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, VOLUME_SHADER_WGSL,
-        };
+        use crate::raymarch::{BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, VOLUME_SHADER_WGSL};
 
         let shipped = declared_by_the_raymarch(VOLUME_SHADER_WGSL).expect("the shipped shader");
         let with_blit = format!(
@@ -952,53 +967,52 @@ mod tests {
         );
     }
 
-    /// `AppState::new` must actually install the latch and run the probe.
+    // The two pins on the app side's *use* of this crate —
+    // `app_state_probes_the_device_and_installs_the_latch` and
+    // `a_surface_loss_is_only_counted_when_a_volume_was_on_screen` — moved to
+    // rustdar-frontend's `app_render::egui_frame_pin_tests` at WO-RV: they
+    // scrape frontend files, and the file a test pins is the crate it lives in.
+
+    /// The limits the app *requests* clear the floor the volume probe applies.
     ///
-    /// Neither is enforced by the type system: `volume_support` could be filled
-    /// in with a literal `Supported` and `install_error_latch` deleted outright,
-    /// and everything would still compile and pass. What would be lost is the
-    /// entire second layer of defence — errors back to panicking, on a device
-    /// nobody checked. `AppState::new` needs a window and a surface, so reading
-    /// the source is the only handle there is.
+    /// [`limits_shortfall`]'s doc says it is testable against
+    /// `downlevel_webgl2_defaults()`, and this crate root does test it against
+    /// that — but nothing tied the figure the probe was exercised with to the
+    /// figure the device request actually produces. They are the same only
+    /// because `device_limits` happens to start from the same call, which is
+    /// precisely the kind of "obviously the same" that this campaign has
+    /// already paid for once. The app side's `AppState::new` requests these
+    /// limits (through `rustdar_gpu::device::request_device`), the device
+    /// grants exactly them, and [`probe`] reads them back off the device — so
+    /// this is the real path, not a restatement. Moved here from the app
+    /// side's `app_state` tests at WO-RV: this crate sees both functions;
+    /// the frontend now sees neither privately.
     #[test]
-    fn app_state_probes_the_device_and_installs_the_latch() {
-        let body = include_str!("app_state.rs")
-            .split_once("pub async fn new(")
-            .and_then(|(_, rest)| rest.split_once("\n    }"))
-            .map(|(body, _)| body)
-            .expect("AppState::new is no longer a method there");
+    fn the_web_limits_this_app_requests_clear_the_volume_probes_floor() {
+        use rustdar_gpu::device::device_limits;
 
-        for call in ["volume::probe(", "volume::install_error_latch("] {
-            assert!(
-                body.contains(call),
-                "AppState::new no longer calls `{call}`, so the volume view's \
-                 pre-check or its error latch is gone"
-            );
-        }
-    }
-
-    /// A lost surface only counts against the volume when one was on screen.
-    ///
-    /// The gate is the property, not the call: counting every surface loss would
-    /// retire 3D after two unplugged monitors on a machine whose GPU never
-    /// complained. `present_frame` needs a real swapchain, so this reads source.
-    #[test]
-    fn a_surface_loss_is_only_counted_when_a_volume_was_on_screen() {
-        let body = include_str!("app_render.rs")
-            .split_once("pub(super) fn present_frame(")
-            .and_then(|(_, rest)| rest.split_once("\n    }"))
-            .map(|(body, _)| body)
-            .expect("present_frame is no longer a method there");
-
-        let call = body
-            .find("note_surface_loss_with_volume(")
-            .expect("present_frame no longer counts surface losses against the volume view");
-        let preamble = &body[..call];
-        assert!(
-            preamble.contains("rustdar_radar::types::RenderView::Volume"),
-            "present_frame counts a surface loss against the volume view without \
-             first checking that a volume pane was on screen"
+        // The least capable browser this build targets: an adapter reporting
+        // exactly the WebGL2 guarantee and not a pixel more.
+        let barest = wgpu::Limits::downlevel_webgl2_defaults();
+        assert_eq!(
+            limits_shortfall(&device_limits(barest, true)),
+            None,
+            "the volume probe rejects the very limits this app asks a browser \
+             for, so the 3D view could never be available in one"
         );
+
+        // And on a capable browser, where `using_resolution` lifts the 3D
+        // texture bound well past the grid.
+        assert_eq!(
+            limits_shortfall(&device_limits(wgpu::Limits::default(), true)),
+            None
+        );
+
+        // Native asks for the adapter's own limits, so any adapter that could
+        // run the app at all clears the floor too.
+        for adapter in [wgpu::Limits::default(), wgpu::Limits::downlevel_defaults()] {
+            assert_eq!(limits_shortfall(&device_limits(adapter, false)), None);
+        }
     }
 
     /// The probe agrees with a real adapter, and installing the latch is safe.
@@ -1019,8 +1033,8 @@ mod tests {
     /// with no graphics hardware. Locally:
     ///
     /// ```text
-    /// cargo test -p rustdar-frontend --lib \
-    ///     volume::tests::a_real_adapter_supports_the_volume_format \
+    /// cargo test -p rustdar-volumetric --lib \
+    ///     tests::a_real_adapter_supports_the_volume_format \
     ///     -- --ignored --exact --nocapture
     /// ```
     #[test]

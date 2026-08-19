@@ -9,7 +9,7 @@
 //! * `pop_error_scope()` is a `Future`, and a browser cannot block on a future,
 //!   so error scopes cannot turn any of it back into an inline `Result`.
 //! * A WebGL2 context loss is reported as a lost surface, and rustdar's response
-//!   is to drop the whole [`crate::app_state::AppState`] and rebuild it.
+//!   is to drop the app side’s whole `AppState` and rebuild it.
 //!
 //! That last one is why **every counter here is a module-level `static` rather
 //! than a field on `AppState`**. `app_render::present_frame`'s

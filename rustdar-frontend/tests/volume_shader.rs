@@ -48,7 +48,7 @@
 use naga::back::glsl;
 use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use rustdar_frontend::volume::raymarch::{
+use rustdar_volumetric::raymarch::{
     BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_FLOOR_SAMPLER, BINDING_FLOOR_TEXTURE,
     BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_JITTER_TEXTURE, BINDING_LUT_SAMPLER,
     BINDING_LUT_TEXTURE, BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR,

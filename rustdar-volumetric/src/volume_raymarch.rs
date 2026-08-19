@@ -63,9 +63,9 @@
 
 use egui_wgpu::wgpu;
 
-use crate::volume::VOLUME_TEXTURE_FORMAT;
-use crate::volume::blue_noise::{BLUE_NOISE_EDGE, blue_noise_tile};
-use crate::volume::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
+use crate::VOLUME_TEXTURE_FORMAT;
+use crate::blue_noise::{BLUE_NOISE_EDGE, blue_noise_tile};
+use crate::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
 use rustdar_device_profile::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
 use rustdar_gpu::egui_renderer::AttachmentConfig;
 use staging::VolumeStaging;

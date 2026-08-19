@@ -96,10 +96,10 @@ use rustdar_egui::volume_alpha::AlphaCurve;
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter, view_for};
 use rustdar_radar::voxel::VoxelGrid;
 
-use crate::volume::VolumeSupport;
-use crate::volume::raymarch::staging::VolumeStaging;
-use crate::volume::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
-use crate::volume::uniform::VolumeUniform;
+use crate::VolumeSupport;
+use crate::raymarch::staging::VolumeStaging;
+use crate::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
+use crate::uniform::VolumeUniform;
 use rustdar_device_profile::quality::VolumeQuality;
 use rustdar_gpu::egui_renderer::AttachmentConfig;
 
@@ -498,7 +498,7 @@ impl StoredVolume {
     /// nothing uploaded.
     ///
     /// Computed from the grid's own shape through
-    /// [`crate::volume::raymarch::resident_grid_bytes`] — what the upload
+    /// [`crate::raymarch::resident_grid_bytes`] — what the upload
     /// path's descriptors actually reserve — rather than from a
     /// per-target constant, because the eviction has to measure what is
     /// actually resident, and a runtime step-down can hand the store a grid
@@ -521,7 +521,7 @@ impl StoredVolume {
         else {
             return 0;
         };
-        crate::volume::raymarch::resident_grid_bytes(cells).unwrap_or(0)
+        crate::raymarch::resident_grid_bytes(cells).unwrap_or(0)
     }
 }
 
@@ -1213,7 +1213,7 @@ impl VolumePainter for BridgeVolumePainter {
         // the process-global latch that `install_error_latch` and the two-strike
         // surface-loss counter write, and neither of those had happened when
         // this painter was built.
-        if let Some(why) = crate::volume::support(&self.probed).reason() {
+        if let Some(why) = crate::support(&self.probed).reason() {
             return VolumePaint::Empty(why.to_owned());
         }
 
@@ -1751,8 +1751,8 @@ impl DrawnBox {
             x_km: grid.x_range_km(),
             y_km: grid.y_range_km(),
             z_km_msl: grid.z_range_km_msl(),
-            scale: crate::volume::uniform::IDENTITY_GRID_FROM_BOX.0,
-            offset: crate::volume::uniform::IDENTITY_GRID_FROM_BOX.1,
+            scale: crate::uniform::IDENTITY_GRID_FROM_BOX.0,
+            offset: crate::uniform::IDENTITY_GRID_FROM_BOX.1,
             bounded: false,
         }
     }
@@ -1996,7 +1996,7 @@ pub struct VolumeResources {
     /// and mobile — for the session. A machine
     /// that never opens a 3D pane never leaves `None` and pays nothing; one that
     /// opens and closes it returns there.
-    mirror: Option<crate::volume::raymarch::PaneMirror>,
+    mirror: Option<crate::raymarch::PaneMirror>,
     /// The host memory every grid upload widens its index plane into, held
     /// across uploads instead of allocated inside each one.
     ///

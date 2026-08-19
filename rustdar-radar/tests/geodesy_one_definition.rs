@@ -185,7 +185,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     // ── The one hand-written copy outside Rust ──────────────────────────
     (
-        "rustdar-frontend/src/volume.wgsl",
+        "rustdar-volumetric/src/volume.wgsl",
         "const KM_PER_DEGREE_LAT: f32 = 111.194927;",
         "WGSL cannot read a Rust constant. This is the only copy of the \
          figure anywhere, and `rustdar-frontend`'s \

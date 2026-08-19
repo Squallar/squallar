@@ -56,7 +56,7 @@
 //! void-and-cluster "runs in well under a millisecond once per
 //! `VolumePipelines`". **That was wrong by a factor of ten natively and thirty
 //! in a browser.** What hid it is that the `OnceLock` was filled from the
-//! *first* [`crate::volume::raymarch::VolumePipelines::upload_volume_at`],
+//! *first* [`crate::raymarch::VolumePipelines::upload_volume_at`],
 //! which runs on the frame thread — so the cost was paid once, inside the frame
 //! that first shows a volume, where a one-off lands on no steady-state figure
 //! at all.

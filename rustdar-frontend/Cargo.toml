@@ -25,6 +25,9 @@ rustdar-device-profile = { workspace = true }
 # guard until WO-RV land 3 moves them into rustdar-gpu. The redundancy is
 # deliberate and temporary.
 rustdar-gpu = { workspace = true }
+# The 3D volume stack: probe/latch, raymarch, staging, uniforms, blue noise,
+# degrade policy and the bridge moved down at WO-RV.
+rustdar-volumetric = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 # The job-boundary vocabulary (DescribedJob, JobCodec, JobGeometry) and the

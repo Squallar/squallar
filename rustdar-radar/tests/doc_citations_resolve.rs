@@ -160,13 +160,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // Sentence-shaped by accident of the upstream API. They resolve for a
     // reader and cannot resolve for this scan, which only reads this tree.
     (
-        "rustdar-frontend/src/volume.rs",
+        "rustdar-volumetric/src/lib.rs",
         "max_uniform_buffer_binding_size",
         "`wgpu::Limits`' own field. The doc is explaining which device limit \
          the uniform block is sized against.",
     ),
     (
-        "rustdar-frontend/src/volume.rs",
+        "rustdar-volumetric/src/lib.rs",
         "max_sampled_textures_per_shader_stage",
         "`wgpu::Limits`' own field, named where the probe's scan explains \
          which limit each binding class is priced against. Its sibling \
@@ -175,7 +175,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          all three.",
     ),
     (
-        "rustdar-frontend/src/volume.rs",
+        "rustdar-volumetric/src/lib.rs",
         "max_samplers_per_shader_stage",
         "As above. This is the limit whose constant was undercounted at 2 \
          against the raymarch's three samplers, so the paragraph that fixed it \
@@ -294,7 +294,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          successor cannot explain why it exists without naming it.",
     ),
     (
-        "rustdar-frontend/src/volume_bridge/tests.rs",
+        "rustdar-volumetric/src/volume_bridge/tests.rs",
         "no_data_blends_at_ramp_bottom",
         "A sketch of the shader code that used to name it, in the comment \
          above the assertion that the shader no longer does. The live check is \
@@ -302,7 +302,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          read by this scan.",
     ),
     (
-        "rustdar-frontend/src/volume_bridge/tests.rs",
+        "rustdar-volumetric/src/volume_bridge/tests.rs",
         "only_reflectivity_clears_the_fade_bar",
         "The successor's doc calls itself \"the deliberate flip of the \
          original\" and quotes that original's own words back. The name is the \

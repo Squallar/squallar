@@ -132,14 +132,14 @@ use egui_wgpu::wgpu;
 use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
-use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use rustdar_frontend::volume::raymarch::{FLOOR_FORMAT, VolumePipelines};
-use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_gpu::egui_renderer::AttachmentConfig;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{
     HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels_with_motion, default_shape,
 };
+use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
+use rustdar_volumetric::raymarch::{FLOOR_FORMAT, VolumePipelines};
+use rustdar_volumetric::uniform::VolumeUniform;
 
 /// The volume reader and the site it learns, shared with the other two live
 /// instruments in this directory. See `live_volume/mod.rs` for why the site
@@ -245,7 +245,7 @@ fn render_a_real_volume_mask() {
     // because "production" is the bridge's configuration, and a harness that
     // rendered the hard-threshold instrument configuration in colour would
     // show an edge the application does not draw.
-    uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
+    uniform.extinction_per_km = rustdar_volumetric::uniform::DEFAULT_EXTINCTION_PER_KM;
     uniform.gradient_shading = true;
     // The bridge's own cell-size taper, not the ceiling constant: production
     // marches a grid this coarse at exactly this level, and a harness pinned
@@ -255,12 +255,12 @@ fn render_a_real_volume_mask() {
         .map(|axis| box_size_km[axis] / grid_dims[axis] as f32)
         .fold(0.0f32, f32::max);
     uniform.reconstruction_lod =
-        rustdar_frontend::volume::bridge::cloud_reconstruction_lod_for(largest_cell_km);
-    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+        rustdar_volumetric::bridge::cloud_reconstruction_lod_for(largest_cell_km);
+    uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
     uniform.vertical_exaggeration = exaggeration;
     uniform.empty_index_threshold =
-        rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
-    uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
+        rustdar_volumetric::bridge::empty_index_threshold_for(grid.fade_band());
+    uniform.edge_soft_width = rustdar_volumetric::bridge::EDGE_SOFT_WIDTH;
     let colour_pixels = raymarch_once(
         &device,
         &queue,
@@ -474,7 +474,7 @@ fn render_a_real_volume_mask() {
         100.0 * above_cut as f64 / shape.cells() as f64,
         size[0],
         size[1],
-        rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM,
+        rustdar_volumetric::uniform::DEFAULT_EXTINCTION_PER_KM,
         parsed_or("MASK_LOD", 0.0f32),
         parsed_or("MASK_STEP", 1.0f32),
         uniform.reconstruction_lod,
@@ -681,16 +681,16 @@ fn measure_boundary_honesty_and_smoothness() {
     let largest_cell_km = (0..3)
         .map(|axis| box_size_km[axis] / grid_dims[axis] as f32)
         .fold(0.0f32, f32::max);
-    uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
+    uniform.extinction_per_km = rustdar_volumetric::uniform::DEFAULT_EXTINCTION_PER_KM;
     uniform.gradient_shading = true;
     uniform.reconstruction_lod = parsed_or(
         "COLOUR_LOD",
-        rustdar_frontend::volume::bridge::cloud_reconstruction_lod_for(largest_cell_km),
+        rustdar_volumetric::bridge::cloud_reconstruction_lod_for(largest_cell_km),
     );
-    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
     uniform.empty_index_threshold =
-        rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
-    uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
+        rustdar_volumetric::bridge::empty_index_threshold_for(grid.fade_band());
+    uniform.edge_soft_width = rustdar_volumetric::bridge::EDGE_SOFT_WIDTH;
     let colour = raymarch_once(
         &device,
         &queue,
