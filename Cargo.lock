@@ -4176,7 +4176,8 @@ dependencies = [
  "log",
  "pollster",
  "rustdar-frontend",
- "rustdar-gps",
+ "rustdar-geo",
+ "rustdar-location",
  "rustdar-platform",
  "rustls-platform-verifier",
  "winit",
@@ -4204,8 +4205,9 @@ dependencies = [
  "reqwest 0.13.4",
  "rustdar-device-profile",
  "rustdar-geo",
- "rustdar-gps",
  "rustdar-kv",
+ "rustdar-location",
+ "rustdar-nmea-serial",
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-units",
@@ -4236,8 +4238,9 @@ dependencies = [
  "rustdar-device-profile",
  "rustdar-egui",
  "rustdar-geo",
- "rustdar-gps",
  "rustdar-kv",
+ "rustdar-location",
+ "rustdar-nmea-serial",
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-source",
@@ -4259,22 +4262,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustdar-gps"
+name = "rustdar-kv"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "rustdar-location"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
+ "rustdar-geo",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustdar-nmea-serial"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "log",
  "nmea",
+ "rustdar-location",
  "serde",
  "serde_json",
  "serialport",
-]
-
-[[package]]
-name = "rustdar-kv"
-version = "0.1.0"
-dependencies = [
- "serde_json",
 ]
 
 [[package]]
@@ -4317,8 +4332,9 @@ dependencies = [
  "pollster",
  "rustdar-egui",
  "rustdar-frontend",
- "rustdar-gps",
  "rustdar-kv",
+ "rustdar-location",
+ "rustdar-nmea-serial",
  "rustdar-radar",
  "walkers",
  "windows",
@@ -4380,8 +4396,8 @@ dependencies = [
  "rustdar-egui",
  "rustdar-frontend",
  "rustdar-geo",
- "rustdar-gps",
  "rustdar-kv",
+ "rustdar-location",
  "rustdar-radar",
  "rustdar-source",
  "serde_json",

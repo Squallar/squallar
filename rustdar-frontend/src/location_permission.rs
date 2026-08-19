@@ -42,8 +42,8 @@
 //! [`PlatformBridge::request_location`]: crate::platform::PlatformBridge::request_location
 
 use crate::platform::PlatformBridge;
-use rustdar_gps::LocationPermission;
 use rustdar_kv::KvStore;
+use rustdar_location::LocationPermission;
 use std::time::Duration;
 use web_time::Instant;
 

@@ -1,5 +1,5 @@
 use super::*;
-use rustdar_gps::FixQuality;
+use rustdar_location::FixQuality;
 use std::sync::{Arc, Mutex, PoisonError};
 
 // Every test here runs with no session bus, no portal and no geoclue. That
@@ -155,8 +155,8 @@ fn measured() -> Reading {
 fn the_reading_this_machine_sends_becomes_a_device_fix_with_its_accuracy() {
     let fix = fix_from_reading(&measured()).expect("a position");
 
-    assert_eq!(fix.latitude, 35.4689);
-    assert_eq!(fix.longitude, -97.5195);
+    assert_eq!(fix.point.lat, 35.4689);
+    assert_eq!(fix.point.lon, -97.5195);
     assert_eq!(fix.accuracy_m, Some(25_000.0));
     assert_eq!(fix.fix_quality, FixQuality::Device);
     assert_eq!(fix.altitude_m, None);
@@ -290,8 +290,8 @@ fn the_payload_the_portal_sends_decodes_into_the_fix_this_machine_reported() {
     assert_eq!(Reading::from(&location), measured());
 
     let fix = fix_from_location(&location).expect("a position");
-    assert_eq!(fix.latitude, 35.4689);
-    assert_eq!(fix.longitude, -97.5195);
+    assert_eq!(fix.point.lat, 35.4689);
+    assert_eq!(fix.point.lon, -97.5195);
     assert_eq!(fix.accuracy_m, Some(25_000.0));
     assert_eq!(fix.fix_quality, FixQuality::Device);
 }

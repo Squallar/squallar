@@ -46,8 +46,8 @@
 //! Measured on the development machine, through the portal: **25 km** accuracy,
 //! described by geoclue as `GeoIP (ichnaea)`. That is an IP lookup, not a GPS
 //! one. Every fix therefore leaves here as
-//! [`FixQuality::Device`](rustdar_gps::FixQuality::Device) carrying its
-//! [`accuracy_m`](GpsFix::accuracy_m): the site-upgrade gate reads that field,
+//! [`FixQuality::Device`](rustdar_location::FixQuality::Device) carrying its
+//! [`accuracy_m`](Fix::accuracy_m): the site-upgrade gate reads that field,
 //! and a 25 km circle is comfortably good enough to pick between WSR-88D sites
 //! ~200 km apart while being useless for anything finer.
 //!
@@ -87,7 +87,7 @@ use ashpd::desktop::location::{Accuracy, Location, LocationProxy};
 /// graph shares, in exchange for no code at all.
 use ashpd::zbus;
 
-use rustdar_gps::{GpsFix, LocationPermission};
+use rustdar_location::{Fix, LocationPermission};
 
 use super::{OsLocationProvider, OsLocationSink};
 
@@ -121,7 +121,7 @@ const ALTITUDE_UNKNOWN: f64 = f64::MIN;
 ///
 /// [`start`]: OsLocationProvider::start
 /// [`request`]: OsLocationProvider::request
-/// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
+/// [`Prompt`]: rustdar_location::LocationPermission::Prompt
 pub struct OsLocationReader {
     /// Cloned into each session. Cheap: a `Sender` and two `Arc`s.
     sink: OsLocationSink,
@@ -132,7 +132,7 @@ pub struct OsLocationReader {
 ///
 /// Same shape as [`SerialGpsReader`]: a value whose drop is the off switch.
 ///
-/// [`SerialGpsReader`]: rustdar_gps::SerialGpsReader
+/// [`SerialGpsReader`]: rustdar_nmea_serial::SerialGpsReader
 struct Session {
     /// The reader's end of the session thread's cancellation.
     ///
@@ -490,8 +490,8 @@ fn publish(location: &Location, out: &OsLocationSink) -> bool {
     };
     log::debug!(
         "OS location fix: {:.4}, {:.4} (±{} m){}",
-        fix.latitude,
-        fix.longitude,
+        fix.point.lat,
+        fix.point.lon,
         fix.accuracy_m.map_or("?".to_owned(), |a| format!("{a:.0}")),
         location
             .description()
@@ -656,7 +656,7 @@ impl From<&Location> for Reading {
     }
 }
 
-/// A portal location as a [`GpsFix`], or `None` when it does not carry a usable
+/// A portal location as a [`Fix`], or `None` when it does not carry a usable
 /// position at all.
 ///
 /// **`Description` is not read into the fix.** The interface says outright that
@@ -664,7 +664,7 @@ impl From<&Location> for Reading {
 /// and nothing in this app has a place to put a string. It is logged, because
 /// on this machine it is the one field that says whether the position came from
 /// an IP lookup or a Wi-Fi one.
-fn fix_from_location(location: &Location) -> Option<GpsFix> {
+fn fix_from_location(location: &Location) -> Option<Fix> {
     fix_from_reading(&Reading::from(location))
 }
 
@@ -679,17 +679,17 @@ fn fix_from_location(location: &Location) -> Option<GpsFix> {
 /// in the UI beside a position that came from a router lookup. The accuracy is
 /// not discarded — it travels in `accuracy_m`, which is what the
 /// provisional-site upgrade actually gates on.
-fn fix_from_reading(reading: &Reading) -> Option<GpsFix> {
+fn fix_from_reading(reading: &Reading) -> Option<Fix> {
     if !reading.latitude.is_finite() || !reading.longitude.is_finite() {
         return None;
     }
-    Some(GpsFix {
+    Some(Fix {
         altitude_m: reading.altitude_m.and_then(decode_altitude),
         speed_mps: reading.speed_mps.and_then(decode_speed),
         heading_deg: reading.heading_deg.and_then(decode_heading),
         accuracy_m: decode_accuracy(reading.accuracy_m),
         timestamp: timestamp_from_epoch(reading.timestamp_s),
-        ..GpsFix::from_device_position(reading.latitude, reading.longitude)
+        ..Fix::from_device_position(reading.latitude, reading.longitude)
     })
 }
 

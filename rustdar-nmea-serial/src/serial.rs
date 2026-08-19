@@ -4,9 +4,9 @@ use std::io::BufRead;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::config::GpsConfig;
+use crate::config::SerialConfig;
 use crate::nmea_parser::NmeaState;
-use crate::types::GpsFix;
+use rustdar_location::Fix;
 
 /// USB VID/PIDs of common GPS chipsets and the USB-serial adapters GPS modules
 /// are usually wired through. `None` PID matches every product from that vendor.
@@ -140,8 +140,8 @@ impl SerialGpsReader {
     /// `Send` and not `Sync`, because the closure is moved into one thread and
     /// shared with none.
     pub fn start(
-        config: &GpsConfig,
-        fix_sender: mpsc::Sender<GpsFix>,
+        config: &SerialConfig,
+        fix_sender: mpsc::Sender<Fix>,
         wake: impl Fn() + Send + 'static,
     ) -> Option<Self> {
         let configured_port = config.port_path.clone();
@@ -180,7 +180,7 @@ impl SerialGpsReader {
 /// gets separated from its send is a fix that sits in the channel until
 /// something else draws a frame — the exact failure this parameter exists for.
 /// `false` means the consumer is gone and the thread should stop.
-fn deliver(fix: GpsFix, fix_sender: &mpsc::Sender<GpsFix>, wake: &impl Fn()) -> bool {
+fn deliver(fix: Fix, fix_sender: &mpsc::Sender<Fix>, wake: &impl Fn()) -> bool {
     if fix_sender.send(fix).is_err() {
         return false;
     }
@@ -222,7 +222,7 @@ fn should_stop(stop_rx: &mpsc::Receiver<()>) -> bool {
 fn gps_read_loop(
     port_name: &str,
     baud: u32,
-    fix_sender: &mpsc::Sender<GpsFix>,
+    fix_sender: &mpsc::Sender<Fix>,
     stop_rx: &mpsc::Receiver<()>,
     wake: &impl Fn(),
 ) {
@@ -356,9 +356,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (woken, wake) = counted();
 
-        assert!(deliver(GpsFix::from_lat_lon(35.25, -97.5), &tx, &wake));
+        assert!(deliver(Fix::from_lat_lon(35.25, -97.5), &tx, &wake));
 
-        assert_eq!(rx.try_recv().map(|f| f.latitude), Ok(35.25));
+        assert_eq!(rx.try_recv().map(|f| f.point.lat), Ok(35.25));
         assert_eq!(
             woke(&woken),
             1,
@@ -376,7 +376,7 @@ mod tests {
         let (woken, wake) = counted();
 
         assert!(
-            !deliver(GpsFix::from_lat_lon(35.25, -97.5), &tx, &wake),
+            !deliver(Fix::from_lat_lon(35.25, -97.5), &tx, &wake),
             "a closed channel must stop the reader"
         );
         assert_eq!(woke(&woken), 0, "woke the loop for a fix nothing received");

@@ -338,9 +338,9 @@ fn should_show_permission_rationale() -> Option<bool> {
 ///
 /// [`PlatformBridge::location_permission`]: rustdar_frontend::platform::PlatformBridge::location_permission
 /// [`LocationHooks`]: rustdar_frontend::platform::LocationHooks
-fn location_permission_status(attempts: u8) -> rustdar_gps::LocationPermission {
+fn location_permission_status(attempts: u8) -> rustdar_location::LocationPermission {
     if has_location_permission() {
-        return rustdar_gps::LocationPermission::Granted;
+        return rustdar_location::LocationPermission::Granted;
     }
     // `has_location_permission` folds "no" and "could not ask" into the same
     // `false`, so the rationale call below doubles as the reachability probe. It
@@ -357,12 +357,12 @@ fn location_permission_status(attempts: u8) -> rustdar_gps::LocationPermission {
 /// Split out for the same reason [`provider_fix_quality`] is: everything above
 /// it is JNI and everything in it is a table, and the table is where the three
 /// mistakes live. See [`location_permission_status`] for what each row means and
-/// why `None` is [`Unknown`](rustdar_gps::LocationPermission::Unknown).
+/// why `None` is [`Unknown`](rustdar_location::LocationPermission::Unknown).
 fn permission_from_rationale(
     rationale: Option<bool>,
     attempts: u8,
-) -> rustdar_gps::LocationPermission {
-    use rustdar_gps::LocationPermission;
+) -> rustdar_location::LocationPermission {
+    use rustdar_location::LocationPermission;
 
     match (rationale, attempts) {
         // Could not ask. First frames of every launch; means "wait".
@@ -434,13 +434,13 @@ fn location_active() -> bool {
 }
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
-/// Returns a [`GpsFix`] on success or `None` if unavailable.
+/// Returns a [`rustdar_location::Fix`] on success or `None` if unavailable.
 ///
 /// "Last known" is whatever the providers last produced for *any* client;
 /// LocationHelper's subscription (see [`start_location_updates`]) is what
 /// keeps them producing once permission is granted, and this poll doubles as
 /// the fallback when that subscription could not be established.
-fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
+fn get_last_known_location() -> Option<rustdar_location::Fix> {
     with_activity(last_known_location_with).flatten()
 }
 
@@ -459,11 +459,11 @@ fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
 /// Split out of [`last_known_location_with`] for the reason `fix_from_coords` is
 /// split out on the web: it is a decision, the rest of that function is nine JNI
 /// calls, and only one of the two can be checked without a device.
-fn provider_fix_quality(provider: &str) -> rustdar_gps::FixQuality {
+fn provider_fix_quality(provider: &str) -> rustdar_location::FixQuality {
     if provider == "gps" {
-        rustdar_gps::FixQuality::Gps
+        rustdar_location::FixQuality::Gps
     } else {
-        rustdar_gps::FixQuality::Device
+        rustdar_location::FixQuality::Device
     }
 }
 
@@ -472,7 +472,7 @@ fn provider_fix_quality(provider: &str) -> rustdar_gps::FixQuality {
 fn last_known_location_with(
     env: &mut jni::Env<'_>,
     activity: &jni::objects::JObject<'_>,
-) -> Option<rustdar_gps::GpsFix> {
+) -> Option<rustdar_location::Fix> {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
@@ -560,7 +560,7 @@ fn last_known_location_with(
             })
             .map(|b| b as f64);
 
-        // The 68% confidence radius in metres, which is what `GpsFix` wants and
+        // The 68% confidence radius in metres, which is what `Fix` wants and
         // what `Location.getAccuracy()` documents itself as. Guarded by
         // `hasAccuracy()` like every other optional above: a `Location` without
         // one returns 0.0, and 0 m would read as a perfect fix rather than an
@@ -576,9 +576,8 @@ fn last_known_location_with(
             })
             .map(|a| a as f64);
 
-        return Some(rustdar_gps::GpsFix {
-            latitude: lat,
-            longitude: lon,
+        return Some(rustdar_location::Fix {
+            point: rustdar_geo::GeoPoint { lat, lon },
             altitude_m,
             speed_mps,
             heading_deg,
@@ -726,7 +725,7 @@ fn stop_location_updates() {
 /// `rustdar-frontend` is not a dependency at all (see Cargo.toml) and the type
 /// cannot be named.
 fn start_location_thread(
-    sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>,
+    sender: std::sync::mpsc::Sender<rustdar_location::Fix>,
     wake: impl Fn() + Send + 'static,
 ) {
     std::thread::Builder::new()
@@ -1641,7 +1640,7 @@ fn android_main(app: AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_gps::{FixQuality, LocationPermission};
+    use rustdar_location::{FixQuality, LocationPermission};
 
     // Everything here runs on the *host*, under the `jni-typecheck` feature that
     // widens this crate's own `cfg` (see the top of the file), so it needs

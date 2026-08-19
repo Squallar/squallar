@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system deps
         # libudev-dev for the same reason the `test` job needs it:
-        # rustdar-platform enables rustdar-gps/serial unconditionally off
+        # rustdar-platform enables rustdar-nmea-serial/serial unconditionally off
         # Android and iOS. mesa-vulkan-drivers is what carries lavapipe.
         run: |
           sudo apt-get update
@@ -180,7 +180,7 @@ jobs:
       #
       # Cheap here in a way it is not on the cross rows in build.yaml:
       # `jni-typecheck` is the only feature this actually adds on Linux. The
-      # workspace's other two, rustdar-gps/serial and rustdar-egui/gps-serial,
+      # workspace's other two, rustdar-nmea-serial/serial and rustdar-egui/gps-serial,
       # rustdar-platform already enables unconditionally for
       # `cfg(not(any(target_os = "android", target_os = "ios")))` -- which is
       # what the libudev-dev above is for, with or without this flag.

@@ -123,7 +123,7 @@ jobs:
       # ungated test module of those crates fails this row; put it behind the
       # same cfg.
       #
-      # No `--all-features` here: that enables rustdar-gps/serial, which links
+      # No `--all-features` here: that enables rustdar-nmea-serial/serial, which links
       # IOKit.
       #
       # Note `--all-targets` also compiles rustdar-web/tests/{pwa_assets,

@@ -80,7 +80,7 @@
 //! `Launcher` — is safe Rust in windows-rs 0.62, which matters because this
 //! crate is `#![deny(unsafe_code)]`.
 
-use rustdar_gps::{FixQuality, GpsFix, LocationPermission};
+use rustdar_location::{Fix, FixQuality, LocationPermission};
 
 // ── The values this file maps between ───────────────────────────────────
 //
@@ -338,7 +338,7 @@ pub fn reference_value<R, T, E>(
     field.ok().and_then(|reference| value(reference).ok())
 }
 
-/// Build a [`GpsFix`] from what a `Geocoordinate` reports.
+/// Build a [`Fix`] from what a `Geocoordinate` reports.
 ///
 /// Separated from the WinRT reads for the reason the module note gives: this is
 /// where a swapped latitude and longitude, or an accuracy landing in the
@@ -349,7 +349,7 @@ pub fn reference_value<R, T, E>(
 /// `accuracy_m` is the number every consumer here actually reads.
 ///
 /// `timestamp` stays `None` too, matching the browser bridge. Windows does
-/// report one, but nothing in the app reads `GpsFix::timestamp` from a
+/// report one, but nothing in the app reads `Fix::timestamp` from a
 /// non-serial source: the settings readout deliberately uses when the fix
 /// *arrived* rather than when it was measured.
 pub fn fix_from_coordinate(
@@ -360,8 +360,8 @@ pub fn fix_from_coordinate(
     heading_deg: Option<f64>,
     speed_mps: Option<f64>,
     position_source: i32,
-) -> GpsFix {
-    GpsFix {
+) -> Fix {
+    Fix {
         altitude_m,
         speed_mps,
         heading_deg,
@@ -370,7 +370,7 @@ pub fn fix_from_coordinate(
         // `from_device_position` decides what a fused platform fix is; the
         // quality above is the one field this source can say more about than it
         // can.
-        ..GpsFix::from_device_position(latitude, longitude)
+        ..Fix::from_device_position(latitude, longitude)
     }
 }
 
@@ -405,7 +405,7 @@ mod live {
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
     use std::time::Duration;
 
-    use rustdar_gps::GpsFix;
+    use rustdar_location::Fix;
     // `::windows`, because this module's own parent is called `windows` too.
     use ::windows::Devices::Geolocation::{
         Geolocator, PositionAccuracy, PositionChangedEventArgs, StatusChangedEventArgs,
@@ -493,7 +493,7 @@ mod live {
         RequestAccess,
         /// Subscribe `PositionChanged` and start pushing fixes.
         StartDelivery {
-            fixes: Sender<GpsFix>,
+            fixes: Sender<Fix>,
             wake: RedrawWake,
         },
         /// Unsubscribe.
@@ -562,7 +562,7 @@ mod live {
         ///
         /// Returns immediately, and the first `CheckAccess` has not happened
         /// yet, so the bridge's permission stays
-        /// [`Unknown`](rustdar_gps::LocationPermission::Unknown) for a moment — which the
+        /// [`Unknown`](rustdar_location::LocationPermission::Unknown) for a moment — which the
         /// gate is built to wait through, and is why `Unknown` is a state at
         /// all. This is the one arm that deliberately leaves the initial report
         /// unmade.
@@ -827,7 +827,7 @@ mod live {
 
     /// Build the `Geolocator` and subscribe. Runs on the worker, because a
     /// delegate has to be registered on the thread that owns the apartment.
-    fn start_delivery(fixes: Sender<GpsFix>, wake: RedrawWake) -> Option<Delivery> {
+    fn start_delivery(fixes: Sender<Fix>, wake: RedrawWake) -> Option<Delivery> {
         let geolocator = match Geolocator::new() {
             Ok(geolocator) => geolocator,
             Err(e) => {
@@ -1189,8 +1189,8 @@ mod tests {
     fn a_windows_coordinate_becomes_a_fix_with_its_fields_in_the_right_columns() {
         let fix = fix_from_coordinate(35.25, -97.5, 65.0, Some(390.0), Some(271.5), Some(3.5), 2);
 
-        assert_eq!(fix.latitude, 35.25);
-        assert_eq!(fix.longitude, -97.5);
+        assert_eq!(fix.point.lat, 35.25);
+        assert_eq!(fix.point.lon, -97.5);
         assert_eq!(fix.accuracy_m, Some(65.0));
         assert_eq!(fix.altitude_m, Some(390.0));
         assert_eq!(fix.heading_deg, Some(271.5));

@@ -28,10 +28,11 @@ rustdar-overlays = { workspace = true }
 rustdar-source = { workspace = true }
 rustdar-geo = { workspace = true }
 rustdar-kv = { workspace = true }
-# Types only (GpsFix, GpsConfig) — nothing here touches the serial reader, so
-# this crate stays free of the `serial` feature. The settings pane that does use
-# it turns on rustdar-egui/gps-serial instead, which is where the gate belongs.
-rustdar-gps = { workspace = true }
+# SerialConfig only — the reader stays behind nmea-serial's `serial` feature,
+# which rustdar-egui/gps-serial turns on. The settings pane that does use the
+# reader is where the gate belongs; this crate stays free of it.
+rustdar-location = { workspace = true }
+rustdar-nmea-serial = { workspace = true }
 # `json` only -- see the note in rustdar-overlays: `default` would re-enable
 # `default-tls` (= platform verifier + aws-lc-rs) and undo the aws-lc-sys removal.
 reqwest = { workspace = true, features = ["json"] }

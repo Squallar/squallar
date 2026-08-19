@@ -148,7 +148,8 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     let saved = gui.ui_config_json().expect("serializable");
     let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
     assert_eq!(
-        v["config_version"], 1,
+        v["config_version"],
+        u64::from(super::migrate::CONFIG_VERSION),
         "the save describes itself as this build's format",
     );
     assert_eq!(
@@ -262,5 +263,70 @@ fn a_truncated_file_is_the_one_remaining_whole_file_refusal() {
     assert_eq!(
         gui.loop_lookback_secs, 3600,
         "the refused load left the defaults untouched",
+    );
+}
+
+/// The v1 → v2 `gps_config` split (WO-RL-1), proven on a file a v1 build
+/// actually could have written: port and baud land under `serial_config`,
+/// `heading_source` becomes its own top-level key, and a member inside the
+/// old container that this build cannot name rides the rename **verbatim** —
+/// the step is a pure `Value` edit, and a rewrite that parsed into the new
+/// types would shed it (the armor this fixture exists to keep).
+#[test]
+fn a_v1_gps_config_splits_into_serial_config_and_a_root_heading() {
+    let fixture = include_str!("fixtures/gps_split_v1.json");
+
+    // The step itself, at `Value` level: the unknown member must survive the
+    // walk, which is only provable before the typed load fields it away.
+    let mut tree: serde_json::Value = serde_json::from_str(fixture).expect("the fixture is JSON");
+    super::migrate::migrate_to_current(&mut tree);
+    assert!(
+        tree.get("gps_config").is_none(),
+        "the old container must not survive beside the new one",
+    );
+    assert_eq!(tree["serial_config"]["port_path"], "/dev/ttyUSB0");
+    assert_eq!(tree["serial_config"]["baud_rate"], 4800);
+    assert_eq!(
+        tree["heading_source"], "CompassOnly",
+        "heading choice moves to the root — it matters on every platform",
+    );
+    assert!(
+        tree["serial_config"].get("heading_source").is_none(),
+        "the moved member must not also stay behind",
+    );
+    assert_eq!(
+        tree["serial_config"]["dgps_beacon_hz"],
+        serde_json::json!(310.5),
+        "a member this build cannot name rides the rename verbatim — the \
+         migration is a pure Value edit, never a parse",
+    );
+
+    // The whole path: load, and reach the save fixpoint in one round trip —
+    // migrating a v1 file is still reopen-1:1.
+    let store = store_with(fixture);
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the v1 file loads");
+    assert_eq!(gui.serial_config.port_path.as_deref(), Some("/dev/ttyUSB0"));
+    assert_eq!(gui.serial_config.baud_rate, 4800);
+    assert_eq!(
+        gui.heading_source,
+        rustdar_location::HeadingSource::CompassOnly,
+    );
+
+    let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
+    let store2 = store_with(&save1);
+    let mut gui2 = Gui::new();
+    assert!(gui2.load_ui_config(&store2));
+    let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
+    let v1: serde_json::Value = serde_json::from_str(&save1).expect("save1 is JSON");
+    let v2: serde_json::Value = serde_json::from_str(&save2).expect("save2 is JSON");
+    assert_eq!(
+        v1["serial_config"]["port_path"], "/dev/ttyUSB0",
+        "the split half the file keeps must actually reach the save",
+    );
+    assert_eq!(v1["heading_source"], "CompassOnly");
+    assert_eq!(
+        v1, v2,
+        "save-load-save moved the migrated file: reopening would not be 1:1"
     );
 }

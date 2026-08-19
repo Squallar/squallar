@@ -2358,12 +2358,12 @@ impl Gui {
     }
 
     /// See [`FrameInputs::gps`](crate::shell_api::FrameInputs::gps).
-    pub fn gps_fix(&self) -> Option<&rustdar_gps::GpsFix> {
+    pub fn gps_fix(&self) -> Option<&rustdar_location::Fix> {
         self.user_fix.as_ref()
     }
 
     /// See [`FrameInputs::location`](crate::shell_api::FrameInputs::location).
-    pub fn location_permission(&self) -> rustdar_gps::LocationPermission {
+    pub fn location_permission(&self) -> rustdar_location::LocationPermission {
         self.location_permission
     }
 

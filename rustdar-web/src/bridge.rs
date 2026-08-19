@@ -15,12 +15,12 @@ pub struct WebPlatform {
     /// `window_attributes` is called after construction, on `resumed`.
     canvas: web_sys::HtmlCanvasElement,
     /// Fixes pushed by the geolocation watch. `None` until the watch starts.
-    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
     /// Last theme reported to the app, so `poll_theme` can answer "changed?"
     /// rather than "what is it?".
     last_theme: Option<bool>,
     /// `navigator.geolocation`, resolved once. `None` is the permanent
-    /// [`Unavailable`](rustdar_gps::LocationPermission::Unavailable) half of
+    /// [`Unavailable`](rustdar_location::LocationPermission::Unavailable) half of
     /// [`geolocation::browser_permission`].
     geolocation: Option<web_sys::Geolocation>,
     /// Whether the page is a secure context, read once — it cannot change for
@@ -53,7 +53,7 @@ pub struct WebPlatform {
 impl WebPlatform {
     pub fn new(canvas: web_sys::HtmlCanvasElement) -> Self {
         let permission: geolocation::PermissionCell =
-            Rc::new(Cell::new(rustdar_gps::LocationPermission::Unknown));
+            Rc::new(Cell::new(rustdar_location::LocationPermission::Unknown));
         let permission_watch = Rc::new(RefCell::new(None));
         let waker: geolocation::SharedWaker = Rc::new(RefCell::new(RedrawWaker::new()));
 
@@ -103,7 +103,7 @@ impl PlatformBridge for WebPlatform {
             .is_some_and(|list| list.matches())
     }
 
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
         self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
@@ -188,7 +188,7 @@ impl PlatformBridge for WebPlatform {
     /// Cheap by the trait's contract: two reads of `Copy` fields and a `Cell`
     /// load. The Promise, the `change` event and the watch's error callback all
     /// resolve *into* that cell on their own schedule.
-    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+    fn location_permission(&self) -> rustdar_location::LocationPermission {
         geolocation::browser_permission(
             self.geolocation.is_some(),
             self.secure_context,

@@ -1,10 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Below this ground speed (m/s), course-over-ground from a near-stationary
-/// receiver is noise. Gated because only `nmea_parser` reads it.
-#[cfg(feature = "serial")]
-pub(crate) const MIN_SPEED_FOR_BEARING_MPS: f64 = 0.5;
-
 /// Ground speed (m/s) above which the device counts as "moving" (~5 mph).
 pub(crate) const MOVING_SPEED_THRESHOLD_MPS: f64 = 2.2;
 
@@ -54,29 +49,5 @@ impl HeadingSource {
             HeadingSource::CompassOnly => compass_heading,
             HeadingSource::GpsOnly => gps_bearing.map(|b| b as f32),
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-pub struct GpsConfig {
-    /// Serial port path. `None` means auto-detect.
-    pub port_path: Option<String>,
-    /// Baud rate. 0 means auto-detect.
-    pub baud_rate: u32,
-    /// How the directional heading is determined.
-    pub heading_source: HeadingSource,
-}
-
-impl GpsConfig {
-    /// Whether baud rate should be auto-detected.
-    pub fn auto_baud(&self) -> bool {
-        self.baud_rate == 0
-    }
-
-    /// Whether the port should be auto-detected.
-    pub fn auto_port(&self) -> bool {
-        self.port_path.is_none()
     }
 }

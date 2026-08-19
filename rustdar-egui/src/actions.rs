@@ -102,7 +102,7 @@ pub enum GuiAction {
     },
     /// Start the desktop serial GPS reader with the given config.
     StartGps {
-        config: rustdar_gps::GpsConfig,
+        config: rustdar_nmea_serial::SerialConfig,
     },
     /// Stop the desktop serial GPS reader.
     StopGps,

@@ -27,7 +27,7 @@ pub enum FixQuality {
     /// in NMEA — a receiver extrapolating from its last real fix — which says
     /// something quite different about how much to trust the coordinates.
     ///
-    /// It carries no accuracy of its own; see [`GpsFix::accuracy_m`], which is
+    /// It carries no accuracy of its own; see [`Fix::accuracy_m`], which is
     /// the field this variant exists alongside.
     Device,
 }
@@ -80,12 +80,11 @@ impl FixQuality {
 
 /// A GPS position fix. The `Option` fields come from different NMEA sentences
 /// and depend on the receiver and fix state.
-#[derive(Debug, Clone, Default)]
-pub struct GpsFix {
-    /// Latitude in decimal degrees (positive = North).
-    pub latitude: f64,
-    /// Longitude in decimal degrees (positive = East).
-    pub longitude: f64,
+#[derive(Debug, Clone)]
+pub struct Fix {
+    /// Where the receiver says it is: latitude positive = North, longitude
+    /// positive = East, both in decimal degrees.
+    pub point: rustdar_geo::GeoPoint,
     /// Altitude above mean sea level in meters (from GGA).
     pub altitude_m: Option<f64>,
     /// Ground speed in meters per second (from RMC/VTG).
@@ -115,11 +114,33 @@ pub struct GpsFix {
     pub timestamp: Option<chrono::NaiveDateTime>,
 }
 
-impl GpsFix {
+// Written out because `rustdar_geo::GeoPoint` does not derive `Default` — a
+// (0, 0) point is a place, not an absence, and the geo floor has no business
+// pretending otherwise. Here it is only the base the two constructors
+// overwrite before anyone reads it.
+impl Default for Fix {
+    fn default() -> Self {
+        Self {
+            point: rustdar_geo::GeoPoint { lat: 0.0, lon: 0.0 },
+            altitude_m: None,
+            speed_mps: None,
+            heading_deg: None,
+            satellites: None,
+            fix_quality: FixQuality::default(),
+            hdop: None,
+            accuracy_m: None,
+            timestamp: None,
+        }
+    }
+}
+
+impl Fix {
     pub fn from_lat_lon(latitude: f64, longitude: f64) -> Self {
         Self {
-            latitude,
-            longitude,
+            point: rustdar_geo::GeoPoint {
+                lat: latitude,
+                lon: longitude,
+            },
             fix_quality: FixQuality::Gps,
             ..Default::default()
         }
@@ -137,16 +158,108 @@ impl GpsFix {
     /// report one, and none of them report it the same way.
     pub fn from_device_position(latitude: f64, longitude: f64) -> Self {
         Self {
-            latitude,
-            longitude,
+            point: rustdar_geo::GeoPoint {
+                lat: latitude,
+                lon: longitude,
+            },
             fix_quality: FixQuality::Device,
             ..Default::default()
         }
     }
 }
 
-impl From<&GpsFix> for (f64, f64) {
-    fn from(fix: &GpsFix) -> (f64, f64) {
-        (fix.latitude, fix.longitude)
+impl From<&Fix> for (f64, f64) {
+    fn from(fix: &Fix) -> (f64, f64) {
+        (fix.point.lat, fix.point.lon)
+    }
+}
+
+/// Choose between a fix from the serial reader and one from the OS.
+///
+/// **"Serial with a positional quality wins", not "serial wins".** The plain
+/// rule looks obviously right — a dongle with a sky view beats an IP lookup by
+/// three orders of magnitude — and it has a failure mode that is silent and
+/// permanent: a receiver with *no* sky view goes on emitting GGA at quality 0,
+/// with the last coordinates it had and a cleared fix flag, at 1 Hz forever. A
+/// user with a USB GPS in a drawer and a working platform location service
+/// would have the good fix discarded on every single frame in favour of a fix
+/// the receiver itself is saying not to trust.
+///
+/// So the serial reader wins only while it is actually reporting a fix. When it
+/// is not, and the OS is, the OS's fix is what there is. When neither is
+/// positional the serial one is still preferred: it carries satellite counts
+/// and HDOP the OS never reports, and preserving it is what keeps today's
+/// behaviour unchanged on a machine with no OS provider at all.
+pub fn prefer_fix(serial: Option<Fix>, os: Option<Fix>) -> Option<Fix> {
+    match (serial, os) {
+        (Some(serial), Some(os)) => Some(if serial.fix_quality == FixQuality::None {
+            os
+        } else {
+            serial
+        }),
+        (serial, os) => serial.or(os),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serial_fix(quality: FixQuality) -> Fix {
+        Fix {
+            fix_quality: quality,
+            ..Fix::from_lat_lon(35.25, -97.5)
+        }
+    }
+
+    fn os_fix() -> Fix {
+        Fix {
+            accuracy_m: Some(25_000.0),
+            ..Fix::from_device_position(39.74, -104.99)
+        }
+    }
+
+    /// A receiver that has a fix is the better source by three orders of
+    /// magnitude, and it stays the better source.
+    #[test]
+    fn a_serial_fix_outranks_the_operating_systems() {
+        let chosen = prefer_fix(Some(serial_fix(FixQuality::Gps)), Some(os_fix()))
+            .expect("both were present");
+        assert_eq!(chosen.fix_quality, FixQuality::Gps);
+    }
+
+    /// The regression the qualifier exists for: a dongle indoors emits quality
+    /// 0 with real-looking coordinates at 1 Hz forever, and plain "serial wins"
+    /// discards a good OS fix on every frame in favour of it.
+    #[test]
+    fn a_dongle_with_no_sky_view_does_not_shadow_a_real_fix() {
+        let chosen = prefer_fix(Some(serial_fix(FixQuality::None)), Some(os_fix()))
+            .expect("both were present");
+        assert_eq!(
+            chosen.fix_quality,
+            FixQuality::Device,
+            "a serial reader reporting no fix suppressed the one source that \
+             had one"
+        );
+    }
+
+    /// With nothing else on offer the serial reading still stands, quality and
+    /// all. This is today's behaviour on a machine with no OS provider, and it
+    /// must not change.
+    #[test]
+    fn a_lone_source_is_used_whatever_it_says() {
+        assert_eq!(
+            prefer_fix(Some(serial_fix(FixQuality::None)), None)
+                .expect("the serial reading")
+                .fix_quality,
+            FixQuality::None,
+        );
+        assert_eq!(
+            prefer_fix(None, Some(os_fix()))
+                .expect("the OS reading")
+                .fix_quality,
+            FixQuality::Device,
+        );
+        assert!(prefer_fix(None, None).is_none());
     }
 }

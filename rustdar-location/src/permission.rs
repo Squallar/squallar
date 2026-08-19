@@ -76,3 +76,91 @@ pub enum LocationPermission {
 // and undo it — so the copy lives at the one place that renders it. A generic
 // label here would be the thing everyone reaches for and nobody is served by,
 // and it would leak UI wording into log lines, where `Debug` is what is wanted.
+
+/// [`LocationPermission`] as one byte, for a platform bridge's atomic.
+///
+/// A provider thread that learns the answer off the frame path needs to hand
+/// it to a `&self` getter *on* the frame path, and an `AtomicU8` is the
+/// lock-free cell that does it — see the representation note on
+/// [`LocationPermission`] for why a lock there is not acceptable.
+///
+/// Hand-written rather than derived, and the discriminants are pinned by the
+/// round-trip tests below: the enum is not `repr(u8)` and nothing here
+/// promises its variants keep their order, so an `as u8` cast at a bridge
+/// would be a silent miscommunication the first time someone inserts a
+/// variant.
+pub fn encode_permission(permission: LocationPermission) -> u8 {
+    use LocationPermission as P;
+    match permission {
+        P::Unknown => 0,
+        P::Prompt => 1,
+        P::Granted => 2,
+        P::Denied => 3,
+        P::Unavailable => 4,
+    }
+}
+
+/// The inverse of [`encode_permission`], with anything unrecognised read as
+/// `Unknown` — the one state that neither asks nor concludes.
+pub fn decode_permission(raw: u8) -> LocationPermission {
+    use LocationPermission as P;
+    match raw {
+        1 => P::Prompt,
+        2 => P::Granted,
+        3 => P::Denied,
+        4 => P::Unavailable,
+        _ => P::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use LocationPermission as P;
+
+    const ALL: &[P] = &[P::Unknown, P::Prompt, P::Granted, P::Denied, P::Unavailable];
+
+    /// The provider thread writes this byte and the frame path reads it, so a
+    /// mapping that is not a bijection is a permission silently turning into a
+    /// different one — most damagingly `Denied` arriving as `Granted`.
+    #[test]
+    fn every_permission_survives_the_trip_through_the_atomic() {
+        for &permission in ALL {
+            assert_eq!(decode_permission(encode_permission(permission)), permission);
+        }
+    }
+
+    /// Distinct codes, checked separately from the round trip: a collision
+    /// where two variants share a byte would still round-trip for one of them
+    /// and quietly rewrite the other.
+    #[test]
+    fn no_two_permissions_share_a_code() {
+        let mut codes: Vec<u8> = ALL.iter().map(|&p| encode_permission(p)).collect();
+        codes.sort_unstable();
+        let count = codes.len();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            count,
+            "two permissions encode to the same byte"
+        );
+    }
+
+    /// The atomic starts at zero, and a `AtomicU8::new(0)` that meant anything
+    /// else would have the bridge claiming an answer before one exists.
+    /// `Unknown` is the state that neither asks nor concludes, which is the
+    /// only safe thing for a value nobody has written yet to mean.
+    #[test]
+    fn an_unwritten_atomic_reads_as_unknown() {
+        assert_eq!(decode_permission(0), P::Unknown);
+        assert_eq!(encode_permission(P::Unknown), 0);
+    }
+
+    /// Nothing writes a byte outside the mapping today, but the decode is on
+    /// the frame path and a garbage value must not become a *grant*.
+    #[test]
+    fn an_unrecognised_code_reads_as_unknown_rather_than_as_a_grant() {
+        assert_eq!(decode_permission(200), P::Unknown);
+        assert_eq!(decode_permission(u8::MAX), P::Unknown);
+    }
+}

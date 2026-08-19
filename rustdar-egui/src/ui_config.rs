@@ -618,10 +618,13 @@ struct UiConfig {
     /// Handler-owned config state (overlay kind name → serialized state).
     #[serde(default)]
     overlay_states: serde_json::Map<String, serde_json::Value>,
-    /// GPS configuration (serial port, baud, heading source). Lenient for
+    /// Serial GPS configuration (port, baud). Lenient for
     /// [`Self::preferences`]' reason.
     #[serde(default, deserialize_with = "lenient_or_default")]
-    gps_config: rustdar_gps::GpsConfig,
+    serial_config: rustdar_nmea_serial::SerialConfig,
+    /// How the directional heading is determined.
+    #[serde(default)]
+    heading_source: rustdar_location::HeadingSource,
     /// The user's storm-motion override — the audit's known persistence gap,
     /// closed here. `#[serde(default)]` makes an older config load as
     /// "override off, default vector", which is what those sessions were.
@@ -984,7 +987,8 @@ impl Default for UiConfig {
             panes: vec![PaneConfig::default()],
             preferences: UserPreferences::default(),
             overlay_states: serde_json::Map::new(),
-            gps_config: rustdar_gps::GpsConfig::default(),
+            serial_config: rustdar_nmea_serial::SerialConfig::default(),
+            heading_source: rustdar_location::HeadingSource::default(),
             storm_motion_override: super::StormMotionOverride::default(),
             srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
@@ -1163,7 +1167,8 @@ impl super::Gui {
                 }
                 states
             },
-            gps_config: self.gps_config.clone(),
+            serial_config: self.serial_config.clone(),
+            heading_source: self.heading_source,
             // The same NaN guard every persisted float gets (see the note on
             // this function): `DragValue` parses "nan", and one non-finite
             // number costs the whole file on the *next* load.
@@ -1328,7 +1333,8 @@ impl super::Gui {
         self.loop_lookback_secs = config.loop_lookback_secs;
         self.loop_speed_fps = config.loop_speed_fps;
         self.preferences = config.preferences;
-        self.gps_config = config.gps_config;
+        self.serial_config = config.serial_config;
+        self.heading_source = config.heading_source;
         self.storm_motion_override = config.storm_motion_override;
         self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
@@ -1964,7 +1970,7 @@ fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
 ///   `config_version` that is not a number) is shed so its absence reads as
 ///   the default, rather than left to fail the whole file.
 ///
-/// The rich top-level containers (`preferences`, `gps_config`,
+/// The rich top-level containers (`preferences`, `serial_config`,
 /// `storm_motion_override`) are not probed here — their fields carry
 /// [`lenient_or_default`], which is the same salvage applied at the same
 /// granularity by the deserializer itself.

@@ -174,8 +174,8 @@ struct FrameFactsForTest {
     supports_exit: bool,
     loop_frame_budget: usize,
     location_settings_available: bool,
-    location: (rustdar_gps::LocationPermission, bool),
-    gps: Option<(rustdar_gps::GpsFix, web_time::Instant)>,
+    location: (rustdar_location::LocationPermission, bool),
+    gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     user_heading: Option<f32>,
     catalogue_pending: bool,
     chunk_status: crate::ui::ChunkFeedStatus,
@@ -192,7 +192,7 @@ impl Default for FrameFactsForTest {
             supports_exit: true,
             loop_frame_budget: 60,
             location_settings_available: false,
-            location: (rustdar_gps::LocationPermission::default(), false),
+            location: (rustdar_location::LocationPermission::default(), false),
             gps: None,
             user_heading: None,
             catalogue_pending: false,
@@ -521,7 +521,7 @@ impl InputHarness {
     /// per-frame compose reads it off the location gate.
     pub(crate) fn set_location_state(
         &mut self,
-        permission: rustdar_gps::LocationPermission,
+        permission: rustdar_location::LocationPermission,
         active: bool,
     ) {
         self.facts.location = (permission, active);
@@ -538,7 +538,7 @@ impl InputHarness {
     /// Deliver a GPS fix, stamped at arrival exactly as `poll_platform_state`
     /// stamps one — the instant travels with the fix through every re-apply,
     /// so the settings pane's staleness question stays honest in tests too.
-    pub(crate) fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
+    pub(crate) fn set_gps_fix(&mut self, fix: rustdar_location::Fix) {
         self.facts.gps = Some((fix, web_time::Instant::now()));
         self.apply_facts();
     }

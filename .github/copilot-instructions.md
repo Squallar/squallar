@@ -20,7 +20,8 @@ Cargo workspace (`resolver = "2"`, edition 2024) with ten crates:
 | `rustdar-units` | Leaf crate for unit conversion and timezone formatting. `UserPreferences` persisted in `ui.json`. Conversions happen at display boundaries only — internal data stays in original units. |
 | `rustdar-radar` | Radar data: Level II from the `unidata-nexrad-level2` S3 bucket, Level III from the `unidata-nexrad-level3` S3 bucket, storm-relative velocity derivation (`srm.rs`), RGBA rendering via Web Mercator, palettes, NEXRAD site list, `RadarProduct` enum. |
 | `rustdar-overlays` | Weather overlay data + render-agnostic logic. SPC outlooks, Mesoscale Discussions, NWS alerts, HRRR model data, GLM lightning, METAR observations, storm reports. `OverlayHandler` trait + `OverlayRegistry` for type-erased overlay management. Rasterized to textures via tiny-skia. |
-| `rustdar-gps` | GPS fix and config types; NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS). |
+| `rustdar-location` | The location domain's common vocabulary: the fix model, the OS permission, heading choice. |
+| `rustdar-nmea-serial` | NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS); one provider of `rustdar_location::Fix`. |
 | `nexrad-level3` | Level III product decoder (WMO headers, zlib/BZ2, radial packets). Byte slices in, model types out — no network, no filesystem. Product-specific LUT/threshold decoding lives in `rustdar-radar`. |
 
 ## Data Flow

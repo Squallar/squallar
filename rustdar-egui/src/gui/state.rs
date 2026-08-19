@@ -178,7 +178,7 @@ pub struct Gui {
     // --- Map tiles (shared across panes) ---
     pub(super) map_tiles: MapTileState,
     // User's GPS fix (full data from GPS receiver or Android LocationManager)
-    pub(super) user_fix: Option<rustdar_gps::GpsFix>,
+    pub(super) user_fix: Option<rustdar_location::Fix>,
     /// When [`user_fix`](Self::user_fix) arrived.
     ///
     /// Not `user_fix.timestamp`: that is the *receiver's* clock, it is absent
@@ -195,7 +195,7 @@ pub struct Gui {
     /// a copy is the only thing available here. How fresh the copy is is the
     /// gate's poll cadence, which tightens while [`Gui::settings_visible`]
     /// answers true for exactly this reason.
-    pub(super) location_permission: rustdar_gps::LocationPermission,
+    pub(super) location_permission: rustdar_location::LocationPermission,
     /// Whether the platform is currently delivering location fixes. A different
     /// question from the permission: every desktop process starts granted and
     /// silent.
@@ -694,8 +694,10 @@ pub struct Gui {
     pub(super) interaction: InteractionState,
     /// User unit and timezone preferences.
     pub preferences: UserPreferences,
-    /// GPS configuration (port, baud, heading source).
-    pub gps_config: rustdar_gps::GpsConfig,
+    /// Serial GPS configuration (port, baud).
+    pub serial_config: rustdar_nmea_serial::SerialConfig,
+    /// How the directional heading is determined.
+    pub heading_source: rustdar_location::HeadingSource,
     /// Storm motion the user typed in, overriding the RPG's SCIT average on
     /// every storm-relative velocity tilt — all four are derived, so all four
     /// take it. `None` means "use the vector the `N0S` product carries", which
@@ -853,7 +855,7 @@ impl Gui {
             map_tiles: MapTileState::default(),
             user_fix: None,
             user_fix_at: None,
-            location_permission: rustdar_gps::LocationPermission::default(),
+            location_permission: rustdar_location::LocationPermission::default(),
             location_active: false,
             location_settings_available: false,
             catalogue_pending: false,
@@ -924,7 +926,8 @@ impl Gui {
             layout: LayoutCtx::default(),
             interaction: InteractionState::default(),
             preferences: UserPreferences::default(),
-            gps_config: rustdar_gps::GpsConfig::default(),
+            serial_config: rustdar_nmea_serial::SerialConfig::default(),
+            heading_source: rustdar_location::HeadingSource::default(),
             storm_motion_override: StormMotionOverride::default(),
             srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             storm_motion_editing: false,

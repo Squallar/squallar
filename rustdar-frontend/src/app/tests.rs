@@ -756,7 +756,7 @@ fn a_location_fix_refines_a_guessed_site() {
 
     // Duluth, Minnesota: same timezone, a different radar.
     fixes
-        .send(rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005))
+        .send(rustdar_location::Fix::from_lat_lon(46.7867, -92.1005))
         .unwrap();
     app.poll_platform_state();
 
@@ -781,7 +781,7 @@ fn a_refined_site_actually_requests_its_radar_data() {
     let mut app = headless(bridge);
 
     fixes
-        .send(rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005))
+        .send(rustdar_location::Fix::from_lat_lon(46.7867, -92.1005))
         .unwrap();
     app.poll_platform_state();
 
@@ -810,7 +810,7 @@ fn a_location_fix_does_not_move_a_stored_site() {
 
     let mut app = headless(bridge);
     fixes
-        .send(rustdar_gps::GpsFix::from_lat_lon(32.7767, -96.7970))
+        .send(rustdar_location::Fix::from_lat_lon(32.7767, -96.7970))
         .unwrap();
     app.poll_platform_state();
 
@@ -830,14 +830,14 @@ fn only_the_first_fix_refines_the_site() {
     let mut app = headless(bridge);
 
     fixes
-        .send(rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005))
+        .send(rustdar_location::Fix::from_lat_lon(46.7867, -92.1005))
         .unwrap();
     app.poll_platform_state();
     assert_eq!(opening_site(&app), "KDLH");
 
     // The same user, now in Denver.
     fixes
-        .send(rustdar_gps::GpsFix::from_lat_lon(39.7392, -104.9903))
+        .send(rustdar_location::Fix::from_lat_lon(39.7392, -104.9903))
         .unwrap();
     app.poll_platform_state();
     assert_eq!(
@@ -859,12 +859,12 @@ fn an_os_fix_refines_a_guessed_site() {
     assert_eq!(opening_site(&app), "KLOT");
 
     fixes
-        .send(rustdar_gps::GpsFix {
+        .send(rustdar_location::Fix {
             // What the location portal measured on the developer's own machine: an
             // IP/ichnaea lookup, and comfortably good enough to choose
             // among sites 200 km apart.
             accuracy_m: Some(25_000.0),
-            ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            ..rustdar_location::Fix::from_device_position(46.7867, -92.1005)
         })
         .unwrap();
     app.poll_platform_state();
@@ -899,9 +899,9 @@ fn an_android_network_fix_refines_the_opening_site() {
     assert_eq!(opening_site(&app), "KLOT");
 
     fixes
-        .send(rustdar_gps::GpsFix {
+        .send(rustdar_location::Fix {
             accuracy_m: Some(32.0),
-            ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            ..rustdar_location::Fix::from_device_position(46.7867, -92.1005)
         })
         .unwrap();
     app.poll_platform_state();
@@ -921,18 +921,18 @@ fn an_android_network_fix_refines_the_opening_site() {
 #[test]
 fn a_simulated_fix_does_not_move_the_radar_site() {
     for quality in [
-        rustdar_gps::FixQuality::Simulation,
-        rustdar_gps::FixQuality::Manual,
-        rustdar_gps::FixQuality::None,
+        rustdar_location::FixQuality::Simulation,
+        rustdar_location::FixQuality::Manual,
+        rustdar_location::FixQuality::None,
     ] {
         let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
         let fixes = bridge.gps_channel();
         let mut app = headless(bridge);
 
         fixes
-            .send(rustdar_gps::GpsFix {
+            .send(rustdar_location::Fix {
                 fix_quality: quality,
-                ..rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005)
+                ..rustdar_location::Fix::from_lat_lon(46.7867, -92.1005)
             })
             .unwrap();
         app.poll_platform_state();
@@ -960,9 +960,9 @@ fn a_low_accuracy_fix_does_not_spend_the_provisional_site() {
     let mut app = headless(bridge);
 
     fixes
-        .send(rustdar_gps::GpsFix {
+        .send(rustdar_location::Fix {
             accuracy_m: Some(MAX_RELOCATION_ACCURACY_M * 2.0),
-            ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            ..rustdar_location::Fix::from_device_position(46.7867, -92.1005)
         })
         .unwrap();
     app.poll_platform_state();
@@ -977,9 +977,9 @@ fn a_low_accuracy_fix_does_not_spend_the_provisional_site() {
     // And the good fix that follows still works, which is the half that
     // makes the rejection worth anything.
     fixes
-        .send(rustdar_gps::GpsFix {
+        .send(rustdar_location::Fix {
             accuracy_m: Some(25_000.0),
-            ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            ..rustdar_location::Fix::from_device_position(46.7867, -92.1005)
         })
         .unwrap();
     app.poll_platform_state();
@@ -1019,12 +1019,13 @@ fn the_accuracy_gate_admits_a_coarse_but_usable_fix() {
 /// since `rustdar-egui` cannot see a `PlatformBridge`.
 #[test]
 fn what_the_platform_says_about_location_reaches_the_settings_pane() {
-    let bridge = TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+    let bridge =
+        TestBridge::desktop().with_permission(rustdar_location::LocationPermission::Granted);
     let location = bridge.location_record();
     let mut app = headless(bridge);
     assert_eq!(
         app.gui.location_permission(),
-        rustdar_gps::LocationPermission::Unknown,
+        rustdar_location::LocationPermission::Unknown,
         "the cache starts inert, before anything has been polled"
     );
 
@@ -1035,7 +1036,7 @@ fn what_the_platform_says_about_location_reaches_the_settings_pane() {
 
     assert_eq!(
         app.gui.location_permission(),
-        rustdar_gps::LocationPermission::Granted
+        rustdar_location::LocationPermission::Granted
     );
     assert!(
         app.gui.location_active(),
@@ -1049,14 +1050,15 @@ fn what_the_platform_says_about_location_reaches_the_settings_pane() {
 /// it is the app showing a location it has just been told it may not know.
 #[test]
 fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
-    let bridge = TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+    let bridge =
+        TestBridge::desktop().with_permission(rustdar_location::LocationPermission::Granted);
     let location = bridge.location_record();
     let mut app = headless(bridge);
     app.poll_platform_state();
     // A delivered fix lands in the App's own field, stamped at arrival, and
     // reaches the UI on the next compose — the same route production takes.
     app.user_gps = Some((
-        rustdar_gps::GpsFix::from_device_position(35.25, -97.5),
+        rustdar_location::Fix::from_device_position(35.25, -97.5),
         web_time::Instant::now(),
     ));
     app.push_frame_inputs();
@@ -1066,7 +1068,7 @@ fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
     // happens on every desktop OS.
     location
         .permission
-        .set(rustdar_gps::LocationPermission::Denied);
+        .set(rustdar_location::LocationPermission::Denied);
     app.location.resumed();
     app.poll_platform_state();
     app.push_frame_inputs();
@@ -1083,19 +1085,21 @@ fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
 /// user plugged in — so a location denial must not take its dot away.
 #[test]
 fn a_revoked_permission_leaves_a_serial_dongles_dot_alone() {
-    let bridge = TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+    let bridge =
+        TestBridge::desktop().with_permission(rustdar_location::LocationPermission::Granted);
     let location = bridge.location_record();
     let mut app = headless(bridge);
     app.poll_platform_state();
-    app.platform.start_gps(&rustdar_gps::GpsConfig::default());
+    app.platform
+        .start_gps(&rustdar_nmea_serial::SerialConfig::default());
     app.user_gps = Some((
-        rustdar_gps::GpsFix::from_lat_lon(35.25, -97.5),
+        rustdar_location::Fix::from_lat_lon(35.25, -97.5),
         web_time::Instant::now(),
     ));
 
     location
         .permission
-        .set(rustdar_gps::LocationPermission::Denied);
+        .set(rustdar_location::LocationPermission::Denied);
     app.location.resumed();
     app.poll_platform_state();
     app.push_frame_inputs();
@@ -1112,7 +1116,8 @@ fn a_revoked_permission_leaves_a_serial_dongles_dot_alone() {
 /// on this side has to tell it, and this is the wire that does.
 #[test]
 fn a_bridge_that_needs_the_attempt_count_is_told_it() {
-    let bridge = TestBridge::android().with_permission(rustdar_gps::LocationPermission::Prompt);
+    let bridge =
+        TestBridge::android().with_permission(rustdar_location::LocationPermission::Prompt);
     let location = bridge.location_record();
     let mut app = headless(bridge);
     // Android has no config dir until `android_main` supplies one.
@@ -1132,12 +1137,13 @@ fn a_bridge_that_needs_the_attempt_count_is_told_it() {
 /// dot with it, at the moment of the click rather than at the next poll.
 #[test]
 fn turning_location_off_stops_the_stream_and_clears_the_dot() {
-    let bridge = TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+    let bridge =
+        TestBridge::desktop().with_permission(rustdar_location::LocationPermission::Granted);
     let location = bridge.location_record();
     let mut app = headless(bridge);
     app.poll_platform_state();
     app.user_gps = Some((
-        rustdar_gps::GpsFix::from_device_position(35.25, -97.5),
+        rustdar_location::Fix::from_device_position(35.25, -97.5),
         web_time::Instant::now(),
     ));
     app.push_frame_inputs();
@@ -1975,7 +1981,7 @@ fn the_platforms_sensors_reach_the_map() {
     app.set_heading_receiver(heading_rx);
 
     fix_tx
-        .send(rustdar_gps::GpsFix::from_lat_lon(35.3331, -97.2778))
+        .send(rustdar_location::Fix::from_lat_lon(35.3331, -97.2778))
         .unwrap();
     heading_tx.send(214.5).unwrap();
 
@@ -1986,7 +1992,7 @@ fn the_platforms_sensors_reach_the_map() {
     app.push_frame_inputs();
 
     let fix = app.gui.gps_fix().expect("no position reached the UI");
-    assert_eq!((fix.latitude, fix.longitude), (35.3331, -97.2778));
+    assert_eq!((fix.point.lat, fix.point.lon), (35.3331, -97.2778));
     assert_eq!(
         app.gui.user_heading(),
         Some(214.5),
@@ -2853,10 +2859,9 @@ fn starting_gps_hands_the_bridge_the_config_the_action_carried() {
 
     app.handle_gui_action(
         GuiAction::StartGps {
-            config: rustdar_gps::GpsConfig {
+            config: rustdar_nmea_serial::SerialConfig {
                 port_path: Some("/dev/ttyPROBE".to_string()),
                 baud_rate: 38400,
-                ..Default::default()
             },
         },
         None,

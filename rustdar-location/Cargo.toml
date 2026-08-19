@@ -1,0 +1,15 @@
+# The location domain's common vocabulary; providers depend on it, it depends
+# on no provider. Ceiling held by tests/charter.rs.
+[package]
+name = "rustdar-location"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustdar-geo = { workspace = true }
+chrono = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

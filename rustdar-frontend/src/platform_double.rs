@@ -34,8 +34,8 @@
 //! the shared handles cheap.
 
 use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
-use rustdar_gps::LocationPermission;
 use rustdar_kv::{KvStore, MemoryKvStore};
+use rustdar_location::LocationPermission;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -82,7 +82,7 @@ impl KvStore for SharedStore {
 /// port and nothing about the app changes. Shared so a test can see *which*
 /// config reached it — passing the wrong one is the failure that matters, and
 /// `gps_active` alone cannot tell.
-pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_gps::GpsConfig>>>;
+pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_nmea_serial::SerialConfig>>>;
 
 /// The [`RedrawWaker`] the app handed this bridge, or a fresh empty one if it
 /// never did.
@@ -186,7 +186,7 @@ pub(crate) struct TestBridge {
     /// exactly the kind of invention this double avoids, and nothing reads it.
     reads_theme_itself: bool,
     theme_receiver: Option<Receiver<bool>>,
-    gps_fix_receiver: Option<Receiver<rustdar_gps::GpsFix>>,
+    gps_fix_receiver: Option<Receiver<rustdar_location::Fix>>,
     heading_receiver: Option<Receiver<f32>>,
     gps: GpsRecord,
     /// See [`WakerRecord`].
@@ -353,7 +353,7 @@ impl TestBridge {
 
     /// Feed `poll_gps_fix`, standing in for the browser's geolocation watch and
     /// Android's location callbacks.
-    pub(crate) fn gps_channel(&mut self) -> std::sync::mpsc::Sender<rustdar_gps::GpsFix> {
+    pub(crate) fn gps_channel(&mut self) -> std::sync::mpsc::Sender<rustdar_location::Fix> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.gps_fix_receiver = Some(rx);
         tx
@@ -372,7 +372,7 @@ impl PlatformBridge for TestBridge {
         self.theme_receiver.as_ref().and_then(drain_latest)
     }
 
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
         self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
@@ -469,7 +469,7 @@ impl PlatformBridge for TestBridge {
         *self.waker.borrow_mut() = waker;
     }
 
-    fn set_gps_fix_receiver(&mut self, receiver: Receiver<rustdar_gps::GpsFix>) {
+    fn set_gps_fix_receiver(&mut self, receiver: Receiver<rustdar_location::Fix>) {
         self.gps_fix_receiver = Some(receiver);
     }
 
@@ -491,7 +491,7 @@ impl PlatformBridge for TestBridge {
         self.theme_detector = Some(detector);
     }
 
-    fn start_gps(&mut self, config: &rustdar_gps::GpsConfig) {
+    fn start_gps(&mut self, config: &rustdar_nmea_serial::SerialConfig) {
         *self.gps.borrow_mut() = Some(config.clone());
     }
 

@@ -15,7 +15,7 @@
 //!
 //! So the hint is a *starting* site, never an override. Precedence is settled in
 //! the caller: a stored configuration always wins, this fills in only when there
-//! is nothing stored, and a real [`GpsFix`](rustdar_gps::GpsFix) — which arrives
+//! is nothing stored, and a real [`Fix`](rustdar_location::Fix) — which arrives
 //! only if the user has already granted location — supersedes it.
 
 /// A representative coordinate for an IANA timezone, and how coarse it is.

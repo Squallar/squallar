@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system deps
         # libudev-dev for the same reason the test workflow needs it:
-        # rustdar-platform enables rustdar-gps/serial unconditionally off
+        # rustdar-platform enables rustdar-nmea-serial/serial unconditionally off
         # Android and iOS, and host-side builds of the workspace graph want it.
         run: |
           sudo apt-get update

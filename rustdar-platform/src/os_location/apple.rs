@@ -3,7 +3,7 @@
 //! One file, two halves, and the split is not cosmetic.
 //!
 //! The **decoding half** — `CLAuthorizationStatus` → [`LocationPermission`],
-//! `CLLocation` → [`GpsFix`] — is pure arithmetic over `f64`s and one `i32`,
+//! `CLLocation` → [`Fix`] — is pure arithmetic over `f64`s and one `i32`,
 //! and it compiles on every target. That is deliberate: it holds every rule
 //! this provider can get wrong (which sentinel is a sentinel, which one is
 //! not, what an unrecognised status means) and it is the only part testable
@@ -72,7 +72,7 @@
     )
 )]
 
-use rustdar_gps::{GpsFix, LocationPermission};
+use rustdar_location::{Fix, LocationPermission};
 
 // ── The decoding half ───────────────────────────────────────────────────
 //
@@ -188,9 +188,9 @@ fn valid_component(v: f64) -> Option<f64> {
 /// with `accuracy_m: None` would hand the app a position it was told not to
 /// believe, in the one shape (`None`) that every consumer treats as "this
 /// source does not report accuracy" and therefore as passing.
-fn fix_from_components(c: LocationComponents) -> Option<GpsFix> {
+fn fix_from_components(c: LocationComponents) -> Option<Fix> {
     let horizontal_accuracy_m = valid_component(c.horizontal_accuracy_m)?;
-    Some(GpsFix {
+    Some(Fix {
         // Present only when `verticalAccuracy` says the altitude is real; the
         // altitude's own sign says nothing about its validity.
         altitude_m: valid_component(c.vertical_accuracy_m).map(|_| c.altitude_m),
@@ -205,7 +205,7 @@ fn fix_from_components(c: LocationComponents) -> Option<GpsFix> {
         timestamp: None,
         // `Device`, not `Gps`: CoreLocation fuses GNSS, Wi-Fi and cell and
         // does not say which won.
-        ..GpsFix::from_device_position(c.latitude, c.longitude)
+        ..Fix::from_device_position(c.latitude, c.longitude)
     })
 }
 
@@ -230,7 +230,7 @@ mod corelocation {
     // macOS only, and so is its one use below.
     #[cfg(target_os = "macos")]
     use objc2_foundation::NSBundle;
-    use rustdar_gps::{GpsFix, LocationPermission};
+    use rustdar_location::{Fix, LocationPermission};
 
     use super::super::{OsLocationProvider, OsLocationSink, RedrawWake, ReportPermission};
 
@@ -263,7 +263,7 @@ mod corelocation {
     /// is the winit event loop, the same thread that reads these. The compiler
     /// enforces all of that, so a lock here would only cost.
     struct Shared {
-        fixes: Sender<GpsFix>,
+        fixes: Sender<Fix>,
         /// Asks the event loop for a frame. Callbacks arrive on the main run
         /// loop, but winit parks in `ControlFlow::Wait` and a run-loop source
         /// firing produces no `RedrawRequested` on its own — so without this a
@@ -648,7 +648,7 @@ pub use corelocation::OsLocationReader;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_gps::FixQuality;
+    use rustdar_location::FixQuality;
 
     /// A fix with every component valid, for tests that vary one thing.
     fn valid() -> LocationComponents {
@@ -716,8 +716,8 @@ mod tests {
     fn a_valid_report_keeps_its_horizontal_accuracy_as_the_confidence_radius() {
         let fix = fix_from_components(valid()).expect("every component was valid");
         assert_eq!(fix.accuracy_m, Some(12.0));
-        assert_eq!(fix.latitude, 35.25);
-        assert_eq!(fix.longitude, -97.5);
+        assert_eq!(fix.point.lat, 35.25);
+        assert_eq!(fix.point.lon, -97.5);
     }
 
     #[test]
