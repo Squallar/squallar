@@ -5,9 +5,9 @@ nexrad-level3/src/decode/symbology.rs	195	172
 nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
-rustdar-app/src/app.rs	1235	902
-rustdar-app/src/app_chunks.rs	213	126
-rustdar-app/src/app_fetch.rs	1250	821
+rustdar-app/src/app.rs	1245	912
+rustdar-app/src/app_chunks.rs	213	117
+rustdar-app/src/app_fetch.rs	1250	820
 rustdar-app/src/app_render.rs	2195	1515
 rustdar-app/src/app_state.rs	75	0
 rustdar-app/src/budget_arms.rs	17	17
@@ -17,7 +17,7 @@ rustdar-app/src/frame_pump.rs	23	23
 rustdar-app/src/input.rs	138	127
 rustdar-app/src/location_hint.rs	82	51
 rustdar-app/src/loop_pool.rs	184	183
-rustdar-app/src/platform.rs	270	228
+rustdar-app/src/platform.rs	270	231
 rustdar-app/src/platform_double.rs	229	210
 rustdar-app/src/render_dispatch.rs	834	743
 rustdar-app/src/site_catalogue.rs	36	29
@@ -149,9 +149,9 @@ rustdar-radar/src/beam.rs	33	33
 rustdar-radar/src/catalogue.rs	137	122
 rustdar-radar/src/chunk_feed.rs	271	257
 rustdar-radar/src/chunk_notify.rs	340	309
-rustdar-radar/src/chunks.rs	985	718
+rustdar-radar/src/chunks.rs	985	710
 rustdar-radar/src/current.rs	120	119
-rustdar-radar/src/derive.rs	210	196
+rustdar-radar/src/derive.rs	311	294
 rustdar-radar/src/dpprep.rs	1022	956
 rustdar-radar/src/eet.rs	297	294
 rustdar-radar/src/frame.rs	258	258
@@ -162,8 +162,8 @@ rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/jobs.rs	571	537
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	115
-rustdar-radar/src/loop_downloads.rs	685	678
+rustdar-radar/src/level3.rs	188	132
+rustdar-radar/src/loop_downloads.rs	690	683
 rustdar-radar/src/nrot.rs	3228	3169
 rustdar-radar/src/nyquist.rs	126	107
 rustdar-radar/src/palette.rs	412	402
@@ -173,7 +173,7 @@ rustdar-radar/src/render/polar.rs	264	260
 rustdar-radar/src/render_input.rs	667	637
 rustdar-radar/src/sampler.rs	574	554
 rustdar-radar/src/sampler/seam_fixture.rs	178	167
-rustdar-radar/src/scan.rs	368	215
+rustdar-radar/src/scan.rs	368	214
 rustdar-radar/src/site_position.rs	81	81
 rustdar-radar/src/sites.rs	581	581
 rustdar-radar/src/sounding.rs	234	207
