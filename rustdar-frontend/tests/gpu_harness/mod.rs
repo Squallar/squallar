@@ -441,12 +441,12 @@ pub fn centre(pixels: &[[u8; 4]], size: [u32; 2]) -> [u8; 4] {
 
 /// The box side that spans exactly one degree of latitude, in kilometres.
 ///
-/// Taken from `rustdar_radar::types::KM_PER_DEGREE_LAT` rather than spelled,
+/// Taken from `rustdar_geo::KM_PER_DEGREE_LAT` rather than spelled,
 /// because "one degree" is the fixture's whole premise: a copied literal that
 /// drifted from the shader's own conversion would leave every lane in
 /// [`equatorial_floor_lanes`] describing a box that is not a degree, and the
 /// harness would still look right.
-pub const DEGREE_BOX_KM: f32 = rustdar_radar::types::KM_PER_DEGREE_LAT as f32;
+pub const DEGREE_BOX_KM: f32 = rustdar_geo::KM_PER_DEGREE_LAT as f32;
 
 /// Web Mercator's y at a latitude in degrees: `ln(tan(pi/4 + phi/2))`.
 ///

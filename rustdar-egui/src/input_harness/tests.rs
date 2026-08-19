@@ -13738,11 +13738,11 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
     h.load_scan("KTLX");
     h.make_pane_cross_section(
         4,
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.1,
             lon: -97.6,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.5,
             lon: -97.0,
         },

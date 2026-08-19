@@ -20,7 +20,8 @@ use std::sync::Arc;
 use super::{AlertPaint, AlertsInput, AlphaMode, rasterize_model_data, rasterize_nws_alerts};
 use crate::hrrr::{HrrrGridData, ModelParameter};
 use crate::nws::alert::AlertCategory;
-use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
+use crate::types::{HatchPattern, OverlayFeature};
+use rustdar_geo::GeoBounds;
 
 const W: u32 = 96;
 const H: u32 = 96;

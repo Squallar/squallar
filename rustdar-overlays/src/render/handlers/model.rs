@@ -557,7 +557,7 @@ impl OverlayHandler for ModelDataHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::GeoBounds;
+    use rustdar_geo::GeoBounds;
 
     const RUN_HOUR: u32 = 3;
 

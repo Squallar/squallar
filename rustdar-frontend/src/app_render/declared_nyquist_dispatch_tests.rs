@@ -259,11 +259,11 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
         pane.selected_product = RadarProduct::NormalizedRotation;
         pane.cross_section_mut().unwrap().line = Some(
             rustdar_egui::pane::SectionLine::new(
-                rustdar_egui::pane::GeoPoint {
+                rustdar_geo::GeoPoint {
                     lat: 35.0,
                     lon: -98.0,
                 },
-                rustdar_egui::pane::GeoPoint {
+                rustdar_geo::GeoPoint {
                     lat: 36.0,
                     lon: -97.0,
                 },

@@ -58,7 +58,8 @@
 //!   kilometres here because an edit has no gesture length to measure: the
 //!   pointer may travel a long way bringing B almost onto A.
 
-use crate::pane::{GeoPoint, PaneId, SectionLine};
+use crate::pane::{PaneId, SectionLine};
+use rustdar_geo::GeoPoint;
 
 /// How close to an endpoint a press must land to grab it, in points.
 ///

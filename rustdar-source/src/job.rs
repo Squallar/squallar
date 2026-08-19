@@ -92,14 +92,15 @@ impl DescribedJob {
 /// width/height/bounds, ignore side_ceiling_px (fill 0); radar raster rows
 /// read side_ceiling_px, ignore the rest.
 ///
-/// `bounds` is the workspace's one geographic-bounds type — `rustdar-geo`'s,
-/// re-exported at [`crate::geo`] since WO-G1 — so the envelope freezes on the
-/// type every crate above already names.
+/// `bounds` is the workspace's one geographic-bounds type,
+/// [`rustdar_geo::GeoBounds`], named at its one spelling since WO-G4 killed
+/// the substrate's re-export — so the envelope freezes on the type every
+/// crate above already names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JobGeometry {
     pub width: u32,
     pub height: u32,
-    pub bounds: crate::geo::GeoBounds,
+    pub bounds: rustdar_geo::GeoBounds,
     pub side_ceiling_px: u32,
 }
 
@@ -473,7 +474,7 @@ mod tests {
         JobGeometry {
             width: 4,
             height: 2,
-            bounds: crate::geo::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 1.0,
                 max_lat: 2.0,
                 min_lon: 3.0,

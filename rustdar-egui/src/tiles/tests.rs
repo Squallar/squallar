@@ -30,6 +30,7 @@
 //! last digit that fits in an `f64` — from either side and exactly on it.
 
 use super::*;
+use rustdar_geo::{MERCATOR_LAT_LIMIT_DEG, lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 
 /// `(lat, lon, zoom, mercantile's x, mercantile's y)`.
 ///

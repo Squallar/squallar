@@ -697,7 +697,7 @@ fn clearing_a_region_returns_the_whole_ring_and_keeps_the_camera() {
 fn reset_view_returns_the_region_as_well_as_the_camera() {
     let mut volume = crate::pane::VolumePane {
         region: crate::pane::VolumeRegion::new(
-            crate::pane::GeoPoint {
+            rustdar_geo::GeoPoint {
                 lat: 35.33,
                 lon: -97.28,
             },

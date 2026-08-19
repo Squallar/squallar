@@ -17,9 +17,9 @@
 //! negative control in `offload::tests`, beside the byte-parity gates.
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use rustdar_overlays::render::rasterize::HitCells;
-use rustdar_overlays::types::GeoBounds;
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job — each

@@ -6,7 +6,8 @@
 //! cut-out empty. Clicking a hole hit nothing, and nothing on screen said why.
 
 use super::*;
-use crate::types::{GeoPolygon, HatchPattern};
+use crate::types::HatchPattern;
+use rustdar_geo::GeoPolygon;
 
 /// Real NWS zone geometry, in rustdar's own cache form: `(lat, lon)` pairs,
 /// already RDP-simplified. See the `_source` key in the file.

@@ -912,7 +912,7 @@ mod tests {
         JobGeometry {
             width: 64,
             height: 32,
-            bounds: rustdar_source::geo::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 30.0,
                 max_lat: 40.0,
                 min_lon: -100.0,

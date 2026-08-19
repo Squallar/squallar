@@ -1252,9 +1252,9 @@ fn a_corrected_position_reaches_every_consumer_of_it() {
     // track, both of which start from the site.
     let target = (table.lat + 0.5, table.lon + 0.5);
     let (was_bearing, was_range) =
-        crate::beam::site_bearing_range_km(table.lat, table.lon, target.0, target.1);
+        rustdar_geo::site_bearing_range_km(table.lat, table.lon, target.0, target.1);
     let (now_bearing, now_range) =
-        crate::beam::site_bearing_range_km(moved.0, moved.1, target.0, target.1);
+        rustdar_geo::site_bearing_range_km(moved.0, moved.1, target.0, target.1);
     assert_ne!(was_range, now_range);
     assert_ne!(was_bearing, now_bearing);
 
@@ -1279,7 +1279,7 @@ fn a_corrected_position_reaches_every_consumer_of_it() {
     );
 }
 
-/// [`super::mercator_y_from_sin_lat`] is [`super::lat_rad_to_mercator_y`],
+/// [`rustdar_geo::mercator_y_from_sin_lat`] is [`rustdar_geo::lat_rad_to_mercator_y`],
 /// reached from the sine — one projection with two spellings, not two
 /// conventions.
 ///
@@ -1299,8 +1299,8 @@ fn the_mercator_y_from_a_sine_is_the_one_from_an_angle() {
     for i in -8_900..=8_900 {
         let lat_deg = f64::from(i) / 100.0;
         let lat_rad = lat_deg.to_radians();
-        let from_angle = super::lat_rad_to_mercator_y(lat_rad);
-        let from_sine = super::mercator_y_from_sin_lat(lat_rad.sin());
+        let from_angle = rustdar_geo::lat_rad_to_mercator_y(lat_rad);
+        let from_sine = rustdar_geo::mercator_y_from_sin_lat(lat_rad.sin());
         let gap = (from_angle - from_sine).abs();
         if gap > worst {
             worst = gap;
@@ -1317,6 +1317,6 @@ fn the_mercator_y_from_a_sine_is_the_one_from_an_angle() {
     // A pole is where the projection is genuinely infinite, and both spellings
     // have to say so rather than one of them returning a finite number a row
     // could be computed from.
-    assert!(super::mercator_y_from_sin_lat(1.0).is_infinite());
-    assert!(super::mercator_y_from_sin_lat(-1.0).is_infinite());
+    assert!(rustdar_geo::mercator_y_from_sin_lat(1.0).is_infinite());
+    assert!(rustdar_geo::mercator_y_from_sin_lat(-1.0).is_infinite());
 }

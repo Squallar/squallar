@@ -28,13 +28,12 @@
 
 use std::sync::Arc;
 
-use rustdar_egui::pane::{
-    GeoPoint, OrbitCamera, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode,
-};
+use rustdar_egui::pane::{OrbitCamera, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode};
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter};
 use rustdar_frontend::volume::VolumeSupport;
 use rustdar_frontend::volume::bridge::{BridgeVolumePainter, VolumeEntry, VolumeStore};
 use rustdar_frontend::volume::quality::VolumeQuality;
+use rustdar_geo::GeoPoint;
 use rustdar_radar::types::RadarProduct;
 
 /// The fixture's radar, and the box the grid below is resampled over.

@@ -310,10 +310,10 @@ pub struct MapPane {
     pub volume: VolumePane,
 }
 
-/// A point on the ground, in degrees — [`rustdar_geo::GeoPoint`], moved
-/// verbatim to the geodesy floor with its `is_on_earth` validity test, and
-/// re-exported at its old spot so `crate::pane::GeoPoint` keeps naming it.
-pub use rustdar_geo::GeoPoint;
+// A point on the ground is [`rustdar_geo::GeoPoint`] — moved verbatim to the
+// geodesy floor with its `is_on_earth` validity test; the re-export that kept
+// the old pane-module spelling naming it died at WO-G4.
+use rustdar_geo::GeoPoint;
 
 /// The line a cross-section is cut along, stored **geographically**.
 ///

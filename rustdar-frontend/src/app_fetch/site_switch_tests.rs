@@ -78,11 +78,11 @@ fn section_pane_showing_the_wsr88ds_cut(app: &mut crate::app::App) {
     use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
 
     let line = rustdar_egui::pane::SectionLine::new(
-        rustdar_egui::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 40.4,
             lon: -80.2,
         },
-        rustdar_egui::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 40.6,
             lon: -79.9,
         },

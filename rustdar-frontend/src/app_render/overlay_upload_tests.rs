@@ -35,8 +35,8 @@
 
 use super::*;
 use crate::app::tests::drain_uploads;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_overlays::types::GeoBounds;
 
 /// A small overlay, and small on purpose: this is about which bytes arrive, and
 /// a viewport-sized buffer would only make the comparison slower to run.

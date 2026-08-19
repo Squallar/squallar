@@ -972,7 +972,7 @@ fn decode_feature(r: &mut Reader) -> Option<crate::types::OverlayFeature> {
     let hatch = HatchWire::from_wire_code(r.u8()?)?.0;
     let geo_bounds = match r.u8()? {
         0 => None,
-        1 => Some(crate::types::GeoBounds {
+        1 => Some(rustdar_geo::GeoBounds {
             min_lat: r.f64()?,
             max_lat: r.f64()?,
             min_lon: r.f64()?,
@@ -1001,7 +1001,7 @@ fn decode_feature(r: &mut Reader) -> Option<crate::types::OverlayFeature> {
 /// convention, stated here and in [`decode_polygon`] and nowhere else. The
 /// first ring is the exterior and the rest are holes, an ordering the codec
 /// preserves by never reordering anything.
-fn encode_polygon(out: &mut Vec<u8>, polygon: &crate::types::GeoPolygon) {
+fn encode_polygon(out: &mut Vec<u8>, polygon: &rustdar_geo::GeoPolygon) {
     out.extend_from_slice(&(polygon.len() as u32).to_le_bytes());
     for ring in polygon {
         out.extend_from_slice(&(ring.len() as u32).to_le_bytes());
@@ -1013,7 +1013,7 @@ fn encode_polygon(out: &mut Vec<u8>, polygon: &crate::types::GeoPolygon) {
 }
 
 /// The inverse of [`encode_polygon`].
-fn decode_polygon(r: &mut Reader) -> Option<crate::types::GeoPolygon> {
+fn decode_polygon(r: &mut Reader) -> Option<rustdar_geo::GeoPolygon> {
     let ring_count = r.u32()? as usize;
     let mut polygon = Vec::new();
     for _ in 0..ring_count {
@@ -1165,7 +1165,8 @@ mod tests {
     };
     use crate::spc::discussion::MdType;
     use crate::spc::reports::StormReportKind;
-    use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
+    use crate::types::{HatchPattern, OverlayFeature};
+    use rustdar_geo::GeoBounds;
     use rustdar_source::job::{DescribedJob, DescribedOut};
 
     fn test_geometry() -> JobGeometry {

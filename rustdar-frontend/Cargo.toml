@@ -23,6 +23,7 @@ rustdar-overlays = { workspace = true }
 # substrate's own envelope types, and the frontend frames codec rows whose
 # signatures speak them.
 rustdar-source = { workspace = true }
+rustdar-geo = { workspace = true }
 # Types only (GpsFix, GpsConfig) — nothing here touches the serial reader, so
 # this crate stays free of the `serial` feature. The settings pane that does use
 # it turns on rustdar-egui/gps-serial instead, which is where the gate belongs.

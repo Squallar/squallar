@@ -1,5 +1,5 @@
 use crate::site_position::SitePosition;
-use crate::types::EARTH_RADIUS_KM;
+use rustdar_geo::EARTH_RADIUS_KM;
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
@@ -941,7 +941,7 @@ pub fn catalogue_position(site: &str) -> Option<(f64, f64)> {
 /// is mostly CONUS), and the flat approximation's error grows with both
 /// separation and latitude — exactly the regime the comparison runs in.
 ///
-/// On [`crate::types::EARTH_RADIUS_KM`], the workspace's one sphere. This
+/// On [`rustdar_geo::EARTH_RADIUS_KM`], the workspace's one sphere. This
 /// used to carry its own `6371.0088`, the IUGG mean to four more decimals;
 /// the two are 1.4e-6 % apart, which is 9 m across a continent and cannot
 /// change which radar is nearest.

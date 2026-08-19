@@ -16,8 +16,8 @@
 //! is on screen between them.
 
 use super::*;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_overlays::types::GeoBounds;
 
 const KIND: OverlayKind = OverlayKind::NwsAlerts;
 const W: usize = 8;

@@ -370,7 +370,7 @@ fn box_target(half_width_km: f64) -> VolumeTarget {
     VolumeTarget {
         region: Some(
             rustdar_egui::pane::VolumeRegion::new(
-                rustdar_egui::pane::GeoPoint {
+                rustdar_geo::GeoPoint {
                     lat: FIXTURE_SITE.0,
                     lon: FIXTURE_SITE.1,
                 },

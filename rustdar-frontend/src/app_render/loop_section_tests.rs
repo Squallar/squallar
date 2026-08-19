@@ -13,9 +13,9 @@ use crate::app::tests::headless;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform_double::TestBridge;
 use rustdar_egui::pane::{
-    GeoPoint, LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, PaneKind, SectionLine,
-    SectionLoopKey,
+    LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, PaneKind, SectionLine, SectionLoopKey,
 };
+use rustdar_geo::GeoPoint;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView};
 

@@ -317,7 +317,7 @@ pub(super) fn an_overlay_sites_job() -> JobRequest {
         geometry: JobGeometry {
             width: 96,
             height: 64,
-            bounds: rustdar_overlays::types::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 33.0,
                 max_lat: 37.0,
                 min_lon: -99.0,
@@ -405,7 +405,7 @@ pub(super) fn an_overlay_alerts_job() -> JobRequest {
         geometry: JobGeometry {
             width: 96,
             height: 64,
-            bounds: rustdar_overlays::types::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 33.0,
                 max_lat: 37.0,
                 min_lon: -99.0,
@@ -489,7 +489,7 @@ pub(super) fn an_overlay_outlooks_job() -> JobRequest {
         geometry: JobGeometry {
             width: 96,
             height: 64,
-            bounds: rustdar_overlays::types::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 33.0,
                 max_lat: 37.0,
                 min_lon: -99.0,
@@ -516,7 +516,7 @@ pub(super) fn an_overlay_discussions_job() -> JobRequest {
         geometry: JobGeometry {
             width: 96,
             height: 64,
-            bounds: rustdar_overlays::types::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 33.0,
                 max_lat: 37.0,
                 min_lon: -99.0,
@@ -565,7 +565,7 @@ pub(super) fn an_overlay_reports_job() -> JobRequest {
         geometry: JobGeometry {
             width: 96,
             height: 64,
-            bounds: rustdar_overlays::types::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 33.0,
                 max_lat: 37.0,
                 min_lon: -99.0,
@@ -637,7 +637,7 @@ pub(super) fn an_overlay_glm_job() -> JobRequest {
         geometry: JobGeometry {
             width: 96,
             height: 64,
-            bounds: rustdar_overlays::types::GeoBounds {
+            bounds: rustdar_geo::GeoBounds {
                 min_lat: 33.0,
                 max_lat: 37.0,
                 min_lon: -99.0,
@@ -693,8 +693,8 @@ fn a_lambert_parts() -> rustdar_overlays::hrrr::lambert::LambertGridParts {
 /// [`a_lambert_parts`]'s grid — printed as bits beside the constants, for the
 /// same digest-stability reason. Its projection window is a **proper** subset
 /// of the grid, which the parity test asserts rather than assumes.
-fn a_model_viewport() -> rustdar_overlays::types::GeoBounds {
-    rustdar_overlays::types::GeoBounds {
+fn a_model_viewport() -> rustdar_geo::GeoBounds {
+    rustdar_geo::GeoBounds {
         min_lat: f64::from_bits(0x4035b080d763ce74), // 21.68946596323663
         max_lat: f64::from_bits(0x4036058f2985b42e), // 22.02171573175672
         min_lon: f64::from_bits(0xc05e8ffce7e7a000), // -122.24981114978436
@@ -2720,7 +2720,7 @@ fn a_zip_ctx() -> rustdar_overlays::render::overlay_state::RasterizeContext {
 fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
     use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::render::rasterize::HitMap;
-    let bounds = rustdar_overlays::types::GeoBounds {
+    let bounds = rustdar_geo::GeoBounds {
         min_lat: 33.0,
         max_lat: 37.0,
         min_lon: -99.0,
@@ -2814,7 +2814,7 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
 fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
     use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::render::rasterize::HitMap;
-    let bounds = rustdar_overlays::types::GeoBounds {
+    let bounds = rustdar_geo::GeoBounds {
         min_lat: 33.0,
         max_lat: 37.0,
         min_lon: -99.0,

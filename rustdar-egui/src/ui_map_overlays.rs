@@ -1,6 +1,6 @@
 use crate::overlay_cache::{OverlayTextureCache, draw_overlay_texture, geo_point_in_feature};
 use crate::tile_source::HttpsTiles;
-use crate::tiles::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
+use rustdar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 use rustdar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
 use rustdar_overlays::types::OverlayLabel;
 use std::sync::Arc;
@@ -204,7 +204,7 @@ impl<'a> OverlayDrawContext<'a> {
 /// # The tile grid does not wrap, and a pane across the antimeridian shows it
 ///
 /// The index walk below runs `min_tx..=max_tx` on one grid, and
-/// [`crate::tiles::lon_to_tile_x`] **clamps** a longitude past ±180 to the last
+/// [`rustdar_geo::lon_to_tile_x`] **clamps** a longitude past ±180 to the last
 /// column rather than wrapping it. Neither `walkers` nor this application
 /// bounds the map's centre longitude, so a pane can be panned onto the seam,
 /// and when it is, the far side gets no basemap: the tiles are there, at

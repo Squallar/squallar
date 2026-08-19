@@ -437,7 +437,7 @@ pub(crate) fn ceiling_only_geometry(side_ceiling_px: u32) -> rustdar_source::job
     rustdar_source::job::JobGeometry {
         width: 0,
         height: 0,
-        bounds: rustdar_source::geo::GeoBounds {
+        bounds: rustdar_geo::GeoBounds {
             min_lat: 0.0,
             max_lat: 0.0,
             min_lon: 0.0,
@@ -553,7 +553,7 @@ impl JobRequest {
         // The canonical envelope, mirroring `to_bytes` field for field.
         let width = r.u32()?;
         let height = r.u32()?;
-        let bounds = rustdar_source::geo::GeoBounds {
+        let bounds = rustdar_geo::GeoBounds {
             min_lat: r.f64()?,
             max_lat: r.f64()?,
             min_lon: r.f64()?,

@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::geo as overlay_geo;
 use rustdar_overlays::render::rasterize::HitMap;
-use rustdar_overlays::types::{GeoBounds, OverlayFeature, ScreenPoint};
+use rustdar_overlays::types::{OverlayFeature, ScreenPoint};
 use rustdar_radar::types::RadarProduct;
 
 // ── Viewport state (reused for render-trigger detection) ─────────────────
@@ -216,14 +217,14 @@ const PAN_REBUILD_THRESHOLD: f32 = 0.7;
 /// Latitude beyond which Web Mercator stops being finite. Bounds are clamped to it
 /// rather than allowed to run to the pole.
 ///
-/// [`crate::tiles::MERCATOR_LAT_LIMIT_DEG`], not a second copy of it: the tile
+/// [`rustdar_geo::MERCATOR_LAT_LIMIT_DEG`], not a second copy of it: the tile
 /// grid's edge and the overlay texture's edge are the same edge, and this file
 /// read `85.05` while the grid under it ended 0.0011287798° further north —
 /// **125.51 m** of meridian. Only ever a clamp bound, so what it cost was a
 /// viewport between the two figures being treated as looking past the map when
 /// it was still on it; but two numbers for one limit is how the next reader
 /// picks the wrong one.
-const MERCATOR_LAT_LIMIT: f64 = crate::tiles::MERCATOR_LAT_LIMIT_DEG;
+const MERCATOR_LAT_LIMIT: f64 = rustdar_geo::MERCATOR_LAT_LIMIT_DEG;
 
 /// The texture an overlay render should actually allocate.
 ///

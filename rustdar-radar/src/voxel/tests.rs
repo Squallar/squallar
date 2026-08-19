@@ -1,4 +1,5 @@
 use super::*;
+use crate::beam;
 use crate::sampler::{Sample, SampleStatus, samplable};
 use nexrad_model::data::{
     ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
@@ -1790,7 +1791,7 @@ fn the_height_axis_is_msl_above_the_sites_own_elevation() {
 fn the_centre_may_sit_away_from_the_site() {
     let scan = scan_of(&|_, _| Some(30.0));
     // ~50 km due east of KTLX, on the crate's own degree.
-    let east_lon = SITE.1 + 50.0 / (crate::types::KM_PER_DEGREE_LAT * SITE.0.to_radians().cos());
+    let east_lon = SITE.1 + 50.0 / (rustdar_geo::KM_PER_DEGREE_LAT * SITE.0.to_radians().cos());
     let req = VoxelRequest {
         centre: (SITE.0, east_lon),
         half_extent_km: Some(HalfExtentKm::square(20.0)),
@@ -4555,7 +4556,8 @@ fn serial_reference_grid(
         Some(picked) => picked.clamped(),
         None => HalfExtentKm::square(box_half_width_km(volume_reach_km(scan, req.product))),
     };
-    let (bearing_deg, range_km) = beam::site_bearing_range_km(lat, lon, req.centre.0, req.centre.1);
+    let (bearing_deg, range_km) =
+        rustdar_geo::site_bearing_range_km(lat, lon, req.centre.0, req.centre.1);
     let bearing = bearing_deg.to_radians();
     let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
     let x_range_km = (cx - half.east_km, cx + half.east_km);

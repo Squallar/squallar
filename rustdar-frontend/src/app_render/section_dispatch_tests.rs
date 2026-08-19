@@ -4,7 +4,8 @@ use nexrad_model::data::{
     ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
     VolumeCoveragePattern, WaveformType,
 };
-use rustdar_egui::pane::{GeoPoint, PaneKind, SectionLine, SectionUnavailable};
+use rustdar_egui::pane::{PaneKind, SectionLine, SectionUnavailable};
+use rustdar_geo::GeoPoint;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 
 const SITE: &str = "KTLX";

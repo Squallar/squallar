@@ -31,7 +31,7 @@ use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
 use crate::overlay_cache::{
     OverlayTextureCache, OverlayTextureData, OverlayTexturePlan, current_quantized_zoom,
 };
-use rustdar_overlays::types::GeoBounds;
+use rustdar_geo::GeoBounds;
 
 /// The layer switched off in most of these — a texture-mode overlay that is on
 /// by default, so the fixture below starts from the state a real pane is in.

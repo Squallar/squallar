@@ -1,4 +1,5 @@
 use super::*;
+use crate::beam;
 use crate::types;
 use nexrad_model::data::{
     ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
@@ -249,7 +250,7 @@ fn scan_with_first_gate(field: &dyn Fn(f64, f64) -> Gate, first_gate_m: u16) -> 
 }
 
 /// A point `range_km` from `SITE` on `bearing_deg`, found by inverting
-/// [`beam::site_bearing_range_km`] numerically rather than by a second
+/// [`rustdar_geo::site_bearing_range_km`] numerically rather than by a second
 /// forward formula — so a fixture and the code under test cannot share a
 /// mistake.
 ///
@@ -259,7 +260,7 @@ fn point_at(bearing_deg: f64, range_km: f64) -> (f64, f64) {
     // Start from the spherical direct solution and refine: the direct
     // formula is on the same sphere, so one Newton step on the residual
     // range is already at machine precision.
-    let ang = range_km / types::EARTH_RADIUS_KM;
+    let ang = range_km / rustdar_geo::EARTH_RADIUS_KM;
     let (lat1, lon1) = (SITE.0.to_radians(), SITE.1.to_radians());
     let brg = bearing_deg.to_radians();
     let lat = (lat1.sin() * ang.cos() + lat1.cos() * ang.sin() * brg.cos()).asin();
@@ -637,8 +638,9 @@ fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
         // `length_km` is the same fraction, and this is the place that must
         // not share it.
         let t = (col as f64 + 0.5) / SECTION_WIDTH as f64;
-        let point = beam::great_circle_point(req.start, req.end, t);
-        let (azimuth, ground) = beam::site_bearing_range_km(SITE.0, SITE.1, point.0, point.1);
+        let point = rustdar_geo::great_circle_point(req.start, req.end, t);
+        let (azimuth, ground) =
+            rustdar_geo::site_bearing_range_km(SITE.0, SITE.1, point.0, point.1);
         for &row in &rows {
             // Row 0 at the top, centres half a row inside the axis, and
             // the query height is above the *antenna* while the axis is MSL.
@@ -1008,10 +1010,10 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
 /// This test used to record a **seam**. `ImageBounds` framed the raster with
 /// `1.0 / 111.32` degrees per km — a 6378.1 km sphere — while the gates
 /// inside it, and this module's columns, walked
-/// [`crate::types::EARTH_RADIUS_KM`] = 6371. A point the 230 km ring drew
+/// [`rustdar_geo::EARTH_RADIUS_KM`] = 6371. A point the 230 km ring drew
 /// therefore measured 229.741580 km here: a 258.42 m gap, 1.1505 px on a
 /// 2048-wide plan view, always in the same direction. `ImageBounds` reads
-/// [`crate::types::KM_PER_DEGREE_LAT`] now, which is the *expression*
+/// [`rustdar_geo::KM_PER_DEGREE_LAT`] now, which is the *expression*
 /// `EARTH_RADIUS_KM · π/180`, so the ring's latitude offset converts back to
 /// exactly the extent it was drawn at. The pixel figure below is computed from
 /// [`crate::types::IMAGE_SIZE`] rather than quoted, so it keeps meaning if
@@ -1029,11 +1031,12 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
 /// reason that has nothing to do with which sphere anything is on.
 #[test]
 fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
-    let ring_deg = types::BASE_EXTENT_KM / types::KM_PER_DEGREE_LAT;
+    let ring_deg = types::BASE_EXTENT_KM / rustdar_geo::KM_PER_DEGREE_LAT;
 
     // The same latitude offset, measured the way this module measures it.
     let ring_point = (SITE.0 + ring_deg, SITE.1);
-    let (_, ours_km) = beam::site_bearing_range_km(SITE.0, SITE.1, ring_point.0, ring_point.1);
+    let (_, ours_km) =
+        rustdar_geo::site_bearing_range_km(SITE.0, SITE.1, ring_point.0, ring_point.1);
 
     let gap_mm = (types::BASE_EXTENT_KM - ours_km) * 1e6;
     assert!(
@@ -1063,8 +1066,8 @@ fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
     // `111.195` would pass the assertions above at this tolerance and still
     // be a second definition of the planet.
     assert_eq!(
-        types::KM_PER_DEGREE_LAT.to_bits(),
-        (types::EARTH_RADIUS_KM * std::f64::consts::PI / 180.0).to_bits(),
+        rustdar_geo::KM_PER_DEGREE_LAT.to_bits(),
+        (rustdar_geo::EARTH_RADIUS_KM * std::f64::consts::PI / 180.0).to_bits(),
         "`KM_PER_DEGREE_LAT` is no longer derived from `EARTH_RADIUS_KM`",
     );
 }
@@ -1321,8 +1324,8 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
     let ranges: Vec<f64> = (0..SECTION_WIDTH)
         .map(|col| {
             let t = axes.column_distance_km(col) / axes.length_km;
-            let p = beam::great_circle_point(req.start, req.end, t);
-            beam::site_bearing_range_km(SITE.0, SITE.1, p.0, p.1).1
+            let p = rustdar_geo::great_circle_point(req.start, req.end, t);
+            rustdar_geo::site_bearing_range_km(SITE.0, SITE.1, p.0, p.1).1
         })
         .collect();
     let min_col = ranges
@@ -1348,8 +1351,8 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
     // The bearings either side of the crossing are 180° apart.
     let bearing = |col: usize| {
         let t = axes.column_distance_km(col) / axes.length_km;
-        let p = beam::great_circle_point(req.start, req.end, t);
-        beam::site_bearing_range_km(SITE.0, SITE.1, p.0, p.1).0
+        let p = rustdar_geo::great_circle_point(req.start, req.end, t);
+        rustdar_geo::site_bearing_range_km(SITE.0, SITE.1, p.0, p.1).0
     };
     let before = bearing(min_col.saturating_sub(40));
     let after = bearing(min_col + 40);
@@ -1442,8 +1445,8 @@ fn the_blind_guard_holds_where_the_first_gate_starts_at_the_antenna() {
         .min_by(|&a, &b| {
             let f = |col: usize| {
                 let t = axes.column_distance_km(col) / axes.length_km;
-                let p = beam::great_circle_point(req.start, req.end, t);
-                beam::site_bearing_range_km(SITE.0, SITE.1, p.0, p.1).1
+                let p = rustdar_geo::great_circle_point(req.start, req.end, t);
+                rustdar_geo::site_bearing_range_km(SITE.0, SITE.1, p.0, p.1).1
             };
             f(a).total_cmp(&f(b))
         })

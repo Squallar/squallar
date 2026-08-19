@@ -1,5 +1,6 @@
 use super::colors::{md_fill_color, md_stroke_color};
-use crate::types::{GeoPolygon, GeoPolygonRing, HatchPattern, OverlayFeature};
+use crate::types::{HatchPattern, OverlayFeature};
+use rustdar_geo::{GeoPolygon, GeoPolygonRing};
 
 /// Not an SPC field: derived from keywords in the discussion text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -30,7 +30,8 @@ use crate::render::rasterize::{
     rasterize_model_data, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
     rasterize_spc_outlooks, rasterize_storm_reports,
 };
-use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
+use crate::types::{HatchPattern, OverlayFeature};
+use rustdar_geo::GeoBounds;
 
 const W: u32 = 96;
 const H: u32 = 96;

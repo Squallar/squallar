@@ -37,10 +37,13 @@ log = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 roxmltree = "=0.21.1"
 # For `origins::DataSources`, `tls` (incl. the no-User-Agent client METAR/SPC
-# need -- see `metar::fetch`), and the geo/feature vocabulary this crate
+# need -- see `metar::fetch`), and the feature vocabulary this crate
 # re-exports from `types`. The substrate under this crate AND `rustdar-radar`;
 # `tests/charter.rs` there pins that this crate depends on no radar code.
 rustdar-source = { workspace = true }
+# The geo vocabulary (GeoBounds, GeoPolygon, GeoPolygonRing) and the Mercator
+# helpers, named directly since WO-G4 killed the `types` re-export shim.
+rustdar-geo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"

@@ -2,8 +2,8 @@ use super::*;
 use crate::platform_double::TestBridge;
 use rustdar_egui::config_store::MemoryConfigStore;
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_overlays::types::GeoBounds;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn bounds() -> GeoBounds {

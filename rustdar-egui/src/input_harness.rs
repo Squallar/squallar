@@ -57,10 +57,11 @@
 //! cancellation at all.
 
 use crate::Gui;
-use crate::pane::{GeoPoint, PaneKind, SectionLine};
+use crate::pane::{PaneKind, SectionLine};
 use crate::ui::DrawnMenuLeaf;
 use crate::ui_input::{MapPointerFrame, TouchGestures};
 use crate::ui_layout::PointerModality;
+use rustdar_geo::GeoPoint;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 
 /// Viewport size used by the harness — a landscape desktop-ish window.
@@ -1698,7 +1699,7 @@ impl InputHarness {
             .overlay_cache_mut(OverlayKind::Radar);
         cache.show(OverlayTextureData {
             texture,
-            geo_bounds: rustdar_overlays::types::GeoBounds {
+            geo_bounds: rustdar_geo::GeoBounds {
                 min_lat: bounds.min_lat,
                 max_lat: bounds.max_lat,
                 min_lon: bounds.min_lon,

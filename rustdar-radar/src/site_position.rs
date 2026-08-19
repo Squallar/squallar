@@ -51,7 +51,7 @@ use crate::sites::{RadarSite, SiteHeights};
 ///
 /// Not a geodesy constant — it converts an angle to an integer count of
 /// angles, and never to a ground distance. See
-/// [`crate::types::KM_PER_DEGREE_LAT`] for the one thing in this workspace
+/// [`rustdar_geo::KM_PER_DEGREE_LAT`] for the one thing in this workspace
 /// that is allowed to do the latter.
 const MICRO_DEGREES_PER_DEGREE: f64 = 1_000_000.0;
 

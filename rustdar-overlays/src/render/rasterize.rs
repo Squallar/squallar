@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustdar_source::geo::lat_rad_to_mercator_y;
+use rustdar_geo::lat_rad_to_mercator_y;
 use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use std::sync::Arc;
@@ -14,7 +14,8 @@ use crate::nws::alert::AlertCategory;
 use crate::render::overlay_state::OverlayItem;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::reports::StormReportKind;
-use crate::types::{GeoBounds, GeoPolygonRing, OverlayFeature};
+use crate::types::OverlayFeature;
+use rustdar_geo::{GeoBounds, GeoPolygonRing};
 
 // ── Hit buffer types ─────────────────────────────────────────────────────
 
@@ -227,7 +228,7 @@ impl rustdar_source::job::JobOut for RasterizeOutput {
 
 // ── Mercator projection helpers ──────────────────────────────────────────
 
-/// Web Mercator's own limit, from [`rustdar_source::geo`] rather than spelled
+/// Web Mercator's own limit, from [`rustdar_geo`] rather than spelled
 /// again here.
 ///
 /// It read `85.05`, under a comment claiming that was where the projection
@@ -242,7 +243,7 @@ impl rustdar_source::job::JobOut for RasterizeOutput {
 /// picture drawn for one rectangle and pinned to another. Sub-pixel at CONUS
 /// latitudes in a whole-world texture, and zero once the two agree, which is
 /// the point of their being one constant.
-const MAX_MERCATOR_LAT: f64 = rustdar_source::geo::MERCATOR_LAT_LIMIT_DEG;
+const MAX_MERCATOR_LAT: f64 = rustdar_geo::MERCATOR_LAT_LIMIT_DEG;
 
 /// Mercator Y for both edges is precomputed once per texture.
 #[derive(Debug, Clone, Copy)]
@@ -458,7 +459,7 @@ pub struct DiscussionPaint {
     /// Chooses the fill and stroke colours (`crate::spc::colors`).
     pub md_type: crate::spc::discussion::MdType,
     /// Every ring drawn as its own filled polygon — MDs carry no holes.
-    pub polygon: crate::types::GeoPolygon,
+    pub polygon: rustdar_geo::GeoPolygon,
 }
 
 /// Everything [`rasterize_spc_discussions`] reads besides the raster's own
@@ -1640,7 +1641,7 @@ use crate::hrrr::HrrrGridData;
 
 /// Returns degrees.
 fn merc_y_to_lat(merc_y: f64) -> f64 {
-    rustdar_source::geo::mercator_y_to_lat_rad(merc_y).to_degrees()
+    rustdar_geo::mercator_y_to_lat_rad(merc_y).to_degrees()
 }
 
 // ── Model data (HRRR) rasterization ──────────────────────────────────────

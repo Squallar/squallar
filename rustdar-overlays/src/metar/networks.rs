@@ -9,7 +9,7 @@
 //! `https://mesonet.agron.iastate.edu/api/1/networks.json` (PostGIS polygon,
 //! EPSG:4326). They are *station* extents, not political borders.
 
-use crate::types::GeoBounds;
+use rustdar_geo::GeoBounds;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StateNetwork {

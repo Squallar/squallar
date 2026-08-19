@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fetch_policy::DataCompleteness;
-use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
+use crate::types::{HatchPattern, OverlayFeature};
+use rustdar_geo::GeoPolygon;
 
 use super::alert::NwsAlert;
 use super::colors::alert_color;

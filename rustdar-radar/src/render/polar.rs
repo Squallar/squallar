@@ -245,7 +245,7 @@ impl PolarGeometry {
     /// `ground_km`) from, or `None` where it painted no gate there.
     ///
     /// `azimuth_deg` and `ground_km` are what
-    /// [`crate::beam::site_bearing_range_km`] answers for a position — this
+    /// [`rustdar_geo::site_bearing_range_km`] answers for a position — this
     /// crate's one spelling of "where is this point, from the radar" — so a
     /// caller does not have to know that a gate is measured along a slanted
     /// beam and drawn on the ground beneath it. The foreshortening is already

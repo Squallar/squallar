@@ -1,7 +1,6 @@
-use crate::types::{
-    GeoPolygon, HatchPattern, OverlayFeature, REGULAR_FILL_ALPHA, SIGNIFICANT_FILL_ALPHA,
-};
+use crate::types::{HatchPattern, OverlayFeature, REGULAR_FILL_ALPHA, SIGNIFICANT_FILL_ALPHA};
 use chrono::NaiveDateTime;
+use rustdar_geo::GeoPolygon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookDay {

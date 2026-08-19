@@ -1,6 +1,6 @@
 use chrono::NaiveDateTime;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_overlays::types::GeoBounds;
 
 /// Configuration for radar site and time selection
 #[derive(Debug, Clone)]

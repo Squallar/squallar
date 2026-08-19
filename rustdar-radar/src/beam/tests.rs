@@ -1,4 +1,7 @@
 use super::*;
+use rustdar_geo::{
+    EARTH_RADIUS_KM, great_circle_destination, great_circle_point, site_bearing_range_km,
+};
 
 /// The exact spherical height on the same effective sphere — the form
 /// `nexrad_model`'s `polar_to_geo` uses. Written out here rather than
@@ -586,7 +589,7 @@ fn the_site_bearing_and_range_agree_with_hand_computed_geometry() {
     // above are what that gap was measured against.
     assert_eq!(EARTH_RADIUS_KM, 6371.0);
     assert_eq!(
-        crate::types::KM_PER_DEGREE_LAT.to_bits(),
+        rustdar_geo::KM_PER_DEGREE_LAT.to_bits(),
         (EARTH_RADIUS_KM * std::f64::consts::PI / 180.0).to_bits(),
         "`ImageBounds`' degree has come off this sphere again, so a gate and \
              the geography drawn under it are no longer on one planet",

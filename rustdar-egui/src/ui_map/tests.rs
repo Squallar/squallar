@@ -21,8 +21,8 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     let lat = 41.0_f64;
     let dlon = 229.0 / (rustdar_geo::KM_PER_DEGREE_LAT * lat.to_radians().cos());
     let line = crate::pane::SectionLine::new(
-        crate::pane::GeoPoint { lat, lon: -97.0 },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint { lat, lon: -97.0 },
+        rustdar_geo::GeoPoint {
             lat,
             lon: -97.0 + dlon,
         },
@@ -34,7 +34,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     // `1/cos(lat)`, so the `cos` is what makes the assertion below readable
     // in metres rather than in projected units.
     let scale = rustdar_geo::EARTH_RADIUS_KM * 1000.0 * lat.to_radians().cos();
-    let project = |p: crate::pane::GeoPoint| {
+    let project = |p: rustdar_geo::GeoPoint| {
         let y = (std::f64::consts::FRAC_PI_4 + p.lat.to_radians() / 2.0)
             .tan()
             .ln();
@@ -87,7 +87,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
                 (line.b().lat, line.b().lon),
                 half,
             );
-            let on_curve = project(crate::pane::GeoPoint { lat, lon });
+            let on_curve = project(rustdar_geo::GeoPoint { lat, lon });
             (on_curve - (p + (q - p) * 0.5)).length()
         })
         .fold(0.0_f32, f32::max);

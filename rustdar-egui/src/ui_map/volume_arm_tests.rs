@@ -675,7 +675,7 @@ fn stored_region(h: &mut InputHarness, idx: usize) -> Option<crate::pane::Volume
 /// to be a *value* rather than the `None` two panes would agree on vacuously.
 fn picked_region(half_east_km: f64, half_north_km: f64) -> crate::pane::VolumeRegion {
     crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.33,
             lon: -97.28,
         },
@@ -1539,7 +1539,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
     );
 
     let tight = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.3,
             lon: -97.3,
         },

@@ -1174,7 +1174,7 @@ fn pane_showing_render(
     pane.overlay_cache_mut(OverlayKind::Radar)
         .show(OverlayTextureData {
             texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
-            geo_bounds: rustdar_overlays::types::GeoBounds {
+            geo_bounds: rustdar_geo::GeoBounds {
                 min_lat: 34.0,
                 max_lat: 36.0,
                 min_lon: -98.0,

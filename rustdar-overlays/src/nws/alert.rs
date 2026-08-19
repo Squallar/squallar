@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use super::colors::alert_color;
-use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
+use crate::types::{HatchPattern, OverlayFeature};
+use rustdar_geo::GeoPolygon;
 
 /// Not an NWS field: derived from the `event` string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
