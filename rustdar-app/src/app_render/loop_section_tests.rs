@@ -11,6 +11,7 @@
 use super::*;
 use crate::app::tests::headless;
 use crate::platform_double::TestBridge;
+use crate::test_keys;
 use rustdar_egui::pane::{
     LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, PaneKind, SectionLine, SectionLoopKey,
 };
@@ -54,8 +55,13 @@ fn key() -> SectionLoopKey {
     SectionLoopKey::new(line(), None, rustdar_radar::srv::SrvFallback::default())
 }
 
+/// This suite's plan-view half of a section identity: [`test_keys::key`] at the
+/// site, product and tilt every test here shares. It delegates rather than being
+/// flattened into its callers because it is named inside `assert!` bodies, and
+/// rewriting an assertion to route a constructor would edit the pin instead of
+/// the plumbing.
 fn target() -> RenderTarget {
-    RenderTarget::new(SITE, PRODUCT, TILT)
+    test_keys::key(SITE, PRODUCT, TILT)
 }
 
 /// An app with one aimed cross-section pane running a section loop over
@@ -490,7 +496,7 @@ fn the_cut_dedupe_weighs_both_halves_of_the_key() {
         !section_already_queued(
             queued.iter(),
             ts(0),
-            &RenderTarget::new("KOUN", PRODUCT, TILT),
+            &test_keys::key("KOUN", PRODUCT, TILT),
             &key()
         ),
         "another site's cut was suppressed, so its frame is served by neither"

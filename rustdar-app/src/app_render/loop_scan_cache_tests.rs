@@ -23,6 +23,7 @@
 use super::*;
 use crate::app::tests::{empty_scan, headless};
 use crate::platform_double::TestBridge;
+use crate::test_keys;
 use rustdar_egui::pane::{LoopPhase, LoopPlaybackState};
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::types::{RadarProduct, RenderView};
@@ -280,7 +281,7 @@ fn a_live_loops_frames_keep_their_volumes() {
 
     app.evict_unshown_scans();
 
-    let target = RenderTarget::new(SITE, RadarProduct::Reflectivity, 0.5);
+    let target = test_keys::key(SITE, RadarProduct::Reflectivity, 0.5);
     for minute in [0, 4, 8] {
         assert!(
             app.loop_mgr.get_cached(SITE, &at(minute)).is_some(),
@@ -694,7 +695,7 @@ fn a_live_level3_loops_frames_keep_their_objects() {
 
     app.evict_unshown_scans();
 
-    let target = RenderTarget::new(SITE, RadarProduct::EchoTops, 0.5);
+    let target = test_keys::key(SITE, RadarProduct::EchoTops, 0.5);
     for minute in [0, 4, 8] {
         assert!(
             matches!(
