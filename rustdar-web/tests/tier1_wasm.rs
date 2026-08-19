@@ -51,9 +51,27 @@ async fn job_request_bytes_survive_a_real_message_channel_transfer() {
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
     let archive: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
-    let request = JobRequest::Decode {
-        archive: std::sync::Arc::new(archive.clone()),
-    };
+    // Constructed the way every dispatch site constructs one (WO-M7.2
+    // dissolved the old `JobRequest::Decode` enum variant this test was born
+    // against): a typed input described under an envelope. A decode carries no
+    // raster geometry, so the envelope is all zeroes — the same shape the
+    // production dispatch site sends.
+    let request = JobRequest::describe(
+        rustdar_radar::jobs::DecodeJob {
+            archive: std::sync::Arc::new(archive.clone()),
+        },
+        rustdar_source::job::JobGeometry {
+            width: 0,
+            height: 0,
+            bounds: rustdar_geo::GeoBounds {
+                min_lat: 0.0,
+                max_lat: 0.0,
+                min_lon: 0.0,
+                max_lon: 0.0,
+            },
+            side_ceiling_px: 0,
+        },
+    );
     let bytes = request.to_bytes();
 
     let array = js_sys::Uint8Array::from(bytes.as_slice());
@@ -95,10 +113,13 @@ async fn job_request_bytes_survive_a_real_message_channel_transfer() {
     // test, never a refusal to tolerate.
     let decoded = JobRequest::from_bytes(&back)
         .expect("this build's own bytes must decode; None here is a broken codec");
-    match decoded {
-        JobRequest::Decode { archive: got } => assert_eq!(*got, archive),
-        other => panic!("decoded to the wrong variant: {other:?}"),
-    }
+    // `JobRequest` equality is value equality down through the type-erased
+    // input (`JobInput::eq_dyn`): same kind, same archive bytes, same
+    // envelope — the whole request survived the transfer, not just a prefix.
+    assert_eq!(
+        decoded, request,
+        "the decoded request must equal the one encoded before the transfer"
+    );
 }
 
 /// The build-token compare reads REAL JS values: a token written onto a
