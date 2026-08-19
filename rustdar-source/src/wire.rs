@@ -30,6 +30,20 @@ impl<'a> Reader<'a> {
         Some(slice)
     }
 
+    /// Everything not yet consumed — the variable-length tail a payload ends
+    /// with, so no length prefix can lie about it. Infallible where every
+    /// other accessor answers `Option`, because an empty tail is a legitimate
+    /// value rather than a misread, and the cursor never sits past the end of
+    /// the buffer, so the slice below cannot panic.
+    ///
+    /// Semantics match the duplicate cursor in `rustdar_frontend::offload`
+    /// (which lives beside this one until WO-M7.2): its first consumer here
+    /// is the overlay reply decoder's raw RGBA tail (WO-M6.2), then the
+    /// radar decode arms (WO-M7.1/M7.2).
+    pub fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.at..]
+    }
+
     pub fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|b| b[0])
     }
@@ -111,4 +125,36 @@ pub fn layout_digest(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_is_the_unconsumed_tail_and_empty_at_the_end() {
+        let bytes = [1u8, 2, 3, 4, 5];
+        let mut r = Reader::new(&bytes);
+        assert_eq!(
+            r.take(2),
+            Some(&[1u8, 2][..]),
+            "the control: take consumes from the front",
+        );
+        assert_eq!(
+            r.rest(),
+            &[3u8, 4, 5][..],
+            "rest is exactly what take has not consumed",
+        );
+        // `rest` peeks rather than consumes: the cursor has not moved, so a
+        // second read answers the same tail and `take` still starts at 3.
+        assert_eq!(r.rest(), &[3u8, 4, 5][..]);
+        assert_eq!(r.take(3), Some(&[3u8, 4, 5][..]));
+        assert_eq!(
+            r.rest(),
+            &[] as &[u8],
+            "at the end the tail is empty, not a panic and not None — an \
+             empty tail is a legitimate value on this wire",
+        );
+        assert!(r.at_end());
+    }
 }
