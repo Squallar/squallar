@@ -358,7 +358,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          other strings instead.",
     ),
     (
-        "rustdar-frontend/src/loop_downloads.rs",
+        "rustdar-radar/src/loop_downloads.rs",
         "clear_all_empties_every_sites_state",
         "\"The successor to …, extended rather than deleted, and inverted \
          where its premise was the defect.\" It pinned \

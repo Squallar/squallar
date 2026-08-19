@@ -475,7 +475,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
     app.loop_mgr.cache_l3_product(BYSTANDER, "EET", at(4), None);
     app.loop_mgr.set_plan(
         1,
-        crate::loop_downloads::FramePlan::new(
+        rustdar_radar::loop_downloads::FramePlan::new(
             BYSTANDER.to_string(),
             [0u32, 4, 8]
                 .iter()
@@ -497,7 +497,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
     // observable rather than assumed.
     app.loop_mgr.set_plan(
         0,
-        crate::loop_downloads::FramePlan::new(
+        rustdar_radar::loop_downloads::FramePlan::new(
             WSR88D.to_string(),
             vec![(
                 at(0),
@@ -623,7 +623,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         .cache_scan(WSR88D, at(0), (empty_scan().into(), Default::default()));
     app.loop_mgr.insert_pending(
         0,
-        crate::loop_downloads::PendingDownloads {
+        rustdar_radar::loop_downloads::PendingDownloads {
             site: WSR88D.to_string(),
             queue: [(
                 at(8),

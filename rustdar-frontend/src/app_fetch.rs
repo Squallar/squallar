@@ -1837,7 +1837,7 @@ impl super::App {
         &self,
         pane_idx: usize,
         timestamp: NaiveDateTime,
-        data: crate::loop_downloads::LoopFrameData,
+        data: rustdar_radar::loop_downloads::LoopFrameData,
         params: crate::render_dispatch::RenderParams,
         target: rustdar_egui::pane::RenderTarget,
     ) -> bool {
@@ -1872,7 +1872,7 @@ impl super::App {
             // without the volume behind it. `None` — no sweep carries the
             // product — is the same answer the renderer gives, and takes the
             // same failure path.
-            crate::loop_downloads::LoopFrameData::Volume(scan_data, declared) => {
+            rustdar_radar::loop_downloads::LoopFrameData::Volume(scan_data, declared) => {
                 // The storm motion override is read from the dispatcher for the
                 // same reason `spawn_level2_render` reads it there: one field
                 // for both the invalidation and the vector drawn.
@@ -2020,25 +2020,27 @@ impl super::App {
             // `DVL ÷ EET` — arrives here with all of them, paired to this frame's
             // volume and ordered by `level3_products`; what it needs is a job
             // kind that reads more than one, not a different loop path.
-            crate::loop_downloads::LoopFrameData::Products(products) => match products.first() {
-                Some(first) => {
-                    rustdar_worker::offload::Job::Described(
-                        rustdar_worker::offload::JobRequest::describe(
-                            rustdar_radar::jobs::Level3Job {
-                                bytes: std::sync::Arc::clone(&first.bytes),
-                                product,
-                                radar_lat: lat,
-                                radar_lon: lon,
-                            },
-                            // A loop frame, so the loop size — see the Level II arm.
-                            rustdar_worker::offload::ceiling_only_geometry(
-                                rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
+            rustdar_radar::loop_downloads::LoopFrameData::Products(products) => {
+                match products.first() {
+                    Some(first) => {
+                        rustdar_worker::offload::Job::Described(
+                            rustdar_worker::offload::JobRequest::describe(
+                                rustdar_radar::jobs::Level3Job {
+                                    bytes: std::sync::Arc::clone(&first.bytes),
+                                    product,
+                                    radar_lat: lat,
+                                    radar_lon: lon,
+                                },
+                                // A loop frame, so the loop size — see the Level II arm.
+                                rustdar_worker::offload::ceiling_only_geometry(
+                                    rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
+                                ),
                             ),
-                        ),
-                    )
+                        )
+                    }
+                    None => rustdar_worker::offload::Job::renders_nothing(),
                 }
-                None => rustdar_worker::offload::Job::renders_nothing(),
-            },
+            }
         };
         rustdar_worker::offload::offload_job("loop-render", job, move |output| {
             let _guard = guard;
@@ -2512,7 +2514,7 @@ pub(super) struct LoopScanRequest {
 /// radar the user has just left.
 fn begin_loop_for_pane(
     panes: &mut [rustdar_egui::pane::PaneState],
-    loop_mgr: &mut crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &mut rustdar_radar::loop_downloads::LoopDownloadManager,
     pane_idx: usize,
     lookback_secs: u64,
 ) -> Option<LoopScanRequest> {

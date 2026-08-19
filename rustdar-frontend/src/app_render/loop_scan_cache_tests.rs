@@ -41,7 +41,7 @@ fn at(minute: u32) -> chrono::NaiveDateTime {
 /// A volume as the cache holds one. Nothing here reads a moment or a fold
 /// limit — every assertion is about *which* keys are present — so the cheap
 /// empty volume is the honest fixture.
-fn volume() -> crate::loop_downloads::CachedVolume {
+fn volume() -> rustdar_radar::loop_downloads::CachedVolume {
     (Arc::new(empty_scan()), Default::default())
 }
 
@@ -183,8 +183,8 @@ fn pair(app: &mut crate::app::App, code: &str, minute: u32) {
 }
 
 /// The plan `poll_loop_scan_list_results` files for a listing naming `minutes`.
-fn plan_for(minutes: &[u32]) -> crate::loop_downloads::FramePlan {
-    crate::loop_downloads::FramePlan::new(
+fn plan_for(minutes: &[u32]) -> rustdar_radar::loop_downloads::FramePlan {
+    rustdar_radar::loop_downloads::FramePlan::new(
         SITE.to_string(),
         minutes
             .iter()

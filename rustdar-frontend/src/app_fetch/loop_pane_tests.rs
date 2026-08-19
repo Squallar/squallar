@@ -1,7 +1,7 @@
 use super::*;
-use crate::loop_downloads::LoopDownloadManager;
 use rustdar_egui::pane::{LoopPlaybackState, PaneState};
 use rustdar_radar::archive::Identifier;
+use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 
@@ -258,7 +258,7 @@ fn beginning_a_loop_clears_the_panes_pending_downloads() {
     let mut mgr = LoopDownloadManager::new();
     mgr.insert_pending(
         0,
-        crate::loop_downloads::PendingDownloads {
+        rustdar_radar::loop_downloads::PendingDownloads {
             site: "KOUN".to_string(),
             queue: [(ts(5), identifier("KOUN20240101_000500_V06"))]
                 .into_iter()

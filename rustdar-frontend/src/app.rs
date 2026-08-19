@@ -15,7 +15,6 @@ use crate::channels::ChannelHub;
 // `create_window` — the web build takes its size from the canvas. A glob import
 // would go unused on wasm32 and warn.
 use crate::input::InputHandler;
-use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,6 +22,7 @@ use rustdar_device_profile::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_egui::{Gui, actions::GuiAction};
 use rustdar_location::LocationGate;
+use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::site_position::SitePositionSource;
 use rustdar_radar::types::ScanInfo;
 
@@ -143,7 +143,10 @@ enum BackPress {
 ///   regroups post-E5/E9e (in this crate's `render_dispatch` orbit — the
 ///   reshape path map reads "RenderOrchestrator" as that module); the
 ///   timeline engine forms post-E7 WITHIN rustdar-radar over the RF2-folded
-///   loop state (WO-RF2's M12 re-read), and so holds no App field today.
+///   loop state (WO-RF2's M12 re-read; narrowed to the download machinery by
+///   seam ruling 5 — `loop_pool`, the app's texture-budget allocator, stays
+///   app-side and is TimelineEngine-adjacent), and so holds no App field
+///   today.
 ///
 /// ## Field census (49 rows, declaration order)
 ///
@@ -163,11 +166,11 @@ enum BackPress {
 /// | `current_volume_stamps` | root | frame-input fact |
 /// | `volume_painter` | later | render orchestration post-E5/E9e; rustdar-volumetric type since RV |
 /// | `mirror_rungs` | later | render orchestration post-E5/E9e; rustdar-gpu type since RG |
-/// | `budgets` | root | a READ from rustdar-device-profile since RD; its App-not-AppState survival comment is load-bearing and stays with this root field (the block above it currently also carries `loop_pool`'s — d5) |
+/// | `budgets` | root | a READ from rustdar-device-profile since RD; its App-not-AppState survival comment is load-bearing and stays with this root field (de-fused from `loop_pool`'s at RF2n — d5, executed) |
 /// | `device_profile` | root | a READ from rustdar-device-profile since RD |
-/// | `loop_pool` | radar | RF2 re-types (`crate::loop_pool` -> radar); field stays App wiring; its survival comment stays root-side and is today FUSED atop `budgets` (d5) |
-/// | `loop_pool_state` | radar | RF2 re-types; field stays App wiring |
-/// | `loop_pool_sized` | radar | loop state by vocabulary; a plain bool whose sole consumer is app-side `install_volume_bridge` — RF2 moves no code for it (d3) |
+/// | `loop_pool` | root | NARROWED at RF2n (seam ruling 5): moving `crate::loop_pool` radar-ward closes a Cargo normal-dep cycle with rustdar-device-profile, so it STAYS app-side; its survival comment now sits on its own field (d5, executed) |
+/// | `loop_pool_state` | root | with `loop_pool` (seam ruling 5) |
+/// | `loop_pool_sized` | root | a plain bool whose sole consumer is app-side `install_volume_bridge` (d3); rides `loop_pool`'s ruling |
 /// | `scan_data` | root | old VolumeInventory (E4.2) superseded; retention comment load-bearing, stays |
 /// | `base_scans` | root | old VolumeInventory superseded; completeness comment load-bearing, stays |
 /// | `input` | root | |
@@ -180,7 +183,7 @@ enum BackPress {
 /// | `tokio_runtime` | root | cfg(not(wasm32)); executor seam |
 /// | `pending_state` | root | cfg(wasm32); shell |
 /// | `http_client` | root | app_fetch residue |
-/// | `loop_mgr` | radar | RF2: loop_downloads.rs moves; field re-types |
+/// | `loop_mgr` | radar | EXECUTED at RF2n: loop_downloads.rs folded into rustdar-radar; field re-typed to `rustdar_radar::loop_downloads::LoopDownloadManager` |
 /// | `chunk_feeds` | radar | RF1: chunk_feed.rs moves; field re-types |
 /// | `chunk_notify` | radar | RF1: chunk_notify.rs moves; field re-types |
 /// | `latest_cached_scans` | root | old VolumeInventory superseded |
@@ -199,7 +202,8 @@ enum BackPress {
 /// | `site_positions` | root | site/source wiring |
 /// | `site_catalogue` | root | site/source wiring |
 ///
-/// Tally: root 39, radar 6, later 4. Fields that became READS from
+/// Tally: root 42, radar 3, later 4 (loop_pool/loop_pool_state/loop_pool_sized
+/// re-tallied root at RF2n, seam ruling 5). Fields that became READS from
 /// rustdar-device-profile: `budgets`, `device_profile`, `loop_frame_budget`
 /// (and `crate::loop_pool` reads `constants::VOLUME_GRID_CELLS` at module
 /// level).
@@ -222,8 +226,8 @@ enum BackPress {
 /// | chunk_notify.rs (797, inline tests) | radar | RF1 |
 /// | input.rs (272) | root | |
 /// | location_hint.rs | root | app-side residue post-RL-2 (site_for_timezone; anchors live in rustdar-location) |
-/// | loop_downloads.rs (1,683, inline tests) | radar | RF2 |
-/// | loop_pool.rs (707) + loop_pool/tests.rs (1,067) | radar | RF2; `resident_grid_bytes` calls parameterized at the seam |
+/// | loop_downloads.rs | radar | FOLDED at RF2n -> rustdar-radar/src/loop_downloads.rs (inline tests moved with it) |
+/// | loop_pool.rs (707) + loop_pool/tests.rs (1,067) | root | STAYS app-side (RF2 narrowed, seam ruling 5): its vocabulary is rustdar-device-profile's, and device-profile -> radar is a charter-fenced normal dep — the move would close a Cargo cycle |
 /// | platform.rs (910) | root | platform seam |
 /// | platform_double.rs (521) | root | test double |
 /// | render_dispatch.rs (2,409) + render_dispatch/ (6 suites) | root | later-phase orchestration operates here post-E5/E9e |
@@ -254,14 +258,17 @@ enum BackPress {
 /// verbatim; it exercises App drain precedence and stays root unless RF1's
 /// execution proves otherwise (an intent edit = STOP and report).
 ///
-/// **WO-RF2 (loop fold)**: loop_downloads.rs 1,683 (tests inline at `mod
-/// tests`); loop_pool.rs 707 + loop_pool/tests.rs 1,067; the volumetric seam
-/// = loop_pool.rs's two `rustdar_volumetric::raymarch::resident_grid_bytes`
-/// calls, parameterized so radar never deps volumetric (the app passes the
-/// figure); fields re-typed: `loop_mgr`, `loop_pool`, `loop_pool_state`; the
-/// ten E7 loop-pin suites live app-side (app_render/loop_*, app_fetch/loop_*,
-/// render_dispatch/*) and take mechanical re-points ONLY; RF2 also de-fuses
-/// the loop_pool survival comment (d5).
+/// **WO-RF2 (loop fold) — EXECUTED NARROWED as RF2n (seam ruling 5, 2026-08-19)**:
+/// loop_downloads.rs 1,683 (tests inline at `mod tests`) folded into
+/// rustdar-radar; loop_pool.rs 707 + loop_pool/tests.rs 1,067 STAY app-side —
+/// the original fold was STOPPED on a proven Cargo normal-dep cycle
+/// (loop_pool's public API and body are woven through rustdar-device-profile's
+/// vocabulary, and device-profile -> radar is a charter-fenced normal dep), so
+/// the `resident_grid_bytes` parameterization never executed (moot: no move);
+/// field re-typed: `loop_mgr` only; the ten E7 loop-pin suites live app-side
+/// (app_render/loop_*, app_fetch/loop_*, pane_kind_render_filter) and took
+/// mechanical re-points ONLY; RF2n also de-fused the loop_pool survival
+/// comment (d5, executed).
 ///
 /// **Stale `rustdar_frontend::` prose in radar/overlays/source/geo (RF1/RF2
 /// own the repair)**: 55 occurrences / 24 files at this tree (radar 36/15,
@@ -289,12 +296,11 @@ enum BackPress {
 ///   plain bool with an app-side-only consumer; RF2 moves no code for it.
 /// * d4 — `chunk_feed_status` is feed-derived but stays root: it is an E2
 ///   frame-input fact published to `Gui`; only its producer folds.
-/// * d5 — `loop_pool`'s App-not-AppState survival comment sits FUSED atop
-///   `budgets`' doc block while `loop_pool` itself is bare — pre-existing
+/// * d5 — `loop_pool`'s App-not-AppState survival comment sat FUSED atop
+///   `budgets`' doc block while `loop_pool` itself was bare — pre-existing
 ///   verbatim at 8586e755, not reshape drift. Both survival comments answer
-///   for ROOT-field placement and stay in this file; WO-RF2 (whose diff
-///   touches the loop_pool spellings here anyway) owns the de-fusion: move
-///   the first paragraph pair onto `loop_pool`, leave `budgets` its own.
+///   for ROOT-field placement and stay in this file; EXECUTED at RF2n: the
+///   first paragraph pair moved onto `loop_pool`, `budgets` keeps its own.
 /// * d6 — WO-RA's "the mobile cfg build.rs carries over" is stale: this crate
 ///   has NO build.rs (WO-RD moved the mechanism down); RA carries nothing.
 /// * d7 — budget_memo.rs's planned re-home (rustdar-device-profile, per its
@@ -362,14 +368,6 @@ pub struct App {
     /// when it may move. One per application, because the mirror is one texture
     /// for the whole application. See `egui_renderer::mirror`.
     mirror_rungs: rustdar_gpu::egui_renderer::MirrorRungs,
-    /// The application's whole loop allowance, and the hysteresis that governs
-    /// how it is divided. One per application, because the pool is one
-    /// allowance for the whole application. See `crate::loop_pool`.
-    ///
-    /// On `App` rather than on `AppState`, and that is load-bearing for exactly
-    /// the reason `rustdar_volumetric::degrade`'s counters are module statics: a lost
-    /// surface sets `self.state = None`, and a pool that backed off *because* of
-    /// a lost surface would be destroyed by the event it just learned from.
     /// Every per-target number this build spends, resolved once from a
     /// [`rustdar_device_profile::budget::DeviceProfile`] and threaded from here.
     ///
@@ -393,6 +391,14 @@ pub struct App {
     /// budgets are decided rather than one for the first resolve and another
     /// for every subsequent one.
     device_profile: rustdar_device_profile::budget::DeviceProfile,
+    /// The application's whole loop allowance, and the hysteresis that governs
+    /// how it is divided. One per application, because the pool is one
+    /// allowance for the whole application. See `crate::loop_pool`.
+    ///
+    /// On `App` rather than on `AppState`, and that is load-bearing for exactly
+    /// the reason `rustdar_volumetric::degrade`'s counters are module statics: a lost
+    /// surface sets `self.state = None`, and a pool that backed off *because* of
+    /// a lost surface would be destroyed by the event it just learned from.
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,

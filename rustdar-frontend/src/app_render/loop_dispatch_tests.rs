@@ -1,11 +1,11 @@
 use super::*;
-use crate::loop_downloads::LoopDownloadManager;
 use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
 };
 use rustdar_device_profile::constants::MAX_LOOP_FRAMES;
 use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
 use rustdar_radar::archive::Identifier;
+use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RadarProduct;
 
@@ -88,7 +88,9 @@ pub(super) fn scan_with_sweeps(elevations: &[f32]) -> Arc<Scan> {
 /// [`scan_with_sweeps`] as the loop cache holds one. Nothing here reads a fold
 /// limit, so the fixture volume declares none — which is what a Message 1
 /// volume gives the cache in production too.
-pub(super) fn volume_with_sweeps(elevations: &[f32]) -> crate::loop_downloads::CachedVolume {
+pub(super) fn volume_with_sweeps(
+    elevations: &[f32],
+) -> rustdar_radar::loop_downloads::CachedVolume {
     (scan_with_sweeps(elevations), Arc::default())
 }
 

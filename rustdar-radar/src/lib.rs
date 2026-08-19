@@ -16,6 +16,7 @@ pub mod jobs;
 pub mod kdp;
 pub(crate) mod l3_values;
 pub mod level3;
+pub mod loop_downloads;
 pub mod nrot;
 pub mod nyquist;
 mod palette;
