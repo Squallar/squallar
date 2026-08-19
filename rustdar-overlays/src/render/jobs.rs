@@ -1,0 +1,1565 @@
+//! The seven overlay codec rows — the overlay half of the job boundary,
+//! beside the rasterizers the rows run (WO-M6.2).
+//!
+//! Each row is a [`JobSpec`] over one of the wire-form inputs `rasterize`
+//! already defines, monomorphized into a [`JobCodec`] in [`JOB_CODECS`]. The
+//! codec bodies moved here **verbatim** (post-WO-M6.1 text) from
+//! `rustdar_frontend::offload`, which keeps byte-identical duplicates until
+//! WO-M6.3 flips the frontend onto this table and deletes them — until that
+//! flip nothing routes through this module, and the frontend's framing
+//! digests over the duplicate bodies are the byte gate the flip must pass.
+//!
+//! **The code byte stays with the caller.** A row's payload is its kind's
+//! bytes *minus* the leading `OVERLAY_INPUT_*` code byte the frontend wire
+//! writes: codes are frontend-owned until WO-M7b's dense flip, so the caller
+//! consumes the code, selects the row, and hands the cursor over. The row
+//! order in [`JOB_CODECS`] — sites, alerts, outlooks, discussions, reports,
+//! glm, model — is load-bearing for exactly that flip, which assigns codes
+//! by registry index.
+//!
+//! **The refusal contract**, shared by every `decode` here: `None` for a
+//! flag or enum byte outside this build's values, a string that is not
+//! UTF-8, or a buffer shorter than its own counts claim. The counts are read
+//! but never trusted with an allocation: rows, features, rings and points
+//! are pushed as they decode, so a count claiming four billion of anything
+//! fails on [`Reader::take`]'s first short read instead of reserving for a
+//! list the buffer cannot hold.
+//!
+//! **No clock.** GLM's `now` is captured at dispatch and travels on the
+//! wire; nothing in this module may read a clock of its own — a worker that
+//! did would render a picture the direct call would not. WO-M7.2 lands the
+//! grep ratchet that pins this for every jobs module.
+//!
+//! **No egui.** `run` answers each rasterizer's own alpha convention
+//! untouched; the premultiply that follows is egui arithmetic and stays in
+//! `rustdar_frontend::offload`.
+
+use std::collections::{HashMap, HashSet};
+
+use rustdar_source::job::{EncodeCtx, JobCodec, JobCost, JobGeometry, JobOutCodec, JobSpec};
+use rustdar_source::wire::Reader;
+
+use crate::render::rasterize::{
+    AlertsInput, AlphaMode, DiscussionsInput, GlmStrikesInput, HitCells, ModelDataInput,
+    OutlooksInput, RasterizeOutput, ReportsInput, SitesInput, rasterize_glm_strikes,
+    rasterize_model_data, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
+    rasterize_spc_outlooks, rasterize_storm_reports,
+};
+
+/// The seven overlay rows, in dispatch order: **sites, alerts, outlooks,
+/// discussions, reports, glm, model**. The order is load-bearing — WO-M7b's
+/// dense code flip assigns wire codes by index into the composed registry —
+/// and the labels are the shipped kind strings the frontend's framing rows
+/// print, byte for byte.
+pub static JOB_CODECS: &[JobCodec] = &[
+    JobCodec::with_out::<SitesJob>(),
+    JobCodec::with_out::<AlertsJob>(),
+    JobCodec::with_out::<OutlooksJob>(),
+    JobCodec::with_out::<DiscussionsJob>(),
+    JobCodec::with_out::<ReportsJob>(),
+    JobCodec::with_out::<GlmJob>(),
+    JobCodec::with_out::<ModelJob>(),
+];
+
+/// The radar-site markers row.
+pub struct SitesJob;
+
+impl JobSpec for SitesJob {
+    type In = SitesInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/sites";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(sites: &SitesInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        out.extend_from_slice(&sites.zoom.to_le_bytes());
+        out.push(u8::from(sites.is_dark));
+        out.extend_from_slice(&sites.device_scale.to_le_bytes());
+        // Count-prefixed, then each row; the name last per row, length-
+        // prefixed. A name is a catalogue identifier — four bytes for
+        // every WSR-88D — so the `u16` is generous; the truncation keeps
+        // the encoder total on input it will never see, and a cut that
+        // split a multi-byte character is refused by the decoder's UTF-8
+        // check rather than misread.
+        out.extend_from_slice(&(sites.sites.len() as u32).to_le_bytes());
+        for site in &sites.sites {
+            out.extend_from_slice(&site.lat.to_le_bytes());
+            out.extend_from_slice(&site.lon.to_le_bytes());
+            out.push(u8::from(site.is_current));
+            out.push(u8::from(site.is_loading));
+            encode_str(out, &site.name);
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(SitesInput, JobGeometry)> {
+        let zoom = r.f64()?;
+        let is_dark = flag(r.u8()?)?;
+        let device_scale = r.f32()?;
+        let count = r.u32()? as usize;
+        let mut sites = Vec::new();
+        for _ in 0..count {
+            let lat = r.f64()?;
+            let lon = r.f64()?;
+            let is_current = flag(r.u8()?)?;
+            let is_loading = flag(r.u8()?)?;
+            let name = decode_str(r)?;
+            sites.push(crate::render::rasterize::RadarSiteInfo {
+                name,
+                lat,
+                lon,
+                is_current,
+                is_loading,
+            });
+        }
+        Some((
+            crate::render::rasterize::SitesInput {
+                sites,
+                zoom,
+                is_dark,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &SitesInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_radar_sites(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for SitesJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+/// The NWS-alerts row.
+pub struct AlertsJob;
+
+impl JobSpec for AlertsJob {
+    type In = AlertsInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/alerts";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(alerts: &AlertsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        out.extend_from_slice(&alerts.device_scale.to_le_bytes());
+        out.extend_from_slice(&(alerts.enabled_categories.len() as u32).to_le_bytes());
+        for category in &alerts.enabled_categories {
+            out.push(AlertCategoryWire(*category).wire_code());
+        }
+        // Sorted, because a `HashSet`'s iteration order is seeded per
+        // process: the *set* round-trips either way, but the bytes have
+        // to be a function of the value for the framing digest to pin
+        // them and for two encodes of one input to agree.
+        let mut hidden: Vec<&String> = alerts.hidden_ids.iter().collect();
+        hidden.sort();
+        out.extend_from_slice(&(hidden.len() as u32).to_le_bytes());
+        for id in hidden {
+            encode_str(out, id);
+        }
+        out.extend_from_slice(&(alerts.alerts.len() as u32).to_le_bytes());
+        for alert in &alerts.alerts {
+            encode_str(out, &alert.id);
+            out.push(AlertCategoryWire(alert.category).wire_code());
+            out.extend_from_slice(&(alert.features.len() as u32).to_le_bytes());
+            // `features` rides an `Arc` since parse time; iteration derefs
+            // to the same rows in the same order — the bytes are those of
+            // the plain `Vec` this field used to be.
+            for feature in alert.features.iter() {
+                encode_feature(out, feature);
+            }
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(AlertsInput, JobGeometry)> {
+        let device_scale = r.f32()?;
+        let category_count = r.u32()? as usize;
+        let mut enabled_categories = Vec::new();
+        for _ in 0..category_count {
+            enabled_categories.push(AlertCategoryWire::from_wire_code(r.u8()?)?.0);
+        }
+        let hidden_count = r.u32()? as usize;
+        let mut hidden_ids = HashSet::new();
+        for _ in 0..hidden_count {
+            hidden_ids.insert(decode_str(r)?);
+        }
+        let alert_count = r.u32()? as usize;
+        let mut alerts = Vec::new();
+        for _ in 0..alert_count {
+            let id = decode_str(r)?;
+            let category = AlertCategoryWire::from_wire_code(r.u8()?)?.0;
+            let feature_count = r.u32()? as usize;
+            let mut features = Vec::new();
+            for _ in 0..feature_count {
+                features.push(decode_feature(r)?);
+            }
+            alerts.push(crate::render::rasterize::AlertPaint {
+                id,
+                category,
+                // A fresh `Arc` per decode: equality with the encoded side
+                // is value equality through the deref, never pointer
+                // identity.
+                features: std::sync::Arc::new(features),
+            });
+        }
+        Some((
+            crate::render::rasterize::AlertsInput {
+                alerts,
+                enabled_categories,
+                hidden_ids,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &AlertsInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_nws_alerts(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for AlertsJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+/// The SPC-outlooks row.
+pub struct OutlooksJob;
+
+impl JobSpec for OutlooksJob {
+    type In = OutlooksInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/outlooks";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(outlooks: &OutlooksInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        out.extend_from_slice(&outlooks.device_scale.to_le_bytes());
+        out.extend_from_slice(&outlooks.hatch_color);
+        out.extend_from_slice(&(outlooks.features.len() as u32).to_le_bytes());
+        for feature in &outlooks.features {
+            encode_feature(out, feature);
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(OutlooksInput, JobGeometry)> {
+        let device_scale = r.f32()?;
+        let hatch_color: [u8; 4] = r.take(4)?.try_into().ok()?;
+        let feature_count = r.u32()? as usize;
+        let mut features = Vec::new();
+        for _ in 0..feature_count {
+            features.push(decode_feature(r)?);
+        }
+        Some((
+            crate::render::rasterize::OutlooksInput {
+                features,
+                hatch_color,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &OutlooksInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_spc_outlooks(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for OutlooksJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+/// The SPC mesoscale-discussions row.
+pub struct DiscussionsJob;
+
+impl JobSpec for DiscussionsJob {
+    type In = DiscussionsInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/discussions";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(discussions: &DiscussionsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        out.extend_from_slice(&discussions.device_scale.to_le_bytes());
+        out.extend_from_slice(&(discussions.discussions.len() as u32).to_le_bytes());
+        for md in &discussions.discussions {
+            out.push(MdTypeWire(md.md_type).wire_code());
+            encode_polygon(out, &md.polygon);
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(DiscussionsInput, JobGeometry)> {
+        let device_scale = r.f32()?;
+        let md_count = r.u32()? as usize;
+        let mut discussions = Vec::new();
+        for _ in 0..md_count {
+            let md_type = MdTypeWire::from_wire_code(r.u8()?)?.0;
+            let polygon = decode_polygon(r)?;
+            discussions.push(crate::render::rasterize::DiscussionPaint { md_type, polygon });
+        }
+        Some((
+            crate::render::rasterize::DiscussionsInput {
+                discussions,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &DiscussionsInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_spc_discussions(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for DiscussionsJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+/// The storm-reports row — the first of the two hit-map kinds.
+pub struct ReportsJob;
+
+impl JobSpec for ReportsJob {
+    type In = ReportsInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/reports";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(reports: &ReportsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        // One of the two hit-map kinds. **Row order is load-bearing**: a
+        // row's position is its hit-map id, and the page zips the reply's
+        // cells with an item list captured in this order — so this loop
+        // appends in input order and the decoder pushes in read order, like
+        // every list on this wire, and unlike every other list a reorder
+        // here would not merely move pixels, it would hand hovers to the
+        // wrong items.
+        out.extend_from_slice(&reports.zoom.to_le_bytes());
+        out.push(u8::from(reports.is_dark));
+        out.extend_from_slice(&reports.device_scale.to_le_bytes());
+        out.extend_from_slice(&(reports.reports.len() as u32).to_le_bytes());
+        for report in &reports.reports {
+            out.push(StormReportKindWire(report.kind).wire_code());
+            out.extend_from_slice(&report.lat.to_le_bytes());
+            out.extend_from_slice(&report.lon.to_le_bytes());
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(ReportsInput, JobGeometry)> {
+        let zoom = r.f64()?;
+        let is_dark = flag(r.u8()?)?;
+        let device_scale = r.f32()?;
+        let count = r.u32()? as usize;
+        let mut reports = Vec::new();
+        for _ in 0..count {
+            reports.push(crate::render::rasterize::ReportPaint {
+                kind: StormReportKindWire::from_wire_code(r.u8()?)?.0,
+                lat: r.f64()?,
+                lon: r.f64()?,
+            });
+        }
+        Some((
+            crate::render::rasterize::ReportsInput {
+                reports,
+                zoom,
+                is_dark,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &ReportsInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_storm_reports(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for ReportsJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+/// The GLM-lightning row — the second hit-map kind. Its `now` is the page's
+/// clock at dispatch, on the wire ([`GlmStrikesInput::now`]); `run` receives
+/// no clock and must never read one.
+pub struct GlmJob;
+
+impl JobSpec for GlmJob {
+    type In = GlmStrikesInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/glm";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(glm: &GlmStrikesInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        // One of the two hit-map kinds. **Row order is load-bearing**: a
+        // row's position is its hit-map id, and the page zips the reply's
+        // cells with an item list captured in this order — so this loop
+        // appends in input order and the decoder pushes in read order, like
+        // every list on this wire, and unlike every other list a reorder
+        // here would not merely move pixels, it would hand hovers to the
+        // wrong items.
+        out.extend_from_slice(&glm.zoom.to_le_bytes());
+        out.push(u8::from(glm.is_dark));
+        out.extend_from_slice(&glm.device_scale.to_le_bytes());
+        out.extend_from_slice(&glm.time_window_secs.to_le_bytes());
+        // The page's clock, on the wire. The worker ages every flash
+        // against this and never against a clock of its own — the parity
+        // gates over an age-straddling fixture are what enforce it.
+        encode_datetime(out, &glm.now);
+        out.extend_from_slice(&(glm.flashes.len() as u32).to_le_bytes());
+        for flash in &glm.flashes {
+            out.extend_from_slice(&flash.lat.to_le_bytes());
+            out.extend_from_slice(&flash.lon.to_le_bytes());
+            encode_datetime(out, &flash.time);
+            match flash.energy {
+                None => out.push(0),
+                Some(energy) => {
+                    out.push(1);
+                    out.extend_from_slice(&energy.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(GlmStrikesInput, JobGeometry)> {
+        let zoom = r.f64()?;
+        let is_dark = flag(r.u8()?)?;
+        let device_scale = r.f32()?;
+        let time_window_secs = r.f64()?;
+        let now = decode_datetime(r)?;
+        let count = r.u32()? as usize;
+        let mut flashes = Vec::new();
+        for _ in 0..count {
+            flashes.push(crate::render::rasterize::FlashPaint {
+                lat: r.f64()?,
+                lon: r.f64()?,
+                time: decode_datetime(r)?,
+                energy: match r.u8()? {
+                    0 => None,
+                    1 => Some(r.f32()?),
+                    _ => return None,
+                },
+            });
+        }
+        Some((
+            crate::render::rasterize::GlmStrikesInput {
+                flashes,
+                zoom,
+                is_dark,
+                time_window_secs,
+                now,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &GlmStrikesInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_glm_strikes(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for GlmJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+/// The HRRR model-grid row — the one row that reads its [`EncodeCtx`]: the
+/// grid is **cut to its projection window at encode time**, the one moment
+/// that knows what ground the texture covers, so what travels is the
+/// window's values rather than 7.62 MB of grid per gesture-settle re-render.
+pub struct ModelJob;
+
+impl JobSpec for ModelJob {
+    type In = ModelDataInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/model";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(input: &ModelDataInput, ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        // The window cut. Scalars first as everywhere: the parameter (its
+        // stable `as_str` identifier — the same exhaustive pair the persisted
+        // pane config round-trips through), the grid shape, the coordinates,
+        // the window, and then the window's values as the one bulk block.
+        // Whichever carry arrives — the dispatch's `Whole` or an
+        // already-windowed form — what leaves is the same window form, so
+        // the bytes are a function of the picture and the framing digest can
+        // pin them.
+        encode_str(out, input.parameter().as_str());
+        let (ni, nj) = input.shape();
+        out.extend_from_slice(&(ni as u32).to_le_bytes());
+        out.extend_from_slice(&(nj as u32).to_le_bytes());
+        encode_grid_coords(out, input.coords());
+        let win = input.window_for(
+            &ctx.geometry.bounds,
+            ctx.geometry.width,
+            ctx.geometry.height,
+        );
+        for edge in [win.i0, win.i1, win.j0, win.j1] {
+            out.extend_from_slice(&(edge as u32).to_le_bytes());
+        }
+        // No count: the length is the window's area, already on the wire
+        // as the four edges, and a second statement of it could lie.
+        input.for_each_window_row(&win, |row| encode_f32s(out, row));
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(ModelDataInput, JobGeometry)> {
+        use crate::render::rasterize::{IndexWindow, ModelWindow};
+        // `FromStr` for the parameter is deliberately total — persisted
+        // pane state must never panic a restore — so an unknown code
+        // parses to a *default*. On this boundary that leniency would be
+        // a misread (a build's new parameter silently rasterized as
+        // CIN), so the code is believed only if it names itself back.
+        let code = decode_str(r)?;
+        let parameter: crate::hrrr::ModelParameter = code.parse().ok()?;
+        (parameter.as_str() == code).then_some(())?;
+        let ni = r.u32()? as usize;
+        let nj = r.u32()? as usize;
+        let coords = decode_grid_coords(r)?;
+        let win = IndexWindow {
+            i0: r.u32()? as usize,
+            i1: r.u32()? as usize,
+            j0: r.u32()? as usize,
+            j1: r.u32()? as usize,
+        };
+        // A window past the grid it indexes, or inside-out, is a layout
+        // this build never writes: refused, not clamped, so a raster of
+        // it cannot silently draw a different region than was asked. An
+        // empty window (a viewport the grid never reaches) is legitimate
+        // and its area — and so its values block — is zero.
+        if win.i0 > win.i1 || win.j0 > win.j1 || win.i1 > ni || win.j1 > nj {
+            return None;
+        }
+        // The values length is the window's own area — no second count
+        // on the wire to disagree with it, and `take` inside refuses a
+        // buffer shorter than the area claims before anything allocates.
+        let values = decode_f32s(r, win.area())?;
+        Some((
+            ModelDataInput::Window(ModelWindow {
+                parameter,
+                ni,
+                nj,
+                coords,
+                win,
+                values,
+            }),
+            geo,
+        ))
+    }
+
+    fn run(input: &ModelDataInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_model_data(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for ModelJob {
+    fn encode_out(v: &RasterizeOutput, out: &mut Vec<u8>) {
+        encode_raster_reply(v, out);
+    }
+
+    fn decode_out(bytes: &[u8]) -> Option<RasterizeOutput> {
+        decode_raster_reply(bytes)
+    }
+}
+
+// ── The shared reply pair ────────────────────────────────────────────────
+
+/// The reply adapter every row's [`JobOutCodec::encode_out`] shares, over the
+/// moved codec body below. (The intermediate `Vec` is the cost of keeping
+/// [`encode_overlay_out`]'s moved signature exact for WO-M6.3's delegation;
+/// WO-M7c, which makes this path live, may flatten it.)
+fn encode_raster_reply(v: &RasterizeOutput, out: &mut Vec<u8>) {
+    out.extend_from_slice(&encode_overlay_out(&v.rgba, v.hit_cells.as_ref()));
+}
+
+/// The reply adapter every row's [`JobOutCodec::decode_out`] shares.
+///
+/// `alpha` is not on the reply wire because only one convention ever crosses
+/// it: `rustdar_frontend::offload::execute`'s output stage converts the one
+/// straight-alpha producer (the model grid) to premultiplied before any
+/// reply is encoded, so a decoded reply states [`AlphaMode::Premultiplied`]
+/// — the only value that is ever true of these bytes.
+fn decode_raster_reply(bytes: &[u8]) -> Option<RasterizeOutput> {
+    let (rgba, hit_cells) = decode_overlay_out(bytes)?;
+    Some(RasterizeOutput {
+        rgba,
+        hit_cells,
+        alpha: AlphaMode::Premultiplied,
+    })
+}
+
+/// The overlay reply's bytes: a hit-cells tag, the framed cells when the tag
+/// says so, and the raw RGBA as the rest.
+///
+/// The cells are written **sorted by cell index** — a `HashMap`'s iteration
+/// order is seeded per process, and these bytes have to be a function of the
+/// value for two encodes of one reply to agree and for the framing digest in
+/// `rustdar_frontend::offload::tests` to pin them. The RGBA takes the rest,
+/// so no length prefix can lie about it; its one guard stays the dispatch's
+/// length check.
+pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() + 64);
+    match hit_cells {
+        None => out.push(0),
+        Some(cells) => {
+            out.push(1);
+            out.extend_from_slice(&cells.width.to_le_bytes());
+            out.extend_from_slice(&cells.height.to_le_bytes());
+            let mut occupied: Vec<(&u32, &Vec<u32>)> = cells.cells.iter().collect();
+            occupied.sort_by_key(|(idx, _)| **idx);
+            out.extend_from_slice(&(occupied.len() as u32).to_le_bytes());
+            for (idx, ids) in occupied {
+                out.extend_from_slice(&idx.to_le_bytes());
+                out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+                for id in ids {
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+        }
+    }
+    out.extend_from_slice(rgba);
+    out
+}
+
+/// The inverse of [`encode_overlay_out`]. `None` for a tag outside `{0, 1}`,
+/// a cell index at or past the grid the stated dimensions span, indices out
+/// of ascending order or repeated (the canonical form the encoder writes and
+/// the only one accepted, so one value has one byte string), an empty id
+/// list (the rasterizer never records one), or a buffer shorter than its own
+/// counts claim. The RGBA tail is handed back **unjudged**: only the
+/// dispatch knows the dimensions it must match.
+pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<HitCells>)> {
+    let mut r = Reader::new(bytes);
+    let hit_cells = match r.u8()? {
+        0 => None,
+        1 => {
+            let width = r.u32()?;
+            let height = r.u32()?;
+            let grid = u64::from(width) * u64::from(height);
+            let occupied = r.u32()? as usize;
+            let mut cells = HashMap::new();
+            let mut previous: Option<u32> = None;
+            for _ in 0..occupied {
+                let idx = r.u32()?;
+                if u64::from(idx) >= grid || previous.is_some_and(|p| p >= idx) {
+                    return None;
+                }
+                previous = Some(idx);
+                let id_count = r.u32()? as usize;
+                if id_count == 0 {
+                    return None;
+                }
+                let mut ids = Vec::new();
+                for _ in 0..id_count {
+                    ids.push(r.u32()?);
+                }
+                cells.insert(idx, ids);
+            }
+            Some(crate::render::rasterize::HitCells {
+                width,
+                height,
+                cells,
+            })
+        }
+        _ => return None,
+    };
+    Some((r.rest().to_vec(), hit_cells))
+}
+
+// ── The field codecs the rows share ──────────────────────────────────────
+
+/// A byte that must be a `bool`: `None` for anything but `{0, 1}`, refused
+/// rather than coerced. The moved decode bodies' one shared refusal helper.
+fn flag(byte: u8) -> Option<bool> {
+    match byte {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// A row of `f32`s, little-endian, in one pass straight off the grid's own
+/// storage — the closest thing to zero-copy a byte codec has. On the
+/// little-endian targets this workspace ships (x86_64, aarch64, wasm32),
+/// `to_le_bytes` is the identity and the loop compiles down to a bulk copy.
+fn encode_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    out.reserve(values.len() * 4);
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// The inverse of [`encode_f32s`] over exactly `count` values: `None` on a
+/// short buffer, checked by [`Reader::take`] **before** anything is sized
+/// from `count` — so a count claiming four billion points fails on the first
+/// short read rather than reserving for it.
+fn decode_f32s(r: &mut Reader, count: usize) -> Option<Vec<f32>> {
+    let bytes = r.take(count.checked_mul(4)?)?;
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("chunks of four")))
+            .collect(),
+    )
+}
+
+/// Grid-coordinate tag: computed Lambert constants. The stored fields of
+/// [`crate::hrrr::lambert::LambertGrid`] travel **as stored** — derived
+/// constants and the measured wrap flag included — so the far side restores
+/// bits and never consults libm; see `LambertGridParts`.
+const GRID_COORDS_LAMBERT: u8 = 1;
+/// Grid-coordinate tag: materialised per-point arrays. No production HRRR
+/// fetch produces one, and such a grid never has a proper-subset window
+/// (only the Lambert case can be narrowed), so this arm always carries its
+/// full 30.5 MB-per-1.9M-points arrays — the honest cost of a source that
+/// materialises its coordinates.
+const GRID_COORDS_EXPLICIT: u8 = 2;
+
+fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
+    use crate::hrrr::GridCoords;
+    match coords {
+        GridCoords::Lambert(grid) => {
+            out.push(GRID_COORDS_LAMBERT);
+            let parts = grid.to_parts();
+            for v in [
+                parts.a,
+                parts.e,
+                parts.n,
+                parts.big_f,
+                parts.rho0,
+                parts.lon0,
+                parts.x0,
+                parts.y0,
+                parts.dx,
+                parts.dy,
+            ] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(parts.ni as u32).to_le_bytes());
+            out.extend_from_slice(&(parts.nj as u32).to_le_bytes());
+            out.push(u8::from(parts.i_consecutive));
+            out.push(u8::from(parts.alternating));
+            out.push(u8::from(parts.wraps_longitude));
+        }
+        GridCoords::Explicit { lats, lons } => {
+            out.push(GRID_COORDS_EXPLICIT);
+            // Two counts, not one: the two arrays are allowed to disagree in
+            // length (`GridCoords::len` takes the min), and an encoder that
+            // wrote one count would silently reshape such a grid.
+            out.extend_from_slice(&(lats.len() as u32).to_le_bytes());
+            for v in lats {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(lons.len() as u32).to_le_bytes());
+            for v in lons {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The inverse of [`encode_grid_coords`]. `None` for a tag this build does
+/// not have, constants `LambertGrid::from_parts` refuses (non-finite, a
+/// degenerate cone), a flag byte outside `{0, 1}`, or a buffer shorter than
+/// its own counts claim — each checked by `take` before any allocation is
+/// sized from a count.
+fn decode_grid_coords(r: &mut Reader) -> Option<crate::hrrr::GridCoords> {
+    use crate::hrrr::GridCoords;
+    use crate::hrrr::lambert::{LambertGrid, LambertGridParts};
+    match r.u8()? {
+        GRID_COORDS_LAMBERT => {
+            let mut constants = [0.0f64; 10];
+            for v in &mut constants {
+                *v = r.f64()?;
+            }
+            let [a, e, n, big_f, rho0, lon0, x0, y0, dx, dy] = constants;
+            let parts = LambertGridParts {
+                a,
+                e,
+                n,
+                big_f,
+                rho0,
+                lon0,
+                x0,
+                y0,
+                dx,
+                dy,
+                ni: r.u32()? as usize,
+                nj: r.u32()? as usize,
+                i_consecutive: flag(r.u8()?)?,
+                alternating: flag(r.u8()?)?,
+                wraps_longitude: flag(r.u8()?)?,
+            };
+            Some(GridCoords::Lambert(LambertGrid::from_parts(parts)?))
+        }
+        GRID_COORDS_EXPLICIT => {
+            let lat_count = r.u32()? as usize;
+            let lats = decode_f64s(r, lat_count)?;
+            let lon_count = r.u32()? as usize;
+            let lons = decode_f64s(r, lon_count)?;
+            Some(GridCoords::Explicit { lats, lons })
+        }
+        _ => None,
+    }
+}
+
+/// [`decode_f32s`]'s shape at `f64` width, for the explicit coordinate arrays.
+fn decode_f64s(r: &mut Reader, count: usize) -> Option<Vec<f64>> {
+    let bytes = r.take(count.checked_mul(8)?)?;
+    Some(
+        bytes
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().expect("chunks of eight")))
+            .collect(),
+    )
+}
+
+/// A UTC timestamp as twelve bytes: the `i64` Unix seconds and the `u32`
+/// subsecond nanoseconds. Two fields rather than one `i64` of nanoseconds
+/// because the pair is total — every `NaiveDateTime` chrono can represent
+/// encodes, where nanoseconds-since-epoch overflows in 2262 — and exact, so
+/// a request round-trips to itself and the parity gates compare identical
+/// inputs on both paths.
+fn encode_datetime(out: &mut Vec<u8>, t: &chrono::NaiveDateTime) {
+    let utc = t.and_utc();
+    out.extend_from_slice(&utc.timestamp().to_le_bytes());
+    out.extend_from_slice(&utc.timestamp_subsec_nanos().to_le_bytes());
+}
+
+/// The inverse of [`encode_datetime`]: `None` for a short buffer or a
+/// (seconds, nanos) pair outside chrono's representable range — which is a
+/// payload from a build whose layout this is not, refused rather than
+/// clamped to some time nobody stated.
+fn decode_datetime(r: &mut Reader) -> Option<chrono::NaiveDateTime> {
+    let secs = i64::from_le_bytes(r.take(8)?.try_into().ok()?);
+    let nanos = r.u32()?;
+    Some(chrono::DateTime::from_timestamp(secs, nanos)?.naive_utc())
+}
+
+/// A `u16` length prefix and then the bytes, truncated to what the prefix can
+/// carry — the sites-name convention, spelled once for every string on this
+/// wire. Every string here is an identifier or a short label, so the
+/// truncation is over input it will never see; a cut that split a multi-byte
+/// character is refused by [`decode_str`]'s UTF-8 check rather than misread.
+fn encode_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = &s.as_bytes()[..s.len().min(usize::from(u16::MAX))];
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The inverse of [`encode_str`]: `None` for a short buffer or bytes that are
+/// not UTF-8.
+fn decode_str(r: &mut Reader) -> Option<String> {
+    let len = usize::from(r.u16()?);
+    Some(std::str::from_utf8(r.take(len)?).ok()?.to_owned())
+}
+
+/// One overlay feature: the two labels, the two colours, the hatch, the
+/// optional geo-AABB, and last the multi-polygon — every ring of every
+/// polygon, holes included, since a hole dropped here is a hole filled on
+/// the far side and the parity tests are what would catch it.
+///
+/// The AABB is **carried, not recomputed**: it is stored state of the value
+/// (`OverlayFeature::geo_bounds`), the round trip compares whole requests,
+/// and a decode that re-derived it would make a request with a hand-built
+/// bounds come back a different request instead of itself.
+fn encode_feature(out: &mut Vec<u8>, feature: &crate::types::OverlayFeature) {
+    encode_str(out, &feature.label);
+    encode_str(out, &feature.label2);
+    out.extend_from_slice(&feature.fill_rgba);
+    out.extend_from_slice(&feature.stroke_rgba);
+    out.push(HatchWire(feature.hatch).wire_code());
+    match &feature.geo_bounds {
+        None => out.push(0),
+        Some(b) => {
+            out.push(1);
+            out.extend_from_slice(&b.min_lat.to_le_bytes());
+            out.extend_from_slice(&b.max_lat.to_le_bytes());
+            out.extend_from_slice(&b.min_lon.to_le_bytes());
+            out.extend_from_slice(&b.max_lon.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&(feature.polygons.len() as u32).to_le_bytes());
+    for polygon in &feature.polygons {
+        encode_polygon(out, polygon);
+    }
+}
+
+/// The inverse of [`encode_feature`], with every refusal the per-kind
+/// `decode` impls promise (see the module doc): `None` on a hatch byte or an
+/// option tag this build does not have, a label that is not UTF-8, or counts
+/// the buffer cannot honour.
+fn decode_feature(r: &mut Reader) -> Option<crate::types::OverlayFeature> {
+    let label = decode_str(r)?;
+    let label2 = decode_str(r)?;
+    let fill_rgba: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let stroke_rgba: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let hatch = HatchWire::from_wire_code(r.u8()?)?.0;
+    let geo_bounds = match r.u8()? {
+        0 => None,
+        1 => Some(crate::types::GeoBounds {
+            min_lat: r.f64()?,
+            max_lat: r.f64()?,
+            min_lon: r.f64()?,
+            max_lon: r.f64()?,
+        }),
+        _ => return None,
+    };
+    let polygon_count = r.u32()? as usize;
+    let mut polygons = Vec::new();
+    for _ in 0..polygon_count {
+        polygons.push(decode_polygon(r)?);
+    }
+    Some(crate::types::OverlayFeature {
+        polygons,
+        fill_rgba,
+        stroke_rgba,
+        label,
+        label2,
+        hatch,
+        geo_bounds,
+    })
+}
+
+/// One polygon: a ring count, then each ring's point count and its
+/// `(lat, lon)` pairs in that order — the crate's own `(f64, f64)`
+/// convention, stated here and in [`decode_polygon`] and nowhere else. The
+/// first ring is the exterior and the rest are holes, an ordering the codec
+/// preserves by never reordering anything.
+fn encode_polygon(out: &mut Vec<u8>, polygon: &crate::types::GeoPolygon) {
+    out.extend_from_slice(&(polygon.len() as u32).to_le_bytes());
+    for ring in polygon {
+        out.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+        for &(lat, lon) in ring {
+            out.extend_from_slice(&lat.to_le_bytes());
+            out.extend_from_slice(&lon.to_le_bytes());
+        }
+    }
+}
+
+/// The inverse of [`encode_polygon`].
+fn decode_polygon(r: &mut Reader) -> Option<crate::types::GeoPolygon> {
+    let ring_count = r.u32()? as usize;
+    let mut polygon = Vec::new();
+    for _ in 0..ring_count {
+        let point_count = r.u32()? as usize;
+        let mut ring = Vec::new();
+        for _ in 0..point_count {
+            ring.push((r.f64()?, r.f64()?));
+        }
+        polygon.push(ring);
+    }
+    Some(polygon)
+}
+
+// ── The wire enums ───────────────────────────────────────────────────────
+
+/// An [`AlertCategory`](crate::nws::alert::AlertCategory) as a number, in
+/// the newtype-pair shape `MeltingLayerWire` (in `rustdar_frontend::offload`)
+/// set: both directions are exhaustive over the same arms, so a variant
+/// added upstream fails this build rather than silently encoding as
+/// something else. The numbering is the enum's own declaration order, most
+/// severe first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlertCategoryWire(crate::nws::alert::AlertCategory);
+
+impl AlertCategoryWire {
+    fn wire_code(self) -> u8 {
+        use crate::nws::alert::AlertCategory as C;
+        match self.0 {
+            C::Warning => 0,
+            C::Watch => 1,
+            C::Advisory => 2,
+            C::Other => 3,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use crate::nws::alert::AlertCategory as C;
+        let category = match code {
+            0 => C::Warning,
+            1 => C::Watch,
+            2 => C::Advisory,
+            3 => C::Other,
+            _ => return None,
+        };
+        Some(Self(category))
+    }
+}
+
+/// A [`StormReportKind`](crate::spc::reports::StormReportKind) as a number.
+/// See [`AlertCategoryWire`]. The numbering is the enum's own declaration
+/// order — a kind byte misread as another decodes cleanly and paints a
+/// tornado as hail, which is what the per-kind parity fixture with all three
+/// kinds exists to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StormReportKindWire(crate::spc::reports::StormReportKind);
+
+impl StormReportKindWire {
+    fn wire_code(self) -> u8 {
+        use crate::spc::reports::StormReportKind as K;
+        match self.0 {
+            K::Tornado => 0,
+            K::Hail => 1,
+            K::Wind => 2,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use crate::spc::reports::StormReportKind as K;
+        let kind = match code {
+            0 => K::Tornado,
+            1 => K::Hail,
+            2 => K::Wind,
+            _ => return None,
+        };
+        Some(Self(kind))
+    }
+}
+
+/// An [`MdType`](crate::spc::discussion::MdType) as a number. See
+/// [`AlertCategoryWire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MdTypeWire(crate::spc::discussion::MdType);
+
+impl MdTypeWire {
+    fn wire_code(self) -> u8 {
+        use crate::spc::discussion::MdType as M;
+        match self.0 {
+            M::Convective => 0,
+            M::WinterWeather => 1,
+            M::Other => 2,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use crate::spc::discussion::MdType as M;
+        let md_type = match code {
+            0 => M::Convective,
+            1 => M::WinterWeather,
+            2 => M::Other,
+            _ => return None,
+        };
+        Some(Self(md_type))
+    }
+}
+
+/// A [`HatchPattern`](crate::types::HatchPattern) as a number. See
+/// [`AlertCategoryWire`]. `None` maps to 0 — the quiet value for the quiet
+/// variant — and the three Conditional Intensity Groups take their own
+/// numbers, because a CIG3 read as a CIG1 is a cross-hatch silently demoted
+/// to dots on the layer that qualifies SPC's strongest areas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HatchWire(crate::types::HatchPattern);
+
+impl HatchWire {
+    fn wire_code(self) -> u8 {
+        use crate::types::HatchPattern as H;
+        match self.0 {
+            H::None => 0,
+            H::Cig1 => 1,
+            H::Cig2 => 2,
+            H::Cig3 => 3,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code).
+    fn from_wire_code(code: u8) -> Option<Self> {
+        use crate::types::HatchPattern as H;
+        let hatch = match code {
+            0 => H::None,
+            1 => H::Cig1,
+            2 => H::Cig2,
+            3 => H::Cig3,
+            _ => return None,
+        };
+        Some(Self(hatch))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nws::alert::AlertCategory;
+    use crate::render::rasterize::{
+        AlertPaint, DiscussionPaint, FlashPaint, IndexWindow, ModelWindow, RadarSiteInfo,
+        ReportPaint,
+    };
+    use crate::spc::discussion::MdType;
+    use crate::spc::reports::StormReportKind;
+    use crate::types::{GeoBounds, HatchPattern, OverlayFeature};
+    use rustdar_source::job::{DescribedJob, DescribedOut};
+
+    fn test_geometry() -> JobGeometry {
+        JobGeometry {
+            width: 64,
+            height: 32,
+            bounds: GeoBounds {
+                min_lat: 30.0,
+                max_lat: 40.0,
+                min_lon: -100.0,
+                max_lon: -90.0,
+            },
+            side_ceiling_px: 0,
+        }
+    }
+
+    /// Encode `job` through `row`, decode it back, and require the identity:
+    /// the decoded job equals the original, the geometry passes through
+    /// unchanged, and the cursor sits exactly at the end of what encode
+    /// wrote.
+    fn assert_round_trips(row: &JobCodec, job: &DescribedJob) {
+        let geo = test_geometry();
+        let mut bytes = Vec::new();
+        (row.encode)(job, &EncodeCtx { geometry: geo }, &mut bytes);
+        let mut r = Reader::new(&bytes);
+        let (decoded, geo_out) =
+            (row.decode)(&mut r, geo).expect("a row must decode its own encode");
+        assert_eq!(
+            &decoded, job,
+            "decode ∘ encode must be the identity for `{}`",
+            row.label,
+        );
+        assert_eq!(
+            geo_out, geo,
+            "`{}` amends nothing: the geometry passes through unchanged",
+            row.label,
+        );
+        assert!(
+            r.at_end(),
+            "`{}` decode must consume exactly what encode wrote",
+            row.label,
+        );
+    }
+
+    fn feature_fixture() -> OverlayFeature {
+        OverlayFeature {
+            polygons: vec![vec![vec![(35.0, -97.5), (36.25, -97.5), (36.25, -96.0)]]],
+            fill_rgba: [255, 40, 0, 80],
+            stroke_rgba: [255, 40, 0, 255],
+            label: "Tornado Warning".to_owned(),
+            label2: "until 22:00 UTC".to_owned(),
+            hatch: HatchPattern::None,
+            geo_bounds: Some(GeoBounds {
+                min_lat: 35.0,
+                max_lat: 36.25,
+                min_lon: -97.5,
+                max_lon: -96.0,
+            }),
+        }
+    }
+
+    /// A second feature exercising the arms the first does not: a hatch and
+    /// an absent AABB.
+    fn hatched_boundless_feature_fixture() -> OverlayFeature {
+        OverlayFeature {
+            polygons: vec![vec![
+                vec![(30.5, -99.0), (31.5, -99.0), (31.5, -98.0), (30.5, -98.0)],
+                vec![(30.75, -98.75), (31.25, -98.75), (31.25, -98.25)],
+            ]],
+            fill_rgba: [0, 0, 0, 0],
+            stroke_rgba: [128, 0, 128, 255],
+            label: "SIG".to_owned(),
+            label2: String::new(),
+            hatch: HatchPattern::Cig3,
+            geo_bounds: None,
+        }
+    }
+
+    fn ts(secs: i64, nanos: u32) -> chrono::NaiveDateTime {
+        chrono::DateTime::from_timestamp(secs, nanos)
+            .expect("a literal in chrono's range")
+            .naive_utc()
+    }
+
+    #[test]
+    fn the_registry_is_the_seven_rows_in_dispatch_order() {
+        assert_eq!(
+            JOB_CODECS.iter().map(|row| row.label).collect::<Vec<_>>(),
+            [
+                "overlay/sites",
+                "overlay/alerts",
+                "overlay/outlooks",
+                "overlay/discussions",
+                "overlay/reports",
+                "overlay/glm",
+                "overlay/model",
+            ],
+            "the labels are the shipped kind strings and the order is \
+             load-bearing: WO-M7b's dense code flip assigns codes by index",
+        );
+        for row in JOB_CODECS {
+            assert_eq!(
+                row.cost,
+                JobCost::Raster,
+                "every overlay row is a raster job (`{}`)",
+                row.label,
+            );
+            assert!(
+                row.encode_out.is_some() && row.decode_out.is_some(),
+                "every overlay reply is a raster; the reply codecs ride \
+                 every row (`{}`)",
+                row.label,
+            );
+        }
+        let distinct: std::collections::HashSet<std::any::TypeId> =
+            JOB_CODECS.iter().map(|row| (row.input_type)()).collect();
+        assert_eq!(
+            distinct.len(),
+            JOB_CODECS.len(),
+            "rows are selected by input type; two rows sharing one would \
+             make routing ambiguous",
+        );
+    }
+
+    #[test]
+    fn the_sites_row_round_trips() {
+        let job = DescribedJob::new(SitesInput {
+            sites: vec![
+                RadarSiteInfo {
+                    name: "KTLX".to_owned(),
+                    lat: 35.333,
+                    lon: -97.278,
+                    is_current: true,
+                    is_loading: false,
+                },
+                RadarSiteInfo {
+                    name: "KFDR".to_owned(),
+                    lat: 34.362,
+                    lon: -98.976,
+                    is_current: false,
+                    is_loading: true,
+                },
+            ],
+            zoom: 7.5,
+            is_dark: true,
+            device_scale: 2.0,
+        });
+        assert_round_trips(&JOB_CODECS[0], &job);
+    }
+
+    #[test]
+    fn the_alerts_row_round_trips() {
+        let job = DescribedJob::new(AlertsInput {
+            alerts: vec![
+                AlertPaint {
+                    id: "urn:oid:2.49.0.1.840.0001".to_owned(),
+                    category: AlertCategory::Warning,
+                    features: std::sync::Arc::new(vec![feature_fixture()]),
+                },
+                AlertPaint {
+                    id: "urn:oid:2.49.0.1.840.0002".to_owned(),
+                    category: AlertCategory::Other,
+                    features: std::sync::Arc::new(vec![hatched_boundless_feature_fixture()]),
+                },
+            ],
+            enabled_categories: vec![AlertCategory::Warning, AlertCategory::Watch],
+            hidden_ids: ["urn:oid:2.49.0.1.840.0002".to_owned()]
+                .into_iter()
+                .collect(),
+            device_scale: 1.0,
+        });
+        assert_round_trips(&JOB_CODECS[1], &job);
+    }
+
+    #[test]
+    fn the_outlooks_row_round_trips() {
+        let job = DescribedJob::new(OutlooksInput {
+            features: vec![feature_fixture(), hatched_boundless_feature_fixture()],
+            hatch_color: [10, 20, 30, 40],
+            device_scale: 1.5,
+        });
+        assert_round_trips(&JOB_CODECS[2], &job);
+    }
+
+    #[test]
+    fn the_discussions_row_round_trips() {
+        let job = DescribedJob::new(DiscussionsInput {
+            discussions: vec![
+                DiscussionPaint {
+                    md_type: MdType::Convective,
+                    polygon: vec![vec![(33.0, -98.0), (34.0, -98.0), (34.0, -97.0)]],
+                },
+                DiscussionPaint {
+                    md_type: MdType::WinterWeather,
+                    polygon: vec![vec![(41.0, -94.0), (42.0, -94.0), (42.0, -93.0)]],
+                },
+            ],
+            device_scale: 1.0,
+        });
+        assert_round_trips(&JOB_CODECS[3], &job);
+    }
+
+    /// The row order IS the hit-map id on this kind, so the identity here is
+    /// doing more than usual: `Vec` equality is ordered, and a decoder that
+    /// reordered rows would fail it.
+    #[test]
+    fn the_reports_row_round_trips_in_order() {
+        let job = DescribedJob::new(ReportsInput {
+            reports: vec![
+                ReportPaint {
+                    kind: StormReportKind::Wind,
+                    lat: 35.5,
+                    lon: -97.5,
+                },
+                ReportPaint {
+                    kind: StormReportKind::Tornado,
+                    lat: 35.25,
+                    lon: -97.75,
+                },
+                ReportPaint {
+                    kind: StormReportKind::Hail,
+                    lat: 36.0,
+                    lon: -96.5,
+                },
+            ],
+            zoom: 6.0,
+            is_dark: false,
+            device_scale: 1.0,
+        });
+        assert_round_trips(&JOB_CODECS[4], &job);
+    }
+
+    /// GLM's `now` is dispatch-captured input and rides the wire like any
+    /// other field — the round trip proves the codec carries it rather than
+    /// any clock re-deriving it.
+    #[test]
+    fn the_glm_row_round_trips_in_order() {
+        let job = DescribedJob::new(GlmStrikesInput {
+            flashes: vec![
+                FlashPaint {
+                    lat: 34.5,
+                    lon: -99.0,
+                    time: ts(1_755_216_000, 250_000_000),
+                    energy: Some(1.5),
+                },
+                FlashPaint {
+                    lat: 34.75,
+                    lon: -98.5,
+                    time: ts(1_755_215_400, 0),
+                    energy: None,
+                },
+            ],
+            zoom: 5.0,
+            is_dark: true,
+            time_window_secs: 600.0,
+            now: ts(1_755_216_030, 0),
+            device_scale: 2.0,
+        });
+        assert_round_trips(&JOB_CODECS[5], &job);
+    }
+
+    #[test]
+    fn the_model_row_round_trips_an_explicit_grid_window() {
+        let job = DescribedJob::new(ModelDataInput::Window(ModelWindow {
+            parameter: crate::hrrr::ModelParameter::SurfaceBasedCape,
+            ni: 4,
+            nj: 3,
+            coords: crate::hrrr::GridCoords::Explicit {
+                lats: vec![30.0, 30.5, 31.0, 31.5],
+                lons: vec![-99.0, -98.5, -98.0, -97.5],
+            },
+            win: IndexWindow {
+                i0: 1,
+                i1: 3,
+                j0: 0,
+                j1: 2,
+            },
+            values: vec![100.0, 250.0, 500.0, 1250.0],
+        }));
+        assert_round_trips(&JOB_CODECS[6], &job);
+    }
+
+    /// The Lambert arm of the grid-coords codec: stored constants travel as
+    /// stored and restore bits — `from_parts` accepts these literals, so the
+    /// identity is over the constants themselves, no libm anywhere.
+    #[test]
+    fn the_model_row_round_trips_lambert_constants() {
+        let grid =
+            crate::hrrr::lambert::LambertGrid::from_parts(crate::hrrr::lambert::LambertGridParts {
+                a: 6371229.0,
+                e: 0.0,
+                n: 0.5,
+                big_f: 1.5,
+                rho0: 2.5,
+                lon0: -1.75,
+                x0: -2500.0,
+                y0: 1500.0,
+                dx: 3000.0,
+                dy: 2000.0,
+                ni: 4,
+                nj: 3,
+                i_consecutive: true,
+                alternating: false,
+                wraps_longitude: false,
+            })
+            .expect("valid literal constants");
+        let job = DescribedJob::new(ModelDataInput::Window(ModelWindow {
+            parameter: crate::hrrr::ModelParameter::MixedLayerCin,
+            ni: 4,
+            nj: 3,
+            coords: crate::hrrr::GridCoords::Lambert(grid),
+            win: IndexWindow {
+                i0: 0,
+                i1: 4,
+                j0: 1,
+                j1: 3,
+            },
+            values: vec![-25.0, -50.0, 0.0, -12.5, -75.0, -100.0, -6.25, -3.0],
+        }));
+        assert_round_trips(&JOB_CODECS[6], &job);
+    }
+
+    /// Round-trip the reply through one row's out codecs, comparing the two
+    /// wire-borne fields; `alpha` is not on the wire and must come back
+    /// [`AlphaMode::Premultiplied`] — the only convention the reply wire
+    /// ever carries.
+    fn assert_reply_round_trips(row: &JobCodec, rgba: Vec<u8>, hit_cells: Option<HitCells>) {
+        let reply = DescribedOut(Box::new(RasterizeOutput {
+            rgba: rgba.clone(),
+            hit_cells: hit_cells.clone(),
+            alpha: AlphaMode::Premultiplied,
+        }));
+        let mut bytes = Vec::new();
+        (row.encode_out
+            .expect("every overlay row carries the reply codecs"))(&reply, &mut bytes);
+        let back = (row
+            .decode_out
+            .expect("every overlay row carries the reply codecs"))(&bytes)
+        .expect("a row must decode its own reply encode")
+        .take::<RasterizeOutput>()
+        .expect("the reply is a raster");
+        assert_eq!(back.rgba, rgba, "the RGBA tail must survive unjudged");
+        assert_eq!(back.hit_cells, hit_cells, "the cells must survive framed");
+        assert_eq!(
+            back.alpha,
+            AlphaMode::Premultiplied,
+            "the reply wire carries premultiplied bytes only — the frontend \
+             converts before any reply is encoded",
+        );
+    }
+
+    #[test]
+    fn the_reply_round_trips_with_hit_cells() {
+        let mut cells = HashMap::new();
+        cells.insert(0u32, vec![0u32, 2]);
+        cells.insert(3u32, vec![1u32]);
+        assert_reply_round_trips(
+            &JOB_CODECS[4],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            Some(HitCells {
+                width: 2,
+                height: 2,
+                cells,
+            }),
+        );
+    }
+
+    #[test]
+    fn the_reply_round_trips_without_hit_cells() {
+        assert_reply_round_trips(&JOB_CODECS[2], vec![9, 8, 7, 6], None);
+    }
+
+    /// Two equal cell maps built in different insertion orders (and so with
+    /// different iteration orders — each `HashMap` is independently seeded)
+    /// must encode to one byte string: the sort in the encoder is what makes
+    /// the bytes a function of the value.
+    #[test]
+    fn two_encodes_of_one_reply_value_agree() {
+        let indices = [21u32, 3, 17, 8, 30, 11, 26, 5];
+        let forward: HashMap<u32, Vec<u32>> =
+            indices.iter().map(|&idx| (idx, vec![idx * 2])).collect();
+        let backward: HashMap<u32, Vec<u32>> = indices
+            .iter()
+            .rev()
+            .map(|&idx| (idx, vec![idx * 2]))
+            .collect();
+        let rgba = [0u8; 4];
+        let a = encode_overlay_out(
+            &rgba,
+            Some(&HitCells {
+                width: 8,
+                height: 4,
+                cells: forward,
+            }),
+        );
+        let b = encode_overlay_out(
+            &rgba,
+            Some(&HitCells {
+                width: 8,
+                height: 4,
+                cells: backward,
+            }),
+        );
+        assert_eq!(
+            a, b,
+            "one reply value must have one byte string, whatever order its \
+             map iterates in",
+        );
+    }
+}

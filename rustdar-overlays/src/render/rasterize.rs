@@ -179,6 +179,36 @@ pub struct RasterizeOutput {
     pub alpha: AlphaMode,
 }
 
+/// Summarized by hand rather than derived: the job boundary's erasure seam
+/// ([`rustdar_source::job::JobOut`]) requires `Debug`, and the derived form
+/// would print every byte of a raster — 206.75 MiB at the desktop ceiling —
+/// into any panic or test-failure message that formats one.
+impl std::fmt::Debug for RasterizeOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RasterizeOutput")
+            .field("rgba_len", &self.rgba.len())
+            .field(
+                "hit_cells_occupied",
+                &self.hit_cells.as_ref().map(|cells| cells.cells.len()),
+            )
+            .field("alpha", &self.alpha)
+            .finish()
+    }
+}
+
+/// The reply half of the job boundary's erasure seam: a described overlay
+/// render answers this type through the codec rows in
+/// [`jobs`](crate::render::jobs).
+impl rustdar_source::job::JobOut for RasterizeOutput {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
 // ── Mercator projection helpers ──────────────────────────────────────────
 
 /// Web Mercator's own limit, from [`rustdar_source::geo`] rather than spelled
@@ -349,6 +379,13 @@ pub struct OutlooksInput {
     pub device_scale: f32,
 }
 
+// The job boundary's erasure seam over this wire form: `as_any` answers
+// `self`, `eq_dyn` is a downcast followed by the derived `==` above — value
+// equality through the erased type, so the retry/discard machinery compares
+// a described job the way the typed one would. One invocation beside each
+// wire-form input; the codec rows live in `render::jobs`.
+rustdar_source::impl_job_input!(OutlooksInput);
+
 /// [`RasterizeOutput`] for the reason [`rasterize_radar_sites`] answers one:
 /// with the outlook render a described job, `rustdar_frontend::offload`'s
 /// `execute` calls this directly and needs the alpha convention stated by the
@@ -418,6 +455,8 @@ pub struct DiscussionsInput {
     /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
     pub device_scale: f32,
 }
+
+rustdar_source::impl_job_input!(DiscussionsInput);
 
 /// [`RasterizeOutput`] for [`rasterize_spc_outlooks`]'s reason. Premultiplied
 /// on every path.
@@ -524,6 +563,8 @@ pub struct AlertsInput {
     pub device_scale: f32,
 }
 
+rustdar_source::impl_job_input!(AlertsInput);
+
 /// Renders only alerts in `enabled_categories` and not in `hidden_ids`.
 ///
 /// [`RasterizeOutput`] for [`rasterize_spc_outlooks`]'s reason. Premultiplied
@@ -610,6 +651,8 @@ pub struct SitesInput {
     /// `device_scale` note on [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
     pub device_scale: f32,
 }
+
+rustdar_source::impl_job_input!(SitesInput);
 
 /// [`RasterizeOutput`] and not a bare buffer, unlike its neighbours, because
 /// this is the one rasterizer whose caller is not an
@@ -873,6 +916,8 @@ pub struct ReportsInput {
     pub device_scale: f32,
 }
 
+rustdar_source::impl_job_input!(ReportsInput);
+
 /// Tornado = red, hail = green, wind = blue. Below a 5 px radius the symbols
 /// are unreadable, so it falls back to filled dots.
 pub fn rasterize_storm_reports(
@@ -1123,6 +1168,8 @@ pub struct GlmStrikesInput {
     /// [`RasterizeContext`](crate::render::overlay_state::RasterizeContext).
     pub device_scale: f32,
 }
+
+rustdar_source::impl_job_input!(GlmStrikesInput);
 
 pub fn rasterize_glm_strikes(
     input: &GlmStrikesInput,
@@ -1763,6 +1810,8 @@ pub enum ModelDataInput {
     /// The projection window and exactly its values — what travels.
     Window(ModelWindow),
 }
+
+rustdar_source::impl_job_input!(ModelDataInput);
 
 /// The wire form of a model-grid raster: the grid's shape and coordinates,
 /// the [`IndexWindow`] its values were cut to, and those values alone.
