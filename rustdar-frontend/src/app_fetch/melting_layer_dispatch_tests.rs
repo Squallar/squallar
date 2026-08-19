@@ -236,7 +236,7 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
         app.spawn_loop_frame_render(
             0,
             volume(0),
-            crate::loop_downloads::LoopFrameData::Volume(
+            rustdar_radar::loop_downloads::LoopFrameData::Volume(
                 std::sync::Arc::new(dual_pol_scan()),
                 Default::default(),
             ),
@@ -252,7 +252,7 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
         app.spawn_loop_frame_render(
             0,
             volume(6),
-            crate::loop_downloads::LoopFrameData::Volume(
+            rustdar_radar::loop_downloads::LoopFrameData::Volume(
                 std::sync::Arc::new(dual_pol_scan()),
                 Default::default(),
             ),
@@ -423,7 +423,7 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
         app.spawn_loop_frame_render(
             0,
             volume(0),
-            crate::loop_downloads::LoopFrameData::Volume(
+            rustdar_radar::loop_downloads::LoopFrameData::Volume(
                 std::sync::Arc::new(dual_pol_scan()),
                 Default::default(),
             ),
@@ -439,7 +439,7 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
         app.spawn_loop_frame_render(
             0,
             volume(6),
-            crate::loop_downloads::LoopFrameData::Volume(
+            rustdar_radar::loop_downloads::LoopFrameData::Volume(
                 std::sync::Arc::new(dual_pol_scan()),
                 Default::default(),
             ),

@@ -1,6 +1,6 @@
 //! Per-site real-time chunk feeds, and the rules for retiring one.
 //!
-//! Modelled on [`crate::loop_downloads::LoopDownloadManager`]: a plain state
+//! Modelled on [`rustdar_radar::loop_downloads::LoopDownloadManager`]: a plain state
 //! container owned by `App`, with no network of its own. `App` drives the
 //! rounds; this decides which sites still want one and when to give up on a
 //! feed and let the archive path take over.

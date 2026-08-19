@@ -159,7 +159,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .unwrap(),
-            crate::loop_downloads::LoopFrameData::Volume(
+            rustdar_radar::loop_downloads::LoopFrameData::Volume(
                 std::sync::Arc::new(sample_scan()),
                 Default::default(),
             ),

@@ -1,7 +1,4 @@
 use super::frame_pump::PumpPhase;
-use crate::loop_downloads::{
-    FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
-};
 use crate::loop_pool::{LoopAllocation, LoopDemand, LoopFrameModel};
 use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
@@ -11,6 +8,9 @@ use rustdar_device_profile::constants::{
 };
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
+use rustdar_radar::loop_downloads::{
+    FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -4030,7 +4030,7 @@ fn section_source_refusal(
 /// the bucket objects of the same volumes and not the volumes at all. The frame
 /// list — the loop's timeline — is the same either way, which is what keeps a
 /// mixed set of panes animating in step. See
-/// [`crate::loop_downloads::LoopDownloadManager::plan_downloads_for`].
+/// [`rustdar_radar::loop_downloads::LoopDownloadManager::plan_downloads_for`].
 fn accept_scan_listing(
     allocation: LoopAllocation,
     budgets: &rustdar_device_profile::budget::Budgets,
@@ -4152,7 +4152,7 @@ pub(super) fn median_step_secs(times: &[chrono::NaiveDateTime]) -> Option<u32> {
 /// the decision is one testable unit rather than three booleans assembled at an
 /// untestable call site.
 fn settle_loop_phase(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     pane_idx: usize,
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     budget: usize,
@@ -4239,7 +4239,7 @@ fn rendered_image(
 /// on the glass wherever a scan's tilts do not line up with the selection, and
 /// a loop steps through scans that do not agree about that.
 fn frame_gates(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     rr: &crate::channels::LoopRenderResponse,
 ) -> Option<rustdar_radar::hover::SweepGates> {
     let (scan, _) = loop_mgr.get_cached(&rr.target.site, &rr.timestamp)?;
@@ -4338,7 +4338,7 @@ fn accept_section_result(
 /// reach that looks like an answer and is not one, since its loop can have been
 /// rebuilt for another site while this download ran.
 fn apply_completed_download(
-    loop_mgr: &mut crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &mut rustdar_radar::loop_downloads::LoopDownloadManager,
     resp: crate::channels::LoopScanDownloadResponse,
 ) {
     loop_mgr.complete_download(&resp.site, &resp.timestamp);
@@ -4381,7 +4381,7 @@ fn pairing_days_for_frames(
 /// substitute — it is re-synced across panes without rebuilding their loops — and
 /// it is not in scope here.
 fn frame_data(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
 ) -> Option<LoopFrameData> {
@@ -4414,7 +4414,7 @@ enum FrameSweep {
 ///   mean something, since two panes resolving the same `(site, code, volume)`
 ///   share one cache entry and therefore one angle.
 fn frame_sweep(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
 ) -> FrameSweep {
@@ -4486,7 +4486,7 @@ fn frame_sweep(
 ///   under the rule this bullet's predecessors state. **A new wholesale clear
 ///   would break that**, and would have to re-check this.
 fn own_sweep(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LoopPlaybackState,
     timestamp: chrono::NaiveDateTime,
     product: rustdar_radar::types::RadarProduct,
@@ -4514,7 +4514,7 @@ fn own_sweep(
 /// unconditionally — the sweep term would still be there, still be read, and mean
 /// nothing.
 fn broadcast_sweep(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LoopPlaybackState,
     rr: &crate::channels::LoopRenderResponse,
 ) -> BroadcastSweep {
@@ -4550,7 +4550,7 @@ fn loop_product(
 /// a Level II volume cache nothing is filling, so no batch would ever settle and
 /// the loop would sit in `Rendering` for the session.
 fn loop_batch_settled(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LoopPlaybackState,
     budget: usize,
 ) -> bool {
@@ -4595,7 +4595,7 @@ enum FrameSection {
 /// `target.site` is where the loop's geometry came from and so the only site
 /// whose data may be cut with it, exactly as in [`frame_data`].
 fn frame_section(
-    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
 ) -> FrameSection {

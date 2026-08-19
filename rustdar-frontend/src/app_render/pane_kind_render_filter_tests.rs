@@ -1,9 +1,9 @@
 use super::*;
 use crate::app::tests::{empty_scan, headless, two_pane_app};
-use crate::loop_downloads::LoopDownloadManager;
 use crate::platform_double::TestBridge;
 use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
 use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RadarProduct;
 
@@ -732,7 +732,7 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
         app.loop_mgr = LoopDownloadManager::new();
         app.loop_mgr.set_plan(
             0,
-            crate::loop_downloads::FramePlan::new(
+            rustdar_radar::loop_downloads::FramePlan::new(
                 SITE.to_string(),
                 vec![(
                     volume_time(),

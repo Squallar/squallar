@@ -1,5 +1,5 @@
-use rustdar_radar::level3::Level3Product;
-use rustdar_radar::types::RadarProduct;
+use crate::level3::Level3Product;
+use crate::types::RadarProduct;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -25,12 +25,12 @@ pub enum LoopFrameData {
     /// folds that sweep's velocity around the second.
     ///
     /// The table is not derivable from the `Scan` — `nexrad_model`'s radial
-    /// has no field for it ([`rustdar_radar::nyquist`]) — so it travels, or
+    /// has no field for it ([`crate::nyquist`]) — so it travels, or
     /// the frame dealiases on an estimate while the still frame beside it
     /// dealiases on the RDA's own number.
     Volume(
         Arc<nexrad_model::data::Scan>,
-        Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+        Arc<crate::nyquist::DeclaredNyquist>,
     ),
     /// The Level III objects of this frame's volume, one per AWIPS code in
     /// [`RadarProduct::level3_products`] order.
@@ -51,7 +51,7 @@ pub enum LoopFrameData {
 /// transposed with no type error to catch it.
 pub type CachedVolume = (
     Arc<nexrad_model::data::Scan>,
-    Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+    Arc<crate::nyquist::DeclaredNyquist>,
 );
 
 /// Whether a frame's Level III objects have arrived.
@@ -146,7 +146,7 @@ pub struct PendingDownloads {
     /// this site's files, and the scan each becomes is cached under it.
     pub site: String,
     /// Scans still to download, oldest-first.
-    pub queue: VecDeque<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    pub queue: VecDeque<(chrono::NaiveDateTime, crate::archive::Identifier)>,
 }
 
 /// A pane's undispatched Level III pairings, with the site they belong to.
@@ -184,7 +184,7 @@ pub struct FramePlan {
     /// files, and every pairing derived from this plan is against its keys.
     pub site: String,
     /// Volume start and archive file per frame, oldest-first.
-    pub frames: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    pub frames: Vec<(chrono::NaiveDateTime, crate::archive::Identifier)>,
     /// The product the queues were last derived for. Compared, not assumed:
     /// re-deriving on every dispatch pass would rebuild both queues every frame
     /// of the UI, and re-deriving never would leave a retargeted pane waiting on
@@ -202,7 +202,7 @@ impl FramePlan {
     /// so the site cannot be re-read from a pane whose loop has moved on.
     pub fn new(
         site: String,
-        frames: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+        frames: Vec<(chrono::NaiveDateTime, crate::archive::Identifier)>,
     ) -> Self {
         Self {
             site,
@@ -258,20 +258,24 @@ impl LoopDownloadManager {
         self.scan_cache.get(site)?.get(ts)
     }
 
+    // ------------------------------------------------------------------
+    // Test probes. `#[cfg(test)]` until the WO-RF2n fold; unconditional
+    // since, because their consumers — the ten loop-pin suites — live
+    // app-side in `rustdar-frontend`, across a crate boundary `cfg(test)`
+    // cannot reach. Read-only counts and containment checks, nothing more.
+    // ------------------------------------------------------------------
+
     /// How many volumes this site is holding.
-    #[cfg(test)]
     pub fn cached_scan_count(&self, site: &str) -> usize {
         self.scan_cache.get(site).map_or(0, |scans| scans.len())
     }
 
     /// How many frames this pane's plan still names.
-    #[cfg(test)]
     pub fn plan_frame_count(&self, pane: usize) -> usize {
         self.plans.get(&pane).map_or(0, |plan| plan.frames.len())
     }
 
     /// How many volume downloads this pane still has queued and undispatched.
-    #[cfg(test)]
     pub fn pending_queue_count(&self, pane: usize) -> usize {
         self.pending_downloads
             .get(&pane)
@@ -283,7 +287,6 @@ impl LoopDownloadManager {
     /// A cached `None` occupies a key and answers a dispatch gate exactly as a
     /// present object does, so a count that skipped them would report a cache
     /// the sweep had not touched as empty.
-    #[cfg(test)]
     pub fn cached_l3_count(&self, site: &str) -> usize {
         self.l3_cache
             .keys()
@@ -292,7 +295,6 @@ impl LoopDownloadManager {
     }
 
     /// How many pairings this pane still has queued and undispatched.
-    #[cfg(test)]
     pub fn pending_l3_queue_count(&self, pane: usize) -> usize {
         self.pending_l3
             .get(&pane)
@@ -304,7 +306,6 @@ impl LoopDownloadManager {
     /// Separate from [`cached_scan_count`](Self::cached_scan_count) because that
     /// answers `0` for a site whose inner map is empty *and* for one that was
     /// pruned, and the pruning is the thing under test.
-    #[cfg(test)]
     pub fn has_cached_site(&self, site: &str) -> bool {
         self.scan_cache.contains_key(site)
     }
@@ -323,14 +324,14 @@ impl LoopDownloadManager {
     ///
     /// # Why it returns them rather than dropping them
     ///
-    /// The mirror of [`RenderCache::retain`](crate::render_dispatch::RenderCache::retain)
-    /// in shape and its opposite in destination. `retain` frees in place, and in
-    /// place is the frame thread: an entry here is a whole decoded volume,
-    /// 47–69 MiB across thousands of per-radial buffers, and returning them is
-    /// what lets the caller hand them to
-    /// [`rustdar_worker::offload::discard_each`](rustdar_worker::offload::discard_each) instead.
-    /// Same reasoning, and the same helper's reasoning, as
-    /// [`crate::app::evicted`].
+    /// The mirror of `RenderCache::retain` (`rustdar-frontend`'s
+    /// `render_dispatch` module) in shape and its opposite in destination.
+    /// `retain` frees in place, and in place is the frame thread: an entry here
+    /// is a whole decoded volume, 47–69 MiB across thousands of per-radial
+    /// buffers, and returning them is what lets the caller hand them to
+    /// `rustdar_worker::offload::discard_each` instead.
+    /// Same reasoning, and the same helper's reasoning, as `rustdar-frontend`'s
+    /// `app::evicted`.
     ///
     /// The Level III cache is bounded by [`retain_l3`](Self::retain_l3), which
     /// mirrors this in shape and is handed the very same predicate.
@@ -916,8 +917,8 @@ impl LoopDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::Identifier;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
-    use rustdar_radar::archive::Identifier;
 
     fn ts(minute: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -1387,7 +1388,7 @@ mod tests {
                 },
                 symbology: None,
             },
-            stamp: rustdar_radar::level3::ProductStamp::from_key("TLX_DVL_2024_01_01_00_00_30"),
+            stamp: crate::level3::ProductStamp::from_key("TLX_DVL_2024_01_01_00_00_30"),
             bytes: Arc::new(Vec::new()),
         })
     }

@@ -1,9 +1,9 @@
 use super::*;
-use crate::loop_downloads::{L3FrameState, LoopDownloadManager};
 use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock};
 use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::level3::{Level3Product, ProductStamp};
+use rustdar_radar::loop_downloads::{L3FrameState, LoopDownloadManager};
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RadarProduct;
 
@@ -31,8 +31,8 @@ fn codes(product: RadarProduct) -> &'static [&'static str] {
 
 /// A frame plan for `n` volumes one minute apart, as `accept_scan_listing`
 /// builds one.
-fn plan(n: u32) -> crate::loop_downloads::FramePlan {
-    crate::loop_downloads::FramePlan::new(
+fn plan(n: u32) -> rustdar_radar::loop_downloads::FramePlan {
+    rustdar_radar::loop_downloads::FramePlan::new(
         SITE.to_string(),
         (0..n)
             .map(|i| {

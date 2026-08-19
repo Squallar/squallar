@@ -23,7 +23,6 @@
 
 use super::*;
 use crate::app::tests::{empty_scan, headless};
-use crate::loop_downloads::LoopDownloadManager;
 use crate::platform_double::TestBridge;
 use rustdar_device_profile::constants::MAX_LOOP_FRAMES;
 use rustdar_egui::pane::{
@@ -31,6 +30,7 @@ use rustdar_egui::pane::{
     VolumeTarget,
 };
 use rustdar_geo::GeoPoint;
+use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView};
 use rustdar_volumetric::bridge::VolumeEntry;
