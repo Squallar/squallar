@@ -33,7 +33,7 @@ const CANVAS_ID: &str = "rustdar-canvas";
 ///
 /// [`WebPlatform`] owns all of it now: the permission state, the query that
 /// reads it without prompting, and the watch. The prompt happens from
-/// `request_location`, which the gate in `rustdar_frontend::location_permission`
+/// `request_location`, which the gate in `rustdar_location`
 /// reaches only from a state that licenses one — never before the browser has
 /// answered, never more than once per install unprompted, and never again after
 /// a refusal.

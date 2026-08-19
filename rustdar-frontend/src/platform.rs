@@ -281,22 +281,22 @@ where
 /// PlatformBridge>` cannot hold a generic method.
 #[derive(Clone, Copy)]
 pub struct LocationHooks {
-    /// Backs [`PlatformBridge::location_permission`].
+    /// Backs [`rustdar_location::LocationBridge::location_permission`].
     ///
     /// The `u8` is the attempt count last handed to
-    /// [`PlatformBridge::set_location_attempts`], passed *in* rather than
+    /// [`rustdar_location::LocationBridge::set_location_attempts`], passed *in* rather than
     /// stashed in a second global on the far side. Android's answer genuinely
     /// depends on it — see that method for the tri-state — and a value the hook
     /// reads out of its own static is a value that can be stale, that has no
     /// compile-time obligation to be installed, and whose absence looks exactly
     /// like "this install has never asked". As a parameter it is none of those.
     pub query: fn(u8) -> rustdar_location::LocationPermission,
-    /// Backs [`PlatformBridge::request_location`]; see the honesty note there
+    /// Backs [`rustdar_location::LocationBridge::request_location`]; see the honesty note there
     /// before believing the `bool`.
     pub request: fn() -> bool,
-    /// Backs [`PlatformBridge::stop_location`].
+    /// Backs [`rustdar_location::LocationBridge::stop_location`].
     pub stop: fn(),
-    /// Backs [`PlatformBridge::location_active`].
+    /// Backs [`rustdar_location::LocationBridge::location_active`].
     pub active: fn() -> bool,
 }
 
@@ -310,7 +310,7 @@ impl std::fmt::Debug for LocationHooks {
 
 /// Platform-specific behavior abstracted behind a common trait.
 /// Keeps `#[cfg(target_os = "android")]` blocks out of `app.rs`.
-pub trait PlatformBridge {
+pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// Poll for theme changes from the OS. Returns `Some(is_dark)` when
     /// a change is detected, `None` otherwise.
     fn poll_theme(&mut self) -> Option<bool>;
@@ -375,13 +375,9 @@ pub trait PlatformBridge {
     /// Set the config directory for UI config persistence.
     fn set_config_dir(&mut self, dir: std::path::PathBuf);
 
-    /// Where to persist UI configuration, or `None` if this platform has not
-    /// been told yet (Android learns its data path only after startup).
-    ///
-    /// Returns a store rather than a directory so the trait carries no
-    /// filesystem assumption: a web bridge hands back a `localStorage` backend,
-    /// which has no path to return.
-    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>>;
+    // `kv` — where blobs persist — is declared on the supertrait
+    // (`rustdar_location::LocationBridge`); UI-config persistence and the
+    // location gate's memo both reach it through there.
 
     /// This device's IANA timezone name, e.g. `"America/Denver"`.
     ///
@@ -484,77 +480,14 @@ pub trait PlatformBridge {
     //
     // A different question from the four `*_gps` methods above, and the split
     // is the point. `start_gps` opens a serial port: a device the user plugged
-    // in and named. These ask the operating system for a privilege it can
-    // withdraw without telling us. See `rustdar_location::LocationPermission`.
-
-    /// What the OS currently says about this app's access to the user's
-    /// location.
-    ///
-    /// **Required, not defaulted.** Every bridge has an answer — the ones with
-    /// no location service answer [`Unavailable`] — and a default would let a
-    /// new bridge silently report [`Unknown`] forever, which the gate reads as
-    /// "still starting up" and waits on indefinitely.
-    ///
-    /// **Cheap by contract.** This is polled on the frame path, so an
-    /// implementation must not block, allocate or make a round trip. A bridge
-    /// whose real query is asynchronous resolves it into a cell or an atomic on
-    /// whatever thread the platform hands it to and answers [`Unknown`] until
-    /// that lands; the gate is built to wait.
-    ///
-    /// [`Unavailable`]: rustdar_location::LocationPermission::Unavailable
-    /// [`Unknown`]: rustdar_location::LocationPermission::Unknown
-    fn location_permission(&self) -> rustdar_location::LocationPermission;
-
-    /// Prompt if the platform needs prompting, and start delivering fixes.
-    ///
-    /// One method rather than two because on the web they are the same call:
-    /// `watchPosition` *is* the prompt, and there is no way to ask without also
-    /// subscribing.
-    ///
-    /// # The `bool` is a hint, not a fact
-    ///
-    /// It answers "did the ask reach the OS", and **only Android can actually
-    /// tell**: `Activity.requestPermissions` either goes through or throws, and
-    /// the miss cases (no `Activity` stashed yet, JNI attach failure) are real
-    /// and recoverable. Everywhere else it is fabricated to some degree —
-    ///
-    /// * the browser returns `true` because `watchPosition` reports nothing
-    ///   synchronously and a refusal arrives later on the error callback;
-    /// * Windows can only say "we spawned an MTA worker", since
-    ///   `RequestAccessAsync` completes on another thread;
-    /// * `requestWhenInUseAuthorization()` on Apple platforms returns `void`
-    ///   and has a documented *silent* failure mode when the Info.plist usage
-    ///   key is missing.
-    ///
-    /// **So nothing durable may hang off it.** It is worth exactly one thing:
-    /// not re-firing an ask this session that the OS has already accepted.
-    /// Anything that has to survive a restart — how many times the user has
-    /// been asked, whether they turned it off — comes from the persisted memo
-    /// in `crate::location_permission` instead. Persisting a decision off a
-    /// value three of five bridges have to invent is the bug this note exists
-    /// to prevent; it has been written once already.
-    fn request_location(&mut self) -> bool;
-
-    /// Stop delivering fixes.
-    ///
-    /// Cannot revoke the permission — no platform offers an app a way to give
-    /// one back — so this is an off switch for the *stream*, and the settings
-    /// pane says so.
-    fn stop_location(&mut self);
-
-    /// Whether the platform is currently delivering location fixes.
-    ///
-    /// Mirrors [`gps_active`](Self::gps_active), and exists for the same reason
-    /// the UI reads that rather than a local flag: "granted" and "delivering"
-    /// are different states, a bridge can stop delivering without anything in
-    /// this crate asking it to (iOS backgrounds, a portal session closes), and a
-    /// gate-local bool would go on claiming otherwise.
-    ///
-    /// Defaulted `false`: a bridge with no location service is never
-    /// delivering, and neither is one whose provider has not been written yet.
-    fn location_active(&self) -> bool {
-        false
-    }
+    // in and named. The location-service calls ask the operating system for a
+    // privilege it can withdraw without telling us — and the SIX of them the
+    // permission gate uses (`location_permission`, `request_location`,
+    // `stop_location`, `location_active`, `set_location_attempts`, `kv`) are
+    // declared on the supertrait, `rustdar_location::LocationBridge`, so the
+    // gate can take a bridge without this crate in the middle. What stays
+    // HERE is the settings-page pair, which is UI wiring rather than
+    // gate surface.
 
     /// Whether this platform has a location settings page worth offering to
     /// open.
@@ -597,22 +530,6 @@ pub trait PlatformBridge {
     /// See [`LocationHooks`] for why they arrive together and why they are
     /// injected at all.
     fn set_location_hooks(&mut self, _hooks: LocationHooks) {}
-
-    /// Tell the bridge how many times this install has already asked.
-    ///
-    /// Android only, and it exists because that platform's own permission state
-    /// is a *tri*-state its API does not name: never asked
-    /// (`shouldShowRequestPermissionRationale` false), denied once (rationale
-    /// true — **and the dialog will still show**), and permanently denied
-    /// (rationale false again). The bridge cannot tell the first from the third
-    /// without knowing whether an ask has ever happened, and the only thing
-    /// that knows is the persisted memo on this side.
-    ///
-    /// Replaces a planned `set_location_previously_asked(bool)`. A bool maps
-    /// "denied once" onto `Denied`, which the settings pane renders with no
-    /// button — a regression against what Android does today, where that user
-    /// can still be asked and can still say yes.
-    fn set_location_attempts(&mut self, _attempts: u8) {}
 }
 
 #[cfg(test)]

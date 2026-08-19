@@ -17,7 +17,7 @@
 //!
 //! # Why this is not a field on `UiConfig`
 //!
-//! Same reason as [`crate::location_permission::LOCATION_MEMO_KEY`], which is
+//! Same reason as [`rustdar_location::LOCATION_MEMO_KEY`], which is
 //! the precedent this follows. `App::autosave_config` writes the UI config on
 //! a 3 s timer behind a string compare, and everything the user has configured
 //! rides in that one blob. Two consequences, both bad: a position learned in

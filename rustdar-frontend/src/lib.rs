@@ -35,7 +35,6 @@ pub mod chunk_feed;
 pub mod chunk_notify;
 pub mod input;
 pub mod location_hint;
-pub mod location_permission;
 pub mod loop_downloads;
 pub mod loop_pool;
 pub mod platform;

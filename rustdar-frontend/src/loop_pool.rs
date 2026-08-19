@@ -161,7 +161,7 @@
 //!
 //! Under [`LOOP_POOL_KEY`], its own `KvStore` entry, written synchronously,
 //! encoded as a decimal count of MiB. Not a field on `UiConfig`, for the reason
-//! `crate::site_positions` and `crate::location_permission::LOCATION_MEMO_KEY`
+//! `crate::site_positions` and `rustdar_location::LOCATION_MEMO_KEY`
 //! both give: `autosave_config` writes that blob on a 3 s timer behind a string
 //! compare, so a value learned in the last three seconds of a session is lost —
 //! and, much worse, one unreadable field in it costs *every* setting on the next

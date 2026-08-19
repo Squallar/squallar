@@ -201,6 +201,37 @@ pub fn prefer_fix(serial: Option<Fix>, os: Option<Fix>) -> Option<Fix> {
     }
 }
 
+/// How coarse a fix may be and still be allowed to spend the provisional site.
+///
+/// **Deliberately enormous, and the number is measured rather than guessed.**
+/// The instinct is to demand a tight fix here, and it is exactly backwards: the
+/// thing this replaces is the IANA timezone guess, whose population-weighted
+/// mean error is **605 km** and which opens 61% of sampled US metro population
+/// on a radar that physically cannot see their weather. A portal IP lookup —
+/// the coarsest source rustdar will ever read — measures **25 km**, and
+/// displacing every sample point by that much changed the chosen site in only
+/// **5.5%** of probes, by a median of 17 km. WSR-88D sites sit ~200 km apart;
+/// this job simply does not need precision.
+///
+/// So the gate exists to reject the absurd, not to hold a standard. 150 km is
+/// roughly where a fix stops beating the hint it would replace. Set it tight
+/// and the single largest win in the feature is silently switched off.
+pub const MAX_RELOCATION_ACCURACY_M: f64 = 150_000.0;
+
+/// Whether a fix reporting this accuracy may choose the opening site.
+///
+/// `None` passes. Every NMEA source reports no accuracy at all — the sentences
+/// carry HDOP, a dimensionless geometry factor, and no way to turn it into
+/// metres — and the serial path has been trusted since before this field
+/// existed. Treating absence as failure would disable the serial dongle's own
+/// upgrade, which is the one source here that is *more* accurate than the
+/// threshold, not less.
+pub fn fix_is_accurate_enough_to_relocate(accuracy_m: Option<f64>) -> bool {
+    // `is_none_or`, so a NaN accuracy — which no producer should emit and which
+    // compares false against everything — is rejected rather than admitted.
+    accuracy_m.is_none_or(|m| m <= MAX_RELOCATION_ACCURACY_M)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +292,25 @@ mod tests {
             FixQuality::Device,
         );
         assert!(prefer_fix(None, None).is_none());
+    }
+    /// The measured portal number, pinned. It is an order of magnitude coarser
+    /// than a satellite fix and an order of magnitude better than it needs to
+    /// be: displacing a sample point by 25 km changed the chosen site in 5.5%
+    /// of probes. A threshold that rejected it would switch off the largest
+    /// single improvement this feature has.
+    #[test]
+    fn the_accuracy_gate_admits_a_coarse_but_usable_fix() {
+        assert!(fix_is_accurate_enough_to_relocate(Some(25_000.0)));
+        assert!(
+            fix_is_accurate_enough_to_relocate(None),
+            "the serial path reports no accuracy at all and has always been \
+                 trusted"
+        );
+        assert!(!fix_is_accurate_enough_to_relocate(Some(1_000_000.0)));
+        assert!(
+            !fix_is_accurate_enough_to_relocate(Some(f64::NAN)),
+            "a NaN accuracy compares false against everything, so it has to be \
+                 rejected explicitly or it slips through as 'good enough'"
+        );
     }
 }

@@ -1,9 +1,8 @@
 //! The one thing that decides whether rustdar asks the OS where the user is.
 //!
-//! Shaped like [`location_hint`](crate::location_hint): self-contained, one
-//! call site. `App` owns a [`LocationGate`] and steps it from
-//! `poll_platform_state`; nothing else in the crate calls
-//! [`PlatformBridge::request_location`], and that is the property worth
+//! Self-contained, one call site: the app owns a [`LocationGate`] and steps
+//! it from its platform poll; nothing else anywhere calls
+//! `LocationBridge::request_location`, and that is the property worth
 //! keeping. A permission prompt is the most intrusive thing this application
 //! can do to a person, so there is exactly one line of code that can do it and
 //! every guard sits in front of that line.
@@ -39,11 +38,9 @@
 //! 4. **A revoked permission must stop the stream**, or a blue dot sits on the
 //!    map at a position the user has withdrawn consent for.
 //!
-//! [`PlatformBridge::request_location`]: crate::platform::PlatformBridge::request_location
-
-use crate::platform::PlatformBridge;
+use crate::bridge::LocationBridge;
+use crate::permission::LocationPermission;
 use rustdar_kv::KvStore;
-use rustdar_location::LocationPermission;
 use std::time::Duration;
 use web_time::Instant;
 
@@ -143,8 +140,8 @@ pub struct LocationGate {
     memo: LocationMemo,
     /// Where the memo is persisted, resolved once.
     ///
-    /// Cached because `PlatformBridge::kv` allocates a fresh
-    /// `Box<FileKvStore>` on every call and this sits on the frame path.
+    /// Cached because a bridge's `kv` allocates a fresh
+    /// boxed store on every call and this sits on the frame path.
     ///
     /// Resolved once and never retried, which is safe because every bridge that
     /// has a store has it before the first frame: Android's `set_config_dir`
@@ -168,10 +165,8 @@ pub struct LocationGate {
     /// Whether the last ask is believed to have reached the OS.
     ///
     /// In memory, per run, never persisted — that restriction is the whole
-    /// point. See [`PlatformBridge::request_location`]'s honesty note: this is
+    /// point. See [`LocationBridge::request_location`]'s honesty note: this is
     /// the only thing allowed to hang off that return value.
-    ///
-    /// [`PlatformBridge::request_location`]: crate::platform::PlatformBridge::request_location
     ask_reached_os: bool,
 }
 
@@ -207,13 +202,13 @@ impl LocationGate {
 
     /// Look at the platform, and act if there is anything to do.
     ///
-    /// Called once per frame from `App::poll_platform_state`; most of those
+    /// Called once per frame from the app's platform poll; most of those
     /// calls return immediately on the cadence check below.
     ///
     /// `settings_open` tightens the cadence rather than gating it, because the
     /// state has to be current whether or not anyone is looking — the blue dot
     /// is drawn on the map, not in the settings window.
-    pub fn step(&mut self, platform: &mut dyn PlatformBridge, settings_open: bool) -> LocationStep {
+    pub fn step(&mut self, platform: &mut dyn LocationBridge, settings_open: bool) -> LocationStep {
         self.step_at(Instant::now(), platform, settings_open)
     }
 
@@ -225,7 +220,7 @@ impl LocationGate {
     pub(crate) fn step_at(
         &mut self,
         now: Instant,
-        platform: &mut dyn PlatformBridge,
+        platform: &mut dyn LocationBridge,
         settings_open: bool,
     ) -> LocationStep {
         if !self.due(now, settings_open) {
@@ -314,7 +309,7 @@ impl LocationGate {
     /// [`step`](Self::step), so the same guards apply. In particular a user who
     /// has already been refused by the OS gets no new dialog out of this, and
     /// the settings pane does not offer them the button in the first place.
-    pub fn enable(&mut self, platform: &mut dyn PlatformBridge) {
+    pub fn enable(&mut self, platform: &mut dyn LocationBridge) {
         self.memo.enabled = true;
         self.memo.attempts = 0;
         self.persist();
@@ -333,7 +328,7 @@ impl LocationGate {
     /// this is the button that says "off", and up to [`POLL_INTERVAL`] of the
     /// dot continuing to move afterwards is the app disagreeing with its own
     /// control.
-    pub fn disable(&mut self, platform: &mut dyn PlatformBridge) {
+    pub fn disable(&mut self, platform: &mut dyn LocationBridge) {
         self.memo.enabled = false;
         self.persist();
         platform.stop_location();
@@ -418,10 +413,8 @@ impl LocationGate {
     ///
     /// The bridge is told because Android cannot otherwise tell "never asked"
     /// from "permanently denied" — see
-    /// [`PlatformBridge::set_location_attempts`].
-    ///
-    /// [`PlatformBridge::set_location_attempts`]: crate::platform::PlatformBridge::set_location_attempts
-    fn set_attempts(&mut self, attempts: u8, platform: &mut dyn PlatformBridge) {
+    /// [`LocationBridge::set_location_attempts`].
+    fn set_attempts(&mut self, attempts: u8, platform: &mut dyn LocationBridge) {
         if self.memo.attempts == attempts {
             return;
         }
@@ -466,7 +459,7 @@ impl LocationGate {
     /// raises a dialog the framework silently refuses to show. Pushed here, on
     /// the one pass that reads the memo, so the bridge has it before the first
     /// query.
-    fn resolve_store(&mut self, platform: &mut dyn PlatformBridge) {
+    fn resolve_store(&mut self, platform: &mut dyn LocationBridge) {
         if self.store_resolved {
             return;
         }
@@ -516,4 +509,9 @@ impl LocationGate {
 }
 
 #[cfg(test)]
+mod double;
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use double::GateDouble;

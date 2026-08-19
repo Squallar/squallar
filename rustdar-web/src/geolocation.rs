@@ -694,7 +694,7 @@ mod tests {
     /// rather than about a flag somebody could set.
     ///
     /// The prompt now happens from `WebPlatform::request_location`, which
-    /// `rustdar_frontend::location_permission` reaches only from a state that
+    /// `rustdar_location::LocationGate` reaches only from a state that
     /// licenses one.
     #[test]
     fn nothing_asks_the_browser_for_a_position_at_page_load() {
