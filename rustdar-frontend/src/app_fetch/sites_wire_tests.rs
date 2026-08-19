@@ -88,17 +88,16 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
              rasterization this slice removed",
         );
         let (_, request) = &posted[0];
-        let crate::offload::JobRequest::Overlay {
-            width,
-            height,
-            input,
-            ..
-        } = request
-        else {
+        let crate::offload::JobRequest::Overlay { geometry, job } = request else {
             panic!("the sites dispatch posted a job of another kind, not JobRequest::Overlay");
         };
-        assert_eq!((*width, *height), (64, 48), "the plan's own dimensions");
-        let crate::offload::OverlayJobInput::Sites(sites) = input else {
+        assert_eq!(
+            (geometry.width, geometry.height),
+            (64, 48),
+            "the plan's own dimensions"
+        );
+        let Some(sites) = job.downcast_ref::<rustdar_overlays::render::rasterize::SitesInput>()
+        else {
             panic!("the sites dispatch posted an overlay job of another kind");
         };
         assert!(

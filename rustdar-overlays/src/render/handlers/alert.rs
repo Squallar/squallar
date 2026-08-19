@@ -9,11 +9,12 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
-    OverlayItem, OverlayKind, OverlayState, PopupAction, PopupActionKind, PopupContent,
-    PopupSection, RasterizeContext, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
+    RenderMode,
 };
 use crate::render::rasterize;
+use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// `pub`, not `pub(crate)`: `rustdar-frontend`'s described-job dispatch tests
 /// seed a live registry with alerts through `apply_fetch_result`, which takes
@@ -488,8 +489,14 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        self.paint_input(ctx).map(HandlerJobInput::Alerts)
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+        self.paint_input(ctx).map(DescribedJob::new)
+    }
+
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/alerts")
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {

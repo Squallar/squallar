@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use rustdar_source::job::JobCodec;
+
 use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
@@ -44,6 +46,17 @@ impl OverlayHandler for RadarSitesHandler {
     }
     fn has_data(&self) -> bool {
         true
+    }
+
+    /// The sites row is registered like every other texture kind's, while
+    /// `prepare_job` stays the default `None`: the described input needs
+    /// `pane.site`/`loading_site`, which this handler cannot see until
+    /// per-pane handler state exists (M10), so the frontend dispatch builds
+    /// the `SitesInput` itself and frames it with this row.
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/sites")
     }
     fn is_fetching(&self) -> bool {
         false

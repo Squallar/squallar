@@ -9,12 +9,12 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
-    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
+use rustdar_source::job::{DescribedJob, JobCodec};
 
 // `pub`, not `pub(crate)`, for `alert::NwsAlertFetchResult`'s reason: the
 // described-job dispatch and hit-map zip tests in `rustdar-frontend` seed a
@@ -321,8 +321,14 @@ impl OverlayHandler for StormReportsHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
-        Some(HandlerJobInput::Reports(self.paint_input(ctx)?))
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+        Some(DescribedJob::new(self.paint_input(ctx)?))
+    }
+
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/reports")
     }
 
     /// Index-aligned with [`Self::paint_input`]'s rows: both iterate

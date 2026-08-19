@@ -1,4 +1,6 @@
 use super::*;
+use rustdar_source::job::{DescribedJob, JobGeometry};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -282,15 +284,18 @@ pub(super) fn an_overlay_sites_job() -> JobRequest {
         }
     };
     JobRequest::Overlay {
-        width: 96,
-        height: 64,
-        bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 33.0,
-            max_lat: 37.0,
-            min_lon: -99.0,
-            max_lon: -96.0,
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
         },
-        input: OverlayJobInput::Sites(rustdar_overlays::render::rasterize::SitesInput {
+        job: DescribedJob::new(rustdar_overlays::render::rasterize::SitesInput {
             sites: vec![
                 site("KTLX", 35.33, -97.28, true),
                 site("KVNX", 36.74, -98.13, false),
@@ -367,15 +372,18 @@ pub(super) fn an_overlay_alerts_job() -> JobRequest {
         HatchPattern::None,
     );
     JobRequest::Overlay {
-        width: 96,
-        height: 64,
-        bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 33.0,
-            max_lat: 37.0,
-            min_lon: -99.0,
-            max_lon: -96.0,
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
         },
-        input: OverlayJobInput::Alerts(Box::new(AlertsInput {
+        job: DescribedJob::new(AlertsInput {
             alerts: vec![
                 AlertPaint {
                     id: "urn:oid:2.49.0.1.840.0001".into(),
@@ -396,7 +404,7 @@ pub(super) fn an_overlay_alerts_job() -> JobRequest {
             enabled_categories: vec![AlertCategory::Warning, AlertCategory::Advisory],
             hidden_ids: std::collections::HashSet::from(["urn:oid:2.49.0.1.840.0003".to_owned()]),
             device_scale: 1.0,
-        })),
+        }),
     }
 }
 
@@ -448,15 +456,18 @@ pub(super) fn an_overlay_outlooks_job() -> JobRequest {
         HatchPattern::Cig3,
     );
     JobRequest::Overlay {
-        width: 96,
-        height: 64,
-        bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 33.0,
-            max_lat: 37.0,
-            min_lon: -99.0,
-            max_lon: -96.0,
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
         },
-        input: OverlayJobInput::Outlooks(OutlooksInput {
+        job: DescribedJob::new(OutlooksInput {
             features: vec![categorical, cig1, cig3],
             hatch_color: [0, 0, 255, 255],
             device_scale: 1.0,
@@ -472,15 +483,18 @@ pub(super) fn an_overlay_discussions_job() -> JobRequest {
     use rustdar_overlays::render::rasterize::{DiscussionPaint, DiscussionsInput};
     use rustdar_overlays::spc::discussion::MdType;
     JobRequest::Overlay {
-        width: 96,
-        height: 64,
-        bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 33.0,
-            max_lat: 37.0,
-            min_lon: -99.0,
-            max_lon: -96.0,
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
         },
-        input: OverlayJobInput::Discussions(DiscussionsInput {
+        job: DescribedJob::new(DiscussionsInput {
             discussions: vec![
                 DiscussionPaint {
                     md_type: MdType::Convective,
@@ -518,15 +532,18 @@ pub(super) fn an_overlay_reports_job() -> JobRequest {
     use rustdar_overlays::render::rasterize::{ReportPaint, ReportsInput};
     use rustdar_overlays::spc::reports::StormReportKind;
     JobRequest::Overlay {
-        width: 96,
-        height: 64,
-        bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 33.0,
-            max_lat: 37.0,
-            min_lon: -99.0,
-            max_lon: -96.0,
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
         },
-        input: OverlayJobInput::Reports(ReportsInput {
+        job: DescribedJob::new(ReportsInput {
             reports: vec![
                 ReportPaint {
                     kind: StormReportKind::Tornado,
@@ -587,15 +604,18 @@ pub(super) fn an_overlay_glm_job() -> JobRequest {
         energy,
     };
     JobRequest::Overlay {
-        width: 96,
-        height: 64,
-        bounds: rustdar_overlays::types::GeoBounds {
-            min_lat: 33.0,
-            max_lat: 37.0,
-            min_lon: -99.0,
-            max_lon: -96.0,
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
         },
-        input: OverlayJobInput::Glm(GlmStrikesInput {
+        job: DescribedJob::new(GlmStrikesInput {
             flashes: vec![
                 at(60, 35.3, -97.3, Some(1e-15)),  // first third: white-ish
                 at(270, 36.2, -98.5, None),        // second third; unknown energy
@@ -690,12 +710,13 @@ fn a_model_grid() -> rustdar_overlays::hrrr::HrrrGridData {
 pub(super) fn an_overlay_model_whole_job() -> JobRequest {
     use rustdar_overlays::render::rasterize::ModelDataInput;
     JobRequest::Overlay {
-        width: 96,
-        height: 72,
-        bounds: a_model_viewport(),
-        input: OverlayJobInput::ModelData(Box::new(ModelDataInput::Whole(std::sync::Arc::new(
-            a_model_grid(),
-        )))),
+        geometry: JobGeometry {
+            width: 96,
+            height: 72,
+            bounds: a_model_viewport(),
+            side_ceiling_px: 0,
+        },
+        job: DescribedJob::new(ModelDataInput::Whole(std::sync::Arc::new(a_model_grid()))),
     }
 }
 
@@ -707,17 +728,20 @@ pub(super) fn an_overlay_model_whole_job() -> JobRequest {
 /// `PartialEq`, so the NaN path is pinned in `model_nan_tests` instead).
 pub(super) fn an_overlay_model_job() -> JobRequest {
     use rustdar_overlays::render::rasterize::{IndexWindow, ModelDataInput, ModelWindow};
-    let geometry = rustdar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
+    let lambert = rustdar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
         .expect("the fixture constants are the ones a real template produced");
     JobRequest::Overlay {
-        width: 96,
-        height: 72,
-        bounds: a_model_viewport(),
-        input: OverlayJobInput::ModelData(Box::new(ModelDataInput::Window(ModelWindow {
+        geometry: JobGeometry {
+            width: 96,
+            height: 72,
+            bounds: a_model_viewport(),
+            side_ceiling_px: 0,
+        },
+        job: DescribedJob::new(ModelDataInput::Window(ModelWindow {
             parameter: rustdar_overlays::hrrr::ModelParameter::SurfaceBasedCape,
             ni: 60,
             nj: 44,
-            coords: rustdar_overlays::hrrr::GridCoords::Lambert(geometry),
+            coords: rustdar_overlays::hrrr::GridCoords::Lambert(lambert),
             win: IndexWindow {
                 i0: 14,
                 i1: 20,
@@ -725,7 +749,7 @@ pub(super) fn an_overlay_model_job() -> JobRequest {
                 j1: 14,
             },
             values: (0..24).map(|k| (k * 100) as f32).collect(),
-        }))),
+        })),
     }
 }
 
@@ -894,20 +918,28 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
 /// misread them.
 #[test]
 fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
-    // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(&str, u8, u8); 7] = [
-        ("OVERLAY_INPUT_SITES", OVERLAY_INPUT_SITES, 1),
-        ("OVERLAY_INPUT_ALERTS", OVERLAY_INPUT_ALERTS, 2),
-        ("OVERLAY_INPUT_OUTLOOKS", OVERLAY_INPUT_OUTLOOKS, 3),
-        ("OVERLAY_INPUT_DISCUSSIONS", OVERLAY_INPUT_DISCUSSIONS, 4),
-        ("OVERLAY_INPUT_REPORTS", OVERLAY_INPUT_REPORTS, 5),
-        ("OVERLAY_INPUT_GLM", OVERLAY_INPUT_GLM, 6),
-        ("OVERLAY_INPUT_MODEL", OVERLAY_INPUT_MODEL, 7),
+    // Deliberately spelled out. Do not regenerate this from the sub-code
+    // map: since WO-M6.3 this table is the pin on [`overlay_sub_code`] —
+    // the sparse, frontend-owned map that reproduces the deleted
+    // `OVERLAY_INPUT_*` constants' bytes until WO-M7b's dense flip.
+    let table: [(&str, u8); 7] = [
+        ("overlay/sites", 1),
+        ("overlay/alerts", 2),
+        ("overlay/outlooks", 3),
+        ("overlay/discussions", 4),
+        ("overlay/reports", 5),
+        ("overlay/glm", 6),
+        ("overlay/model", 7),
     ];
-    for (name, actual, expected) in table {
+    for (label, expected) in table {
+        let row = job_codecs()
+            .iter()
+            .find(|row| row.label == label)
+            .unwrap_or_else(|| panic!("no codec row is labelled {label:?}"));
+        let actual = overlay_sub_code(row);
         assert_eq!(
             actual, expected,
-            "{name} moved on the wire: it is {actual} now, not {expected}",
+            "{label} moved on the wire: it is {actual} now, not {expected}",
         );
     }
 
@@ -1784,6 +1816,76 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 
 // ── The overlay job ─────────────────────────────────────────────────────────
 
+/// **The pairing gate between the registry and the parity suite** (m6): the
+/// per-row via-wire-vs-direct parity tests below ARE the byte gate on the
+/// codec rows, so a row without one is a codec whose move-fidelity nothing
+/// proves. The registry's row count is pinned to the literal list of the
+/// seven parity-test names, and each name is verified to exist in this very
+/// file — an eighth row cannot land without writing its parity test and
+/// adding the name here. WO-M7.2 extends this to 13 rows / 13 names.
+#[test]
+fn every_overlay_codec_row_has_a_parity_test() {
+    // Deliberately spelled out, label beside test name, in registry order.
+    let named: [(&str, &str); 7] = [
+        (
+            "overlay/sites",
+            "the_sites_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/alerts",
+            "the_alerts_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/outlooks",
+            "the_outlooks_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/discussions",
+            "the_discussions_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/reports",
+            "the_reports_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/glm",
+            "the_glm_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/model",
+            "the_model_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+    ];
+    assert_eq!(
+        job_codecs().len(),
+        named.len(),
+        "the registry has {} rows where this list names {} parity tests: a \
+         row without a via-wire-vs-direct parity test is a codec whose \
+         byte-identity nothing proves — write the test, then add its name \
+         here",
+        job_codecs().len(),
+        named.len(),
+    );
+    let labels: Vec<&str> = job_codecs().iter().map(|row| row.label).collect();
+    let expected: Vec<&str> = named.iter().map(|(label, _)| *label).collect();
+    assert_eq!(
+        labels, expected,
+        "the registry's rows and the parity list disagree about which kinds \
+         exist or their order",
+    );
+    // The names are real: each must appear as a test fn in this very file,
+    // so the pin cannot drift into naming tests that no longer exist.
+    let source = include_str!("tests.rs");
+    for (label, test_name) in named {
+        assert!(
+            source.contains(&format!("fn {test_name}(")),
+            "{label}'s parity test `{test_name}` is not defined in \
+             offload/tests.rs; the row count above is only as good as the \
+             names being live tests",
+        );
+    }
+}
+
 /// **The parity gate for the sites render: direct call and via-wire execution
 /// are byte-identical.** This is what makes describing the job a move of the
 /// same work rather than a second implementation of it — the wire decodes back
@@ -1799,21 +1901,16 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 /// elsewhere or not at all, and the byte comparison reports it.
 #[test]
 fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_sites_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_sites_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Sites(sites) = input else {
-        unreachable!("the fixture is a sites job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let sites = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::SitesInput>()
+        .expect("the fixture is a sites job");
 
     let direct =
-        rustdar_overlays::render::rasterize::rasterize_radar_sites(&sites, &bounds, width, height);
+        rustdar_overlays::render::rasterize::rasterize_radar_sites(sites, &bounds, width, height);
     // The premise the via-wire contract ("always premultiplied") rides on for
     // this kind: the direct path already answers premultiplied bytes, so the
     // wire's conversion arm is a no-op and identity is exact.
@@ -1832,10 +1929,8 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
 
     let (via_wire, hit_cells) = execute_bytes(
         &JobRequest::Overlay {
-            width,
-            height,
-            bounds,
-            input: OverlayJobInput::Sites(sites),
+            geometry,
+            job: job.clone(),
         }
         .to_bytes(),
     )
@@ -1893,21 +1988,16 @@ fn overlay_reply_via_wire(
 /// flattens plausibly, and exactly what this comparison exists to catch.
 #[test]
 fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_alerts_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_alerts_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Alerts(alerts) = input else {
-        unreachable!("the fixture is an alerts job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let alerts = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::AlertsInput>()
+        .expect("the fixture is an alerts job");
 
     let direct =
-        rustdar_overlays::render::rasterize::rasterize_nws_alerts(&alerts, &bounds, width, height);
+        rustdar_overlays::render::rasterize::rasterize_nws_alerts(alerts, &bounds, width, height);
     assert_eq!(
         direct.alpha,
         rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -1920,10 +2010,8 @@ fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let via_wire = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Alerts(alerts.clone()),
+        geometry,
+        job: job.clone(),
     });
     assert_eq!(
         via_wire.len(),
@@ -1942,13 +2030,11 @@ fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
     // otherwise-empty corner of the fixture.
     let unhidden = rustdar_overlays::render::rasterize::AlertsInput {
         hidden_ids: std::collections::HashSet::new(),
-        ..*alerts
+        ..alerts.clone()
     };
     let more = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Alerts(Box::new(unhidden)),
+        geometry,
+        job: DescribedJob::new(unhidden),
     });
     assert!(
         painted(&more) > painted(&via_wire),
@@ -1965,21 +2051,16 @@ fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
 /// assumed to.
 #[test]
 fn the_outlooks_render_is_byte_identical_direct_and_via_the_wire() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_outlooks_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_outlooks_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Outlooks(outlooks) = input else {
-        unreachable!("the fixture is an outlooks job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let outlooks = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::OutlooksInput>()
+        .expect("the fixture is an outlooks job");
 
     let direct = rustdar_overlays::render::rasterize::rasterize_spc_outlooks(
-        &outlooks, &bounds, width, height,
+        outlooks, &bounds, width, height,
     );
     assert_eq!(
         direct.alpha,
@@ -2007,10 +2088,8 @@ fn the_outlooks_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let via_wire = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Outlooks(outlooks),
+        geometry,
+        job: job.clone(),
     });
     assert_eq!(
         via_wire.len(),
@@ -2029,21 +2108,16 @@ fn the_outlooks_render_is_byte_identical_direct_and_via_the_wire() {
 /// the described input must lose pixels through the wire.
 #[test]
 fn the_discussions_render_is_byte_identical_direct_and_via_the_wire() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_discussions_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_discussions_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Discussions(discussions) = input else {
-        unreachable!("the fixture is a discussions job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let discussions = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::DiscussionsInput>()
+        .expect("the fixture is a discussions job");
 
     let direct = rustdar_overlays::render::rasterize::rasterize_spc_discussions(
-        &discussions,
+        discussions,
         &bounds,
         width,
         height,
@@ -2060,10 +2134,8 @@ fn the_discussions_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let via_wire = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Discussions(discussions.clone()),
+        geometry,
+        job: job.clone(),
     });
     assert_eq!(
         via_wire.len(),
@@ -2078,13 +2150,11 @@ fn the_discussions_render_is_byte_identical_direct_and_via_the_wire() {
 
     // Every row travels: the winter-weather MD sits apart from the
     // convective one, so a wire that lost the second row loses its pixels.
-    let mut first_only = discussions;
+    let mut first_only = discussions.clone();
     first_only.discussions.truncate(1);
     let fewer = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Discussions(first_only),
+        geometry,
+        job: DescribedJob::new(first_only),
     });
     assert!(
         painted(&fewer) < painted(&via_wire),
@@ -2119,21 +2189,16 @@ fn uv_of_cell(cells: &rustdar_overlays::render::rasterize::HitCells, idx: u32) -
 /// hover that names the wrong report, which no pixel comparison can see.
 #[test]
 fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_reports_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_reports_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Reports(reports) = input else {
-        unreachable!("the fixture is a reports job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let reports = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
+        .expect("the fixture is a reports job");
 
     let direct = rustdar_overlays::render::rasterize::rasterize_storm_reports(
-        &reports, &bounds, width, height,
+        reports, &bounds, width, height,
     );
     assert_eq!(
         direct.alpha,
@@ -2147,10 +2212,8 @@ fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let (via_wire, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Reports(reports.clone()),
+        geometry,
+        job: job.clone(),
     });
     assert_eq!(
         via_wire.len(),
@@ -2179,13 +2242,11 @@ fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
 
     // The kind byte is a live input through the wire, not a field a broken
     // codec could zero: recolouring the first report repaints its marker.
-    let mut rekinded = reports;
+    let mut rekinded = reports.clone();
     rekinded.reports[0].kind = rustdar_overlays::spc::reports::StormReportKind::Hail;
     let repainted = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Reports(rekinded),
+        geometry,
+        job: DescribedJob::new(rekinded),
     });
     assert_ne!(
         repainted, via_wire,
@@ -2202,21 +2263,16 @@ fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
 /// paths.
 #[test]
 fn the_glm_render_is_byte_identical_direct_and_via_the_wire() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_glm_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_glm_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Glm(glm) = input else {
-        unreachable!("the fixture is a GLM job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let glm = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::GlmStrikesInput>()
+        .expect("the fixture is a GLM job");
 
     let direct =
-        rustdar_overlays::render::rasterize::rasterize_glm_strikes(&glm, &bounds, width, height);
+        rustdar_overlays::render::rasterize::rasterize_glm_strikes(glm, &bounds, width, height);
     assert_eq!(
         direct.alpha,
         rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -2229,10 +2285,8 @@ fn the_glm_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let (via_wire, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Glm(glm.clone()),
+        geometry,
+        job: job.clone(),
     });
     assert_eq!(
         via_wire.len(),
@@ -2270,25 +2324,20 @@ fn the_glm_render_is_byte_identical_direct_and_via_the_wire() {
 /// a worker re-read its clock and pass everything.
 #[test]
 fn a_worker_that_re_read_its_own_clock_would_fail_the_glm_parity() {
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_glm_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_glm_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::Glm(glm) = input else {
-        unreachable!("the fixture is a GLM job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let glm = job
+        .downcast_ref::<rustdar_overlays::render::rasterize::GlmStrikesInput>()
+        .expect("the fixture is a GLM job");
 
     let honest =
-        rustdar_overlays::render::rasterize::rasterize_glm_strikes(&glm, &bounds, width, height);
+        rustdar_overlays::render::rasterize::rasterize_glm_strikes(glm, &bounds, width, height);
 
     let rederived = rustdar_overlays::render::rasterize::GlmStrikesInput {
         now: glm.now + chrono::Duration::seconds(60),
-        ..glm
+        ..glm.clone()
     };
     let drifted = rustdar_overlays::render::rasterize::rasterize_glm_strikes(
         &rederived, &bounds, width, height,
@@ -2421,7 +2470,7 @@ fn a_zip_ctx() -> rustdar_overlays::render::overlay_state::RasterizeContext {
 /// fixture's.
 #[test]
 fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
-    use rustdar_overlays::render::overlay_state::{HandlerJobInput, OverlayKind};
+    use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::render::rasterize::HitMap;
     let bounds = rustdar_overlays::types::GeoBounds {
         min_lat: 33.0,
@@ -2436,38 +2485,37 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
         (a_seeded_reports_registry(), OverlayKind::StormReports),
         (a_seeded_glm_registry(), OverlayKind::Lightning),
     ] {
-        let input = registry
+        let job = registry
             .prepare_job(kind, &ctx)
             .expect("the seeded registry describes a job");
         let items = registry
             .hit_items(kind)
             .expect("a hit-map kind captures items beside its input");
-        let (direct, job) = match input {
-            HandlerJobInput::Reports(input) => {
-                assert_eq!(items.len(), input.reports.len(), "one item per row");
-                (
-                    rustdar_overlays::render::rasterize::rasterize_storm_reports(
-                        &input, &bounds, width, height,
-                    ),
-                    OverlayJobInput::Reports(input),
-                )
-            }
-            HandlerJobInput::Glm(input) => {
-                assert_eq!(items.len(), input.flashes.len(), "one item per row");
-                (
-                    rustdar_overlays::render::rasterize::rasterize_glm_strikes(
-                        &input, &bounds, width, height,
-                    ),
-                    OverlayJobInput::Glm(input),
-                )
-            }
-            other => panic!("{kind:?} described {other:?}, another kind's input"),
+        let direct = if let Some(input) =
+            job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
+        {
+            assert_eq!(items.len(), input.reports.len(), "one item per row");
+            rustdar_overlays::render::rasterize::rasterize_storm_reports(
+                input, &bounds, width, height,
+            )
+        } else if let Some(input) =
+            job.downcast_ref::<rustdar_overlays::render::rasterize::GlmStrikesInput>()
+        {
+            assert_eq!(items.len(), input.flashes.len(), "one item per row");
+            rustdar_overlays::render::rasterize::rasterize_glm_strikes(
+                input, &bounds, width, height,
+            )
+        } else {
+            panic!("{kind:?} described {job:?}, another kind's input")
         };
         let (_, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
-            width,
-            height,
-            bounds,
-            input: job,
+            geometry: JobGeometry {
+                width,
+                height,
+                bounds,
+                side_ceiling_px: 0,
+            },
+            job,
         });
         let wire_cells = wire_cells.expect("a hit-map kind answers cells over the wire");
         let direct_map = HitMap::from_cells(
@@ -2516,7 +2564,7 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
 /// report is worse than no hit map at all.
 #[test]
 fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
-    use rustdar_overlays::render::overlay_state::{HandlerJobInput, OverlayKind};
+    use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::render::rasterize::HitMap;
     let bounds = rustdar_overlays::types::GeoBounds {
         min_lat: 33.0,
@@ -2527,19 +2575,25 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
     let (width, height) = (96u32, 64u32);
     let registry = a_seeded_reports_registry();
     let ctx = a_zip_ctx();
-    let Some(HandlerJobInput::Reports(input)) =
-        registry.prepare_job(OverlayKind::StormReports, &ctx)
-    else {
-        panic!("the seeded registry describes a reports job");
-    };
+    let job = registry
+        .prepare_job(OverlayKind::StormReports, &ctx)
+        .expect("the seeded registry describes a reports job");
+    assert!(
+        job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
+            .is_some(),
+        "the seeded registry described another kind's input: {job:?}",
+    );
     let items = registry
         .hit_items(OverlayKind::StormReports)
         .expect("items");
     let (_, wire_cells) = overlay_reply_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::Reports(input),
+        geometry: JobGeometry {
+            width,
+            height,
+            bounds,
+            side_ceiling_px: 0,
+        },
+        job,
     });
     let wire_cells = wire_cells.expect("cells");
 
@@ -2766,15 +2820,17 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
     assert_eq!(rekinded[59], 0, "premise: row 0 travels as tornado, code 0");
     rekinded[59] = 2;
     match JobRequest::from_bytes(&rekinded) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Reports(reports),
-            ..
-        }) => assert_eq!(
-            reports.reports[0].kind,
-            rustdar_overlays::spc::reports::StormReportKind::Wind,
-            "byte 59 is not the first row's kind; the refusal below would be \
-             about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let reports = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()
+                .expect("the reports row decoded");
+            assert_eq!(
+                reports.reports[0].kind,
+                rustdar_overlays::spc::reports::StormReportKind::Wind,
+                "byte 59 is not the first row's kind; the refusal below \
+                 would be about some other field",
+            );
+        }
         other => panic!("the rekinded control failed to decode: {other:?}"),
     }
     let mut bad_kind = bytes.clone();
@@ -2813,15 +2869,17 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     let secs = i64::from_le_bytes(renow[63..71].try_into().unwrap());
     renow[63..71].copy_from_slice(&(secs + 60).to_le_bytes());
     match JobRequest::from_bytes(&renow) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Glm(glm),
-            ..
-        }) => assert_eq!(
-            glm.now,
-            glm_fixture_now() + chrono::Duration::seconds(60),
-            "bytes 63..71 are not the dispatch clock; the refusal below \
-             would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let glm = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::GlmStrikesInput>()
+                .expect("the GLM row decoded");
+            assert_eq!(
+                glm.now,
+                glm_fixture_now() + chrono::Duration::seconds(60),
+                "bytes 63..71 are not the dispatch clock; the refusal below \
+                 would be about some other field",
+            );
+        }
         other => panic!("the re-clocked control failed to decode: {other:?}"),
     }
     let mut bad_now = bytes.clone();
@@ -2837,14 +2895,16 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     let mut renanos = bytes.clone();
     renanos[71..75].copy_from_slice(&500_000_000u32.to_le_bytes());
     match JobRequest::from_bytes(&renanos) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Glm(glm),
-            ..
-        }) => assert_eq!(
-            glm.now,
-            glm_fixture_now() + chrono::Duration::milliseconds(500),
-            "bytes 71..75 are not the clock's subsecond half",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let glm = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::GlmStrikesInput>()
+                .expect("the GLM row decoded");
+            assert_eq!(
+                glm.now,
+                glm_fixture_now() + chrono::Duration::milliseconds(500),
+                "bytes 71..75 are not the clock's subsecond half",
+            );
+        }
         other => panic!("the nanos control failed to decode: {other:?}"),
     }
     let mut bad_nanos = bytes.clone();
@@ -2869,15 +2929,17 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     let mut re_energized = bytes.clone();
     re_energized[108..112].copy_from_slice(&2e-15f32.to_le_bytes());
     match JobRequest::from_bytes(&re_energized) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Glm(glm),
-            ..
-        }) => assert_eq!(
-            glm.flashes[0].energy,
-            Some(2e-15),
-            "bytes 108..112 are not the first flash's energy; the refusal \
-             below would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let glm = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::GlmStrikesInput>()
+                .expect("the GLM row decoded");
+            assert_eq!(
+                glm.flashes[0].energy,
+                Some(2e-15),
+                "bytes 108..112 are not the first flash's energy; the \
+                 refusal below would be about some other field",
+            );
+        }
         other => panic!("the energy control failed to decode: {other:?}"),
     }
     let mut bad_energy_tag = bytes;
@@ -2908,18 +2970,13 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
 #[test]
 fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
     use rustdar_overlays::render::rasterize::ModelDataInput;
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    } = an_overlay_model_whole_job()
-    else {
+    let JobRequest::Overlay { geometry, job } = an_overlay_model_whole_job() else {
         unreachable!("the fixture is an overlay job");
     };
-    let OverlayJobInput::ModelData(model) = &input else {
-        unreachable!("the fixture is a model job");
-    };
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let model = job
+        .downcast_ref::<ModelDataInput>()
+        .expect("the fixture is a model job");
 
     let grid_points = {
         let (ni, nj) = model.shape();
@@ -2951,23 +3008,18 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
         painted(&expected),
     );
 
-    let job = JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input,
-    };
+    let request = JobRequest::Overlay { geometry, job };
     // The size claim, on the actual bytes: the job must be smaller than the
     // values it declined to ship, or the cut exists only in theory.
     assert!(
-        job.to_bytes().len() < grid_points * 4 / 2,
+        request.to_bytes().len() < grid_points * 4 / 2,
         "the encoded model job is {} bytes against {} bytes of whole-grid \
          values — the encoder is not cutting to the window",
-        job.to_bytes().len(),
+        request.to_bytes().len(),
         grid_points * 4,
     );
 
-    let (via_wire, hit_cells) = overlay_reply_via_wire(&job);
+    let (via_wire, hit_cells) = overlay_reply_via_wire(&request);
     assert_eq!(
         via_wire.len(),
         (width * height * 4) as usize,
@@ -2991,12 +3043,8 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
     let (ci, cj) = ((win.i0 + win.i1) / 2, (win.j0 + win.j1) / 2);
     moved.values[cj * moved.ni + ci] = 4000.0;
     let repainted = overlay_raster_via_wire(&JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::ModelData(Box::new(ModelDataInput::Whole(std::sync::Arc::new(
-            moved,
-        )))),
+        geometry,
+        job: DescribedJob::new(ModelDataInput::Whole(std::sync::Arc::new(moved))),
     });
     assert_ne!(
         repainted, via_wire,
@@ -3017,24 +3065,21 @@ fn the_whole_model_grid_encodes_as_exactly_its_window() {
     let bytes = whole.to_bytes();
     let decoded = JobRequest::from_bytes(&bytes).expect("the whole-grid job encodes decodably");
 
-    let JobRequest::Overlay {
-        width,
-        height,
-        bounds,
-        input: OverlayJobInput::ModelData(model),
-    } = &decoded
-    else {
+    let JobRequest::Overlay { geometry, job } = &decoded else {
         panic!("the model job decoded as something else: {decoded:?}");
     };
+    let model = job
+        .downcast_ref::<ModelDataInput>()
+        .unwrap_or_else(|| panic!("the model job decoded as something else: {decoded:?}"));
 
     // The expected window form, built by the same accessors the encoder uses.
     let grid = a_model_grid();
     let source = ModelDataInput::Whole(std::sync::Arc::new(grid.clone()));
-    let win = source.window_for(bounds, *width, *height);
+    let win = source.window_for(&geometry.bounds, geometry.width, geometry.height);
     let mut values = Vec::with_capacity(win.area());
     source.for_each_window_row(&win, |row| values.extend_from_slice(row));
     assert_eq!(
-        **model,
+        *model,
         ModelDataInput::Window(ModelWindow {
             parameter: grid.parameter,
             ni: grid.ni,
@@ -3073,10 +3118,9 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     let bytes = job.to_bytes();
 
     let decoded_model = |bytes: &[u8]| match JobRequest::from_bytes(bytes) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::ModelData(model),
-            ..
-        }) => Some(model),
+        Some(JobRequest::Overlay { job, .. }) => job
+            .downcast_ref::<rustdar_overlays::render::rasterize::ModelDataInput>()
+            .cloned(),
         _ => None,
     };
 
@@ -3174,7 +3218,7 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     shifted[150..154].copy_from_slice(&(i0 + 1).to_le_bytes());
     shifted[154..158].copy_from_slice(&(i1 + 1).to_le_bytes());
     let model = decoded_model(&shifted).expect("the shifted control decodes");
-    match &*model {
+    match &model {
         rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
             assert_eq!(
                 (w.win.i0, w.win.i1),
@@ -3208,7 +3252,7 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     let mut revalued = bytes;
     revalued[166..170].copy_from_slice(&123.5f32.to_le_bytes());
     let model = decoded_model(&revalued).expect("the revalued control decodes");
-    match &*model {
+    match &model {
         rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
             assert_eq!(w.values[0], 123.5, "bytes 166..170 are not value 0");
         }
@@ -3344,14 +3388,16 @@ fn a_malformed_overlay_job_is_refused_rather_than_misread() {
     let mut renamed = bytes.clone();
     renamed[79] = b'Q';
     match JobRequest::from_bytes(&renamed) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Sites(sites),
-            ..
-        }) => assert_eq!(
-            sites.sites[0].name, "QTLX",
-            "byte 79 is not the first name byte; the refusal below would be \
-             about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let sites = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::SitesInput>()
+                .expect("the sites row decoded");
+            assert_eq!(
+                sites.sites[0].name, "QTLX",
+                "byte 79 is not the first name byte; the refusal below would \
+                 be about some other field",
+            );
+        }
         other => panic!("the renamed control failed to decode: {other:?}"),
     }
     let mut bad_name = bytes;
@@ -3420,15 +3466,17 @@ fn a_malformed_alerts_job_is_refused_rather_than_misread() {
     );
     retagged[first_category] = 1;
     match JobRequest::from_bytes(&retagged) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Alerts(alerts),
-            ..
-        }) => assert_eq!(
-            alerts.enabled_categories[0],
-            AlertCategory::Watch,
-            "byte {first_category} is not the first category code; the \
-             refusal below would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let alerts = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::AlertsInput>()
+                .expect("the alerts row decoded");
+            assert_eq!(
+                alerts.enabled_categories[0],
+                AlertCategory::Watch,
+                "byte {first_category} is not the first category code; the \
+                 refusal below would be about some other field",
+            );
+        }
         other => panic!("the retagged control failed to decode: {other:?}"),
     }
     retagged[first_category] = 4;
@@ -3443,14 +3491,16 @@ fn a_malformed_alerts_job_is_refused_rather_than_misread() {
     assert_eq!(renamed[first_hidden_byte], b'u', "the fixture id is a urn");
     renamed[first_hidden_byte] = b'Q';
     match JobRequest::from_bytes(&renamed) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Alerts(alerts),
-            ..
-        }) => assert!(
-            alerts.hidden_ids.iter().any(|id| id.starts_with('Q')),
-            "byte {first_hidden_byte} is not the first hidden-id byte; the \
-             refusal below would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let alerts = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::AlertsInput>()
+                .expect("the alerts row decoded");
+            assert!(
+                alerts.hidden_ids.iter().any(|id| id.starts_with('Q')),
+                "byte {first_hidden_byte} is not the first hidden-id byte; \
+                 the refusal below would be about some other field",
+            );
+        }
         other => panic!("the renamed control failed to decode: {other:?}"),
     }
     renamed[first_hidden_byte] = 0xFF;
@@ -3487,15 +3537,17 @@ fn a_malformed_outlooks_job_is_refused_rather_than_misread() {
     );
     rehatched[first_hatch] = 2;
     match JobRequest::from_bytes(&rehatched) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Outlooks(outlooks),
-            ..
-        }) => assert_eq!(
-            outlooks.features[0].hatch,
-            HatchPattern::Cig2,
-            "byte {first_hatch} is not the first hatch code; the refusal \
-             below would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let outlooks = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::OutlooksInput>()
+                .expect("the outlooks row decoded");
+            assert_eq!(
+                outlooks.features[0].hatch,
+                HatchPattern::Cig2,
+                "byte {first_hatch} is not the first hatch code; the refusal \
+                 below would be about some other field",
+            );
+        }
         other => panic!("the rehatched control failed to decode: {other:?}"),
     }
     rehatched[first_hatch] = 4;
@@ -3513,14 +3565,16 @@ fn a_malformed_outlooks_job_is_refused_rather_than_misread() {
         "the fixture's feature carries its AABB"
     );
     match JobRequest::from_bytes(&untagged) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Outlooks(outlooks),
-            ..
-        }) => assert!(
-            outlooks.features[0].geo_bounds.is_some(),
-            "byte {bounds_tag} is not the geo-bounds tag; the refusal below \
-             would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let outlooks = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::OutlooksInput>()
+                .expect("the outlooks row decoded");
+            assert!(
+                outlooks.features[0].geo_bounds.is_some(),
+                "byte {bounds_tag} is not the geo-bounds tag; the refusal \
+                 below would be about some other field",
+            );
+        }
         other => panic!("the option-tag control failed to decode: {other:?}"),
     }
     untagged[bounds_tag] = 2;
@@ -3548,15 +3602,17 @@ fn a_malformed_discussions_job_is_refused_rather_than_misread() {
     assert_eq!(retyped[first_md_type], 0, "the fixture leads Convective");
     retyped[first_md_type] = 1;
     match JobRequest::from_bytes(&retyped) {
-        Some(JobRequest::Overlay {
-            input: OverlayJobInput::Discussions(discussions),
-            ..
-        }) => assert_eq!(
-            discussions.discussions[0].md_type,
-            MdType::WinterWeather,
-            "byte {first_md_type} is not the first MD-type code; the refusal \
-             below would be about some other field",
-        ),
+        Some(JobRequest::Overlay { job, .. }) => {
+            let discussions = job
+                .downcast_ref::<rustdar_overlays::render::rasterize::DiscussionsInput>()
+                .expect("the discussions row decoded");
+            assert_eq!(
+                discussions.discussions[0].md_type,
+                MdType::WinterWeather,
+                "byte {first_md_type} is not the first MD-type code; the \
+                 refusal below would be about some other field",
+            );
+        }
         other => panic!("the retyped control failed to decode: {other:?}"),
     }
     retyped[first_md_type] = 3;

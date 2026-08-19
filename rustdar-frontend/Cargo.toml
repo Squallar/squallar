@@ -17,6 +17,12 @@ web-time = { workspace = true }
 rustdar-egui = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
+# The job-boundary vocabulary (DescribedJob, JobCodec, JobGeometry) and the
+# substrate wire Reader the codec rows decode with. The overlay wire flip
+# (WO-M6.3) is what forced the edge: `JobRequest::Overlay` carries the
+# substrate's own envelope types, and the frontend frames codec rows whose
+# signatures speak them.
+rustdar-source = { workspace = true }
 # Types only (GpsFix, GpsConfig) — nothing here touches the serial reader, so
 # this crate stays free of the `serial` feature. The settings pane that does use
 # it turns on rustdar-egui/gps-serial instead, which is where the gate belongs.

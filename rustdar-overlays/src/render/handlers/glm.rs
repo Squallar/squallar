@@ -14,11 +14,11 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, HandlerJobInput, OverlayHandler,
-    OverlayItem, OverlayKind, OverlayState, PopupContent, PopupSection, RasterizeContext,
-    RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
+use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// What a poll's listings covered, in the layer-agnostic terms the UI renders.
 ///
@@ -881,10 +881,16 @@ impl OverlayHandler for GlmHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<HandlerJobInput> {
+    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
         // Captures the dispatch's own `ctx.now`, which is what keeps the
         // flash ages a worker renders the ages this page computed.
-        Some(HandlerJobInput::Glm(self.paint_input(ctx)?))
+        Some(DescribedJob::new(self.paint_input(ctx)?))
+    }
+
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/glm")
     }
 
     /// Index-aligned with [`Self::paint_input`]'s rows: both iterate

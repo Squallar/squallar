@@ -4226,6 +4226,7 @@ dependencies = [
  "rustdar-gps",
  "rustdar-overlays",
  "rustdar-radar",
+ "rustdar-source",
  "serde",
  "serde_json",
  "syn 3.0.3",
