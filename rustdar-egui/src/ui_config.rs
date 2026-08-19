@@ -14,10 +14,11 @@ use super::PaneState;
 #[path = "ui_config/migrate.rs"]
 mod migrate;
 use crate::pane::{
-    CrossSectionPane, GeoPoint, MapPane, MapRender, OrbitCamera, PaneContent, SectionLine,
-    VolumePane, VolumeRegion,
+    CrossSectionPane, MapPane, MapRender, OrbitCamera, PaneContent, SectionLine, VolumePane,
+    VolumeRegion,
 };
 use crate::ui_layout::WidthClass;
+use rustdar_geo::GeoPoint;
 
 /// Serializable per-pane state persisted across sessions.
 #[derive(Serialize, Deserialize)]

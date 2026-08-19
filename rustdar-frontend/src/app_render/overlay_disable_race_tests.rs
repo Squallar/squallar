@@ -31,8 +31,8 @@
 
 use super::*;
 use rustdar_egui::overlay_cache::OverlayTextureData;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_overlays::types::GeoBounds;
 
 /// The layer raced. A texture-mode overlay that `poll_overlay_render_results`
 /// really serves — the radar raster never reaches this poller at all

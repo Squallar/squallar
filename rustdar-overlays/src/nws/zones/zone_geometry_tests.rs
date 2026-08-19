@@ -29,7 +29,8 @@
 
 use super::parse_zone_polygons;
 use crate::render::geo::simplify_ring;
-use crate::types::{GeoPolygon, GeoPolygonRing, SIMPLIFY_EPSILON};
+use crate::types::SIMPLIFY_EPSILON;
+use rustdar_geo::{GeoPolygon, GeoPolygonRing};
 
 /// Verbatim `geometry` members from `api.weather.gov/zones/{kind}/{id}`.
 const ZONE_GEOMETRY: &str = include_str!("../../../testdata/nws_zone_geometry.json");

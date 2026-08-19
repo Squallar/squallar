@@ -82,33 +82,10 @@ impl TileSource for CartoDb {
 // Slippy-map tile coordinates (standard OSM / Web Mercator formulas), from
 // the workspace's geodesy floor.
 
-/// The latitude Web Mercator ends at — [`rustdar_geo`]'s constant, not a
-/// second copy of it, and no longer a chain of them: this crate used to reach
-/// it through `rustdar-radar`'s re-export of the substrate's re-export, and
-/// now reads the floor directly.
-///
-/// Re-exported under this path because that is where it was named when the
-/// tile helpers, `overlay_cache` and `rustdar-overlays`'s rasterizer were each
-/// given their own spelling of it. The constant's own doc carries the
-/// projection's reasoning and what the truncated copies cost.
-///
-/// Not applied as a clamp by [`lat_to_tile_y`], which needs no branch: the
-/// index clamp inside it already carries every latitude past this to the edge
-/// row.
-pub use rustdar_geo::MERCATOR_LAT_LIMIT_DEG;
-
-/// The tile transforms themselves, moved verbatim to the geodesy floor —
-/// where the projection they quantize lives, so the grid and the projection
-/// cannot drift apart ([`tile_to_lat`] now routes through
-/// `rustdar_geo::mercator_y_to_lat_rad`, the workspace's one inverse, with
-/// bit-identical arithmetic).
-///
-/// Re-exported here because this is the path the tile grid's consumers have
-/// always named. The mercantile reference vectors in `tiles/tests.rs` pin
-/// these exact bits through this re-export — their passing unedited is the
-/// proof the move was a move. The private index clamp (`tile_index` — both
-/// ends, see `no_input_produces_an_index_off_the_grid`) moved with them.
-pub use rustdar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
+// The tile transforms and `MERCATOR_LAT_LIMIT_DEG` live in `rustdar-geo`
+// (moved at WO-G2/G3; the re-exports here died at WO-G4 — `rustdar_geo::` is
+// the one spelling). The mercantile reference vectors in `tiles/tests.rs` pin
+// their exact bits directly at the floor.
 
 // ---------------------------------------------------------------------------
 // MapTileState — shared map tile management

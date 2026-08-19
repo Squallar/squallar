@@ -449,7 +449,7 @@ pub struct App {
     /// Fed to `FetchConfig::viewport` so overlays that fetch per-region data
     /// can scope their requests. `None` until the first frame that draws an
     /// overlay; `metar::networks::DEFAULT_VIEWPORT` covers that window.
-    last_viewport: Option<rustdar_overlays::types::GeoBounds>,
+    last_viewport: Option<rustdar_geo::GeoBounds>,
     autosave: AutosaveState,
     /// When egui next wants a frame, from a timed repaint request
     /// (`request_repaint_after` — a cursor blink, a tooltip delay). `None`

@@ -903,7 +903,8 @@ fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
 /// assertion here would hide the one kind of drift that matters.
 #[test]
 fn a_drawn_section_line_survives_a_save_and_load() {
-    use crate::pane::{GeoPoint, PaneKind, SectionLine};
+    use crate::pane::{PaneKind, SectionLine};
+    use rustdar_geo::GeoPoint;
 
     let store = MemoryConfigStore::default();
     let a = GeoPoint {
@@ -1232,7 +1233,7 @@ fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
 #[test]
 fn a_picked_region_survives_a_save_and_load() {
     let picked = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.33,
             lon: -97.28,
         },
@@ -1281,7 +1282,7 @@ fn a_picked_region_survives_a_save_and_load() {
 #[test]
 fn the_map_a_region_was_picked_on_survives_a_save_and_load() {
     let picked = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.33,
             lon: -97.28,
         },
@@ -1345,7 +1346,7 @@ fn the_map_a_region_was_picked_on_survives_a_save_and_load() {
 #[test]
 fn a_dangling_source_pane_is_forgotten_and_the_region_kept() {
     let picked = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.33,
             lon: -97.28,
         },

@@ -40,7 +40,7 @@ use serde_json::Value;
 use super::networks;
 use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
 use crate::fetch_policy::FetchError;
-use crate::types::GeoBounds;
+use rustdar_geo::GeoBounds;
 
 // ── Units ─────────────────────────────────────────────────────────────────
 //

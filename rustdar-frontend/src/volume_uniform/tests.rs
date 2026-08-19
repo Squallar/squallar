@@ -510,7 +510,7 @@ fn the_shader_and_the_lut_constant_agree() {
 /// `floor_colour` reprojects the box floor through geography to sample the
 /// pane mirror, so its degree is the same conversion `ImageBounds` framed
 /// that mirror with and `render_gate` placed the echoes in it with. WGSL
-/// cannot read `rustdar_radar::types::KM_PER_DEGREE_LAT`, so `volume.wgsl`
+/// cannot read `rustdar_geo::KM_PER_DEGREE_LAT`, so `volume.wgsl`
 /// holds the workspace's only hand-written copy of that number and this is
 /// the guard that stops it becoming a second definition.
 ///
@@ -537,12 +537,12 @@ fn the_shaders_km_per_degree_is_the_radar_crates_own() {
         .parse()
         .unwrap_or_else(|_| panic!("volume.wgsl's KM_PER_DEGREE_LAT `{literal}` is not a number"));
 
-    let expected = rustdar_radar::types::KM_PER_DEGREE_LAT as f32;
+    let expected = rustdar_geo::KM_PER_DEGREE_LAT as f32;
     assert_eq!(
         shader.to_bits(),
         expected.to_bits(),
         "volume.wgsl says {shader} km per degree and \
-             `rustdar_radar::types::KM_PER_DEGREE_LAT` says {expected}, so \
+             `rustdar_geo::KM_PER_DEGREE_LAT` says {expected}, so \
              the volume floor's geography and the radar data drawn over it \
              are on different spheres",
     );

@@ -363,7 +363,7 @@ fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) 
 /// This *was* a duplicate, and the duplication is what let the placement stay
 /// wrong: it walked the same equirectangular offsets `render_gate` walked, so
 /// every probe in this file agreed with the renderer about a position neither
-/// of them shared with [`crate::beam::site_bearing_range_km`] — which is the
+/// of them shared with [`rustdar_geo::site_bearing_range_km`] — which is the
 /// function the hover readout, the cross-section and [`painted_ranges_km`] all
 /// ask the same question backwards with.
 ///
@@ -377,7 +377,7 @@ fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize
     let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
     let proj = MercatorProjection::from_bounds(LAT, &bounds, extent_km, side_px);
     let (sin_az, cos_az) = az_deg.to_radians().sin_cos();
-    let (sin_d, cos_d) = (range_km / types::EARTH_RADIUS_KM).sin_cos();
+    let (sin_d, cos_d) = (range_km / rustdar_geo::EARTH_RADIUS_KM).sin_cos();
     let (px, py) = proj.pixel_at(sin_az, cos_az, sin_d, cos_d);
     py as usize * side_px + px as usize
 }
@@ -1220,8 +1220,8 @@ fn tdwr_sweep_from_gates(gates: Vec<u8>) -> Scan {
 ///
 /// `site_lat` because the trip is not latitude-independent and the caller that
 /// matters renders the same sweep at several: it is
-/// [`crate::beam::site_bearing_range_km`] on the way back and
-/// [`crate::beam::great_circle_destination`] on the way out, and reading a
+/// [`rustdar_geo::site_bearing_range_km`] on the way back and
+/// [`rustdar_geo::great_circle_destination`] on the way out, and reading a
 /// render taken at one latitude through bounds built at another measures the
 /// mismatch instead of the render.
 fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f64> {
@@ -1239,7 +1239,7 @@ fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f6
                 + (col as f64 + 0.5) / side as f64 * (bounds.max_lon - bounds.min_lon);
             let merc_y = bounds.mercator_y_max - (row as f64 + 0.5) / side as f64 * merc_span;
             let lat = (2.0 * merc_y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
-            crate::beam::site_bearing_range_km(site_lat, LON, lat, lon).1
+            rustdar_geo::site_bearing_range_km(site_lat, LON, lat, lon).1
         })
         .collect()
 }
@@ -1466,7 +1466,7 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
         // What the ring the user sees is drawn at, at this site's latitude:
         // the bounds the frontend hands back to `ImageBounds::from_radar_site`.
         let bounds = types::ImageBounds::from_radar_site(lat, lon, vel.max_range_km);
-        let ring_km = (bounds.max_lat - lat) * types::KM_PER_DEGREE_LAT;
+        let ring_km = (bounds.max_lat - lat) * rustdar_geo::KM_PER_DEGREE_LAT;
         assert!(
             (ring_km - doppler_ground_km).abs() < 1e-6,
             "{name}: the ring stands {ring_km:.4} km out around \
@@ -1952,13 +1952,13 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
 /// ground — `render_gate` placing a gate equirectangularly, `dy` km north read
 /// off as a latitude offset and `dx` km east as a longitude one, against
 /// [`painted_ranges_km_at`] reading the pixel back with
-/// [`crate::beam::site_bearing_range_km`], a great-circle distance. Those agree
+/// [`rustdar_geo::site_bearing_range_km`], a great-circle distance. Those agree
 /// on the cardinals and diverge on the diagonals, always outward, growing with
 /// range and with latitude to 1.44 % of the extent at 47 °N over 417 km. The
 /// bound here was widened to that measured disagreement and said so.
 ///
 /// It is not widened now. `render_gate` asks
-/// [`crate::beam::great_circle_destination`] where a gate is — the exact
+/// [`rustdar_geo::great_circle_destination`] where a gate is — the exact
 /// inverse of the function reading it back — so the two models are one model
 /// and the residual is the pixel grid alone. What is left over is a *negative*
 /// excess at every fixture and latitude below, i.e. the outermost painted pixel
@@ -3547,7 +3547,7 @@ fn a_checked_out_value_grid_is_empty_at_every_length() {
 // interleaving can make them fail. See that file for how a separate process
 // gets the exact-contents claim back without the race.
 
-/// The rasterizer's own placement is [`crate::beam::great_circle_destination`]
+/// The rasterizer's own placement is [`rustdar_geo::great_circle_destination`]
 /// carried into pixels — the same point, arrived at by two routes.
 ///
 /// `MercatorProjection::pixel_at` does not *call* `great_circle_destination`:
@@ -3579,15 +3579,15 @@ fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
                     let range_km = extent_km * frac;
 
                     let (sin_az, cos_az) = az.to_radians().sin_cos();
-                    let (sin_d, cos_d) = (range_km / types::EARTH_RADIUS_KM).sin_cos();
+                    let (sin_d, cos_d) = (range_km / rustdar_geo::EARTH_RADIUS_KM).sin_cos();
                     let (px, py) = proj.pixel_at(sin_az, cos_az, sin_d, cos_d);
 
                     // The same gate, placed by `beam` and framed by the bounds.
                     let (lat, lon) =
-                        crate::beam::great_circle_destination(site_lat, LON, az, range_km);
+                        rustdar_geo::great_circle_destination(site_lat, LON, az, range_km);
                     let want_px =
                         (lon - bounds.min_lon) / (bounds.max_lon - bounds.min_lon) * side as f64;
-                    let merc_y = types::lat_rad_to_mercator_y(lat.to_radians());
+                    let merc_y = rustdar_geo::lat_rad_to_mercator_y(lat.to_radians());
                     let want_py = (bounds.mercator_y_max - merc_y) / merc_span * side as f64;
 
                     let off = (px - want_px).abs().max((py - want_py).abs());

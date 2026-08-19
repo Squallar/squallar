@@ -12,8 +12,8 @@
 //! exist for a job that was never described).
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
+use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_overlays::types::GeoBounds;
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job, standing

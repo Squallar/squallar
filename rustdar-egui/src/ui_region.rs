@@ -138,7 +138,7 @@ pub(crate) struct RegionDrag {
     /// dragging past the edge of a pane to make a big box is ordinary.
     pane_idx: crate::pane::PaneId,
     /// The box's centre, fixed on the press frame and never revised.
-    centre: crate::pane::GeoPoint,
+    centre: rustdar_geo::GeoPoint,
     /// Half-width in kilometres as the pointer currently stands. Capped at the
     /// resampler's maximum on the way in — see [`Self::extend_to`] — but *not*
     /// held up to its minimum: a too-small drag is refused whole at commit
@@ -155,7 +155,7 @@ impl RegionDrag {
     /// `f64::clamp` propagates NaN.
     pub(crate) fn begin(
         pane_idx: crate::pane::PaneId,
-        centre: crate::pane::GeoPoint,
+        centre: rustdar_geo::GeoPoint,
     ) -> Option<Self> {
         centre.is_on_earth().then_some(Self {
             pane_idx,
@@ -170,7 +170,7 @@ impl RegionDrag {
     }
 
     /// The centre the press fixed.
-    pub(crate) fn centre(self) -> crate::pane::GeoPoint {
+    pub(crate) fn centre(self) -> rustdar_geo::GeoPoint {
         self.centre
     }
 
@@ -204,7 +204,7 @@ impl RegionDrag {
     /// discarded.
     ///
     /// [`VolumeRegion::new`]: crate::pane::VolumeRegion::new
-    pub(crate) fn extend_to(&mut self, corner: crate::pane::GeoPoint) {
+    pub(crate) fn extend_to(&mut self, corner: rustdar_geo::GeoPoint) {
         if !corner.is_on_earth() {
             return;
         }
@@ -296,20 +296,20 @@ impl RegionDrag {
 /// place. No NEXRAD site is within 20° of one; the check is here because the
 /// alternative is an infinity in a painter.
 pub(crate) fn corners_for(
-    centre: crate::pane::GeoPoint,
+    centre: rustdar_geo::GeoPoint,
     half: rustdar_radar::voxel::HalfExtentKm,
-) -> Option<(crate::pane::GeoPoint, crate::pane::GeoPoint)> {
+) -> Option<(rustdar_geo::GeoPoint, rustdar_geo::GeoPoint)> {
     let d_lat = half.north_km / rustdar_geo::KM_PER_DEGREE_LAT;
     let cos_lat = centre.lat.to_radians().cos();
     if !(cos_lat.is_finite() && cos_lat.abs() > 1e-6) {
         return None;
     }
     let d_lon = half.east_km / (rustdar_geo::KM_PER_DEGREE_LAT * cos_lat);
-    let nw = crate::pane::GeoPoint {
+    let nw = rustdar_geo::GeoPoint {
         lat: centre.lat + d_lat,
         lon: centre.lon - d_lon,
     };
-    let se = crate::pane::GeoPoint {
+    let se = rustdar_geo::GeoPoint {
         lat: centre.lat - d_lat,
         lon: centre.lon + d_lon,
     };

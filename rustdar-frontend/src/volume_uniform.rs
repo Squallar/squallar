@@ -372,7 +372,7 @@ pub struct VolumeUniform {
     /// (u, v) = (u₀ + (λ − λ₀)·u_per_deg,  v₀ + (mercᵧ(φ) − mercᵧ(φ₀))·v_per_merc)
     /// ```
     ///
-    /// That is [`rustdar_radar::beam::great_circle_destination`], which is also
+    /// That is [`rustdar_geo::great_circle_destination`], which is also
     /// what `render_gate` places the echoes in the mirror with — the whole
     /// reason this reprojection lands on them.
     ///
@@ -386,7 +386,7 @@ pub struct VolumeUniform {
     /// stand ~15 km apart at the corners, twice the trapezoid error this
     /// reprojection exists to remove and in the same direction as it.
     ///
-    /// `KM_PER_DEGREE_LAT` is [`rustdar_radar::types::KM_PER_DEGREE_LAT`], and
+    /// `KM_PER_DEGREE_LAT` is [`rustdar_geo::KM_PER_DEGREE_LAT`], and
     /// survives as how the shader reaches `EARTH_RADIUS_KM` without writing it
     /// down a second time: kilometres over kilometres-per-degree is degrees of
     /// arc, whatever the sphere. The shader holds the only hand-written copy of

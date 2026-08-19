@@ -283,7 +283,8 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
 /// picked is the same thing seen from the other side.
 #[test]
 fn a_picked_region_decides_the_ground_that_is_resampled() {
-    use rustdar_egui::pane::{GeoPoint, VolumeRegion, VolumeStamp, VolumeTarget};
+    use rustdar_egui::pane::{VolumeRegion, VolumeStamp, VolumeTarget};
+    use rustdar_geo::GeoPoint;
 
     let target = |region| VolumeTarget {
         volume: VolumeStamp {
@@ -339,7 +340,8 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
 /// pane reports.
 #[test]
 fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
-    use rustdar_egui::pane::{GeoPoint, VolumeRegion, VolumeStamp, VolumeTarget};
+    use rustdar_egui::pane::{VolumeRegion, VolumeStamp, VolumeTarget};
+    use rustdar_geo::GeoPoint;
 
     let make = |region| VolumeTarget {
         volume: VolumeStamp {

@@ -991,7 +991,7 @@ impl super::Gui {
             // and longitude is `x` — the same reading `render_pane_map_content`
             // takes off `unproject`.
             let position = projector.unproject(egui::vec2(pos.x, pos.y));
-            crate::pane::GeoPoint {
+            rustdar_geo::GeoPoint {
                 lat: position.y(),
                 lon: position.x(),
             }
@@ -1091,7 +1091,7 @@ impl super::Gui {
             // and longitude is `x` — the same reading `track_section_draw`
             // takes off `unproject`.
             let position = projector.unproject(egui::vec2(pos.x, pos.y));
-            crate::pane::GeoPoint {
+            rustdar_geo::GeoPoint {
                 lat: position.y(),
                 lon: position.x(),
             }
@@ -1263,7 +1263,7 @@ impl super::Gui {
         }
 
         let project =
-            |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
+            |p: rustdar_geo::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
         // Every committed line this map owns, with its projected geometry —
         // the same polyline the track is drawn from, so what is grabbable is
         // exactly what is visible. Reading `self.panes` mid-loop is safe here
@@ -1311,7 +1311,7 @@ impl super::Gui {
         });
         let ground = |p: egui::Pos2| {
             let position = projector.unproject(egui::vec2(p.x, p.y));
-            crate::pane::GeoPoint {
+            rustdar_geo::GeoPoint {
                 lat: position.y(),
                 lon: position.x(),
             }
@@ -1445,7 +1445,7 @@ impl super::Gui {
     ) {
         let painter = ui.painter();
         let project =
-            |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
+            |p: rustdar_geo::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
 
         #[cfg(test)]
         let mut painted: Vec<(usize, usize, egui::Pos2, egui::Pos2)> = Vec::new();
@@ -3270,7 +3270,7 @@ const REGION_FILL_ALPHA: f32 = 0.12;
 /// the start of every drag reads as a stray click artefact.
 fn region_screen_rect(
     projector: &walkers::Projector,
-    centre: crate::pane::GeoPoint,
+    centre: rustdar_geo::GeoPoint,
     half: rustdar_radar::voxel::HalfExtentKm,
 ) -> Option<egui::Rect> {
     if !(half.is_finite() && half.east_km > 0.0 && half.north_km > 0.0) {
@@ -3278,7 +3278,7 @@ fn region_screen_rect(
     }
     let (nw, se) = crate::ui_region::corners_for(centre, half)?;
     let project =
-        |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
+        |p: rustdar_geo::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
     Some(egui::Rect::from_two_pos(project(nw), project(se)))
 }
 
@@ -3351,7 +3351,7 @@ fn paint_region_hint(
 /// [`Gui::volume_cells_across`]: super::Gui::volume_cells_across
 fn region_hint_text(half_width_km: f64, cells: Option<usize>) -> Option<String> {
     let region = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint { lat: 0.0, lon: 0.0 },
+        rustdar_geo::GeoPoint { lat: 0.0, lon: 0.0 },
         rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
     )?;
     let across = 2.0 * region.half_east_km();
@@ -3457,7 +3457,7 @@ const SECTION_TRACK_SAMPLES: usize = 32;
 /// "the line looked slightly off" is one nothing can fail on.
 fn great_circle_track(
     line: crate::pane::SectionLine,
-    project: impl Fn(crate::pane::GeoPoint) -> egui::Pos2,
+    project: impl Fn(rustdar_geo::GeoPoint) -> egui::Pos2,
 ) -> Vec<egui::Pos2> {
     let a = (line.a().lat, line.a().lon);
     let b = (line.b().lat, line.b().lon);
@@ -3465,7 +3465,7 @@ fn great_circle_track(
         .map(|i| {
             let t = i as f64 / SECTION_TRACK_SAMPLES as f64;
             let (lat, lon) = rustdar_geo::great_circle_point(a, b, t);
-            project(crate::pane::GeoPoint { lat, lon })
+            project(rustdar_geo::GeoPoint { lat, lon })
         })
         .collect()
 }

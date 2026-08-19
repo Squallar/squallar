@@ -1,5 +1,6 @@
 use super::*;
-use rustdar_egui::pane::{GeoPoint, SectionLine, SectionTarget, VolumeStamp};
+use rustdar_egui::pane::{SectionLine, SectionTarget, VolumeStamp};
+use rustdar_geo::GeoPoint;
 
 fn at(minute: u32) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 30)

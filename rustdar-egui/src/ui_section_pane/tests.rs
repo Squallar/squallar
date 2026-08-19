@@ -945,11 +945,11 @@ fn the_line_chip_reads_in_the_users_own_distance_unit() {
     use rustdar_units::DistanceUnit;
 
     let line = crate::pane::SectionLine::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.0,
             lon: -97.0,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 36.0,
             lon: -97.0,
         },
@@ -1254,11 +1254,11 @@ fn the_hover_names_the_sweep_it_came_from_and_how_old_it_is() {
 
     let (site_lat, site_lon) = (35.0, -97.0);
     let line = crate::pane::SectionLine::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: site_lat,
             lon: -96.0,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: site_lat,
             lon: -95.0,
         },

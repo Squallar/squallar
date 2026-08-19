@@ -127,7 +127,7 @@ impl MercatorProjection {
             center_px: side_px as f64 / 2.0,
             merc_y_top: bounds.mercator_y_max,
             merc_y_scale: side_px as f64 / (bounds.mercator_y_max - bounds.mercator_y_min),
-            lon_rad_to_px: types::EARTH_RADIUS_KM * cos_radar_lat * px_per_km,
+            lon_rad_to_px: rustdar_geo::EARTH_RADIUS_KM * cos_radar_lat * px_per_km,
             px_per_km,
             extent_km,
             side_px,
@@ -152,9 +152,9 @@ impl MercatorProjection {
     /// range's, so every azimuth sample at one range step shares them.
     #[inline]
     fn pixel_at(&self, sin_az: f64, cos_az: f64, sin_d: f64, cos_d: f64) -> (f64, f64) {
-        // `beam::great_circle_destination`'s two lines, with the site's sine and
+        // `rustdar_geo::great_circle_destination`'s two lines, with the site's sine and
         // cosine hoisted onto the projection and the destination's latitude left
-        // as a sine — see `types::mercator_y_from_sin_lat` for why it never
+        // as a sine — see `rustdar_geo::mercator_y_from_sin_lat` for why it never
         // becomes an angle. `great_circle_destination` itself is what
         // `the_rasterizer_places_a_gate_where_the_beam_module_says_it_is` holds
         // this against.
@@ -162,7 +162,7 @@ impl MercatorProjection {
             (self.sin_radar_lat * cos_d + self.cos_radar_lat * sin_d * cos_az).clamp(-1.0, 1.0);
         let dlon =
             (sin_az * sin_d * self.cos_radar_lat).atan2(cos_d - self.sin_radar_lat * sin_lat);
-        let merc_y = types::mercator_y_from_sin_lat(sin_lat);
+        let merc_y = rustdar_geo::mercator_y_from_sin_lat(sin_lat);
         (
             self.center_px + dlon * self.lon_rad_to_px,
             (self.merc_y_top - merc_y) * self.merc_y_scale,
@@ -256,7 +256,7 @@ impl MercatorProjection {
             // and the loop body is left with one `atan2` and one `ln`. That is
             // the same two transcendentals the equirectangular spelling paid
             // (`tan` and `ln`); the accuracy is not bought with frame time.
-            let (sin_d, cos_d) = (r / types::EARTH_RADIUS_KM).sin_cos();
+            let (sin_d, cos_d) = (r / rustdar_geo::EARTH_RADIUS_KM).sin_cos();
 
             for az_step in 0..num_az_samples {
                 let t = az_step as f64 * inv_num_az;
@@ -493,7 +493,7 @@ impl RadialContext {
 /// Chromium, and relaxed atomic stores cost it 5% over plain ones.
 ///
 /// Most of the frame is the per-sample `(π/4 + lat/2).tan().ln()` in
-/// `types::lat_rad_to_mercator_y`: 28 M of those cost 660 ms in Firefox and
+/// `rustdar_geo::lat_rad_to_mercator_y`: 28 M of those cost 660 ms in Firefox and
 /// 597 ms in Chromium against 29 ms and 37 ms for the same loop without them.
 /// Reducing it means changing the arithmetic every output pixel depends on, so
 /// it cannot be done bit-identically. Firefox's reported 5.7× `radar-render`

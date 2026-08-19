@@ -72,7 +72,7 @@ const RADIALS: usize = 360;
 /// naming a kilometres-per-degree figure here — a second opinion about the
 /// planet, which `tests/geodesy_one_definition.rs` exists to refuse and did
 /// refuse the first version of this line. `render_section` does the real
-/// great-circle work on `types::EARTH_RADIUS_KM` and reports the length it
+/// great-circle work on `rustdar_geo::EARTH_RADIUS_KM` and reports the length it
 /// found; nothing here needs to predict it.
 fn at(north_deg: f64, east_deg: f64) -> (f64, f64) {
     (SITE.0 + north_deg, SITE.1 + east_deg)

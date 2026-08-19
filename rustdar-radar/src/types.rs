@@ -4,6 +4,7 @@ use crate::sites::get_radar_site;
 use chrono::NaiveDateTime;
 use nexrad_model::data::Radial;
 use nexrad_model::data::Scan;
+use rustdar_geo::{KM_PER_DEGREE_LAT, lat_rad_to_mercator_y};
 use rustdar_units::{Quantity, UserPreferences};
 use std::collections::HashMap;
 
@@ -365,31 +366,8 @@ pub fn data_limited_side_px(extent_km: f64, sample_km: f64) -> usize {
     (at_reference.max(at_nyquist).ceil() as usize).max(1)
 }
 
-/// The horizontal-geodesy sphere and its degree ↔ kilometre conversion,
-/// defined in `rustdar-geo` — the workspace's geometry floor, reached through
-/// [`rustdar_source::geo`]'s re-export — and re-exported under the paths this
-/// crate always published them at (`sites`, `render`, `xsect` and the voxel
-/// builder all read them as `crate::types::`). The constants' own docs carry
-/// the one-sphere reasoning and the 111.32 history;
-/// `rustdar-radar/tests/geodesy_one_definition.rs` still guards against a
-/// second spelling anywhere in the workspace.
-pub use rustdar_source::geo::{EARTH_RADIUS_KM, KM_PER_DEGREE_LAT};
-
 /// m/s to mph conversion factor.
 pub const MS_TO_MPH: f32 = 2.23694;
-
-/// The latitude Web Mercator ends at, defined in [`rustdar_source::geo`] —
-/// the shared floor under this crate and `rustdar-overlays` — and re-exported
-/// under the path this crate always published it at (`rustdar-egui`'s `tiles`
-/// re-exports it from here). The constant's own doc carries the projection's
-/// reasoning; `rustdar-radar/tests/geodesy_one_definition.rs` still guards
-/// against a second spelling anywhere in the workspace.
-pub use rustdar_source::geo::MERCATOR_LAT_LIMIT_DEG;
-
-// Crate-visible re-exports so `render`'s gate loop and the types tests keep
-// their spelling; the definitions (and their load-bearing `#[inline]`) live in
-// `rustdar_source::geo`.
-pub(crate) use rustdar_source::geo::{lat_rad_to_mercator_y, mercator_y_from_sin_lat};
 
 /// Geographic bounds of the rendered radar image. Pixels are linearly spaced
 /// in Web Mercator Y and longitude, matching slippy-map tile providers.
@@ -417,7 +395,8 @@ impl ImageBounds {
     /// render that made the picture reports its extent as `max_range_km`, and
     /// every placement site hands that back here.
     ///
-    /// On [`KM_PER_DEGREE_LAT`], which is [`EARTH_RADIUS_KM`] — the same
+    /// On [`KM_PER_DEGREE_LAT`], which is [`rustdar_geo::EARTH_RADIUS_KM`]
+    /// — the same
     /// sphere [`crate::render::render_gate`] paints the gates inside these
     /// bounds on. It read `111.32` until the two were unified; see that
     /// constant for what moved. The two changes compose: the ratio is the
@@ -448,7 +427,7 @@ impl ImageBounds {
 /// The geographic half of an [`ImageBounds`]: the four lat/lon edges, copied.
 /// The mercator pair is placement arithmetic, re-derivable through
 /// `lat_rad_to_mercator_y`, so nothing is lost that cannot be recomputed.
-impl From<ImageBounds> for rustdar_source::geo::GeoBounds {
+impl From<ImageBounds> for rustdar_geo::GeoBounds {
     fn from(bounds: ImageBounds) -> Self {
         Self {
             min_lat: bounds.min_lat,

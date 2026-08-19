@@ -606,8 +606,8 @@ mod round_tests {
 
     /// A viewport spanning several plains ASOS networks, so a round really is
     /// several requests and one of them can be refused on its own.
-    fn plains() -> crate::types::GeoBounds {
-        crate::types::GeoBounds {
+    fn plains() -> rustdar_geo::GeoBounds {
+        rustdar_geo::GeoBounds {
             min_lat: 33.0,
             max_lat: 40.0,
             min_lon: -103.0,

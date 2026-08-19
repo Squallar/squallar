@@ -99,36 +99,36 @@
 //!
 //! # Horizontal geometry: 6371, spherical — the sphere ops live in `rustdar-geo` now
 //!
-//! [`site_bearing_range_km`], [`great_circle_destination`] and
-//! [`great_circle_point`] measure on a sphere of
-//! [`crate::types::EARTH_RADIUS_KM`] (6371 km) — deliberately the same
+//! [`rustdar_geo::site_bearing_range_km`],
+//! [`rustdar_geo::great_circle_destination`] and
+//! [`rustdar_geo::great_circle_point`] measure on a sphere of
+//! [`rustdar_geo::EARTH_RADIUS_KM`] (6371 km) — deliberately the same
 //! constant [`crate::render`]'s `render_gate` projects gates with, so a line
 //! drawn on a plan view lands on the ground the plan view put under the
-//! cursor. The map's hover readout reads [`site_bearing_range_km`] for exactly
+//! cursor. The map's hover readout reads `site_bearing_range_km` for exactly
 //! that reason.
 //!
 //! All three moved **verbatim** to `rustdar-geo` — the workspace's geometry
-//! floor, below even `rustdar-source` — at WO-G1, and are re-exported here
-//! under the paths this module always published them at, so `beam::`
-//! spellings and the tests' `use super::*` glob keep resolving. Their docs,
+//! floor, below even `rustdar-source` — at WO-G1 (the `beam::` re-export
+//! shims died at WO-G4; `rustdar_geo::` is the one spelling). Their docs,
 //! the equirectangular error table and the antipodal guard's derivation
 //! travelled with them; the history stays here too, because it is this
 //! module's history:
 //!
 //! The first two of those are a matched pair, inverse and direct, and the plan
 //! view goes through the direct one: `render_gate` asks
-//! [`great_circle_destination`] where a gate is and turns the answer into a
+//! [`rustdar_geo::great_circle_destination`] where a gate is and turns the answer into a
 //! pixel. It used to walk `r·cos az` north and `r·sin az` east instead and read
 //! those off as degrees — an equirectangular approximation of the same
 //! question, worth 11.8 km at KTLX's 460 km reach and 17.9 km at KMSX's. The
-//! table is at [`great_circle_destination`].
+//! table is at [`rustdar_geo::great_circle_destination`].
 //!
 //! [`crate::types::ImageBounds`] used to disagree, working in `1.0 / 111.32`
 //! degrees per km — a 6378 km sphere, 0.11 % off this one, which put the
 //! framing and everything hung off it (the range ring, the volume floor, the
 //! region-drag preview) a quarter of a kilometre away from the gates at the
-//! raster edge. It now works in [`crate::types::KM_PER_DEGREE_LAT`], which is
-//! this same [`crate::types::EARTH_RADIUS_KM`] times `π/180`. There is one
+//! raster edge. It now works in [`rustdar_geo::KM_PER_DEGREE_LAT`], which is
+//! this same [`rustdar_geo::EARTH_RADIUS_KM`] times `π/180`. There is one
 //! horizontal sphere in the workspace and
 //! `rustdar-radar/tests/geodesy_one_definition.rs` is what keeps it that way —
 //! including keeping [`RE_EFF_KM`] below out of its reach, since that is
@@ -177,7 +177,7 @@
 //! the coherent scatter-free per-gate offset a bin-for-bin comparison used to
 //! show is gone. What is left between us and Py-ART is that it reads its `s` off
 //! as planar azimuthal-equidistant coordinates where this crate walks it as a
-//! true arc on [`crate::types::EARTH_RADIUS_KM`] — the split described above,
+//! true arc on [`rustdar_geo::EARTH_RADIUS_KM`] — the split described above,
 //! and the one `polar_to_geo` makes as well.
 //!
 //! # Nothing spells the tangent plane any more
@@ -204,13 +204,6 @@
 //! together, which is the failure this module was created to end. The
 //! 6371-vs-6378 inconsistency [`crate::types::ImageBounds`] used to carry is a
 //! tenth of a pixel beside what was closed here.
-
-// The consuming sphere ops moved to `rustdar-geo` (WO-G1); this import stays
-// for `beam/tests.rs`' `use super::*` glob, and is `cfg(test)`-gated because
-// nothing in a non-test build uses it any more (rustc lints an unused
-// `pub(crate) use` too, measured at this land).
-#[cfg(test)]
-pub(crate) use crate::types::EARTH_RADIUS_KM;
 
 /// Effective earth radius under the standard 4/3 refraction model, km.
 ///
@@ -408,15 +401,6 @@ pub fn height_at_ground_km(ground_range_km: f64, elev_deg: f64) -> f64 {
         elev_deg,
     )
 }
-
-/// The three sphere operations, defined verbatim in `rustdar-geo` (reached
-/// through [`rustdar_source::geo`]) and re-exported under the `beam::` paths
-/// this crate always published them at. The module doc above carries the move
-/// and their history; their own docs — the equirectangular error table, the
-/// clamp reasoning, the antipodal guard's derivation — travelled with them.
-pub use rustdar_source::geo::{
-    great_circle_destination, great_circle_point, site_bearing_range_km,
-};
 
 #[cfg(test)]
 mod tests;

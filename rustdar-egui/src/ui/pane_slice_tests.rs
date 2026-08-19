@@ -205,11 +205,11 @@ fn a_pane_kind_request_for_a_pane_that_is_gone_converts_nothing() {
 /// A line for the target rule to place, and the pane it was drawn on.
 fn drawn_line() -> crate::pane::SectionLine {
     crate::pane::SectionLine::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.0,
             lon: -97.8,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.6,
             lon: -96.9,
         },
@@ -255,11 +255,11 @@ fn blank_section() -> rustdar_radar::xsect::CrossSection {
 /// belongs to another map and must be left alone.
 fn other_line() -> crate::pane::SectionLine {
     crate::pane::SectionLine::new(
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 40.0,
             lon: -100.0,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 41.0,
             lon: -99.0,
         },
@@ -968,7 +968,8 @@ fn an_unlinked_active_pane_is_not_the_fallback_hold_source() {
 /// note.
 #[test]
 fn loop_actions_skip_panes_that_draw_no_frames() {
-    use crate::pane::{GeoPoint, PaneKind, SectionLine};
+    use crate::pane::{PaneKind, SectionLine};
+    use rustdar_geo::GeoPoint;
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);

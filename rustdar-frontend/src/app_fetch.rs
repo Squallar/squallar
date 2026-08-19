@@ -13,7 +13,7 @@ use winit::event_loop::ActiveEventLoop;
 /// Parameters for a background overlay rasterization request.
 pub(super) struct OverlayRenderRequest {
     /// The pane's viewport, *before* overdraw is applied.
-    pub geo_bounds: rustdar_overlays::types::GeoBounds,
+    pub geo_bounds: rustdar_geo::GeoBounds,
     /// Pixel dimensions and the overdraw fraction they were sized for, already
     /// reconciled with the adapter's `max_texture_dimension_2d` by
     /// `rustdar_egui::overlay_cache::plan_overlay_texture`.

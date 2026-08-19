@@ -38,7 +38,7 @@ use rustdar_source::origins::DataSources;
 
 use super::{GridCoords, HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::fetch_policy::{FetchError, FetchFailure, NotFound};
-use crate::types::GeoBounds;
+use rustdar_geo::GeoBounds;
 
 /// Live tests only. Production fetches with `ctx.client` (30 s).
 ///

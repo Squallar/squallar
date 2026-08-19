@@ -26,12 +26,13 @@ pub const REGULAR_FILL_ALPHA: u8 = 100;
 pub const NWS_FILL_ALPHA: u8 = 80;
 pub const STROKE_ALPHA: u8 = 255;
 
-// The geo/feature vocabulary is defined in `rustdar-source` — the shared floor
+// The feature vocabulary is defined in `rustdar-source` — the shared floor
 // under this crate and `rustdar-radar` — and re-exported here under the paths
-// this crate always published it at, so every `crate::types::X` and
-// `rustdar_overlays::types::X` user compiles unchanged.
+// this crate always published it at. The geo vocabulary is `rustdar-geo`'s and
+// is named at that one spelling since WO-G4 killed the re-export shim here.
 pub use rustdar_source::feature::{HatchPattern, OverlayFeature, OverlayLabel};
-pub use rustdar_source::geo::{GeoBounds, GeoPolygon, GeoPolygonRing};
+
+use rustdar_geo::GeoPolygon;
 
 /// GeoJSON is `[[[lon, lat], ...], ...]`; output is `(lat, lon)`. Order swaps.
 /// Rings with fewer than 3 points are dropped.

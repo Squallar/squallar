@@ -488,8 +488,8 @@ impl super::App {
         uploads: &mut PlanViewUploads,
     ) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+        use rustdar_geo::GeoBounds;
         use rustdar_overlays::render::overlay_state::OverlayKind;
-        use rustdar_overlays::types::GeoBounds;
         use rustdar_radar::types::ImageBounds;
 
         // Extract site coordinates before mutable borrow
@@ -2026,8 +2026,8 @@ impl super::App {
     /// renderer, so a test could not tell a skipped pane from a skipped call.
     pub(super) fn restore_cached_render(&mut self, ctx: &egui::Context) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+        use rustdar_geo::GeoBounds;
         use rustdar_overlays::render::overlay_state::OverlayKind;
-        use rustdar_overlays::types::GeoBounds;
         use rustdar_radar::types::ImageBounds;
 
         // Every raster still arriving is let go of first, on **every** pane and

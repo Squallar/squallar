@@ -57,7 +57,7 @@
 //! plane**: `x` is km east of the radar, `y` is km north, `z` is km MSL, and
 //! `(x, y)` maps to the polar pair the sampler wants by
 //! `range = hypot(x, y)`, `azimuth = atan2(x, y)`. That is exactly invertible
-//! against [`crate::beam::site_bearing_range_km`] — bearings and distances
+//! against [`rustdar_geo::site_bearing_range_km`] — bearings and distances
 //! *from the site* are both exact — which is what makes a column's coordinates
 //! the radar's own rather than a projection's approximation of them. Distances
 //! between two non-site points are distorted, which nothing here asks for.
@@ -398,7 +398,6 @@
 //! is therefore a named constant the frontend's grid-spec ladder selects
 //! explicitly, alongside stepping down when a device reports less than 256.
 
-use crate::beam;
 use crate::palette::{get_color_for_value, get_legend_scale};
 use crate::par::*;
 use crate::sampler::{Column, VolumeSampler};
@@ -2465,7 +2464,7 @@ pub fn horizontal_ranges_km(
     site_lon: f64,
 ) -> ((f64, f64), (f64, f64)) {
     let (bearing_deg, range_km) =
-        beam::site_bearing_range_km(site_lat, site_lon, centre.0, centre.1);
+        rustdar_geo::site_bearing_range_km(site_lat, site_lon, centre.0, centre.1);
     let bearing = bearing_deg.to_radians();
     let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
     (

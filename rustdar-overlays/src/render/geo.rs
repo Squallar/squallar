@@ -1,12 +1,8 @@
 //! Geometry utilities. GUI-framework-agnostic: `rustdar-egui` bridges
 //! `egui::Pos2` ↔ [`ScreenPoint`].
 
-use crate::types::{GeoPolygon, GeoPolygonRing, ScreenPoint};
-
-// Defined in `rustdar-source` beside the `GeoBounds` it returns (inherent
-// impls live in the defining crate; `OverlayFeature::new` calls it there);
-// re-exported so this module's callers keep their path.
-pub use rustdar_source::geo::compute_geo_bounds;
+use crate::types::ScreenPoint;
+use rustdar_geo::{GeoPolygon, GeoPolygonRing};
 
 /// The whole multiple of 360° that carries the datum spanning
 /// `[datum_min, datum_max]` to its representation nearest the target spanning

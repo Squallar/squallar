@@ -783,7 +783,7 @@ pub struct FetchConfig {
     /// `None` before the first frame is rendered. METAR must scope to this —
     /// the whole-country IEM form is 54 MB ungzipped; see
     /// [`crate::metar::networks`] for the no-viewport fallback.
-    pub viewport: Option<crate::types::GeoBounds>,
+    pub viewport: Option<rustdar_geo::GeoBounds>,
 }
 
 /// `Copy` so a rasterizer can be handed the whole thing rather than three loose

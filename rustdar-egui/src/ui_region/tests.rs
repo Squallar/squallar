@@ -1332,8 +1332,8 @@ fn a_framed_strip_is_centred_on_the_box() {
 }
 
 /// A point on Earth near KTLX, for the drag fixtures.
-fn ktlx() -> crate::pane::GeoPoint {
-    crate::pane::GeoPoint {
+fn ktlx() -> rustdar_geo::GeoPoint {
+    rustdar_geo::GeoPoint {
         lat: 35.33,
         lon: -97.28,
     }
@@ -1359,9 +1359,9 @@ const OFFSET_TOLERANCE_KM: f64 = 1.5;
 /// (`rustdar_geo::great_circle_destination`), but a fixture built on it would
 /// share its arithmetic with the code under test. See [`OFFSET_TOLERANCE_KM`]
 /// for what the independence costs and why it costs nothing that matters.
-fn offset(from: crate::pane::GeoPoint, east_km: f64, north_km: f64) -> crate::pane::GeoPoint {
+fn offset(from: rustdar_geo::GeoPoint, east_km: f64, north_km: f64) -> rustdar_geo::GeoPoint {
     let per_deg = rustdar_geo::KM_PER_DEGREE_LAT;
-    crate::pane::GeoPoint {
+    rustdar_geo::GeoPoint {
         lat: from.lat + north_km / per_deg,
         lon: from.lon + east_km / (per_deg * from.lat.to_radians().cos()),
     }
@@ -1495,15 +1495,15 @@ fn a_corner_off_earth_leaves_the_drag_where_it_was() {
     drag.extend_to(offset(ktlx(), 80.0, 0.0));
     let settled = drag;
     for bad in [
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: f64::NAN,
             lon: -97.28,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.33,
             lon: f64::INFINITY,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 95.0,
             lon: -97.28,
         },
@@ -1525,15 +1525,15 @@ fn a_corner_off_earth_leaves_the_drag_where_it_was() {
 #[test]
 fn a_press_off_earth_starts_no_drag() {
     for bad in [
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: f64::NAN,
             lon: 0.0,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 0.0,
             lon: f64::NAN,
         },
-        crate::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 91.0,
             lon: 0.0,
         },
@@ -1555,7 +1555,7 @@ fn a_press_off_earth_starts_no_drag() {
 #[test]
 fn the_drawn_box_is_square_in_kilometres_rather_than_degrees() {
     for lat in [0.0, 25.0, 35.33, 49.0, 64.8] {
-        let centre = crate::pane::GeoPoint { lat, lon: -97.28 };
+        let centre = rustdar_geo::GeoPoint { lat, lon: -97.28 };
         let half = rustdar_radar::voxel::HalfExtentKm::square(100.0);
         let (nw, se) = corners_for(centre, half).expect("a box away from the poles");
         let (_, north_km) =
@@ -1583,7 +1583,7 @@ fn a_polar_box_has_no_corners() {
     for lat in [90.0, -90.0] {
         assert_eq!(
             corners_for(
-                crate::pane::GeoPoint { lat, lon: 0.0 },
+                rustdar_geo::GeoPoint { lat, lon: 0.0 },
                 rustdar_radar::voxel::HalfExtentKm::square(100.0),
             ),
             None,

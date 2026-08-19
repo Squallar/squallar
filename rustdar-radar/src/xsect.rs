@@ -72,9 +72,9 @@
 //!
 //! # The ground track and the range ring are the same sphere
 //!
-//! Columns are great-circle points ([`beam::great_circle_point`]) and their
-//! radar-relative coordinates come from [`beam::site_bearing_range_km`], both
-//! on [`crate::types::EARTH_RADIUS_KM`] = 6371 km. That is deliberately the
+//! Columns are great-circle points ([`rustdar_geo::great_circle_point`]) and their
+//! radar-relative coordinates come from [`rustdar_geo::site_bearing_range_km`], both
+//! on [`rustdar_geo::EARTH_RADIUS_KM`] = 6371 km. That is deliberately the
 //! same sphere `render::render_gate` projects gates onto, so a section samples
 //! the ground the plan view put under the cursor.
 //!
@@ -84,7 +84,7 @@
 //! `230 / 111.32` degrees of latitude, which converted back on 6371 is
 //! 229.742 km. A point the ring put at 230 km therefore read **258.4 m
 //! nearer the site** here, 1.15 px on a 2048-wide plan view. `ImageBounds`
-//! reads [`crate::types::KM_PER_DEGREE_LAT`] now, which *is*
+//! reads [`rustdar_geo::KM_PER_DEGREE_LAT`] now, which *is*
 //! `EARTH_RADIUS_KM · π/180`, so the two agree exactly and
 //! `the_ground_track_and_the_range_ring_are_the_same_sphere` pins that they
 //! keep agreeing.
@@ -157,7 +157,6 @@
 //!   listed here because the offset is what a reader of the old pictures
 //!   remembers, not because it is still there.
 
-use crate::beam;
 use crate::par::*;
 use crate::sampler::{Column, Sample, SampleStatus, VolumeSampler};
 use crate::types::RadarProduct;
@@ -240,7 +239,7 @@ const FT_TO_KM: f64 = 0.0003048;
 ///
 /// Half of one 250 m super-resolution gate. Two things go wrong inside it and
 /// neither announces itself. The bearing from
-/// [`beam::site_bearing_range_km`] is `atan2` of two differences that have gone
+/// [`rustdar_geo::site_bearing_range_km`] is `atan2` of two differences that have gone
 /// to zero, so it is dominated by rounding and reaches `atan2(0, 0)` exactly
 /// over the site; and every azimuth's gates converge there anyway, so whatever
 /// bearing comes back names ground indistinguishable from every other bearing's.
@@ -874,7 +873,7 @@ fn render_with_sampler(
     // back `NaN` and there is no non-finite case here to guard — only the
     // coincident one.
     let (_, length_km) =
-        beam::site_bearing_range_km(req.start.0, req.start.1, req.end.0, req.end.1);
+        rustdar_geo::site_bearing_range_km(req.start.0, req.start.1, req.end.0, req.end.1);
     if length_km <= 0.0 {
         log::warn!(
             "cross-section refused: {:?} to {:?} is a line of {length_km} km",
@@ -1292,9 +1291,9 @@ fn sample_columns(
             // makes exactly a fraction of its ground range — so this is the
             // point `column_distance_km(col)` names, and not merely near it.
             let t = axes.column_distance_km(col) / axes.length_km;
-            let point = beam::great_circle_point(req.start, req.end, t);
+            let point = rustdar_geo::great_circle_point(req.start, req.end, t);
             let (azimuth_deg, ground_range_km) =
-                beam::site_bearing_range_km(lat, lon, point.0, point.1);
+                rustdar_geo::site_bearing_range_km(lat, lon, point.0, point.1);
             let column = if is_blind(ground_range_km) {
                 Column::new()
             } else {

@@ -219,7 +219,7 @@ impl HoverSource {
 
     /// What was painted at this point.
     ///
-    /// `azimuth_deg` and `ground_km` are [`crate::beam::site_bearing_range_km`]'s
+    /// `azimuth_deg` and `ground_km` are [`rustdar_geo::site_bearing_range_km`]'s
     /// answer for the position under the pointer — this crate's one spelling of
     /// "where is this point, from the radar".
     pub fn read(&self, azimuth_deg: f64, ground_km: f64) -> Reading {

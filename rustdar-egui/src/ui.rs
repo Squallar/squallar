@@ -348,7 +348,7 @@ struct SectionAnchor {
     /// The map pane the draw started on.
     pane_idx: PaneId,
     /// Where it started, on the ground.
-    ground: crate::pane::GeoPoint,
+    ground: rustdar_geo::GeoPoint,
     /// Where it started, on screen.
     screen: egui::Pos2,
     /// Where the pointer is now, on screen. The far end of the rubber band.
@@ -1741,7 +1741,7 @@ impl Gui {
     /// kilometres, so drawing it through the projector is what makes it stay
     /// over the same ground when the map moves under it — which is what the
     /// committed box will do.
-    pub(crate) fn region_preview(&self, pane_idx: PaneId) -> Option<(crate::pane::GeoPoint, f64)> {
+    pub(crate) fn region_preview(&self, pane_idx: PaneId) -> Option<(rustdar_geo::GeoPoint, f64)> {
         self.region_drag
             .filter(|drag| drag.pane_idx() == pane_idx)
             .map(|drag| (drag.centre(), drag.half_width_km()))

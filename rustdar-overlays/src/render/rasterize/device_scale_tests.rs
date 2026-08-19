@@ -14,7 +14,7 @@
 //! differs between the two runs is the scale.
 
 use super::{RadarSiteInfo, SitesInput, rasterize_radar_sites};
-use crate::types::GeoBounds;
+use rustdar_geo::GeoBounds;
 
 const BOUNDS: GeoBounds = GeoBounds {
     min_lat: 34.0,

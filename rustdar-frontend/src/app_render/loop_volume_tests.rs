@@ -28,9 +28,10 @@ use crate::loop_downloads::LoopDownloadManager;
 use crate::platform_double::TestBridge;
 use crate::volume::bridge::VolumeEntry;
 use rustdar_egui::pane::{
-    GeoPoint, LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, VolumeRegion, VolumeStamp,
+    LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, VolumeRegion, VolumeStamp,
     VolumeTarget,
 };
+use rustdar_geo::GeoPoint;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView};
 

@@ -59,11 +59,11 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
 /// reaches a rasterizer.
 fn section_line() -> rustdar_egui::pane::SectionLine {
     rustdar_egui::pane::SectionLine::new(
-        rustdar_egui::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 35.0,
             lon: -98.0,
         },
-        rustdar_egui::pane::GeoPoint {
+        rustdar_geo::GeoPoint {
             lat: 36.0,
             lon: -97.0,
         },

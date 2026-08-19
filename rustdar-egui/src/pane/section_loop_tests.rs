@@ -22,6 +22,7 @@
 //! differ only in what kind of picture they hold.
 
 use super::*;
+use rustdar_geo::GeoPoint;
 use rustdar_radar::types::RenderView;
 
 const SITE: &str = "KTLX";

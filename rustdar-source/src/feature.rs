@@ -1,7 +1,7 @@
 //! The overlay feature vocabulary: what a polygon layer is made of, below any
 //! particular renderer.
 
-use crate::geo::{GeoBounds, GeoPolygon};
+use rustdar_geo::{GeoBounds, GeoPolygon};
 
 /// A map label to be drawn at a geographic position.
 #[derive(Debug, Clone)]
@@ -59,7 +59,7 @@ impl OverlayFeature {
         label2: String,
         hatch: HatchPattern,
     ) -> Self {
-        let geo_bounds = crate::geo::compute_geo_bounds(&polygons);
+        let geo_bounds = rustdar_geo::compute_geo_bounds(&polygons);
         Self {
             polygons,
             fill_rgba,

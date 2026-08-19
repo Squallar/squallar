@@ -296,7 +296,7 @@ use live_volume::{scan_from_archive, site_of};
 /// instrument imports it rather than copying it, so that a future divergence
 /// shows up as a *measurement* here instead of being mirrored into the model
 /// and cancelling itself out.
-use rustdar_radar::types::KM_PER_DEGREE_LAT;
+use rustdar_geo::KM_PER_DEGREE_LAT;
 
 /// Side of the lattice both masks are expressed on, in texels.
 ///
@@ -333,8 +333,9 @@ const DUMP_GROUND_RGBA: [u8; 4] = [16, 18, 22, 255];
 /// sharper mask of something the floor does not have.
 const PAINTED_ALPHA: u8 = 8;
 
-/// Web Mercator's y: `ln(tan(π/4 + φ/2))`. The shader's `mercator_y`, and
-/// `rustdar_radar::types::lat_rad_to_mercator_y`, which is private.
+/// Web Mercator's y: `ln(tan(π/4 + φ/2))`. The shader's `mercator_y`, and a
+/// deliberate test-side mirror of `rustdar_geo::lat_rad_to_mercator_y` — a
+/// drift detector, not a convergence miss.
 fn mercator_y(lat_rad: f64) -> f64 {
     (std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln()
 }
@@ -564,13 +565,13 @@ fn mirror_uv(
             (lat_deg, x_km / (KM_PER_DEGREE_LAT * cos_lat))
         }
         _ => {
-            // `beam::great_circle_destination` about the site, which is what
+            // `rustdar_geo::great_circle_destination` about the site, which is what
             // the box's kilometres mean. Called rather than restated: the
             // point of this instrument is to score the *shader's* arithmetic,
             // and the placement it has to agree with is the radar crate's.
             let range_km = x_km.hypot(y_km);
             let bearing_deg = x_km.atan2(y_km).to_degrees();
-            let (lat, lon) = rustdar_radar::beam::great_circle_destination(
+            let (lat, lon) = rustdar_geo::great_circle_destination(
                 mirror.site_lat_deg,
                 0.0,
                 bearing_deg,

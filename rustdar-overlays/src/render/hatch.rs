@@ -393,7 +393,8 @@ mod tests {
     #[test]
     fn a_real_spc_product_puts_hatch_lines_on_the_texture() {
         use crate::spc::outlook::{OutlookDay, OutlookProduct, parse_geojson};
-        use crate::types::{GeoBounds, HatchPattern};
+        use crate::types::HatchPattern;
+        use rustdar_geo::GeoBounds;
 
         let raw = include_str!("../../testdata/day1otlk_20260425_1300_hail.lyr.geojson");
         let json: serde_json::Value = serde_json::from_str(raw).expect("SPC's own JSON");

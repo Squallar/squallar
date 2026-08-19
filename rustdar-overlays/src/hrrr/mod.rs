@@ -8,7 +8,7 @@
 pub mod fetch;
 pub mod lambert;
 
-use crate::types::GeoBounds;
+use rustdar_geo::GeoBounds;
 
 /// A selectable model parameter to fetch and display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
