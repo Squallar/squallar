@@ -6,6 +6,12 @@ use nexrad_model::data::{
 const FIRST_GATE_M: u16 = 2125;
 const GATE_M: u16 = 250;
 
+/// The site handed to `prepare` for its memo key. Every fixture below is
+/// unclocked unless a test says otherwise, and the memo never touches an
+/// unclocked volume (see `derive_key`) — so these coordinates only need to
+/// exist, not to vary.
+const SITE: (f64, f64) = (35.33, -97.28);
+
 fn cut(angle_deg: f64) -> ElevationCut {
     ElevationCut::new(
         angle_deg,
@@ -246,6 +252,8 @@ fn srv_subtracts_the_override_motion_radial_by_radial() {
             user_override: Some((speed_kt, direction)),
             ..Default::default()
         },
+        SITE.0,
+        SITE.1,
     )
     .expect("a velocity volume with an override derives");
     let Prepared::Derived(derived) = prepared else {
@@ -438,7 +446,9 @@ fn srv_with_no_motion_vector_refuses() {
         prepare(
             (&scan).into(),
             RadarProduct::StormRelativeVelocity,
-            crate::srv::MotionInputs::default()
+            crate::srv::MotionInputs::default(),
+            SITE.0,
+            SITE.1,
         )
         .is_none()
     );
@@ -454,6 +464,8 @@ fn nrot_is_rotation_not_relabelled_velocity() {
         (&scan).into(),
         RadarProduct::NormalizedRotation,
         crate::srv::MotionInputs::default(),
+        SITE.0,
+        SITE.1,
     )
     .expect("a velocity volume derives");
     let Prepared::Derived(derived) = prepared else {
@@ -631,6 +643,8 @@ fn kdp_is_the_phase_derivative_not_relabelled_phase() {
         (&scan).into(),
         RadarProduct::SpecificDifferentialPhase,
         crate::srv::MotionInputs::default(),
+        SITE.0,
+        SITE.1,
     )
     .expect("a ΦDP volume derives");
     let Prepared::Derived(derived) = prepared else {
@@ -721,6 +735,8 @@ fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
                 user_override: Some((30.0, 240.0)),
                 ..Default::default()
             },
+            SITE.0,
+            SITE.1,
         )
         .unwrap_or_else(|| panic!("{product:?} derives from this fixture"));
         let derived = match &prepared {
@@ -793,6 +809,8 @@ fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
             (&scan).into(),
             RadarProduct::NormalizedRotation,
             crate::srv::MotionInputs::default(),
+            SITE.0,
+            SITE.1,
         )
         .expect("a velocity volume derives NROT");
         let Prepared::Derived(derived) = prepared else {
@@ -861,6 +879,8 @@ fn a_tilt_whose_leading_radial_lost_its_phase_is_still_derived() {
         (&maimed).into(),
         RadarProduct::SpecificDifferentialPhase,
         crate::srv::MotionInputs::default(),
+        SITE.0,
+        SITE.1,
     )
     .expect("a \u{3a6}DP volume derives");
     let Prepared::Derived(derived) = prepared else {
@@ -870,5 +890,182 @@ fn a_tilt_whose_leading_radial_lost_its_phase_is_still_derived() {
         derived.sweeps().len(),
         clean.sweeps().len(),
         "one blank leading radial dropped a tilt from the KDP volume",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The derivation memo (WO-E4.8). These tests share one process-global memo
+// with every other test in this binary, so each uses its own clock epoch and
+// site, and they serialize against each other — a `memo_clear` in one must
+// not race a hit-check in another. Tests elsewhere in the crate cannot be
+// polluted BY the memo (a hit is byte-identical by the determinism gate
+// below), and cannot pollute these keys (distinct epoch + site).
+// ---------------------------------------------------------------------------
+
+/// The memo tests' mutual exclusion. Only they take it.
+static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A clocked two-tilt volume over `fields` — the derivation memo only fires
+/// for a volume that can say when it was flown.
+fn clocked_scan_with(t0: i64, fields: Fields<'_>) -> Scan {
+    Scan::new(
+        vcp(&[0.5, 1.5]),
+        vec![
+            sweep_with_clock(t0, 1, 0.53, 360, 240, fields),
+            sweep_with_clock(t0 + 60_000, 2, 1.47, 360, 240, fields),
+        ],
+    )
+}
+
+/// Every decodable value of `slot`, walked in one canonical order, plus the
+/// per-radial geometry — equality of two of these is byte-equality of the
+/// synthetic scans, because the fixed-point codec is deterministic.
+fn derived_fingerprint(scan: &Scan, slot: MomentSlot) -> Vec<(usize, usize, usize, Option<f64>)> {
+    let mut out = Vec::new();
+    for (s, sweep) in scan.sweeps().iter().enumerate() {
+        for (r, _radial) in sweep.radials().iter().enumerate() {
+            for g in 0..240 {
+                out.push((s, r, g, decoded(scan, s, r, g, slot)));
+            }
+        }
+    }
+    out
+}
+
+/// **The determinism gate (WO-E4.8).** The second same-key derivation is a
+/// hit — the very allocation the first call computed — and the bytes it
+/// serves are the bytes a fresh compute (memo cleared) produces.
+#[test]
+fn a_memoized_derivation_is_the_bytes_a_fresh_one_computes() {
+    let _serial = MEMO_TEST_LOCK.lock().unwrap();
+    // A rotational couplet, so NROT has structure worth comparing.
+    let scan = clocked_scan_with(1_770_000_000_000, &|az, _| {
+        (
+            Some(30.0),
+            Some(if az < 180.0 { 18.0 } else { -18.0 }),
+            None,
+            Some(0.98),
+        )
+    });
+    let site = (36.0, -96.0);
+    let run = || match prepare(
+        (&scan).into(),
+        RadarProduct::NormalizedRotation,
+        crate::srv::MotionInputs::default(),
+        site.0,
+        site.1,
+    )
+    .expect("a clocked velocity volume derives NROT")
+    {
+        Prepared::Derived(derived) => derived,
+        Prepared::Native(_) => panic!("NROT must be derived"),
+    };
+
+    memo_clear();
+    let first = run();
+    let second = run();
+    // The hit proof: pointer identity is a per-key fact no parallel test can
+    // fake — only this key's insert can put this allocation in the memo.
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "the second same-key derivation was recomputed — the memo missed \
+         (key built differently across two identical calls, or the insert \
+         never happened)",
+    );
+
+    // The byte proof: what the memo serves == what a fresh compute builds.
+    memo_clear();
+    let fresh = run();
+    assert!(
+        !Arc::ptr_eq(&first, &fresh),
+        "precondition: after memo_clear the derivation must actually rerun",
+    );
+    assert_eq!(
+        derived_fingerprint(&first, MomentSlot::Velocity),
+        derived_fingerprint(&fresh, MomentSlot::Velocity),
+        "a memoized derivation served different bytes than a fresh compute",
+    );
+}
+
+/// The native invalidation seam: `retain_volumes` drops a memo entry whose
+/// volume is gone and keeps one whose volume is still held — the contract
+/// `App::evict_unshown_scans` calls this under (WO-E4.8).
+#[test]
+fn evicting_a_volume_drops_its_memo_entry_and_keeps_the_live_ones() {
+    let _serial = MEMO_TEST_LOCK.lock().unwrap();
+    let scan = clocked_scan_with(1_771_000_000_000, &|az, _| {
+        (
+            Some(30.0),
+            Some(if az < 180.0 { 12.0 } else { -12.0 }),
+            None,
+            Some(0.98),
+        )
+    });
+    let site = (37.0, -95.0);
+    let run = || match prepare(
+        (&scan).into(),
+        RadarProduct::NormalizedRotation,
+        crate::srv::MotionInputs::default(),
+        site.0,
+        site.1,
+    )
+    .expect("a clocked velocity volume derives NROT")
+    {
+        Prepared::Derived(derived) => derived,
+        Prepared::Native(_) => panic!("NROT must be derived"),
+    };
+
+    memo_clear();
+    let first = run();
+    // The volume is still live: the entry survives and the next ask hits.
+    retain_volumes([&scan]);
+    let kept = run();
+    assert!(
+        Arc::ptr_eq(&first, &kept),
+        "retain_volumes dropped an entry whose volume is still live",
+    );
+    // The volume is gone: the entry dies and the next ask recomputes.
+    retain_volumes([]);
+    let recomputed = run();
+    assert!(
+        !Arc::ptr_eq(&first, &recomputed),
+        "retain_volumes kept an entry whose volume was evicted",
+    );
+}
+
+/// An unclocked volume is never memoized: `0` is the decoder's "no clock"
+/// sentinel, and a volume that cannot say when it was flown has no identity
+/// to cache under — two unclocked fixtures of one shape would otherwise
+/// serve each other's fields. (This is also what keeps every unclocked
+/// fixture in this crate's suites on the exact pre-memo compute path.)
+#[test]
+fn an_unclocked_volume_is_never_memoized() {
+    let _serial = MEMO_TEST_LOCK.lock().unwrap();
+    let scan = scan_with(&|az, _| {
+        (
+            Some(30.0),
+            Some(if az < 180.0 { 9.0 } else { -9.0 }),
+            None,
+            Some(0.98),
+        )
+    });
+    let run = || match prepare(
+        (&scan).into(),
+        RadarProduct::NormalizedRotation,
+        crate::srv::MotionInputs::default(),
+        38.0,
+        -94.0,
+    )
+    .expect("a velocity volume derives NROT")
+    {
+        Prepared::Derived(derived) => derived,
+        Prepared::Native(_) => panic!("NROT must be derived"),
+    };
+    let first = run();
+    let second = run();
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "an unclocked volume was served from the memo — it has no identity \
+         to be cached under",
     );
 }

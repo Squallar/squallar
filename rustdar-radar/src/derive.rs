@@ -39,14 +39,27 @@
 //!
 //! # Cadence and cost
 //!
-//! Derivation runs inside the section/voxel jobs, so it recomputes exactly
-//! when they do: **per sealed sweep** for a live volume (the same rebuild key
-//! the native moments have — a derived product is never staler than its
-//! volume), per request for a section whose line moves. The cost is the
-//! whole-volume derivation on the worker: NROT is the heavy one (the full
+//! Derivation runs inside the section/voxel jobs, so it is *asked for*
+//! exactly when they run: **per sealed sweep** for a live volume (the same
+//! rebuild key the native moments have — a derived product is never staler
+//! than its volume), per request for a section whose line moves. The cost is
+//! the whole-volume derivation on the worker: NROT is the heavy one (the full
 //! stencil pipeline per velocity tilt), SRV is a dealias plus a subtraction,
 //! KDP a filtered range derivative per ΦDP tilt. Nothing here runs on the
 //! frame thread.
+//!
+//! Asked for, not necessarily recomputed (WO-E4.8): [`prepare`] memoizes the
+//! derived scans in a process-local three-entry LRU keyed by [`DeriveKey`],
+//! so a section and a 3D pane of one volume — or a section whose line moved —
+//! share one derivation instead of running the stencil pipeline once each.
+//! The memo is a cache, never an eager step: nothing derives until the first
+//! consumer asks, and callers are unchanged (AF1). It serves both targets by
+//! construction — native pool threads share the process, and the wasm
+//! worker's own instance of this static serves its jobs; nothing crosses the
+//! wire. Native invalidation is owned by the App's volume-eviction pass
+//! through [`retain_volumes`]; on wasm the worker is bounded by the LRU
+//! capacity plus the `sealed_sweeps` re-keying (a growing live volume keys
+//! away from its own stale entries).
 //!
 //! # Encodings
 //!
@@ -56,6 +69,8 @@
 //! for range folding). `voxel::data_levels_for` declares the matching ramp
 //! ranges, so the voxel index ramp and this codec agree about what the
 //! extremes mean.
+
+use std::sync::{Arc, LazyLock, Mutex};
 
 use nexrad_model::data::{MomentData, Radial, RadialStatus, Scan, Sweep};
 
@@ -71,7 +86,12 @@ pub enum Prepared<'s> {
     Native(&'s Scan),
     /// The product was derived; the field lives in
     /// [`derived_slot`]'s moment of these synthetic sweeps.
-    Derived(Box<Scan>),
+    ///
+    /// An `Arc` because the scan may be shared with the derivation memo (see
+    /// [`prepare`]): the second consumer of one volume's derivation holds the
+    /// same allocation the first one computed. A native moment is never
+    /// memoized — it is a borrow, not a computation.
+    Derived(Arc<Scan>),
 }
 
 impl Prepared<'_> {
@@ -179,6 +199,205 @@ fn codec(product: RadarProduct) -> (f32, f32) {
     }
 }
 
+/// The identity of one derivation — everything [`prepare`]'s output bytes are
+/// a function of, besides the volume's own gate values (WO-E4.8).
+///
+/// The gate values themselves are proxied by `(volume_start, sealed_sweeps)`:
+/// a real volume is named by when its first radial was collected, and a live
+/// volume that seals another sweep grows `sealed_sweeps` and keys away from
+/// its own earlier entries. `radar_lat_bits`/`radar_lon_bits` pin the site,
+/// because two radars' clocks are the one thing `volume_start` alone cannot
+/// separate. The declared-Nyquist table is hashed whole (`declared_digest`)
+/// — SRV and NROT unfold around the limits it declares, so a re-declared cut
+/// is a different derivation.
+///
+/// # The motion component is the *resolution*, not the raw inputs
+///
+/// `motion_bits` carries the vector that would win [`srv::MotionInputs::resolve`]'s
+/// precedence — the finite user override, else the finite RPG vector — and
+/// `motion_rung` the fallback the resolution would drop to with neither.
+/// That is exactly the set of facts the derived bytes depend on:
+/// [`srv::apply_storm_motion`] reads only the winning vector's speed and
+/// direction (the provenance label never touches a gate), and the fallback
+/// rung matters only when no explicit vector arrived, in which case the
+/// vector it derives is a function of the volume — which the key already
+/// names. NROT and KDP read no motion at all; keying them on it costs a miss
+/// when the vector moves, never a stale hit.
+#[derive(Clone, PartialEq, Debug)]
+struct DeriveKey {
+    /// When the volume's first radial was collected, ms since the Unix epoch
+    /// — the minimum positive per-sweep clock, which is the same number
+    /// whether read off an original decoded volume or off a payload-
+    /// reconstructed one (reconstruction stamps each sweep's own minimum
+    /// back onto its radials). Never `0`: an unclocked volume has no
+    /// identity and is never memoized — see [`prepare`].
+    volume_start: i64,
+    /// How many sweeps the scan carried when it was derived — the live
+    /// volume's re-key, exactly the "per sealed sweep" cadence the module
+    /// docs state.
+    sealed_sweeps: usize,
+    radar_lat_bits: u64,
+    radar_lon_bits: u64,
+    product: RadarProduct,
+    /// `(speed_kt, direction_from_deg)` bits of the vector that outranks the
+    /// wind fit, or `None` when the derivation would fall to the fitted rung.
+    motion_bits: Option<(u32, u32)>,
+    /// Which fitted rung it would fall to ([`srv::SrvFallback`] discriminant).
+    motion_rung: u8,
+    /// FNV-1a over [`crate::nyquist::DeclaredNyquist::to_bytes`].
+    declared_digest: u64,
+}
+
+/// The derivation memo: most-recently-used last, at most
+/// [`DERIVE_MEMO_CAPACITY`] entries.
+struct DeriveMemo {
+    entries: Vec<(DeriveKey, Arc<Scan>)>,
+}
+
+/// **Capacity 3 is deliberate**: the live volume's section + 3D pair plus one
+/// loop volume. Entries are whole synthetic scans, tens of MB apiece — raise
+/// this only with a measured reason recorded in the raising commit.
+const DERIVE_MEMO_CAPACITY: usize = 3;
+
+static DERIVE_MEMO: LazyLock<Mutex<DeriveMemo>> = LazyLock::new(|| {
+    Mutex::new(DeriveMemo {
+        entries: Vec::new(),
+    })
+});
+
+/// FNV-1a, 64-bit — the digest [`DeriveKey::declared_digest`] carries.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// When the volume's first radial was collected: the minimum positive
+/// per-sweep clock, or `0` when no radial anywhere carries one.
+///
+/// Per-sweep minima rather than a flat walk on purpose: a job's payload
+/// carries only the sweeps that hold the product's moment, and its
+/// reconstruction stamps each sweep's own minimum onto every rebuilt radial —
+/// so "the minimum over per-sweep minima" is the one spelling that reads the
+/// same off an original volume (what [`retain_volumes`] is handed) and off a
+/// reconstructed one (what [`prepare`] sees inside a job).
+fn volume_start_ms(scan: &Scan) -> i64 {
+    scan.sweeps()
+        .iter()
+        .map(|sweep| crate::render_input::sweep_collected_ms(sweep.radials()))
+        .filter(|&ms| ms > 0)
+        .min()
+        .unwrap_or(0)
+}
+
+/// The memo key for this prepare call, or `None` for a volume the memo must
+/// not touch: an unclocked one (`volume_start == 0` is the decoder's own "no
+/// clock" sentinel, and a volume that cannot say when it was flown has no
+/// identity to cache under — two unclocked volumes of one shape would
+/// otherwise collide and serve each other's fields).
+fn derive_key(
+    volume: &crate::nyquist::Volume<'_>,
+    product: RadarProduct,
+    motion: srv::MotionInputs,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Option<DeriveKey> {
+    let volume_start = volume_start_ms(volume.scan());
+    if volume_start == 0 {
+        return None;
+    }
+    // Mirrors `MotionInputs::resolve` exactly, non-finite refusals included:
+    // a non-finite override falls through to the RPG vector there, so it
+    // must fall through here too or the key would split what the resolution
+    // joins.
+    let finite = |&(speed, direction): &(f32, f32)| speed.is_finite() && direction.is_finite();
+    let motion_bits = motion
+        .user_override
+        .filter(finite)
+        .or(motion.rpg.filter(finite))
+        .map(|(speed, direction)| (speed.to_bits(), direction.to_bits()));
+    Some(DeriveKey {
+        volume_start,
+        sealed_sweeps: volume.scan().sweeps().len(),
+        radar_lat_bits: radar_lat.to_bits(),
+        radar_lon_bits: radar_lon.to_bits(),
+        product,
+        motion_bits,
+        motion_rung: motion.fallback as u8,
+        declared_digest: fnv1a(&volume.declared_nyquist().to_bytes()),
+    })
+}
+
+/// Drop every memo entry whose volume is not among `live` (WO-E4.8's native
+/// invalidation, called from the App's once-a-frame volume-eviction pass —
+/// the same pass that frees the volumes themselves).
+///
+/// Matching is by per-sweep clock: an entry's `volume_start` was computed
+/// over a payload's *subset* of the volume's sweeps, so it equals one of the
+/// live volume's per-sweep minima rather than necessarily the volume-wide
+/// one. The candidate set is therefore every live sweep's clock, which the
+/// entry's start must be exactly one of.
+///
+/// On wasm this is a harmless no-op where the App calls it: the memo that
+/// holds entries lives in the *worker's* instance of this static (jobs run
+/// there), and the worker is bounded by the LRU capacity plus the
+/// `sealed_sweeps` re-keying instead.
+pub fn retain_volumes<'a>(live: impl IntoIterator<Item = &'a Scan>) {
+    let mut memo = DERIVE_MEMO.lock().expect("the derive memo mutex");
+    if memo.entries.is_empty() {
+        return;
+    }
+    let live_sweep_clocks: Vec<i64> = live
+        .into_iter()
+        .flat_map(|scan| {
+            scan.sweeps()
+                .iter()
+                .map(|sweep| crate::render_input::sweep_collected_ms(sweep.radials()))
+        })
+        .filter(|&ms| ms > 0)
+        .collect();
+    memo.entries
+        .retain(|(key, _)| live_sweep_clocks.contains(&key.volume_start));
+}
+
+/// The memoized scan for `key`, marked most-recently-used.
+fn memo_get(key: &DeriveKey) -> Option<Arc<Scan>> {
+    let mut memo = DERIVE_MEMO.lock().expect("the derive memo mutex");
+    let position = memo.entries.iter().position(|(held, _)| held == key)?;
+    let entry = memo.entries.remove(position);
+    let scan = Arc::clone(&entry.1);
+    memo.entries.push(entry);
+    Some(scan)
+}
+
+/// Insert a freshly derived scan, evicting the least-recently-used past
+/// capacity. A racing duplicate insert (two threads that both missed) keeps
+/// the newer allocation — the two are byte-identical, so which one survives
+/// is unobservable.
+fn memo_insert(key: DeriveKey, scan: Arc<Scan>) {
+    let mut memo = DERIVE_MEMO.lock().expect("the derive memo mutex");
+    memo.entries.retain(|(held, _)| held != &key);
+    memo.entries.push((key, scan));
+    while memo.entries.len() > DERIVE_MEMO_CAPACITY {
+        memo.entries.remove(0);
+    }
+}
+
+/// Empty the memo — the determinism gate's "fresh compute" arm. Gated as the
+/// tests module is: under a wasm test build the module is compiled out, and
+/// an ungated helper would be this crate's one new dead-code warning there.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn memo_clear() {
+    DERIVE_MEMO
+        .lock()
+        .expect("the derive memo mutex")
+        .entries
+        .clear();
+}
+
 /// Prepare a volume for sampling under `product`: pass a native moment through,
 /// derive a derived one, refuse (`None`) what cannot be derived — a product
 /// with no per-tilt field, a volume without the source moment, or SRV with no
@@ -199,13 +418,38 @@ fn codec(product: RadarProduct) -> (f32, f32) {
 /// through rather than resolved here so a section and the plan view of one
 /// volume shift by the *same* vector; resolving them separately is how the two
 /// panes come to disagree with no error and no visible difference.
+///
+/// `radar_lat`/`radar_lon` name the site, for the [`DeriveKey`] alone — the
+/// derivations themselves never read them. Both callers already hold the
+/// pair; this asks for it rather than leaving two radars' identically-clocked
+/// volumes to collide in the memo.
+///
+/// # Memoized (WO-E4.8)
+///
+/// A derived result is served from the process-local memo when the same
+/// [`DeriveKey`] was derived before, and computed **outside the memo's lock**
+/// otherwise — the mutex covers only the map operations, so a pool thread
+/// deriving NROT never blocks a sibling deriving KDP. Two threads that miss
+/// the same key at once both compute (byte-identical by determinism, so the
+/// double-compute race is acceptable) and the later insert wins. A refusal
+/// (`None`) is never cached: it is already cheap, and SRV's refusal depends
+/// on inputs the key deliberately reduces.
 pub fn prepare<'s>(
     volume: crate::nyquist::Volume<'s>,
     product: RadarProduct,
     motion: crate::srv::MotionInputs,
+    radar_lat: f64,
+    radar_lon: f64,
 ) -> Option<Prepared<'s>> {
     if crate::sampler::samplable(product).is_some() {
         return Some(Prepared::Native(volume.scan()));
+    }
+    derived_slot(product)?;
+    let key = derive_key(&volume, product, motion, radar_lat, radar_lon);
+    if let Some(key) = &key
+        && let Some(hit) = memo_get(key)
+    {
+        return Some(Prepared::Derived(hit));
     }
     let derived = match product {
         RadarProduct::StormRelativeVelocity => derive_srv(volume, motion)?,
@@ -213,7 +457,11 @@ pub fn prepare<'s>(
         RadarProduct::SpecificDifferentialPhase => derive_kdp(volume.scan())?,
         _ => return None,
     };
-    Some(Prepared::Derived(Box::new(derived)))
+    let derived = Arc::new(derived);
+    if let Some(key) = key {
+        memo_insert(key, Arc::clone(&derived));
+    }
+    Some(Prepared::Derived(derived))
 }
 
 /// Every velocity-carrying tilt of the volume, decoded once, each paired with
