@@ -72,7 +72,7 @@
     )
 )]
 
-use rustdar_location::{Fix, LocationPermission};
+use crate::{Fix, LocationPermission};
 
 // ── The decoding half ───────────────────────────────────────────────────
 //
@@ -228,9 +228,9 @@ mod corelocation {
     };
     use objc2_foundation::{MainThreadMarker, NSArray, NSError};
     // macOS only, and so is its one use below.
+    use crate::{Fix, LocationPermission};
     #[cfg(target_os = "macos")]
     use objc2_foundation::NSBundle;
-    use rustdar_location::{Fix, LocationPermission};
 
     use super::super::{OsLocationProvider, OsLocationSink, RedrawWake, ReportPermission};
 
@@ -648,7 +648,7 @@ pub use corelocation::OsLocationReader;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_location::FixQuality;
+    use crate::FixQuality;
 
     /// A fix with every component valid, for tests that vary one thing.
     fn valid() -> LocationComponents {

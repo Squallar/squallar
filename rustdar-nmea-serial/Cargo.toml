@@ -1,5 +1,7 @@
-# NMEA parsing and the serial-port transport — one provider of
-# rustdar_location::Fix. Ceiling held by tests/charter.rs.
+# NMEA parsing and the serial-port transport, in its own parsed vocabulary —
+# a parser that does not know the app's fix model. rustdar-location's `serial`
+# module is the translation (the edge flipped at WO-RL-3: the facade depends
+# on this provider, never the reverse). Ceiling held by tests/charter.rs.
 [package]
 name = "rustdar-nmea-serial"
 version.workspace = true
@@ -10,7 +12,6 @@ default = ["serial"]
 serial = ["dep:serialport"]
 
 [dependencies]
-rustdar-location = { workspace = true }
 chrono = { workspace = true }
 log = { workspace = true }
 nmea = "=0.8.0"

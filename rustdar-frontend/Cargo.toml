@@ -48,7 +48,10 @@ rustdar-kv = { workspace = true }
 # SerialConfig only — the reader stays behind nmea-serial's `serial` feature,
 # which rustdar-egui/gps-serial turns on. The settings pane that does use the
 # reader is where the gate belongs; this crate stays free of it.
-rustdar-location = { workspace = true }
+# Vocabulary only (default-features = false, re-declared deliberately): the
+# portable app speaks Fix/permission/gate and must compile for targets that
+# have never heard of any provider — the shell turns the arms on per target.
+rustdar-location = { workspace = true, default-features = false }
 rustdar-nmea-serial = { workspace = true }
 # `json` only -- see the note in rustdar-overlays: `default` would re-enable
 # `default-tls` (= platform verifier + aws-lc-rs) and undo the aws-lc-sys removal.

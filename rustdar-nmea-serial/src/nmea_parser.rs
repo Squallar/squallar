@@ -1,11 +1,69 @@
 use crate::config::MIN_SPEED_FOR_BEARING_MPS;
 use nmea::sentences::FixType;
-use rustdar_location::{Fix, FixQuality};
+
+/// The GGA fix-quality indicator, in this crate's own vocabulary.
+///
+/// Exactly the nine codes NMEA can put on the wire — nothing else, because a
+/// parser can only report what a sentence said. What each one means to the
+/// *app* (which of them may relocate a map, which are noise) is the fix
+/// model's business, and the fix model lives above this crate:
+/// `rustdar_location`'s `serial` module owns that translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedQuality {
+    None,
+    Gps,
+    Dgps,
+    Pps,
+    Rtk,
+    FloatRtk,
+    Estimated,
+    Manual,
+    Simulation,
+}
+
+/// One position-bearing sentence's accumulated result, in this crate's own
+/// vocabulary.
+///
+/// Deliberately not the app's fix type: this crate parses NMEA and knows
+/// nothing about what an application does with a position. There is no
+/// accuracy field because NMEA has none — GGA and GSA give
+/// [`hdop`](Self::hdop), a dimensionless geometry factor, and turning that
+/// into metres needs the receiver's UERE, which it does not report.
+#[derive(Debug, Clone)]
+pub struct ParsedFix {
+    /// Latitude in decimal degrees, positive = North.
+    pub lat: f64,
+    /// Longitude in decimal degrees, positive = East.
+    pub lon: f64,
+    /// Altitude above mean sea level in meters (from GGA).
+    pub altitude_m: Option<f64>,
+    /// Ground speed in meters per second (from RMC/VTG).
+    pub speed_mps: Option<f64>,
+    /// True course heading in degrees (0–360, from RMC/VTG). Suppressed below
+    /// `MIN_SPEED_FOR_BEARING_MPS` — course-over-ground from a near-stationary
+    /// receiver is noise. That is a statement about NMEA receivers, so the
+    /// parser is where it is decided.
+    pub heading_deg: Option<f64>,
+    /// Number of satellites in use (from GGA).
+    pub satellites: Option<u8>,
+    /// Fix quality indicator (from GGA).
+    pub quality: ParsedQuality,
+    /// Horizontal dilution of precision (from GSA).
+    pub hdop: Option<f32>,
+    /// UTC timestamp from the receiver.
+    pub timestamp: Option<chrono::NaiveDateTime>,
+}
 
 /// A fix is spread across several sentence types (GGA, RMC, GSA, VTG), so
 /// fields accumulate here until a position-bearing one completes.
-pub(crate) struct NmeaState {
+pub struct NmeaState {
     parser: nmea::Nmea,
+}
+
+impl Default for NmeaState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NmeaState {
@@ -16,7 +74,7 @@ impl NmeaState {
     }
 
     /// `sentence` must keep its `$` prefix and `*XX` checksum.
-    pub fn feed_sentence(&mut self, sentence: &str) -> Option<Fix> {
+    pub fn feed_sentence(&mut self, sentence: &str) -> Option<ParsedFix> {
         if self.parser.parse(sentence).is_err() {
             return None;
         }
@@ -24,16 +82,16 @@ impl NmeaState {
         let lat = self.parser.latitude?;
         let lon = self.parser.longitude?;
 
-        let fix_quality = match self.parser.fix_type {
-            Some(FixType::Invalid) | None => FixQuality::None,
-            Some(FixType::Gps) => FixQuality::Gps,
-            Some(FixType::DGps) => FixQuality::Dgps,
-            Some(FixType::Pps) => FixQuality::Pps,
-            Some(FixType::Rtk) => FixQuality::Rtk,
-            Some(FixType::FloatRtk) => FixQuality::FloatRtk,
-            Some(FixType::Estimated) => FixQuality::Estimated,
-            Some(FixType::Manual) => FixQuality::Manual,
-            Some(FixType::Simulation) => FixQuality::Simulation,
+        let quality = match self.parser.fix_type {
+            Some(FixType::Invalid) | None => ParsedQuality::None,
+            Some(FixType::Gps) => ParsedQuality::Gps,
+            Some(FixType::DGps) => ParsedQuality::Dgps,
+            Some(FixType::Pps) => ParsedQuality::Pps,
+            Some(FixType::Rtk) => ParsedQuality::Rtk,
+            Some(FixType::FloatRtk) => ParsedQuality::FloatRtk,
+            Some(FixType::Estimated) => ParsedQuality::Estimated,
+            Some(FixType::Manual) => ParsedQuality::Manual,
+            Some(FixType::Simulation) => ParsedQuality::Simulation,
         };
 
         let altitude_m = self.parser.altitude.map(|a| a as f64);
@@ -57,24 +115,16 @@ impl NmeaState {
             date.and_time(t)
         });
 
-        Some(Fix {
+        Some(ParsedFix {
+            lat,
+            lon,
             altitude_m,
             speed_mps,
             heading_deg,
             satellites,
-            fix_quality,
+            quality,
             hdop,
-            // NMEA has no accuracy field. GGA and GSA give HDOP, which is a
-            // geometry factor and not metres — turning one into the other needs
-            // the receiver's UERE, which it does not report. `None` is the
-            // honest answer and every reader treats it as passing.
-            accuracy_m: None,
             timestamp,
-            // The position rides through `from_lat_lon`, which is also what
-            // stamps `Gps` quality -- overridden by the `fix_quality` named
-            // above. This crate deliberately does not name the geo floor's
-            // point type; the domain crate's constructor is its spelling.
-            ..Fix::from_lat_lon(lat, lon)
         })
     }
 }

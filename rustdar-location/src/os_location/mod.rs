@@ -14,17 +14,22 @@
 //! build ends up compiling two providers, or none, on a target nobody tested.
 //!
 //! Landing a provider touches this file, the provider's own file, and that
-//! target's dependency block in `rustdar/Cargo.toml`. **Nothing else**
-//! — not `platform.rs`, not `lib.rs`. The three providers that landed here each
+//! target's `os-providers`-fenced dependency block in
+//! `rustdar-location/Cargo.toml`. **Nothing else** — not the shell's
+//! `platform.rs`, not any `lib.rs`. The three providers that landed here each
 //! discovered independently that the older wording ("a one-line change here")
 //! was false, because the older contract was not one contract: each of them had
 //! to add a parameter `unsupported` did not take, and each therefore had to
-//! reach into `platform.rs` to call it. [`OsLocationProvider`] is what makes the
-//! claim true, and the claim is checkable: every `target_os` left in
-//! `platform.rs` says which *bridge* exists, and not one of them says anything
-//! about how that bridge does location.
+//! reach into the shell's `platform.rs` to call it. [`OsLocationProvider`] is
+//! what makes the claim true, and the claim is checkable: every `target_os`
+//! left in the shell's `platform.rs` says which *bridge* exists, and not one of
+//! them says anything about how that bridge does location.
 //!
-//! [`SerialGpsReader::start`]: rustdar_nmea_serial::SerialGpsReader::start
+//! Since WO-RL-3 the arms live here in the facade rather than in the shell —
+//! every remote location arm belongs to rustdar-location (seam ruling 6). The
+//! `OsLocationReader`/`OsLocationProvider`/`OsLocationSink` seam is still
+//! `pub` only because the shell's `platform.rs` wiring drives it until WO-RL-4
+//! collapses that wiring into this crate.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -112,7 +117,7 @@ pub type RedrawWake = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Announces a permission the app did not ask for.
 pub type ReportPermission =
-    std::sync::Arc<dyn Fn(rustdar_location::LocationPermission) + Send + Sync + 'static>;
+    std::sync::Arc<dyn Fn(crate::LocationPermission) + Send + Sync + 'static>;
 
 /// The three ways a provider talks back to the app, and the only three.
 ///
@@ -127,8 +132,8 @@ pub type ReportPermission =
 #[derive(Clone)]
 pub struct OsLocationSink {
     /// Where fixes go. `DesktopPlatform` drains this alongside the serial
-    /// reader's and picks between them; see [`rustdar_location::prefer_fix`].
-    pub fixes: std::sync::mpsc::Sender<rustdar_location::Fix>,
+    /// reader's and picks between them; see [`crate::prefer_fix`].
+    pub fixes: std::sync::mpsc::Sender<crate::Fix>,
     /// See [`RedrawWake`].
     pub wake: RedrawWake,
     /// See [`ReportPermission`] and the note on [`OsLocationProvider::start`].
@@ -149,7 +154,8 @@ pub struct OsLocationSink {
 /// # Why the parameter is not a `SerialConfig`
 ///
 /// The old signature took one (a `GpsConfig`, then), inherited from
-/// [`SerialGpsReader::start`], whose
+/// `SerialGpsReader::start` (rustdar-nmea-serial, an optional dependency this
+/// doc cannot link across), whose
 /// job it is to open a serial port. That config carries a port name and a baud
 /// rate: settings for a piece of hardware the user
 /// plugged in. A portal session, a WinRT `Geolocator` and a `CLLocationManager`
@@ -192,9 +198,8 @@ pub struct OsLocationSink {
 /// Windows leaves it `Unknown` until its worker's first `CheckAccess`, which is
 /// what the settings pane's "Checking…" exists for.
 ///
-/// [`SerialGpsReader::start`]: rustdar_nmea_serial::SerialGpsReader::start
-/// [`Unknown`]: rustdar_location::LocationPermission::Unknown
-/// [`Prompt`]: rustdar_location::LocationPermission::Prompt
+/// [`Unknown`]: crate::LocationPermission::Unknown
+/// [`Prompt`]: crate::LocationPermission::Prompt
 pub trait OsLocationProvider: Sized {
     /// Bring the provider up, prompting nobody and delivering nothing.
     ///
@@ -202,7 +207,7 @@ pub trait OsLocationProvider: Sized {
     /// subscribe to — which is not the same as the user having said no, and the
     /// bridge renders it as [`Unavailable`] rather than as a refusal.
     ///
-    /// [`Unavailable`]: rustdar_location::LocationPermission::Unavailable
+    /// [`Unavailable`]: crate::LocationPermission::Unavailable
     fn start(sink: OsLocationSink) -> Option<Self>;
 
     /// Prompt if the platform needs prompting, and start delivering.

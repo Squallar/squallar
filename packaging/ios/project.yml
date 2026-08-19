@@ -49,7 +49,7 @@ targets:
       # rustls-platform-verifier's Apple path (SecTrustEvaluateWithError).
       - sdk: Security.framework
       # CLLocationManager: position, via
-      # rustdar/src/os_location/apple.rs.
+      # rustdar-location/src/os_location/apple.rs.
       - sdk: CoreLocation.framework
 schemes:
   rustdar:

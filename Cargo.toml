@@ -60,7 +60,7 @@ rustdar-units = { path = "rustdar-units" }
 rustdar-volumetric = { path = "rustdar-volumetric" }
 rustdar-web = { path = "rustdar-web" }
 rustdar-worker = { path = "rustdar-worker" }
-rustdar-location = { path = "rustdar-location" }
+rustdar-location = { path = "rustdar-location", default-features = false }
 rustdar-nmea-serial = { path = "rustdar-nmea-serial", default-features = false }
 
 egui = "=0.35.0"
