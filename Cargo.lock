@@ -4242,7 +4242,6 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
- "ewebsock",
  "log",
  "nexrad-level3",
  "nexrad-model",
@@ -4357,6 +4356,7 @@ name = "rustdar-radar"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "ewebsock",
  "flate2",
  "log",
  "nexrad-data",
@@ -4372,6 +4372,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "web-time",
  "xml",
 ]
 

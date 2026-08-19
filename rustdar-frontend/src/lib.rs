@@ -31,8 +31,6 @@ pub mod app_state;
 pub(crate) mod budget_arms;
 pub mod budget_memo;
 pub mod channels;
-pub mod chunk_feed;
-pub mod chunk_notify;
 pub mod input;
 pub mod location_hint;
 pub mod loop_pool;

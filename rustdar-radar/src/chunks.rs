@@ -1920,7 +1920,7 @@ impl ChunkPoller {
     /// this survives **one or two consecutive failures**, which is the common
     /// case and the whole point, not an arbitrary number of them. A parked
     /// volume still dies with the poller or the round, at four places the poller
-    /// cannot see — `rustdar_frontend::chunk_feed` rebuilding a retired feed
+    /// cannot see — [`crate::chunk_feed`] rebuilding a retired feed
     /// after `RETRY_AFTER`, `retain_live` dropping a site, `finish_round`
     /// finding no feed to return the poller to, and `app_chunks` discarding a
     /// round whose fetch generation went stale. Feed retirement at three

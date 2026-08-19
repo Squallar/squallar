@@ -11,7 +11,7 @@
 //! difference between an early wake-up and a shortcut: the volume's
 //! `YYYYMMDD-HHMMSS` start time is part of the object name and cannot be derived
 //! from the numeric fields, so without it a listing would still be needed to
-//! learn the key. With it, [`rustdar_radar::chunks::ChunkPoller::fetch_notified`]
+//! learn the key. With it, [`crate::chunks::ChunkPoller::fetch_notified`]
 //! goes straight to a `GET`.
 //!
 //! What that retires, per site: the ~11-request cold-start discovery search, the
@@ -37,13 +37,13 @@
 //!
 //! `ewebsock` hands back a `WsReceiver` with a non-blocking `try_recv`, and its
 //! reader lives on its own thread natively and on the browser's event loop on
-//! web. So this drains once a frame like every other channel in this crate, with
-//! no executor and no `MaybeSend` gymnastics.
+//! web. So this drains once a frame like every other channel the app crate
+//! owns, with no executor and no `MaybeSend` gymnastics.
 
 use std::collections::HashMap;
 
+use crate::chunks::{ChunkId, VolumeIndex};
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
-use rustdar_radar::chunks::{ChunkId, VolumeIndex};
 
 /// Backoff after a failed or dropped connection, doubling to a ceiling.
 ///
@@ -144,7 +144,9 @@ pub enum Feed {
 }
 
 impl Feed {
-    pub(crate) const ALL: [Feed; 2] = [Feed::Chunk, Feed::Archive];
+    /// `pub` rather than `pub(crate)` since WO-RF1: the app crate's
+    /// notification driver narrows from this set when the live feed is off.
+    pub const ALL: [Feed; 2] = [Feed::Chunk, Feed::Archive];
 
     fn route(self) -> &'static str {
         match self {
@@ -340,7 +342,7 @@ impl ChunkNotifier {
         // process default, and this is the call that installs it. Cheap and
         // idempotent; called here so a session that somehow reaches a socket
         // before any S3 request still has one.
-        rustdar_radar::tls::init();
+        crate::tls::init();
 
         let url = format!(
             "{}/ws/events/{}/{site}",
@@ -456,8 +458,12 @@ impl ChunkNotifier {
 
     /// Age a socket's handshake, so [`CONNECT_TIMEOUT`] can be exercised without
     /// the test sleeping for it.
-    #[cfg(test)]
-    pub(crate) fn backdate_handshake(&mut self, site: &str, feed: Feed, by: std::time::Duration) {
+    ///
+    /// Also compiled under the `test-support` feature: the app crate's re-arm
+    /// suite drives a handshake past its timeout, and a `#[cfg(test)]` in this
+    /// crate is invisible to a dependent's tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn backdate_handshake(&mut self, site: &str, feed: Feed, by: std::time::Duration) {
         if let Some(sub) = self.subs.get_mut(&(site.to_string(), feed)) {
             sub.since = sub.since.checked_sub(by).unwrap_or(sub.since);
         }
@@ -492,7 +498,7 @@ mod tests {
         assert_eq!(id.site(), "KJAX");
         assert_eq!(id.volume(), VolumeIndex::new(415).unwrap());
         assert_eq!(id.sequence(), 25);
-        assert_eq!(id.kind(), rustdar_radar::chunks::ChunkKind::Intermediate);
+        assert_eq!(id.kind(), crate::chunks::ChunkKind::Intermediate);
         // The part no numeric field carries, and the reason `path` is what makes
         // listing unnecessary.
         assert_eq!(

@@ -4,13 +4,14 @@
 //! self-scheduling task: this crate builds for wasm, where there is no
 //! `tokio::time` and a detached loop could not be cancelled by the UI. The
 //! cadence lives in [`rustdar_radar::chunks::POLL_INTERVAL`] and is enforced by
-//! [`crate::chunk_feed::ChunkFeedManager`], not here.
+//! [`rustdar_radar::chunk_feed::ChunkFeedManager`] (the machinery moved to
+//! rustdar-radar at WO-RF1), not here.
 
 use std::sync::Arc;
 
 use crate::channels::ChunkResponse;
-use crate::chunk_feed::Retirement;
-use crate::chunk_notify::{ChunkAvailable, Feed, Notified};
+use rustdar_radar::chunk_feed::Retirement;
+use rustdar_radar::chunk_notify::{ChunkAvailable, Feed, Notified};
 
 impl super::App {
     /// Start or stop feeds so the set matches the sites panes are watching
@@ -52,12 +53,19 @@ impl super::App {
             // of which gates on this setting — and each one holds tens of
             // megabytes of dead volume besides. A no-op every frame after the
             // first: the map is already empty.
-            self.chunk_feeds.retain_live(&[]);
+            rustdar_worker::offload::discard_each(
+                "retired-feed",
+                self.chunk_feeds.retain_live(&[]),
+            );
             return;
         }
         // Narrower than `evict_unshown_scans`: a feed has no reader once no pane
-        // is live on its site. See `ChunkFeedManager::retain_live`.
-        self.chunk_feeds.retain_live(&live);
+        // is live on its site. See `ChunkFeedManager::retain_live` — it hands
+        // the evicted feeds back owned (each holds an assembler's full copy of
+        // a volume), and this drain is what gets their frees off the frame
+        // thread. `discard_each` requires the frame thread, which
+        // `poll_data_channels` is.
+        rustdar_worker::offload::discard_each("retired-feed", self.chunk_feeds.retain_live(&live));
 
         for site in live {
             self.chunk_feeds.ensure(&site);
@@ -89,39 +97,15 @@ impl super::App {
 
     /// What this site's feed needs to download: **everything, always.**
     ///
-    /// This used to narrow the feed to the tilts on screen, with `All` forced
-    /// by whole-volume products, whole-volume pane kinds, and active loops —
-    /// three exceptions whose omission each produced a plausible, wrong
-    /// picture with no error to notice. The narrowing is superseded by the
-    /// current merged volume: a live site's whole point is now that the app
-    /// *always* holds a full and current copy of its data, so that a
-    /// cross-section or a 3D pane opened at any moment cuts instantly from
-    /// `base_scans` plus every sealed sweep, and so that each closed volume is
-    /// `whole_volume_complete` and rolls the base forward without another
-    /// archive download. A narrowed feed breaks both halves of that promise:
-    /// the overlay would carry only the shown tilts, and no closed volume
-    /// would ever be whole, so the base would age from the moment the first
-    /// archive fetch landed — `CheckForNewScans` is skipped for any chunk-fed
-    /// site, so nothing else would refresh it.
-    ///
-    /// The cost this buys back is one full volume per volume period —
-    /// measured against KTLX, chunks for a complete super-resolution volume
-    /// run 10–25 MB per 4–7 minutes — which is the price of the product
-    /// working the way the reference display does.
-    ///
-    /// What the narrowing protected is still protected, one layer down:
-    /// `App::apply_chunk_outcome` refuses to cache or base a volume that is
-    /// not whole. That guard is now the belt for a rule this function makes
-    /// true by construction, exactly as before — it must never be the thing
-    /// that fires.
-    ///
-    /// [`CutSelection::Tilts`](rustdar_radar::chunks::CutSelection::Tilts)
-    /// itself stays in `rustdar-radar`, tested and working: the decision
-    /// retired here is the *frontend's*, and a future caller with a genuine
-    /// bandwidth ceiling (a metered mobile build, say) has the mechanism and
-    /// this history to weigh against it.
-    fn cut_selection_for(&self, _site: &str) -> rustdar_radar::chunks::CutSelection {
-        rustdar_radar::chunks::CutSelection::All
+    /// The policy body and its full history moved to
+    /// [`rustdar_radar::chunk_feed::cut_selection_for`] with the feed
+    /// machinery (WO-RF1); this is the wiring that asks it. Short version:
+    /// the old on-screen narrowing is superseded by the current merged
+    /// volume, whose whole point is that a live site always holds a full and
+    /// current copy of its data — read the policy's own doc for the two
+    /// promises a narrowed feed breaks and what still guards them.
+    fn cut_selection_for(&self, site: &str) -> rustdar_radar::chunks::CutSelection {
+        rustdar_radar::chunk_feed::cut_selection_for(site)
     }
 
     /// Keep the notification subscriptions matched to the live sites, and turn
@@ -429,7 +413,7 @@ impl super::App {
             // and images to be handed straight back.
             self.render.reset_panes_for_site(site, &self.gui);
             self.spawn_level3_fetches(site);
-            self.record_tilt_freshness(site, &scan, sealed);
+            self.chunk_feeds.record_tilt_freshness(site, &scan, sealed);
             // Two conditions, and both are about permanence.
             //
             // *Here and not mid-volume*, because `append_polled_frame` dedupes by
@@ -469,7 +453,7 @@ impl super::App {
                     info,
                 });
             self.gui.clear_loading_site_for_site(site);
-            self.record_tilt_freshness(site, &scan, sealed);
+            self.chunk_feeds.record_tilt_freshness(site, &scan, sealed);
             let hit = self
                 .render
                 .reset_panes_for_tilts(site, &self.gui, &outcome.sealed_angles);
@@ -482,42 +466,6 @@ impl super::App {
         // to user navigation and would drag the time picker along every few
         // seconds, and `manual_nav_pending`, which would trigger
         // `reinit_active_loops` and re-list the whole lookback window per round.
-    }
-
-    /// Stamp each freshly delivered cut with the age of its newest radial.
-    ///
-    /// Taken from the sweep rather than from the wall clock at arrival: what a
-    /// user wants to know is how long ago the *radar* looked, and a chunk can
-    /// sit in the bucket or in a retry before it gets here.
-    fn record_tilt_freshness(
-        &mut self,
-        site: &str,
-        scan: &nexrad_model::data::Scan,
-        sealed: &[u8],
-    ) {
-        let now = chrono::Utc::now();
-        for elevation_number in sealed {
-            let Some(sweep) = scan
-                .sweeps()
-                .iter()
-                .find(|s| s.elevation_number() == *elevation_number)
-            else {
-                continue;
-            };
-            let Some(angle) = sweep.elevation_angle_degrees() else {
-                continue;
-            };
-            let newest = sweep
-                .radials()
-                .iter()
-                .map(|r| r.collection_timestamp())
-                .max()
-                .and_then(chrono::DateTime::from_timestamp_millis);
-            let age = newest
-                .map(|t| (now - t).to_std().unwrap_or_default())
-                .unwrap_or_default();
-            self.chunk_feeds.record_delivery(site, angle, age);
-        }
     }
 
     /// Hand a site back to the archive path.

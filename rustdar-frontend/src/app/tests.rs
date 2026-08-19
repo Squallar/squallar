@@ -1743,7 +1743,7 @@ fn a_chunk_feed_between_rounds_still_gets_its_frame() {
 /// the arithmetic, where the backoff constants are in scope.
 #[test]
 fn a_notifier_backoff_is_slept_through_rather_than_spun_on() {
-    use crate::chunk_notify::Feed;
+    use rustdar_radar::chunk_notify::Feed;
 
     // Loopback on a closed port: `ewebsock` opens a socket that will never
     // finish its handshake, which is the state a blocked network leaves.

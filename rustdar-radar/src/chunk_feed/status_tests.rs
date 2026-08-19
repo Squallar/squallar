@@ -35,10 +35,7 @@ fn a_running_feed_reports_its_own_interval() {
     mgr.ensure("KTLX");
     let status = mgr.status(&live(&["KTLX"]), true, None);
     assert!(status.feeding);
-    assert_eq!(
-        status.interval_secs,
-        rustdar_radar::chunks::POLL_INTERVAL.as_secs()
-    );
+    assert_eq!(status.interval_secs, crate::chunks::POLL_INTERVAL.as_secs());
 }
 
 /// A retirement is a silent drop from seconds of latency to minutes, so it
