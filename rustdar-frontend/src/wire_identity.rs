@@ -7,16 +7,21 @@
 //! [`wire_digest`] is the local-dev half of the page/worker build token
 //! (`rustdar_web::worker_protocol::build_token`). In CI the token carries
 //! `GITHUB_SHA`, which distinguishes two deploys finer than any hand-kept
-//! number ever did; locally there is no SHA, and this digest stands in. It
-//! folds, in order, every job-tag `(name, byte)` pair and then every row of
-//! [`WIRE_FRAMING_ROWS`] and [`WIRE_REPLY_ROWS`] — the same literals the
-//! framing tests pin — so the two halves of one build are equal by
-//! construction (same module, same constants), and two local builds diverge
-//! exactly when a re-pinned row or tag differs between them. A divergent pair
-//! refuses the handshake and respawns instead of exchanging bytes one of them
-//! misreads.
+//! number ever did; locally there is no SHA, and this digest stands in.
+//! **Since WO-M7b it is based on the composed registry**
+//! (the crate-private `job_registry` module): it folds, in test order, every row of
+//! [`WIRE_FRAMING_ROWS`] paired with the composed-registry index of the row's
+//! kind — the index IS the wire code minus one, so a recomposed registry
+//! moves the fold even before any row's bytes do — then the canonical
+//! envelope's layout ([`CANONICAL_ENVELOPE_LAYOUT`]), and then every row of
+//! [`WIRE_REPLY_ROWS`]. The row digests are the same values the framing test
+//! pins — so the two halves of one build are equal by construction (same
+//! module, same constants), and two local builds diverge exactly when a
+//! re-pinned row, the composition, or the envelope's shape differs between
+//! them. A divergent pair refuses the handshake and respawns instead of
+//! exchanging bytes one of them misreads.
 //!
-//! # What it deliberately does not cover (yet)
+//! # What it deliberately does not cover
 //!
 //! The nested payload layouts — `RenderInput`, the polar field, the decoded
 //! volume — are pinned by `rustdar-radar`'s own digest suites and do not feed
@@ -25,17 +30,12 @@
 //! build: a missed detection, accepted, and exactly the status quo before
 //! this module existed — locally there is no service-worker deploy skew to
 //! create such a pair, and production always has the SHA.
-//!
-//! # Interim form
-//!
-//! This digests the current `TAG_*` constants and the fixture rows. **M7b
-//! re-bases it onto the composed `JobCodec` registry** once that registry
-//! exists (M6/M7): the source of the folded identity moves, the mechanism
-//! stays.
 
 /// The 14 job-framing rows, exactly as
 /// `offload::tests::the_job_framing_is_the_one_this_protocol_ships` asserts
 /// them, in test order: `kind | framed-prefix length | FNV-1a-64 digest`.
+/// (`voxels` contributes two rows — the picked-region and sourceless forms
+/// frame differently.)
 ///
 /// The literal list lives HERE — spelled out, never regenerated from the
 /// encoder — and the test points at it. A framing change goes red against
@@ -43,21 +43,26 @@
 /// the local build token: two local builds with different rows refuse each
 /// other and respawn, and in CI the `GITHUB_SHA` does the same for every
 /// change.
+///
+/// Re-pinned wholesale at WO-M7b: every row shifted by the canonical
+/// envelope (the code byte + 44 envelope bytes ahead of every payload, the
+/// row-owned ceiling interleaves gone), which is the one order where a moved
+/// digest was the design rather than a defect.
 pub const WIRE_FRAMING_ROWS: &[&str] = &[
-    "radar | 6 | 0x7d65cbf16a7b2ab7",
-    "level3 | 28 | 0xff9d9dbb7736ea4e",
-    "level3/vild | 34 | 0x4f9fb6a0901a3704",
-    "section | 44 | 0x4fe286e53034800e",
-    "voxels | 59 | 0x625ac8a3330ec11f",
-    "voxels | 43 | 0xdbe9f7d560c79fd4",
-    "decode | 30 | 0x2aad0634cde46e59",
-    "overlay/sites | 131 | 0xf24942f4dd119e16",
-    "overlay/alerts | 760 | 0xa89f5057b3b51a4a",
-    "overlay/outlooks | 557 | 0x62486e4e14434bb0",
-    "overlay/discussions | 264 | 0x3d28f1976f832a20",
-    "overlay/reports | 127 | 0x533f15051c5cc607",
-    "overlay/glm | 240 | 0xca1519d51136a8ef",
-    "overlay/model | 262 | 0x0133cf4f818a1a23",
+    "radar | 46 | 0x813f26d9407ac047",
+    "level3 | 68 | 0xae8be80f6b6cf96e",
+    "level3/vild | 74 | 0xad0639c99f05f4e7",
+    "section | 88 | 0xe8e95369569f391f",
+    "voxels | 103 | 0x7992be29197ec332",
+    "voxels | 87 | 0xb6df319c59c9e0a5",
+    "decode | 74 | 0xc06cc21eea05e948",
+    "overlay/sites | 134 | 0x41633a0073cefd5e",
+    "overlay/alerts | 763 | 0x9a307969466bc79a",
+    "overlay/outlooks | 560 | 0x01fc75ae56a219d4",
+    "overlay/discussions | 267 | 0x6a6da1ea1f7fc09c",
+    "overlay/reports | 130 | 0x8baff87efe9934bf",
+    "overlay/glm | 243 | 0xf628cffc30d313df",
+    "overlay/model | 265 | 0x01f0be29a2ccb24f",
 ];
 
 /// The 2 overlay-reply framing rows, exactly as
@@ -69,6 +74,15 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
     "bare | 17 | 0x770d1b313226dd5f",
     "cells | 69 | 0x6637c90fa10e397a",
 ];
+
+/// The canonical envelope's layout as one literal sentence, folded into
+/// [`wire_digest`] so a reshaped envelope (a field added, removed, reordered
+/// or retyped) changes the local build token even in the impossible corner
+/// where every fixture row's bytes happened to survive it.
+///
+/// The code byte ahead of the envelope is covered by the per-row index fold;
+/// this names the 44 bytes after it, in wire order.
+pub const CANONICAL_ENVELOPE_LAYOUT: &str = "w:u32 h:u32 bounds:4xf64 ceil:u32";
 
 /// FNV-1a 64, continued from `hash`. A copy of the house hash rather than a
 /// call to `rustdar_radar::wire::layout_digest`: that one is `#[cfg(test)]`,
@@ -85,20 +99,41 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The wire's identity as one number: FNV-1a 64 over, in order, each
-/// `(name, byte)` of the job-tag table, then every row of
-/// [`WIRE_FRAMING_ROWS`], then every row of [`WIRE_REPLY_ROWS`].
+/// The wire's identity as one number, based on the composed registry
+/// (WO-M7b): FNV-1a 64 over, in order, each row of [`WIRE_FRAMING_ROWS`]
+/// prefixed by the composed-registry index of the row's kind, then
+/// [`CANONICAL_ENVELOPE_LAYOUT`], then every row of [`WIRE_REPLY_ROWS`].
+///
+/// The index prefix is resolved against the crate-private
+/// `job_registry::job_codecs` composition by the row's own kind label — the
+/// fold reads the registry, so the two
+/// instantiations of one build agree by construction (same module, same
+/// composition) and a recomposition diverges the token even before the
+/// framing bytes move. Panics on a pinned row whose label is not in the
+/// registry: the framing test asserts the correspondence, so a miss here is
+/// a build defect, not another build's bytes.
 ///
 /// Equal between the two halves of one build by construction; divergent
-/// between two builds exactly when a pinned tag or row differs. See the
-/// module doc for what deliberately does not feed it.
+/// between two builds exactly when a pinned row, the composition, or the
+/// envelope layout differs. See the module doc for what deliberately does
+/// not feed it.
 pub fn wire_digest() -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, byte) in crate::offload::wire_tags() {
-        hash = fnv1a64(hash, name.as_bytes());
-        hash = fnv1a64(hash, &[byte]);
+    for row in WIRE_FRAMING_ROWS {
+        let label = row
+            .split(" | ")
+            .next()
+            .expect("a pinned row is never empty");
+        let index = crate::job_registry::job_codecs()
+            .position(|codec| codec.label == label)
+            .unwrap_or_else(|| {
+                panic!("the pinned framing row {row:?} names no composed-registry kind")
+            });
+        hash = fnv1a64(hash, &[u8::try_from(index).expect("13 rows fit a byte")]);
+        hash = fnv1a64(hash, row.as_bytes());
     }
-    for row in WIRE_FRAMING_ROWS.iter().chain(WIRE_REPLY_ROWS) {
+    hash = fnv1a64(hash, CANONICAL_ENVELOPE_LAYOUT.as_bytes());
+    for row in WIRE_REPLY_ROWS {
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash

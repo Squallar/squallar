@@ -11,23 +11,21 @@
 //! module, and the frontend's framing digests over the duplicate bodies are
 //! the byte gate the flip must pass.
 //!
-//! **The tag byte stays with the caller**, as the overlay rows' code byte
-//! does: a row's payload is its `JobRequest` arm's bytes minus the leading
-//! `TAG_*` byte. Codes are frontend-owned until WO-M7b's dense flip, and
-//! the row order in [`JOB_CODECS`] — radar, level3, level3/vild, section,
-//! voxels, decode — is load-bearing for exactly that flip, which assigns
-//! wire codes by composed-registry index.
+//! **The code byte and the envelope stay with the caller.** A row's payload
+//! is the kind's own bytes and nothing else: since WO-M7b's dense flip the
+//! frontend frames every row as its composed-registry index plus one and the
+//! one canonical envelope, so no row here writes or reads a wire byte of
+//! either. The row order in [`JOB_CODECS`] — radar, level3, level3/vild,
+//! section, voxels, decode — is load-bearing for exactly that framing: the
+//! wire code IS the composed-registry index plus one.
 //!
 //! **The side ceiling is envelope, not input.** The frontend's `execute`
 //! reads `side_ceiling_px` once off the request so its rasterizing arms
 //! cannot come to disagree about how large a picture a job was allowed to
 //! make; here the same property is structural — no input struct carries the
-//! field, `run` reads it only from the [`JobGeometry`], and the three
-//! raster rows' decodes fill the envelope from the sparse-era wire position
-//! their legacy layouts put it at (`level3`/`level3/vild` at offset 1,
-//! `radar` after `values_wanted`). **The interleaves are row-owned until
-//! WO-M7b**: bytes must not move before the dense flip re-bases the framing
-//! digests, so the rows write today's layouts exactly.
+//! field, `run` reads it only from the [`JobGeometry`], and the caller's
+//! canonical envelope is what carries it across the wire. Every decode here
+//! passes the envelope through unchanged.
 //!
 //! **The frame rows carry no reply codec yet.** `radar`, `level3` and
 //! `level3/vild` ride [`JobCodec::of`] — their replies still cross the
@@ -39,7 +37,7 @@
 //!
 //! **The refusal contract**, shared by every `decode` here: `None` for a
 //! flag, product code or enum byte outside this build's values, a payload
-//! whose two product statements disagree ([`agree_on_product`]), a voxel
+//! whose two product statements disagree (`agree_on_product`), a voxel
 //! shape the budget cannot afford, or a buffer shorter than its layout
 //! claims. The variable-length tails ride last — `RenderInput::from_bytes`
 //! refuses trailing bytes, and the archive rows' tails are the buffer's own
@@ -62,10 +60,10 @@ use crate::voxel::{HalfExtentKm, VoxelGrid, VoxelRequest, VoxelShape};
 use crate::xsect::{CrossSection, SectionRequest};
 
 /// The six radar rows, in dispatch order: **radar, level3, level3/vild,
-/// section, voxels, decode**. The order is load-bearing — WO-M7b's dense
-/// code flip assigns wire codes by index into the composed registry — and
-/// the labels are the shipped kind strings the frontend's `kind()` prints,
-/// byte for byte (`radar`'s per-product `"radar/nrot"`/`"radar/srv"`
+/// section, voxels, decode**. The order is load-bearing — the dense wire
+/// code (WO-M7b) IS the row's index into the composed registry, plus one —
+/// and the labels are the shipped kind strings the frontend's `kind()`
+/// prints, byte for byte (`radar`'s per-product `"radar/nrot"`/`"radar/srv"`
 /// refinements are a `kind()` nicety over the same row, not row labels).
 ///
 /// The three frame rows ride [`JobCodec::of`] — no reply codec until
@@ -84,8 +82,8 @@ pub static JOB_CODECS: &[JobCodec] = &[
 ///
 /// The shape of the frontend's `JobRequest::Radar` arm minus its
 /// `side_ceiling_px`: the ceiling is envelope, not input — `run` reads it
-/// from the [`JobGeometry`] and the row's sparse-era wire interleave
-/// carries it (see the module doc).
+/// from the [`JobGeometry`] and the caller's canonical envelope carries it
+/// (see the module doc).
 #[derive(Debug, PartialEq)]
 pub struct RadarPlanJob {
     /// Boxed because a `RenderInput` owns its gate bytes and is the largest
@@ -117,28 +115,23 @@ impl JobSpec for RadarPlanJob {
     const LABEL: &'static str = "radar";
     const COST: JobCost = JobCost::Raster;
 
-    fn encode(input: &RadarPlanJob, ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    // `values_wanted` is input, not envelope — it stays. The ceiling does
+    // not: the caller's canonical envelope carries it (WO-M7b), so the row
+    // writes no envelope bytes and the decode passes the geometry through.
+    fn encode(input: &RadarPlanJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.push(u8::from(input.values_wanted));
-        // The ceiling comes off the envelope — the input carries no copy —
-        // and rides after `values_wanted`, at the offset the legacy layout
-        // put it (row-owned until WO-M7b).
-        out.extend_from_slice(&ctx.geometry.side_ceiling_px.to_le_bytes());
         out.extend_from_slice(&input.input.to_bytes());
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(RadarPlanJob, JobGeometry)> {
         let values_wanted = flag(r.u8()?)?;
-        let side_ceiling_px = r.u32()?;
         let input = RenderInput::from_bytes(r.rest())?;
         Some((
             RadarPlanJob {
                 input: Box::new(input),
                 values_wanted,
             },
-            JobGeometry {
-                side_ceiling_px,
-                ..geo
-            },
+            geo,
         ))
     }
 
@@ -188,10 +181,10 @@ impl JobSpec for Level3Job {
     const LABEL: &'static str = "level3";
     const COST: JobCost = JobCost::Raster;
 
-    fn encode(input: &Level3Job, ctx: &EncodeCtx, out: &mut Vec<u8>) {
-        // The ceiling first, off the envelope, at offset 1 of the legacy
-        // layout (row-owned until WO-M7b).
-        out.extend_from_slice(&ctx.geometry.side_ceiling_px.to_le_bytes());
+    // No envelope bytes: the ceiling `run` spends rides the caller's
+    // canonical envelope (WO-M7b), and the decode passes the geometry
+    // through.
+    fn encode(input: &Level3Job, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&input.product.wire_code().to_le_bytes());
         out.extend_from_slice(&input.radar_lat.to_le_bytes());
         out.extend_from_slice(&input.radar_lon.to_le_bytes());
@@ -199,7 +192,6 @@ impl JobSpec for Level3Job {
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(Level3Job, JobGeometry)> {
-        let side_ceiling_px = r.u32()?;
         Some((
             Level3Job {
                 product: RadarProduct::from_wire_code(r.u16()?)?,
@@ -207,10 +199,7 @@ impl JobSpec for Level3Job {
                 radar_lon: r.f64()?,
                 bytes: Arc::new(r.rest().to_vec()),
             },
-            JobGeometry {
-                side_ceiling_px,
-                ..geo
-            },
+            geo,
         ))
     }
 
@@ -253,12 +242,10 @@ impl JobSpec for Level3PairJob {
     const LABEL: &'static str = "level3/vild";
     const COST: JobCost = JobCost::Raster;
 
-    fn encode(input: &Level3PairJob, ctx: &EncodeCtx, out: &mut Vec<u8>) {
-        // The ceiling first, off the envelope, at offset 1 of the legacy
-        // layout (row-owned until WO-M7b). The first object is
-        // length-prefixed and the second takes the rest, so neither length
-        // can lie about the other.
-        out.extend_from_slice(&ctx.geometry.side_ceiling_px.to_le_bytes());
+    // No envelope bytes (WO-M7b, as on the two rows above). The first
+    // object is length-prefixed and the second takes the rest, so neither
+    // length can lie about the other.
+    fn encode(input: &Level3PairJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&input.radar_lat.to_le_bytes());
         out.extend_from_slice(&input.radar_lon.to_le_bytes());
         out.extend_from_slice(&(input.dvl.len() as u32).to_le_bytes());
@@ -267,7 +254,6 @@ impl JobSpec for Level3PairJob {
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(Level3PairJob, JobGeometry)> {
-        let side_ceiling_px = r.u32()?;
         let radar_lat = r.f64()?;
         let radar_lon = r.f64()?;
         let dvl_len = r.u32()? as usize;
@@ -278,10 +264,7 @@ impl JobSpec for Level3PairJob {
                 dvl: Arc::new(r.take(dvl_len)?.to_vec()),
                 eet: Arc::new(r.rest().to_vec()),
             },
-            JobGeometry {
-                side_ceiling_px,
-                ..geo
-            },
+            geo,
         ))
     }
 
@@ -846,9 +829,11 @@ mod tests {
             .expect("the fixture carries reflectivity")
     }
 
-    /// The envelope the frontend's dispatch hands the rows at WO-M7.2:
-    /// distinctive width/height/bounds the radar rows must pass through
-    /// untouched, and the ceiling under test in `side_ceiling_px`.
+    /// The envelope the frontend's dispatch hands the rows: distinctive
+    /// width/height/bounds/ceiling every row must pass through untouched —
+    /// since WO-M7b the caller's canonical envelope is the one carrier of
+    /// all four, so a row that amended any of them would be a second
+    /// statement of the envelope.
     fn geometry_with_ceiling(side_ceiling_px: u32) -> JobGeometry {
         JobGeometry {
             width: 64,
@@ -863,50 +848,20 @@ mod tests {
         }
     }
 
-    /// Encode `job` through `row` under an envelope carrying `ceiling`,
-    /// decode it back under an envelope that does NOT carry it (the WO-M7.2
-    /// caller's shape: the shared header fills width/height/bounds and the
-    /// radar row fills the ceiling from its own sparse-era wire position),
-    /// and require the identity: the decoded job equals the original and the
-    /// returned envelope is the encode-side one — the ceiling filled,
-    /// everything else passed through.
+    /// The one round-trip harness (WO-M7b re-pin of the WO-M7.1 pair):
+    /// encode `job` through `row`, decode it back under the same envelope,
+    /// and require the identity — the decoded job equals the original and
+    /// the geometry passes through unchanged, every field including the
+    /// deliberately non-zero ceiling. No row writes or reads envelope bytes
+    /// anymore; a row that zeroed or filled any envelope field would fail
+    /// the pass-through half.
     ///
     /// No cursor assertion: every radar row's payload ends in a tail that
     /// takes the rest, so completeness is proven by value equality — a stray
     /// trailing byte lands inside the tail (or is refused by
     /// `RenderInput::from_bytes`) and fails the equality either way.
-    fn assert_round_trips_filling_the_ceiling(row: &JobCodec, job: &DescribedJob, ceiling: u32) {
-        let mut bytes = Vec::new();
-        (row.encode)(
-            job,
-            &EncodeCtx {
-                geometry: geometry_with_ceiling(ceiling),
-            },
-            &mut bytes,
-        );
-        let mut r = Reader::new(&bytes);
-        let (decoded, geo_out) = (row.decode)(&mut r, geometry_with_ceiling(0))
-            .expect("a row must decode its own encode");
-        assert_eq!(
-            &decoded, job,
-            "decode ∘ encode must be the identity for `{}`",
-            row.label,
-        );
-        assert_eq!(
-            geo_out,
-            geometry_with_ceiling(ceiling),
-            "`{}` fills the envelope's ceiling from the wire and passes the \
-             rest through",
-            row.label,
-        );
-    }
-
-    /// The harness for the rows with no ceiling on the wire (`section`,
-    /// `voxels`, `decode`): the geometry passes through unchanged — their
-    /// effective ceiling is 0, exactly what the frontend's
-    /// `side_ceiling_px()` has always answered for them.
     fn assert_round_trips_passing_geo_through(row: &JobCodec, job: &DescribedJob) {
-        let geo = geometry_with_ceiling(0);
+        let geo = geometry_with_ceiling(4096);
         let mut bytes = Vec::new();
         (row.encode)(job, &EncodeCtx { geometry: geo }, &mut bytes);
         let mut r = Reader::new(&bytes);
@@ -937,8 +892,8 @@ mod tests {
                 "decode"
             ],
             "the labels are the shipped kind strings and the order is \
-             load-bearing: WO-M7b's dense code flip assigns codes by index \
-             into the composed registry",
+             load-bearing: the dense wire code (WO-M7b) is the row's index \
+             into the composed registry, plus one",
         );
         for row in JOB_CODECS {
             assert_eq!(
@@ -980,7 +935,7 @@ mod tests {
                 input: Box::new(a_plan_input()),
                 values_wanted,
             });
-            assert_round_trips_filling_the_ceiling(&JOB_CODECS[0], &job, 4096);
+            assert_round_trips_passing_geo_through(&JOB_CODECS[0], &job);
         }
     }
 
@@ -994,7 +949,7 @@ mod tests {
             radar_lat: 35.0,
             radar_lon: -97.0,
         });
-        assert_round_trips_filling_the_ceiling(&JOB_CODECS[1], &job, 4096);
+        assert_round_trips_passing_geo_through(&JOB_CODECS[1], &job);
     }
 
     /// The two payloads differ in length *and* in content, so a framing that
@@ -1008,7 +963,7 @@ mod tests {
             radar_lat: 35.0,
             radar_lon: -97.0,
         });
-        assert_round_trips_filling_the_ceiling(&JOB_CODECS[2], &job, 4096);
+        assert_round_trips_passing_geo_through(&JOB_CODECS[2], &job);
     }
 
     #[test]

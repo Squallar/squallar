@@ -746,8 +746,8 @@ pub(super) fn an_overlay_model_whole_job() -> JobRequest {
 
 /// The model overlay job in its **wire form** — the window carry the decoder
 /// produces — which is the fixture for everything that must round-trip to
-/// itself: the framing digest, the tag and inner-code tables, and the
-/// malformed suite's shared walk. A 6×4 window with 24 distinct finite
+/// itself: the framing digest, the literal code table, and the malformed
+/// suite's shared walk. A 6×4 window with 24 distinct finite
 /// values (`NaN` would be honest data but breaks the round trip's
 /// `PartialEq`, so the NaN path is pinned in `model_nan_tests` instead).
 pub(super) fn an_overlay_model_job() -> JobRequest {
@@ -830,112 +830,116 @@ fn every_job_kind_survives_the_wire_format() {
     }
 }
 
-/// The retired SRM job tag must be refused, not resurrected: a worker
-/// from a build that still posts it gets a failed job, never a render of
-/// something this build would compute differently.
+/// An unallocated code must be refused, not resurrected: **0 and 14 — the
+/// bytes on either end of the dense space — decode `None` on otherwise-valid
+/// bytes** (a real job's framing with only its code byte overwritten).
+///
+/// This is the property the retired-SRM-tag test guarded in the sparse era:
+/// a stale or corrupt byte never decodes as something else. A dense space
+/// has no interior hole left to reserve, and with a same-build wire (the M5
+/// build token refuses any cross-build pairing) the remaining hazard is a
+/// corrupt or zeroed buffer — 0 stays unallocated so a zeroed buffer never
+/// decodes, and 14 stays unallocated so a fourteenth kind cannot arrive
+/// without a line in the literal table
+/// ([`every_code_is_the_literal_index_and_label_this_registry_composes`]).
 #[test]
-fn the_retired_srm_tag_is_refused() {
-    assert_eq!(JobRequest::from_bytes(&[TAG_SRM_RETIRED, 1, 2, 3]), None);
+fn an_unallocated_code_is_refused() {
+    let mut bytes = a_voxel_job().to_bytes();
+    for unallocated in [0u8, 14] {
+        bytes[0] = unallocated;
+        assert_eq!(
+            JobRequest::from_bytes(&bytes),
+            None,
+            "code {unallocated} decodes, so the literal code table has \
+             stopped being the whole wire",
+        );
+    }
 }
 
-/// Every job tag is pinned to the literal byte it ships as.
+/// Every wire code is pinned to the literal registry index (plus one) and
+/// label it ships as: **one code space, codes 1..=13, dense over the
+/// composed registry** (WO-M7b).
 ///
 /// Distinctness and the round trip are both entailed by this table, and
-/// neither would be enough on its own: a check that reads the constants it
-/// is checking **survives a renumbering**, and the round trip does too. Swap
-/// [`TAG_LEVEL3_PAIR`]'s 4 with [`TAG_VOXELS`]'s 6 and every tag is still
-/// distinct, every job still round-trips through this build, and the whole
-/// workspace still passes.
-///
-/// What that costs is already written down above the constants: a job
-/// landing in the `TAG_LEVEL3_PAIR` arm reads two `f64`s and a `u32`
-/// length and then takes the rest, so on another kind's plausible bytes it
-/// *succeeds* and renders a VIL-density product out of the wrong geometry.
-/// The tag is a contract between two builds — a page that renumbers is
-/// talking to workers that did not — so the numbers have to be written
-/// out, not read back.
+/// neither would be enough on its own: a check that reads the registry it is
+/// checking **survives a recomposition**, and the round trip does too —
+/// reorder two rows of the composition and every code is still distinct,
+/// every job still round-trips through this build, and the whole workspace
+/// still passes, while a page and a worker built either side of that change
+/// decode one kind as another. So the codes are written out, not read back.
+/// The correct consequence of a deliberate recomposition is exactly what the
+/// re-pin produces: this table and the framing rows move, and with them the
+/// governing number — the M5 build token — so two builds that disagree
+/// refuse each other at the handshake and respawn instead of exchanging
+/// bytes one of them misreads.
 #[test]
-fn every_job_tag_is_the_literal_byte_it_ships_as() {
+fn every_code_is_the_literal_index_and_label_this_registry_composes() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(&str, u8, u8); 8] = [
-        ("TAG_RADAR", TAG_RADAR, 1),
-        ("TAG_LEVEL3", TAG_LEVEL3, 2),
-        ("TAG_SRM_RETIRED", TAG_SRM_RETIRED, 3),
-        ("TAG_LEVEL3_PAIR", TAG_LEVEL3_PAIR, 4),
-        ("TAG_SECTION", TAG_SECTION, 5),
-        ("TAG_VOXELS", TAG_VOXELS, 6),
-        ("TAG_DECODE", TAG_DECODE, 7),
-        ("TAG_OVERLAY", TAG_OVERLAY, 8),
+    let table: [(u8, &str); 13] = [
+        (1, "radar"),
+        (2, "level3"),
+        (3, "level3/vild"),
+        (4, "section"),
+        (5, "voxels"),
+        (6, "decode"),
+        (7, "overlay/sites"),
+        (8, "overlay/alerts"),
+        (9, "overlay/outlooks"),
+        (10, "overlay/discussions"),
+        (11, "overlay/reports"),
+        (12, "overlay/glm"),
+        (13, "overlay/model"),
     ];
-    for (name, actual, expected) in table {
-        assert_eq!(
-            actual, expected,
-            "{name} moved on the wire: it is {actual} now, not {expected}",
-        );
-    }
 
-    // And the LegacyCode map — the row-to-code judgment `to_bytes` routes on
-    // since WO-M7.2 — pinned per composed-registry row against the same
-    // literals. Deliberately spelled out, never regenerated from the map:
-    // this is the sparse era's whole wire, and WO-M7b's dense flip is the
-    // one order allowed to replace it.
-    let by_row: [(&str, LegacyCode); 13] = [
-        ("radar", LegacyCode::Tag(1)),
-        ("level3", LegacyCode::Tag(2)),
-        ("level3/vild", LegacyCode::Tag(4)),
-        ("section", LegacyCode::Tag(5)),
-        ("voxels", LegacyCode::Tag(6)),
-        ("decode", LegacyCode::Tag(7)),
-        ("overlay/sites", LegacyCode::OverlaySub(1)),
-        ("overlay/alerts", LegacyCode::OverlaySub(2)),
-        ("overlay/outlooks", LegacyCode::OverlaySub(3)),
-        ("overlay/discussions", LegacyCode::OverlaySub(4)),
-        ("overlay/reports", LegacyCode::OverlaySub(5)),
-        ("overlay/glm", LegacyCode::OverlaySub(6)),
-        ("overlay/model", LegacyCode::OverlaySub(7)),
-    ];
+    // Against the composed registry: row `i` is labelled what this table
+    // says and ships as code `i + 1` — both halves literal, so a recomposed
+    // registry is named here, row by row, rather than silently renumbering
+    // everything after the row that moved.
     assert_eq!(
-        by_row.len(),
+        table.len(),
         job_codecs().count(),
-        "a codec row exists with no LegacyCode pin (or one was removed): \
-         every row's sparse wire code is spelled out here",
+        "a codec row exists with no code pin (or one was removed): every \
+         row's dense wire code is spelled out here",
     );
-    for (label, expected) in by_row {
-        let row = job_codecs()
-            .find(|row| row.label == label)
-            .unwrap_or_else(|| panic!("no codec row is labelled {label:?}"));
+    for (index, row) in job_codecs().enumerate() {
+        let (code, label) = table[index];
         assert_eq!(
-            legacy_code(row),
-            expected,
-            "{label} moved on the wire: a page and a worker built either side \
-             of that change decode one kind as another",
+            row.label, label,
+            "registry index {index} is not {label:?}: the composition moved, \
+             which renumbers every code after it",
+        );
+        assert_eq!(
+            usize::from(code),
+            index + 1,
+            "{label} is pinned to code {code}, which is not its registry \
+             index {index} plus one — the pin and the composition disagree",
         );
     }
 
-    // And the encoder really posts those bytes — the constant could be
-    // right while the arm that writes it is not. Every constructible kind,
-    // framed against its literal rather than against its own constant.
+    // And the encoder really posts those bytes — the table could agree with
+    // the registry while the framing that writes the byte does not. Every
+    // constructible kind, framed against its literal.
     let framing: [(JobRequest, u8); 13] = [
         (a_job(), 1),
         (a_level3_job(), 2),
-        (a_level3_pair_job(), 4),
-        (a_section_job(), 5),
-        (a_voxel_job(), 6),
-        (a_decode_job(), 7),
-        (an_overlay_sites_job(), 8),
+        (a_level3_pair_job(), 3),
+        (a_section_job(), 4),
+        (a_voxel_job(), 5),
+        (a_decode_job(), 6),
+        (an_overlay_sites_job(), 7),
         (an_overlay_alerts_job(), 8),
-        (an_overlay_outlooks_job(), 8),
-        (an_overlay_discussions_job(), 8),
-        (an_overlay_reports_job(), 8),
-        (an_overlay_glm_job(), 8),
-        (an_overlay_model_job(), 8),
+        (an_overlay_outlooks_job(), 9),
+        (an_overlay_discussions_job(), 10),
+        (an_overlay_reports_job(), 11),
+        (an_overlay_glm_job(), 12),
+        (an_overlay_model_job(), 13),
     ];
-    for (job, tag) in framing {
+    for (job, code) in framing {
         let bytes = job.to_bytes();
         assert_eq!(
             bytes[0],
-            tag,
-            "{:?} posts tag {}, not {tag} — a worker of another build \
+            code,
+            "{:?} posts code {}, not {code} — a worker of another build \
                  decodes it as whatever {} names there",
             job.kind(),
             bytes[0],
@@ -946,104 +950,6 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
             Some(job.clone()),
             "{:?} did not decode back from its own framing",
             job.kind(),
-        );
-    }
-
-    // The unallocated bytes on either end of the table stay unallocated.
-    // A ninth kind added without a line in the table above makes 9
-    // decode, and this is what says so. **7 left this list when the decode
-    // job took it, and 8 when the overlay job did**, which is the whole point
-    // of the list: a new kind cannot be added without coming here and saying
-    // so.
-    let mut bytes = a_voxel_job().to_bytes();
-    for unallocated in [0u8, 9] {
-        bytes[0] = unallocated;
-        assert_eq!(
-            JobRequest::from_bytes(&bytes),
-            None,
-            "tag {unallocated} decodes, so the table above has stopped \
-                 being the whole wire",
-        );
-    }
-}
-
-/// The overlay job's **inner** code space, pinned the way the outer tags are
-/// and for the same reason: the code is a contract between two builds, so
-/// the numbers are written out, not read back from the constants they check.
-///
-/// A renumbering here is quieter than one of the outer tags — every overlay
-/// input is length-counted and refuses trailing bytes, so a swapped pair of
-/// codes mostly fails to decode — but "mostly" is not a guard: two kinds
-/// whose leading fields happen to parse under each other's layout would
-/// rasterize the wrong layer, and the version 10 worker split exists
-/// precisely because a version 9 worker must refuse codes 2-4 rather than
-/// misread them.
-#[test]
-fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
-    // Deliberately spelled out. Do not regenerate this from the sub-code
-    // map: since WO-M6.3 this table is the pin on [`overlay_sub_code`] —
-    // the sparse, frontend-owned map that reproduces the deleted
-    // `OVERLAY_INPUT_*` constants' bytes until WO-M7b's dense flip.
-    let table: [(&str, u8); 7] = [
-        ("overlay/sites", 1),
-        ("overlay/alerts", 2),
-        ("overlay/outlooks", 3),
-        ("overlay/discussions", 4),
-        ("overlay/reports", 5),
-        ("overlay/glm", 6),
-        ("overlay/model", 7),
-    ];
-    for (label, expected) in table {
-        let row = job_codecs()
-            .find(|row| row.label == label)
-            .unwrap_or_else(|| panic!("no codec row is labelled {label:?}"));
-        let LegacyCode::OverlaySub(actual) = legacy_code(row) else {
-            panic!("{label} is mapped as a radar-family tag, not an overlay sub-code");
-        };
-        assert_eq!(
-            actual, expected,
-            "{label} moved on the wire: it is {actual} now, not {expected}",
-        );
-    }
-
-    // And the encoder really writes those bytes where the decoder reads them:
-    // the input-kind byte sits after the fixed header — tag(1) + width(4) +
-    // height(4) + bounds(32) = offset 41 — for every overlay kind alike.
-    let by_fixture: [(JobRequest, u8); 7] = [
-        (an_overlay_sites_job(), 1),
-        (an_overlay_alerts_job(), 2),
-        (an_overlay_outlooks_job(), 3),
-        (an_overlay_discussions_job(), 4),
-        (an_overlay_reports_job(), 5),
-        (an_overlay_glm_job(), 6),
-        (an_overlay_model_job(), 7),
-    ];
-    for (job, code) in by_fixture {
-        let bytes = job.to_bytes();
-        assert_eq!(
-            bytes[41],
-            code,
-            "{:?} posts inner code {}, not {code} — a worker of another build \
-             rasterizes it as whatever {} names there, or refuses it",
-            job.kind(),
-            bytes[41],
-            bytes[41],
-        );
-    }
-
-    // The unallocated bytes on either end stay unallocated: 0 so a zeroed
-    // buffer never decodes, and 8 so an eighth kind cannot arrive without a
-    // line in the table above. **2 through 4 left this list when the polygon
-    // kinds took them, 5 and 6 when the hit-map kinds did, and 7 when the
-    // model grid — the last opaque kind — did.**
-    let mut bytes = an_overlay_sites_job().to_bytes();
-    for unallocated in [0u8, 8] {
-        bytes[41] = unallocated;
-        assert_eq!(
-            JobRequest::from_bytes(&bytes),
-            None,
-            "overlay input code {unallocated} decodes, so the table above has \
-             stopped being the whole inner wire",
         );
     }
 }
@@ -1058,7 +964,10 @@ fn every_overlay_input_code_is_the_literal_byte_it_ships_as() {
 /// through genuinely empty sky.
 #[test]
 fn a_request_naming_a_different_product_from_its_payload_is_refused() {
-    for (job, product_offset) in [(a_section_job(), 1), (a_voxel_job(), 2)] {
+    // Offsets: the code byte and the 44-byte canonical envelope precede
+    // every payload, so the section's product code sits at 45 and the voxel
+    // request's at 46 (its `values_wanted` byte comes first).
+    for (job, product_offset) in [(a_section_job(), 45), (a_voxel_job(), 46)] {
         let mut bytes = job.to_bytes();
         let code = rustdar_radar::types::RadarProduct::Velocity.wire_code();
         bytes[product_offset..product_offset + 2].copy_from_slice(&code.to_le_bytes());
@@ -1098,21 +1007,24 @@ fn a_malformed_vertical_job_is_refused_rather_than_misread() {
             "{}: trailing bytes mean the layouts disagree",
             job.kind(),
         );
-        // A product code this build does not have.
+        // A product code this build does not have. The code byte and the
+        // 44-byte canonical envelope precede every payload: the section's
+        // product code sits at 45, the voxel request's at 46.
         let mut bad_product = bytes.clone();
         let at = if job.job.downcast_ref::<SectionJob>().is_some() {
-            1
+            45
         } else {
-            2
+            46
         };
         bad_product[at] = 0xFE;
         bad_product[at + 1] = 0xFF;
         assert_eq!(JobRequest::from_bytes(&bad_product), None, "product code");
     }
 
-    // The voxel job's `values_wanted` is a bool, not a byte.
+    // The voxel job's `values_wanted` is a bool, not a byte. It is the
+    // first payload byte, at 45.
     let mut bad_flag = a_voxel_job().to_bytes();
-    bad_flag[1] = 2;
+    bad_flag[45] = 2;
     assert_eq!(JobRequest::from_bytes(&bad_flag), None, "values_wanted");
 
     // And a shape with a zero axis is refused at the boundary rather than
@@ -1306,73 +1218,63 @@ fn a_job_answered_with_the_wrong_output_kind_still_delivers() {
 #[test]
 fn a_malformed_job_is_refused_rather_than_misread() {
     assert_eq!(JobRequest::from_bytes(&[]), None, "empty");
-    assert_eq!(JobRequest::from_bytes(&[0xFF, 1, 2]), None, "unknown tag");
-    assert_eq!(JobRequest::from_bytes(&[TAG_RADAR]), None, "no flag");
-    assert_eq!(
-        JobRequest::from_bytes(&[TAG_RADAR, 1]),
-        None,
-        "no second flag"
-    );
-    assert_eq!(
-        JobRequest::from_bytes(&[TAG_RADAR, 1, 1]),
-        None,
-        "no payload"
-    );
+    assert_eq!(JobRequest::from_bytes(&[0xFF, 1, 2]), None, "unknown code");
+
+    // The 44-byte canonical envelope is fixed, so every cut inside it — on
+    // any kind — must be a refusal: no field of a half-envelope may be read
+    // as a smaller whole one.
+    for job in [a_job(), a_level3_job(), a_level3_pair_job()] {
+        let bytes = job.to_bytes();
+        for cut in 1..45 {
+            assert_eq!(
+                JobRequest::from_bytes(&bytes[..cut]),
+                None,
+                "{} cut to {cut} bytes — inside the envelope — was accepted",
+                job.kind(),
+            );
+        }
+    }
+
+    // A radar code over a complete envelope and nothing else: the row has
+    // no flag byte to read.
+    let envelope_only: Vec<u8> = {
+        let mut b = vec![1u8]; // the radar row's code
+        b.extend_from_slice(&[0; 44]);
+        b
+    };
+    assert_eq!(JobRequest::from_bytes(&envelope_only), None, "no flag");
     // `values_wanted` is a boolean, and a byte outside `{0, 1}` is a build
     // whose protocol is not this one — refused rather than guessed at.
+    let mut bad_flag = envelope_only.clone();
+    bad_flag.push(2);
     assert_eq!(
-        JobRequest::from_bytes(&[TAG_RADAR, 2, 0, 0, 0, 0]),
+        JobRequest::from_bytes(&bad_flag),
         None,
         "values_wanted is a bool, not a byte"
     );
-    // The side ceiling beside it is four bytes, not one. A header holding
-    // fewer is a build that wrote the flag this replaced, and reading its one
-    // byte as a size would put a 1 px ceiling on every render rather than
-    // refusing the message.
-    assert_eq!(
-        JobRequest::from_bytes(&[TAG_RADAR, 1, 2]),
-        None,
-        "a side ceiling short of its four bytes"
-    );
-    for (tag, what) in [(TAG_LEVEL3, "level3"), (TAG_LEVEL3_PAIR, "level3 pair")] {
-        assert_eq!(
-            JobRequest::from_bytes(&[tag, 2]),
-            None,
-            "{what}: a side ceiling short of its four bytes"
-        );
-    }
+    // A well-formed flag over an empty payload: `RenderInput::from_bytes`
+    // has nothing to read and must refuse.
+    let mut no_payload = envelope_only.clone();
+    no_payload.push(1);
+    assert_eq!(JobRequest::from_bytes(&no_payload), None, "no payload");
 
     // A length prefix that claims more than the payload holds must be
     // refused, not read as a short object: the pair's first length is the
-    // one number on the wire that could lie. Byte 21: the tag, the four-byte
-    // side ceiling and two `f64`s precede it.
+    // one number on the wire that could lie. Byte 61: the code, the 44-byte
+    // envelope and two `f64`s precede it.
     let mut overlong = a_level3_pair_job().to_bytes();
-    overlong[21] = 0xFF;
+    overlong[61] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&overlong),
         None,
         "a DVL length past the end of the payload",
     );
 
-    // A truncated header must not be read as a short one. The variable tail
-    // is whatever is left, so only the fixed part can be checked this way.
-    for job in [a_job(), a_level3_job(), a_level3_pair_job()] {
-        let bytes = job.to_bytes();
-        for cut in 1..bytes.len().min(20) {
-            let _ = JobRequest::from_bytes(&bytes[..cut]);
-        }
-        assert_eq!(
-            JobRequest::from_bytes(&bytes[..1]),
-            None,
-            "a tag with no header must be refused"
-        );
-    }
-
-    // Bytes 5 and 6: the tag and the four-byte side ceiling precede the
+    // Bytes 45 and 46: the code and the 44-byte envelope precede the
     // product code.
     let mut bad_product = a_level3_job().to_bytes();
-    bad_product[5] = 0xFE;
-    bad_product[6] = 0xFF;
+    bad_product[45] = 0xFE;
+    bad_product[46] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&bad_product),
         None,
@@ -1594,19 +1496,19 @@ fn a_decode_job_round_trips_its_archive_whole() {
     assert_eq!(back, job);
 }
 
-/// The tag space is shared with five render kinds, and a decode's payload is
-/// arbitrary bytes — so a `Decode` posted to a build that read it as any other
-/// kind is exactly the misparse the tag byte exists to prevent.
+/// The code space is shared with twelve other kinds, and a decode's payload
+/// is arbitrary bytes — so a `Decode` posted to a build that read it as any
+/// other kind is exactly the misparse the code byte exists to prevent.
 #[test]
 fn a_decode_job_is_not_readable_as_another_kind() {
     let mut bytes = a_decode_job().to_bytes();
-    for tag in [1u8, 2, 3, 4, 5, 6] {
-        bytes[0] = tag;
+    for code in (1u8..=13).filter(|&code| code != 6) {
+        bytes[0] = code;
         // Whatever it decodes to, it must not decode to a `DecodeJob`.
         assert!(
             !JobRequest::from_bytes(&bytes)
                 .is_some_and(|job| job.job.downcast_ref::<DecodeJob>().is_some()),
-            "tag {tag} produced a decode job"
+            "code {code} produced a decode job"
         );
     }
 }
@@ -1748,7 +1650,7 @@ fn layout_digest(bytes: &[u8]) -> u64 {
 /// The part of a request's bytes this file owns: everything before the nested
 /// [`RenderInput`], which has a pin of its own.
 ///
-/// Three of the six variants put a `RenderInput` last, and its bytes are
+/// Three of the thirteen rows put a `RenderInput` last, and its bytes are
 /// already pinned by `rustdar_radar`'s
 /// `render_input::tests::the_wire_layout_is_the_one_this_version_ships`.
 /// Digesting them again here would say nothing new and would make this test
@@ -1759,13 +1661,14 @@ fn layout_digest(bytes: &[u8]) -> u64 {
 /// libm said and a digest over them would go red on a target nobody changed.
 ///
 /// **The denominator, stated:** what follows is a pin on the *framing* — the
-/// tag byte and the request's own fields — and on nothing else. The nested
-/// payload's length still moves this test's `len` column if the framing's own
-/// size changes, because the framing is measured as a prefix of the whole.
+/// code byte, the canonical envelope and the request's own fields — and on
+/// nothing else. The nested payload's length still moves this test's `len`
+/// column if the framing's own size changes, because the framing is measured
+/// as a prefix of the whole.
 ///
-/// The match is exhaustive on purpose: a seventh job kind cannot reach the wire
-/// without someone deciding here whether it nests a payload with a pin of its
-/// own.
+/// The match is exhaustive on purpose: a fourteenth job kind cannot reach the
+/// wire without someone deciding here whether it nests a payload with a pin of
+/// its own.
 fn framing_of(request: &JobRequest) -> Vec<u8> {
     let bytes = request.to_bytes();
     let nested = match row_for(&request.job).label {
@@ -1814,23 +1717,25 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
 ///
 /// # What stands over this wire
 ///
-/// This encoding has no version and no magic — one tag byte and then the
-/// variant's own fields. What stands over it is the page/worker build token
-/// (`rustdar_web`'s `build_token`): in CI it carries `GITHUB_SHA`, and
-/// locally it carries `wire_identity::wire_digest()`, a fold over the tag
-/// table and these very rows. Two halves of one build are equal by
-/// construction — same module, same constants — and two local builds whose
-/// rows disagree refuse each other at the handshake and respawn. These rows
-/// are within-build native->web parity pins and refactor gates, not
+/// This encoding has no version and no magic — one code byte, the canonical
+/// envelope and then the row's own fields. What stands over it is the
+/// page/worker build token (`rustdar_web`'s `build_token`): in CI it carries
+/// `GITHUB_SHA`, and locally it carries `wire_identity::wire_digest()`, a
+/// fold over the composed registry's indices, these very rows and the
+/// envelope's layout. Two halves of one build are equal by construction —
+/// same module, same constants — and two local builds whose rows disagree
+/// refuse each other at the handshake and respawn. These rows are
+/// within-build native->web parity pins and refactor gates, not
 /// cross-version contracts: the wire is same-build-only by construction.
 ///
-/// [`every_job_tag_is_the_literal_byte_it_ships_as`] pins the tag bytes,
-/// which is the first byte of each of these. Everything
-/// after it — the two `f64` coordinates, the `u32` ceiling, the section's four
-/// corners and its optional top, the voxel request's tagged half-extent and its
-/// three axes — is what these rows pin: every round-trip test in this file is
-/// written against `to_bytes` and `from_bytes` together, so a same-width
-/// reorder made to both in step passes all of them and only a digest sees it.
+/// [`every_code_is_the_literal_index_and_label_this_registry_composes`] pins
+/// the code bytes, which is the first byte of each of these. Everything
+/// after it — the envelope's four dimensions and box, the two `f64`
+/// coordinates, the section's four corners and its optional top, the voxel
+/// request's tagged half-extent and its three axes — is what these rows pin:
+/// every round-trip test in this file is written against `to_bytes` and
+/// `from_bytes` together, so a same-width reorder made to both in step
+/// passes all of them and only a digest sees it.
 ///
 /// # A list and not one digest
 ///
@@ -1887,16 +1792,17 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
          `wire_identity::WIRE_FRAMING_ROWS` pins. Left is what this build \
          posts; right is what that list was last told. Something about a \
          request's layout moved — a field added, removed, reordered, retyped, \
-         or written at a different width, or a tag renumbered. If the change \
-         was deliberate, re-pin the row in `wire_identity.rs`: the row feeds \
-         the local build token, so two local builds with different rows \
-         refuse each other and respawn, and in CI the `GITHUB_SHA` does the \
-         same for every change. These rows are within-build native->web \
-         parity pins and refactor gates, not cross-version contracts — the \
-         wire is same-build-only by construction, and a mispaired job would \
-         render the wrong region, or the wrong product, or fail to decode \
-         and strand the pane that posted it; the token is what keeps that \
-         pair from ever exchanging bytes."
+         or written at a different width, or the registry recomposed. If the \
+         change was deliberate, re-pin the row in `wire_identity.rs`: the \
+         governing number is the M5 build token, which the row feeds — two \
+         local builds with different rows refuse each other and respawn, and \
+         in CI the `GITHUB_SHA` does the same for every change. These rows \
+         are within-build native->web parity pins and refactor gates, not \
+         cross-version contracts — the wire is same-build-only by \
+         construction, and a mispaired job would render the wrong region, or \
+         the wrong product, or fail to decode and strand the pane that \
+         posted it; the token is what keeps that pair from ever exchanging \
+         bytes."
     );
 }
 
@@ -3141,11 +3047,12 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
     assert_refuses_cuts_and_trailing(&job);
     let bytes = job.to_bytes();
 
-    // Offsets: header 41 (input code), zoom 42..50, is_dark 50,
-    // device_scale 51..55, count 55..59, first row's kind byte 59.
+    // Offsets: envelope 45 (code 1 + width 4 + height 4 + bounds 32 +
+    // ceiling 4), zoom 45..53, is_dark 53, device_scale 54..58,
+    // count 58..62, first row's kind byte 62.
     let mut rekinded = bytes.clone();
-    assert_eq!(rekinded[59], 0, "premise: row 0 travels as tornado, code 0");
-    rekinded[59] = 2;
+    assert_eq!(rekinded[62], 0, "premise: row 0 travels as tornado, code 0");
+    rekinded[62] = 2;
     match JobRequest::from_bytes(&rekinded) {
         Some(JobRequest { job, .. }) => {
             let reports = job
@@ -3154,14 +3061,14 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
             assert_eq!(
                 reports.reports[0].kind,
                 rustdar_overlays::spc::reports::StormReportKind::Wind,
-                "byte 59 is not the first row's kind; the refusal below \
+                "byte 62 is not the first row's kind; the refusal below \
                  would be about some other field",
             );
         }
         other => panic!("the rekinded control failed to decode: {other:?}"),
     }
     let mut bad_kind = bytes.clone();
-    bad_kind[59] = 3;
+    bad_kind[62] = 3;
     assert_eq!(
         JobRequest::from_bytes(&bad_kind),
         None,
@@ -3169,7 +3076,7 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
     );
 
     let mut bad_flag = bytes;
-    bad_flag[50] = 2;
+    bad_flag[53] = 2;
     assert_eq!(
         JobRequest::from_bytes(&bad_flag),
         None,
@@ -3179,7 +3086,7 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
 
 /// The GLM job's own malformed shapes. Beside the flag and the energy tag,
 /// the field this kind exists to carry gets its own pair: the dispatch clock
-/// at bytes 63..71, moved to a different valid second and read back —
+/// at bytes 66..74, moved to a different valid second and read back —
 /// proving the wire really is where the worker's `now` comes from — then
 /// pushed outside chrono's range and refused.
 #[test]
@@ -3188,13 +3095,14 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     assert_refuses_cuts_and_trailing(&job);
     let bytes = job.to_bytes();
 
-    // Offsets: header 41 (input code), zoom 42..50, is_dark 50,
-    // device_scale 51..55, time_window 55..63, now 63..75 (secs then nanos),
-    // count 75..79, first flash at 79 — lat 79..87, lon 87..95, time
-    // 95..107, energy tag 107, energy 108..112.
+    // Offsets: envelope 45 (code 1 + width 4 + height 4 + bounds 32 +
+    // ceiling 4), zoom 45..53, is_dark 53, device_scale 54..58,
+    // time_window 58..66, now 66..78 (secs then nanos), count 78..82,
+    // first flash at 82 — lat 82..90, lon 90..98, time 98..110, energy tag
+    // 110, energy 111..115.
     let mut renow = bytes.clone();
-    let secs = i64::from_le_bytes(renow[63..71].try_into().unwrap());
-    renow[63..71].copy_from_slice(&(secs + 60).to_le_bytes());
+    let secs = i64::from_le_bytes(renow[66..74].try_into().unwrap());
+    renow[66..74].copy_from_slice(&(secs + 60).to_le_bytes());
     match JobRequest::from_bytes(&renow) {
         Some(JobRequest { job, .. }) => {
             let glm = job
@@ -3203,14 +3111,14 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
             assert_eq!(
                 glm.now,
                 glm_fixture_now() + chrono::Duration::seconds(60),
-                "bytes 63..71 are not the dispatch clock; the refusal below \
+                "bytes 66..74 are not the dispatch clock; the refusal below \
                  would be about some other field",
             );
         }
         other => panic!("the re-clocked control failed to decode: {other:?}"),
     }
     let mut bad_now = bytes.clone();
-    bad_now[63..71].copy_from_slice(&i64::MAX.to_le_bytes());
+    bad_now[66..74].copy_from_slice(&i64::MAX.to_le_bytes());
     assert_eq!(
         JobRequest::from_bytes(&bad_now),
         None,
@@ -3220,7 +3128,7 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     // The nanos half: half a second in decodes and reads back, and a value
     // no clock writes refuses.
     let mut renanos = bytes.clone();
-    renanos[71..75].copy_from_slice(&500_000_000u32.to_le_bytes());
+    renanos[74..78].copy_from_slice(&500_000_000u32.to_le_bytes());
     match JobRequest::from_bytes(&renanos) {
         Some(JobRequest { job, .. }) => {
             let glm = job
@@ -3229,13 +3137,13 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
             assert_eq!(
                 glm.now,
                 glm_fixture_now() + chrono::Duration::milliseconds(500),
-                "bytes 71..75 are not the clock's subsecond half",
+                "bytes 74..78 are not the clock's subsecond half",
             );
         }
         other => panic!("the nanos control failed to decode: {other:?}"),
     }
     let mut bad_nanos = bytes.clone();
-    bad_nanos[71..75].copy_from_slice(&u32::MAX.to_le_bytes());
+    bad_nanos[74..78].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(
         JobRequest::from_bytes(&bad_nanos),
         None,
@@ -3243,7 +3151,7 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
     );
 
     let mut bad_flag = bytes.clone();
-    bad_flag[50] = 2;
+    bad_flag[53] = 2;
     assert_eq!(
         JobRequest::from_bytes(&bad_flag),
         None,
@@ -3252,9 +3160,9 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
 
     // The energy option tag. Read-back first: the first flash's energy is
     // present, and moving its value bytes moves the decoded energy.
-    assert_eq!(bytes[107], 1, "premise: flash 0 carries an energy");
+    assert_eq!(bytes[110], 1, "premise: flash 0 carries an energy");
     let mut re_energized = bytes.clone();
-    re_energized[108..112].copy_from_slice(&2e-15f32.to_le_bytes());
+    re_energized[111..115].copy_from_slice(&2e-15f32.to_le_bytes());
     match JobRequest::from_bytes(&re_energized) {
         Some(JobRequest { job, .. }) => {
             let glm = job
@@ -3263,14 +3171,14 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
             assert_eq!(
                 glm.flashes[0].energy,
                 Some(2e-15),
-                "bytes 108..112 are not the first flash's energy; the \
+                "bytes 111..115 are not the first flash's energy; the \
                  refusal below would be about some other field",
             );
         }
         other => panic!("the energy control failed to decode: {other:?}"),
     }
     let mut bad_energy_tag = bytes;
-    bad_energy_tag[107] = 2;
+    bad_energy_tag[110] = 2;
     assert_eq!(
         JobRequest::from_bytes(&bad_energy_tag),
         None,
@@ -3427,12 +3335,12 @@ fn the_whole_model_grid_encodes_as_exactly_its_window() {
 /// read-back control proving it landed on the byte this test believes it
 /// did.
 ///
-/// Offsets, stated once: tag(1) + width(4) + height(4) + bounds(32) = 41 is
-/// the input-kind byte; + 1 + name_len(2) = 44 is the parameter string's
-/// first byte ("sbcape", 6 bytes); + 6 = 50 is `ni`, 54 is `nj`; 58 the
-/// coords tag; + 1 + ten f64 constants (80) = 139 `ni` of the Lambert
-/// parts, 143 `nj`, then three flag bytes at 147..150; the window's four
-/// `u32` edges at 150..166; the values from 166.
+/// Offsets, stated once: code(1) + width(4) + height(4) + bounds(32) +
+/// ceiling(4) = 45 is the payload's first byte; + name_len(2) = 47 is the
+/// parameter string's first byte ("sbcape", 6 bytes); + 6 = 53 is `ni`, 57
+/// is `nj`; 61 the coords tag; + 1 + ten f64 constants (80) = 142 `ni` of
+/// the Lambert parts, 146 `nj`, then three flag bytes at 150..153; the
+/// window's four `u32` edges at 153..169; the values from 169.
 #[test]
 fn a_malformed_model_job_is_refused_rather_than_misread() {
     use rustdar_overlays::hrrr::ModelParameter;
@@ -3451,18 +3359,18 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     // a different *valid* code of the same length — decodes and reads back
     // as the other parameter, so byte 44 really is the string.
     let mut reparam = bytes.clone();
-    reparam[44] = b'm';
-    reparam[45] = b'l';
+    reparam[47] = b'm';
+    reparam[48] = b'l';
     let model = decoded_model(&reparam).expect("the reparam control decodes");
     assert_eq!(
         model.parameter(),
         ModelParameter::MixedLayerCape,
-        "bytes 44..50 are not the parameter string; the refusals below would \
+        "bytes 47..53 are not the parameter string; the refusals below would \
          be about some other field",
     );
     // A code no build ships refuses (valid UTF-8, unknown parameter)…
     let mut unknown = bytes.clone();
-    unknown[44] = b'z';
+    unknown[47] = b'z';
     assert_eq!(
         JobRequest::from_bytes(&unknown),
         None,
@@ -3470,7 +3378,7 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     );
     // …and so does a byte no UTF-8 string contains.
     let mut not_utf8 = bytes.clone();
-    not_utf8[44] = 0xFF;
+    not_utf8[47] = 0xFF;
     assert_eq!(JobRequest::from_bytes(&not_utf8), None, "not UTF-8");
 
     // The coordinates tag: 0 and 3 are unallocated. (The other *valid* tag
@@ -3479,7 +3387,7 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     // arithmetic, which is itself the refusal wanted.)
     for bad_tag in [0u8, 3] {
         let mut retagged = bytes.clone();
-        retagged[58] = bad_tag;
+        retagged[61] = bad_tag;
         assert_eq!(
             JobRequest::from_bytes(&retagged),
             None,
@@ -3487,16 +3395,16 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
         );
     }
 
-    // A Lambert constant. Control: `dx` (the ninth f64, bytes 123..131)
+    // A Lambert constant. Control: `dx` (the ninth f64, bytes 126..134)
     // moved to another finite value decodes and reads back moved…
     let mut restepped = bytes.clone();
-    restepped[123..131].copy_from_slice(&1500.0f64.to_le_bytes());
+    restepped[126..134].copy_from_slice(&1500.0f64.to_le_bytes());
     let model = decoded_model(&restepped).expect("the restepped control decodes");
     match model.coords() {
         rustdar_overlays::hrrr::GridCoords::Lambert(grid) => assert_eq!(
             grid.to_parts().dx,
             1500.0,
-            "bytes 123..131 are not the grid step; the refusal below would \
+            "bytes 126..134 are not the grid step; the refusal below would \
              be about some other field",
         ),
         other => panic!("the fixture's coords are Lambert, got {other:?}"),
@@ -3505,25 +3413,25 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     // refused at the boundary, not rasterized into a blank nobody can
     // explain.
     let mut poisoned = bytes.clone();
-    poisoned[123..131].copy_from_slice(&f64::NAN.to_le_bytes());
+    poisoned[126..134].copy_from_slice(&f64::NAN.to_le_bytes());
     assert_eq!(
         JobRequest::from_bytes(&poisoned),
         None,
         "a non-finite Lambert constant was accepted",
     );
 
-    // The wrap flag (byte 149). Control: flipped to the other valid value it
+    // The wrap flag (byte 152). Control: flipped to the other valid value it
     // decodes and reads back flipped; outside {0, 1} it is refused.
     let mut rewrapped = bytes.clone();
-    assert_eq!(rewrapped[149], 0, "premise: the fixture grid does not wrap");
-    rewrapped[149] = 1;
+    assert_eq!(rewrapped[152], 0, "premise: the fixture grid does not wrap");
+    rewrapped[152] = 1;
     let model = decoded_model(&rewrapped).expect("the rewrapped control decodes");
     assert!(
         model.coords().wraps_longitude(),
-        "byte 149 is not the wrap flag",
+        "byte 152 is not the wrap flag",
     );
     let mut bad_flag = bytes.clone();
-    bad_flag[149] = 2;
+    bad_flag[152] = 2;
     assert_eq!(
         JobRequest::from_bytes(&bad_flag),
         None,
@@ -3532,52 +3440,52 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
 
     // The window's range check. Control first: the whole window shifted one
     // column right keeps its area (so the values arithmetic still closes)
-    // and decodes, reading back shifted — proving bytes 150..158 are the
+    // and decodes, reading back shifted — proving bytes 153..161 are the
     // `i` edges. Then the same area parked past `ni` must be refused: a
     // window the grid cannot contain, drawn anyway, would paint the wrong
     // region of the country under this pane.
     let (i0, i1) = (14u32, 20u32);
     let mut shifted = bytes.clone();
-    shifted[150..154].copy_from_slice(&(i0 + 1).to_le_bytes());
-    shifted[154..158].copy_from_slice(&(i1 + 1).to_le_bytes());
+    shifted[153..157].copy_from_slice(&(i0 + 1).to_le_bytes());
+    shifted[157..161].copy_from_slice(&(i1 + 1).to_le_bytes());
     let model = decoded_model(&shifted).expect("the shifted control decodes");
     match &model {
         rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
             assert_eq!(
                 (w.win.i0, w.win.i1),
                 (15, 21),
-                "bytes 150..158 are not the window's i edges",
+                "bytes 153..161 are not the window's i edges",
             );
         }
         other => panic!("the wire only ever decodes the window form, got {other:?}"),
     }
     let mut escaped = bytes.clone();
-    escaped[150..154].copy_from_slice(&55u32.to_le_bytes());
-    escaped[154..158].copy_from_slice(&61u32.to_le_bytes());
+    escaped[153..157].copy_from_slice(&55u32.to_le_bytes());
+    escaped[157..161].copy_from_slice(&61u32.to_le_bytes());
     assert_eq!(
         JobRequest::from_bytes(&escaped),
         None,
         "a window past the grid's own ni was accepted",
     );
     let mut inverted = bytes.clone();
-    inverted[150..154].copy_from_slice(&20u32.to_le_bytes());
-    inverted[154..158].copy_from_slice(&14u32.to_le_bytes());
+    inverted[153..157].copy_from_slice(&20u32.to_le_bytes());
+    inverted[157..161].copy_from_slice(&14u32.to_le_bytes());
     assert_eq!(
         JobRequest::from_bytes(&inverted),
         None,
         "an inside-out window was accepted",
     );
 
-    // A value byte: the first value (bytes 166..170) moved decodes and reads
+    // A value byte: the first value (bytes 169..173) moved decodes and reads
     // back moved — the read-back that proves the values block starts where
     // the offsets above say, so every cut of it in the shared walk was
     // cutting what this test believes.
     let mut revalued = bytes;
-    revalued[166..170].copy_from_slice(&123.5f32.to_le_bytes());
+    revalued[169..173].copy_from_slice(&123.5f32.to_le_bytes());
     let model = decoded_model(&revalued).expect("the revalued control decodes");
     match &model {
         rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
-            assert_eq!(w.values[0], 123.5, "bytes 166..170 are not value 0");
+            assert_eq!(w.values[0], 123.5, "bytes 169..173 are not value 0");
         }
         other => panic!("the wire only ever decodes the window form, got {other:?}"),
     }
@@ -3680,36 +3588,23 @@ fn a_malformed_overlay_job_is_refused_rather_than_misread() {
         assert_eq!(JobRequest::from_bytes(&sized), None, "{what} was accepted");
     }
 
-    // Offsets, stated once: tag(1) + width(4) + height(4) + bounds(32) = 41
-    // is the input kind byte; + 1 + zoom(8) = 50 is `is_dark`.
-    let mut bad_kind = bytes.clone();
-    bad_kind[41] = 0;
-    assert_eq!(
-        JobRequest::from_bytes(&bad_kind),
-        None,
-        "input kind 0 must stay unallocated",
-    );
-    bad_kind[41] = 2;
-    assert_eq!(
-        JobRequest::from_bytes(&bad_kind),
-        None,
-        "input kind 2 is a build this one is not",
-    );
-
+    // Offsets, stated once: code(1) + width(4) + height(4) + bounds(32) +
+    // ceiling(4) = 45 is the payload's first byte, `zoom`; + 8 = 53 is
+    // `is_dark`.
     let mut bad_flag = bytes.clone();
-    bad_flag[50] = 2;
+    bad_flag[53] = 2;
     assert_eq!(
         JobRequest::from_bytes(&bad_flag),
         None,
         "is_dark is a bool, not a byte",
     );
 
-    // The first site's name: 50 + 1 + count(4) + lat(8) + lon(8) + two flags
-    // + name_len(2) = 79. Positive control first — a *different ASCII byte*
-    // still decodes, proving 79 really is inside the name — then a byte no
+    // The first site's name: 53 + 1 + count(4) + lat(8) + lon(8) + two flags
+    // + name_len(2) = 82. Positive control first — a *different ASCII byte*
+    // still decodes, proving 82 really is inside the name — then a byte no
     // UTF-8 string contains.
     let mut renamed = bytes.clone();
-    renamed[79] = b'Q';
+    renamed[82] = b'Q';
     match JobRequest::from_bytes(&renamed) {
         Some(JobRequest { job, .. }) => {
             let sites = job
@@ -3717,14 +3612,14 @@ fn a_malformed_overlay_job_is_refused_rather_than_misread() {
                 .expect("the sites row decoded");
             assert_eq!(
                 sites.sites[0].name, "QTLX",
-                "byte 79 is not the first name byte; the refusal below would \
+                "byte 82 is not the first name byte; the refusal below would \
                  be about some other field",
             );
         }
         other => panic!("the renamed control failed to decode: {other:?}"),
     }
     let mut bad_name = bytes;
-    bad_name[79] = 0xFF;
+    bad_name[82] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&bad_name),
         None,
@@ -3772,16 +3667,16 @@ fn a_malformed_alerts_job_is_refused_rather_than_misread() {
     assert_refuses_cuts_and_trailing(&job);
     let bytes = job.to_bytes();
 
-    // Offsets, stated once: tag(1) + width(4) + height(4) + bounds(32) = 41
-    // is the input-kind byte; + 1 + device_scale(4) + category_count(4) = 50
-    // is the first enabled-category code; the two categories, the hidden
-    // count (4) and the first hidden id's length prefix (2) put the id's
-    // first byte at 58.
-    let first_category = 50;
-    let first_hidden_byte = 58;
+    // Offsets, stated once: code(1) + width(4) + height(4) + bounds(32) +
+    // ceiling(4) = 45 is the payload's first byte; + device_scale(4) +
+    // category_count(4) = 53 is the first enabled-category code; the two
+    // categories, the hidden count (4) and the first hidden id's length
+    // prefix (2) put the id's first byte at 61.
+    let first_category = 53;
+    let first_hidden_byte = 61;
 
     // Positive control: a *different valid* category code decodes, and to the
-    // category that code names — so 50 really is the category byte.
+    // category that code names — so 53 really is the category byte.
     let mut retagged = bytes.clone();
     assert_eq!(
         retagged[first_category], 0,
@@ -3845,12 +3740,12 @@ fn a_malformed_outlooks_job_is_refused_rather_than_misread() {
     assert_refuses_cuts_and_trailing(&job);
     let bytes = job.to_bytes();
 
-    // Offsets, stated once: the fixed header and input-kind byte end at 42;
-    // + device_scale(4) + hatch_color(4) + feature_count(4) = 54 opens the
-    // first feature; its labels are "SLGT" (2+4) and "Slight Risk" (2+11),
-    // then fill(4) + stroke(4) put the hatch code at 81 and the geo-bounds
-    // option tag at 82.
-    let first_hatch = 54 + 2 + 4 + 2 + 11 + 4 + 4;
+    // Offsets, stated once: the code byte and the canonical envelope end at
+    // 45; + device_scale(4) + hatch_color(4) + feature_count(4) = 57 opens
+    // the first feature; its labels are "SLGT" (2+4) and "Slight Risk"
+    // (2+11), then fill(4) + stroke(4) put the hatch code at 84 and the
+    // geo-bounds option tag at 85.
+    let first_hatch = 57 + 2 + 4 + 2 + 11 + 4 + 4;
     let bounds_tag = first_hatch + 1;
 
     let mut rehatched = bytes.clone();
@@ -3917,9 +3812,9 @@ fn a_malformed_discussions_job_is_refused_rather_than_misread() {
     assert_refuses_cuts_and_trailing(&job);
     let bytes = job.to_bytes();
 
-    // Offsets, stated once: the fixed header and input-kind byte end at 42;
-    // + device_scale(4) + md_count(4) = 50 is the first MD's type code.
-    let first_md_type = 50;
+    // Offsets, stated once: the code byte and the canonical envelope end at
+    // 45; + device_scale(4) + md_count(4) = 53 is the first MD's type code.
+    let first_md_type = 53;
 
     let mut retyped = bytes;
     assert_eq!(retyped[first_md_type], 0, "the fixture leads Convective");

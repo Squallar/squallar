@@ -9,12 +9,13 @@
 //! overlay seven, each half published beside the pipeline it runs
 //! (`rustdar_radar::jobs`, `rustdar_overlays::render::jobs`).
 //!
-//! **ONE explicit expression, radar first, deliberately**: WO-M7b's dense
-//! code flip assigns wire codes by index into exactly this composition
-//! (codes 1..=13, `radar` = 1 … `overlay/model` = 13), so the composition
-//! must stay a single spelled-out expression rather than something assembled
-//! in pieces. Until that flip the wire codes are `offload`'s frontend-owned
-//! sparse `LegacyCode` map, pinned literal-by-literal in `offload::tests`.
+//! **ONE explicit expression, radar first, deliberately**: since WO-M7b's
+//! dense code flip the wire codes ARE indices into exactly this composition,
+//! plus one (codes 1..=13, `radar` = 1 … `overlay/model` = 13, 0 unallocated
+//! so a zeroed buffer never decodes), so the composition must stay a single
+//! spelled-out expression rather than something assembled in pieces. The
+//! assignment is pinned literal-by-literal in `offload::tests`, and
+//! [`crate::wire_identity`] folds it into the local build token.
 
 /// Every codec row this build composes, in the load-bearing order: the six
 /// radar rows (**radar, level3, level3/vild, section, voxels, decode**) and
@@ -25,7 +26,8 @@
 /// [`rustdar_source::job::JobCodec`] is a row of function pointers built by
 /// `const` constructors and deliberately not `Clone`, so the one way to
 /// compose the halves without restating any row is to chain them — which is
-/// also the one-expression shape WO-M7b's index assignment depends on.
+/// also the one-expression shape WO-M7b's index-as-code assignment depends
+/// on.
 pub(crate) fn job_codecs() -> impl Iterator<Item = &'static rustdar_source::job::JobCodec> {
     rustdar_radar::jobs::JOB_CODECS
         .iter()
