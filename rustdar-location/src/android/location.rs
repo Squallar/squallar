@@ -6,20 +6,22 @@ use super::{with_activity, with_env};
 
 /// Prompt if Android needs prompting, and start delivering fixes.
 ///
-/// Backs [`PlatformBridge::request_location`] through [`LocationHooks`]. The
-/// two halves are one method because the gate has one question — "make location
-/// happen" — and which of the two it means is a thing only the platform knows.
+/// Backs the arm's `request` (the gate's `request_location`, driven in-crate
+/// since WO-RL-4 — the `LocationHooks` fn-pointer hop died with the bridge
+/// verbs). The two halves are one method because the gate has one question —
+/// "make location happen" — and which of the two it means is a thing only the
+/// platform knows.
 ///
-/// The `bool` is the one this trait method is honest about anywhere, and both
+/// The `bool` is the one this verb is honest about anywhere, and both
 /// branches answer the same question: **did the call reach Java?** Neither is
 /// "did the user agree", which arrives later and is read back through
-/// [`location_permission_status`]. See [`request_location_permission`] for the
+/// [`location_permission_status`](super::permissions::location_permission_status).
+/// See [`request_location_permission`] for the
 /// threading note that makes a `false` a real and recoverable outcome rather
 /// than a user's decision — that distinction is the whole reason the gate has a
 /// second attempt.
 ///
-/// [`PlatformBridge::request_location`]: rustdar_frontend::platform::PlatformBridge::request_location
-/// [`LocationHooks`]: rustdar_frontend::platform::LocationHooks
+/// [`request_location_permission`]: super::permissions::request_location_permission
 pub(super) fn request_location() -> bool {
     if !has_location_permission() {
         log::info!("Requesting ACCESS_FINE_LOCATION + ACCESS_COARSE_LOCATION permissions");
@@ -30,14 +32,12 @@ pub(super) fn request_location() -> bool {
 
 /// Stop delivering fixes.
 ///
-/// Backs [`PlatformBridge::stop_location`]. Cannot revoke the runtime
+/// Backs the arm's `stop`. Cannot revoke the runtime
 /// permission — Android offers an app no way to give one back — so this is an
 /// off switch for the *stream*, and it is a real one: the flag stops
 /// [`start_location_thread`]'s poll from reading the provider, and
 /// `LocationHelper.stop()` drops the subscription that keeps the providers
 /// producing at all.
-///
-/// [`PlatformBridge::stop_location`]: rustdar_frontend::platform::PlatformBridge::stop_location
 pub(super) fn stop_location() {
     // Flag first: the poll thread is a different thread and may be mid-sleep,
     // so this is what stops the *next* pass regardless of what Java does.
@@ -47,24 +47,22 @@ pub(super) fn stop_location() {
 
 /// Whether Android is currently delivering fixes.
 ///
-/// Backs [`PlatformBridge::location_active`]. Read on the frame path, so it is a
+/// Backs the arm's `active`. Read on the frame path, so it is a
 /// relaxed atomic load rather than a JNI call: the flag is set only when
 /// `LocationHelper.start()` has actually reached Java, so "active" here means
 /// the subscription was established, not merely that it was asked for.
-///
-/// [`PlatformBridge::location_active`]: rustdar_frontend::platform::PlatformBridge::location_active
 pub(super) fn location_active() -> bool {
     LOCATION_UPDATES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
-/// Returns a [`rustdar_location::Fix`] on success or `None` if unavailable.
+/// Returns a [`crate::Fix`] on success or `None` if unavailable.
 ///
 /// "Last known" is whatever the providers last produced for *any* client;
 /// LocationHelper's subscription (see [`start_location_updates`]) is what
 /// keeps them producing once permission is granted, and this poll doubles as
 /// the fallback when that subscription could not be established.
-fn get_last_known_location() -> Option<rustdar_location::Fix> {
+fn get_last_known_location() -> Option<crate::Fix> {
     with_activity(last_known_location_with).flatten()
 }
 
@@ -83,11 +81,11 @@ fn get_last_known_location() -> Option<rustdar_location::Fix> {
 /// Split out of [`last_known_location_with`] for the reason `fix_from_coords` is
 /// split out on the web: it is a decision, the rest of that function is nine JNI
 /// calls, and only one of the two can be checked without a device.
-fn provider_fix_quality(provider: &str) -> rustdar_location::FixQuality {
+fn provider_fix_quality(provider: &str) -> crate::FixQuality {
     if provider == "gps" {
-        rustdar_location::FixQuality::Gps
+        crate::FixQuality::Gps
     } else {
-        rustdar_location::FixQuality::Device
+        crate::FixQuality::Device
     }
 }
 
@@ -96,7 +94,7 @@ fn provider_fix_quality(provider: &str) -> rustdar_location::FixQuality {
 fn last_known_location_with(
     env: &mut jni::Env<'_>,
     activity: &jni::objects::JObject<'_>,
-) -> Option<rustdar_location::Fix> {
+) -> Option<crate::Fix> {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
@@ -200,7 +198,7 @@ fn last_known_location_with(
             })
             .map(|a| a as f64);
 
-        return Some(rustdar_location::Fix {
+        return Some(crate::Fix {
             point: rustdar_geo::GeoPoint { lat, lon },
             altitude_m,
             speed_mps,
@@ -217,9 +215,10 @@ fn last_known_location_with(
 
 /// JClass for com.rustdar.LocationHelper, loaded once via the app class loader.
 ///
-/// A `OnceLock`, unlike [`JAVA`]: this is a *class* resolved through the
-/// process-wide app ClassLoader, so the same object serves every Activity
-/// instance and there is nothing to replace. Same shape as [`COMPASS_CLASS`].
+/// A `OnceLock`, unlike [`JAVA`](super::java_context): this is a *class*
+/// resolved through the process-wide app ClassLoader, so the same object
+/// serves every Activity instance and there is nothing to replace. Same shape
+/// as the shell's `COMPASS_CLASS` (rustdar/src/android/compass.rs).
 pub(super) static LOCATION_CLASS: std::sync::OnceLock<
     jni::objects::Global<jni::objects::JClass<'static>>,
 > = std::sync::OnceLock::new();
@@ -317,7 +316,7 @@ fn stop_location_updates() {
 /// This thread used to own the permission too: a bounded `requestPermissions`
 /// loop with its own counter, firing three seconds after launch on whatever
 /// state the Activity happened to be in. All of that has moved to
-/// `rustdar_frontend::location_permission`, which is the one place in the app
+/// [`crate::LocationGate`], which is the one place in the app
 /// that may prompt, and which knows three things this thread could not -- what
 /// the OS currently says, whether this *install* has ever asked, and whether the
 /// user has turned location off. What is left here is a reader.
@@ -329,13 +328,14 @@ fn stop_location_updates() {
 ///
 /// # `wake`
 ///
-/// Called after each fix reaches the channel. The frontend drains that channel
-/// from `App::poll_platform_state`, which runs only while rendering a frame,
+/// Called after each fix reaches the channel. The app drains that channel
+/// from its platform poll, which runs only while rendering a frame,
 /// and the loop sits on `ControlFlow::Wait` -- so without this a fix pushed
 /// from here is invisible until something unrelated happens to draw one. It is
-/// `rustdar_frontend::platform::RedrawWaker::wake` in production.
+/// the facade's [`Wake`](crate::Wake) (the app's redraw waker) in production.
 ///
-/// **Not** [`EVENT_LOOP_PROXY`], and the difference is not that the proxy would
+/// **Not** the shell's `EVENT_LOOP_PROXY` (its android back module), and the
+/// difference is not that the proxy would
 /// fail to wake the loop -- it would. It is that a proxy wake surfaces as
 /// `ApplicationHandler::user_event`, which `App` does not override, so it
 /// produces an *iteration* and not a *frame*; the back press below is collected
@@ -347,10 +347,11 @@ fn stop_location_updates() {
 ///
 /// A bare `impl Fn()` rather than the concrete waker type, so this module
 /// stays a plain JNI reader with no coupling to the app's waker type: the
-/// caller (`entry::android_main`) owns the wiring, and the host
-/// `jni-typecheck` builds type-check this signature without naming it.
+/// caller ([`AndroidBackend::set_wake`](super::AndroidBackend)) owns the
+/// wiring, and the host `jni-typecheck` builds type-check this signature
+/// without naming it.
 pub(super) fn start_location_thread(
-    sender: std::sync::mpsc::Sender<rustdar_location::Fix>,
+    sender: std::sync::mpsc::Sender<crate::Fix>,
     wake: impl Fn() + Send + 'static,
 ) {
     std::thread::Builder::new()
@@ -386,7 +387,7 @@ pub(super) fn start_location_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_location::FixQuality;
+    use crate::FixQuality;
 
     // Host-run under `jni-typecheck`, like the tri-state tests in
     // `permissions.rs` (the full preamble lives there): no JVM, so every

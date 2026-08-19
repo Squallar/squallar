@@ -1,7 +1,11 @@
 //! Concrete [`PlatformBridge`] implementations. The trait lives in
 //! `rustdar-frontend`, which must never name a per-OS type.
 
-use rustdar_frontend::platform::{PlatformBridge, RedrawWaker, drain_latest};
+use rustdar_frontend::platform::{PlatformBridge, RedrawWaker};
+// Only the android bridge drains channels since WO-RL-4 took the desktop
+// bridge's location channels into the facade.
+#[cfg(target_os = "android")]
+use rustdar_frontend::platform::drain_latest;
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -34,211 +38,20 @@ pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    /// Active serial GPS source (dropped to stop). The facade's wrapper since
-    /// WO-RL-3: the transport parses in its own vocabulary, and
-    /// `rustdar_location::serial` is where sentences become fixes.
-    gps_reader: Option<rustdar_location::serial::SerialFixReader>,
-    /// Receives GPS fixes from the serial reader thread.
-    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
-    /// The OS location service and everything the bridge keeps beside it. See
-    /// [`OsLocation`].
-    os_location: OsLocation,
-    /// Handed to the reader thread so a fix arriving while the loop is parked
-    /// gets a frame to be shown on. See [`RedrawWaker`].
+    /// Handed to the theme/back producers this bridge starts. The location
+    /// producers left with the location half (WO-RL-4): the facade's
+    /// `OsBackend` owns the OS provider AND the serial reader now, and gets
+    /// the app's wake through `LocationFacade::set_wake`.
     redraw_waker: RedrawWaker,
 }
 
-// ── The OS location service, once, for every bridge that has one ────────
+// ── The OS location service left this file at WO-RL-4 ───────────────────
 //
-// Written here rather than inside each bridge because `DesktopPlatform` and
-// `IosPlatform` want exactly the same thing from it, and get it from the same
-// provider: `rustdar_location::os_location`'s arm table chooses, and that table is the
-// entire `cfg` surface.
-//
-// **No `cfg` in this file decides how location is done.** Every `target_os`
-// left below says which *bridge* exists — Android's, iOS's, the desktop one —
-// or, on `OsLocation` and the two permission codecs, whether the facade's
-// `os_location` module is reachable at all, which this crate's manifest gates
-// on the same axis (the `os-providers` feature is enabled for
-// `cfg(not(target_os = "android"))` and nowhere else) and for the same reason:
-// Android reaches its location service over JNI from the `android` module
-// beside this file. That is checkable, and it is worth checking, because it was false
-// twice: `platform.rs` carried a four-armed table of inherent `impl`s that every
-// landing provider had to edit, and a `#[cfg(target_os = "windows")]` field
-// beside it.
-
-/// The provider, the permission it last reported, and the channel it delivers
-/// on.
-#[cfg(not(target_os = "android"))]
-struct OsLocation {
-    /// The platform's own location service.
-    ///
-    /// Built once, from `set_redraw_waker`, and held for the life of the
-    /// bridge. **Not** dropped by `stop_location`: on two of the three
-    /// platforms this value *is* the permission watcher, and a revocation made
-    /// in system settings while delivery is off would go unnoticed if it were
-    /// torn down with the stream. `None` means this target has no provider at
-    /// all, which the bridge renders as `Unavailable`.
-    provider: Option<rustdar_location::os_location::OsLocationReader>,
-    /// What the provider last reported.
-    ///
-    /// An atomic and not a `Cell`, because it is written from whatever thread
-    /// the provider is given — a portal session thread, a WinRT RPC thread,
-    /// the main run loop — and read from
-    /// [`location_permission`](rustdar_location::LocationBridge::location_permission), which is a
-    /// `&self` getter on the frame path. That rules out a `Cell` (not `Send`),
-    /// a `Receiver` (cannot be drained through `&self`) and a `Mutex` (a lock
-    /// on the frame path). See [`rustdar_location::encode_permission`].
-    ///
-    /// **It deliberately outlives every session.** A revocation arrives as a
-    /// permission change *and* stops delivery, and the gate responds to
-    /// `Denied` by calling `stop_location` — so a state that lived inside the
-    /// thing being stopped would evaporate at exactly the moment it started to
-    /// matter, the bridge would fall back to "nobody has been asked", and the
-    /// app would ask again straight into the refusal it just received.
-    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    /// Receives fixes from the provider.
-    ///
-    /// A channel of its own rather than a second sender into the serial
-    /// reader's, because on desktop the two sources have to be told apart:
-    /// `poll_gps_fix` picks between them (see [`prefer_fix`]) and cannot do
-    /// that once they are merged.
-    ///
-    /// `None` until a provider exists, and never dropped afterwards — the
-    /// provider keeps the matching `Sender` for the life of the bridge, so the
-    /// channel survives a stop and is reused by the next start.
-    ///
-    /// [`prefer_fix`]: rustdar_location::prefer_fix
-    fixes: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
-}
-
-#[cfg(not(target_os = "android"))]
-impl OsLocation {
-    /// No provider yet. Constructing one needs the app's waker, which does not
-    /// exist when a bridge is built; see [`start`](Self::start).
-    fn new() -> Self {
-        Self {
-            provider: None,
-            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-                rustdar_location::encode_permission(rustdar_location::LocationPermission::Unknown),
-            )),
-            fixes: None,
-        }
-    }
-
-    /// Bring the provider up.
-    ///
-    /// Called from [`set_redraw_waker`](PlatformBridge::set_redraw_waker) and
-    /// nowhere else, which is the only point where both of its requirements
-    /// hold. `App::with_instance` calls that exactly once, immediately after
-    /// constructing itself and before any frame — so the provider exists before
-    /// the gate's first `location_permission()` — and it is also the only point
-    /// where the app's real waker is in hand: `set_redraw_waker` *replaces* the
-    /// field, so a clone taken in `new()` would fire into a slot nothing ever
-    /// fills.
-    ///
-    /// Prompts nobody. That is the contract's first phase; see
-    /// [`OsLocationProvider::start`](rustdar_location::os_location::OsLocationProvider::start).
-    fn start(&mut self, waker: &RedrawWaker) {
-        use rustdar_location::os_location::OsLocationProvider as _;
-
-        let (fixes, receiver) = std::sync::mpsc::channel();
-        let wake = waker.clone();
-        let reported = std::sync::Arc::clone(&self.state);
-        let report_waker = waker.clone();
-        self.provider = rustdar_location::os_location::OsLocationReader::start(
-            rustdar_location::os_location::OsLocationSink {
-                fixes,
-                wake: std::sync::Arc::new(move || wake.wake()),
-                // Store *and* wake. The store is what the frame path reads; the
-                // wake is what gets a frame drawn for it to be read on, which
-                // under `ControlFlow::Wait` is not otherwise going to happen —
-                // a permission change is exactly the kind of event nothing else
-                // is causing a redraw for.
-                report: std::sync::Arc::new(move |permission| {
-                    reported.store(
-                        rustdar_location::encode_permission(permission),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    report_waker.wake();
-                }),
-            },
-        );
-        // Only keep the receiver if something is going to push into it; an open
-        // one would make `poll_gps_fix` drain a channel forever.
-        self.fixes = self.provider.is_some().then_some(receiver);
-    }
-
-    /// Whatever the provider last reported, or `Unavailable` when this build
-    /// has none.
-    ///
-    /// `Unavailable` and not `Unknown` for the no-provider case, and the
-    /// difference matters. `Unknown` means "ask again shortly", so the gate
-    /// would poll a bridge that is never going to answer and the settings pane
-    /// would sit on "Checking…" for the life of the process. `Unavailable` is
-    /// the truth: this build has no OS location provider, the pane says so, and
-    /// nothing spins.
-    fn permission(&self) -> rustdar_location::LocationPermission {
-        match self.provider {
-            Some(_) => rustdar_location::decode_permission(
-                self.state.load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            None => rustdar_location::LocationPermission::Unavailable,
-        }
-    }
-
-    fn request(&mut self) -> bool {
-        use rustdar_location::os_location::OsLocationProvider as _;
-        self.provider
-            .as_mut()
-            .is_some_and(rustdar_location::os_location::OsLocationReader::request)
-    }
-
-    /// Stop the stream and discard anything already in it.
-    ///
-    /// The drain is the part that is easy to leave out and is not optional:
-    /// this is the path a *revoked* permission takes, and a fix that was in
-    /// flight when consent was withdrawn must not land on the map one frame
-    /// later. The receiver itself stays — the provider still holds the matching
-    /// `Sender`, and a later `request` delivers down the same channel.
-    ///
-    /// The permission is left exactly as the provider last reported it. This is
-    /// an off switch, not a revocation, and no platform lets an app hand a
-    /// permission back.
-    fn stop(&mut self) {
-        use rustdar_location::os_location::OsLocationProvider as _;
-
-        let was_active = self.active();
-        if let Some(provider) = self.provider.as_mut() {
-            provider.stop();
-        }
-        if let Some(receiver) = self.fixes.as_ref() {
-            let _ = drain_latest(receiver);
-        }
-        if was_active {
-            log::info!("OS location delivery stopped");
-        }
-    }
-
-    fn active(&self) -> bool {
-        use rustdar_location::os_location::OsLocationProvider as _;
-        self.provider
-            .as_ref()
-            .is_some_and(rustdar_location::os_location::OsLocationReader::active)
-    }
-
-    fn open_settings(&mut self) {
-        use rustdar_location::os_location::OsLocationProvider as _;
-        if let Some(provider) = self.provider.as_mut() {
-            provider.open_settings();
-        }
-    }
-
-    /// The newest fix waiting, if any.
-    fn poll_fix(&self) -> Option<rustdar_location::Fix> {
-        self.fixes.as_ref().and_then(drain_latest)
-    }
-}
+// The `OsLocation` wiring (provider + permission atomic + fix channel) and
+// the serial reader beside it live in `rustdar_location::os_location` as
+// `OsBackend` — the arm `create_location()` below hands the app inside its
+// `LocationFacade`. Every `target_os` left in this file says which *bridge*
+// exists, and not one of them says anything about location at all.
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Default for DesktopPlatform {
@@ -254,9 +67,6 @@ impl DesktopPlatform {
             back_handler: None,
             zone_cache_dir: Self::default_zone_cache_dir(),
             config_dir: Self::default_config_dir(),
-            gps_reader: None,
-            gps_fix_receiver: None,
-            os_location: OsLocation::new(),
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -283,19 +93,6 @@ impl PlatformBridge for DesktopPlatform {
     fn poll_theme(&mut self) -> Option<bool> {
         // Desktop uses WindowEvent::ThemeChanged; no polling needed.
         None
-    }
-
-    /// Drains **both** sources every time, not the first one that answers.
-    ///
-    /// Draining conditionally would leave the loser's channel filling up: the
-    /// OS provider pushes on its own schedule and nothing else empties it, so a
-    /// serial fix arriving first would build an unbounded backlog behind it
-    /// that later surfaces as minutes-old positions. See
-    /// [`prefer_fix`](rustdar_location::prefer_fix) for which one wins and
-    /// why it is not simply "serial".
-    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
-        let serial = self.gps_fix_receiver.as_ref().and_then(drain_latest);
-        rustdar_location::prefer_fix(serial, self.os_location.poll_fix())
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -343,90 +140,18 @@ impl PlatformBridge for DesktopPlatform {
         false
     }
 
-    /// The waker is taken here rather than at `start_gps`, because `start_gps`
-    /// is reached from a menu toggle and carries nothing but a config. It is
-    /// also handed over before any window exists, which is what
-    /// [`RedrawWaker`]'s slot is for.
-    ///
-    /// It is also where the OS location provider is brought up, which is not
-    /// opportunism: see [`OsLocation::start`].
+    /// Handed over before any window exists, which is what [`RedrawWaker`]'s
+    /// slot is for. (The location facade takes the same wake through its own
+    /// `set_wake`, which is also what brings the OS provider up since
+    /// WO-RL-4.)
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
         self.redraw_waker = waker;
-        self.os_location.start(&self.redraw_waker);
     }
 
-    fn start_gps(&mut self, config: &rustdar_nmea_serial::SerialConfig) {
-        // Stop any existing reader first
-        self.stop_gps();
-        let (tx, rx) = std::sync::mpsc::channel();
-        // The reader is a thread of its own, and `poll_gps_fix` is drained only
-        // on a frame: under `ControlFlow::Wait` a fix it pushes while the app is
-        // idle is invisible until something else happens to draw one.
-        let wake = self.redraw_waker.clone();
-        if let Some(reader) =
-            rustdar_location::serial::SerialFixReader::start(config, tx, move || wake.wake())
-        {
-            self.gps_reader = Some(reader);
-            self.gps_fix_receiver = Some(rx);
-            log::info!("Desktop serial GPS reader started");
-        } else {
-            log::warn!("No GPS port found — serial GPS not started");
-        }
-    }
-
-    fn stop_gps(&mut self) {
-        if self.gps_reader.take().is_some() {
-            log::info!("Desktop serial GPS reader stopped");
-        }
-        self.gps_fix_receiver = None;
-    }
-
-    fn gps_active(&self) -> bool {
-        self.gps_reader.is_some()
-    }
-
-    // ── Platform location service ───────────────────────────────────────
-    //
-    // Six one-line forwards to [`OsLocation`], and not one of them names a
-    // target. Everything per-OS — the location portal over ashpd, `AppCapability` +
-    // `Geolocator`, `CLLocationManager` — is behind `rustdar_location::os_location`, which
-    // is the entire `cfg` surface, and every arm of it implements the same
-    // trait.
-
-    /// Asked once, at startup, and before any provider exists — which is why
-    /// the trait's is an associated function rather than a method.
-    fn location_settings_available(&self) -> bool {
-        use rustdar_location::os_location::OsLocationProvider as _;
-        rustdar_location::os_location::OsLocationReader::settings_available()
-    }
-
-    fn open_location_settings(&mut self) {
-        self.os_location.open_settings();
-    }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-impl rustdar_location::LocationBridge for DesktopPlatform {
     fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
         self.config_dir
             .clone()
             .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
-    }
-
-    fn location_permission(&self) -> rustdar_location::LocationPermission {
-        self.os_location.permission()
-    }
-
-    fn request_location(&mut self) -> bool {
-        self.os_location.request()
-    }
-
-    fn stop_location(&mut self) {
-        self.os_location.stop();
-    }
-
-    fn location_active(&self) -> bool {
-        self.os_location.active()
     }
 }
 
@@ -440,7 +165,6 @@ pub struct AndroidPlatform {
     theme_detector: Option<fn() -> bool>,
     /// Theme changes from the poll thread `set_theme_detector` starts.
     theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,
-    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_location::Fix>>,
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
@@ -449,16 +173,12 @@ pub struct AndroidPlatform {
     back_press_taker: Option<fn() -> bool>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    /// Injected by `android::entry`: all four are JNI calls, for the same
-    /// reason `theme_detector` is injected. `None` until they are installed —
-    /// see [`rustdar_location::LocationBridge::location_permission`] for why that is
-    /// reported as `Unavailable` rather than `Unknown`.
-    location_hooks: Option<rustdar_frontend::platform::LocationHooks>,
-    /// What the app last said about how many times it has asked, kept for the
-    /// hooks to read. Android is the one platform that cannot tell "never
-    /// asked" from "permanently denied" without it — see
-    /// [`rustdar_location::LocationBridge::set_location_attempts`].
-    location_attempts: u8,
+    // The location hooks and their fix receiver left at WO-RL-4: the JNI arm
+    // lives in `rustdar_location::android` (initialised once by the entry's
+    // `rustdar_location::android::init`), and the app polls it through its
+    // `LocationFacade`. The inversion rule in `src/android/mod.rs` still
+    // governs insets, theme and back — location's consumer is no longer this
+    // bridge at all.
     /// Handed to the theme poller below, so a light/dark switch noticed on that
     /// thread gets a frame to be applied on. See [`RedrawWaker`].
     redraw_waker: RedrawWaker,
@@ -477,15 +197,12 @@ impl AndroidPlatform {
         Self {
             theme_detector: None,
             theme_receiver: None,
-            gps_fix_receiver: None,
             heading_receiver: None,
             insets_querier: None,
             back_handler: None,
             back_press_taker: None,
             zone_cache_dir: None,
             config_dir: None,
-            location_hooks: None,
-            location_attempts: 0,
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -495,10 +212,6 @@ impl AndroidPlatform {
 impl PlatformBridge for AndroidPlatform {
     fn poll_theme(&mut self) -> Option<bool> {
         self.theme_receiver.as_ref().and_then(drain_latest)
-    }
-
-    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
-        self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -579,10 +292,6 @@ impl PlatformBridge for AndroidPlatform {
         self.redraw_waker = waker;
     }
 
-    fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_location::Fix>) {
-        self.gps_fix_receiver = Some(receiver);
-    }
-
     fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {
         self.heading_receiver = Some(receiver);
     }
@@ -618,76 +327,24 @@ impl PlatformBridge for AndroidPlatform {
         }
     }
 
-    // ── Platform location service ───────────────────────────────────────
-    //
-    // Everything here is a `checkSelfPermission` / `requestPermissions` /
-    // `LocationHelper` call over JNI, which needs `unsafe` and the process
-    // `JavaVM`. JNI stays confined to the cfg(android) modules in
-    // `src/android/` by the injection rule written in `android/mod.rs` -- this
-    // bridge stays `deny(unsafe_code)`-clean and host-testable -- so the calls
-    // arrive as `fn` pointers, exactly as the theme detector does.
-
-    /// Refuses a second set, as `set_theme_detector` refuses a second detector
-    /// and for the same reason: a half-replaced set would leave the state query
-    /// and the request pointing at different implementations, which is a bug
-    /// with no symptom until somebody is standing in front of a permission
-    /// dialog that never appears.
-    fn set_location_hooks(&mut self, hooks: rustdar_frontend::platform::LocationHooks) {
-        if self.location_hooks.is_some() {
-            log::warn!("location hooks already installed; ignoring the second set");
-            return;
-        }
-        self.location_hooks = Some(hooks);
-    }
-}
-
-#[cfg(target_os = "android")]
-impl rustdar_location::LocationBridge for AndroidPlatform {
     fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
         self.config_dir
             .clone()
             .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
     }
-
-    /// `Unavailable` until the hooks are installed, deliberately not `Unknown`.
-    ///
-    /// `Unknown` is "the platform has not answered *yet*", and the gate keeps
-    /// polling for one. A bridge with no hooks is never going to answer, so
-    /// that would be a JNI-shaped poll that never terminates and a settings
-    /// pane parked on "Checking…" for the life of the process. `android_main`
-    /// installs the hooks before `run_app`, so on a wired build this window
-    /// closes before the first frame.
-    fn location_permission(&self) -> rustdar_location::LocationPermission {
-        match self.location_hooks {
-            Some(hooks) => (hooks.query)(self.location_attempts),
-            None => rustdar_location::LocationPermission::Unavailable,
-        }
-    }
-
-    fn request_location(&mut self) -> bool {
-        self.location_hooks.is_some_and(|hooks| (hooks.request)())
-    }
-
-    fn stop_location(&mut self) {
-        if let Some(hooks) = self.location_hooks {
-            (hooks.stop)();
-        }
-    }
-
-    fn location_active(&self) -> bool {
-        self.location_hooks.is_some_and(|hooks| (hooks.active)())
-    }
-
-    fn set_location_attempts(&mut self, attempts: u8) {
-        self.location_attempts = attempts;
-    }
 }
 
 // ── iOS implementation ──────────────────────────────────────────────────
 //
-// Compass and theme are still the next unit of work and are `None` here. The
-// location service is not: it is the same `os_location` provider the desktop
-// bridge uses, because CoreLocation is the same API on both.
+// Compass and theme are still the next unit of work and are `None` here.
+// Location is the facade's business since WO-RL-4: `create_location()` below
+// hands iOS the same `OsBackend` the desktop gets, whose arm table selects
+// `apple` — CoreLocation is the same API on both. (The provider used to be
+// brought up from this bridge's `set_redraw_waker`; the note about
+// constructing CoreLocation before `UIApplicationMain` has run lives on
+// `OsBackend::set_wake`'s path now and is unchanged in substance: the main
+// thread is still the main thread, and the callbacks CoreLocation schedules
+// are delivered once UIKit starts spinning the loop.)
 //
 // There is no insets querier and must not be one: egui-winit already fills
 // `RawInput::safe_area_insets` on iOS. Android's side channel works around a
@@ -701,11 +358,6 @@ pub struct IosPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    /// The same [`OsLocation`] the desktop bridge holds, running the same
-    /// provider: `os_location`'s arm table selects `apple` for macOS and iOS
-    /// alike, because `CLLocationManager` is the same API on both. What differs
-    /// between the two platforms lives inside that file.
-    os_location: OsLocation,
     redraw_waker: RedrawWaker,
 }
 
@@ -723,7 +375,6 @@ impl IosPlatform {
             back_handler: None,
             zone_cache_dir: Self::sandbox_subdir("Library/Caches/rustdar/zones"),
             config_dir: Self::sandbox_subdir("Library/Application Support/rustdar"),
-            os_location: OsLocation::new(),
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -739,13 +390,6 @@ impl IosPlatform {
 impl PlatformBridge for IosPlatform {
     fn poll_theme(&mut self) -> Option<bool> {
         None
-    }
-
-    /// One source, so no [`prefer_fix`](rustdar_location::prefer_fix): iOS
-    /// has no serial port to plug a dongle into and the `gps-serial` feature is
-    /// not compiled here at all.
-    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix> {
-        self.os_location.poll_fix()
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -800,66 +444,14 @@ impl PlatformBridge for IosPlatform {
         false
     }
 
-    /// Brings CoreLocation up; see [`OsLocation::start`].
-    ///
-    /// One thing is genuinely different here and it is upstream of this call:
-    /// this bridge is constructed before `UIApplicationMain` has run, so there
-    /// is no `UIApplication` and no *running* run loop when the provider is
-    /// built. Neither is required to build one — the main thread is still the
-    /// main thread — and the callbacks CoreLocation schedules are delivered
-    /// once UIKit starts spinning the loop a few milliseconds later.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
         self.redraw_waker = waker;
-        self.os_location.start(&self.redraw_waker);
     }
 
-    // ── Platform location service ───────────────────────────────────────
-    //
-    // The same forwards `DesktopPlatform` writes, to the same [`OsLocation`],
-    // running the same provider.
-
-    fn location_settings_available(&self) -> bool {
-        use rustdar_location::os_location::OsLocationProvider as _;
-        rustdar_location::os_location::OsLocationReader::settings_available()
-    }
-
-    fn open_location_settings(&mut self) {
-        self.os_location.open_settings();
-    }
-}
-
-#[cfg(target_os = "ios")]
-impl rustdar_location::LocationBridge for IosPlatform {
     fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>> {
         self.config_dir
             .clone()
             .map(|dir| Box::new(crate::kv::FileKvStore::new(dir)) as Box<_>)
-    }
-
-    fn location_permission(&self) -> rustdar_location::LocationPermission {
-        self.os_location.permission()
-    }
-
-    fn request_location(&mut self) -> bool {
-        self.os_location.request()
-    }
-
-    fn stop_location(&mut self) {
-        self.os_location.stop();
-    }
-
-    /// Whether CoreLocation was asked to deliver — **not** whether it is
-    /// delivering.
-    ///
-    /// The gap is real and iOS-only: with no `UIBackgroundModes: location` in
-    /// `packaging/ios/Info.plist`, the OS stops delivering while the app is backgrounded
-    /// and gives no callback saying so, so this keeps reporting `true` and the
-    /// map keeps the last dot. The settings pane's fix-age line, which is timed
-    /// from arrival, is what tells the user the dot is stale. See the module
-    /// note in `os_location/apple.rs` for why the fix for that is not simply
-    /// setting `allowsBackgroundLocationUpdates`.
-    fn location_active(&self) -> bool {
-        self.os_location.active()
     }
 }
 
@@ -867,6 +459,25 @@ impl rustdar_location::LocationBridge for IosPlatform {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn create_platform() -> DesktopPlatform {
     DesktopPlatform::new()
+}
+
+/// Create the platform-appropriate location facade (WO-RL-4): the arm is
+/// per-OS and feature-fenced inside rustdar-location, and this crate — which
+/// turns the fences on per target — is the one place that knows which arm to
+/// build. Desktop and iOS share `OsBackend` (its arm table selects the
+/// provider); Android's JNI arm requires `rustdar_location::android::init`
+/// first, which `android_main` has already run by the time it builds an app.
+#[cfg(not(target_os = "android"))]
+pub fn create_location() -> rustdar_location::LocationFacade {
+    rustdar_location::LocationFacade::new(Box::new(rustdar_location::os_location::OsBackend::new()))
+}
+
+/// See the non-android arm above.
+#[cfg(target_os = "android")]
+pub fn create_location() -> rustdar_location::LocationFacade {
+    rustdar_location::LocationFacade::new(
+        Box::new(rustdar_location::android::AndroidBackend::new()),
+    )
 }
 
 #[cfg(target_os = "android")]
@@ -879,44 +490,6 @@ pub fn create_platform() -> IosPlatform {
     IosPlatform::new()
 }
 
-#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
-mod tests {
-    use super::*;
-    use rustdar_location::LocationBridge;
-    use rustdar_location::LocationPermission as P;
-
-    /// A bridge whose provider has not been built has nothing to report, and
-    /// `Unavailable` is the honest answer: it is the state the settings pane
-    /// renders as "not available on this platform", and the gate treats it as
-    /// terminal rather than spinning on "Checking…".
-    #[test]
-    fn a_bridge_with_no_provider_yet_reports_unavailable() {
-        let platform = DesktopPlatform::new();
-        assert_eq!(platform.location_permission(), P::Unavailable);
-        assert!(!platform.location_active());
-    }
-
-    /// The contract's first phase, pinned on whichever arm this host compiles.
-    ///
-    /// Two rules, and both have been got wrong by a provider already. Bringing
-    /// one up must **not** start delivering — that is `request_location`'s job
-    /// and the user's decision — and it must leave the bridge with something
-    /// the gate can act on, which `Unavailable` is not: the gate reads it as
-    /// terminal and never asks again, so a provider that came up and reported
-    /// nothing would be a location service the app could never turn on.
-    #[test]
-    fn bringing_a_provider_up_reports_a_state_and_delivers_nothing() {
-        let mut platform = DesktopPlatform::new();
-        platform.set_redraw_waker(RedrawWaker::new());
-
-        assert!(
-            !platform.location_active(),
-            "`start` delivered without anybody asking"
-        );
-        assert_eq!(
-            platform.location_permission() == P::Unavailable,
-            platform.os_location.provider.is_none(),
-            "`Unavailable` must mean no provider and nothing else"
-        );
-    }
-}
+// The two provider-contract tests that lived here moved to
+// `rustdar_location::os_location::backend` with the wiring they test
+// (WO-RL-4).

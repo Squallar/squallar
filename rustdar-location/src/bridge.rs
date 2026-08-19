@@ -5,10 +5,14 @@ use crate::permission::LocationPermission;
 /// widening what the gate can do to a user; the gate's one-prompt-line
 /// discipline is the reason it is narrow.
 ///
-/// The app-side platform trait declares this as a supertrait, so every
-/// concrete bridge implements it and the gate receives the bridge by upcast
-/// coercion.
-pub trait LocationBridge {
+/// `pub(crate)` since WO-RL-4: the trait collapsed to the facade-internal
+/// seam between the gate and the provider arms. Its one production
+/// implementor is the facade's `GateSeam` adapter (the provider answers five
+/// of the six; the app-passed kv closure answers the last); the test
+/// implementor is `GateDouble`. Nothing outside this crate implements it —
+/// the old app-side supertrait arrangement (RL-2) died with the
+/// `PlatformBridge` location verbs.
+pub(crate) trait LocationBridge {
     /// What the OS currently says about this app's access to the user's
     /// location.
     ///

@@ -657,14 +657,19 @@ fn escape_with_nothing_open_still_exits() {
 // `app_render`'s tests rely on.
 
 /// An `App` with no GPU behind it, wired the way `App::new` wires one.
-pub(super) fn headless(platform: TestBridge) -> App {
+pub(super) fn headless(mut platform: TestBridge) -> App {
     crate::test_sites::install();
+    // The facade over the bridge's own arm double, wired the way the entry
+    // points wire the real arms (WO-RL-4) — the test's records keep working
+    // on both sides of the split.
+    let location = rustdar_location::LocationFacade::new(Box::new(platform.location_provider()));
     App::with_instance(
         egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::empty(),
             ..instance_descriptor()
         }),
         Box::new(platform),
+        location,
     )
 }
 
@@ -1073,8 +1078,8 @@ fn a_revoked_permission_leaves_a_serial_dongles_dot_alone() {
     let location = bridge.location_record();
     let mut app = headless(bridge);
     app.poll_platform_state();
-    app.platform
-        .start_gps(&rustdar_nmea_serial::SerialConfig::default());
+    app.location
+        .start_serial(&rustdar_nmea_serial::SerialConfig::default());
     app.user_gps = Some((
         rustdar_location::Fix::from_lat_lon(35.25, -97.5),
         web_time::Instant::now(),
@@ -1957,10 +1962,12 @@ fn the_menus_exit_goes_through_the_same_gate() {
 /// before it needs a renderer.
 #[test]
 fn the_platforms_sensors_reach_the_map() {
-    let mut app = headless(TestBridge::android());
-    let (fix_tx, fix_rx) = std::sync::mpsc::channel();
+    let mut bridge = TestBridge::android();
+    // The fix channel feeds the facade's arm (WO-RL-4); the heading channel
+    // still feeds the bridge.
+    let fix_tx = bridge.gps_channel();
+    let mut app = headless(bridge);
     let (heading_tx, heading_rx) = std::sync::mpsc::channel();
-    app.set_gps_fix_receiver(fix_rx);
     app.set_heading_receiver(heading_rx);
 
     fix_tx
@@ -2852,10 +2859,10 @@ fn starting_gps_hands_the_bridge_the_config_the_action_carried() {
         None,
     );
 
-    assert!(app.platform.gps_active(), "the reader was never started");
+    assert!(app.location.serial_active(), "the reader was never started");
     {
         let record = started.borrow();
-        let config = record.as_ref().expect("start_gps was not reached");
+        let config = record.as_ref().expect("start_serial was not reached");
         assert_eq!(
             config.port_path.as_deref(),
             Some("/dev/ttyPROBE"),
@@ -2866,7 +2873,7 @@ fn starting_gps_hands_the_bridge_the_config_the_action_carried() {
 
     app.handle_gui_action(GuiAction::StopGps, None);
     assert!(
-        !app.platform.gps_active(),
+        !app.location.serial_active(),
         "the reader kept the serial port open after being told to stop",
     );
 }

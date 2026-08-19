@@ -65,12 +65,14 @@
 //!
 //! [`PlatformBridge`]: rustdar_frontend::platform::PlatformBridge
 
-pub mod geolocation;
+// `geolocation` moved to `rustdar_location::web` at WO-RL-4 (seam ruling 6:
+// every remote location arm lives in the facade); `entry` hands the app a
+// `WebBackend` inside its LocationFacade.
 pub mod kv;
 
 /// How long the page waits before starting another rasterization worker.
 ///
-/// Not wasm32-gated, for the reason `kv` and `geolocation` are not:
+/// Not wasm32-gated, for the reason `kv` is not:
 /// the ladder is pure arithmetic, `worker_port` is gated, and a retry policy
 /// that only a browser can walk is a retry policy no test ever checks.
 pub mod worker_retry;
@@ -100,3 +102,42 @@ pub mod worker_protocol;
 pub use entry::start;
 #[cfg(target_arch = "wasm32")]
 pub use worker::rustdar_worker_main;
+
+#[cfg(test)]
+mod entry_probes {
+    // Relocated from the geolocation module when the browser arm moved to
+    // `rustdar_location::web` (WO-RL-4). Lives HERE, in the ungated crate
+    // root, because `entry` itself is wasm-gated and a probe inside it would
+    // never compile on the host — where every test in this crate runs.
+
+    /// **The audited defect, pinned at the one place it was written.**
+    ///
+    /// `entry::start` used to open a channel and call the geolocation watch on
+    /// it before the first frame, so the browser's permission dialog appeared
+    /// on first paint, with no user gesture, before the page had shown the
+    /// user anything. `watchPosition` *is* the prompt on this platform: there
+    /// is no way to start a watch quietly, which is why the only defence is
+    /// not calling it — and why the assertion is about the entry point's
+    /// source rather than about a flag somebody could set.
+    ///
+    /// The prompt now happens from the facade's web arm
+    /// (`rustdar_location::web::WebBackend::request`), which the gate reaches
+    /// only from a state that licenses one. Constructing the backend is fine —
+    /// its permission QUERY prompts nobody — so `WebBackend::new` is not on
+    /// the needle list; the verbs that subscribe are.
+    #[test]
+    fn nothing_asks_the_browser_for_a_position_at_page_load() {
+        let entry = include_str!("entry.rs");
+        let start = entry
+            .find("pub fn start()")
+            .map(|i| &entry[i..])
+            .expect("entry::start is gone");
+        for asked in ["watch_position", "start_watch", "request_location"] {
+            assert!(
+                !start.contains(asked),
+                "the browser entry point calls {asked} at boot, so the page \
+                 prompts for location on first paint with no user gesture"
+            );
+        }
+    }
+}

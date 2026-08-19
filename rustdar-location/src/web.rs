@@ -1,11 +1,11 @@
-//! The browser's Geolocation and Permissions APIs standing in for the serial
-//! GPS reader and for an OS permission service.
+//! The browser arm of the facade: the Geolocation and Permissions APIs
+//! standing in for the serial GPS reader and for an OS permission service.
+//! Owned by rustdar-location since WO-RL-4 (seam ruling 6); `WebBackend`
+//! (wasm-only, below) is
+//! what rustdar-web's entry hands to the app inside a
+//! [`LocationFacade`](crate::LocationFacade).
 //!
-//! Nothing downstream is serial-aware: a source pushes into a `Sender<Fix>`
-//! and hands the `Receiver` to [`PlatformBridge::set_gps_fix_receiver`]. Android
-//! already does this over JNI.
-//!
-//! # What is in here and what is in `bridge.rs`
+//! # What is host-testable and what is wasm-only
 //!
 //! Everything below that decides *what a browser's answer means* is a plain
 //! function over plain values, compiled and tested on the host. Everything that
@@ -15,10 +15,8 @@
 //! longitude is silently valid, and the permission mapping has the same shape.
 //! Mapping `Unavailable` where `Prompt` belongs is a browser on which location
 //! never works again, and it throws nothing and logs nothing.
-//!
-//! [`PlatformBridge::set_gps_fix_receiver`]: rustdar_frontend::platform::PlatformBridge::set_gps_fix_receiver
 
-use rustdar_location::{Fix, LocationPermission};
+use crate::{Fix, LocationPermission};
 
 /// Build a [`Fix`] from a browser `GeolocationCoordinates`.
 ///
@@ -130,64 +128,37 @@ pub fn browser_permission(
     queried
 }
 
-/// The browser's IANA timezone, e.g. `"America/Denver"`.
-///
-/// `Intl.DateTimeFormat().resolvedOptions().timeZone` is the whole mechanism:
-/// no permission, no prompt, no network, and an answer before the first frame.
-/// It is the only "where is this user" signal a page gets for free, which is why
-/// it is worth the coarse resolution — see [`location_hint`] for what that
-/// resolution is and is not good for.
-///
-/// Reached through `js_sys::Reflect` rather than a typed `web_sys` binding
-/// because `ResolvedDateTimeFormatOptions` is an anonymous object in the spec
-/// and `web_sys` exposes it as a bare `Object`.
-///
-/// [`location_hint`]: rustdar_frontend::location_hint
-#[cfg(target_arch = "wasm32")]
-pub fn browser_timezone() -> Option<String> {
-    use wasm_bindgen::JsValue;
-
-    let resolved = js_sys::Intl::DateTimeFormat::default().resolved_options();
-    let zone = js_sys::Reflect::get(&resolved, &JsValue::from_str("timeZone")).ok()?;
-    // A browser too old for the `timeZone` key returns `undefined`, whose
-    // `as_string` is `None` — the same miss as any other absent value.
-    let zone = zone.as_string()?;
-    // An empty string is not a zone, and would otherwise reach the anchor table
-    // as a lookup that misses in a way that looks deliberate.
-    (!zone.is_empty()).then_some(zone)
-}
-
 // ── The browser half ────────────────────────────────────────────────────
 //
 // Everything below talks to `web_sys` and exists only on wasm32. The decisions
 // it makes are all delegated to the plain functions above.
 
-/// The app's redraw waker, behind a slot the bridge refills.
+/// The app's wake, behind a slot the facade refills.
 ///
-/// `PlatformBridge::set_redraw_waker` is called from `App::with_instance`, i.e.
-/// *after* `WebPlatform::new` has already started the permission query — so a
-/// waker captured at construction would be a private empty one that the app's
-/// later install never reaches. `RedrawWaker` is itself a shared slot, but
-/// installing a *different* waker replaces the handle rather than filling it,
-/// which is why this second indirection is needed and the type's own one is not
-/// enough.
+/// The facade's `set_wake` arrives from the app *after* [`WebBackend::new`]
+/// has already started the permission query — so a wake captured at
+/// construction would be an empty one that the app's later install never
+/// reaches. `None` (before the install) is a no-op wake: nothing can be
+/// looking at a frame that early.
 #[cfg(target_arch = "wasm32")]
-pub type SharedWaker = std::rc::Rc<std::cell::RefCell<rustdar_frontend::platform::RedrawWaker>>;
+pub(crate) type SharedWake = std::rc::Rc<std::cell::RefCell<Option<crate::Wake>>>;
 
 /// The cell every browser callback writes the permission state into.
 #[cfg(target_arch = "wasm32")]
-pub type PermissionCell = std::rc::Rc<std::cell::Cell<LocationPermission>>;
+pub(crate) type PermissionCell = std::rc::Rc<std::cell::Cell<LocationPermission>>;
 
 /// Ask for a frame, without holding the borrow across the call.
 ///
-/// `wake` ends in `Window::request_redraw`, which on this backend is
+/// The wake ends in `Window::request_redraw`, which on this backend is
 /// `requestAnimationFrame` and re-enters nothing here — but a `RefCell` borrow
 /// held across a callback into the app is the kind of thing that becomes a panic
 /// two refactors later, and the clone is a pointer copy.
 #[cfg(target_arch = "wasm32")]
-fn wake(waker: &SharedWaker) {
-    let waker = waker.borrow().clone();
-    waker.wake();
+fn wake(waker: &SharedWake) {
+    let wake = waker.borrow().clone();
+    if let Some(wake) = wake {
+        wake();
+    }
 }
 
 /// `navigator.geolocation`, if this page can ever have a position at all.
@@ -197,13 +168,13 @@ fn wake(waker: &SharedWaker) {
 /// the same window, because it is a property of the *page* rather than of the
 /// object.
 #[cfg(target_arch = "wasm32")]
-pub fn geolocation() -> Option<web_sys::Geolocation> {
+pub(crate) fn geolocation() -> Option<web_sys::Geolocation> {
     web_sys::window().and_then(|w| w.navigator().geolocation().ok())
 }
 
 /// Whether the page is a secure context. See [`browser_permission`].
 #[cfg(target_arch = "wasm32")]
-pub fn is_secure_context() -> bool {
+pub(crate) fn is_secure_context() -> bool {
     // A page with no `window` has already failed harder than this; `false` keeps
     // the answer on the conservative side of a state nothing can reach.
     web_sys::window().is_some_and(|w| w.is_secure_context())
@@ -237,7 +208,7 @@ pub fn is_secure_context() -> bool {
 /// drops fields, so the order is structural rather than a convention someone has
 /// to remember.
 #[cfg(target_arch = "wasm32")]
-pub struct LocationWatch {
+pub(crate) struct LocationWatch {
     /// The same object `watchPosition` was called on. `clearWatch` ids are
     /// scoped to it, and holding it is what lets [`Drop`] cancel without going
     /// back through `window()`.
@@ -262,7 +233,7 @@ impl Drop for LocationWatch {
 /// Start watching the browser's position, pushing every reading into `sender`.
 ///
 /// **Not called at page load.** It is called from
-/// `WebPlatform::request_location`, which the gate reaches only from a state
+/// `WebBackend::request`, which the gate reaches only from a state
 /// that licenses a prompt — because on the web this call *is* the prompt, and
 /// prompting on first paint with no user gesture is the audited defect this
 /// whole path exists to fix. A page that has never been granted location now
@@ -290,11 +261,11 @@ impl Drop for LocationWatch {
 /// `request_redraw` on the web backend is `requestAnimationFrame`, so this is
 /// one frame per reading, not a poll.
 #[cfg(target_arch = "wasm32")]
-pub fn watch_position(
+pub(crate) fn watch_position(
     geolocation: &web_sys::Geolocation,
     sender: std::sync::mpsc::Sender<Fix>,
     permission: PermissionCell,
-    waker: SharedWaker,
+    waker: SharedWake,
 ) -> Option<LocationWatch> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::Closure;
@@ -370,7 +341,7 @@ pub fn watch_position(
 /// `change`. Holding it in the wasm heap is what keeps the subscription alive,
 /// and it is also what [`Drop`] needs in order to take the handler off again.
 #[cfg(target_arch = "wasm32")]
-pub struct PermissionWatch {
+pub(crate) struct PermissionWatch {
     status: web_sys::PermissionStatus,
     /// Held for the same reason [`LocationWatch`]'s are.
     _on_change: wasm_bindgen::prelude::Closure<dyn FnMut()>,
@@ -407,10 +378,10 @@ impl Drop for PermissionWatch {
 /// foreground and the settings window closed is noticed by *nothing else*. One
 /// event listener closes that gap for the whole platform.
 #[cfg(target_arch = "wasm32")]
-pub fn query_permission(
+pub(crate) fn query_permission(
     permission: PermissionCell,
     subscription: std::rc::Rc<std::cell::RefCell<Option<PermissionWatch>>>,
-    waker: SharedWaker,
+    waker: SharedWake,
 ) {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::JsValue;
@@ -491,7 +462,7 @@ pub fn query_permission(
 fn adopt_state(
     status: &web_sys::PermissionStatus,
     permission: &PermissionCell,
-    waker: &SharedWaker,
+    waker: &SharedWake,
 ) {
     use wasm_bindgen::JsValue;
 
@@ -508,10 +479,174 @@ fn adopt_state(
     wake(waker);
 }
 
+/// The browser arm: the permission cell, its `change` subscription, and the
+/// live watch — the location half of rustdar-web's old `WebPlatform`,
+/// collapsed into the facade at WO-RL-4.
+#[cfg(target_arch = "wasm32")]
+pub struct WebBackend {
+    /// Fixes pushed by the geolocation watch. `None` until the watch starts.
+    fixes: Option<std::sync::mpsc::Receiver<Fix>>,
+    /// `navigator.geolocation`, resolved once. `None` is the permanent
+    /// [`Unavailable`](LocationPermission::Unavailable) half of
+    /// [`browser_permission`].
+    geolocation: Option<web_sys::Geolocation>,
+    /// Whether the page is a secure context, read once — it cannot change for
+    /// the life of a document.
+    secure_context: bool,
+    /// What `navigator.permissions.query` has produced so far.
+    ///
+    /// Behind an `Rc<Cell<_>>` because three different browser callbacks write
+    /// it and none of them can hold a `&mut WebBackend`: the query's promise
+    /// resolution, the `PermissionStatus` `change` event, and `watchPosition`'s
+    /// error callback. `permission` is a `&self` getter on the frame path,
+    /// which a `Cell` serves without a lock — the same constraint that makes
+    /// Windows' arm an `AtomicI32`, one thread down.
+    permission: PermissionCell,
+    /// The `change` subscription, once the query has settled.
+    ///
+    /// Underscored because holding it *is* its job: the async task that fills
+    /// it drops its own handle when it finishes, so this is the reference that
+    /// keeps the `PermissionStatus` and its handler alive for the life of the
+    /// page. See [`PermissionWatch`].
+    _permission_watch: std::rc::Rc<std::cell::RefCell<Option<PermissionWatch>>>,
+    /// The live `watchPosition`, or `None` when nothing is being delivered.
+    /// Dropping it is what `stop` does.
+    watch: Option<LocationWatch>,
+    /// The app's wake, behind a slot the browser callbacks share. See
+    /// [`SharedWake`].
+    waker: SharedWake,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Default for WebBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebBackend {
+    pub fn new() -> Self {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let permission: PermissionCell = Rc::new(Cell::new(LocationPermission::Unknown));
+        let permission_watch = Rc::new(RefCell::new(None));
+        let waker: SharedWake = Rc::new(RefCell::new(None));
+
+        // Started here rather than lazily, and it is the whole reason the app
+        // can be honest about location on the first frame: the query asks what
+        // the browser already knows *without prompting*, so a user who granted
+        // location on a previous visit gets a blue dot and no dialog, and one
+        // who refused gets told so rather than being asked again.
+        query_permission(
+            Rc::clone(&permission),
+            Rc::clone(&permission_watch),
+            Rc::clone(&waker),
+        );
+
+        Self {
+            fixes: None,
+            geolocation: geolocation(),
+            secure_context: is_secure_context(),
+            permission,
+            _permission_watch: permission_watch,
+            watch: None,
+            waker,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl crate::LocationProvider for WebBackend {
+    /// The composition is [`browser_permission`]'s; see it for why each
+    /// fallback is the state it is.
+    ///
+    /// Cheap by the gate seam's contract: two reads of `Copy` fields and a
+    /// `Cell` load. The Promise, the `change` event and the watch's error
+    /// callback all resolve *into* that cell on their own schedule.
+    fn permission(&self) -> LocationPermission {
+        browser_permission(
+            self.geolocation.is_some(),
+            self.secure_context,
+            self.permission.get(),
+        )
+    }
+
+    /// Start delivering, prompting if the browser needs to.
+    ///
+    /// On the web the ask and the subscription are the same call — there is no
+    /// way to prompt without also subscribing — which is why the gate seam has
+    /// one method and not two.
+    ///
+    /// The `bool` is the honest one for this platform: `true` means the watch
+    /// was registered, not that the user agreed. A refusal arrives later on the
+    /// error callback, which writes `Denied` into the same cell
+    /// [`permission`](Self::permission) reads. `false` is reserved for the
+    /// watch failing to register at all, which leaves the gate free to retry
+    /// within its bound.
+    fn request(&mut self) -> bool {
+        let Some(geolocation) = self.geolocation.as_ref() else {
+            return false;
+        };
+        // Idempotent: the gate calls this from the `Granted` arm on every poll
+        // until `active` agrees, and a second `watchPosition` would be a
+        // second subscription with the first one leaked.
+        if self.watch.is_some() {
+            return true;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let Some(watch) = watch_position(
+            geolocation,
+            sender,
+            std::rc::Rc::clone(&self.permission),
+            std::rc::Rc::clone(&self.waker),
+        ) else {
+            return false;
+        };
+        self.watch = Some(watch);
+        self.fixes = Some(receiver);
+        true
+    }
+
+    /// Really stops, because [`LocationWatch`] really cancels.
+    ///
+    /// The alternative — `forget()`ing the watch's closures and making this a
+    /// documented no-op — was rejected once the settings pane grew a **Turn
+    /// off** button: the gate calls this from that button, from the revocation
+    /// arm and from the app's own disabled switch, and a no-op would leave the
+    /// browser's location indicator lit and the dot moving after the user had
+    /// said stop three different ways.
+    fn stop(&mut self) {
+        // The receiver goes with the watch. Leaving it would let `poll_fix`
+        // hand the app one more reading that arrived between the last frame and
+        // the cancel, which is a dot re-appearing after the user turned it off.
+        self.fixes = None;
+        if self.watch.take().is_some() {
+            log::info!("browser location updates stopped");
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.watch.is_some()
+    }
+
+    fn poll_fix(&mut self) -> Option<Fix> {
+        self.fixes.as_ref().and_then(crate::provider::drain_latest)
+    }
+
+    /// Fills the slot every browser callback wakes through. Arrives from the
+    /// app after [`WebBackend::new`] has already started the permission query
+    /// — the reason [`SharedWake`] is a refillable slot.
+    fn set_wake(&mut self, wake: crate::Wake) {
+        *self.waker.borrow_mut() = Some(wake);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_location::FixQuality;
+    use crate::FixQuality;
 
     /// Nothing downstream would notice a transposition: both are plain `f64` and
     /// a swapped pair is a valid location, just the wrong one.
@@ -676,95 +811,68 @@ mod tests {
 
     // ── What the browser half does with all of that ─────────────────────
     //
-    // `entry.rs` and `bridge.rs` are `#[cfg(target_arch = "wasm32")]` and there
-    // is no wasm test runner in this repo, so the three properties below are
-    // pinned by source probes. Same technique the frontend uses for claims about
-    // code only a frame can reach (`app_chunks.rs`), and the same one this
-    // crate's `tests/pwa_assets.rs` already uses to read `src/worker_port.rs`.
-    // Each of these three has a failure mode that is silent on a device.
+    // The `web_sys` half above is `#[cfg(target_arch = "wasm32")]` and there
+    // is no wasm test runner in this repo, so the two properties below are
+    // pinned by source probes over this file's own shipped half. Same
+    // technique the app side uses for claims about code only a frame can
+    // reach. Each has a failure mode that is silent on a device. (The third
+    // probe of this family — that the page's entry point never starts a watch
+    // at boot — is ABOUT rustdar-web's entry source and stayed there when the
+    // arm moved in at WO-RL-4.)
 
-    /// **The audited defect, pinned at the one place it was written.**
-    ///
-    /// `entry::start` used to open a channel and call the geolocation watch on
-    /// it before the first frame, so the browser's permission dialog appeared on
-    /// first paint, with no user gesture, before the page had shown the user
-    /// anything. `watchPosition` *is* the prompt on this platform: there is no
-    /// way to start a watch quietly, which is why the only defence is not
-    /// calling it — and why the assertion is about the entry point's source
-    /// rather than about a flag somebody could set.
-    ///
-    /// The prompt now happens from `WebPlatform::request_location`, which
-    /// `rustdar_location::LocationGate` reaches only from a state that
-    /// licenses one.
-    #[test]
-    fn nothing_asks_the_browser_for_a_position_at_page_load() {
-        let entry = include_str!("entry.rs");
-        let start = entry
-            .find("pub fn start()")
-            .map(|i| &entry[i..])
-            .expect("entry::start is gone");
-        for asked in ["watch_position", "start_watch", "request_location"] {
-            assert!(
-                !start.contains(asked),
-                "the browser entry point calls {asked} at boot, so the page \
-                 prompts for location on first paint with no user gesture"
-            );
-        }
+    /// This file's shipped half, sliced at the test module — and not only for
+    /// tidiness: these probes name the calls they are looking for, so a
+    /// whole-file search would find its own needles and pass for ever.
+    fn shipped() -> &'static str {
+        include_str!("web.rs")
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("the test module marker moved")
     }
 
-    /// The three fallbacks above are only worth anything if the bridge routes
-    /// its answer through them. A `location_permission` that read the cell
-    /// directly would report `Unknown` on a browser with no Permissions API and
-    /// wait for ever, and the tests here would all still pass.
+    /// The three fallbacks above are only worth anything if the arm routes
+    /// its answer through them. A `permission` that read the cell directly
+    /// would report `Unknown` on a browser with no Permissions API and wait
+    /// for ever, and the tests here would all still pass.
     #[test]
-    fn the_bridge_reports_the_permission_this_module_maps() {
-        let bridge = include_str!("bridge.rs");
-        let query = bridge
-            .find("fn location_permission(")
-            .map(|i| &bridge[i..])
-            .expect("WebPlatform::location_permission is gone");
+    fn the_arm_reports_the_permission_this_module_maps() {
+        let query = shipped()
+            .find("fn permission(&self)")
+            .map(|i| &shipped()[i..])
+            .expect("WebBackend::permission is gone");
         assert!(
-            query.contains("geolocation::browser_permission("),
-            "the web bridge answers the permission question without the \
+            query.contains("browser_permission("),
+            "the web arm answers the permission question without the \
              fallbacks, so a browser with no Permissions API is dead and \
              nothing here would notice"
         );
     }
 
     /// The closure-ownership decision, made visible. The settings pane has a
-    /// **Turn off** button wired through `stop_location`, and the gate calls the
-    /// same method on a revocation — so a version that kept `forget()` and let
-    /// this be a no-op would leave the browser's location indicator lit and the
-    /// dot moving after the user had said stop three different ways.
+    /// **Turn off** button wired through the gate's stop, and the gate calls
+    /// the same verb on a revocation — so a version that kept `forget()` and
+    /// let this be a no-op would leave the browser's location indicator lit
+    /// and the dot moving after the user had said stop three different ways.
     #[test]
     fn turning_location_off_really_cancels_the_watch() {
-        let bridge = include_str!("bridge.rs");
-        let stop = bridge
-            .find("fn stop_location(")
-            .map(|i| &bridge[i..])
-            .expect("WebPlatform::stop_location is gone");
+        let stop = shipped()
+            .find("fn stop(&mut self)")
+            .map(|i| &shipped()[i..])
+            .expect("WebBackend::stop is gone");
         assert!(
             stop.contains("self.watch.take()"),
-            "stop_location does not drop the watch, so the off switch does not \
+            "stop does not drop the watch, so the off switch does not \
              switch anything off"
         );
 
-        // Sliced at the test module, and not only for tidiness: this probe
-        // names the call it is looking for, so a whole-file search would find
-        // its own needle and pass for ever.
-        let source = include_str!("geolocation.rs");
-        let shipped = source
-            .split_once("#[cfg(test)]")
-            .map(|(before, _)| before)
-            .expect("the test module marker moved");
         assert!(
-            !shipped.contains(&format!(".{}()", "forget")),
+            !shipped().contains(&format!(".{}()", "forget")),
             "a browser callback was leaked with forget(), which is what made \
              cancelling the watch unsafe in the first place"
         );
-        let drop_impl = shipped
+        let drop_impl = shipped()
             .find("impl Drop for LocationWatch")
-            .map(|i| &shipped[i..])
+            .map(|i| &shipped()[i..])
             .expect("LocationWatch stopped cancelling itself");
         assert!(
             drop_impl.contains("clear_watch"),

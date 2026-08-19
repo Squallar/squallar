@@ -60,6 +60,11 @@ rustdar-radar = { workspace = true }
 walkers = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# The facade's JNI location arm (`rustdar_location::android`), which
+# `android_main` initialises once through `rustdar_location::android::init`
+# and hands to the app inside its LocationFacade (WO-RL-4). Feature-unions
+# with the base entry, like winit's below.
+rustdar-location = { workspace = true, features = ["android-provider"] }
 android_logger = "=0.15.1"
 # The JNI layer in `src/android/`. NB: no `ndk-context`. That module tree
 # deliberately does not use it -- android-activity 0.6 registers
@@ -128,10 +133,12 @@ rustdar-location = { workspace = true, features = ["os-providers"] }
 # One dep to add and nothing else: `jni` 0.22 is `default = []` and pure Rust,
 # and everything else the android modules read -- log, rustdar-location,
 # rustdar-geo, rustdar-frontend -- is already an unconditional dependency of
-# this crate since the fold. It does not replace the cargo-ndk job:
-# `android_main`, the winit Android backend and the linked `.so` are still only
-# exercised there.
-jni-typecheck = ["dep:jni"]
+# this crate since the fold. Forwards to rustdar-location's feature of the
+# same name since WO-RL-4, so the facade's JNI arm (the location half that
+# moved out) is type-checked in the same pass. It does not replace the
+# cargo-ndk job: `android_main`, the winit Android backend and the linked
+# `.so` are still only exercised there.
+jni-typecheck = ["dep:jni", "rustdar-location/jni-typecheck"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Android's theme is a JNI call injected by the android module

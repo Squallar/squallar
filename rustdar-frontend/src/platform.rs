@@ -67,7 +67,7 @@ type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 ///
 /// # Why a slot, and why it empties
 ///
-/// `DesktopPlatform::start_gps`, `android_main` and the browser entry all hand
+/// The facade's serial/OS arms, `android_main` and the browser entry all hand
 /// their producer a waker while `App::window` is still `None`, so a snapshot of
 /// the window would be a snapshot of nothing. Every handle is a clone of one
 /// `Arc`, so filling the slot in `create_window` reaches producers that took
@@ -263,62 +263,12 @@ where
     Ok(receiver)
 }
 
-/// The four calls a bridge needs to serve the location half of
-/// [`PlatformBridge`], as plain `fn` pointers.
-///
-/// The same inversion [`PlatformBridge::set_theme_detector`] uses, and for the
-/// same reason: on Android all four are JNI calls, and JNI stays confined to
-/// the `rustdar` crate's cfg(android) modules — this trait must compile for
-/// targets that have never heard of JNI, so the calls are injected rather than
-/// named (the full rule lives in `rustdar/src/android/mod.rs`).
-///
-/// **One setter carrying all four, not four setters.** A half-installed set has
-/// no symptom: a bridge with `query` but no `request` reports `Prompt` forever
-/// and never asks, which is indistinguishable from a user who has not been
-/// asked yet. Making it impossible to install half is cheaper than detecting
-/// it.
-///
-/// `fn` pointers rather than boxed closures because nothing here captures — the
-/// Android side reads process-wide statics — and because a `Box<dyn
-/// PlatformBridge>` cannot hold a generic method.
-#[derive(Clone, Copy)]
-pub struct LocationHooks {
-    /// Backs [`rustdar_location::LocationBridge::location_permission`].
-    ///
-    /// The `u8` is the attempt count last handed to
-    /// [`rustdar_location::LocationBridge::set_location_attempts`], passed *in* rather than
-    /// stashed in a second global on the far side. Android's answer genuinely
-    /// depends on it — see that method for the tri-state — and a value the hook
-    /// reads out of its own static is a value that can be stale, that has no
-    /// compile-time obligation to be installed, and whose absence looks exactly
-    /// like "this install has never asked". As a parameter it is none of those.
-    pub query: fn(u8) -> rustdar_location::LocationPermission,
-    /// Backs [`rustdar_location::LocationBridge::request_location`]; see the honesty note there
-    /// before believing the `bool`.
-    pub request: fn() -> bool,
-    /// Backs [`rustdar_location::LocationBridge::stop_location`].
-    pub stop: fn(),
-    /// Backs [`rustdar_location::LocationBridge::location_active`].
-    pub active: fn() -> bool,
-}
-
-impl std::fmt::Debug for LocationHooks {
-    /// `fn` pointers have no useful rendering, and the only question anyone
-    /// asks of this struct is whether it was installed at all.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocationHooks").finish_non_exhaustive()
-    }
-}
-
 /// Platform-specific behavior abstracted behind a common trait.
 /// Keeps `#[cfg(target_os = "android")]` blocks out of `app.rs`.
-pub trait PlatformBridge: rustdar_location::LocationBridge {
+pub trait PlatformBridge {
     /// Poll for theme changes from the OS. Returns `Some(is_dark)` when
     /// a change is detected, `None` otherwise.
     fn poll_theme(&mut self) -> Option<bool>;
-
-    /// Poll for GPS fix updates. Returns the latest [`Fix`](rustdar_location::Fix) if available.
-    fn poll_gps_fix(&mut self) -> Option<rustdar_location::Fix>;
 
     /// Poll for compass heading updates. Returns degrees (0–360) if available.
     fn poll_heading(&mut self) -> Option<f32>;
@@ -381,9 +331,20 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// Set the config directory for UI config persistence.
     fn set_config_dir(&mut self, dir: std::path::PathBuf);
 
-    // `kv` — where blobs persist — is declared on the supertrait
-    // (`rustdar_location::LocationBridge`); UI-config persistence and the
-    // location gate's memo both reach it through there.
+    /// Where this platform persists small blobs — the UI config, the learned
+    /// site data, and (through the closure `App` passes to its
+    /// [`rustdar_location::LocationFacade`]) the location gate's memo — or
+    /// `None` if the platform has not been told where yet (Android learns its
+    /// data path only after startup).
+    ///
+    /// Returns a store rather than a directory so the trait carries no
+    /// filesystem assumption: a web bridge hands back a `localStorage`
+    /// backend, which has no path to return.
+    ///
+    /// Declared here again since WO-RL-4 — it lived on the
+    /// `rustdar_location::LocationBridge` supertrait between RL-2 and RL-4,
+    /// and that trait collapsed into the facade with the location verbs.
+    fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>>;
 
     /// This device's IANA timezone name, e.g. `"America/Denver"`.
     ///
@@ -432,10 +393,11 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// Called once from `App::with_instance`, which is before any window exists
     /// — deliberately, and it is why [`RedrawWaker`] is a slot rather than a
     /// window. A bridge that starts a producer at construction (Android's theme
-    /// poller, started from `set_theme_detector` during `android_main`) or on
-    /// demand from a UI action (`start_gps`) has nowhere else to get one: the
-    /// trait's other methods carry no window, and by the time `start_gps` is
-    /// called the waker has to already be in the bridge's hands.
+    /// poller, started from `set_theme_detector` during `android_main`) has
+    /// nowhere else to get one: the trait's other methods carry no window.
+    /// (`App` installs the same wake into its `LocationFacade` at the same
+    /// moment, for the same reason — the arms' producers push from their own
+    /// threads and callbacks.)
     ///
     /// A concrete type rather than `impl Fn()` because a `Box<dyn
     /// PlatformBridge>` cannot hold a generic method.
@@ -443,13 +405,6 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// Defaulted: iOS has no pollable channels yet, and the web bridge's one
     /// producer is wired by the entry point rather than by the bridge.
     fn set_redraw_waker(&mut self, _waker: RedrawWaker) {}
-
-    /// Set a receiver for GPS fix updates (Android only, no-op on desktop).
-    fn set_gps_fix_receiver(
-        &mut self,
-        _receiver: std::sync::mpsc::Receiver<rustdar_location::Fix>,
-    ) {
-    }
 
     /// Set a receiver for compass heading updates (Android only, no-op on desktop).
     fn set_heading_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<f32>) {}
@@ -474,71 +429,14 @@ pub trait PlatformBridge: rustdar_location::LocationBridge {
     /// Desktop and web answer `detect_dark_theme` themselves and ignore this.
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}
 
-    /// Start the desktop serial GPS reader (no-op on Android).
-    fn start_gps(&mut self, _config: &rustdar_nmea_serial::SerialConfig) {}
-
-    /// Stop the desktop serial GPS reader (no-op on Android).
-    fn stop_gps(&mut self) {}
-
-    /// Whether the desktop serial GPS reader is currently running.
-    fn gps_active(&self) -> bool {
-        false
-    }
-
-    // ── Platform location service ───────────────────────────────────────
+    // ── Location left this trait at WO-RL-4 ─────────────────────────────
     //
-    // A different question from the four `*_gps` methods above, and the split
-    // is the point. `start_gps` opens a serial port: a device the user plugged
-    // in and named. The location-service calls ask the operating system for a
-    // privilege it can withdraw without telling us — and the SIX of them the
-    // permission gate uses (`location_permission`, `request_location`,
-    // `stop_location`, `location_active`, `set_location_attempts`, `kv`) are
-    // declared on the supertrait, `rustdar_location::LocationBridge`, so the
-    // gate can take a bridge without this crate in the middle. What stays
-    // HERE is the settings-page pair, which is UI wiring rather than
-    // gate surface.
-
-    /// Whether this platform has a location settings page worth offering to
-    /// open.
-    ///
-    /// Asked once, at startup, and cached by the UI — the answer is a property
-    /// of the build, not of the permission state. Defaulted `false`, because
-    /// "there is a page" is a narrower claim than it sounds and the wrong answer
-    /// is a button that does nothing:
-    ///
-    /// * **Windows** answers `true`. `ms-settings:privacy-location` is a
-    ///   documented URI that `Launcher::LaunchUriAsync` opens with no HWND, no
-    ///   spawned process and no console flash.
-    /// * The **browser** has no such thing at all — permission lives in chrome
-    ///   the page cannot reach, and every browser puts it somewhere different.
-    /// * **Android** has one, but reaching it means an `Intent` with the app's
-    ///   own package URI, so it belongs with the rest of that bridge's JNI
-    ///   hooks rather than here.
-    ///
-    /// Only ever surfaced in the `Denied` state. Everywhere else there is
-    /// something better to offer — a button that asks, or nothing to fix.
-    fn location_settings_available(&self) -> bool {
-        false
-    }
-
-    /// Open the system location settings.
-    ///
-    /// Fire and forget, and deliberately not `-> bool`: the honest answer is
-    /// not knowable synchronously on the one platform that implements it, and
-    /// there is nothing the caller would do with a failure that the log line
-    /// does not already do better. Must not block — on Windows the launch goes
-    /// through the same worker thread the permission calls do.
-    ///
-    /// It is not a promise that Settings helps. A machine-wide policy can grey
-    /// the toggle out; the pane's wording says where to look, not what will be
-    /// there.
-    fn open_location_settings(&mut self) {}
-
-    /// Install the four location calls (Android only, no-op elsewhere).
-    ///
-    /// See [`LocationHooks`] for why they arrive together and why they are
-    /// injected at all.
-    fn set_location_hooks(&mut self, _hooks: LocationHooks) {}
+    // The entire location/gps verb family — the gate's six calls (RL-2's
+    // supertrait), the serial trio, the settings-page pair, the android
+    // fix-receiver/hooks injection — lives in `rustdar_location` now: `App`
+    // holds a `LocationFacade` directly and the platform shells construct its
+    // provider arm. Only `kv` came back up (above): where blobs persist is a
+    // platform question, not a location one.
 }
 
 #[cfg(test)]
@@ -571,7 +469,7 @@ mod tests {
 
     /// The reason this is a slot and not a window.
     ///
-    /// `DesktopPlatform::start_gps`, `android_main` and the browser entry all
+    /// The facade's serial/OS arms, `android_main` and the browser entry all
     /// hand a producer its waker while `App::window` is still `None`. A
     /// snapshot taken then would be a snapshot of nothing, and the producer
     /// would go on holding it for the life of the process.

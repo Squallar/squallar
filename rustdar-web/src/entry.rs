@@ -63,12 +63,15 @@ pub fn start() -> Result<(), JsValue> {
     // every later scan, scrub and loop frame back on this thread.
     crate::worker_port::attach();
 
-    // Nothing about location happens here. `WebPlatform::new` starts a
-    // *permission query*, which prompts nobody; `App::new` hands the bridge the
-    // waker its callbacks fire, and the watch waits for the gate. See the note
-    // above.
+    // Nothing about location happens here beyond construction.
+    // `WebBackend::new` starts a *permission query*, which prompts nobody;
+    // `App` hands the facade the wake its callbacks fire, and the watch waits
+    // for the gate. See the note above, and the boot probe in this file's
+    // tests.
     let platform = crate::bridge::WebPlatform::new(canvas);
-    let app = rustdar_frontend::app::App::new(Box::new(platform));
+    let location =
+        rustdar_location::LocationFacade::new(Box::new(rustdar_location::web::WebBackend::new()));
+    let app = rustdar_frontend::app::App::new(Box::new(platform), location);
 
     event_loop.spawn_app(app);
     Ok(())

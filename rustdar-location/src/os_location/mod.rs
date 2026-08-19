@@ -26,14 +26,18 @@
 //! them says anything about how that bridge does location.
 //!
 //! Since WO-RL-3 the arms live here in the facade rather than in the shell —
-//! every remote location arm belongs to rustdar-location (seam ruling 6). The
-//! `OsLocationReader`/`OsLocationProvider`/`OsLocationSink` seam is still
-//! `pub` only because the shell's `platform.rs` wiring drives it until WO-RL-4
-//! collapses that wiring into this crate.
+//! every remote location arm belongs to rustdar-location (seam ruling 6) —
+//! and since WO-RL-4 the shell's wiring does too: `OsBackend` (backend.rs, re-exported here) is the arm
+//! the desktop and iOS shells hand to the app, and the
+//! `OsLocationReader`/`OsLocationProvider`/`OsLocationSink` seam is
+//! crate-internal.
 
+mod backend;
 #[cfg(target_os = "linux")]
 mod linux;
 mod unsupported;
+
+pub use backend::OsBackend;
 
 /// CoreLocation, for macOS and iOS.
 ///
@@ -100,7 +104,7 @@ use apple as provider;
 )))]
 use unsupported as provider;
 
-pub use provider::OsLocationReader;
+pub(crate) use provider::OsLocationReader;
 
 // ── The provider contract ───────────────────────────────────────────────
 
@@ -113,10 +117,10 @@ pub use provider::OsLocationReader;
 /// `RedrawWaker` already guarantees — `rustdar-frontend` pins that with a
 /// `const` assertion — so requiring it here costs nothing and is what makes the
 /// clone legal.
-pub type RedrawWake = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+pub(crate) type RedrawWake = crate::provider::Wake;
 
 /// Announces a permission the app did not ask for.
-pub type ReportPermission =
+pub(crate) type ReportPermission =
     std::sync::Arc<dyn Fn(crate::LocationPermission) + Send + Sync + 'static>;
 
 /// The three ways a provider talks back to the app, and the only three.
@@ -130,7 +134,7 @@ pub type ReportPermission =
 /// `Clone` is load-bearing: a provider that can be stopped and started again
 /// needs to hand a fresh copy to each session it runs.
 #[derive(Clone)]
-pub struct OsLocationSink {
+pub(crate) struct OsLocationSink {
     /// Where fixes go. `DesktopPlatform` drains this alongside the serial
     /// reader's and picks between them; see [`crate::prefer_fix`].
     pub fixes: std::sync::mpsc::Sender<crate::Fix>,
@@ -200,7 +204,7 @@ pub struct OsLocationSink {
 ///
 /// [`Unknown`]: crate::LocationPermission::Unknown
 /// [`Prompt`]: crate::LocationPermission::Prompt
-pub trait OsLocationProvider: Sized {
+pub(crate) trait OsLocationProvider: Sized {
     /// Bring the provider up, prompting nobody and delivering nothing.
     ///
     /// `None` means this build or this machine has no location service to

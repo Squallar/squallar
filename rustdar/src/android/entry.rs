@@ -10,10 +10,6 @@ use super::back::{set_event_loop_proxy, take_back_press};
 use super::compass::{COMPASS_CLASS, start_compass_thread};
 use super::density::get_display_density;
 use super::insets::get_system_insets;
-use super::location::{
-    LOCATION_CLASS, location_active, request_location, start_location_thread, stop_location,
-};
-use super::permissions::location_permission_status;
 use super::task_to_back::move_task_to_back;
 use super::theme::detect_dark_theme;
 use super::{JavaContext, register_java_helper, set_java_context};
@@ -86,8 +82,12 @@ fn android_main(app: AndroidApp) {
             // it -- android-activity 0.6 registers `Activity.getApplication()`
             // there, and `getWindow` / `moveTaskToBack` / `requestPermissions`
             // do not exist on `Application`. See [`JAVA`].
-            match env.new_global_ref(&activity) {
-                Ok(global) => {
+            // Two global refs, one per context: a `Global` is an owned JNI
+            // reference (not `Clone` — dropping it deletes the ref), and the
+            // shell's helpers and the facade's arm release theirs
+            // independently at teardown.
+            match (env.new_global_ref(&activity), env.new_global_ref(&activity)) {
+                (Ok(global), Ok(location_global)) => {
                     // `JavaVM` is a handle onto a process-wide singleton, so the
                     // clone is the same VM this closure is attached through.
                     //
@@ -100,11 +100,16 @@ fn android_main(app: AndroidApp) {
                         vm: vm.clone(),
                         activity: global,
                     }));
+                    // The facade's JNI arm keeps its own context and registers
+                    // com.rustdar.LocationHelper itself (WO-RL-4: the facade
+                    // owns its env-attach helper and the classloader
+                    // registration; `deinit` below mirrors the teardown).
+                    rustdar_location::android::init(vm.clone(), location_global);
                 }
                 // Not fatal on its own -- TLS and the event loop still work --
                 // but insets, back-to-minimise and the location permission
                 // prompt are all gone, so say which.
-                Err(e) => log::error!(
+                (Err(e), _) | (_, Err(e)) => log::error!(
                     "Could not take a global ref to the Activity ({e:?}); \
                      window insets, back-to-minimise and the GPS permission \
                      prompt will be unavailable"
@@ -141,16 +146,9 @@ fn android_main(app: AndroidApp) {
                 let _ = COMPASS_CLASS.set(cls);
             }
 
-            // Holds the location-update subscription that keeps the providers
-            // producing fixes for the gps-location thread's poll. Registered
-            // here; actually *started* later, by the permission gate, once it
-            // sees the runtime permission granted. See `start_location_updates`
-            // and `request_location`.
-            if let Some(cls) =
-                register_java_helper(env, &loader, &activity, "com.rustdar.LocationHelper")
-            {
-                let _ = LOCATION_CLASS.set(cls);
-            }
+            // com.rustdar.LocationHelper is registered by
+            // `rustdar_location::android::init` above — the facade owns the
+            // location half of this JNI setup since WO-RL-4.
             Ok(())
         })
         .expect("Failed to attach JNI thread");
@@ -184,9 +182,12 @@ fn android_main(app: AndroidApp) {
     // consumed. See [`EVENT_LOOP_PROXY`].
     set_event_loop_proxy(Some(event_loop.create_proxy()));
 
-    // Create and run the platform app
-    let mut platform_app =
-        rustdar_frontend::app::App::new(Box::new(crate::platform::create_platform()));
+    // Create and run the platform app. The location facade's arm is the JNI
+    // one `rustdar_location::android::init` above prepared.
+    let mut platform_app = rustdar_frontend::app::App::new(
+        Box::new(crate::platform::create_platform()),
+        crate::platform::create_location(),
+    );
 
     // Wire up Android back button to minimize instead of exit
     platform_app.set_back_handler(move_task_to_back);
@@ -233,38 +234,17 @@ fn android_main(app: AndroidApp) {
     // light/dark switch; it also answers the initial query on the first frame.
     platform_app.set_theme_detector(detect_dark_theme);
 
-    // ...and the four location calls, for the same reason and by the same
-    // inversion. Since the fold, callee and caller share this crate -- the
-    // injection survives ON PURPOSE: it is the frontend portability contract,
-    // not a crate-graph workaround (the rule, in full, is in this module
-    // tree's doc -- see `android/mod.rs`; do not "simplify" these into direct
-    // calls from AndroidPlatform).
-    //
-    // All four at once, deliberately: a half-installed set has no symptom. A
-    // bridge with `query` and no `request` reports `Prompt` forever and never
-    // asks, which is indistinguishable from a user who has not been asked yet.
-    //
-    // Before `run_app`, so the window in which `AndroidPlatform` answers
-    // `Unavailable` for want of hooks closes before the first frame -- that
-    // answer is terminal, and a gate that saw it would stop polling for good.
-    platform_app.set_location_hooks(rustdar_frontend::platform::LocationHooks {
-        query: location_permission_status,
-        request: request_location,
-        stop: stop_location,
-        active: location_active,
-    });
+    // The location calls left this file at WO-RL-4: the facade's JNI arm
+    // (`rustdar_location::android`, initialised above) makes them directly,
+    // and its poll thread starts when the app installs its wake. The
+    // fn-pointer inversion below still governs insets, theme and back -- the
+    // rule, in full, is in this module tree's doc (`android/mod.rs`).
 
-    // Both threads below ask for the frame their value will be read on through
+    // The compass thread asks for the frame its value will be read on through
     // a handle that is *empty right now* -- the window does not exist until the
     // first `resumed()`, which is inside `run_app`. That is the whole reason it
-    // is a slot they share rather than a window handle each takes a copy of;
+    // is a slot rather than a window handle it takes a copy of;
     // see `rustdar_frontend::platform::RedrawWaker`.
-
-    // Start GPS location polling thread and wire it to the app
-    let (location_sender, location_receiver) = std::sync::mpsc::channel();
-    let location_waker = platform_app.redraw_waker();
-    start_location_thread(location_sender, move || location_waker.wake());
-    platform_app.set_gps_fix_receiver(location_receiver);
 
     // Start compass heading thread and wire it to the app
     let (heading_sender, heading_receiver) = std::sync::mpsc::channel();
@@ -287,6 +267,8 @@ fn android_main(app: AndroidApp) {
     // Same for the Activity context: from here until the next `android_main`
     // the object behind [`JAVA`] is a destroyed Activity, so let the global
     // ref go and let the helpers degrade to their documented defaults instead
-    // of calling into the corpse.
+    // of calling into the corpse. The facade's own context (WO-RL-4) is
+    // released the same way, for the same reason.
     set_java_context(None);
+    rustdar_location::android::deinit();
 }

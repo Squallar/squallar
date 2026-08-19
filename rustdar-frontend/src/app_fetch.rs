@@ -616,10 +616,10 @@ impl super::App {
                 self.handle_jump_to_live(pane_idx);
             }
             GuiAction::StartGps { config } => {
-                self.platform.start_gps(&config);
+                self.location.start_serial(&config);
             }
             GuiAction::StopGps => {
-                self.platform.stop_gps();
+                self.location.stop_serial();
             }
             // Through the gate in both directions, never straight at the
             // bridge. The gate is where the persisted memo lives and where the
@@ -627,10 +627,12 @@ impl super::App {
             // past it would be a second way to raise a permission dialog, with
             // none of the guards.
             GuiAction::RequestLocation => {
-                self.location.enable(self.platform.as_mut());
+                let platform = &self.platform;
+                self.location.enable(&|| platform.kv());
             }
             GuiAction::StopLocation => {
-                self.location.disable(self.platform.as_mut());
+                let platform = &self.platform;
+                self.location.disable(&|| platform.kv());
                 // The location facts reach the UI through the per-frame
                 // compose (`push_frame_inputs`), which reads the gate this
                 // click just changed.
@@ -638,16 +640,16 @@ impl super::App {
                 // The dot is fed by whatever was delivering. Nothing else will
                 // clear it — the gate has already stopped polling — so it goes
                 // here, and only when a serial dongle is not also feeding it.
-                if !self.platform.gps_active() {
+                if !self.location.serial_active() {
                     self.user_gps = None;
                 }
             }
-            // Straight at the bridge, and this is the one location action that
+            // Around the gate, and this is the one location action that
             // legitimately is. The gate exists to guard the single call that can
             // raise a permission dialog; opening a settings page raises nothing,
             // changes no state this crate owns, and has nothing to remember.
             GuiAction::OpenLocationSettings => {
-                self.platform.open_location_settings();
+                self.location.open_settings();
             }
         }
     }

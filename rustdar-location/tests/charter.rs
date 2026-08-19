@@ -1,7 +1,9 @@
 //! The crate's charter, held as tests: the facade's dependency discipline —
 //! a lean DEFAULT set for the vocabulary every consumer pays for, and named,
-//! feature-fenced allowances for the provider arms (WO-RL-3, seam ruling 6:
-//! "everything between 'where am I' and the operating system").
+//! feature-fenced allowances for the provider arms (WO-RL-3/RL-4, seam ruling
+//! 6: "everything between 'where am I' and the operating system"; amended in
+//! writing at RL-4 when the android/web arms came home and the parser dep
+//! became unconditional).
 //!
 //! The helpers read `cargo metadata --no-deps --format-version 1` from the
 //! workspace root. `packages[].dependencies` there are *declared*
@@ -87,6 +89,11 @@ fn the_dependency_ceiling_holds() {
     const DEFAULT_NORMAL: &[&str] = &[
         "rustdar-geo",
         "rustdar-kv",
+        // The parser and SerialConfig only (its default is off workspace-wide;
+        // the transport and serialport stay behind the `serial` fence). Joined
+        // the default set at WO-RL-4: the facade's serial verbs name the
+        // config type.
+        "rustdar-nmea-serial",
         "chrono",
         "log",
         "serde",
@@ -94,8 +101,6 @@ fn the_dependency_ceiling_holds() {
         "web-time",
     ];
     const FENCED_NORMAL: &[&str] = &[
-        // serial
-        "rustdar-nmea-serial",
         // os-providers, linux
         "ashpd",
         "futures-lite",
@@ -106,6 +111,13 @@ fn the_dependency_ceiling_holds() {
         "objc2",
         "objc2-foundation",
         "objc2-core-location",
+        // android-provider / jni-typecheck
+        "jni",
+        // web-provider, wasm32
+        "web-sys",
+        "js-sys",
+        "wasm-bindgen",
+        "wasm-bindgen-futures",
     ];
 
     let meta = metadata();
@@ -187,14 +199,46 @@ fn the_feature_fences_map_the_arms() {
     );
 
     let serial = entries("serial");
-    let expected: BTreeSet<String> = ["dep:rustdar-nmea-serial", "rustdar-nmea-serial?/serial"]
+    let expected: BTreeSet<String> = ["rustdar-nmea-serial/serial"]
         .iter()
         .map(|s| s.to_string())
         .collect();
     assert_eq!(
         serial, expected,
-        "the `serial` fence no longer wraps rustdar-nmea-serial (forwarding \
-         its serial gate)",
+        "the `serial` fence no longer forwards rustdar-nmea-serial's serial \
+         gate (the parser dep itself is unconditional since WO-RL-4)",
+    );
+
+    let android = entries("android-provider");
+    let expected: BTreeSet<String> = ["dep:jni"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        android, expected,
+        "the `android-provider` fence no longer maps to exactly the JNI \
+         surface",
+    );
+
+    let typecheck = entries("jni-typecheck");
+    let expected: BTreeSet<String> = ["dep:jni"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        typecheck, expected,
+        "the `jni-typecheck` fence stopped being the host-typecheck copy of \
+         the android arm's one dependency",
+    );
+
+    let web = entries("web-provider");
+    let expected: BTreeSet<String> = [
+        "dep:web-sys",
+        "dep:js-sys",
+        "dep:wasm-bindgen",
+        "dep:wasm-bindgen-futures",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        web, expected,
+        "the `web-provider` fence no longer matches the browser arm's binding \
+         set",
     );
 
     // No default feature: naming the facade must cost the lean set and
@@ -219,9 +263,10 @@ fn the_facade_stands_on_the_provider_and_not_the_reverse() {
     assert!(
         location
             .iter()
-            .any(|(k, n, o)| k == "normal" && n == "rustdar-nmea-serial" && *o),
+            .any(|(k, n, o)| k == "normal" && n == "rustdar-nmea-serial" && !o),
         "rustdar-location no longer declares rustdar-nmea-serial (normal, \
-         optional) — the serial arm lost its provider: {location:?}",
+         unconditional since WO-RL-4) — the facade lost its parser: \
+         {location:?}",
     );
 
     let nmea = declared_deps(&meta, "rustdar-nmea-serial");
