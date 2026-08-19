@@ -117,6 +117,195 @@ enum BackPress {
     Exit,
 }
 
+/// # WO-RC — App destination census (Phase 3F opener, 2026-08-19, tree fd288166)
+///
+/// ## Recount
+///
+/// `struct App` has **49 fields**: 46 unconditional + 3 cfg-gated
+/// (`tokio_runtime` under `cfg(not(target_arch = "wasm32"))`, `pending_state`
+/// under `cfg(target_arch = "wasm32")`, `volume_extractions` under
+/// `cfg(test)`). The pre-reshape count at 8586e755 was ALSO 49, with a
+/// byte-identical field-NAME set: the 3R landings re-typed a third of the
+/// struct (spellings now come from rustdar-device-profile, rustdar-gpu,
+/// rustdar-volumetric, rustdar-location, rustdar-geo, and `egui_wgpu::wgpu`)
+/// but removed no field. This recount governs.
+///
+/// ## The three destinations (binding vocabulary, WO-RC)
+///
+/// * **root** — rustdar-app root wiring: App/pump/wake/channels/platform
+///   seam/render_dispatch/app_render/app_fetch residue. Stays here through
+///   WO-RA (the crate rename).
+/// * **radar** — fold-into-radar: chunk/live-feed/loop state. WO-RF1/WO-RF2
+///   move the backing MACHINERY into rustdar-radar; a field tagged `radar`
+///   stays on `App` as thin wiring, re-typed/re-pointed at the fold. RF1/RF2's
+///   file lists derive from these rows (listed under "RF1/RF2 file lists").
+/// * **later** — later-phase, named and never moved now: render orchestration
+///   regroups post-E5/E9e (in this crate's `render_dispatch` orbit — the
+///   reshape path map reads "RenderOrchestrator" as that module); the
+///   timeline engine forms post-E7 WITHIN rustdar-radar over the RF2-folded
+///   loop state (WO-RF2's M12 re-read), and so holds no App field today.
+///
+/// ## Field census (49 rows, declaration order)
+///
+/// | field | dest | note |
+/// |---|---|---|
+/// | `instance` | root | shell; wgpu spelled via `egui_wgpu::wgpu` since RV-l3 |
+/// | `state` | root | `AppState` struct stays app-side (RG ruling: fn-split only) |
+/// | `window` | root | shell |
+/// | `gui` | root | the Gui seam |
+/// | `supports_exit` | root | frame-input fact (E2); platform seam |
+/// | `loop_frame_budget` | root | frame-input fact; a READ from rustdar-device-profile (`budgets.loop_frames_held`) |
+/// | `location_settings_available` | root | frame-input fact; platform seam |
+/// | `safe_area_insets` | root | frame-input fact; platform seam |
+/// | `user_gps` | root | frame-input fact; `rustdar_location::Fix` since RL-1 |
+/// | `user_heading` | root | frame-input fact; platform seam |
+/// | `chunk_feed_status` | root | frame-input fact published to `Gui`; its PRODUCER folds at RF1 (d4) |
+/// | `current_volume_stamps` | root | frame-input fact |
+/// | `volume_painter` | later | render orchestration post-E5/E9e; rustdar-volumetric type since RV |
+/// | `mirror_rungs` | later | render orchestration post-E5/E9e; rustdar-gpu type since RG |
+/// | `budgets` | root | a READ from rustdar-device-profile since RD; its App-not-AppState survival comment is load-bearing and stays with this root field (the block above it currently also carries `loop_pool`'s — d5) |
+/// | `device_profile` | root | a READ from rustdar-device-profile since RD |
+/// | `loop_pool` | radar | RF2 re-types (`crate::loop_pool` -> radar); field stays App wiring; its survival comment stays root-side and is today FUSED atop `budgets` (d5) |
+/// | `loop_pool_state` | radar | RF2 re-types; field stays App wiring |
+/// | `loop_pool_sized` | radar | loop state by vocabulary; a plain bool whose sole consumer is app-side `install_volume_bridge` — RF2 moves no code for it (d3) |
+/// | `scan_data` | root | old VolumeInventory (E4.2) superseded; retention comment load-bearing, stays |
+/// | `base_scans` | root | old VolumeInventory superseded; completeness comment load-bearing, stays |
+/// | `input` | root | |
+/// | `channels` | root | `ChannelHub` — the pump drains it |
+/// | `render` | root | `RenderDispatcher`; the root list names render_dispatch, and E4.9/E4.10 land there |
+/// | `platform` | root | platform seam |
+/// | `texture_counter` | later | render orchestration post-E5/E9e |
+/// | `cached_dark_theme` | later | render orchestration post-E5/E9e (platform-seam flavored; THEME made is_dark a cache-token term) |
+/// | `exit_requested` | root | shell/wake |
+/// | `tokio_runtime` | root | cfg(not(wasm32)); executor seam |
+/// | `pending_state` | root | cfg(wasm32); shell |
+/// | `http_client` | root | app_fetch residue |
+/// | `loop_mgr` | radar | RF2: loop_downloads.rs moves; field re-types |
+/// | `chunk_feeds` | radar | RF1: chunk_feed.rs moves; field re-types |
+/// | `chunk_notify` | radar | RF1: chunk_notify.rs moves; field re-types |
+/// | `latest_cached_scans` | root | old VolumeInventory superseded |
+/// | `manual_nav_pending` | root | app_fetch residue; timeline-engine candidate post-E7 (named only) |
+/// | `last_viewport` | root | app_fetch residue |
+/// | `autosave` | root | old ConfigAutosave (E4.1) superseded; persists via `platform.kv()` since RK |
+/// | `egui_repaint_at` | root | wake |
+/// | `auto_poll_at` | root | wake |
+/// | `site_is_provisional` | root | site/source wiring |
+/// | `catalogue_pending` | root | site/source wiring |
+/// | `site_hint_pending` | root | site/source wiring |
+/// | `volume_store` | root | old VolumeInventory superseded; deliberately off AppState, survives surface loss |
+/// | `volume_extractions` | root | cfg(test) probe |
+/// | `redraw_waker` | root | wake |
+/// | `location` | root | platform seam; `LocationGate` re-homed to rustdar-location at RL-2 |
+/// | `site_positions` | root | site/source wiring |
+/// | `site_catalogue` | root | site/source wiring |
+///
+/// Tally: root 39, radar 6, later 4. Fields that became READS from
+/// rustdar-device-profile: `budgets`, `device_profile`, `loop_frame_budget`
+/// (and `crate::loop_pool` reads `constants::VOLUME_GRID_CELLS` at module
+/// level).
+///
+/// ## Module census (every remaining rustdar-frontend module)
+///
+/// | module (LOC) | dest | note |
+/// |---|---|---|
+/// | lib.rs | root | crate root; keeps the `rustdar_radar::tls` re-export |
+/// | app.rs (3,707) + app/ suites | root | mounts app_fetch/app_render/app_chunks/frame_pump via `#[path]` |
+/// | app_state.rs | root | RG ruling: struct stays, fn-split only |
+/// | app_fetch.rs (2,748) + app_fetch/ (11 suites) | root | residue |
+/// | app_render.rs (5,191) + app_render/ (25 suites) | root | residue; later-phase orchestration is named, not moved |
+/// | app_chunks.rs (565) + app_chunks/ (3 suites) | radar (halves) | ONE `impl App` block; RF1 takes the radar-owned policy halves, the drains stay root — see RF1 list |
+/// | frame_pump.rs (264) + frame_pump/tests.rs | root | the pump |
+/// | budget_arms.rs | root | pub(crate) fixtures for the upward-bridging budget agreement tests |
+/// | budget_memo.rs | root | kv-persisted ladder position; its own doc plans a WRITTEN re-home to rustdar-device-profile (d7) |
+/// | channels.rs (733) | root | ChannelHub |
+/// | chunk_feed.rs (551) + chunk_feed/ (4 suites) | radar | RF1; module suites are App-free |
+/// | chunk_notify.rs (797, inline tests) | radar | RF1 |
+/// | input.rs (272) | root | |
+/// | location_hint.rs | root | app-side residue post-RL-2 (site_for_timezone; anchors live in rustdar-location) |
+/// | loop_downloads.rs (1,683, inline tests) | radar | RF2 |
+/// | loop_pool.rs (707) + loop_pool/tests.rs (1,067) | radar | RF2; `resident_grid_bytes` calls parameterized at the seam |
+/// | platform.rs (910) | root | platform seam |
+/// | platform_double.rs (521) | root | test double |
+/// | render_dispatch.rs (2,409) + render_dispatch/ (6 suites) | root | later-phase orchestration operates here post-E5/E9e |
+/// | site_catalogue.rs (161) + tests | root | |
+/// | site_positions.rs (230) + tests | root | |
+/// | test_sites.rs (102), volume_fixture.rs (113) | root | cfg(test) support |
+/// | tests/arch_ratchets.rs | root | the standing ratchet suite |
+///
+/// No build.rs exists in this crate (WO-RD moved the mobile-cfg mechanism to
+/// rustdar-device-profile/build.rs — d6).
+///
+/// ## RF1/RF2 file lists (bound by this census)
+///
+/// **WO-RF1 (live-chunk fold)**: chunk_feed.rs 551 + chunk_feed/{tests 314,
+/// due_tests 59, freshness_tests 68, status_tests 67} (App-free, move
+/// unedited); chunk_notify.rs 797 (inline tests, moves whole); app_chunks.rs
+/// 565 radar-owned halves = the policy bodies (`cut_selection_for`,
+/// `apply_chunk_outcome`, `record_tilt_freshness`) — the drains
+/// (`drive_chunk_feeds`, `poll_chunk_results`, `drive_chunk_notifications`,
+/// `check_archive_for`, `fetch_notified_chunk`, `fall_back_to_archive`,
+/// `any_pane_live_for_site`, `chunks_are_feeding`) stay root; app_chunks/
+/// tests.rs 146 is App-free, selection_tests.rs 86 + volume_close_tests.rs
+/// 557 drive App+TestBridge and stay with the wiring; the ewebsock dep
+/// (Cargo.toml) moves to radar's manifest target-gated as today. CAUTION
+/// (d9): app/chunk_feed_precedence_tests.rs 1,532 is App-MOUNTED (app.rs,
+/// `mod chunk_feed_precedence_tests`) and imports `super::tests::{empty_scan,
+/// headless}` + `crate::platform_double::TestBridge` — it cannot move
+/// verbatim; it exercises App drain precedence and stays root unless RF1's
+/// execution proves otherwise (an intent edit = STOP and report).
+///
+/// **WO-RF2 (loop fold)**: loop_downloads.rs 1,683 (tests inline at `mod
+/// tests`); loop_pool.rs 707 + loop_pool/tests.rs 1,067; the volumetric seam
+/// = loop_pool.rs's two `rustdar_volumetric::raymarch::resident_grid_bytes`
+/// calls, parameterized so radar never deps volumetric (the app passes the
+/// figure); fields re-typed: `loop_mgr`, `loop_pool`, `loop_pool_state`; the
+/// ten E7 loop-pin suites live app-side (app_render/loop_*, app_fetch/loop_*,
+/// render_dispatch/*) and take mechanical re-points ONLY; RF2 also de-fuses
+/// the loop_pool survival comment (d5).
+///
+/// **Stale `rustdar_frontend::` prose in radar/overlays/source/geo (RF1/RF2
+/// own the repair)**: 55 occurrences / 24 files at this tree (radar 36/15,
+/// overlays 16/6, source 2/2, geo 1/1) — 45 name the worker-moved
+/// offload/wire_identity family (WO-RW's "~45" was exactly this family), 5
+/// name volumetric-moved modules, 3 name device-profile-moved constants, 1
+/// names chunk_feed (radar chunks.rs — RF1 re-words in place when the module
+/// arrives), 1 names render_dispatch (overlays handlers/model.rs — still
+/// valid today, re-keys at WO-RA, not at RF1/RF2).
+///
+/// ## Discrepancies vs the plan's expectations
+///
+/// * d1 — the order expected the splits to have "removed several" fields:
+///   they removed NONE (49 -> 49, identical name set); the extractions moved
+///   modules and types below the app, and every App field was already wiring.
+/// * d2 — the old E4.0 seven-subsystem table (HISTORICAL input) maps onto the
+///   three destinations as: LiveFeeds -> radar (RF1); TimelineEngine's loop
+///   state -> radar (RF2 moves the machinery; the post-E7 engine then forms
+///   WITHIN radar, so `later`/timeline holds zero App fields today);
+///   RenderOrchestrator -> `later` for its four loose fields, EXCEPT `render`
+///   itself which is root (the order's root list names render_dispatch);
+///   ConfigAutosave, VolumeInventory, SourceOrchestrator, Shell -> root
+///   (superseded as extractions; their fields are root wiring).
+/// * d3 — `loop_pool_sized` rides the radar tag as loop state though it is a
+///   plain bool with an app-side-only consumer; RF2 moves no code for it.
+/// * d4 — `chunk_feed_status` is feed-derived but stays root: it is an E2
+///   frame-input fact published to `Gui`; only its producer folds.
+/// * d5 — `loop_pool`'s App-not-AppState survival comment sits FUSED atop
+///   `budgets`' doc block while `loop_pool` itself is bare — pre-existing
+///   verbatim at 8586e755, not reshape drift. Both survival comments answer
+///   for ROOT-field placement and stay in this file; WO-RF2 (whose diff
+///   touches the loop_pool spellings here anyway) owns the de-fusion: move
+///   the first paragraph pair onto `loop_pool`, leave `budgets` its own.
+/// * d6 — WO-RA's "the mobile cfg build.rs carries over" is stale: this crate
+///   has NO build.rs (WO-RD moved the mechanism down); RA carries nothing.
+/// * d7 — budget_memo.rs's planned re-home (rustdar-device-profile, per its
+///   own module doc) is a destination OUTSIDE this census's three; it is
+///   root until that written kv-lane step.
+/// * d8 — the stale-mention count is 55/24, not ~45: RW's figure counted only
+///   the worker family; RD/RV accreted 8 more and 2 are not stale yet.
+/// * d9 — RF1's trap "chunk suites (incl. chunk_feed_precedence_tests) move
+///   with the code" cannot apply verbatim to that one suite (App-mounted,
+///   app-double-coupled — see the RF1 list); the chunk_feed/chunk_notify
+///   module suites move unedited as the trap intends.
 pub struct App {
     instance: wgpu::Instance,
     state: Option<app_state::AppState>,
