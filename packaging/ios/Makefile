@@ -49,22 +49,22 @@ build:
 	# the image's 23 preinstalled targets.
 	#
 	# `cargo rustc --crate-type staticlib` rather than a manifest crate-type:
-	# putting `staticlib` in rustdar-platform's [lib] would archive the whole
+	# putting `staticlib` in rustdar's [lib] would archive the whole
 	# graph on every desktop build and every --all-targets clippy run too.
 	#
 	# The framework list mirrors packaging/ios/project.yml. Nothing here is auto-linked:
 	# a link without `-framework Security` fails on SecTrustEvaluateWithError,
 	# which is rustls-platform-verifier's Apple trust path, and one without
 	# `-framework CoreLocation` fails on the CLLocationManager class reference
-	# that rustdar-platform's os_location/apple.rs emits.
+	# that rustdar's os_location/apple.rs emits.
 	INCMD="set -e
 	    export RUSTUP_TOOLCHAIN=\"\$${RUST_VERSION:?the rust-cross image must set RUST_VERSION}\"
 	    export IPHONEOS_DEPLOYMENT_TARGET=$(IOS_MIN)
 	    export CARGO_TARGET_DIR=$(TARGET_DIR)
-	    cargo rustc $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar-platform --lib --crate-type staticlib
-	    test -f $$LIBDIR/librustdar_platform_lib.a || { echo 'staticlib missing'; exit 1; }
+	    cargo rustc $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar --lib --crate-type staticlib
+	    test -f $$LIBDIR/librustdar_native.a || { echo 'staticlib missing'; exit 1; }
 	    $$IOS_CC -c packaging/ios/Sources/main.m -o $$LIBDIR/rustdar_main.o
-	    $$IOS_CC $$LIBDIR/rustdar_main.o $$LIBDIR/librustdar_platform_lib.a \
+	    $$IOS_CC $$LIBDIR/rustdar_main.o $$LIBDIR/librustdar_native.a \
 	        -lobjc \
 	        -framework UIKit -framework QuartzCore -framework Metal \
 	        -framework CoreGraphics \

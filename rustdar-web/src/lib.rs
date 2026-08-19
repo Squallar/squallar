@@ -3,7 +3,7 @@
 
 //! rustdar in the browser: wasm32 + WebGL2.
 //!
-//! This crate is to the browser what `rustdar-platform` is to the desktop — the
+//! This crate is to the browser what the `rustdar` crate is to the desktop — the
 //! entry point, the concrete [`PlatformBridge`] and the capabilities that bridge
 //! exposes. Everything visible on the page belongs to `rustdar-frontend`.
 //!

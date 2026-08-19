@@ -30,7 +30,7 @@ DESKTOP := $(APPID).desktop
 # `app_id` at all unless one is asked for. `StartupWMClass` in the desktop entry
 # must equal that basename or the window will not group under this launcher, so
 # renaming the installed binary means editing the entry too.
-BIN     ?= rustdar-platform
+BIN     ?= rustdar
 BINSRC  ?= ../../target/release/$(BIN)
 
 # The repo's only raster art, and the reason there is no `icons/` directory

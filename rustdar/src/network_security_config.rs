@@ -12,12 +12,12 @@
 //! `aviationweather.gov` entry, and it was the stale entry that made the list
 //! look maintained while the live METAR host went uncovered.
 //!
-//! Not in `rustdar-android`: that crate is `#![cfg(target_os = "android")]` and
-//! compiles to nothing on the host, so a test in it never runs in CI.
+//! Not under `cfg(android)`: the `android` module tree compiles to nothing on
+//! the host, so a test inside it would never run in CI. This file is ungated
+//! and host-run on every row.
 
 #[cfg(test)]
-const CONFIG_PATH: &str =
-    "../rustdar-android/android/app/src/main/res/xml/network_security_config.xml";
+const CONFIG_PATH: &str = "../packaging/android/app/src/main/res/xml/network_security_config.xml";
 
 /// One `<domain>` entry.
 #[cfg(test)]

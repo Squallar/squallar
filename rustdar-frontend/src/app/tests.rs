@@ -422,12 +422,15 @@ fn a_dismissal_asks_for_the_frame_that_shows_it() {
 /// The Java half of the route, so a rename on either side is a build
 /// failure rather than an `UnsatisfiedLinkError` on a device.
 const BACK_HANDLER_JAVA: &str =
-    include_str!("../../../rustdar-android/android/app/src/main/java/com/rustdar/BackHandler.java");
+    include_str!("../../../packaging/android/app/src/main/java/com/rustdar/BackHandler.java");
 
-/// The Rust half. `rustdar-android` is `#![cfg(target_os = "android")]`, so
-/// it compiles to nothing on a host and can hold no test of its own; this
-/// crate owns the funnel both halves are about, so the pins live here.
-const ANDROID_ENTRY: &str = include_str!("../../../rustdar-android/src/lib.rs");
+/// The Rust half: the one module file that CONTAINS the exported JNI symbol
+/// (`rustdar/src/android/back.rs`) -- NOT the crate root, which since the
+/// android fold holds only module mounts and would silently pin wrong text.
+/// The android modules are `cfg(target_os = "android")`, so they compile to
+/// nothing on a host and can hold no test of their own; this crate owns the
+/// funnel both halves are about, so the pins live here.
+const ANDROID_BACK: &str = include_str!("../../../rustdar/src/android/back.rs");
 
 /// `src` with its Java comments removed.
 ///
@@ -498,7 +501,7 @@ fn the_java_callback_calls_the_symbol_rust_exports() {
         "the Java side no longer declares com.rustdar.BackHandler.nativeBackPressed",
     );
     assert!(
-        ANDROID_ENTRY.contains("fn Java_com_rustdar_BackHandler_nativeBackPressed("),
+        ANDROID_BACK.contains("fn Java_com_rustdar_BackHandler_nativeBackPressed("),
         "nothing exports the symbol BackHandler.nativeBackPressed() binds to",
     );
 }
@@ -877,7 +880,8 @@ fn an_os_fix_refines_a_guessed_site() {
     );
 }
 
-/// The shape `rustdar-android` now produces from the network provider, end
+/// The shape the android location module now produces from the network
+/// provider, end
 /// to end.
 ///
 /// Two things about that shape changed, and only one of them is visible

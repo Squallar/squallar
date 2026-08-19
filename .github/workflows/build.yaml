@@ -35,13 +35,13 @@ jobs:
         include:
           # `--all-features` on the desktop rows only: it enables
           # rustdar-nmea-serial/serial, which links IOKit. It also enables
-          # rustdar-android/jni-typecheck, so these rows type-check the JNI layer.
+          # rustdar/jni-typecheck, so these rows type-check the JNI layer.
           #
           # `--release` on every row whose artifact a person can run, and folded
           # into the command that already provides the compile coverage rather
           # than added as a second one. Not for wall clock -- that comes out even,
           # measured: folding it in is 6:30 cold and 3:25 warm against 6:25 and
-          # 3:27 for a debug coverage pass plus a release `-p rustdar-platform`.
+          # 3:27 for a debug coverage pass plus a release `-p rustdar`.
           # One fat-LTO link is nearly serial, while the 21 here run in parallel.
           # What folding buys is the other two axes: one profile instead of two
           # means the dependency graph is compiled once, `target/` is 1.8 GB
@@ -60,7 +60,7 @@ jobs:
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
             cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu
-            artifact: target/x86_64-unknown-linux-gnu/release/rustdar-platform
+            artifact: target/x86_64-unknown-linux-gnu/release/rustdar
           # The artifact is a signed .app in a zip, not the bare executable.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
           # execute an unsigned Mach-O at all, so the old `macos-aarch64`
@@ -84,9 +84,9 @@ jobs:
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
             cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-pc-windows-gnullvm
-            artifact: target/x86_64-pc-windows-gnullvm/release/rustdar-platform.exe
+            artifact: target/x86_64-pc-windows-gnullvm/release/rustdar.exe
 
-          # A real link, not a `check`. `rustdar-platform --lib` as a staticlib
+          # A real link, not a `check`. `rustdar --lib` as a staticlib
           # codegens the whole graph, and the link is where the failures that
           # only iOS has actually appear: a missing `-framework`, or a
           # dependency that reaches for IOKit. `IN_CONTAINER=1` because this job
@@ -122,7 +122,7 @@ jobs:
           # This is still one compile of one triple, and the coverage the old
           # `cargo ndk` line gave is unchanged, because Gradle *is* that line:
           # `buildRustLibRelease` runs `cargo ndk -t <abi> -P <minSdk> build -p
-          # rustdar-android --lib --release`. `ring`'s build script still gets
+          # rustdar --lib --release`. `ring`'s build script still gets
           # the cross clang/sysroot cargo-ndk exports. What changes is that the
           # two constants are read from the Gradle build instead of repeated
           # here: the old comment warned that `-P 28` "must track minSdk there",
@@ -177,14 +177,14 @@ jobs:
             target: aarch64-linux-android
             package: android
             abi: arm64-v8a
-            cmd: cd rustdar-android/android && ./gradlew assembleRelease -PabiFilter=arm64-v8a
-            artifact: rustdar-android/android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
+            cmd: cd packaging/android && ./gradlew assembleRelease -PabiFilter=arm64-v8a
+            artifact: packaging/android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
           - name: android-x86_64
             target: x86_64-linux-android
             package: android
             abi: x86_64
-            cmd: cd rustdar-android/android && ./gradlew assembleRelease -PabiFilter=x86_64
-            artifact: rustdar-android/android/app/build/outputs/apk/release/app-x86_64-release.apk
+            cmd: cd packaging/android && ./gradlew assembleRelease -PabiFilter=x86_64
+            artifact: packaging/android/app/build/outputs/apk/release/app-x86_64-release.apk
 
           # The only wasm build, and deliberately so. The deleted `wasm32
           # libraries` row named members as roots, so the gps crate (rustdar-nmea-serial
@@ -286,9 +286,9 @@ jobs:
                   fi
                 done
               }
-              check jni                      rustdar-android:aarch64-linux-android rustdar-android:x86_64-linux-android
-              check rustls-platform-verifier rustdar-android:aarch64-linux-android rustdar-android:x86_64-linux-android
-              check wgpu                     rustdar-platform:x86_64-unknown-linux-gnu rustdar-platform:aarch64-apple-ios rustdar-web:wasm32-unknown-unknown rustdar-android:aarch64-linux-android
+              check jni                      rustdar:aarch64-linux-android rustdar:x86_64-linux-android
+              check rustls-platform-verifier rustdar:aarch64-linux-android rustdar:x86_64-linux-android
+              check wgpu                     rustdar:x86_64-unknown-linux-gnu rustdar:aarch64-apple-ios rustdar-web:wasm32-unknown-unknown rustdar:aarch64-linux-android
               exit "$fail"
 
     steps:
@@ -418,7 +418,7 @@ jobs:
         # and the `::error::` would never be printed. Checked both ways -- the
         # annotation appears only with the `|| true` there.
         run: |
-          sdk=$(grep -oP '^\s*compileSdk\s*=\s*\K[0-9]+' rustdar-android/android/app/build.gradle.kts || true)
+          sdk=$(grep -oP '^\s*compileSdk\s*=\s*\K[0-9]+' packaging/android/app/build.gradle.kts || true)
           test -n "$sdk" \
             || { echo "::error::could not read compileSdk out of app/build.gradle.kts"; exit 1; }
           sdkmanager --licenses < <(yes) >/dev/null
@@ -475,7 +475,7 @@ jobs:
         #
         # The password is in the clear on purpose and is not a secret: it guards
         # a keypair generated three lines above it and destroyed with the
-        # container. Both files land on paths rustdar-android/android/.gitignore
+        # container. Both files land on paths packaging/android/.gitignore
         # already covers (`keystore.properties`, `*.jks`), so a stray `git add`
         # cannot carry either of them.
         #
@@ -488,7 +488,7 @@ jobs:
         # what keeps the keystore written by the same JDK that reads it on the
         # day the image gains a second one.
         run: |
-          cd rustdar-android/android
+          cd packaging/android
           # Idempotent by deletion. keytool refuses a second `-genkeypair` into
           # a keystore that already holds the alias ("Key pair not generated,
           # alias <ci> already exists"), which a GitHub-hosted runner never
@@ -640,7 +640,7 @@ jobs:
         run: |
           make -C packaging/macos IN_CONTAINER=1 ARCHIVE=1 \
             ARCH=${{ matrix.macos_arch }} \
-            BIN=target/${{ matrix.target }}/release/rustdar-platform
+            BIN=target/${{ matrix.target }}/release/rustdar
 
       - name: Upload native build
         if: matrix.artifact

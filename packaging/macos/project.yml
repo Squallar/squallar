@@ -12,7 +12,7 @@
 # the four keys.
 #
 # Unlike iOS there is no ObjC shell here: winit's AppKit backend calls
-# `NSApplicationMain` itself, so `rustdar-platform`'s own `main` is the
+# `NSApplicationMain` itself, so `rustdar`'s own `main` is the
 # executable and the bundle is only metadata around it.
 name: rustdar
 options:

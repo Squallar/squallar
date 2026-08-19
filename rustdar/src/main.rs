@@ -3,7 +3,7 @@
 // the two halves of the crate carry the same rule.
 #![deny(unsafe_code)]
 
-use rustdar_platform_lib::run;
+use rustdar_native::run;
 
 fn main() {
     if let Err(e) = pollster::block_on(run()) {

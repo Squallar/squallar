@@ -1,5 +1,5 @@
 //! The browser's [`PlatformBridge`], counterpart of
-//! `rustdar_platform::platform::DesktopPlatform`. Most of the trait is
+//! `rustdar_native::platform::DesktopPlatform`. Most of the trait is
 //! capabilities a tab does not have, so most of this file is honest `None`s.
 
 use crate::geolocation;

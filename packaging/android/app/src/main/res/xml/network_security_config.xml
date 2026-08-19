@@ -71,7 +71,7 @@
   origin missing from this file was silently falling through to base-config,
   where cleartext is permitted.
 
-  `rustdar-platform/src/network_security_config.rs` parses this file at test
+  `rustdar/src/network_security_config.rs` parses this file at test
   time and asserts, both ways, that it covers exactly the origins
   `rustdar_radar::sources::DataSources::production()` and the tile sources
   declare. Adding an origin there and not here now fails `cargo test`.

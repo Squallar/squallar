@@ -13,12 +13,14 @@ plugins {
 // Layout
 // ---------------------------------------------------------------------------
 //
-// This file lives at `rustdar-android/android/app/`, so the Cargo workspace root
-// is three directories up. `rustCrateManifest` is the manifest of the crate that
-// actually depends on `rustls-platform-verifier` — that is what the Maven lookup
-// below has to be pointed at, not the workspace root.
+// This file lives at `packaging/android/app/`, so the Cargo workspace root is
+// three directories up from here (two up from the Gradle root project at
+// `packaging/android/`, which is what the paths below hang off).
+// `rustCrateManifest` is the manifest of the crate that actually depends on
+// `rustls-platform-verifier` — the `rustdar` app crate — because that is what
+// the Maven lookup below has to be pointed at, not the workspace root.
 val rustWorkspaceRoot = rootProject.layout.projectDirectory.dir("../..")
-val rustCrateManifest = rootProject.layout.projectDirectory.file("../Cargo.toml")
+val rustCrateManifest = rootProject.layout.projectDirectory.file("../../rustdar/Cargo.toml")
 
 // ---------------------------------------------------------------------------
 // Native-library staging
@@ -323,11 +325,10 @@ android {
 // two must not be allowed to drift apart: one directory shared between profiles
 // is exactly the bug described at `jniLibsDirFor` above.
 //
-// NOTE the package is `rustdar-android`, not `rustdar-platform`. `android_main` —
-// the symbol NativeActivity dlsym()s after loading the .so named by the
-// `android.app.lib_name` manifest meta-data — is defined in rustdar-android.
-// rustdar-platform is a plain dependency of it and its own cdylib has no entry
-// point, so building that instead yields a library the app cannot start from.
+// NOTE the package is `rustdar` — since the android fold there is no separate
+// entry crate. `android_main` lives in rustdar's cfg(target_os = "android")
+// android::entry module, and `android.app.lib_name` names its [lib],
+// `rustdar_native` -> librustdar_native.so.
 fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.register<Exec>(name) {
     workingDir = rustWorkspaceRoot.asFile
 
@@ -344,7 +345,7 @@ fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.re
         "-P", ndkPlatform,
         "-o", stagingDir.asFile.absolutePath,
         "build",
-        "-p", "rustdar-android",
+        "-p", "rustdar",
         "--lib",
     )
     if (buildType == "release") args += "--release"
@@ -363,22 +364,35 @@ fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.re
     }
     environment("ANDROID_NDK_HOME", ndkDir.absolutePath)
 
-    // Full workspace-crate closure of rustdar-android on aarch64-linux-android
-    // (regenerate with `cargo metadata --filter-platform aarch64-linux-android`).
-    // A crate missing from this list leaves the task UP-TO-DATE after edits to it,
-    // and Gradle then packages a stale .so — the failure mode is a build that
-    // "succeeds" while shipping last hour's Rust. build.rs goes through files() so
+    // Full in-repo crate closure of `rustdar` on aarch64-linux-android
+    // (regenerate with `cargo metadata --filter-platform aarch64-linux-android`
+    // and list every workspace-path package in rustdar's dependency closure --
+    // vendor/ members included). A crate missing from this list leaves the task
+    // UP-TO-DATE after edits to it, and Gradle then packages a stale .so — the
+    // failure mode is a build that "succeeds" while shipping last hour's Rust;
+    // the pre-fold list had exactly that bug (rustdar-source, rustdar-geo and
+    // the three vendor crates were missing). build.rs goes through files() so
     // crates without one are tolerated, and picked up if one is added later.
     listOf(
         "nexrad-level3",
-        "rustdar-android",
+        "rustdar",
+        "rustdar-device-profile",
         "rustdar-egui",
         "rustdar-frontend",
-        "rustdar-gps",
+        "rustdar-geo",
+        "rustdar-gpu",
+        "rustdar-kv",
+        "rustdar-location",
+        "rustdar-nmea-serial",
         "rustdar-overlays",
-        "rustdar-platform",
         "rustdar-radar",
+        "rustdar-source",
         "rustdar-units",
+        "rustdar-volumetric",
+        "rustdar-worker",
+        "vendor/bzip2-rs",
+        "vendor/nexrad-data",
+        "vendor/nexrad-decode",
     ).forEach { crate ->
         inputs.dir(rustWorkspaceRoot.dir("$crate/src"))
         inputs.file(rustWorkspaceRoot.file("$crate/Cargo.toml"))
@@ -437,7 +451,7 @@ androidComponents.onVariants { variant ->
                         "Android will refuse to install it.\n" +
                         "  Do not sideload the debug APK instead: it is debuggable and signed with " +
                         "the stock 'CN=Android Debug' key.\n" +
-                        "  Fix: cp android/keystore.properties.example android/keystore.properties " +
+                        "  Fix: cp packaging/android/keystore.properties.example packaging/android/keystore.properties " +
                         "and follow the keytool command in it.\n"
                 )
             }

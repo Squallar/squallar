@@ -1,6 +1,6 @@
 // rustdar iOS entry shim.
 //
-// The real entry point is in the Rust staticlib (rustdar-platform):
+// The real entry point is in the Rust staticlib (the rustdar crate):
 // `rustdar_ios_main` hands control to the shared winit GUI loop, whose UIKit
 // backend calls `UIApplicationMain` internally and never returns. So `main()`
 // here is only a trampoline — there is no AppDelegate and no storyboard; winit

@@ -426,7 +426,7 @@ pub struct ClickableItem<'a> {
 
 /// Adding an overlay means: implement this, register it in `create_handlers()`,
 /// add an `OverlayKind` variant. Nothing in `rustdar-egui` or
-/// `rustdar-platform` changes.
+/// the `rustdar` crate changes.
 pub trait OverlayHandler: Send {
     // ── Identity & metadata ───────────────────────────────────────────
 

@@ -429,8 +429,9 @@ impl rustdar_location::LocationBridge for DesktopPlatform {
 
 #[cfg(target_os = "android")]
 pub struct AndroidPlatform {
-    /// Injected by `rustdar-android`: the read is a JNI call and this crate is
-    /// `#![deny(unsafe_code)]`.
+    /// Injected by `android::entry`: the read is a JNI call, and the bridge
+    /// stays `deny(unsafe_code)`-clean and host-testable by the injection rule
+    /// in `src/android/mod.rs`.
     theme_detector: Option<fn() -> bool>,
     /// Theme changes from the poll thread `set_theme_detector` starts.
     theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,
@@ -438,12 +439,12 @@ pub struct AndroidPlatform {
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
-    /// Injected by `rustdar-android`: the flag it reads is set by the JNI
-    /// callback `BackHandler.java` invokes on the UI thread.
+    /// Injected by `android::entry`: the flag it reads is set by the JNI
+    /// callback `BackHandler.java` invokes on the UI thread (`android::back`).
     back_press_taker: Option<fn() -> bool>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    /// Injected by `rustdar-android`: all four are JNI calls, for the same
+    /// Injected by `android::entry`: all four are JNI calls, for the same
     /// reason `theme_detector` is injected. `None` until they are installed —
     /// see [`rustdar_location::LocationBridge::location_permission`] for why that is
     /// reported as `Unavailable` rather than `Unknown`.
@@ -616,9 +617,10 @@ impl PlatformBridge for AndroidPlatform {
     //
     // Everything here is a `checkSelfPermission` / `requestPermissions` /
     // `LocationHelper` call over JNI, which needs `unsafe` and the process
-    // `JavaVM`. This crate is `#![deny(unsafe_code)]` and cannot depend on
-    // `rustdar-android` — that crate depends on this one — so the calls arrive
-    // as `fn` pointers, exactly as the theme detector does.
+    // `JavaVM`. JNI stays confined to the cfg(android) modules in
+    // `src/android/` by the injection rule written in `android/mod.rs` -- this
+    // bridge stays `deny(unsafe_code)`-clean and host-testable -- so the calls
+    // arrive as `fn` pointers, exactly as the theme detector does.
 
     /// Refuses a second set, as `set_theme_detector` refuses a second detector
     /// and for the same reason: a half-replaced set would leave the state query
@@ -845,7 +847,7 @@ impl rustdar_location::LocationBridge for IosPlatform {
     /// delivering.
     ///
     /// The gap is real and iOS-only: with no `UIBackgroundModes: location` in
-    /// `ios/Info.plist`, the OS stops delivering while the app is backgrounded
+    /// `packaging/ios/Info.plist`, the OS stops delivering while the app is backgrounded
     /// and gives no callback saying so, so this keeps reporting `true` and the
     /// map keeps the last dot. The settings pane's fix-age line, which is timed
     /// from arrival, is what tells the user the dot is stale. See the module

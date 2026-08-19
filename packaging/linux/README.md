@@ -89,7 +89,7 @@ install the binary, so it works on a machine that has not built anything; add
 that separately when you want it:
 
 ```sh
-cargo build --release -p rustdar-platform --bin rustdar-platform
+cargo build --release -p rustdar --bin rustdar
 make -C packaging/linux install-bin      # or install-bin BIN=… BINSRC=…
 ```
 
@@ -102,8 +102,8 @@ could have written, including the binary.
 |---|---|---|
 | file name | `dev.mcswain.rustdar.desktop` | The basename is the application id. It matches `ios/project.yml`'s bundle id and the Android `applicationId`, and a test in `os_location/linux.rs` compiles this file in by that exact path, so renaming it fails the build. |
 | `Icon=` | `dev.mcswain.rustdar` | A bare identifier, not a path. The icon theme spec resolves it against the installed `hicolor` sizes; a path would pin one size and defeat the lookup. |
-| `StartupWMClass=` | `rustdar-platform` | See below. |
-| `Exec=` | `rustdar-platform` | The binary this repo builds. Rename it and `StartupWMClass` has to change with it. |
+| `StartupWMClass=` | `rustdar` | See below. |
+| `Exec=` | `rustdar` | The binary this repo builds. Rename it and `StartupWMClass` has to change with it. |
 
 **`StartupWMClass` is the fragile one.** winit sets no window class of its own:
 its X11 backend falls back to `basename(argv[0])`, and its Wayland backend calls
@@ -111,7 +111,7 @@ its X11 backend falls back to `basename(argv[0])`, and its Wayland backend calls
 rustdar does not do, so **a native Wayland window carries no `app_id` at all**.
 The consequence is worth knowing before filing a bug about it:
 
-* Under X11 or XWayland the window's `WM_CLASS` is `rustdar-platform`, which is
+* Under X11 or XWayland the window's `WM_CLASS` is `rustdar`, which is
   what the entry claims, and grouping works.
 * Under native Wayland there is nothing for a compositor to match on, so the
   window will not group under this launcher whatever the entry says.
@@ -168,7 +168,7 @@ ls ~/.local/share/applications/dev.mcswain.rustdar.desktop
 gio info ~/.local/share/applications/dev.mcswain.rustdar.desktop   # optional
 ```
 
-Then run the app with `RUST_LOG=rustdar_platform_lib=debug` and press "Use my
+Then run the app with `RUST_LOG=rustdar_native=debug` and press "Use my
 location". A working session logs:
 
 ```text

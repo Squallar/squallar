@@ -25,7 +25,7 @@
 #     Contents/{Info.plist, MacOS/rustdar, Resources/, PkgInfo}; an iOS one puts
 #     all of that at the top level.
 #   * There is no ObjC shell. winit's AppKit backend brings up NSApplication
-#     itself, so `rustdar-platform`'s own `main` is the executable and there is
+#     itself, so `rustdar`'s own `main` is the executable and there is
 #     nothing to compile or link by hand.
 #   * Signing is not optional. arm64 macOS refuses to execute an unsigned
 #     Mach-O at all, and — the reason this file exists — `locationd` keys its
@@ -115,7 +115,7 @@ build:
 	      ;;
 	  esac
 	else
-	  EXE="$(TARGET_DIR)/$$RUST_TARGET/$$PROFILE_DIR/rustdar-platform"
+	  EXE="$(TARGET_DIR)/$$RUST_TARGET/$$PROFILE_DIR/rustdar"
 	  # RUSTUP_TOOLCHAIN from the image's own RUST_VERSION: rust-toolchain.toml
 	  # says `stable`, and obeying it here fetches a toolchain that has none of
 	  # the image's 23 preinstalled targets.
@@ -128,7 +128,7 @@ build:
 	  INCMD="set -e
 	      export RUSTUP_TOOLCHAIN=\"\$${RUST_VERSION:?the rust-cross image must set RUST_VERSION}\"
 	      export CARGO_TARGET_DIR=$(TARGET_DIR)
-	      cargo build $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar-platform --bin rustdar-platform"
+	      cargo build $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar --bin rustdar"
 	  if [ -n "$(IN_CONTAINER)" ]; then
 	    echo "==> cargo build ($$RUST_TARGET, $$PROFILE_DIR)"
 	    sh -c "$$INCMD"
