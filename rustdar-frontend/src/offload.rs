@@ -4,8 +4,8 @@
 //! stall the frame that created it: the static radar render, the loop-frame
 //! render, the overlay rasterization and the radar-sites rasterization. All
 //! of it is **described jobs** now — [`JobRequest`] values a worker can be
-//! handed, the overlay rasterizations included ([`JobRequest::Overlay`]
-//! carries the sites raster, the three polygon kinds, the two hit-map kinds
+//! handed, the overlay rasterizations included (the overlay codec rows
+//! carry the sites raster, the three polygon kinds, the two hit-map kinds
 //! and the model grid). The opaque funnel those closures rode — an
 //! `offload(name, FnOnce)` whose wasm arm ran the closure **inline on the
 //! browser's one thread** — is deleted with its last rider: there is no
@@ -40,9 +40,14 @@
 //! that queue draining is a term in the frame loop's own wake-up condition —
 //! see [`drain_deferred_drops`], where the invariant is written.
 
-use rustdar_radar::render_input::RenderInput;
-use rustdar_radar::voxel::{VoxelGrid, VoxelRequest, VoxelShape};
-use rustdar_radar::xsect::{CrossSection, SectionRequest};
+// Reply-direction types only, and deliberately: the REQUEST direction of
+// this module is source-type-free since WO-M7.2 — every job kind's input,
+// codec and run body lives with its pipeline, reached through the composed
+// registry (`crate::job_registry`) — and the reply vocabulary below
+// ([`JobOutput`] and its decoders) survives here only until WO-M7c closes
+// the reply direction onto the same table.
+use rustdar_radar::voxel::VoxelGrid;
+use rustdar_radar::xsect::CrossSection;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -352,150 +357,104 @@ pub(crate) fn drain_deferred_drops(budget: std::time::Duration) -> usize {
 /// A CPU-bound job described as data, so it can be executed somewhere that does
 /// not share this thread's memory.
 ///
-/// Every variant is an *input* to a render, never its output: what travels is
-/// the smallest thing the renderer can be re-run from, because re-running it is
+/// It is an *input* to a render, never its output: what travels is the
+/// smallest thing the renderer can be re-run from, because re-running it is
 /// how the worker and this thread stay byte-identical without a second
 /// implementation to keep in step.
+///
+/// # One envelope over one described job
+///
+/// This used to be an enum of every job kind, each arm restating its own
+/// payload and its own slice of the envelope. The kinds live with their
+/// pipelines now — the radar and overlays crates' `jobs` modules each
+/// publish their rows as [`rustdar_source::job::JobCodec`]s, composed by
+/// [`crate::job_registry::job_codecs`] — and what remains here is exactly the
+/// pair every kind shares: the type-erased input and the run envelope. The
+/// codec row that owns `job`'s input type ([`row_for`]) is what encodes,
+/// decodes and runs it; this crate's judgment about a described job begins
+/// and ends at that lookup.
 #[derive(Debug, Clone, PartialEq)]
-pub enum JobRequest {
-    /// Rasterize a Level II frame.
-    Radar {
-        /// Boxed because a `RenderInput` owns its gate bytes and is the largest
-        /// thing in the enum by three orders of magnitude.
-        input: Box<RenderInput>,
-        /// Whether the caller wants the numbers behind the gates, or only the
-        /// geometry of where they are.
-        ///
-        /// Static pane renders want both — the numbers are what a hover reads.
-        /// A **loop frame** wants only the geometry: 5.03 MiB of values for the
-        /// widest sweep, across a loop of up to 36 frames, is not affordable and
-        /// does not have to be paid, because the volume the frame was rendered
-        /// from is resident for as long as the loop lives and the wedges are
-        /// what turn a point back into a gate of it. See
-        /// [`rustdar_radar::hover::SweepGates`].
-        ///
-        /// It used to mean the `side²` `f32` raster grid, which no longer
-        /// leaves `rustdar-radar` on any path — see [`RenderedFrame::polar`].
-        /// The geometry is kept on both settings; only the values are dropped,
-        /// and the texture is unaffected either way.
-        values_wanted: bool,
-        /// The largest side this render's raster may have. See
-        /// [`JobRequest::side_ceiling_px`].
-        side_ceiling_px: u32,
-    },
-    /// Rasterize a Level III radial product.
+pub struct JobRequest {
+    /// What the kind's renderer reads, behind the one type-erased seam: the
+    /// kind's own input struct (`RadarPlanJob`, `SitesInput` and their
+    /// siblings), and the codec row that owns it — [`row_for`] finds the row
+    /// by the input's type; the row carries the encode/decode/run bodies.
+    pub job: rustdar_source::job::DescribedJob,
+    /// The run envelope — the one statement of the raster's size and ground.
     ///
-    /// The product's *bytes*, not its decoded form: a `Level3Message` holds
-    /// run-length radial packets with no serde derives anywhere in the graph,
-    /// and re-decoding is both cheap against the render and a use of the one
-    /// decoder rather than a second description of the format. The decode moves
-    /// off the main thread with the render as a result.
-    Level3 {
-        bytes: std::sync::Arc<Vec<u8>>,
-        product: rustdar_radar::types::RadarProduct,
-        radar_lat: f64,
-        radar_lon: f64,
-        /// See [`JobRequest::side_ceiling_px`].
-        side_ceiling_px: u32,
-    },
-    /// Rasterize a Level III product **derived from two objects of the same
-    /// volume**: VIL density, Digital VIL over Enhanced Echo Tops
-    /// (`rustdar_radar::vild`).
+    /// For an **overlay** job: texture width and height in physical texels
+    /// from the pane's `OverlayTexturePlan` (never re-derived on the far
+    /// side), and the ground the texture covers exactly as
+    /// `OverlayTexturePlan::coverage` answered it at the dispatch site; its
+    /// `side_ceiling_px` is 0 on every overlay dispatch and every decode —
+    /// the texture's exact dimensions are the request's own, so there is no
+    /// ceiling to spend.
     ///
-    /// A second variant rather than a `Vec<Arc<Vec<u8>>>` on the one above: the
-    /// two objects are not interchangeable — the first is the numerator and the
-    /// second the denominator — and a positional pair says so where a list
-    /// would leave it to a comment. The bytes travel for the same reason
-    /// [`JobRequest::Level3`]'s do.
-    Level3Pair {
-        dvl: std::sync::Arc<Vec<u8>>,
-        eet: std::sync::Arc<Vec<u8>>,
-        radar_lat: f64,
-        radar_lon: f64,
-        /// See [`JobRequest::side_ceiling_px`].
-        side_ceiling_px: u32,
-    },
-    /// Draw a vertical cross-section through a volume.
+    /// For the **radar** kinds the envelope carries only `side_ceiling_px` —
+    /// the largest raster side the render may produce — and the rest is
+    /// zeroed ([`ceiling_only_geometry`]). **Four bytes on the wire, and a
+    /// size rather than a flag.** It used to be one `full_res` byte selecting
+    /// between two constants, which could only ever answer "the long-range
+    /// size" or "the base size" — and the long-range size was itself a
+    /// literal, so a device offering eight times it per axis was told about
+    /// none of that. What the renderer needs is one number, "how big a
+    /// texture is this result allowed to become", and there are two callers
+    /// who know one:
     ///
-    /// The geometry rides here rather than on the [`RenderInput`]: a section's
-    /// endpoints are not a render parameter *of reflectivity*, and a
-    /// `RenderInput` carrying them would make every plan-view payload's bytes
-    /// depend on where somebody last drew a line.
+    ///   * **A loop frame** says [`crate::constants::LOOP_IMAGE_SIZE`]. A loop
+    ///     holds frames by the dozen, so it renders leaner by policy — it
+    ///     already drops the value grid for the same reason.
+    ///   * **A static render** says what the device can hold,
+    ///     `crate::constants::raster_side_ceiling_px` of this adapter's
+    ///     `max_texture_dimension_2d`, which is a real measurement of a real
+    ///     device rather than a class the build guessed at. A handheld that
+    ///     reports the GLES floor still says the base size and still gets a
+    ///     correct picture rather than a texture creation that fails.
     ///
-    /// The `input` is a [`RenderInput::extract_volume`] payload — every tilt
-    /// carrying the moment, and the cut table that keys them.
-    Section {
-        input: Box<RenderInput>,
-        request: SectionRequest,
-    },
-    /// Resample a volume into a Cartesian grid for a raymarch.
-    Voxels {
-        input: Box<RenderInput>,
-        request: VoxelRequest,
-    },
-    /// Rasterize an overlay layer — the frame-following work that used to
-    /// ride the opaque closure funnel, whose wasm arm ran it **inline on the
-    /// browser's one thread** (a measured 224 ms against a 290 ms p50
-    /// gesture frame for the layer set that prompted this; measured at
-    /// main@ebe0ad3b, 2026-08-12 web-baseline campaign; instrumentation
-    /// 3673d316). That funnel is
-    /// deleted; this variant is how every overlay rasterizes now.
-    ///
-    /// The raster's geometry travels on this variant — one statement of the
-    /// texture's size and ground for every overlay kind — and everything a
-    /// particular kind's rasterizer reads beyond that travels in `input`,
-    /// whose variant *is* the kind. A separate kind field would be a second
-    /// statement of one fact, which is the disagreement
-    /// [`agree_on_product`] exists to refuse elsewhere.
-    ///
-    /// Every overlay kind is described: the sites render, the three polygon
-    /// kinds (NWS alerts, SPC outlooks, SPC discussions), the two hit-map
-    /// kinds (storm reports, GLM lightning) and the HRRR model grid — the
-    /// last kind through the wire, and the one whose departure deleted the
-    /// opaque closure path outright.
-    Overlay {
-        /// The raster's envelope — texture width and height in physical
-        /// texels from the pane's `OverlayTexturePlan` (never re-derived on
-        /// the far side), and the ground the texture covers exactly as
-        /// `OverlayTexturePlan::coverage` answered it at the dispatch site.
-        /// `side_ceiling_px` is 0 on every overlay job: the texture's exact
-        /// dimensions are the request's own, so there is no ceiling to spend.
+    /// Neither is "the picture the display always made": the extent is the
+    /// sweep's either way, and `rustdar_radar::types::raster_side_px` spends
+    /// this ceiling only as far as the sweep's own gates justify. The figure
+    /// is resolved at the dispatch site rather than in the row because this
+    /// type travels to a worker that has no device to ask. The section, voxel
+    /// and decode kinds carry no ceiling — a section's raster is a constant
+    /// of the view (`xsect`'s `SECTION_WIDTH`), a voxel grid's shape is
+    /// already on the wire, and a decode draws nothing — so their dispatch
+    /// sites say 0, which is the same effective value the envelope has always
+    /// answered for them.
+    pub geometry: rustdar_source::job::JobGeometry,
+}
+
+impl JobRequest {
+    /// Describe `input` under `geometry` — the one construction every
+    /// dispatch site uses, so the type erasure happens in exactly one place.
+    pub fn describe(
+        input: impl rustdar_source::job::JobInput,
         geometry: rustdar_source::job::JobGeometry,
-        /// What the kind's rasterizer reads, behind the one type-erased seam:
-        /// the kind's own input struct (`SitesInput` and its siblings), and
-        /// the codec row that owns it — [`row_for`] finds the row by the
-        /// input's type, `rustdar_overlays::render::jobs::JOB_CODECS` carries
-        /// the moved encode/decode/run bodies.
-        job: rustdar_source::job::DescribedJob,
-    },
-    /// **Decode a downloaded Level II archive volume.**
-    ///
-    /// The one job here that does not rasterize anything, and the one whose
-    /// input is not already a decoded volume — it is what *produces* the
-    /// volume every other variant is built from.
-    ///
-    /// It is a job for the reason the renders are: on the web the work has to
-    /// happen somewhere that is not the one thread the browser has.
-    /// `rustdar_radar::scan`'s own doc predicted this — the walk is paid "on
-    /// cold start, on every timeline scrub, on every 'next scan', and once per
-    /// frame of a loop download … and on the web it is paid on the browser's
-    /// main thread" — and the frame-thread audit put a number on it: **1021.9
-    /// ms in Firefox 153 and 911.4 ms in Chrome 151** for a 16.9 MB, 21-sweep
-    /// volume, against 42–66 ms on a native thread pool. Nothing else this
-    /// application does blocks a frame for a second.
-    ///
-    /// # The bytes, not a `File`
-    ///
-    /// `nexrad_data::volume::File` owns a `Vec<u8>` and nothing else, so the
-    /// archive bytes *are* the job's input and no wrapper has to cross. They
-    /// arrive here straight off the download, which is the split this variant
-    /// exists to make: the network half belongs to whoever has the fetch stack
-    /// and stays on the async task, and the CPU half comes here.
-    ///
-    /// `Arc` so that the dispatch site — which may hold the bytes for a retry —
-    /// does not have to hand over its only copy, and so the enum's `Clone`
-    /// costs a refcount rather than 16 MB.
-    Decode { archive: std::sync::Arc<Vec<u8>> },
+    ) -> Self {
+        Self {
+            job: rustdar_source::job::DescribedJob::new(input),
+            geometry,
+        }
+    }
+}
+
+/// The envelope of a job with no raster geometry of its own — the radar
+/// kinds, whose rows read only `side_ceiling_px` off it. Width, height and
+/// bounds are zeroed: nothing on those rows reads them (they are the overlay
+/// half of the envelope until WO-M7b's canonical envelope), and the decode
+/// side fills the same zeroes, so a round trip is the identity.
+pub(crate) fn ceiling_only_geometry(side_ceiling_px: u32) -> rustdar_source::job::JobGeometry {
+    rustdar_source::job::JobGeometry {
+        width: 0,
+        height: 0,
+        bounds: rustdar_source::geo::GeoBounds {
+            min_lat: 0.0,
+            max_lat: 0.0,
+            min_lon: 0.0,
+            max_lon: 0.0,
+        },
+        side_ceiling_px,
+    }
 }
 
 /// What a job produces.
@@ -519,18 +478,19 @@ pub enum JobOutput {
     Section(Box<CrossSection>),
     /// Boxed for the same reason, more so: a desktop grid is 8 MiB of indices.
     Voxels(Box<VoxelGrid>),
-    /// A decoded Level II volume — the answer to [`JobRequest::Decode`], and
-    /// the only output here that is not a picture of anything.
+    /// A decoded Level II volume — the answer to the `decode` row's
+    /// `DecodeJob`, and the only output here that is not a picture of
+    /// anything.
     ///
     /// Boxed like the two above and for a stronger version of their reason: a
     /// `DecodedScan` owns every gate of every radial of every sweep, 47–69 MiB
     /// across the volumes this was measured on, which is an order of magnitude
     /// past the largest thing that had been in this enum.
     Volume(Box<rustdar_radar::scan::DecodedScan>),
-    /// An overlay raster — the answer to [`JobRequest::Overlay`]: the RGBA
-    /// texture, **always premultiplied** ([`execute`]'s overlay arm converts
-    /// any rasterizer that declares straight alpha), and — for the two
-    /// hit-map kinds — the portable half of their hit map.
+    /// An overlay raster — the answer to a described overlay job: the RGBA
+    /// texture, **always premultiplied** ([`execute`]'s output conversion
+    /// premultiplies any rasterizer that declares straight alpha), and — for
+    /// the two hit-map kinds — the portable half of their hit map.
     ///
     /// `rgba` is deliberately a bare buffer with no width, height or framing,
     /// for the reason [`RenderedFrame`] has no width: nothing on this port
@@ -835,442 +795,122 @@ impl Job {
 }
 
 impl JobRequest {
-    /// Encode for a worker. The framing is one tag byte and then the variant's
-    /// own bytes, so a new variant cannot be mistaken for an old one.
+    /// Encode for a worker. The framing is the row's legacy code and then the
+    /// row's own bytes, so one kind cannot be mistaken for another.
+    ///
+    /// **The sparse era, byte for byte** ([`LegacyCode`]): a radar-family row
+    /// writes its one `TAG_*` byte and then the row's payload — the row
+    /// itself writes its legacy `side_ceiling_px` interleave off the
+    /// [`EncodeCtx`](rustdar_source::job::EncodeCtx), row-owned until WO-M7b
+    /// canonicalises the envelope — and an overlay row writes [`TAG_OVERLAY`],
+    /// the shared geometry header, its sparse sub-code and then the row's
+    /// payload. WO-M7b's dense flip is where every row gains the one
+    /// canonical envelope and the two-level overlay framing dies.
     pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Radar {
-                input,
-                values_wanted,
-                side_ceiling_px,
-            } => {
-                let mut out = Vec::new();
-                out.push(TAG_RADAR);
-                out.push(u8::from(*values_wanted));
-                out.extend_from_slice(&side_ceiling_px.to_le_bytes());
-                out.extend_from_slice(&input.to_bytes());
-                out
+        let row = row_for(&self.job);
+        let ctx = rustdar_source::job::EncodeCtx {
+            geometry: self.geometry,
+        };
+        let mut out = Vec::new();
+        match legacy_code(row) {
+            LegacyCode::Tag(tag) => {
+                out.push(tag);
+                (row.encode)(&self.job, &ctx, &mut out);
             }
-            Self::Level3 {
-                bytes,
-                product,
-                radar_lat,
-                radar_lon,
-                side_ceiling_px,
-            } => {
-                let mut out = vec![TAG_LEVEL3];
-                out.extend_from_slice(&side_ceiling_px.to_le_bytes());
-                out.extend_from_slice(&product.wire_code().to_le_bytes());
-                out.extend_from_slice(&radar_lat.to_le_bytes());
-                out.extend_from_slice(&radar_lon.to_le_bytes());
-                out.extend_from_slice(bytes);
-                out
-            }
-            Self::Level3Pair {
-                dvl,
-                eet,
-                radar_lat,
-                radar_lon,
-                side_ceiling_px,
-            } => {
-                // The first object is length-prefixed and the second takes the
-                // rest, so neither length can lie about the other.
-                let mut out = vec![TAG_LEVEL3_PAIR];
-                out.extend_from_slice(&side_ceiling_px.to_le_bytes());
-                out.extend_from_slice(&radar_lat.to_le_bytes());
-                out.extend_from_slice(&radar_lon.to_le_bytes());
-                out.extend_from_slice(&(dvl.len() as u32).to_le_bytes());
-                out.extend_from_slice(dvl);
-                out.extend_from_slice(eet);
-                out
-            }
-            // Both of the two below put the `RenderInput` **last**, because
-            // `RenderInput::from_bytes` refuses trailing bytes: it has to be
-            // handed exactly the remainder, so nothing may follow it.
-            Self::Section { input, request } => {
-                let mut out = vec![TAG_SECTION];
-                encode_section_request(&mut out, request);
-                out.extend_from_slice(&input.to_bytes());
-                out
-            }
-            Self::Voxels { input, request } => {
-                let mut out = vec![TAG_VOXELS];
-                encode_voxel_request(&mut out, request);
-                out.extend_from_slice(&input.to_bytes());
-                out
-            }
-            Self::Overlay { geometry, job } => {
-                let row = row_for(job);
-                let mut out = vec![TAG_OVERLAY];
-                out.extend_from_slice(&geometry.width.to_le_bytes());
-                out.extend_from_slice(&geometry.height.to_le_bytes());
+            LegacyCode::OverlaySub(sub) => {
+                out.push(TAG_OVERLAY);
+                out.extend_from_slice(&self.geometry.width.to_le_bytes());
+                out.extend_from_slice(&self.geometry.height.to_le_bytes());
                 // The box in its declaration order, spelled here and in the
                 // decoder and nowhere else.
-                out.extend_from_slice(&geometry.bounds.min_lat.to_le_bytes());
-                out.extend_from_slice(&geometry.bounds.max_lat.to_le_bytes());
-                out.extend_from_slice(&geometry.bounds.min_lon.to_le_bytes());
-                out.extend_from_slice(&geometry.bounds.max_lon.to_le_bytes());
+                out.extend_from_slice(&self.geometry.bounds.min_lat.to_le_bytes());
+                out.extend_from_slice(&self.geometry.bounds.max_lat.to_le_bytes());
+                out.extend_from_slice(&self.geometry.bounds.min_lon.to_le_bytes());
+                out.extend_from_slice(&self.geometry.bounds.max_lon.to_le_bytes());
                 // The kind *within* the overlay: this crate's sparse
                 // sub-code, written by the caller — the rows' payloads start
-                // after it. See [`overlay_sub_code`].
-                out.push(overlay_sub_code(row));
-                // The geometry rides in the [`EncodeCtx`] because one input —
+                // after it. See [`LegacyCode`].
+                out.push(sub);
+                // The geometry rides in the `EncodeCtx` because one input —
                 // the model grid — is *cut to it* on the way out, at the one
                 // moment that knows what ground the texture covers; every
-                // other row ignores it. The row's payload is the kind's own
-                // bytes: scalars first, then the count-prefixed lists.
-                (row.encode)(
-                    job,
-                    &rustdar_source::job::EncodeCtx {
-                        geometry: *geometry,
-                    },
-                    &mut out,
-                );
-                out
-            }
-            // The tag and then the archive, which takes the rest: an archive
-            // volume has no framing this needs to know about, and a length
-            // prefix would be a second statement of a length the buffer
-            // already has.
-            Self::Decode { archive } => {
-                let mut out = Vec::with_capacity(1 + archive.len());
-                out.push(TAG_DECODE);
-                out.extend_from_slice(archive);
-                out
+                // other overlay row ignores it. The row's payload is the
+                // kind's own bytes: scalars first, then the count-prefixed
+                // lists.
+                (row.encode)(&self.job, &ctx, &mut out);
             }
         }
+        out
     }
 
-    /// `None` on an unknown tag or a payload this build cannot read — the two
+    /// `None` on an unknown code or a payload this build cannot read — the two
     /// ends of a message port can be different builds, so that has to be a
     /// clean refusal rather than a misparse.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let (tag, rest) = bytes.split_first()?;
-        match *tag {
-            TAG_RADAR => {
-                let (values_wanted, rest) = rest.split_first()?;
-                let (ceiling, rest) = rest.split_at_checked(4)?;
-                Some(Self::Radar {
-                    values_wanted: flag(*values_wanted)?,
-                    side_ceiling_px: u32::from_le_bytes(ceiling.try_into().ok()?),
-                    input: Box::new(RenderInput::from_bytes(rest)?),
-                })
+        let mut r = rustdar_source::wire::Reader::new(rest);
+        if *tag == TAG_OVERLAY {
+            let width = r.u32()?;
+            let height = r.u32()?;
+            // Refused at the boundary for the voxel affordability guard's
+            // reason: these bytes arrive on a message port and the two
+            // numbers are what [`execute`]'s output allocates a
+            // `width × height` pixmap from, so without a ceiling a malformed
+            // job is a multi-gigabyte allocation rather than a refusal. The
+            // ceiling is the largest raster *any* target of this workspace
+            // affords — the desktop plan-view side, squared — which every
+            // real overlay plan sits under (a plan never exceeds the
+            // adapter's texture limit, and its pixel count is the viewport
+            // plus a quarter overdraw). A zero side is refused with it:
+            // the rasterizer would answer a zero-length buffer whose
+            // "success" no consumer could tell from a failure.
+            let ceiling = crate::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
+            let pixels = u64::from(width) * u64::from(height);
+            if width == 0 || height == 0 || pixels > ceiling * ceiling {
+                return None;
             }
-            TAG_LEVEL3 => {
-                let mut r = Reader::new(rest);
-                Some(Self::Level3 {
-                    side_ceiling_px: r.u32()?,
-                    product: rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?,
-                    radar_lat: r.f64()?,
-                    radar_lon: r.f64()?,
-                    bytes: std::sync::Arc::new(r.rest().to_vec()),
-                })
-            }
-            TAG_LEVEL3_PAIR => {
-                let mut r = Reader::new(rest);
-                let side_ceiling_px = r.u32()?;
-                let radar_lat = r.f64()?;
-                let radar_lon = r.f64()?;
-                let dvl_len = r.u32()? as usize;
-                Some(Self::Level3Pair {
-                    side_ceiling_px,
-                    radar_lat,
-                    radar_lon,
-                    dvl: std::sync::Arc::new(r.take(dvl_len)?.to_vec()),
-                    eet: std::sync::Arc::new(r.rest().to_vec()),
-                })
-            }
-            TAG_SECTION => {
-                let mut r = Reader::new(rest);
-                let request = decode_section_request(&mut r)?;
-                let input = RenderInput::from_bytes(r.rest())?;
-                agree_on_product(request.product, &input)?;
-                Some(Self::Section {
-                    input: Box::new(input),
-                    request,
-                })
-            }
-            TAG_VOXELS => {
-                let mut r = Reader::new(rest);
-                let request = decode_voxel_request(&mut r)?;
-                let input = RenderInput::from_bytes(r.rest())?;
-                agree_on_product(request.product, &input)?;
-                Some(Self::Voxels {
-                    input: Box::new(input),
-                    request,
-                })
-            }
-            TAG_DECODE => Some(Self::Decode {
-                archive: std::sync::Arc::new(rest.to_vec()),
-            }),
-            TAG_OVERLAY => {
-                // The substrate `Reader`, not this file's duplicate: the
-                // codec rows' `decode` signatures speak it, and the cursor is
-                // handed over mid-payload.
-                let mut r = rustdar_source::wire::Reader::new(rest);
-                let width = r.u32()?;
-                let height = r.u32()?;
-                // Refused at the boundary for `decode_voxel_request`'s reason:
-                // these bytes arrive on a message port and the two numbers are
-                // what [`execute`]'s overlay arm allocates a `width × height`
-                // pixmap from, so without a ceiling a malformed job is a
-                // multi-gigabyte allocation rather than a refusal. The ceiling
-                // is the largest raster *any* target of this workspace
-                // affords — the desktop plan-view side, squared — which every
-                // real overlay plan sits under (a plan never exceeds the
-                // adapter's texture limit, and its pixel count is the viewport
-                // plus a quarter overdraw). A zero side is refused with it:
-                // the rasterizer would answer a zero-length buffer whose
-                // "success" no consumer could tell from a failure.
-                let ceiling = crate::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
-                let pixels = u64::from(width) * u64::from(height);
-                if width == 0 || height == 0 || pixels > ceiling * ceiling {
-                    return None;
-                }
-                let bounds = rustdar_overlays::types::GeoBounds {
-                    min_lat: r.f64()?,
-                    max_lat: r.f64()?,
-                    min_lon: r.f64()?,
-                    max_lon: r.f64()?,
-                };
-                // An overlay's raster is never ceiling-sized; see
-                // [`JobRequest::side_ceiling_px`].
-                let geometry = rustdar_source::job::JobGeometry {
-                    width,
-                    height,
-                    bounds,
-                    side_ceiling_px: 0,
-                };
-                // The sub-code selects the row (`None` for a code this build
-                // does not have), and the row decodes its own payload — geo
-                // passes through the row unchanged on every overlay kind.
-                let row = overlay_row_for_code(r.u8()?)?;
-                let (job, geometry) = (row.decode)(&mut r, geometry)?;
-                // Every overlay input's lists are length-counted rather than
-                // "the rest", so unlike the archive arms nothing may follow
-                // the payload: trailing bytes mean the two builds' layouts
-                // disagree.
-                r.rest().is_empty().then_some(())?;
-                Some(Self::Overlay { geometry, job })
-            }
-            _ => None,
+            let bounds = rustdar_source::geo::GeoBounds {
+                min_lat: r.f64()?,
+                max_lat: r.f64()?,
+                min_lon: r.f64()?,
+                max_lon: r.f64()?,
+            };
+            // An overlay's raster is never ceiling-sized; see
+            // [`JobRequest::geometry`].
+            let geometry = rustdar_source::job::JobGeometry {
+                width,
+                height,
+                bounds,
+                side_ceiling_px: 0,
+            };
+            // The sub-code selects the row (`None` for a code this build
+            // does not have), and the row decodes its own payload — geo
+            // passes through the row unchanged on every overlay kind.
+            let row = overlay_row_for_code(r.u8()?)?;
+            let (job, geometry) = (row.decode)(&mut r, geometry)?;
+            // Every overlay input's lists are length-counted rather than
+            // "the rest", so unlike the radar-family tails nothing may
+            // follow the payload: trailing bytes mean the two builds'
+            // layouts disagree.
+            r.rest().is_empty().then_some(())?;
+            Some(Self { job, geometry })
+        } else {
+            // A radar-family row. The envelope starts zeroed — these rows'
+            // wire form carries no geometry header — and a row whose legacy
+            // layout interleaves `side_ceiling_px` in its payload fills it in
+            // and returns the amended envelope; the rest pass it through, so
+            // their effective ceiling is the 0 their dispatch sites say.
+            let row = radar_row_for_tag(*tag)?;
+            let (job, geometry) = (row.decode)(&mut r, ceiling_only_geometry(0))?;
+            Some(Self { job, geometry })
         }
     }
 
-    /// The largest raster side this job's render may produce.
-    ///
-    /// **Four bytes on the wire, and a size rather than a flag.** It used to be
-    /// one `full_res` byte selecting between two constants, which could only
-    /// ever answer "the long-range size" or "the base size" — and the
-    /// long-range size was itself a literal, so a device offering eight times
-    /// it per axis was told about none of that. What the renderer needs is one
-    /// number, "how big a texture is this result allowed to become", and there
-    /// are two callers who know one:
-    ///
-    ///   * **A loop frame** says [`crate::constants::LOOP_IMAGE_SIZE`]. A loop
-    ///     holds frames by the dozen, so it renders leaner by policy — it
-    ///     already drops the value grid for the same reason.
-    ///   * **A static render** says what the device can hold,
-    ///     `crate::constants::raster_side_ceiling_px` of this adapter's
-    ///     `max_texture_dimension_2d`, which is a real measurement of a real
-    ///     device rather than a class the build guessed at. A handheld that
-    ///     reports the GLES floor still says the base size and still gets a
-    ///     correct picture rather than a texture creation that fails.
-    ///
-    /// Neither is "the picture the display always made": the extent is the
-    /// sweep's either way, and `rustdar_radar::types::raster_side_px` spends
-    /// this ceiling only as far as the sweep's own gates justify. The figure is
-    /// resolved at the dispatch site rather than here because this type travels
-    /// to a worker that has no device to ask.
-    ///
-    /// The [`JobRequest::Section`] and [`JobRequest::Voxels`] arms carry no
-    /// ceiling: a section's raster is a constant of the view (`xsect`'s
-    /// `SECTION_WIDTH`) and a voxel grid's shape is already on the wire.
-    fn side_ceiling_px(&self) -> usize {
-        match self {
-            Self::Radar {
-                side_ceiling_px, ..
-            }
-            | Self::Level3 {
-                side_ceiling_px, ..
-            }
-            | Self::Level3Pair {
-                side_ceiling_px, ..
-            } => *side_ceiling_px as usize,
-            // An overlay's raster is not ceiling-sized at all: the texture's
-            // exact dimensions are the request's own `width` and `height`
-            // (its `geometry.side_ceiling_px` is 0 on every dispatch and
-            // every decode, the same value this arm has always answered).
-            Self::Section { .. }
-            | Self::Voxels { .. }
-            | Self::Decode { .. }
-            | Self::Overlay { .. } => 0,
-        }
-    }
-
-    /// For the timing log, so a slow job says which kind it was.
+    /// For the timing log, so a slow job says which kind it was: the codec
+    /// row's label, which is the shipped kind string.
     fn kind(&self) -> &'static str {
-        match self {
-            Self::Radar { input, .. } => match input.product() {
-                rustdar_radar::types::RadarProduct::NormalizedRotation => "radar/nrot",
-                rustdar_radar::types::RadarProduct::StormRelativeVelocity => "radar/srv",
-                _ => "radar",
-            },
-            Self::Level3 { .. } => "level3",
-            Self::Level3Pair { .. } => "level3/vild",
-            Self::Section { .. } => "section",
-            Self::Voxels { .. } => "voxels",
-            Self::Decode { .. } => "decode",
-            // The row's label IS the shipped kind string — the codec rows
-            // carried the exact `"overlay/sites"` … `"overlay/model"`
-            // spellings over with the bodies, byte-verified against
-            // `wire_identity`'s rows at their move.
-            Self::Overlay { job, .. } => row_for(job).label,
-        }
+        row_for(&self.job).label
     }
-}
-
-/// The product is on the wire twice — once in the request's own geometry and
-/// once inside the [`RenderInput`] — and two statements of one fact can
-/// disagree.
-///
-/// They must not be allowed to. A section of a moment the payload does not
-/// carry does not fail: `VolumeSampler` builds no rung for it, every sample
-/// comes back `NoCoverage`, and the raster is a full-size, correctly-shaped
-/// picture of clear air. That is indistinguishable from a genuinely empty
-/// section, so it is refused here rather than drawn.
-///
-/// The alternative — carrying the product only in the payload and filling the
-/// request's field from it at decode — was rejected because it makes
-/// [`JobRequest`] not round-trip: a caller who built an inconsistent pair would
-/// get a *different* request back rather than a refusal, which moves the
-/// disagreement from the wire into the type.
-fn agree_on_product(wanted: rustdar_radar::types::RadarProduct, input: &RenderInput) -> Option<()> {
-    (wanted == input.product()).then_some(())
-}
-
-/// A wire boolean, refusing anything that is not 0 or 1.
-///
-/// The two ends of a message port can be different builds, and a byte outside
-/// the pair is a payload this one cannot read rather than a `true` to guess at
-/// — the same refusal `values_wanted` has always made, now spelt once for the
-/// several flags that make it.
-fn flag(byte: u8) -> Option<bool> {
-    match byte {
-        0 => Some(false),
-        1 => Some(true),
-        _ => None,
-    }
-}
-
-fn encode_section_request(out: &mut Vec<u8>, request: &SectionRequest) {
-    out.extend_from_slice(&request.product.wire_code().to_le_bytes());
-    out.extend_from_slice(&request.start.0.to_le_bytes());
-    out.extend_from_slice(&request.start.1.to_le_bytes());
-    out.extend_from_slice(&request.end.0.to_le_bytes());
-    out.extend_from_slice(&request.end.1.to_le_bytes());
-    match request.top_km_msl {
-        None => out.push(0),
-        Some(top) => {
-            out.push(1);
-            out.extend_from_slice(&top.to_le_bytes());
-        }
-    }
-}
-
-fn decode_section_request(r: &mut Reader) -> Option<SectionRequest> {
-    let product = rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?;
-    Some(SectionRequest {
-        start: (r.f64()?, r.f64()?),
-        end: (r.f64()?, r.f64()?),
-        top_km_msl: match r.u8()? {
-            0 => None,
-            1 => Some(r.f64()?),
-            _ => return None,
-        },
-        product,
-    })
-}
-
-fn encode_voxel_request(out: &mut Vec<u8>, request: &VoxelRequest) {
-    out.push(u8::from(request.values_wanted));
-    out.extend_from_slice(&request.product.wire_code().to_le_bytes());
-    out.extend_from_slice(&request.centre.0.to_le_bytes());
-    out.extend_from_slice(&request.centre.1.to_le_bytes());
-    // Tagged rather than sent as a sentinel width, the same shape the storm
-    // motion override above is sent in: `None` means "as wide as the volume
-    // reaches", which is a decision `build_voxels` makes on the worker side
-    // with the volume in hand, and no f64 can stand for it without also being
-    // a width somebody could legitimately ask for.
-    // East then north, and both always written when the tag says `Some`: the
-    // two axes are independent, so a wire that carried one and squared it on
-    // the far side would silently resample ground the pane is not framing.
-    match request.half_extent_km {
-        None => out.push(0),
-        Some(half) => {
-            out.push(1);
-            out.extend_from_slice(&half.east_km.to_le_bytes());
-            out.extend_from_slice(&half.north_km.to_le_bytes());
-        }
-    }
-    out.extend_from_slice(&request.base_km_msl.to_le_bytes());
-    out.extend_from_slice(&request.top_km_msl.to_le_bytes());
-    // `u16` per axis rather than `u8`: `MAX_AXIS` is 1625, which does not fit
-    // in a byte, and a wrapped axis would arrive as a shorter one rather than
-    // as an error. It fits a `u16` with room to spare, and
-    // `the_arithmetic_bound_is_the_largest_cubable_axis` is what keeps this
-    // encoding and that bound agreeing if the bound moves again.
-    for n in [request.shape.nx, request.shape.ny, request.shape.nz] {
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-    }
-}
-
-fn decode_voxel_request(r: &mut Reader) -> Option<VoxelRequest> {
-    let values_wanted = match r.u8()? {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let product = rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?;
-    let request = VoxelRequest {
-        centre: (r.f64()?, r.f64()?),
-        half_extent_km: match r.u8()? {
-            0 => None,
-            1 => Some(rustdar_radar::voxel::HalfExtentKm {
-                east_km: r.f64()?,
-                north_km: r.f64()?,
-            }),
-            _ => return None,
-        },
-        base_km_msl: r.f64()?,
-        top_km_msl: r.f64()?,
-        product,
-        shape: VoxelShape {
-            nx: r.u16()? as usize,
-            ny: r.u16()? as usize,
-            nz: r.u16()? as usize,
-        },
-        values_wanted,
-    };
-    // `build_voxels` refuses an unsupported shape too, and logs it — but that
-    // refusal happens after the whole payload has been decoded and the sampler
-    // built. Refusing here keeps the same rule at the boundary where the bytes
-    // are untrusted, and it is the shape check that `is_supported` owns rather
-    // than a second copy of the bounds.
-    //
-    // The **cell count** is checked beside it, and that half is new since
-    // `MAX_AXIS` stopped being the 256 a GLES 3.0 device guarantees.
-    // `is_supported` now admits 1625 an axis, which is 4.29 *billion* cells —
-    // the bound is on what `VoxelShape::cells` can represent, not on what a
-    // machine can hold, and unlike `VoxelGrid::from_bytes` there is no payload
-    // in hand here whose length would have to match. A request is thirty-odd
-    // bytes and `build_voxels` allocates the grid it names, so without this a
-    // malformed job would be a multi-gigabyte allocation rather than a refusal.
-    // `VOXEL_TEXTURE_BUDGET_BYTES` is one byte per cell of the largest index
-    // plane this workspace produces, which is exactly the ceiling wanted: every
-    // shape any tier can ask for is at or under it.
-    let affordable = request.shape.cells() <= rustdar_radar::voxel::VOXEL_TEXTURE_BUDGET_BYTES;
-    (request.shape.is_supported() && affordable).then_some(request)
 }
 
 const TAG_RADAR: u8 = 1;
@@ -1303,47 +943,68 @@ const TAG_DECODE: u8 = 7;
 /// without spending a job tag each.
 const TAG_OVERLAY: u8 = 8;
 
-/// The composed codec registry this crate frames jobs against — today the
-/// seven overlay rows, in their load-bearing order (**sites, alerts,
-/// outlooks, discussions, reports, glm, model**).
+/// The composed codec registry this crate frames jobs against — the six
+/// radar rows and then the seven overlay rows, each half in its own
+/// load-bearing order. The composition itself lives in
+/// [`crate::job_registry`], which is the one frontend module that names the
+/// source crates' registries; this funnel consumes rows and never their
+/// crates.
+pub(crate) use crate::job_registry::job_codecs;
+
+/// The wire code a row ships under in the sparse era — **frontend-owned, and
+/// a literal map CHOSEN to reproduce today's bytes** until WO-M7b's dense
+/// registry-index flip collapses the two levels into one code space.
 ///
-/// ONE explicit expression, deliberately: WO-M7 prepends the six radar rows
-/// here (`RADAR ++ OVERLAYS`), and WO-M7b's dense code flip assigns wire
-/// codes by index into exactly this composition — so the composition must
-/// stay a single spelled-out expression rather than something assembled in
-/// pieces.
-pub(crate) fn job_codecs() -> &'static [rustdar_source::job::JobCodec] {
-    rustdar_overlays::render::jobs::JOB_CODECS
+/// A radar-family row is `Tag(t)`: its payload rides directly under one
+/// `TAG_*` byte. An overlay row is `OverlaySub(s)`: its payload rides under
+/// [`TAG_OVERLAY`], the shared geometry header and then `s` — the numbers
+/// the deleted `OVERLAY_INPUT_*` constants shipped, starting at 1 so 0 stays
+/// unallocated on the inner wire exactly as the outer tag space leaves it (a
+/// zeroed buffer must never decode). Renumbering is no longer forbidden by
+/// cross-build compatibility — the wire is same-build-only by construction —
+/// but it re-pins the literal test in `offload::tests` and thereby changes
+/// the build token, which is the correct consequence: two builds that
+/// disagree refuse each other and respawn rather than misread a byte.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LegacyCode {
+    /// A radar-family row's own tag byte.
+    Tag(u8),
+    /// An overlay row's sub-code inside a [`TAG_OVERLAY`] job.
+    OverlaySub(u8),
 }
 
-/// The sub-code a row's payload ships under inside a [`TAG_OVERLAY`] job —
-/// the sparse map, frontend-owned until WO-M7b's dense registry-index flip.
+/// The sparse-era code of `row` — the one map from the composed registry to
+/// today's bytes, pinned literal-by-literal in `offload::tests`.
 ///
-/// A literal match, **CHOSEN to reproduce today's bytes**: the numbers are
-/// the ones the deleted `OVERLAY_INPUT_*` constants shipped, starting at 1 so
-/// 0 stays unallocated on this inner wire exactly as the outer tag space
-/// leaves it — a zeroed buffer must never decode. Renumbering is no longer
-/// forbidden by cross-build compatibility — the wire is same-build-only by
-/// construction — but it re-pins the literal test in `offload::tests` and
-/// thereby changes the build token, which is the correct consequence: two
-/// builds that disagree refuse each other and respawn rather than misread a
-/// byte.
-///
-/// Panics on a row outside the overlay registry: the caller resolved the row
-/// with [`row_for`], whose registry this map spells out — an unmapped row is
-/// a registry this build does not have, and a silently-wrong code byte would
-/// be a payload decoded as another kind.
-fn overlay_sub_code(row: &rustdar_source::job::JobCodec) -> u8 {
+/// Panics on a row outside the composed registry: the caller resolved the
+/// row with [`row_for`], whose registry this map spells out — an unmapped
+/// row is a registry this build does not have, and a silently-wrong code
+/// byte would be a payload decoded as another kind.
+fn legacy_code(row: &rustdar_source::job::JobCodec) -> LegacyCode {
     match row.label {
-        "overlay/sites" => 1,
-        "overlay/alerts" => 2,
-        "overlay/outlooks" => 3,
-        "overlay/discussions" => 4,
-        "overlay/reports" => 5,
-        "overlay/glm" => 6,
-        "overlay/model" => 7,
-        other => panic!("the codec row {other:?} has no overlay sub-code in this build"),
+        "radar" => LegacyCode::Tag(TAG_RADAR),
+        "level3" => LegacyCode::Tag(TAG_LEVEL3),
+        "level3/vild" => LegacyCode::Tag(TAG_LEVEL3_PAIR),
+        "section" => LegacyCode::Tag(TAG_SECTION),
+        "voxels" => LegacyCode::Tag(TAG_VOXELS),
+        "decode" => LegacyCode::Tag(TAG_DECODE),
+        "overlay/sites" => LegacyCode::OverlaySub(1),
+        "overlay/alerts" => LegacyCode::OverlaySub(2),
+        "overlay/outlooks" => LegacyCode::OverlaySub(3),
+        "overlay/discussions" => LegacyCode::OverlaySub(4),
+        "overlay/reports" => LegacyCode::OverlaySub(5),
+        "overlay/glm" => LegacyCode::OverlaySub(6),
+        "overlay/model" => LegacyCode::OverlaySub(7),
+        other => panic!("the codec row {other:?} has no legacy wire code in this build"),
     }
+}
+
+/// The radar-family row a decoded tag byte selects, or `None` for a tag this
+/// build does not have — including [`TAG_SRM_RETIRED`], which no row claims,
+/// and [`TAG_OVERLAY`], which is the two-level framing's own and never a
+/// row's.
+fn radar_row_for_tag(tag: u8) -> Option<&'static rustdar_source::job::JobCodec> {
+    job_codecs().find(|row| legacy_code(row) == LegacyCode::Tag(tag))
 }
 
 /// The inverse of [`overlay_sub_code`]: the row a decoded sub-code selects,
@@ -1361,7 +1022,7 @@ fn overlay_row_for_code(code: u8) -> Option<&'static rustdar_source::job::JobCod
         7 => "overlay/model",
         _ => return None,
     };
-    job_codecs().iter().find(|row| row.label == label)
+    job_codecs().find(|row| row.label == label)
 }
 
 /// The codec row that owns `job`'s input type — a scan of [`job_codecs`] by
@@ -1370,16 +1031,16 @@ fn overlay_row_for_code(code: u8) -> Option<&'static rustdar_source::job::JobCod
 /// is the row's.
 ///
 /// Panics on an input type outside the registry, deliberately: every
-/// constructor of a described overlay job — the handlers' `prepare_job`, the
-/// dispatch's inline sites input, this file's own decode — draws from the
+/// constructor of a described job — the typed dispatch sites, the overlay
+/// handlers' `prepare_job`, this file's own decode — draws from the
 /// registry, so a miss is a build defect and a silent skip here would be a
 /// job encoded as zero bytes or logged under no name (silent partial
-/// success). The refusal-shaped path is [`overlay_row_for_code`], on the
-/// decode side, where the bytes may genuinely be another build's.
+/// success). The refusal-shaped paths are [`radar_row_for_tag`] and
+/// [`overlay_row_for_code`], on the decode side, where the bytes may
+/// genuinely be another build's.
 fn row_for(job: &rustdar_source::job::DescribedJob) -> &'static rustdar_source::job::JobCodec {
     let input_type = job.0.as_any().type_id();
     job_codecs()
-        .iter()
         .find(|row| (row.input_type)() == input_type)
         .unwrap_or_else(|| {
             panic!("no codec row owns the input type of {job:?}; the registry is incomplete")
@@ -1404,53 +1065,6 @@ pub(crate) fn wire_tags() -> [(&'static str, u8); 8] {
         ("TAG_DECODE", TAG_DECODE),
         ("TAG_OVERLAY", TAG_OVERLAY),
     ]
-}
-
-/// A bounds-checked cursor over a job's fixed-width header.
-///
-/// Every accessor answers `None` rather than panicking: these bytes arrive on a
-/// message port and are not trusted. The variable-length tail is whatever
-/// [`rest`](Reader::rest) is left holding, so no length prefix can lie about it.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.at.checked_add(n)?;
-        let slice = self.bytes.get(self.at..end)?;
-        self.at = end;
-        Some(slice)
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        &self.bytes[self.at..]
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|b| b[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    // `f32` left with the overlay field codecs (WO-M6.3): the radar arms —
-    // this duplicate's only remaining readers, until WO-M7.2 deletes it whole
-    // in favour of `rustdar_source::wire::Reader` — never read one.
-
-    fn f64(&mut self) -> Option<f64> {
-        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
 }
 
 /// Rewrite an RGBA8 raster from the rasterizers' straight alpha into the
@@ -1551,7 +1165,7 @@ fn premultiplied(output: JobOutput) -> JobOutput {
 /// * the plan-view rasterizer carries its cell buffer between calls
 ///   (`rustdar_radar::render`'s `POOLED_CELLS`);
 /// * the section rasterizer carries its three planes between cuts
-///   (`rustdar_radar::xsect`'s `POOLED_PLANES`), which the `Section` arm below
+///   (`rustdar_radar::xsect`'s `POOLED_PLANES`), which the section row
 ///   reaches through `render_section`; and
 /// * the plan-view rasterizer carries the RGBA texture and the value grid it
 ///   answers with (`rustdar_radar::render`'s `POOLED_IMAGE` and
@@ -1577,185 +1191,85 @@ fn premultiplied(output: JobOutput) -> JobOutput {
 /// slot, in its own linear memory, which is a fact about where the win lands
 /// and not about what comes back.
 pub fn execute(request: &JobRequest) -> JobResult {
-    // Read once, off the request, so the three rasterizing arms cannot come to
-    // disagree about how large a picture this job was allowed to make.
-    let side_ceiling_px = request.side_ceiling_px();
-    let output = match request {
-        JobRequest::Radar {
-            input,
-            values_wanted,
-            ..
-        } => rustdar_radar::render::render_from_sized(input, side_ceiling_px).map(|render| {
-            let mut frame = RenderedFrame::from(render);
-            if !*values_wanted {
-                // A loop frame keeps its geometry and drops its numbers. 5.03
-                // MiB apiece across a loop of up to 36 frames is not affordable
-                // and does not have to be paid: the volume the frame was
-                // rendered from is resident for as long as the loop lives, and
-                // 5.8 KiB of wedges is what turns a point back into a gate of
-                // it. See `rustdar_radar::hover::SweepGates`.
-                //
-                // A *Level II* loop frame is the one render that reaches this
-                // arm. The Level III loop has no `values_wanted` to reach it by
-                // and strips at the consumer instead; `app_fetch`'s `deliver`
-                // is the site, and stripping an already-stripped field there is
-                // what makes the one call safe for both.
-                frame.polar.strip_values();
-            }
-            JobOutput::Frame(frame)
-        }),
-        JobRequest::Level3 {
-            bytes,
-            product,
-            radar_lat,
-            radar_lon,
-            ..
-        } => decode_level3(bytes).and_then(|message| {
-            rustdar_radar::render::render_level3_message_to_image_sized(
-                &message,
-                *product,
-                *radar_lat,
-                *radar_lon,
-                side_ceiling_px,
-            )
-            .map(Into::into)
-            .map(JobOutput::Frame)
-        }),
-        JobRequest::Level3Pair {
-            dvl,
-            eet,
-            radar_lat,
-            radar_lon,
-            ..
-        } => match (decode_level3(dvl), decode_level3(eet)) {
-            (Some(dvl), Some(eet)) => rustdar_radar::render::render_derived_vild_to_image_sized(
-                &dvl,
-                &eet,
-                *radar_lat,
-                *radar_lon,
-                side_ceiling_px,
-            )
-            .map(Into::into)
-            .map(JobOutput::Frame),
-            // One of the two did not decode, which `decode_level3` has already
-            // logged: nothing to draw, the same answer a missing sweep gets.
-            _ => None,
-        },
-        // The `Scan` is rebuilt from the payload and dropped again here, which
-        // is the same shape the `Radar` arm has: one renderer, run wherever the
-        // job landed, rather than a worker-side reimplementation that could
-        // come to disagree with the main thread's.
-        // The storm motion override rides the `RenderInput` — the lane the
-        // plan-view SRV render already uses — and is threaded here into the
-        // derivation seam both vertical renderers share. The RPG's own vector
-        // rides the same payload, one field over, and is threaded through
-        // beside it: the two are rungs of one chain and the derivation is what
-        // arbitrates between them, so a caller that passed only the override
-        // would silently demote every vertical SRV cut to a derived rung while
-        // the map beside it used the RPG's.
-        //
-        // So does the declared Nyquist table, and it has to be lifted back out
-        // separately: `to_scan` rebuilds model types, and the model type is
-        // precisely what dropped the number. Pairing the two here is what
-        // keeps this thread's velocity fold guard on the same limits the
-        // thread that extracted the payload used.
-        JobRequest::Section { input, request } => {
-            let (scan, declared) = (input.to_scan(), input.declared_nyquist());
-            rustdar_radar::xsect::render_section(
-                rustdar_radar::nyquist::Volume::new(&scan, &declared),
-                request,
-                input.radar_lat(),
-                input.radar_lon(),
-                input.storm_motion(),
-            )
-            .map(|section| JobOutput::Section(Box::new(section)))
-        }
-        // The one arm that produces a volume rather than consuming one. It is
-        // also the one arm whose input is bigger than a pointer: `File::new`
-        // takes the archive by value, so the bytes are cloned out of the `Arc`
-        // here. That is one 16 MB memcpy against a decode of ~1000 ms in a
-        // browser, and it happens wherever the job ran rather than on the
-        // thread that asked for it.
-        JobRequest::Decode { archive } => {
-            match rustdar_radar::scan::decode_bytes(archive.as_ref().clone()) {
-                Ok(volume) => Some(JobOutput::Volume(Box::new(volume))),
-                Err(e) => {
-                    // "Nothing to draw", which is what every other arm's
-                    // failure already means, and what the caller's `deliver`
-                    // already handles: the fetch reports it and the pane keeps
-                    // whatever it had.
-                    log::error!("could not decode a Level II volume: {e}");
-                    None
-                }
-            }
-        }
-        JobRequest::Voxels { input, request } => {
-            let (scan, declared) = (input.to_scan(), input.declared_nyquist());
-            rustdar_radar::voxel::build_voxels_with_motion(
-                rustdar_radar::nyquist::Volume::new(&scan, &declared),
-                request,
-                input.radar_lat(),
-                input.radar_lon(),
-                input.storm_motion(),
-            )
-            .map(|grid| JobOutput::Voxels(Box::new(grid)))
-        }
-        JobRequest::Overlay { geometry, job } => {
-            // The row that owns the input's type runs it — the same moved
-            // rasterizer body the per-kind match here used to call, now one
-            // registry lookup. The GLM row still ages every flash against
-            // the `now` its input carries (the page's clock at dispatch,
-            // the parity gates' whole subject), and the model row draws
-            // whichever carry arrived; both facts live beside the rows in
-            // `rustdar_overlays::render::jobs` now.
-            let row = row_for(job);
-            (row.run)(job, geometry).and_then(|out| {
-                let output = out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>()?;
-                // The output contract is **premultiplied, always** — stated on
-                // [`JobOutput::OverlayRaster`] — where each rasterizer's own
-                // convention is whatever it declares. The tiny-skia rasterizers
-                // declare premultiplied on every path (a pixmap *is*
-                // premultiplied), so the arm below is theirs never; it exists
-                // because the model-grid rasterizer writes straight palette
-                // bytes and declares so, and a seam that silently dropped the
-                // declaration would ship that layer double-bright.
-                //
-                // The conversion is [`premultiply_raster`] — egui's own
-                // constructor per pixel, the exact call the frame-thread consumer
-                // used to make — so via-wire and direct bytes stay identical. It
-                // stays HERE, not in the rows: it is egui arithmetic, and
-                // `rustdar-overlays` never gains egui.
-                let mut rgba = output.rgba;
-                match output.alpha {
-                    rustdar_overlays::render::rasterize::AlphaMode::Premultiplied => {}
-                    rustdar_overlays::render::rasterize::AlphaMode::Straight => {
-                        premultiply_raster(&mut rgba)
-                    }
-                }
-                // The cells ride the reply; the items they index into never left
-                // the dispatch, which zips the two at delivery. The four
-                // no-hit-map kinds answer `None` here on every path, and the
-                // reply says so with its own tag byte.
-                Some(JobOutput::OverlayRaster {
-                    rgba,
-                    hit_cells: output.hit_cells,
-                })
-            })
-        }
-    };
-    // One place, after every arm, so no rasterizing arm can be added that
-    // forgets it — the alternative is five call sites and a sixth that does not
-    // exist yet.
+    // The row that owns the input's type runs it — the same moved renderer
+    // bodies the per-kind match here used to call, now one registry lookup.
+    // The rows read the run envelope themselves (the radar raster rows read
+    // `side_ceiling_px` off it once, so no two of them can come to disagree
+    // about how large a picture a job was allowed to make); the GLM row still
+    // ages every flash against the `now` its input carries (the page's clock
+    // at dispatch, the parity gates' whole subject), and the model row draws
+    // whichever carry arrived — those facts live beside the rows in their
+    // source crates now.
+    let row = row_for(&request.job);
+    let output = (row.run)(&request.job, &request.geometry).and_then(described_into_output);
+    // One place, after every kind, so no rasterizing row can be added that
+    // forgets it — the alternative is five call sites and a sixth that does
+    // not exist yet.
     output.map(premultiplied)
 }
 
-/// The product these bytes decode to, or `None` — which the caller reports as a
-/// render that drew nothing, the same answer a scan with no matching sweep gets.
-fn decode_level3(bytes: &[u8]) -> Option<nexrad_level3::model::Level3Message> {
-    match nexrad_level3::decode::decode_product(bytes) {
-        Ok(message) => Some(message),
-        Err(e) => {
-            log::error!("could not decode a Level III product for rendering: {e}");
+/// A row's typed output back into this crate's reply vocabulary — the
+/// downcast ladder from [`rustdar_source::job::DescribedOut`] to
+/// [`JobOutput`], which survives here until WO-M7c dissolves the reply
+/// direction onto the codec table too.
+///
+/// Every output type a row can answer has an arm; a type outside the ladder
+/// is `None`, which is "nothing to draw" — unreachable while the rows below
+/// answer exactly the five types this enum names, and a refusal rather than
+/// a misread if a row ever answers something else.
+fn described_into_output(out: rustdar_source::job::DescribedOut) -> Option<JobOutput> {
+    let any = out.0.into_any();
+    let any = match any.downcast::<RenderedFrame>() {
+        Ok(frame) => return Some(JobOutput::Frame(*frame)),
+        Err(any) => any,
+    };
+    let any = match any.downcast::<CrossSection>() {
+        Ok(section) => return Some(JobOutput::Section(section)),
+        Err(any) => any,
+    };
+    let any = match any.downcast::<VoxelGrid>() {
+        Ok(grid) => return Some(JobOutput::Voxels(grid)),
+        Err(any) => any,
+    };
+    let any = match any.downcast::<rustdar_radar::scan::DecodedScan>() {
+        Ok(volume) => return Some(JobOutput::Volume(volume)),
+        Err(any) => any,
+    };
+    match any.downcast::<rustdar_overlays::render::rasterize::RasterizeOutput>() {
+        Ok(output) => {
+            // The output contract is **premultiplied, always** — stated on
+            // [`JobOutput::OverlayRaster`] — where each rasterizer's own
+            // convention is whatever it declares. The tiny-skia rasterizers
+            // declare premultiplied on every path (a pixmap *is*
+            // premultiplied), so the arm below is theirs never; it exists
+            // because the model-grid rasterizer writes straight palette
+            // bytes and declares so, and a seam that silently dropped the
+            // declaration would ship that layer double-bright.
+            //
+            // The conversion is [`premultiply_raster`] — egui's own
+            // constructor per pixel, the exact call the frame-thread consumer
+            // used to make — so via-wire and direct bytes stay identical. It
+            // stays HERE, not in the rows: it is egui arithmetic, and
+            // `rustdar-overlays` never gains egui.
+            let output = *output;
+            let mut rgba = output.rgba;
+            match output.alpha {
+                rustdar_overlays::render::rasterize::AlphaMode::Premultiplied => {}
+                rustdar_overlays::render::rasterize::AlphaMode::Straight => {
+                    premultiply_raster(&mut rgba)
+                }
+            }
+            // The cells ride the reply; the items they index into never left
+            // the dispatch, which zips the two at delivery. The four
+            // no-hit-map kinds answer `None` here on every path, and the
+            // reply says so with its own tag byte.
+            Some(JobOutput::OverlayRaster {
+                rgba,
+                hit_cells: output.hit_cells,
+            })
+        }
+        Err(other) => {
+            log::error!("a job answered {other:?}, which this build has no reply arm for");
             None
         }
     }
@@ -2085,12 +1599,12 @@ pub fn worker_attached() -> bool {
 /// expecting, before the oldest is given up on.
 ///
 /// A count and not a byte budget, which is worth saying plainly because the job
-/// kinds here are not one size: a full queue of `Radar` requests is ~1.3 MB
-/// apiece, and a full queue of [`JobRequest::Decode`]s is 16.9 MB apiece — 541
+/// kinds here are not one size: a full queue of radar requests is ~1.3 MB
+/// apiece, and a full queue of archive decodes is 16.9 MB apiece — 541
 /// MB, on a target whose address space is 4 GiB. A byte budget would be the
 /// honest bound and it is not available: a `JobRequest`'s cost is its payload's
-/// length on two arms, a `RenderInput`'s owned gates on three more, and nothing
-/// here can price the last without walking it.
+/// length on two kinds, a `RenderInput`'s owned gates on three more, and
+/// nothing here can price the last without walking it.
 ///
 /// What makes the count safe anyway is that this queue only fills while there
 /// is **no sink at all** — a handshake in flight, or a worker being replaced —
@@ -2153,8 +1667,8 @@ thread_local! {
 /// none again from the moment that worker is lost until a replacement answers
 /// one. In both windows [`offload_job`] falls through to running the job on the
 /// browser's **one** thread, and the audit's figure for the largest of them —
-/// an existing in-code measurement, quoted from
-/// [`JobRequest::Decode`] rather than re-taken here — is 1021.9 ms in Firefox
+/// an existing in-code measurement, quoted from the `decode` row's
+/// `DecodeJob` rather than re-taken here — is 1021.9 ms in Firefox
 /// and 911.4 ms in Chrome for a 16.9 MB volume. Waiting a moment for the
 /// transport that is on its way costs less than that, and costs it once.
 ///

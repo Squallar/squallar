@@ -160,12 +160,13 @@ fn dispatched_objects(posted: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<Option<Vec<u8>>>
         .iter()
         .map(|bytes| {
             let job = JobRequest::from_bytes(bytes).expect("a job this build posted decodes");
-            match job {
-                JobRequest::Radar { input, .. } => {
-                    input.melting_layer_product().map(|o| o.as_ref().clone())
-                }
-                other => panic!("expected a Level II render job, got {other:?}"),
-            }
+            let plan = job
+                .job
+                .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+                .unwrap_or_else(|| panic!("expected a Level II render job, got {job:?}"));
+            plan.input
+                .melting_layer_product()
+                .map(|o| o.as_ref().clone())
         })
         .collect()
 }
@@ -340,10 +341,11 @@ fn dispatched_motions(posted: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<Option<(f32, f32
         .iter()
         .map(|bytes| {
             let job = JobRequest::from_bytes(bytes).expect("a job this build posted decodes");
-            match job {
-                JobRequest::Radar { input, .. } => input.rpg_storm_motion(),
-                other => panic!("expected a Level II render job, got {other:?}"),
-            }
+            let plan = job
+                .job
+                .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+                .unwrap_or_else(|| panic!("expected a Level II render job, got {job:?}"));
+            plan.input.rpg_storm_motion()
         })
         .collect()
 }

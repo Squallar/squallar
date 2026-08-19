@@ -160,7 +160,7 @@ impl super::App {
     /// The network half has to stay on the async task, because that is where the
     /// fetch stack is. The CPU half does not, and now does not: it goes through
     /// [`crate::offload::offload_job`] as a
-    /// [`JobRequest::Decode`](crate::offload::JobRequest::Decode), which means a
+    /// described [`DecodeJob`](rustdar_radar::jobs::DecodeJob), which means a
     /// Web Worker where there is one and this thread where there is not — the same
     /// fallback every render already has, and the same behaviour the build had
     /// before any of this existed.
@@ -179,9 +179,14 @@ impl super::App {
     ) {
         crate::offload::offload_job(
             "level2-decode",
-            crate::offload::Job::Described(crate::offload::JobRequest::Decode {
-                archive: std::sync::Arc::new(archive),
-            }),
+            crate::offload::Job::Described(crate::offload::JobRequest::describe(
+                rustdar_radar::jobs::DecodeJob {
+                    archive: std::sync::Arc::new(archive),
+                },
+                // A decode draws nothing, so its envelope carries no ceiling —
+                // the same effective 0 it has always had.
+                crate::offload::ceiling_only_geometry(0),
+            )),
             move |result| {
                 // `None` here is an archive that did not decode, which
                 // `execute`'s arm has already logged. Every caller treats it as
@@ -1234,8 +1239,8 @@ impl super::App {
         match kind {
             // The handler-backed kinds — the three polygon kinds, the two
             // hit-map kinds and the model grid, which is every texture kind
-            // a handler renders — are **described jobs**
-            // (`JobRequest::Overlay`). On the web the job posts to the worker
+            // a handler renders — are **described jobs** on their overlay
+            // codec rows. On the web the job posts to the worker
             // instead of running inline on the browser's one thread, which is
             // where the frame-thread audit measured 224 ms of gesture-end
             // stall for the polygon layer set alone (measured at
@@ -1299,7 +1304,7 @@ impl super::App {
                     bounds: render_bounds,
                     side_ceiling_px: 0,
                 };
-                let request = crate::offload::JobRequest::Overlay { geometry, job };
+                let request = crate::offload::JobRequest { geometry, job };
                 crate::offload::offload_job(
                     row.label,
                     crate::offload::Job::Described(request),
@@ -1368,7 +1373,7 @@ impl super::App {
                     bounds: render_bounds,
                     side_ceiling_px: 0,
                 };
-                let request = crate::offload::JobRequest::Overlay {
+                let request = crate::offload::JobRequest {
                     geometry,
                     job: rustdar_source::job::DescribedJob::new(rasterize::SitesInput {
                         sites,
@@ -1965,34 +1970,38 @@ impl super::App {
                     env_heights,
                 ) {
                     Some(input) => {
-                        crate::offload::Job::Described(crate::offload::JobRequest::Radar {
-                            // The same stamp the still frame takes, off this
-                            // frame's own volume. Without it a loop of NROT or
-                            // SRV would fold around whatever each frame's
-                            // calmest sector estimated while the static render
-                            // of the newest frame folded around the RDA's
-                            // declaration — one storm, two pictures, no error.
-                            input: Box::new(
-                                input
-                                    .with_declared_nyquist(&declared)
-                                    .with_srv_fallback(self.render.srv_fallback())
-                                    .with_melting_layer_product(melting_layer)
-                                    .with_rpg_storm_motion(rpg_storm_motion),
-                            ),
-                            // Loop frames store an empty value grid, so asking
-                            // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
-                            // per frame to be dropped on arrival — and copied
-                            // across a worker boundary first.
-                            values_wanted: false,
+                        crate::offload::Job::Described(crate::offload::JobRequest::describe(
+                            rustdar_radar::jobs::RadarPlanJob {
+                                // The same stamp the still frame takes, off this
+                                // frame's own volume. Without it a loop of NROT or
+                                // SRV would fold around whatever each frame's
+                                // calmest sector estimated while the static render
+                                // of the newest frame folded around the RDA's
+                                // declaration — one storm, two pictures, no error.
+                                input: Box::new(
+                                    input
+                                        .with_declared_nyquist(&declared)
+                                        .with_srv_fallback(self.render.srv_fallback())
+                                        .with_melting_layer_product(melting_layer)
+                                        .with_rpg_storm_motion(rpg_storm_motion),
+                                ),
+                                // Loop frames store an empty value grid, so asking
+                                // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
+                                // per frame to be dropped on arrival — and copied
+                                // across a worker boundary first.
+                                values_wanted: false,
+                            },
                             // The same policy in the other dimension: a loop
                             // renders at `LOOP_IMAGE_SIZE` however far its
                             // sweep reaches. A desktop loop textures up to 36
                             // frames at once, and at 4096² that is
                             // 36 × 64 MiB = 2.3 GiB a pane against a 576 MiB
                             // loop budget.
-                            // See `JobRequest::side_ceiling_px`.
-                            side_ceiling_px: crate::constants::LOOP_IMAGE_SIZE as u32,
-                        })
+                            // See `JobRequest::geometry`.
+                            crate::offload::ceiling_only_geometry(
+                                crate::constants::LOOP_IMAGE_SIZE as u32,
+                            ),
+                        ))
                     }
                     None => crate::offload::Job::renders_nothing(),
                 }
@@ -2008,14 +2017,20 @@ impl super::App {
             // volume and ordered by `level3_products`; what it needs is a job
             // kind that reads more than one, not a different loop path.
             crate::loop_downloads::LoopFrameData::Products(products) => match products.first() {
-                Some(first) => crate::offload::Job::Described(crate::offload::JobRequest::Level3 {
-                    bytes: std::sync::Arc::clone(&first.bytes),
-                    product,
-                    radar_lat: lat,
-                    radar_lon: lon,
-                    // A loop frame, so the loop size — see the Level II arm.
-                    side_ceiling_px: crate::constants::LOOP_IMAGE_SIZE as u32,
-                }),
+                Some(first) => {
+                    crate::offload::Job::Described(crate::offload::JobRequest::describe(
+                        rustdar_radar::jobs::Level3Job {
+                            bytes: std::sync::Arc::clone(&first.bytes),
+                            product,
+                            radar_lat: lat,
+                            radar_lon: lon,
+                        },
+                        // A loop frame, so the loop size — see the Level II arm.
+                        crate::offload::ceiling_only_geometry(
+                            crate::constants::LOOP_IMAGE_SIZE as u32,
+                        ),
+                    ))
+                }
                 None => crate::offload::Job::renders_nothing(),
             },
         };
@@ -2068,9 +2083,9 @@ impl super::App {
                     // is exactly as dead as one it accepted.
                     //
                     // The numbers are not already dropped by `offload::execute`.
-                    // That one runs off `JobRequest::Radar`'s `values_wanted:
+                    // That one runs off `RadarPlanJob`'s `values_wanted:
                     // false`, which only the Level II half of the dispatch above
-                    // has: `JobRequest::Level3` carries no such field, so half
+                    // has: `Level3Job` carries no such field, so half
                     // the frames passing this site — every Level III loop —
                     // arrive still holding their gates, and this is the only
                     // place those die. One call covers both halves, because
@@ -2352,10 +2367,15 @@ impl super::App {
             top_km_msl: None,
             product,
         };
-        let job = crate::offload::Job::Described(crate::offload::JobRequest::Section {
-            input: Box::new(input),
-            request,
-        });
+        let job = crate::offload::Job::Described(crate::offload::JobRequest::describe(
+            rustdar_radar::jobs::SectionJob {
+                input: Box::new(input),
+                request,
+            },
+            // A section's raster is a constant of the view, so its envelope
+            // carries no ceiling — the same effective 0 it has always had.
+            crate::offload::ceiling_only_geometry(0),
+        ));
         let sender = self.channels.loop_section_sender.clone();
         let window = self.window.clone();
         crate::offload::offload_job("loop-section", job, move |output| {

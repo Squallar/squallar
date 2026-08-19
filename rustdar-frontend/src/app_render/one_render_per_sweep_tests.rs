@@ -87,9 +87,12 @@ fn posted(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<JobRequest> {
 fn asked_for(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<(RadarProduct, f32)> {
     posted(recorded)
         .iter()
-        .map(|job| match job {
-            JobRequest::Radar { input, .. } => (input.product(), input.elevation()),
-            other => panic!("a plan-view dispatch posted {other:?}"),
+        .map(|job| {
+            let plan = job
+                .job
+                .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+                .unwrap_or_else(|| panic!("a plan-view dispatch posted {job:?}"));
+            (plan.input.product(), plan.input.elevation())
         })
         .collect()
 }

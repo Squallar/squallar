@@ -31,6 +31,10 @@ pub mod chunk_notify;
 pub mod constants;
 pub mod egui_renderer;
 pub mod input;
+/// The composed job-codec registry — the one module that names the source
+/// crates' `JOB_CODECS`; `offload`'s request direction consumes it and names
+/// neither crate (WO-M7.2).
+pub(crate) mod job_registry;
 pub mod location_hint;
 pub mod location_permission;
 pub mod loop_downloads;

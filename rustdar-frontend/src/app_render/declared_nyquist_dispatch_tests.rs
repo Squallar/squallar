@@ -194,10 +194,16 @@ fn app_showing_site() -> crate::app::App {
 /// velocity tilts, so even a single-tilt payload for one of them reaches the
 /// worker with every velocity sweep in it.
 fn declaration_on_the_wire(job: &JobRequest) -> Vec<(u8, f64)> {
-    let input = match job {
-        JobRequest::Radar { input, .. } | JobRequest::Section { input, .. } => input,
-        other => panic!("expected a payload-carrying job, got {other:?}"),
-    };
+    let input = job
+        .job
+        .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+        .map(|plan| &plan.input)
+        .or_else(|| {
+            job.job
+                .downcast_ref::<rustdar_radar::jobs::SectionJob>()
+                .map(|section| &section.input)
+        })
+        .unwrap_or_else(|| panic!("expected a payload-carrying job, got {job:?}"));
     input.declared_nyquist().iter().collect()
 }
 
@@ -272,11 +278,19 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
 
     let plan = jobs
         .iter()
-        .find(|job| matches!(job, JobRequest::Radar { .. }))
+        .find(|job| {
+            job.job
+                .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+                .is_some()
+        })
         .expect("the map pane must have dispatched a plan-view render");
     let section = jobs
         .iter()
-        .find(|job| matches!(job, JobRequest::Section { .. }))
+        .find(|job| {
+            job.job
+                .downcast_ref::<rustdar_radar::jobs::SectionJob>()
+                .is_some()
+        })
         .expect("the section pane must have dispatched a cut");
 
     let plan_declared = declaration_on_the_wire(plan);
@@ -343,7 +357,11 @@ fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
 
     let radar: Vec<Vec<(u8, f64)>> = jobs
         .iter()
-        .filter(|job| matches!(job, JobRequest::Radar { .. }))
+        .filter(|job| {
+            job.job
+                .downcast_ref::<rustdar_radar::jobs::RadarPlanJob>()
+                .is_some()
+        })
         .map(declaration_on_the_wire)
         .collect();
     assert_eq!(radar.len(), 2, "one still frame and one loop frame");

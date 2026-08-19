@@ -47,8 +47,9 @@
 //! `Budgets::concurrent_renders`. The `rd-opaque` lane carries the overlay
 //! rasterizations, which follow the map and are wanted *now*. The name is the
 //! one the opaque closures gave it; the closures are gone — every overlay
-//! kind is a described [`JobRequest::Overlay`] now — and the lane keeps its
-//! name and its charter, carrying exactly those described overlay jobs. One
+//! kind is a described job on an `overlay/` codec row now — and the lane
+//! keeps its name and its charter, carrying exactly those described overlay
+//! jobs. One
 //! lane would let a full slate of radar renders put an overlay behind a
 //! second of work that a thread-per-job never made it wait for. Two lanes,
 //! each sized at the render bound, is the shape that keeps the bound and does
@@ -322,8 +323,11 @@ impl JobSink for Handle {
         // The one routing decision this transport makes, and it is over the
         // job's deadline rather than its kind list: an overlay follows the
         // map and must not queue behind a slate of radar renders. See
-        // [`Pool`].
-        let lane = if matches!(request, JobRequest::Overlay { .. }) {
+        // [`Pool`]. "Is an overlay" is the row's own label — the overlay
+        // half of the composed registry is exactly the labels under
+        // `overlay/`, which is the same judgment the deleted `Overlay`
+        // variant match made; `offload::tests`' lane test pins it per kind.
+        let lane = if super::row_for(&request.job).label.starts_with("overlay/") {
             &self.interactive
         } else {
             &self.described
