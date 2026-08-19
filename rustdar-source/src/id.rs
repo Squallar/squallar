@@ -1,13 +1,16 @@
 //! Layer identity as an open string: [`LayerId`].
 //!
-//! This is the M8 replacement shape for `rustdar_overlays::OverlayKind`. The
-//! twelve values below are not arbitrary names — they are the **exact bytes
-//! sitting in every user's config file today** (`draw_order`,
-//! `enabled_overlays`, `overlay_configs`, and the `handler_states` map all
-//! key on them), so the whole M8 sequence lands with **zero config
-//! migration**. The spelling-pin test in rustdar-overlays
-//! (`every_kinds_id_is_its_own_debug_spelling`) is the proof the two
-//! spellings agree; the E0a fixture corpus is the proof the files agree.
+//! One open string is a layer's whole identity. This shape replaced a closed
+//! twelve-variant layer enum in rustdar-overlays over the M8 sequence (the
+//! enum was deleted at WO-M8c). The twelve values below are not arbitrary
+//! names — they are the **exact bytes sitting in every user's config file
+//! today** (`draw_order`, `enabled_overlays`, `overlay_configs`, and the
+//! `handler_states` map all key on them), which is why that sequence landed
+//! with **zero config migration**. Two things still hold that: rustdar-
+//! overlays' `handler_state_keys_are_the_twelve_names_saved_configs_file_state_under`
+//! pins the live registry's ids against the twelve spellings configs are
+//! written under, and the E0a fixture corpus is the proof the files
+//! themselves round-trip.
 
 use std::borrow::Cow;
 
@@ -16,19 +19,19 @@ use serde::{Deserialize, Serialize};
 /// An open-string identity for one map layer.
 ///
 /// `#[serde(transparent)]`: a `LayerId` serializes as the bare string
-/// (`"NwsAlerts"`, never `{"0": "NwsAlerts"}`), which is byte-identical to
-/// how `OverlayKind`'s derived serde spells the same layer in every existing
-/// config file — the zero-migration property the serde-form pin test holds.
+/// (`"NwsAlerts"`, never `{"0": "NwsAlerts"}`) — byte-identical to what every
+/// existing config file already holds, which is the zero-migration property
+/// the serde-form pin test below holds.
 ///
 /// **Deliberately NOT `Copy`**: a `Cow<'static, str>` cannot be `Copy`, and
 /// consumers converting from the `Copy` enum must decide where they clone
 /// (`Cow::Borrowed` clones are pointer-cheap; do not intern).
 ///
 /// **Deliberately DERIVED `Debug`**: `{:?}` prints `LayerId("Radar")`, not
-/// `Radar`. Persistence keys by Debug spelling today
-/// (`serialize_handler_states`), and after M8b any leftover
-/// `format!("{:?}")` keying produces a VISIBLY wrong key that the E0a
-/// fixture corpus catches. A "nice" hand-written `Debug` printing the bare
+/// `Radar`. Persistence keys by [`LayerId::as_str`]
+/// (`serialize_handler_states`); a leftover `format!("{:?}")` keying site
+/// therefore produces a VISIBLY wrong key that the E0a fixture corpus
+/// catches. A "nice" hand-written `Debug` printing the bare
 /// string would mask exactly that bug — never add one. Key by
 /// [`LayerId::as_str`], never by `{:?}`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -58,40 +61,32 @@ impl LayerId {
 
 /// The twelve layer ids the workspace registers today.
 ///
-/// Every spelling was captured from `format!("{:?}", kind)` output over
-/// `OverlayKind::all()` (2026-08-19, main 7a2a78ff), never typed by hand:
-/// these are load-bearing bytes in every user's config file. The spelling-pin
-/// test in rustdar-overlays re-proves the equality on every run.
+/// Every spelling below was captured mechanically from the pre-M8 layer
+/// enum's `Debug` output (2026-08-19, main 7a2a78ff), never typed by hand:
+/// these are load-bearing bytes already sitting in every user's config file,
+/// which is why [`LAYER_ID_LEDGER`] is append-only. A new layer appends a
+/// const here and a row there; editing an existing spelling orphans that
+/// layer's saved state for every user, silently.
+///
+/// [`LAYER_ID_LEDGER`]: super::LAYER_ID_LEDGER
 pub mod known {
     use super::LayerId;
 
-    /// `"ModelData"` — captured from `format!("{:?}", OverlayKind::ModelData)`.
     pub const MODEL_DATA: LayerId = LayerId::from_static("ModelData");
-    /// `"SpcOutlook"` — captured from `format!("{:?}", OverlayKind::SpcOutlook)`.
     pub const SPC_OUTLOOK: LayerId = LayerId::from_static("SpcOutlook");
-    /// `"Radar"` — captured from `format!("{:?}", OverlayKind::Radar)`.
     pub const RADAR: LayerId = LayerId::from_static("Radar");
-    /// `"SpcDiscussions"` — captured from `format!("{:?}", OverlayKind::SpcDiscussions)`.
     pub const SPC_DISCUSSIONS: LayerId = LayerId::from_static("SpcDiscussions");
-    /// `"NwsAlerts"` — captured from `format!("{:?}", OverlayKind::NwsAlerts)`.
     pub const NWS_ALERTS: LayerId = LayerId::from_static("NwsAlerts");
-    /// `"StormReports"` — captured from `format!("{:?}", OverlayKind::StormReports)`.
     pub const STORM_REPORTS: LayerId = LayerId::from_static("StormReports");
-    /// `"Lightning"` — captured from `format!("{:?}", OverlayKind::Lightning)`.
     pub const LIGHTNING: LayerId = LayerId::from_static("Lightning");
-    /// `"Metar"` — captured from `format!("{:?}", OverlayKind::Metar)`.
     pub const METAR: LayerId = LayerId::from_static("Metar");
-    /// `"CityLabels"` — captured from `format!("{:?}", OverlayKind::CityLabels)`.
     pub const CITY_LABELS: LayerId = LayerId::from_static("CityLabels");
-    /// `"RadarSites"` — captured from `format!("{:?}", OverlayKind::RadarSites)`.
     pub const RADAR_SITES: LayerId = LayerId::from_static("RadarSites");
-    /// `"UserLocation"` — captured from `format!("{:?}", OverlayKind::UserLocation)`.
     pub const USER_LOCATION: LayerId = LayerId::from_static("UserLocation");
-    /// `"ColorScale"` — captured from `format!("{:?}", OverlayKind::ColorScale)`.
     pub const COLOR_SCALE: LayerId = LayerId::from_static("ColorScale");
 }
 
-/// Every layer id ever registered, in `OverlayKind::all()` order.
+/// Every layer id ever registered, in the default draw order — bottom to top.
 ///
 /// **APPEND-ONLY.** These strings are persisted in user config files;
 /// renaming or removing an entry in place orphans saved state silently.
@@ -156,9 +151,8 @@ mod tests {
     }
 
     /// Test group 4 (serde form): `#[serde(transparent)]` emits the BARE
-    /// string — the exact bytes `OverlayKind`'s derived serde writes into
-    /// every existing config file — and reads it back. This is the
-    /// zero-migration property in one assert.
+    /// string — the exact bytes every existing config file already holds —
+    /// and reads it back. This is the zero-migration property in one assert.
     #[test]
     fn a_layer_id_serializes_as_the_bare_string() {
         let json = serde_json::to_string(&known::NWS_ALERTS).expect("LayerId serializes");

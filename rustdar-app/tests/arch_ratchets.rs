@@ -1,10 +1,16 @@
 //! WO-E0c — the campaign's architectural ratchets: the enforced starting line.
 //!
-//! Six metric families are ASSERTED as ceilings from measured at-land
-//! baselines; one family (the wasm-cfg line counts, row 3) is RECORDED below
+//! Six metric families were ASSERTED as ceilings from measured at-land
+//! baselines; **five are asserted here today** (row 5 RETIRED at WO-M8c,
+//! below), and one family (the wasm-cfg line counts, row 3) is RECORDED below
 //! and deliberately NOT asserted. Every ceiling may only move DOWN: the phase
 //! that earns a lower count lowers the MAX const in the same land; a MAX is
 //! never raised without a written plan amendment.
+//!
+//! A ceiling is retired only by reaching the end of its own trajectory — row
+//! 5 reached zero, where a count stops being a ceiling and becomes an absence
+//! assertion, and it was replaced by one in the same land. Retirement is
+//! never a way to stop a ceiling firing.
 //!
 //! Discipline, borrowed from the tree's two proven patterns:
 //! - grep-ratchet with presence controls: every ceiling sits beside a
@@ -65,9 +71,11 @@
 //!      [RECORDED, NOT ASSERTED] (re-keyed at WO-RD)
 //!  4a  product-enum occurrences in rustdar-egui        444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
 //!  4b  ... files containing it (info)                   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
-//!  5a  overlay-kind occurrences, whole tree            762  rg -o 'Overlay''Kind' . --glob '*.rs' | wc -l
-//!  5b  ... files containing it (info)                   61  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
-//!      (56 at the E0c-era count; re-counted at WO-RD)
+//!  5a  overlay-kind occurrences, whole tree              0  rg -o 'Overlay''Kind' . --glob '*.rs' | wc -l
+//!      [RETIRED at WO-M8c — 762 at E0c, 766 at WO-THEME,               (0 since WO-M8c; the enum is gone)
+//!      29 at WO-M8b b3, 0 here. No test asserts it.]
+//!  5b  ... files containing it (info)                    0  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
+//!      (61 at the E0c-era count; 56 re-counted at WO-RD)
 //!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
@@ -91,10 +99,21 @@
 //!   exactly the dissolution this note anticipated — still unratcheted.
 //! - Row 4a reaches 0 at WO-E9 (FieldId adoption); the enum itself stays pub
 //!   in rustdar-radar through the campaign.
-//! - Row 5a's command runs over `.`; measured at land, every occurrence
-//!   lives inside the five application crates, so the test's five-crate walk
-//!   equals the command. WO-M8c deletes the enum and re-shapes this metric
-//!   to enum-absent in the same land.
+//! - **Row 5 is RETIRED at WO-M8c**, which deleted the enum. The trajectory
+//!   ran 762 (E0c) -> 766 (WO-THEME amendment) -> 29 (WO-M8b b3, when
+//!   `fn kind()` left the handler trait) -> **0**, whole tree, prose
+//!   included: rustdar-source's 17 `known`-const provenance comments were
+//!   reworded in the same land, so the command over `.` and the retired
+//!   five-crate walk now agree at zero. A ceiling of zero is an absence
+//!   assertion wearing a number, so the ceiling and its test were deleted
+//!   and replaced by one:
+//!   `rustdar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`,
+//!   which scrapes overlay_state.rs for the declaration AND the bare name,
+//!   behind a presence control on the handler trait. What the enum's closed
+//!   set used to guarantee is now held by rustdar-overlays'
+//!   `registry_identity_tests` (uniqueness, ledger membership, and the
+//!   draw-order weight pin — the last of which is also the anti-swap pin).
+//!   The five-crate walk died with this row; it was row 5's only caller.
 //! - Row 6 is a COUNT ceiling only. The literal shrink-only field-list pin
 //!   LANDS at WO-E3 and is VERIFIED at WO-M13b. WO-E4.9's extract-results
 //!   channel is a RenderOrchestrator-local mpsc, not a hub pair — the hub
@@ -109,15 +128,6 @@ use std::path::{Path, PathBuf};
 /// Workspace root: this integration test's manifest dir is `rustdar-app/`.
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
-/// The five application crates the campaign's counters walk.
-const CRATES: [&str; 5] = [
-    "rustdar-app",
-    "rustdar-radar",
-    "rustdar-egui",
-    "rustdar-web",
-    "rustdar-overlays",
-];
-
 // ---------------------------------------------------------------------------
 // Needles — split literals so this file never contains what it counts.
 // ---------------------------------------------------------------------------
@@ -125,7 +135,6 @@ const CRATES: [&str; 5] = [
 const SELF_GUI: &str = concat!("self.", "gui.");
 const PUB_FN_SET: &str = concat!("pub fn ", "set_");
 const PRODUCT_ENUM: &str = concat!("Radar", "Product");
-const KIND_ENUM: &str = concat!("Overlay", "Kind");
 const RECEIVER_FIELD: &str = concat!("_receiver: ", "Receiver<");
 const OVERLAYS_PATH: &str = concat!("rustdar_", "overlays::");
 const RADAR_PATH: &str = concat!("rustdar_", "radar::");
@@ -138,7 +147,6 @@ const UI_MOD_ANCHOR: &str = concat!("mod ", "ui;");
 const HUB_ANCHOR: &str = concat!("struct ", "ChannelHub");
 const OFFLOAD_ANCHOR: &str = concat!("pub fn ", "offload_job(");
 const PRODUCT_DEF_ANCHOR: &str = concat!("enum Radar", "Product");
-const KIND_DEF_ANCHOR: &str = concat!("enum Overlay", "Kind");
 
 // ---------------------------------------------------------------------------
 // Ceilings — at-land measurements (see the table above). Lower the MAX in
@@ -157,17 +165,9 @@ const SELF_GUI_NON_TEST_MAX: usize = 186;
 const UI_SETTER_MAX: usize = 3;
 /// Row 4a. WO-E9 (FieldId adoption) reaches 0.
 const PRODUCT_IN_EGUI_MAX: usize = 444;
-/// Row 5a. WO-M8 shrinks it; WO-M8c deletes the enum and re-shapes the
-/// metric to enum-absent in the same land — this ceiling dies there.
-/// Re-baselined 762 -> 766 at WO-THEME per the 2026-08-18 KIND_MAX
-/// amendment in the campaign log; lowered 766 -> 29 at WO-M8b b3, the land
-/// that deleted `fn kind()` from the handler trait and its twelve impls and
-/// flipped every remaining consumer onto `LayerId`. The 29 that remain are
-/// the enum definition and its `impl` header (2), `all()` +
-/// `default_draw_order()` (14), the M8a bridge's own test group (6), and
-/// eight doc-prose mentions that record where today's spellings came from.
-/// If this ever fires, answer by shedding spellings, never by raising it.
-const KIND_MAX: usize = 29;
+// Row 5a's KIND_MAX is RETIRED at WO-M8c (762 -> 766 at WO-THEME -> 29 at
+// WO-M8b b3 -> 0, at which point the ceiling became an absence assertion).
+// See the retirement note beside row 6's test.
 /// Row 6. COUNT ceiling only — the shrink-only field-list pin lands at
 /// WO-E3 and is verified at WO-M13b; the hub stays at 18 (WO-E4.9's extract
 /// channel is orchestrator-local, not a hub pair).
@@ -357,34 +357,12 @@ fn the_product_enum_never_spreads_further_into_egui() {
     );
 }
 
-/// Row 5 — occurrences of the overlay-kind enum's name across the five
-/// application crates. **Not** the whole-tree count since WO-M8b b3: the
-/// substrate's `rustdar-source/src/id.rs` carries 17 more, all doc-comment
-/// provenance for the `known` consts (each spelling was captured from the
-/// enum's `Debug` output), and rustdar-source is outside this haystack.
-/// WO-M8c deletes the enum and re-shapes this metric to enum-absent in the
-/// same land.
-#[test]
-fn the_overlay_kind_enum_never_spreads_further() {
-    let root = Path::new(ROOT);
-    let mut files = Vec::new();
-    for c in CRATES {
-        files.extend(load_tree(&root.join(c)));
-    }
-    assert_anchored(
-        &files,
-        "rustdar-overlays/src/render/overlay_state.rs",
-        KIND_DEF_ANCHOR,
-    );
-    let n = count(&files, KIND_ENUM);
-    assert!(
-        n <= KIND_MAX,
-        "the overlay-kind enum spread further: {n} occurrences > ceiling {KIND_MAX}. \
-         WO-M8 shrinks this; WO-M8c deletes the enum and re-shapes this metric in \
-         the same land. Lower the MAX in the land that earns it; never raise it \
-         without a written plan amendment."
-    );
-}
+// Row 5 — RETIRED at WO-M8c. The ceiling reached zero when the enum was
+// deleted, and a ceiling that can only be zero is an absence assertion
+// wearing a number. Its successor is
+// `rustdar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`
+// — same subject, stronger claim, and it carries the presence control this
+// one carried.
 
 /// Row 6 — ChannelHub receiver-field count, ceiling 18. COUNT ceiling only:
 /// the literal shrink-only field-list pin LANDS at WO-E3 and is VERIFIED at

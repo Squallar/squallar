@@ -34,7 +34,7 @@ use super::overlay_state::OverlayHandler;
 /// construction, the config-absent serde default) that have no live registry
 /// in reach. Never a literal list: the weights are the one spelling of the
 /// order, and the literal-list pin in `registry_identity_tests` is what holds
-/// them to the historical `OverlayKind::all()` order.
+/// them to the order users have always seen.
 pub fn default_draw_order() -> Vec<LayerId> {
     let mut handlers = create_handlers();
     handlers.sort_by_key(|h| h.draw_order_weight());
