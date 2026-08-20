@@ -72,6 +72,15 @@ const RADAR_PATH: &str = concat!("rustdar_", "radar::");
 // split so a future absence-grep for a deleted definition stays clean).
 const APP_ANCHOR: &str = concat!("pub struct ", "App");
 const GUI_IMPL_ANCHOR: &str = concat!("impl ", "Gui");
+/// Row 2's widened half: an inherent `impl` block on the `Gui` type, in either
+/// spelling this crate uses — `impl Gui {` inside the `ui` module and
+/// `impl super::Gui {` in the files hung off it. A trait impl
+/// (`impl Default for Gui {`) is deliberately not one: it can carry no
+/// inherent setter, so counting it would inflate the ceiling with rows the
+/// property is not about.
+const IMPL_KW: &str = concat!("impl", " ");
+const GUI_IMPL_TAIL: &str = concat!("Gui", " {");
+const TRAIT_IMPL_INFIX: &str = concat!(" ", "for", " ");
 /// Row 2's replacement: the one generic write door the deleted setters became.
 const GENERIC_CONTROL_DOOR: &str = concat!("pub fn apply_layer", "_control");
 const UI_MOD_ANCHOR: &str = concat!("mod ", "ui;");
@@ -115,7 +124,7 @@ const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
 const SELF_GUI_MAX: usize = 185;
 /// Row 1b — the same needle outside test-named paths.
 const SELF_GUI_NON_TEST_MAX: usize = 180;
-/// Row 2.
+/// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last
 /// three were `set_live_chunks`, `set_chunk_notifications` and
@@ -126,9 +135,36 @@ const SELF_GUI_NON_TEST_MAX: usize = 180;
 /// **This ceiling is only worth 0 if the needle was not moved instead of the
 /// coupling.** The setters were not renamed or relocated out of the walk: the
 /// shell's own call — `rustdar-app`'s `app.gui.set_live_chunks(false)` — is
-/// gone rather than re-spelled, and what replaced it is generic. A future
-/// `pub fn set_` on the `Gui` impl, wherever spelled, must not appear.
+/// gone rather than re-spelled, and what replaced it is generic.
+///
+/// **What this figure is NOT** is the whole `Gui`. It counts one file, and
+/// until WO-E8d it claimed to count "the `Gui` impl, wherever spelled" — a
+/// claim [`GUI_IMPL_SETTER_MAX`] measured and found false. The doc now says
+/// what the walk does; the wider claim is the constant below, which makes it
+/// and pays for it.
 const UI_SETTER_MAX: usize = 0;
+/// Row 2b — **every inherent `impl Gui` block in `rustdar-egui`, wherever
+/// spelled**: the claim [`UI_SETTER_MAX`]'s doc used to make about itself.
+///
+/// **1, measured, not chosen.** `Gui::set_initial_site` lives on the
+/// `impl super::Gui` block in `ui_config.rs` and is called from
+/// `rustdar-app/src/app.rs` on a first run with no stored config — it points
+/// every pane at the site nearest the host's timezone. It was never inside
+/// the walked file: it is absent from `ui.rs` at WO-E8a's SHA and at WO-E8c's,
+/// so nothing was relocated to reach a zero, and this is not needle-hiding.
+/// **The gate was over-claiming; the code was not lying.**
+///
+/// **This is the floor, not a raise.** WO-E8b's 0 is untouched above, over
+/// the same file it always covered; this row is a *second, wider* measurement
+/// whose denominator is 22 impl blocks across 21 files rather than one. The
+/// two figures are not the same figure and must never be compared as one.
+///
+/// The remainder is named because a ceiling may under-claim and may never
+/// over-claim: driving this to 0 means the first-run site reaching the panes
+/// without a `Gui` setter, which is a boot-path question this order had no
+/// mandate to open. Lower it in the land that earns it; never raise it
+/// without a written plan amendment.
+const GUI_IMPL_SETTER_MAX: usize = 1;
 /// Row 4a.
 ///
 /// **440, not 438: WO-E6a's accessors add exactly two occurrences** — the
@@ -278,6 +314,38 @@ fn anchored_file(path: &Path, anchor: &str) -> String {
     text
 }
 
+/// The header line of an inherent `impl` block on `Gui` — see [`IMPL_KW`].
+fn is_gui_impl_header(line: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with(IMPL_KW) && line.ends_with(GUI_IMPL_TAIL) && !line.contains(TRAIT_IMPL_INFIX)
+}
+
+/// Every inherent `impl Gui` block in the walked tree, as (file, body) pairs.
+///
+/// **Why lines and not a parser.** These blocks are top-level items in a
+/// `rustfmt`-shaped tree, so each opens at column 0 and closes at the next
+/// `}` at column 0. That assumption is not taken on trust: the caller asserts
+/// no extracted body contains another header, which is exactly what an extent
+/// that overran its own closing brace would produce.
+fn gui_impl_blocks(files: &[(PathBuf, String)]) -> Vec<(PathBuf, String)> {
+    let mut blocks = Vec::new();
+    for (path, text) in files {
+        let lines: Vec<&str> = text.lines().collect();
+        for (start, line) in lines.iter().enumerate() {
+            if !is_gui_impl_header(line) {
+                continue;
+            }
+            let body = &lines[start + 1..];
+            let end = body
+                .iter()
+                .position(|l| *l == "}")
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            blocks.push((path.clone(), lines[start + 1..end].join("\n")));
+        }
+    }
+    blocks
+}
+
 /// Mirrors ripgrep's `-g '!*tests*'`: a path is test-side when any component
 /// under the crate root has a name containing "tests".
 fn in_test_path(path: &Path, crate_root: &Path) -> bool {
@@ -398,10 +466,72 @@ fn the_gui_setter_surface_never_grows() {
     // vacuity this suite exists to refuse.
     assert_eq!(
         n, UI_SETTER_MAX,
-        "the Gui setter surface is {n}, not {UI_SETTER_MAX}. WO-E2 Land 2 \
-         left 3; WO-E8b reached 0, and 0 is where it stays. A switch a layer \
-         owns is written through `Gui::apply_layer_control`, not through a \
-         setter beside it. Never raise it without a written plan amendment."
+        "the Gui setter surface in `ui.rs` is {n}, not {UI_SETTER_MAX}. WO-E2 \
+         Land 2 left 3; WO-E8b reached 0, and 0 is where it stays. A switch a \
+         layer owns is written through `Gui::apply_layer_control`, not through \
+         a setter beside it. Never raise it without a written plan amendment."
+    );
+
+    // ----------------------------------------------------------------- 2b:
+    // the same needle over EVERY `impl Gui` block, which is the claim the
+    // constant above used to make about itself and could not keep. A setter
+    // moved from `ui.rs` into any sibling file passes 2a and fails here.
+    let files = load_tree(&Path::new(ROOT).join("rustdar-egui"));
+    assert_anchored(&files, "rustdar-egui/src/ui.rs", GUI_IMPL_ANCHOR);
+    let blocks = gui_impl_blocks(&files);
+
+    // Extent control: a body that swallowed its own closing brace would run
+    // on into the next block's header. None may.
+    for (path, body) in &blocks {
+        assert!(
+            !body.lines().any(is_gui_impl_header),
+            "extent control: an `impl Gui` body in {} ran past its closing \
+             brace and swallowed the next block's header, so this walk's \
+             count covers text it does not mean to. Re-anchor it in the land \
+             that reshaped the file.",
+            path.display(),
+        );
+    }
+
+    // Widening control: the whole point of 2b is that it reads more than the
+    // one file 2a reads. A walk that collapsed back onto `ui.rs` would count
+    // 0 and read green while proving nothing 2a had not already proved.
+    let walked: std::collections::BTreeSet<&PathBuf> = blocks.iter().map(|(p, _)| p).collect();
+    assert!(
+        walked.len() > 1,
+        "widening control: the `impl Gui` walk found blocks in {} file(s). It \
+         exists to cover every file that carries one; a single-file answer is \
+         the narrow walk this row was added to replace.",
+        walked.len(),
+    );
+
+    // Presence control: the extractor must really yield `pub fn` bodies, and
+    // from a file that is NOT `ui.rs`. The generic write door is one, and it
+    // lives in the layer glue. Without this, a `gui_impl_blocks` that
+    // returned empty bodies would count 0 and pass.
+    let bodies: String = blocks
+        .iter()
+        .map(|(_, body)| body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        bodies.contains(GENERIC_CONTROL_DOOR),
+        "presence control: {GENERIC_CONTROL_DOOR:?} is not inside any walked \
+         `impl Gui` body, so this walk is reading empty or wrong extents and \
+         its zero would mean nothing.",
+    );
+
+    let wide = bodies.matches(PUB_FN_SET).count();
+    // `assert_eq!` again, and for a second reason beyond vacuity: this row's
+    // value is a measured floor with a named remainder, so a DROP is news the
+    // constant must be lowered to record, not silently absorbed.
+    assert_eq!(
+        wide, GUI_IMPL_SETTER_MAX,
+        "the Gui setter surface across every `impl Gui` block is {wide}, not \
+         {GUI_IMPL_SETTER_MAX}. The named remainder is `set_initial_site` in \
+         `ui_config.rs`; anything above that is a new setter on the shell, \
+         which is what WO-E8b removed the last of. If the count FELL, lower \
+         the constant in this land and strike the remainder from its doc."
     );
 }
 
