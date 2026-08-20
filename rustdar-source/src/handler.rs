@@ -554,6 +554,19 @@ pub trait SourceHandler: Send {
         None
     }
 
+    /// Age this layer's **poll clock**, as though `by` had passed since its
+    /// last round — the [`fetch_time`](Self::fetch_time) twin of
+    /// [`FetchRetry::rewind`], and there for the same reason: a test that
+    /// needs a timer part-way through its interval cannot fabricate a
+    /// [`web_time::Instant`] in the past through any other door.
+    ///
+    /// Default: nothing. A layer whose clock is stamped only on delivery is
+    /// exercised by delivering to it, which needs no seam.
+    #[doc(hidden)]
+    fn rewind_fetch_time(&mut self, by: std::time::Duration) {
+        let _ = by;
+    }
+
     /// How long until an **automatic** fetch may start; `None` for a layer that
     /// does not auto-poll, or one already in flight. Two terms, whichever is
     /// later: the poll clock `fetch_time + interval`, and the backoff from

@@ -22,6 +22,78 @@ pub fn default_draw_order() -> Vec<LayerId> {
 }
 
 #[cfg(test)]
+mod retry_ledger_tests {
+    use rustdar_source::fetch_policy::FetchError;
+    use rustdar_source::id::{LayerId, known};
+
+    use super::all;
+
+    /// The composed twin of `rustdar-overlays`' own
+    /// `every_auto_polling_handler_backs_off_after_a_failure`, which iterates
+    /// that crate's six and **cannot see the radar layer** — post-M9 it lives
+    /// in `rustdar-radar` and is chained in here. The overlays literal stays
+    /// six and is about that crate's own registry; this one is about the app's.
+    ///
+    /// Radar is named as well as counted: a count alone would go on reading 7
+    /// if one layer stopped polling and another started.
+    #[test]
+    fn every_auto_polling_layer_backs_off_after_a_failure() {
+        let mut checked: Vec<LayerId> = Vec::new();
+        for handler in all().iter_mut() {
+            let Some(interval) = handler.auto_poll_interval() else {
+                continue;
+            };
+            checked.push(handler.id());
+            let id = handler.id();
+            let id = id.as_str();
+
+            assert!(
+                handler.retry().is_some(),
+                "{id} auto-polls every {interval}s but keeps no retry ledger, \
+                 so a failed fetch leaves it due on every frame",
+            );
+            assert_eq!(
+                handler.auto_fetch_delay(),
+                Some(std::time::Duration::ZERO),
+                "{id} has never been fetched, so it is due now",
+            );
+
+            handler
+                .retry_mut()
+                .expect("just asserted present")
+                .record_failure(&FetchError::transient("network down"));
+
+            let delay = handler
+                .auto_fetch_delay()
+                .expect("a transient failure is still owed an eventual retry");
+            assert!(
+                !delay.is_zero(),
+                "{id} is due again immediately after a failed fetch — this is \
+                 the per-frame retry storm",
+            );
+            assert!(
+                delay <= std::time::Duration::from_secs(interval),
+                "{id} backs off past its own {interval}s poll interval, so a \
+                 failure recovers slower than an ordinary refresh: {delay:?}",
+            );
+        }
+
+        assert!(
+            checked.contains(&known::RADAR),
+            "the radar layer polls the archive and must be on the same ladder \
+             as every other poller; it is missing from {checked:?}",
+        );
+        assert_eq!(
+            checked.len(),
+            7,
+            "the app's auto-polling layers are overlays' six plus radar; a new \
+             one is not exempt and a removed one should be removed from this \
+             count deliberately: {checked:?}",
+        );
+    }
+}
+
+#[cfg(test)]
 mod controls_parity_tests {
     use rustdar_overlays::render::controls::ControlItem;
     use rustdar_overlays::render::overlay_state::{OverlayRegistry, PaneMut, PaneRef};

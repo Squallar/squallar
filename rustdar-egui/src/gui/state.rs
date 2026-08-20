@@ -7,75 +7,6 @@
 use super::probes::FrameProbes;
 use super::*;
 
-/// Auto-polling timer state.
-pub(crate) struct AutoPollState {
-    pub(super) last_fetch_time: Option<web_time::Instant>,
-    pub enabled: bool,
-    pub(super) initial_fetch_done: bool,
-    pub(super) interval_secs: u64,
-}
-
-impl AutoPollState {
-    /// Record that a fetch was just dispatched.
-    pub fn record_fetch(&mut self) {
-        self.last_fetch_time = Some(web_time::Instant::now());
-    }
-
-    /// Call when a scan loads successfully — resets backoff to the base interval.
-    pub fn on_success(&mut self) {
-        self.interval_secs = 60;
-    }
-
-    /// Call on fetch failure — exponential backoff capped at 5 minutes.
-    pub fn on_error(&mut self) {
-        self.interval_secs = (self.interval_secs * 2).min(300);
-    }
-
-    /// Whether the poll timer has elapsed and a new check should fire.
-    pub fn should_poll(&self) -> bool {
-        self.enabled
-            && self
-                .last_fetch_time
-                .is_some_and(|t| t.elapsed().as_secs() >= self.interval_secs)
-    }
-
-    /// Seconds remaining until the next poll, if a timer is running.
-    pub fn time_until_next(&self) -> Option<u64> {
-        self.last_fetch_time
-            .map(|t| self.interval_secs.saturating_sub(t.elapsed().as_secs()))
-    }
-
-    /// How long the event loop may sleep before [`should_poll`] would answer
-    /// yes, or `None` when there is no timer to run out.
-    pub fn poll_delay(&self) -> Option<std::time::Duration> {
-        if !self.enabled {
-            return None;
-        }
-        let elapsed = self.last_fetch_time?.elapsed();
-        Some(std::time::Duration::from_secs(self.interval_secs).saturating_sub(elapsed))
-    }
-
-    /// How long until the countdown the status bar prints changes, or `None`
-    /// when the number on screen has stopped moving.
-    pub fn countdown_tick_delay(&self) -> Option<std::time::Duration> {
-        if !self.enabled {
-            return None;
-        }
-        let elapsed = self.last_fetch_time?.elapsed();
-        if elapsed.as_secs() >= self.interval_secs {
-            return None;
-        }
-        // Strictly positive by construction — `subsec_nanos` is below a
-        // second — so this term can never schedule a zero-length sleep.
-        Some(std::time::Duration::from_nanos(u64::from(
-            NANOS_PER_SEC - elapsed.subsec_nanos(),
-        )))
-    }
-}
-
-/// One second, for [`AutoPollState::countdown_tick_delay`]'s remainder.
-const NANOS_PER_SEC: u32 = 1_000_000_000;
-
 // The chunk-feed status vocabulary is defined beside its producer in
 // `rustdar_radar::chunk_feed` — one name, one path.
 use rustdar_radar::chunk_feed::ChunkFeedStatus;
@@ -95,7 +26,6 @@ pub struct CurrentVolumeStamp {
 
 pub struct Gui {
     pub(super) radar: RadarState,
-    pub(super) auto_poll: AutoPollState,
     /// See [`Gui::live_chunks_enabled`].
     pub(super) live_chunks: bool,
     /// See [`Gui::chunk_notifications_enabled`].
@@ -464,12 +394,6 @@ impl Gui {
             notifier_endpoint: crate::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
             chunk_status: ChunkFeedStatus::default(),
             current_volumes: HashMap::new(),
-            auto_poll: AutoPollState {
-                last_fetch_time: None,
-                enabled: true,
-                initial_fetch_done: false,
-                interval_secs: 60,
-            },
             time_dialog: TimeDialogState {
                 date_string,
                 time_string,

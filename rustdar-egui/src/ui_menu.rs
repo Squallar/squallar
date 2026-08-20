@@ -242,9 +242,9 @@ impl super::Gui {
                     },
                     MenuNode::Separator,
                     MenuNode::Toggle {
-                        label: "Auto-poll",
+                        label: rustdar_radar::source::AUTO_POLL_LABEL,
                         toggle: MenuToggle::AutoPoll,
-                        value: self.auto_poll.enabled,
+                        value: crate::radar_layer::auto_poll_enabled(&self.overlays),
                     },
                     MenuNode::Toggle {
                         label: "Live: real-time chunks",
@@ -294,7 +294,7 @@ impl super::Gui {
                 self.set_active_pane_overlay(&kind, on);
                 self.propagate_layer_sync();
             }
-            MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
+            MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.set_auto_poll_enabled(on),
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.set_live_chunks(on),
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
             MenuEvent::Toggled(MenuToggle::VolumePane, on) => {
@@ -411,7 +411,7 @@ mod tests {
             gui.inspector_sel,
             gui.time_dialog.show,
             gui.drawer_open,
-            gui.auto_poll.enabled,
+            crate::radar_layer::auto_poll_enabled(&gui.overlays),
             gui.live_chunks,
             gui.chunk_notifications,
             gui.active_pane().render_view(),

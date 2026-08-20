@@ -122,14 +122,24 @@ fn a_newly_seen_tilt_is_added_to_the_list() {
     );
 }
 
+/// How far up the archive poll's failure ladder the radar layer is — the
+/// quantity `interval_secs` used to hold, now read off the layer's own retry
+/// ledger.
+fn archive_failures(gui: &Gui) -> u32 {
+    match gui.overlays.fetch_health(&crate::radar_layer::POLL_LAYER) {
+        Some(rustdar_source::fetch_policy::FetchHealth::Failing { attempts, .. }) => *attempts,
+        _ => 0,
+    }
+}
+
 /// A chunk round happens on its own every few seconds.
 #[test]
 fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.end_radar_round(crate::ui::RoundOutcome::Failed("network down"));
     gui.radar.fetching = true;
-    gui.auto_poll.on_error();
-    let backed_off = gui.auto_poll.interval_secs;
-    assert!(backed_off > 60, "the fixture must actually be backed off");
+    let backed_off = archive_failures(&gui);
+    assert!(backed_off > 0, "the fixture must actually be backed off");
 
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
@@ -141,7 +151,8 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
         "a chunk update cancelled a manual fetch's spinner"
     );
     assert_eq!(
-        gui.auto_poll.interval_secs, backed_off,
+        archive_failures(&gui),
+        backed_off,
         "a chunk update reset the archive poll's backoff"
     );
 }
