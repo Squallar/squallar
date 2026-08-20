@@ -4135,7 +4135,7 @@ fn a_looping_pane_reports_its_current_frames_time() {
             render_in_flight: false,
             render_failed: false,
         }];
-        pane.loop_state_mut().current_frame = 0;
+        pane.park_on_loop_frame(0);
     }
     h.warm_up();
 
@@ -8427,7 +8427,7 @@ fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
                 render_failed: false,
             })
             .collect();
-        pane.loop_state_mut().current_frame = 13;
+        pane.park_on_loop_frame(13);
     }
     h.mouse_click(h.timeline().expander.center());
     h.warm_up();
@@ -11010,7 +11010,7 @@ fn the_loop_and_archive_scrubbers_resolve_distinct_ids() {
             render_in_flight: false,
             render_failed: false,
         }];
-        pane.loop_state_mut().current_frame = 0;
+        pane.park_on_loop_frame(0);
     }
     h.warm_up();
     let loop_id = h

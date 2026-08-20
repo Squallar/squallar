@@ -2,19 +2,28 @@
 //! one surface floating over the map's bottom edge.
 
 use crate::actions::GuiAction;
-use crate::pane::{LoopFrame, TimeStep};
+use crate::pane::{LoopFrame, TimeMode, TimeStep};
 
-/// Available time step options: (seconds, label). 0 = "one scan". Moved here
-/// from the layers panel with the navigation buttons that consume it.
-pub(super) const TIME_STEP_OPTIONS: &[(i64, &str)] = &[
-    (0, "1 scan"),
-    (600, "10 min"),
-    (1800, "30 min"),
-    (3600, "1 hr"),
-    (7200, "2 hr"),
-    (21600, "6 hr"),
-    (43200, "12 hr"),
+/// Available time step options, in the order the picker offers them. The
+/// first is not a duration at all — [`TimeStep::OneFrame`] means "to the next
+/// frame the pane's time-primary layer actually has", which is a different
+/// distance at every site and every VCP. It used to be spelled as a `0`
+/// seconds sentinel; the `0` survives only in the config file, where
+/// [`TimeStep::as_secs`] still writes it.
+pub(super) const TIME_STEP_OPTIONS: &[(TimeStep, &str)] = &[
+    (TimeStep::OneFrame, "1 scan"),
+    (TimeStep::Secs(600), "10 min"),
+    (TimeStep::Secs(1800), "30 min"),
+    (TimeStep::Secs(3600), "1 hr"),
+    (TimeStep::Secs(7200), "2 hr"),
+    (TimeStep::Secs(21600), "6 hr"),
+    (TimeStep::Secs(43200), "12 hr"),
 ];
+
+/// Why a one-frame step is not offered on a pane that has no layer supplying
+/// frames — shown on hover rather than by hiding the entry, so the option a
+/// pane could have is still visible from the pane that cannot.
+const NO_FRAME_SERIES_REASON: &str = "no frame-series layer on this pane";
 
 /// How far above the map's bottom edge the transport floats (plan §1.5) —
 /// clear of the status bar spanning the bottom inset below it.
@@ -538,7 +547,7 @@ impl super::Gui {
             actions.push(GuiAction::JumpToLive { pane_idx });
         }
 
-        let step_secs = self.panes[pane_idx].time.step.as_secs();
+        let step = self.panes[pane_idx].time.step;
         let back = ui.button("\u{23f4}").on_hover_text("Back one step");
         #[cfg(test)]
         {
@@ -546,16 +555,15 @@ impl super::Gui {
         }
         if back.clicked() {
             self.panes[pane_idx].viewing_live = false;
-            if step_secs == 0 {
-                actions.push(GuiAction::NavigateOneScan {
+            match step {
+                TimeStep::OneFrame => actions.push(GuiAction::NavigateOneScan {
                     pane_idx,
                     forward: false,
-                });
-            } else {
-                actions.push(GuiAction::NavigateTime {
+                }),
+                TimeStep::Secs(secs) => actions.push(GuiAction::NavigateTime {
                     pane_idx,
-                    step_secs: -step_secs,
-                });
+                    step_secs: -secs,
+                }),
             }
         }
 
@@ -567,31 +575,42 @@ impl super::Gui {
             self.probes.last_timeline.fwd = (fwd.rect, !viewing_live);
         }
         if fwd.clicked() {
-            if step_secs == 0 {
-                actions.push(GuiAction::NavigateOneScan {
+            match step {
+                TimeStep::OneFrame => actions.push(GuiAction::NavigateOneScan {
                     pane_idx,
                     forward: true,
-                });
-            } else {
-                actions.push(GuiAction::NavigateTime {
+                }),
+                TimeStep::Secs(secs) => actions.push(GuiAction::NavigateTime {
                     pane_idx,
-                    step_secs,
-                });
+                    step_secs: secs,
+                }),
             }
         }
 
+        // A one-frame step needs a layer that has frames. A pane with none
+        // still SEES the entry — disabled, with the reason on hover — because
+        // an option that vanishes is an option the user cannot ask about.
+        let offers_frames = self.pane_has_frame_series_layer(pane_idx);
         let step_label = TIME_STEP_OPTIONS
             .iter()
-            .find(|(s, _)| *s == step_secs)
+            .find(|(s, _)| *s == step)
             .map(|(_, l)| *l)
             .unwrap_or("10 min");
-        let mut new_step = step_secs;
+        let mut new_step = step;
         let combo = egui::ComboBox::from_id_salt("layers_time_step_sel")
             .selected_text(step_label)
             .width(70.0)
             .show_ui(ui, |ui| {
-                for &(secs, label) in TIME_STEP_OPTIONS {
-                    ui.selectable_value(&mut new_step, secs, label);
+                for &(option, label) in TIME_STEP_OPTIONS {
+                    if option == TimeStep::OneFrame && !offers_frames {
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.selectable_value(&mut new_step, option, label)
+                        })
+                        .response
+                        .on_hover_text(NO_FRAME_SERIES_REASON);
+                        continue;
+                    }
+                    ui.selectable_value(&mut new_step, option, label);
                 }
             });
         #[cfg(test)]
@@ -603,8 +622,8 @@ impl super::Gui {
         }
         #[cfg(not(test))]
         let _ = combo;
-        if new_step != step_secs {
-            self.panes[pane_idx].time.step = TimeStep::from_secs(new_step);
+        if new_step != step {
+            self.panes[pane_idx].time.step = new_step;
         }
 
         let can_loop = self.panes[pane_idx].can_loop();
@@ -659,7 +678,7 @@ impl super::Gui {
         if let Some(total) = loop_frames {
             let seek = ui
                 .push_id("scrub_loop", |ui| {
-                    let mut frame_idx = self.panes[pane_idx].loop_state().current_frame;
+                    let mut frame_idx = self.panes[pane_idx].loop_state().current_frame();
                     let seek = ui
                         .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
                     if seek.changed() {
@@ -745,6 +764,10 @@ impl super::Gui {
             let target = now - chrono::Duration::seconds((lookback_secs * (1.0 - frac)) as i64);
             let step_secs = (target - scan_time).num_seconds();
             self.panes[pane_idx].viewing_live = false;
+            // The release names an INSTANT, so say so: the pane's clock moves
+            // to it and every layer on the pane is shown at that moment. The
+            // scan fetch below is radar's half of the same answer.
+            self.panes[pane_idx].set_time_mode(TimeMode::AsOf(target));
             actions.push(GuiAction::NavigateTime {
                 pane_idx,
                 step_secs,
@@ -815,7 +838,7 @@ impl super::Gui {
             let rendering = total > 0 && !ls.is_render_ready();
             let playing = ls.is_playing();
             let fetching = ls.is_fetching();
-            let current_frame = ls.current_frame;
+            let current_frame = ls.current_frame();
             let frame_time = ls.frames.get(current_frame).map(|f| f.timestamp);
 
             if fetching {

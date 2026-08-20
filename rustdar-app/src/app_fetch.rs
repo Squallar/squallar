@@ -398,14 +398,18 @@ impl super::App {
             GuiAction::StepLoopFrame { pane_idx, forward } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
                     let ls = pane.loop_state_mut();
-                    if !ls.frames.is_empty() {
+                    let next = (!ls.frames.is_empty()).then(|| {
+                        let current = ls.current_frame();
                         if forward {
-                            ls.current_frame = (ls.current_frame + 1) % ls.frames.len();
-                        } else if ls.current_frame == 0 {
-                            ls.current_frame = ls.frames.len() - 1;
+                            (current + 1) % ls.frames.len()
+                        } else if current == 0 {
+                            ls.frames.len() - 1
                         } else {
-                            ls.current_frame -= 1;
+                            current - 1
                         }
+                    });
+                    if let Some(next) = next {
+                        pane.park_on_loop_frame(next);
                     }
                 }
             }
@@ -414,10 +418,7 @@ impl super::App {
                 frame_index,
             } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = pane.loop_state_mut();
-                    if frame_index < ls.frames.len() {
-                        ls.current_frame = frame_index;
-                    }
+                    pane.park_on_loop_frame(frame_index);
                 }
             }
             GuiAction::NavigateTime {
@@ -1645,6 +1646,10 @@ fn append_polled_frame_to_loops(
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
         let held = super::render::loop_frames_held(allocation, pane.loop_state(), budgets);
         if append_polled_frame(pane.loop_state_mut(), site, timestamp, held) {
+            // The frame list moved under the playhead — evicted at the front,
+            // possibly re-sampled — so the pane's clock names a different
+            // index now. It names the same INSTANT, which is the point.
+            pane.settle_playheads();
             log::info!(
                 "Appended {} scan {} to loop on pane {} ({} frames)",
                 site,
@@ -1693,9 +1698,6 @@ fn append_polled_frame(
     if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
         let cutoff = newest - lookback;
         ls.frames.retain(|f| f.timestamp >= cutoff);
-        if ls.current_frame >= ls.frames.len() {
-            ls.current_frame = ls.frames.len().saturating_sub(1);
-        }
     }
 
     // Re-measure the site's cadence, while it is still measurable.

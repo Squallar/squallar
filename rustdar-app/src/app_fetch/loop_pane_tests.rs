@@ -294,7 +294,7 @@ fn appending_evicts_past_the_lookback_window() {
 fn eviction_pulls_the_playhead_back_inside_the_list() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
-    panes[0].loop_state_mut().current_frame = 2;
+    panes[0].park_on_loop_frame(2);
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
 
@@ -304,7 +304,7 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
         "precondition: only the new frame survives"
     );
     assert_eq!(
-        panes[0].loop_state().current_frame,
+        panes[0].loop_state().current_frame(),
         0,
         "the playhead must land on a frame that exists"
     );
@@ -312,7 +312,7 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
         panes[0]
             .loop_state()
             .frames
-            .get(panes[0].loop_state().current_frame)
+            .get(panes[0].loop_state().current_frame())
             .is_some(),
         "and resolve to one, which is what the pane renders through"
     );
@@ -349,7 +349,7 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
         panes[0].loop_state().frames.len(),
     );
     assert!(
-        panes[0].loop_state().current_frame < panes[0].loop_state().frames.len(),
+        panes[0].loop_state().current_frame() < panes[0].loop_state().frames.len(),
         "the playhead must land on a frame that exists",
     );
 }

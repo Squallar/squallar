@@ -405,7 +405,7 @@ fn the_playing_frame_is_a_grid_and_no_raster_consumer_takes_it() {
     // is which accessor answers, not how the frame was filled.
     let pane = app.gui.pane_mut(0).expect("pane 0");
     pane.loop_state_mut().phase = LoopPhase::Playing;
-    pane.loop_state_mut().current_frame = 1;
+    pane.park_on_loop_frame(1);
     pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::Volume(
         rustdar_egui::pane::VolumeFrameGrid {
             id: 42,

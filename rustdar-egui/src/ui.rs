@@ -1556,6 +1556,31 @@ impl Gui {
         self.panes.get(idx).is_none_or(|pane| pane.layer_link)
     }
 
+    /// **Whether pane `idx` draws any layer that comes in stamped frames** —
+    /// the question a one-frame step is only meaningful for, asked of the
+    /// layers themselves rather than by knowing which layer is radar.
+    ///
+    /// The registry half of the pair whose other half is
+    /// [`PaneState::clock_layer`]: this one answers for a pane that is
+    /// animating nothing, which is exactly the pane the step picker has to
+    /// decide about.
+    ///
+    /// [`PaneState::clock_layer`]: crate::pane::PaneState::clock_layer
+    pub fn pane_has_frame_series_layer(&self, idx: usize) -> bool {
+        let Some(pane) = self.panes.get(idx) else {
+            return false;
+        };
+        pane.layers.iter().filter(|slot| slot.enabled).any(|slot| {
+            self.overlays.handlers().any(|handler| {
+                handler.id() == slot.id
+                    && matches!(
+                        handler.time_axis(),
+                        rustdar_source::time::TimeAxis::FrameSeries { .. }
+                    )
+            })
+        })
+    }
+
     /// Whether pane `idx` follows shared time — the loop playback
     /// synchroniser's per-pane gate.
     pub fn pane_time_linked(&self, idx: usize) -> bool {
