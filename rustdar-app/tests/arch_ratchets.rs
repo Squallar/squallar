@@ -26,8 +26,8 @@
 //!
 //! ```text
 //!  #   metric                                        value  was  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-app          191  192  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
-//!  1b  ... excluding test-named paths                  186  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  1a  App-pokes-Gui occurrences, rustdar-app          185  191  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
+//!  1b  ... excluding test-named paths                  180  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //!  2   Gui setter fns in rustdar-egui/src/ui.rs          3    3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
 //!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -    -  rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs'
 //!  4a  product-enum occurrences in rustdar-egui        440  444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
@@ -35,6 +35,7 @@
 //!  6   ChannelHub receiver fields                       18   18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0    0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0    0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
+//!  8   config-swap occurrences, six crates                0    -  rg -o 'load_pane''_configs|save_pane''_configs|loaded_''configs' rustdar-{overlays,egui,app,radar,source,worker} --glob '*.rs' | wc -l
 //! ```
 //!
 //! Rows 1b, 2, 6, 7a and 7b were already pinned at their measured values and do
@@ -72,13 +73,24 @@ const HUB_ANCHOR: &str = concat!("struct ", "ChannelHub");
 const OFFLOAD_ANCHOR: &str = concat!("pub fn ", "offload_job(");
 const PRODUCT_DEF_ANCHOR: &str = concat!("enum Radar", "Product");
 
+// Row 8 — the config swap, deleted at WO-M10c. Split so this file never holds
+// a needle contiguously, and so a future grep for the deleted names stays
+// clean here too.
+const SWAP_LOAD: &str = concat!("load_pane", "_configs");
+const SWAP_SAVE: &str = concat!("save_pane", "_configs");
+const SWAP_MEMO: &str = concat!("loaded_", "configs");
+/// The presence control for row 8: the pane-state hook that REPLACED the swap.
+/// If the walk stops seeing this, it is reading the wrong tree and the three
+/// zeroes below mean nothing.
+const SWAP_REPLACEMENT: &str = concat!("serialize_pane", "_state");
+
 // --------------------------------------------------------------------------- Ceilings
 // — at-land measurements (see the table above).
 
 /// Row 1a.
-const SELF_GUI_MAX: usize = 188;
+const SELF_GUI_MAX: usize = 185;
 /// Row 1b — the same needle outside test-named paths.
-const SELF_GUI_NON_TEST_MAX: usize = 183;
+const SELF_GUI_NON_TEST_MAX: usize = 180;
 /// Row 2.
 const UI_SETTER_MAX: usize = 3;
 /// Row 4a.
@@ -229,6 +241,64 @@ fn the_app_pokes_gui_coupling_never_grows() {
          ceiling {SELF_GUI_NON_TEST_MAX}. WO-E2/WO-E8 drive this to 0 via GuiEvent. \
          Lower the MAX in the land that earns it; never raise it without a written \
          plan amendment."
+    );
+}
+
+/// Row 8 — **the config swap stays deleted**, everywhere.
+///
+/// The swap installed one pane's saved state into the shared handler before
+/// each call and took it out again. It was a CORRECTNESS mechanism, not
+/// plumbing: any method it covered that stayed global answered for one pane
+/// and acted for every pane the moment it died. WO-M10c moved all twelve
+/// handlers' per-pane state into the pane, so the mechanism has nothing left
+/// to do — and a single call site coming back is a handler reading a global
+/// again.
+///
+/// The zero is checked against a **positive control on the same walk**: the
+/// hook that replaced the swap must be found, and found many times, or the
+/// three absence checks are reading an empty or wrong haystack and pass for
+/// the wrong reason.
+#[test]
+fn the_config_swap_stays_deleted() {
+    let crates = [
+        "rustdar-overlays",
+        "rustdar-egui",
+        "rustdar-app",
+        "rustdar-radar",
+        "rustdar-source",
+        "rustdar-worker",
+    ];
+    let mut swap = 0usize;
+    let mut replacement = 0usize;
+    let mut walked = 0usize;
+    for name in crates {
+        let files = load_tree(&Path::new(ROOT).join(name));
+        walked += files.len();
+        swap += count(&files, SWAP_LOAD) + count(&files, SWAP_SAVE) + count(&files, SWAP_MEMO);
+        replacement += count(&files, SWAP_REPLACEMENT);
+    }
+    // Two controls, because a zero is only as good as the haystack under it.
+    assert!(
+        walked > 200,
+        "presence control: only {walked} .rs files were walked across {} \
+         crates — the walk is not reaching the tree, so the zero below would \
+         be a zero about nothing",
+        crates.len(),
+    );
+    assert!(
+        replacement >= 12,
+        "presence control: the walk found {SWAP_REPLACEMENT:?} only \
+         {replacement} times. Every handler that keeps per-pane state defines \
+         it, so a count this low means the walk is reading the wrong files \
+         and the absence check below proves nothing.",
+    );
+    assert_eq!(
+        swap, 0,
+        "the config swap is back ({swap} occurrence(s) of {SWAP_LOAD:?}, \
+         {SWAP_SAVE:?} or {SWAP_MEMO:?}). It installed one pane's state into \
+         the shared handler before each call, which is how two panes came to \
+         share one answer; a handler's per-pane state belongs in the pane, \
+         reached through `PaneRef`/`PaneMut`. See WO-M10b/WO-M10c.",
     );
 }
 

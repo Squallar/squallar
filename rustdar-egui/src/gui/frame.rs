@@ -94,12 +94,6 @@ impl Gui {
 
         self.render_catalog(ctx, &mut actions);
 
-        let active = &self.panes[self.active_pane];
-        if active.has_slot_configs() {
-            let configs = active.slot_config_map();
-            self.overlays.load_pane_configs(&configs);
-        }
-
         actions
     }
 

@@ -97,9 +97,9 @@ impl SourceHandler for RadarSource {
     // ── Per-pane state (WO-M10b) ──────────────────────────────────────
     //
     // This layer's only per-pane fact is whether the pane draws it, so its
-    // state IS the toggle. `self.enabled` survives as the registry's own copy
-    // until WO-M10c deletes the swap that keeps it; every answer below prefers
-    // the pane's when a pane is supplied.
+    // state IS the toggle. `self.enabled` survives as the LAYER'S DEFAULT for
+    // a caller that supplies no pane; nothing reads it into a pane, and the
+    // global `serialize_state` no longer carries it — the pane's slot does.
 
     fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
         PaneToggle::create(enabled)
@@ -115,15 +115,5 @@ impl SourceHandler for RadarSource {
 
     fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
         PaneToggle::save(state)
-    }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        serde_json::json!({ "enabled": self.enabled })
-    }
-
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.enabled = enabled;
-        }
     }
 }

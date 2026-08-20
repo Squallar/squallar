@@ -567,6 +567,10 @@ impl Gui {
             probes: FrameProbes::default(),
         };
         gui.initialize_pane_enabled();
+        // The site layer draws from its own copy of the table; without this it
+        // has no rows and answers `has_data` false, which is a map with no
+        // site markers on it.
+        gui.publish_radar_sites();
         gui
     }
 }

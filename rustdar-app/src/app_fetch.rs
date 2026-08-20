@@ -7,7 +7,6 @@ use rustdar_egui::actions::GuiAction;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_radar::types::RadarProduct;
-use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
@@ -606,15 +605,6 @@ impl super::App {
     fn fetch_overlay(&mut self, kind: rustdar_source::id::LayerId, pane_idx: usize) {
         use rustdar_overlays::render::overlay_state::FetchConfig;
 
-        let pane_configs = self
-            .gui
-            .pane(pane_idx)
-            .map(rustdar_egui::pane::PaneState::slot_config_map)
-            .unwrap_or_default();
-        if !pane_configs.is_empty() {
-            self.gui.overlays.load_pane_configs(&pane_configs);
-        }
-
         let config = FetchConfig {
             client: self.http_client.clone(),
             zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
@@ -622,35 +612,38 @@ impl super::App {
             viewport: self.last_viewport,
         };
 
-        // The pane is named, not read: the swap above still hands the handler
-        // this pane's saved state, so there is nothing in the slot yet for a
-        // `PaneRef` to carry. WO-M10's deletion commit is what frees the
-        // registry's mutable borrow and lets the real pane be built here.
-        let tasks = self
-            .gui
-            .overlays
-            .create_fetch_tasks(&kind, &config, &PaneRef::bare(pane_idx));
-        if tasks.is_empty() {
-            // A handler that cannot build a task says so, and is believed.
-            log::warn!("{kind:?}: no fetch task could be built; backing off");
-            self.gui.overlays.record_fetch_failure(
-                &kind,
-                &rustdar_overlays::fetch_policy::FetchError::permanent(
-                    "no fetch task could be built",
-                ),
-                &PaneRef::bare(pane_idx),
+        // **The real pane**, not `PaneRef::bare`: a handler's selection is the
+        // pane's since WO-M10c, so a task built against a bare pane would be
+        // built against the layer's defaults and fetch the wrong thing.
+        let tasks = {
+            let (panes, overlays) = self.gui.panes_and_overlays_mut();
+            let Some(pane) = panes.get_mut(pane_idx) else {
+                return;
+            };
+            pane.hydrate_layer_states(overlays, pane_idx);
+            let view = panes[pane_idx].view(pane_idx);
+            let pane_ref = view.layer(&kind);
+            let tasks = overlays.create_fetch_tasks(&kind, &config, &pane_ref);
+            if tasks.is_empty() {
+                // A handler that cannot build a task says so, and is believed.
+                log::warn!("{kind:?}: no fetch task could be built; backing off");
+                overlays.record_fetch_failure(
+                    &kind,
+                    &rustdar_overlays::fetch_policy::FetchError::permanent(
+                        "no fetch task could be built",
+                    ),
+                    &pane_ref,
+                );
+                return;
+            }
+            log::info!(
+                "Fetching overlay data for {:?} ({} task(s))",
+                kind,
+                tasks.len()
             );
-            return;
-        }
-
-        log::info!(
-            "Fetching overlay data for {:?} ({} task(s))",
-            kind,
-            tasks.len()
-        );
-        self.gui
-            .overlays
-            .set_fetching(&kind, true, &PaneRef::bare(pane_idx));
+            overlays.set_fetching(&kind, true, &pane_ref);
+            tasks
+        };
 
         for task in tasks {
             let task_kind = task.kind;
@@ -746,7 +739,6 @@ impl super::App {
         req: OverlayRenderRequest,
     ) {
         use rustdar_egui::overlay_cache::ZOOM_QUANTIZATION_FACTOR;
-        use rustdar_overlays::render::rasterize;
 
         let OverlayRenderRequest {
             geo_bounds,
@@ -781,29 +773,27 @@ impl super::App {
         let render_bounds = texture.coverage(&geo_bounds);
 
         let first_pane_idx = pane_indices[0];
-        let pane_configs = {
-            let Some(target_pane) = self.gui.pane(first_pane_idx) else {
-                self.clear_overlay_render_marks(&pane_indices, &id);
-                return;
-            };
-            target_pane.slot_config_map()
-        };
-        if !pane_configs.is_empty() {
-            self.gui.overlays.load_pane_configs(&pane_configs);
+        if self.gui.pane(first_pane_idx).is_none() {
+            self.clear_overlay_render_marks(&pane_indices, &id);
+            return;
         }
 
         let sender = self.channels.overlay_render_sender.clone();
         let window = self.window.clone();
 
         match &id {
-            // The handler-backed kinds — the three polygon kinds, the two hit-map kinds
-            // and the model grid.
+            // **The seven described kinds** — the three polygon kinds, the two
+            // hit-map kinds, the model grid and, since WO-M10c, the site
+            // table. The list is a coincidence of "answers `prepare_job`",
+            // pinned in `texture_tests`; `RadarSites` joined it when the
+            // handler gained a pane to read its site from.
             id if *id == known::SPC_OUTLOOK
                 || *id == known::SPC_DISCUSSIONS
                 || *id == known::NWS_ALERTS
                 || *id == known::STORM_REPORTS
                 || *id == known::LIGHTNING
-                || *id == known::MODEL_DATA =>
+                || *id == known::MODEL_DATA
+                || *id == known::RADAR_SITES =>
             {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
@@ -814,19 +804,23 @@ impl super::App {
                     // THE capture of the page's clock, and the only one on this path.
                     now: chrono::Utc::now().naive_utc(),
                 };
-                // One registry read for the three captures below — the job.
-                let overlays = &self.gui.overlays;
-                // Named, not read — see `fetch_overlay`.
-                let pane = PaneRef::bare(first_pane_idx);
-                let Some(job) = overlays.prepare_job(id, &rctx, &pane) else {
-                    self.clear_overlay_render_marks(&pane_indices, id);
-                    return;
+                // **The real pane, with its siblings.** `PaneView` and not
+                // `layer_ref`: the site table reads the radar slot's `"site"`
+                // out of `pane.slots`, and `layer_ref` carries none.
+                let built = {
+                    let (panes, overlays) = self.gui.panes_and_overlays_mut();
+                    panes[first_pane_idx].hydrate_layer_states(overlays, first_pane_idx);
+                    let view = panes[first_pane_idx].view(first_pane_idx);
+                    let pane = view.layer(id);
+                    let job = overlays.prepare_job(id, &rctx, &pane);
+                    // The page-side half of a hit map.
+                    let id_map = overlays.hit_items(id);
+                    // The codec row the handler registered — its label is the
+                    // job's name in the timing log.
+                    let row = overlays.job_codec(id);
+                    job.zip(row).map(|(job, row)| (job, id_map, row))
                 };
-                // The page-side half of a hit map.
-                let id_map = overlays.hit_items(id);
-                // The codec row the handler registered — its label is the job's name in
-                // the timing log.
-                let Some(row) = overlays.job_codec(id) else {
+                let Some((job, id_map, row)) = built else {
                     self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };
@@ -845,75 +839,6 @@ impl super::App {
                         width,
                         height,
                         id_map,
-                        OverlayRenderResponse {
-                            image: None,
-                            geo_bounds: render_bounds,
-                            overlay_kind: id.clone(),
-                            generation: data_generation,
-                            pane_indices,
-                            zoom,
-                            hit_map: None,
-                        },
-                        sender,
-                        window,
-                    ),
-                );
-            }
-            // TEMPORARY (per-pane handler state): the sites handler cannot
-            // see pane.site/loading_site.
-            id if *id == known::RADAR_SITES => {
-                let Some(target_pane) = self.gui.pane(first_pane_idx) else {
-                    self.clear_overlay_render_marks(&pane_indices, id);
-                    return;
-                };
-                let target_site = target_pane.site().to_string();
-                let target_loading = target_pane.loading_site.clone();
-                let is_dark = self.cached_dark_theme.unwrap_or(false);
-                let actual_zoom = zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
-                // See the `RasterizeContext` above: the density the pixels were
-                // counted at is the density the symbols are drawn at.
-                let device_scale = texture.pixels_per_point;
-                let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::radars()
-                    .iter()
-                    .map(|s| rasterize::RadarSiteInfo {
-                        name: s.name.to_string(),
-                        lat: s.lat,
-                        lon: s.lon,
-                        is_current: s.name == target_site,
-                        is_loading: target_loading.as_deref() == Some(s.name),
-                    })
-                    .collect();
-                // The sites row, through the same registry accessor as the handler-
-                // backed kinds.
-                let Some(row) = self.gui.overlays.job_codec(id) else {
-                    self.clear_overlay_render_marks(&pane_indices, id);
-                    return;
-                };
-                // Described, not closed over: the first overlay layer whose dispatch is
-                // a `JobRequest`.
-                let geometry = rustdar_source::job::JobGeometry {
-                    width,
-                    height,
-                    bounds: render_bounds,
-                    side_ceiling_px: 0,
-                };
-                let request = rustdar_worker::offload::JobRequest {
-                    geometry,
-                    job: rustdar_source::job::DescribedJob::new(rasterize::SitesInput {
-                        sites,
-                        zoom: actual_zoom,
-                        is_dark,
-                        device_scale,
-                    }),
-                };
-                rustdar_worker::offload::offload_job(
-                    row.label,
-                    rustdar_worker::offload::Job::Described(request),
-                    Self::overlay_job_deliver(
-                        row.label,
-                        width,
-                        height,
-                        None,
                         OverlayRenderResponse {
                             image: None,
                             geo_bounds: render_bounds,

@@ -587,9 +587,6 @@ impl super::Gui {
         // own rules hold: a cached parameter re-renders without a fetch, an
         // uncached one asks for one.
         pane.hydrate_layer_states(&self.overlays, idx);
-        if pane.has_slot_configs() {
-            self.overlays.load_pane_configs(&pane.slot_config_map());
-        }
         let update = ControlUpdate {
             id: "parameter",
             value: ControlValue::String(param.as_str().to_owned()),

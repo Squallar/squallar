@@ -21,9 +21,6 @@ impl Gui {
         }
 
         pane.hydrate_layer_states(&self.overlays, self.active_pane);
-        if pane.has_slot_configs() {
-            self.overlays.load_pane_configs(&pane.slot_config_map());
-        }
 
         let mut updates: Vec<(LayerId, ControlUpdate)> = Vec::new();
         let mut probe = ControlProbe::default();
@@ -119,20 +116,18 @@ impl Gui {
     /// its `draw_order_weight` puts it in, which is the reconcile the flat
     /// `draw_order` used to get on its own.
     ///
-    /// The joined slot takes the handler's current enabled state and, when
-    /// the pane carries no handler configs at all, the handler's current
-    /// config too — the same two answers the parallel maps were seeded with.
+    /// The joined slot takes the **layer's own default**, and nothing else:
+    /// it used to take `is_enabled` off the registry, and to copy the
+    /// registry's whole serialize into a pane that had saved nothing. Both
+    /// read one pane's state and wrote it into every other — which is what
+    /// the config swap was, and it dies with it. A slot with a `null` config
+    /// gets its state from `create_pane_state(slot.enabled)` at the hydrate
+    /// below, which is the same answer without the borrowed opinion.
     pub fn initialize_pane_enabled(&mut self) {
         let mut wanted: Vec<(LayerId, u32, bool)> = self
             .overlays
             .handlers()
-            .map(|h| {
-                (
-                    h.id(),
-                    h.draw_order_weight(),
-                    h.is_enabled(&PaneRef::bare(0)),
-                )
-            })
+            .map(|h| (h.id(), h.draw_order_weight(), h.default_enabled()))
             .collect();
         // Weight order, so each insertion lands among slots that are already
         // in it — the same walk `reconcile_draw_order` made.
@@ -141,20 +136,8 @@ impl Gui {
             .iter()
             .map(|(id, weight, _)| (id.clone(), *weight))
             .collect();
-        let default_configs = self.overlays.save_pane_configs();
         for pane in &mut self.panes {
             pane.insert_missing_slots(&wanted, &|id| weights.get(id).copied());
-            if pane.has_slot_configs() {
-                continue;
-            }
-            for slot in &mut pane.layers {
-                if slot.id == rustdar_source::id::known::RADAR {
-                    continue;
-                }
-                if let Some(config) = default_configs.get(&slot.id) {
-                    slot.config = config.clone();
-                }
-            }
         }
         // Every pane that has just gained slots also needs the state those
         // slots stand for — this is the one place every pane-making site
@@ -177,10 +160,6 @@ impl Gui {
         } = self;
         let pane = &mut panes[idx];
         pane.hydrate_layer_states(overlays, idx);
-        if pane.has_slot_configs() {
-            overlays.load_pane_configs(&pane.slot_config_map());
-        }
-        overlays.set_enabled(kind, on, &mut PaneMut::bare(idx));
         pane.set_layer_enabled(overlays, idx, kind, on);
         pane.adopt_handler_state(overlays);
     }
@@ -247,6 +226,46 @@ impl Gui {
         }
     }
 
+    /// Drive one control edit on ONE pane through the same construction
+    /// `render_overlay_controls_one` uses — the REAL slot state, and the other
+    /// panes' state as peers.
+    ///
+    /// Exists so a test can diverge two panes the way a user does, without an
+    /// `egui::Ui`. A test that built a `PaneMut` of its own would be free to
+    /// pass `None` and prove nothing, which is the silent-partial-success
+    /// shape this whole order is about.
+    #[cfg(test)]
+    pub(crate) fn apply_control_on_pane_for_test(
+        &mut self,
+        idx: usize,
+        kind: &LayerId,
+        update: &ControlUpdate,
+    ) -> ControlEffect {
+        let visible = self.pane_layout.pane_count;
+        let mut pane = std::mem::take(&mut self.panes[idx]);
+        pane.hydrate_layer_states(&self.overlays, idx);
+        let peers: Vec<&dyn std::any::Any> = self
+            .panes
+            .iter()
+            .take(visible)
+            .filter_map(|p| p.slot(kind))
+            .filter_map(|slot| slot.state.as_deref())
+            .map(|s| s as &dyn std::any::Any)
+            .collect();
+        let mut pane_ctx = PaneMut {
+            pane_idx: idx,
+            state: pane
+                .slot_mut(kind)
+                .and_then(|slot| slot.state.as_deref_mut())
+                .map(|s| s as &mut dyn std::any::Any),
+            peers: &peers,
+        };
+        let effect = self.overlays.apply_control(kind, update, &mut pane_ctx);
+        pane.adopt_handler_state(&self.overlays);
+        self.panes[idx] = pane;
+        effect
+    }
+
     /// Re-run every pane's write-back against the registry as it stands **now**
     /// — the step a layer toggle, a control edit and the autosave all end
     /// with. Exists so a test can put the registry's own copy at odds with the
@@ -259,6 +278,32 @@ impl Gui {
         for pane in panes.iter_mut() {
             pane.adopt_handler_state(overlays);
         }
+    }
+
+    /// **Hand the site table to the layer that draws it.**
+    ///
+    /// The table lives in `rustdar-radar`, which `rustdar-overlays` must not
+    /// name (WO-M3's edge cut), so the shell that already reads it for the
+    /// per-frame site labels installs the rows through the ordinary arrival
+    /// door. Re-run whenever the table moves — a catalogue landing
+    /// mid-session places radars this call did not have — which is why the
+    /// App calls it again from `adopt_the_first_catalogue`.
+    pub fn publish_radar_sites(&mut self) {
+        use rustdar_overlays::render::handlers::sites::{RadarSitesFetchResult, SiteRow};
+        let rows: Vec<SiteRow> = rustdar_radar::sites::radars()
+            .iter()
+            .map(|site| SiteRow {
+                name: site.name.to_string(),
+                lat: site.lat,
+                lon: site.lon,
+            })
+            .collect();
+        self.deliver_overlay_fetch(
+            rustdar_overlays::render::overlay_state::OverlayFetchResult {
+                kind: rustdar_source::id::known::RADAR_SITES,
+                data: Box::new(RadarSitesFetchResult(rows)),
+            },
+        );
     }
 
     /// **Take delivery of one overlay fetch round.**

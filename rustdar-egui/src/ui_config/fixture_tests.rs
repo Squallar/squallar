@@ -914,7 +914,15 @@ fn a_layer_toggle_leaves_the_radar_slots_own_members_alone() {
 #[test]
 fn the_radar_handler_and_the_pane_do_not_claim_the_same_slot_members() {
     use rustdar_source::handler::SourceHandler;
-    let state = rustdar_radar::source::RadarSource::new().serialize_state();
+    // **`serialize_pane_state`, not `serialize_state`**: the radar slot's
+    // handler half is what the PANE persists, and since WO-M10c that is the
+    // only half a handler writes at all — the global `serialize_state` no
+    // longer carries a per-pane member for any layer.
+    let handler = rustdar_radar::source::RadarSource::new();
+    let fresh = handler
+        .create_pane_state(false)
+        .expect("the radar handler keeps per-pane state");
+    let state = handler.serialize_pane_state(&*fresh);
     let members: Vec<&String> = state
         .as_object()
         .expect("the radar handler saves an object")
@@ -1046,10 +1054,12 @@ fn two_panes_hold_different_answers_for_one_layer_and_both_survive_a_reopen() {
 
     // **Put the registry's own copy at odds with the panes**, then re-run the
     // write-back every toggle and control edit ends with. Without this the
-    // check below cannot fail: the swap is still alive, and the registry
-    // happens to be holding the value the last pane wrote, so bytes taken
-    // from the registry and bytes taken from the pane are the same bytes.
-    // This is the disagreement that tells them apart.
+    // check below could not fail while the config swap was alive: the registry
+    // happened to be holding the value the last pane wrote, so bytes taken
+    // from the registry and bytes taken from the pane were the same bytes.
+    // The swap died at WO-M10c and `self.enabled` is now only the layer's
+    // default, but the disagreement is still what tells the two sources
+    // apart, so it stays.
     gui.overlays
         .set_enabled(&kind, true, &mut rustdar_source::handler::PaneMut::bare(0));
     gui.readopt_panes_for_test();
@@ -1098,6 +1108,194 @@ fn two_panes_hold_different_answers_for_one_layer_and_both_survive_a_reopen() {
                 .is_enabled(&kind, &pane.layer_ref(idx, &kind)),
             want,
             "pane {idx}'s handler state did not survive the reopen",
+        );
+    }
+}
+
+/// **The two-panes-diverge test of WO-M10c: two panes, two HRRR parameters.**
+///
+/// The order's named subject, and the case the config swap could only fake.
+/// Every read below goes through the pane — the controls model, the legend,
+/// the cache token and the described job — and the swap symbols are absent
+/// from the build (`arch_ratchets::the_config_swap_stays_deleted`), so nothing
+/// is re-installing one pane's selection before each read.
+///
+/// **Non-triviality floor**: the two panes are asserted to agree before they
+/// are diverged, and the parameter is set through `apply_control` on the real
+/// slot state rather than by writing a field.
+#[test]
+fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
+    use rustdar_overlays::hrrr::{GridCoords, HrrrFetchResult, HrrrGridData, ModelParameter};
+    use rustdar_overlays::render::controls::{ControlItem, ControlUpdate, ControlValue};
+    use rustdar_overlays::render::overlay_state::{OverlayFetchResult, RasterizeContext};
+
+    let kind = known::MODEL_DATA;
+    let left = ModelParameter::all()[0];
+    let right = ModelParameter::all()[1];
+    assert_ne!(left, right, "premise: two distinct parameters");
+
+    fn grid(parameter: ModelParameter) -> HrrrGridData {
+        let (ni, nj) = (4usize, 3usize);
+        let values: Vec<f32> = (0..ni * nj).map(|k| 10.0 + k as f32).collect();
+        let mut lats = Vec::new();
+        let mut lons = Vec::new();
+        for j in 0..nj {
+            for i in 0..ni {
+                lats.push(36.0 - 2.0 * (j as f64 / (nj - 1) as f64));
+                lons.push(-98.0 + 2.0 * (i as f64 / (ni - 1) as f64));
+            }
+        }
+        let (visible_points, value_range) =
+            rustdar_overlays::hrrr::summarize_values(&values, parameter);
+        HrrrGridData {
+            parameter,
+            values,
+            coords: GridCoords::Explicit { lats, lons },
+            ni,
+            nj,
+            bounds: rustdar_geo::GeoBounds {
+                min_lat: 34.0,
+                max_lat: 36.0,
+                min_lon: -98.0,
+                max_lon: -96.0,
+            },
+            ref_time: chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+            forecast_hour: parameter.forecast_hour(),
+            visible_points,
+            value_range,
+        }
+    }
+
+    let store = store_with(include_str!("fixtures/live_chunks_off.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the two-pane fixture must load");
+
+    // Both grids resident, so a difference below is a difference in the
+    // SELECTION and not in what happens to be cached.
+    for parameter in [left, right] {
+        gui.deliver_overlay_fetch(OverlayFetchResult {
+            kind: kind.clone(),
+            data: Box::new(HrrrFetchResult(Ok(grid(parameter)))),
+        });
+    }
+    for idx in 0..2 {
+        gui.set_overlay_on_pane_for_test(idx, &kind, true);
+    }
+
+    let selected = |gui: &Gui, idx: usize| -> String {
+        let pane = gui.pane(idx).expect("both panes");
+        let items = gui.overlays.controls(&kind, &pane.layer_ref(idx, &kind));
+        fn find(items: &[ControlItem]) -> Option<String> {
+            for item in items {
+                match item {
+                    ControlItem::Dropdown { id, selected, .. } if *id == "parameter" => {
+                        return Some(selected.clone());
+                    }
+                    ControlItem::Section { items, .. } => {
+                        if let Some(found) = find(items) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        find(&items).expect("the model layer offers a parameter dropdown")
+    };
+
+    assert_eq!(
+        selected(&gui, 0),
+        selected(&gui, 1),
+        "premise: the two panes start on the same parameter, or the \
+         divergence asserted below was already there",
+    );
+
+    // Through the same construction the inspector uses — the REAL slot state.
+    for (idx, parameter) in [(0usize, left), (1usize, right)] {
+        gui.apply_control_on_pane_for_test(
+            idx,
+            &kind,
+            &ControlUpdate {
+                id: "parameter",
+                value: ControlValue::String(parameter.as_str().to_owned()),
+            },
+        );
+    }
+
+    let ctx = RasterizeContext {
+        is_dark: false,
+        zoom: 7.0,
+        device_scale: 1.0,
+        now: chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+    };
+    let mut tokens = Vec::new();
+    for (idx, parameter) in [(0usize, left), (1usize, right)] {
+        let pane = gui.pane(idx).expect("both panes");
+        let view = pane.layer_ref(idx, &kind);
+        assert_eq!(
+            selected(&gui, idx),
+            parameter.as_str(),
+            "pane {idx}'s controls offer another pane's parameter",
+        );
+        assert_eq!(
+            gui.overlays.status_line(&kind, &view).as_deref(),
+            Some(parameter.display_name()),
+            "pane {idx}'s status line",
+        );
+        assert_eq!(
+            gui.overlays.legend(&kind, &view).map(|l| l.signature),
+            Some(parameter as u64 + 1),
+            "pane {idx}'s legend signature",
+        );
+        assert!(
+            gui.overlays.prepare_job(&kind, &ctx, &view).is_some(),
+            "pane {idx} would be skipped by the render dispatch",
+        );
+        tokens.push(gui.overlays.content_signature(&kind, &view));
+    }
+    assert_ne!(
+        tokens[0], tokens[1],
+        "the two panes share one cache token, so the dispatch would group \
+         them and hand both the same raster",
+    );
+
+    // The saved bytes carry both, and a reopen brings them back.
+    let json = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    for (idx, parameter) in [(0usize, left), (1usize, right)] {
+        assert_eq!(
+            v["panes"][idx]["layer_slots"]
+                .as_array()
+                .expect("a slot list")
+                .iter()
+                .find(|s| s["id"] == kind.as_str())
+                .expect("a model slot")["config"]["parameter"],
+            serde_json::json!(parameter.as_str()),
+            "pane {idx}'s parameter did not reach the file",
+        );
+    }
+
+    let reopened = MemoryKvStore::default();
+    reopened
+        .store(UI_CONFIG_KEY, &json)
+        .expect("the memory store accepts a write");
+    let mut again = Gui::new();
+    assert!(
+        again.load_ui_config(&reopened),
+        "the written file must reload"
+    );
+    for (idx, parameter) in [(0usize, left), (1usize, right)] {
+        assert_eq!(
+            selected(&again, idx),
+            parameter.as_str(),
+            "pane {idx} did not come back on the parameter it was left on",
         );
     }
 }

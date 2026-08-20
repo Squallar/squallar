@@ -1118,39 +1118,6 @@ impl OverlayHandler for GlmHandler {
             "show_flashes": state.show_flashes,
         })
     }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        serde_json::json!({
-            "enabled": self.defaults.enabled,
-            "satellite": self.defaults.satellite.as_str(),
-            "time_window_secs": self.defaults.time_window_secs,
-            "show_events": self.defaults.show_events,
-            "show_groups": self.defaults.show_groups,
-            "show_flashes": self.defaults.show_flashes,
-        })
-    }
-
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.defaults.enabled = enabled;
-        }
-        if let Some(sat) = value.get("satellite").and_then(|v| v.as_str()) {
-            self.defaults.satellite = SatelliteSelection::from_str(sat);
-        }
-        if let Some(tw) = value.get("time_window_secs").and_then(|v| v.as_f64()) {
-            self.defaults.time_window_secs =
-                tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
-        }
-        if let Some(v) = value.get("show_events").and_then(|v| v.as_bool()) {
-            self.defaults.show_events = v;
-        }
-        if let Some(v) = value.get("show_groups").and_then(|v| v.as_bool()) {
-            self.defaults.show_groups = v;
-        }
-        if let Some(v) = value.get("show_flashes").and_then(|v| v.as_bool()) {
-            self.defaults.show_flashes = v;
-        }
-    }
 }
 
 #[cfg(test)]

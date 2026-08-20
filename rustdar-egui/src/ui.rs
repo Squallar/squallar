@@ -1,6 +1,5 @@
 use crate::actions::{GuiAction, RadarConfig};
 use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
-use rustdar_source::handler::PaneMut;
 
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
@@ -964,12 +963,8 @@ impl Gui {
         on: bool,
     ) {
         pane.hydrate_layer_states(overlays, pane_idx);
-        if pane.has_slot_configs() {
-            overlays.load_pane_configs(&pane.slot_config_map());
-        }
-        overlays.set_enabled(kind, on, &mut PaneMut::bare(pane_idx));
-        // The pane's own state is where "on" lives for a converted handler;
-        // the global above is what the swap still hands the rest.
+        // The pane's own state is where "on" lives — for every handler, since
+        // WO-M10c. There is no second half to keep in step.
         pane.set_layer_enabled(overlays, pane_idx, kind, on);
         pane.adopt_handler_state(overlays);
         pane.release_disabled_overlay_textures();
@@ -1113,6 +1108,16 @@ impl Gui {
 
     pub fn remembered_pane_count(&self) -> usize {
         self.panes.len()
+    }
+
+    /// **The panes and the registry at once**, disjointly borrowed.
+    ///
+    /// A caller that has to hand a handler its pane needs both halves live:
+    /// the registry to ask, and the pane to ask *about*. Reaching for
+    /// `gui.overlays` and `gui.panes_mut()` in turn cannot express that, and
+    /// the config swap is what used to stand in for it.
+    pub fn panes_and_overlays_mut(&mut self) -> (&mut [PaneState], &mut OverlayRegistry) {
+        (&mut self.panes, &mut self.overlays)
     }
 
     pub fn panes_mut(&mut self) -> &mut [PaneState] {

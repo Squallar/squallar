@@ -581,22 +581,6 @@ impl OverlayHandler for ModelDataHandler {
             "parameter": state.selected_param.as_str(),
         })
     }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        serde_json::json!({
-            "enabled": self.defaults.enabled,
-            "parameter": self.defaults.selected_param.as_str(),
-        })
-    }
-
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.defaults.enabled = enabled;
-        }
-        if let Some(param) = value.get("parameter").and_then(|v| v.as_str()) {
-            self.defaults.selected_param = param.parse().unwrap();
-        }
-    }
 }
 
 #[cfg(test)]
