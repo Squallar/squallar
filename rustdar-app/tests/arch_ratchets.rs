@@ -15,20 +15,30 @@
 //! root; the walker skips dirs named `target`/`pkg` and never leaves the
 //! workspace.
 //!
-//! Baseline measured 2026-08-18 at main @ 854f4a64:
+//! Baseline RE-MEASURED 2026-08-19 at main @ b85bfa2d, on the tree left by the
+//! comment pass `be5b203a`..`ee8bcc7c` (443 files, 99,212 deletions measured
+//! `0e45ccb5`..`ee8bcc7c`). Every needle is counted in comments as in code,
+//! so a pass that deletes prose lowers these counts without changing one line
+//! of behaviour. The ceilings move down with them: the land that earns a lower
+//! count takes it, and this land earned two. The `was` column is the
+//! 2026-08-18 reading at main @ 854f4a64, kept so the size of the prose's
+//! share stays visible.
 //!
 //! ```text
-//!  #   metric                                        value  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-app          192  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
-//!  1b  ... excluding test-named paths                  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
-//!  2   Gui setter fns in rustdar-egui/src/ui.rs          3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
-//!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -  rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs'
-//!  4a  product-enum occurrences in rustdar-egui        444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
-//!  4b  ... files containing it (info)                   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
-//!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
-//!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
-//!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
+//!  #   metric                                        value  was  command (run from the workspace root)
+//!  1a  App-pokes-Gui occurrences, rustdar-app          191  192  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
+//!  1b  ... excluding test-named paths                  186  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  2   Gui setter fns in rustdar-egui/src/ui.rs          3    3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
+//!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -    -  rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs'
+//!  4a  product-enum occurrences in rustdar-egui        438  444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
+//!  4b  ... files containing it (info)                   29   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
+//!  6   ChannelHub receiver fields                       18   18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
+//!  7a  overlays-crate path occurrences in offload.rs     0    0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
+//!  7b  radar-crate path occurrences in offload.rs        0    0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
 //! ```
+//!
+//! Rows 1b, 2, 6, 7a and 7b were already pinned at their measured values and do
+//! not move: the comment pass left no prose mention of those needles to delete.
 //!
 //! Row 3 is recorded, not asserted, by user ruling: no count ratchets on style
 //! metrics. Row 5 (the overlay-kind enum) is retired — the enum is gone, and
@@ -64,13 +74,13 @@ const PRODUCT_DEF_ANCHOR: &str = concat!("enum Radar", "Product");
 // — at-land measurements (see the table above).
 
 /// Row 1a.
-const SELF_GUI_MAX: usize = 192;
+const SELF_GUI_MAX: usize = 191;
 /// Row 1b — the same needle outside test-named paths.
 const SELF_GUI_NON_TEST_MAX: usize = 186;
 /// Row 2.
 const UI_SETTER_MAX: usize = 3;
 /// Row 4a.
-const PRODUCT_IN_EGUI_MAX: usize = 444;
+const PRODUCT_IN_EGUI_MAX: usize = 438;
 /// Row 6.
 const HUB_RECEIVER_MAX: usize = 18;
 
