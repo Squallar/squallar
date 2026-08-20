@@ -149,8 +149,11 @@ pub struct AndroidPlatform {
     insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
     /// Injected by `android::entry`: the flag it reads is set by the JNI callback
-    /// `BackHandler.java` invokes on the UI thread (`android::back`).
+    /// `BackHandler.kt` invokes on the UI thread (`android::back`).
     back_press_taker: Option<fn() -> bool>,
+    /// Injected by `android::entry`: the JNI static call that publishes this
+    /// app's claim on the next press to `BackHandler.setClaimed`.
+    back_claim_reporter: Option<fn(bool)>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     /// Handed to the theme poller below, so a light/dark switch noticed on that
@@ -175,6 +178,7 @@ impl AndroidPlatform {
             insets_querier: None,
             back_handler: None,
             back_press_taker: None,
+            back_claim_reporter: None,
             zone_cache_dir: None,
             config_dir: None,
             redraw_waker: RedrawWaker::new(),
@@ -211,6 +215,16 @@ impl PlatformBridge for AndroidPlatform {
 
     fn set_back_press_taker(&mut self, taker: fn() -> bool) {
         self.back_press_taker = Some(taker);
+    }
+
+    fn set_back_claimed(&mut self, claimed: bool) {
+        if let Some(report) = self.back_claim_reporter {
+            report(claimed);
+        }
+    }
+
+    fn set_back_claim_reporter(&mut self, reporter: fn(bool)) {
+        self.back_claim_reporter = Some(reporter);
     }
 
     fn detect_dark_theme(&self) -> bool {

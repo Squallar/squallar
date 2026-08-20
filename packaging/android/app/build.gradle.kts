@@ -277,15 +277,24 @@ android {
             isMinifyEnabled = false
         }
         getByName("release") {
-            // Shrinks the DEX, which is almost entirely kotlin-stdlib pulled in by
-            // the rustls verifier. Everything reached reflectively or over JNI is
-            // kept explicitly in proguard-rules.pro — see the file for why each
-            // rule is load-bearing.
-            isMinifyEnabled = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro",
-            )
+            // Nothing is shrunk, so nothing has to be kept, and that is the trade
+            // being made here deliberately.
+            //
+            // Every class this app owns is reached only reflectively (loaded by
+            // name through the app ClassLoader) or over JNI (static calls and
+            // native-symbol binding), so R8 sees no reference to any of them.
+            // Shrinking therefore required a -keep rule per class and per JNI
+            // entry point in a hand-maintained keep file, and the failure mode of
+            // a missing one was a NoSuchMethodError on a device in a release
+            // build that no host test can reach.
+            //
+            // The cost of turning it off is DEX size: the ~1.5 MB kotlin-stdlib
+            // that arrives with the rustls-platform-verifier AAR now ships
+            // unshrunk, alongside this app's own three Kotlin helpers. Against a
+            // native library measured in tens of megabytes that is noise.
+            // Re-enabling R8 is registered as post-campaign polish, and it has to
+            // come back with the keeps, not without them.
+            isMinifyEnabled = false
             if (keystoreProps != null) {
                 signingConfig = signingConfigs.getByName("release")
             }

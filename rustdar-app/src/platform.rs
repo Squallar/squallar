@@ -173,6 +173,31 @@ pub trait PlatformBridge {
     /// `rustdar` crate's cfg(android) back module.
     fn set_back_press_taker(&mut self, _taker: fn() -> bool) {}
 
+    /// Tell the platform whether the next back press has something to close.
+    ///
+    /// Android's predictive-back dispatcher only lets an app decline a press by
+    /// not being registered when it arrives — `onBackInvoked()` returns void —
+    /// and declining is what buys the system's own back-to-home preview. So the
+    /// claim has to be published *before* the press, and it has to be true at
+    /// every transition that opens or closes something. Pushed on change only,
+    /// at the end of a frame; a per-frame JNI hop is what this shape avoids.
+    ///
+    /// Every other platform ignores it: back is a key there, answered when it
+    /// arrives — and so, today, does Android, which has not opted into the
+    /// dispatcher (see `BackHandler.kt` and the manifest for the measurement
+    /// that keeps it opted out). The claim is published anyway so that the day
+    /// the opt-in becomes mandatory nothing but a manifest attribute changes.
+    fn set_back_claimed(&mut self, _claimed: bool) {}
+
+    /// Set the sink [`set_back_claimed`](Self::set_back_claimed) forwards to
+    /// (Android only).
+    ///
+    /// Injected for the same reason as
+    /// [`set_back_press_taker`](Self::set_back_press_taker): the far end is a
+    /// JNI static call in the `rustdar` crate's cfg(android) back module, and
+    /// this trait has to compile for targets that never heard of JNI.
+    fn set_back_claim_reporter(&mut self, _reporter: fn(bool)) {}
+
     fn detect_dark_theme(&self) -> bool;
 
     fn set_back_handler(&mut self, handler: fn());

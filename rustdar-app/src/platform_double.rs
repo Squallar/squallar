@@ -122,6 +122,10 @@ pub(crate) struct TestBridge {
     timezone: Option<String>,
     /// See [`LocationRecord`].
     location: LocationRecord,
+    /// Every value `set_back_claimed` was handed, in order. A log rather than a
+    /// flag: the whole contract is that the push is *edge-triggered*, and only
+    /// the sequence can show a repeat that should not have been sent.
+    back_claims: Rc<RefCell<Vec<bool>>>,
 }
 
 impl TestBridge {
@@ -146,6 +150,7 @@ impl TestBridge {
             store_availability: StoreAvailability::WhenToldADirectory,
             timezone: None,
             location: LocationRecord::default(),
+            back_claims: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -188,6 +193,12 @@ impl TestBridge {
             store_availability: StoreAvailability::Always,
             ..Self::bare()
         }
+    }
+
+    /// Every predictive-back claim the app has pushed, in order. Taken before the
+    /// bridge is handed to `App`, which owns it from then on.
+    pub(crate) fn back_claim_log(&self) -> Rc<RefCell<Vec<bool>>> {
+        Rc::clone(&self.back_claims)
     }
 
     /// A handle on the blobs `kv` hands out, for seeding a config
@@ -295,6 +306,10 @@ impl PlatformBridge for TestBridge {
 
     fn set_back_press_taker(&mut self, taker: fn() -> bool) {
         self.back_press_taker = Some(taker);
+    }
+
+    fn set_back_claimed(&mut self, claimed: bool) {
+        self.back_claims.borrow_mut().push(claimed);
     }
 
     fn detect_dark_theme(&self) -> bool {

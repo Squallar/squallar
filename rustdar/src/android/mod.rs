@@ -6,7 +6,8 @@
 //! # The injection is a rule, not a leftover (READ BEFORE "SIMPLIFYING")
 //!
 //! `android_main` installs `set_theme_detector` / `set_insets_querier` /
-//! `set_back_handler` / `set_back_press_taker` as injected `fn` pointers even
+//! `set_back_handler` / `set_back_press_taker` / `set_back_claim_reporter` as
+//! injected `fn` pointers even
 //! though callee and caller share this crate: `PlatformBridge` is declared in
 //! rustdar-app, which must compile for targets that have never heard of JNI,
 //! the bridge structs stay `deny(unsafe_code)`-clean and host-testable, and

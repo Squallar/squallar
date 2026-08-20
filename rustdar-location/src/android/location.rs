@@ -89,79 +89,97 @@ fn last_known_location_with(
             continue;
         }
 
-        let lat = env
-            .call_method(&location, jni_str!("getLatitude"), jni_sig!("()D"), &[])
-            .ok()?
-            .d()
-            .ok()?;
-        let lon = env
-            .call_method(&location, jni_str!("getLongitude"), jni_sig!("()D"), &[])
-            .ok()?
-            .d()
-            .ok()?;
-
-        if lat.abs() < 0.001 && lon.abs() < 0.001 {
-            continue;
+        if let Some(fix) = fix_from_location(env, &location, provider) {
+            return Some(fix);
         }
-
-        let altitude_m = env
-            .call_method(&location, jni_str!("getAltitude"), jni_sig!("()D"), &[])
-            .and_then(|v| v.d())
-            .ok()
-            .filter(|_| {
-                env.call_method(&location, jni_str!("hasAltitude"), jni_sig!("()Z"), &[])
-                    .and_then(|v| v.z())
-                    .unwrap_or(false)
-            });
-
-        let speed_mps = env
-            .call_method(&location, jni_str!("getSpeed"), jni_sig!("()F"), &[])
-            .and_then(|v| v.f())
-            .ok()
-            .filter(|_| {
-                env.call_method(&location, jni_str!("hasSpeed"), jni_sig!("()Z"), &[])
-                    .and_then(|v| v.z())
-                    .unwrap_or(false)
-            })
-            .map(|s| s as f64);
-
-        let heading_deg = env
-            .call_method(&location, jni_str!("getBearing"), jni_sig!("()F"), &[])
-            .and_then(|v| v.f())
-            .ok()
-            .filter(|_| {
-                env.call_method(&location, jni_str!("hasBearing"), jni_sig!("()Z"), &[])
-                    .and_then(|v| v.z())
-                    .unwrap_or(false)
-            })
-            .map(|b| b as f64);
-
-        // Guarded by `hasAccuracy()`: a `Location` without one returns 0.0, and
-        // 0 m would read as a perfect fix rather than an absent field.
-        let accuracy_m = env
-            .call_method(&location, jni_str!("getAccuracy"), jni_sig!("()F"), &[])
-            .and_then(|v| v.f())
-            .ok()
-            .filter(|_| {
-                env.call_method(&location, jni_str!("hasAccuracy"), jni_sig!("()Z"), &[])
-                    .and_then(|v| v.z())
-                    .unwrap_or(false)
-            })
-            .map(|a| a as f64);
-
-        return Some(crate::Fix {
-            point: rustdar_geo::GeoPoint { lat, lon },
-            altitude_m,
-            speed_mps,
-            heading_deg,
-            satellites: None, // Not available from getLastKnownLocation
-            fix_quality: provider_fix_quality(provider),
-            hdop: None,
-            accuracy_m,
-            timestamp: None,
-        });
     }
     None
+}
+
+/// Decode one `android.location.Location` into a [`Fix`](crate::Fix). The one
+/// decoder: both reads — the cached fix `LocationHelper` was handed and the
+/// passive `getLastKnownLocation` — come through here, so a field guarded on one
+/// path cannot be unguarded on the other.
+fn fix_from_location(
+    env: &mut jni::Env<'_>,
+    location: &jni::objects::JObject<'_>,
+    provider: &str,
+) -> Option<crate::Fix> {
+    use jni::{jni_sig, jni_str};
+
+    let lat = env
+        .call_method(&location, jni_str!("getLatitude"), jni_sig!("()D"), &[])
+        .ok()?
+        .d()
+        .ok()?;
+    let lon = env
+        .call_method(&location, jni_str!("getLongitude"), jni_sig!("()D"), &[])
+        .ok()?
+        .d()
+        .ok()?;
+
+    // A provider that has produced nothing answers (0, 0) rather than null on
+    // some devices, and Null Island is not a fix.
+    if lat.abs() < 0.001 && lon.abs() < 0.001 {
+        return None;
+    }
+
+    let altitude_m = env
+        .call_method(&location, jni_str!("getAltitude"), jni_sig!("()D"), &[])
+        .and_then(|v| v.d())
+        .ok()
+        .filter(|_| {
+            env.call_method(&location, jni_str!("hasAltitude"), jni_sig!("()Z"), &[])
+                .and_then(|v| v.z())
+                .unwrap_or(false)
+        });
+
+    let speed_mps = env
+        .call_method(&location, jni_str!("getSpeed"), jni_sig!("()F"), &[])
+        .and_then(|v| v.f())
+        .ok()
+        .filter(|_| {
+            env.call_method(&location, jni_str!("hasSpeed"), jni_sig!("()Z"), &[])
+                .and_then(|v| v.z())
+                .unwrap_or(false)
+        })
+        .map(|s| s as f64);
+
+    let heading_deg = env
+        .call_method(&location, jni_str!("getBearing"), jni_sig!("()F"), &[])
+        .and_then(|v| v.f())
+        .ok()
+        .filter(|_| {
+            env.call_method(&location, jni_str!("hasBearing"), jni_sig!("()Z"), &[])
+                .and_then(|v| v.z())
+                .unwrap_or(false)
+        })
+        .map(|b| b as f64);
+
+    // Guarded by `hasAccuracy()`: a `Location` without one returns 0.0, and
+    // 0 m would read as a perfect fix rather than an absent field.
+    let accuracy_m = env
+        .call_method(&location, jni_str!("getAccuracy"), jni_sig!("()F"), &[])
+        .and_then(|v| v.f())
+        .ok()
+        .filter(|_| {
+            env.call_method(&location, jni_str!("hasAccuracy"), jni_sig!("()Z"), &[])
+                .and_then(|v| v.z())
+                .unwrap_or(false)
+        })
+        .map(|a| a as f64);
+
+    Some(crate::Fix {
+        point: rustdar_geo::GeoPoint { lat, lon },
+        altitude_m,
+        speed_mps,
+        heading_deg,
+        satellites: None, // Not available from getLastKnownLocation
+        fix_quality: provider_fix_quality(provider),
+        hdop: None,
+        accuracy_m,
+        timestamp: None,
+    })
 }
 
 /// JClass for com.rustdar.LocationHelper, loaded once via the app class loader.
@@ -228,12 +246,66 @@ fn stop_location_updates() {
     });
 }
 
+/// The freshest fix `LocationHelper`'s subscription has been handed, or `None`
+/// before the first delivery.
+///
+/// The helper caches what its listener receives; this reads the cache. It is not
+/// a replacement for [`get_last_known_location`] but the layer above it: the
+/// cache is empty until a provider has delivered at least once, which on a cold
+/// start is minutes, and the passive last-known read is what the app opens on.
+/// The provider name is read alongside rather than off the `Location`, so a fix
+/// whose provider field is absent still maps to a quality.
+fn cached_fix() -> Option<crate::Fix> {
+    use jni::objects::JClass;
+    use jni::{jni_sig, jni_str};
+
+    let global_ref = LOCATION_CLASS.get()?;
+
+    with_env(|env| {
+        let cls: &JClass<'static> = global_ref;
+        let location = env
+            .call_static_method(
+                cls,
+                jni_str!("cachedFix"),
+                jni_sig!("()Landroid/location/Location;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .inspect_err(|e| log::warn!("LocationHelper.cachedFix() failed: {e:?}"))
+            .ok()?;
+        if location.is_null() {
+            return None;
+        }
+
+        let provider = env
+            .call_static_method(
+                cls,
+                jni_str!("cachedFixProvider"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .ok()
+            .filter(|s| !s.is_null())
+            .and_then(|s| env.cast_local::<jni::objects::JString>(s).ok())
+            .and_then(|s| s.try_to_string(env).ok())
+            .unwrap_or_default();
+
+        fix_from_location(env, &location, &provider)
+    })
+    .flatten()
+}
+
 /// Start a background thread that polls GPS location and sends updates through
 /// the provided channel. It asks for nothing: prompting is
 /// [`crate::LocationGate`]'s alone.
 ///
-/// The 10 s poll stays: `getLastKnownLocation` is what actually produces every
-/// fix here, since `LocationHelper`'s listener is deliberately empty.
+/// The 10 s poll stays, and it is a poll rather than a push on purpose: a push
+/// would deliver on the UI thread and need JNI plumbing in the other direction
+/// for a reader that already exists. Each turn reads the helper's cached fix
+/// first and falls back to the passive `getLastKnownLocation` — the cache is
+/// empty until a provider has delivered once, and the passive read is what a
+/// cold start opens on.
 ///
 /// `wake` is called after each fix reaches the channel — the app drains it only
 /// while rendering, on `ControlFlow::Wait`. **Not** the shell's
@@ -257,7 +329,7 @@ pub(super) fn start_location_thread(
                 // permission check keeps a withdrawn grant from throwing.
                 if location_active()
                     && has_location_permission()
-                    && let Some(fix) = get_last_known_location()
+                    && let Some(fix) = cached_fix().or_else(get_last_known_location)
                 {
                     if sender.send(fix).is_err() {
                         break; // channel closed
