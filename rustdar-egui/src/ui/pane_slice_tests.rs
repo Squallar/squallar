@@ -545,8 +545,7 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     for idx in 0..2 {
         gui.pane_mut(idx)
             .unwrap()
-            .enabled_overlays
-            .insert(kind.clone(), true);
+            .set_overlay_enabled(kind.clone(), true);
     }
     assert!(
         gui.any_pane_has_overlay_enabled(&kind),

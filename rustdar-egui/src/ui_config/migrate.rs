@@ -1,7 +1,7 @@
 //! Stepwise config-format migrations, applied to the raw JSON tree before
 //! `UiConfig` ever sees it.
 
-pub(crate) const CONFIG_VERSION: u32 = 2;
+pub(crate) const CONFIG_VERSION: u32 = 3;
 
 /// The version a file with no `config_version` key speaks: every config
 /// written before the field existed. A constant fact about history — this
@@ -16,7 +16,7 @@ type Migration = (u32, fn(&mut serde_json::Value));
 
 /// One step per entry: a file at exactly the named version is rewritten in
 /// place to speak the next one, in order, so a v1 file walks every rung.
-const MIGRATIONS: &[Migration] = &[(1, split_gps_config)];
+const MIGRATIONS: &[Migration] = &[(1, split_gps_config), (2, panes_take_layer_slots)];
 
 /// v1 → v2: the `gps_config` container split — the serial half (`port_path`,
 /// `baud_rate`) keeps the container under the new name `serial_config`, and
@@ -38,6 +38,144 @@ fn split_gps_config(value: &mut serde_json::Value) {
         root.insert("heading_source".to_string(), heading);
     }
 }
+
+/// v2 → v3: **a pane's three parallel layer containers become one ordered
+/// list of slots.** `draw_order`, `enabled_overlays` and `overlay_configs`
+/// were keyed on the same layer ids and had to be kept in step by hand; a
+/// slot carries all three facts about one layer together, and the list's
+/// order is the draw order.
+///
+/// The radar layer gets a slot like any other, and its config is where this
+/// pane's own selection now lives — `site`, `product`, `elevation`, moved out
+/// of the flat pane fields — plus `live_chunks`, **fanned out from the one
+/// global** so a per-pane answer becomes expressible. The global stays at the
+/// root: the settings UI still writes it, and an older build still reads it.
+///
+/// Everything the step does not consume is left exactly as it was, and every
+/// value it moves is moved **verbatim**: an id no build here serves keeps its
+/// slot, a product spelling this build cannot read is still handed to the
+/// tolerant reader that has always fielded it, and a `draw_order` element
+/// that is not a string at all rides along as a non-slot entry.
+fn panes_take_layer_slots(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    // The global's value at the moment of the move — the switch every pane
+    // was answering to before per-pane answers existed.
+    let global_live_chunks = root
+        .get("live_chunks")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let Some(panes) = root
+        .get_mut("panes")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for pane in panes {
+        let Some(pane) = pane.as_object_mut() else {
+            continue;
+        };
+        // Consumed either way: a pane that already carries slots is one a
+        // newer build wrote and an older one handed back, and its flat fields
+        // are the older build's stale copy, not the truth.
+        let draw_order = pane.remove("draw_order");
+        let enabled_overlays = pane.remove("enabled_overlays");
+        let overlay_configs = pane.remove("overlay_configs");
+        let site = pane.remove("site");
+        let product = pane.remove("selected_product");
+        let elevation = pane.remove("selected_elevation");
+        if pane.contains_key("layer_slots") {
+            continue;
+        }
+
+        let member = |value: &Option<serde_json::Value>, key: &str| -> Option<serde_json::Value> {
+            value.as_ref()?.as_object()?.get(key).cloned()
+        };
+        let keys = |value: &Option<serde_json::Value>| -> Vec<String> {
+            value
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        // The order, exactly as the list gave it. An absent list is not "the
+        // default order" here: the default is the build's weight order, which
+        // this step cannot know and the load reconstructs anyway.
+        let mut ids: Vec<String> = Vec::new();
+        let mut non_ids: Vec<serde_json::Value> = Vec::new();
+        if let Some(serde_json::Value::Array(list)) = &draw_order {
+            for entry in list {
+                match entry {
+                    serde_json::Value::String(name) if !ids.contains(name) => {
+                        ids.push(name.clone());
+                    }
+                    serde_json::Value::String(_) => {}
+                    other => non_ids.push(other.clone()),
+                }
+            }
+        }
+        // Ids the maps name but the order did not, appended in a fixed order
+        // so the same file always migrates to the same stack. The radar id is
+        // always one of them: its slot is where the pane's selection goes,
+        // so it has to exist whether or not the file listed it.
+        let mut extras: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys(&enabled_overlays)
+            .into_iter()
+            .chain(keys(&overlay_configs))
+        {
+            extras.insert(key);
+        }
+        extras.insert(RADAR_ID.to_string());
+        for id in ids.iter() {
+            extras.remove(id);
+        }
+        ids.extend(extras);
+
+        let mut slots: Vec<serde_json::Value> = Vec::with_capacity(ids.len() + non_ids.len());
+        for id in ids {
+            let mut slot = serde_json::Map::new();
+            slot.insert("id".to_string(), serde_json::Value::String(id.clone()));
+            // A layer the map states nothing about states nothing here
+            // either: the load asks the handler, exactly as it always did for
+            // a missing map entry.
+            if let Some(on) = member(&enabled_overlays, &id).and_then(|v| v.as_bool()) {
+                slot.insert("enabled".to_string(), serde_json::Value::Bool(on));
+            }
+            let mut config = match member(&overlay_configs, &id) {
+                Some(serde_json::Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            if id == RADAR_ID {
+                if let Some(site) = site.clone() {
+                    config.insert("site".to_string(), site);
+                }
+                if let Some(product) = product.clone() {
+                    config.insert("product".to_string(), product);
+                }
+                if let Some(elevation) = elevation.clone() {
+                    config.insert("elevation".to_string(), elevation);
+                }
+                config.insert(
+                    "live_chunks".to_string(),
+                    serde_json::Value::Bool(global_live_chunks),
+                );
+            }
+            if !config.is_empty() {
+                slot.insert("config".to_string(), serde_json::Value::Object(config));
+            }
+            slots.push(serde_json::Value::Object(slot));
+        }
+        slots.extend(non_ids);
+        pane.insert("layer_slots".to_string(), serde_json::Value::Array(slots));
+    }
+}
+
+/// The radar layer's id, spelled here rather than imported: a migration is a
+/// fact about a file that was already written, and it must not move when the
+/// constant a live build uses moves.
+const RADAR_ID: &str = "Radar";
 
 /// Walk `value` up from whatever version it speaks to [`CONFIG_VERSION`].
 pub(crate) fn migrate_to_current(value: &mut serde_json::Value) {

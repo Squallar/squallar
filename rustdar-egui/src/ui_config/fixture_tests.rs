@@ -52,7 +52,7 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
 
     // The rest of the file arrived: a failed load could not have applied
     // these, so they double as proof the `true` above was honest.
-    assert_eq!(pane.site, "KMPX");
+    assert_eq!(pane.site(), "KMPX");
     assert_eq!(gui.loop_lookback_secs, 7200);
 }
 
@@ -68,10 +68,10 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
 
     // Spot checks that the file was applied, not defaults: every value here
     // differs from what a fresh `Gui` starts with.
-    assert_eq!(gui.pane(0).expect("pane 0").site, "KTLX");
+    assert_eq!(gui.pane(0).expect("pane 0").site(), "KTLX");
     let pane1 = gui.pane(1).expect("pane 1");
-    assert_eq!(pane1.site, "KOUN");
-    assert_eq!(pane1.selected_product, RadarProduct::Velocity);
+    assert_eq!(pane1.site(), "KOUN");
+    assert_eq!(pane1.selected_product(), RadarProduct::Velocity);
     assert!(!pane1.time_link, "pane 1 saved its time link off");
     assert_eq!(gui.presets.len(), 1, "the user preset arrived");
 
@@ -121,9 +121,14 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
     );
 }
 
-/// A file written by a **newer build** — greater version, an overlay kind,
-/// a product, pane fields and top-level fields this build has never heard
-/// of — loads what it can and, on save, hands back every unknown byte.
+/// A file written by a **newer build** — greater version, a layer, a product,
+/// a slot member, pane fields and top-level fields this build has never heard
+/// of, and even a slot list entry that is not a slot — loads what it can and,
+/// on save, hands back every unknown byte.
+///
+/// The file speaks the **slot shape**, because that is the shape a newer
+/// build writes; its `config_version` is far enough ahead that no migration
+/// step touches it, so what is read here is read straight.
 #[test]
 fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     let store = store_with(include_str!("fixtures/future_build.json"));
@@ -133,25 +138,35 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
         "a greater config_version is not an error — the tolerant load proceeds",
     );
 
-    // The known half applied.
+    // The known half applied — out of the radar slot, which is where a pane's
+    // selection lives. The file's top-level site is a DIFFERENT one on
+    // purpose: reading "KTLX" here can only have come from the slot.
     let pane = gui.pane(0).expect("pane 0");
-    assert_eq!(pane.site, "KTLX");
+    assert_eq!(gui.radar.config.site, "KGRR", "premise: the globals differ");
+    assert_eq!(pane.site(), "KTLX", "the radar slot's site is the pane's");
     assert_eq!(
-        pane.selected_product,
+        pane.selected_product(),
         RadarProduct::Reflectivity,
         "the unknown product falls back to the default, as ever",
     );
+    assert_eq!(pane.selected_elevation(), 0.5, "the slot's tilt applied");
     assert_eq!(
-        pane.enabled_overlays.get(&known::RADAR),
-        Some(&true),
-        "the known overlay keys beside the unknown one still applied",
+        pane.slot(&known::RADAR).map(|slot| slot.enabled),
+        Some(true),
+        "the radar slot's own enabled flag applied",
     );
-    let order = &pane.draw_order;
+    let mystery = rustdar_source::id::LayerId::new("FutureSatellite");
+    assert_eq!(
+        pane.slot(&mystery).map(|slot| slot.enabled),
+        Some(true),
+        "the unknown layer kept its slot and its flag",
+    );
+    let order = pane.draw_order_vec();
     let radar = order.iter().position(|k| *k == known::RADAR);
     let alerts = order.iter().position(|k| *k == known::NWS_ALERTS);
     assert!(
         radar < alerts,
-        "the known draw-order names keep their saved relative order",
+        "the known slot ids keep their saved relative order",
     );
 
     // The downgrade-safe round trip: the save carries every unknown.
@@ -171,22 +186,36 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
         v["panes"][0]["particle_engine"], "on",
         "an unknown pane-level field survives to the file",
     );
-    assert!(
-        v["panes"][0]["draw_order"]
-            .as_array()
-            .expect("draw_order is a list")
+    let slots = v["panes"][0]["layer_slots"]
+        .as_array()
+        .expect("layer_slots is a list");
+    let slot = |id: &str| {
+        slots
             .iter()
-            .any(|e| e == "FutureSatellite"),
-        "an unknown overlay kind survives in the draw order",
+            .find(|entry| entry.get("id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap_or_else(|| panic!("{id} missing from the saved slot list"))
+    };
+    assert_eq!(
+        slot("FutureSatellite")["enabled"],
+        serde_json::json!(true),
+        "an unknown layer survives with its flag",
     );
     assert_eq!(
-        v["panes"][0]["enabled_overlays"]["FutureSatellite"], true,
-        "an unknown overlay kind survives in the enabled map",
-    );
-    assert_eq!(
-        v["panes"][0]["overlay_configs"]["FutureSatellite"],
+        slot("FutureSatellite")["config"],
         serde_json::json!({ "band": "infrared" }),
-        "an unknown overlay kind survives in the config map",
+        "an unknown layer survives with its config",
+    );
+    assert_eq!(
+        slot("Radar")["config"]["beam_hologram"],
+        serde_json::json!(true),
+        "a member of the radar slot this build cannot name survives beside \
+         the four it can — the slot's config is carried, not rebuilt",
+    );
+    assert!(
+        slots
+            .iter()
+            .any(|entry| entry == &serde_json::json!("a slot shape this build cannot read")),
+        "a slot-list entry that is not a slot at all survives verbatim: {slots:?}",
     );
     assert_eq!(
         v["overlay_states"]["FutureSatellite"],
@@ -216,7 +245,7 @@ fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
     );
 
     let p0 = gui.pane(0).expect("pane 0");
-    assert_eq!(p0.site, "KTLX");
+    assert_eq!(p0.site(), "KTLX");
     assert_eq!(p0.time_step_secs, 300, "pane 0 arrived intact");
 
     let p1 = gui.pane(1).expect("pane 1");
@@ -225,17 +254,19 @@ fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
         "the corrupt pane is at defaults, not at its unreadable values",
     );
     assert_eq!(
-        p1.site, "KTLX",
+        p1.site(),
+        "KTLX",
         "the corrupt pane's site is the global fallback, as a default pane's is",
     );
 
     let p2 = gui.pane(2).expect("pane 2");
     assert_eq!(
-        p2.site, "KDMX",
+        p2.site(),
+        "KDMX",
         "the pane AFTER the corrupt one kept its own position — salvage is \
          defaults-in-place, never removal",
     );
-    assert_eq!(p2.selected_product, RadarProduct::Velocity);
+    assert_eq!(p2.selected_product(), RadarProduct::Velocity);
     assert_eq!(p2.time_step_secs, 900);
 }
 
@@ -255,7 +286,7 @@ fn a_corrupt_top_level_field_resets_to_its_default_and_the_rest_loads() {
         serde_json::to_value(rustdar_units::UserPreferences::default()).expect("serializable"),
         "the unreadable preferences reset to defaults",
     );
-    assert_eq!(gui.pane(0).expect("pane 0").site, "KDMX");
+    assert_eq!(gui.pane(0).expect("pane 0").site(), "KDMX");
     assert_eq!(gui.loop_lookback_secs, 7200, "the rest of the file arrived");
 }
 
@@ -341,13 +372,14 @@ fn a_v1_gps_config_splits_into_serial_config_and_a_root_heading() {
     );
 }
 
-/// **The M8b unknown-id pin, both directions.** A `draw_order` naming a layer
-/// no handler serves — "MysteryLayer" — survives load→save→reload **in
-/// place**, and is skipped at draw rather than resolved.
+/// **The M8b unknown-id pin, both directions, now through the shape
+/// migration.** A v2 `draw_order` naming a layer no handler serves —
+/// "MysteryLayer" — survives load→migrate→save→reload **in place**, and is
+/// skipped at draw rather than resolved.
 #[test]
 fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
     let store = store_with(
-        r#"{"config_version":3,"pane_count":1,"site":"KTLX",
+        r#"{"config_version":2,"pane_count":1,"site":"KTLX",
             "panes":[{"site":"KTLX",
                       "draw_order":["Radar","MysteryLayer","NwsAlerts"]}]}"#,
     );
@@ -356,9 +388,9 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
 
     let mystery = rustdar_source::id::LayerId::new("MysteryLayer");
 
-    // Direction 1 (load): retained in the live list, in place — after Radar,
+    // Direction 1 (load): retained in the live stack, in place — after Radar,
     // before NwsAlerts, exactly where the file put it.
-    let order = &gui.pane(0).expect("pane 0").draw_order;
+    let order = gui.pane(0).expect("pane 0").draw_order_vec();
     let pos = |id: &rustdar_source::id::LayerId| {
         order
             .iter()
@@ -383,20 +415,20 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
         "all twelve registered layers plus the unknown id: {order:?}",
     );
 
-    // Direction 2 (save): written back in place.
+    // Direction 2 (save): written back in place, as a slot.
     let saved = gui.ui_config_json().expect("serializable");
     let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
-    let written: Vec<&str> = v["panes"][0]["draw_order"]
+    let written: Vec<&str> = v["panes"][0]["layer_slots"]
         .as_array()
-        .expect("draw_order is a list")
+        .expect("layer_slots is a list")
         .iter()
-        .map(|e| e.as_str().expect("every entry is a string"))
+        .map(|e| e["id"].as_str().expect("every slot names an id"))
         .collect();
     let wpos = |name: &str| {
         written
             .iter()
             .position(|e| *e == name)
-            .unwrap_or_else(|| panic!("{name} missing from the saved draw order"))
+            .unwrap_or_else(|| panic!("{name} missing from the saved slot list"))
     };
     assert!(
         wpos("Radar") < wpos("MysteryLayer") && wpos("MysteryLayer") < wpos("NwsAlerts"),
@@ -409,26 +441,27 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
     let mut second = Gui::new();
     assert!(second.load_ui_config(&second_store), "the save must reload");
     assert_eq!(
-        second.pane(0).expect("pane 0").draw_order,
-        gui.pane(0).expect("pane 0").draw_order,
+        second.pane(0).expect("pane 0").draw_order_vec(),
+        gui.pane(0).expect("pane 0").draw_order_vec(),
         "the second session's live order must equal the first's — the \
          unknown id neither moves nor multiplies across sessions",
     );
     let resaved = second.ui_config_json().expect("serializable");
     let rv: serde_json::Value = serde_json::from_str(&resaved).expect("valid JSON");
     assert_eq!(
-        rv["panes"][0]["draw_order"], v["panes"][0]["draw_order"],
-        "save→reload→save is a fixpoint for a list carrying an unknown id",
+        rv["panes"][0]["layer_slots"], v["panes"][0]["layer_slots"],
+        "save→reload→save is a fixpoint for a stack carrying an unknown id",
     );
 }
 
 /// The swap half of the unknown-id doctrine: an unregistered id's saved
-/// `enabled_overlays`/`overlay_configs` entries survive the registry-state
-/// overwrite every layer toggle performs (`PaneState::adopt_handler_state`).
+/// enabled flag and config survive the registry-state overwrite every layer
+/// toggle performs (`PaneState::adopt_handler_state`) — and survive the shape
+/// migration that folded the three v2 maps into one slot.
 #[test]
 fn an_unknown_ids_saved_state_survives_a_layer_toggle() {
     let store = store_with(
-        r#"{"config_version":3,"pane_count":1,"site":"KTLX",
+        r#"{"config_version":2,"pane_count":1,"site":"KTLX",
             "panes":[{"site":"KTLX",
                       "draw_order":["Radar","MysteryLayer"],
                       "enabled_overlays":{"Radar":true,"MysteryLayer":true},
@@ -437,66 +470,68 @@ fn an_unknown_ids_saved_state_survives_a_layer_toggle() {
     let mut gui = Gui::new();
     assert!(gui.load_ui_config(&store), "the fixture must load");
     let mystery = rustdar_source::id::LayerId::new("MysteryLayer");
-    assert_eq!(
-        gui.pane(0)
+    let slot = |g: &Gui, i| {
+        g.pane(i)
             .expect("pane 0")
-            .overlay_configs
-            .get(&mystery)
-            .cloned(),
-        Some(serde_json::json!({"band": "infrared"})),
-        "premise: the unknown entry landed in the pane map",
+            .slot(&mystery)
+            .cloned()
+            .map(|slot| (slot.enabled, slot.config))
+    };
+    assert_eq!(
+        slot(&gui, 0),
+        Some((true, serde_json::json!({"band": "infrared"}))),
+        "premise: the three v2 entries folded into one slot for the unknown id",
     );
 
     // The toggle every eye click routes through — the swap overwrite.
     gui.set_overlay_on_pane_for_test(0, &known::CITY_LABELS, true);
 
-    let pane = gui.pane(0).expect("pane 0");
     assert_eq!(
-        pane.overlay_configs.get(&mystery).cloned(),
-        Some(serde_json::json!({"band": "infrared"})),
+        slot(&gui, 0),
+        Some((true, serde_json::json!({"band": "infrared"}))),
         "a layer toggle's registry-state overwrite dropped an unknown id's \
-         saved config",
-    );
-    assert_eq!(
-        pane.enabled_overlays.get(&mystery).copied(),
-        Some(true),
-        "a layer toggle's registry-state overwrite dropped an unknown id's \
-         enabled flag",
+         saved slot",
     );
     let saved = gui.ui_config_json().expect("serializable");
     let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    let written = v["panes"][0]["layer_slots"]
+        .as_array()
+        .expect("layer_slots is a list")
+        .iter()
+        .find(|entry| entry["id"] == "MysteryLayer")
+        .cloned()
+        .expect("the unknown id keeps a slot in the save");
     assert_eq!(
-        v["panes"][0]["overlay_configs"]["MysteryLayer"],
+        written["config"],
         serde_json::json!({"band": "infrared"}),
-        "the save after the toggle must still carry the unknown id's state",
+        "the save after the toggle must still carry the unknown id's config",
+    );
+    assert_eq!(
+        written["enabled"],
+        serde_json::json!(true),
+        "the save after the toggle must still carry the unknown id's flag",
     );
 
     // The reload leg (WO-E6a). The pin above stopped at the save, so the
     // corpus proved the unknown id's *position* survives a round trip (the
     // draw-order test) and its *state* survives a save — but never the whole
-    // triple through a second session. WO-E6b folds all three into one
-    // `LayerSlot` per id, and that transform can lose the enabled flag or the
-    // config while leaving the order intact, so the reload is the direction
-    // that has to be nailed down before the shape moves.
+    // triple through a second session. WO-E6b folded all three into one
+    // `LayerSlot`, and that transform can lose the enabled flag or the config
+    // while leaving the order intact, so the reload is the direction that had
+    // to be nailed down before the shape moved.
     let mut second = Gui::new();
     assert!(
         second.load_ui_config(&store_with(&saved)),
         "the save must reload",
     );
-    let reloaded = second.pane(0).expect("pane 0");
     assert_eq!(
-        reloaded.overlay_configs.get(&mystery).cloned(),
-        Some(serde_json::json!({"band": "infrared"})),
-        "the second session lost the unknown id's config",
+        slot(&second, 0),
+        Some((true, serde_json::json!({"band": "infrared"}))),
+        "the second session lost the unknown id's slot",
     );
     assert_eq!(
-        reloaded.enabled_overlays.get(&mystery).copied(),
-        Some(true),
-        "the second session lost the unknown id's enabled flag",
-    );
-    assert_eq!(
-        reloaded.draw_order,
-        gui.pane(0).expect("pane 0").draw_order,
+        second.pane(0).expect("pane 0").draw_order_vec(),
+        gui.pane(0).expect("pane 0").draw_order_vec(),
         "the second session's draw order must equal the first's",
     );
     let resaved = second.ui_config_json().expect("serializable");
@@ -575,4 +610,379 @@ fn a_global_live_chunks_off_reaches_the_gui_and_returns_on_the_save() {
         v1, v2,
         "save-load-save moved the file: reopening the app would not be 1:1"
     );
+}
+
+/// **The v2 → v3 shape migration, at `Value` level** — the campaign's one
+/// structural config migration, proven where it happens rather than through
+/// the typed load that would hide it.
+///
+/// Three parallel per-pane maps become one ordered list of slots; the pane's
+/// flat radar selection moves into the radar slot's config; the one global
+/// `live_chunks` fans out to every pane while staying at the root for the
+/// settings UI and for an older build; and everything the step does not
+/// consume is left exactly where it was.
+#[test]
+fn the_shape_migration_folds_three_maps_into_slots_and_fans_the_global_out() {
+    let mut tree: serde_json::Value = serde_json::from_str(
+        r#"{"config_version":2,"live_chunks":false,"site":"KTLX",
+            "panes":[{"site":"KOUN","selected_product":"Velocity",
+                      "selected_elevation":0.9,"time_step_secs":300,
+                      "draw_order":["Radar","MysteryLayer",42,"NwsAlerts"],
+                      "enabled_overlays":{"Radar":true,"NwsAlerts":false,
+                                          "ZebraLayer":true},
+                      "overlay_configs":{"MysteryLayer":{"band":"infrared"},
+                                         "AardvarkLayer":{"n":1}}},
+                     {"site":"KDMX"}]}"#,
+    )
+    .expect("the fixture is JSON");
+    super::migrate::migrate_to_current(&mut tree);
+
+    let pane = &tree["panes"][0];
+    for gone in [
+        "draw_order",
+        "enabled_overlays",
+        "overlay_configs",
+        "site",
+        "selected_product",
+        "selected_elevation",
+    ] {
+        assert!(
+            pane.get(gone).is_none(),
+            "{gone} was consumed by the transform and must not survive beside \
+             the slot it moved into",
+        );
+    }
+    assert_eq!(
+        pane["time_step_secs"], 300,
+        "a pane field the step does not consume is left exactly alone",
+    );
+
+    let slots = pane["layer_slots"]
+        .as_array()
+        .expect("the pane carries a slot list");
+    let ids: Vec<&serde_json::Value> = slots.iter().map(|s| &s["id"]).collect();
+    assert_eq!(
+        ids,
+        vec![
+            &serde_json::json!("Radar"),
+            &serde_json::json!("MysteryLayer"),
+            &serde_json::json!("NwsAlerts"),
+            &serde_json::json!("AardvarkLayer"),
+            &serde_json::json!("ZebraLayer"),
+            &serde_json::json!(null),
+        ],
+        "the list order is the draw order the file gave, then the ids only \
+         the maps named, sorted so the same file always migrates the same \
+         way — and the non-string element rides along at the end: {slots:?}",
+    );
+    let slot = |id: &str| {
+        slots
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("{id} has no slot"))
+    };
+    assert_eq!(slot("Radar")["enabled"], serde_json::json!(true));
+    assert_eq!(slot("NwsAlerts")["enabled"], serde_json::json!(false));
+    assert!(
+        slot("MysteryLayer").get("enabled").is_none(),
+        "a layer the maps said nothing about says nothing here either — the \
+         load asks the handler, exactly as a missing map entry always did",
+    );
+    assert_eq!(
+        slot("MysteryLayer")["config"],
+        serde_json::json!({"band": "infrared"}),
+        "an unknown id's config rides the shape transform verbatim",
+    );
+    assert_eq!(
+        slot("ZebraLayer")["enabled"],
+        serde_json::json!(true),
+        "an id only the enabled map named still gets its slot",
+    );
+    assert!(
+        slots.iter().any(|s| s == &serde_json::json!(42)),
+        "a draw_order element that is not a string at all survives verbatim",
+    );
+
+    // The radar slot: the pane's selection, moved, plus the fan-out.
+    assert_eq!(
+        slot("Radar")["config"],
+        serde_json::json!({
+            "site": "KOUN",
+            "product": "Velocity",
+            "elevation": 0.9,
+            "live_chunks": false
+        }),
+        "the radar slot is the pane's own selection plus the global's value",
+    );
+    assert_eq!(
+        tree["panes"][1]["layer_slots"][0],
+        serde_json::json!({
+            "id": "Radar",
+            "config": { "site": "KDMX", "live_chunks": false }
+        }),
+        "a pane that listed no layers at all still gets its radar slot, and \
+         it too takes the fan-out — one pane taking it and the other keeping \
+         a default is the divergence this step must not introduce",
+    );
+    assert_eq!(
+        tree["live_chunks"],
+        serde_json::json!(false),
+        "the global stays at the root: the settings UI still writes it and an \
+         older build still reads it",
+    );
+    // The walk does not stamp `config_version` — the save does, from
+    // [`CONFIG_VERSION`] — so this step has to be safe to run twice on its
+    // own output, and the pane it already rewrote is how it knows.
+    let once = tree.clone();
+    super::migrate::migrate_to_current(&mut tree);
+    assert_eq!(
+        tree, once,
+        "the shape step is not idempotent, and the tree it produces still \
+         reads as the version it came from",
+    );
+}
+
+/// A file that **already carries slots** keeps them. This is the shape an
+/// older build hands back after a session: it cannot name `layer_slots`, so
+/// it carries the list through untouched while writing its own version and
+/// its own empty flat fields. Rebuilding the stack from those would throw the
+/// user's real layout away on the way back up.
+#[test]
+fn a_pane_that_already_carries_slots_keeps_them_and_sheds_the_flat_fields() {
+    let mut tree: serde_json::Value = serde_json::from_str(
+        r#"{"config_version":2,"live_chunks":true,
+            "panes":[{"site":"","selected_product":"Reflectivity",
+                      "draw_order":[],"enabled_overlays":{},
+                      "layer_slots":[{"id":"Radar","enabled":true,
+                                      "config":{"site":"KOUN",
+                                                "product":"Velocity",
+                                                "elevation":0.9,
+                                                "live_chunks":false}}]}]}"#,
+    )
+    .expect("the fixture is JSON");
+    super::migrate::migrate_to_current(&mut tree);
+    assert_eq!(
+        tree["panes"][0]["layer_slots"],
+        serde_json::json!([{
+            "id": "Radar", "enabled": true,
+            "config": {"site": "KOUN", "product": "Velocity",
+                       "elevation": 0.9, "live_chunks": false}
+        }]),
+        "the slots the file already carried are the truth; the older build's \
+         empty flat fields are its stale copy",
+    );
+    assert!(
+        tree["panes"][0].get("draw_order").is_none() && tree["panes"][0].get("site").is_none(),
+        "the stale copy is shed either way, or the next round trip would \
+         resurrect it",
+    );
+}
+
+/// **The bytes before the shape moved are kept, once.** The v2 → v3 rewrite
+/// is not reversible by a downgrade, so the file as it stood is copied aside
+/// before the first v3 write and never written again.
+#[test]
+fn the_first_v3_write_keeps_the_v2_bytes_and_never_writes_them_twice() {
+    let original = include_str!("fixtures/current_full.json");
+    let store = store_with(original);
+    assert!(
+        store.load(crate::UI_CONFIG_BACKUP_KEY).is_none(),
+        "premise: nothing has been kept aside yet",
+    );
+
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the v2 file loads");
+    assert_eq!(
+        store.load(crate::UI_CONFIG_BACKUP_KEY).as_deref(),
+        Some(original),
+        "the pre-slot bytes were not kept, byte for byte",
+    );
+
+    // A second session, and a save: the copy must not be overwritten with
+    // something this build has already rewritten.
+    gui.save_ui_config(&store);
+    assert_ne!(
+        store.load(crate::UI_CONFIG_KEY).as_deref(),
+        Some(original),
+        "premise: the save really did rewrite the live file",
+    );
+    assert_eq!(
+        store.load(crate::UI_CONFIG_BACKUP_KEY).as_deref(),
+        Some(original),
+        "the copy is one-time — a second write would replace the only copy \
+         of the shape that cannot be rebuilt",
+    );
+
+    // **The leg the guard actually exists for**, and the only one that can
+    // fail: a second pre-slot file turning up at the live key later. That is
+    // the downgrade path — an older build rewrites the file in its own shape,
+    // carrying the slot list it cannot name as baggage — and the version
+    // check alone does NOT stop it, because that file reads as v2 too.
+    // Without the one-time guard the user's real layout is replaced by the
+    // downgraded build's flattened copy of it, and the original is gone.
+    let downgraded = r#"{"config_version":2,"pane_count":1,"site":"KDMX",
+                         "panes":[{"site":"KDMX","layer_slots":[]}]}"#;
+    store
+        .store(crate::UI_CONFIG_KEY, downgraded)
+        .expect("the memory store accepts a write");
+    crate::back_up_pre_slot_config(&store);
+    assert_eq!(
+        store.load(crate::UI_CONFIG_BACKUP_KEY).as_deref(),
+        Some(original),
+        "a later pre-slot file overwrote the copy — the only bytes that could \
+         not be rebuilt were replaced by a build that had already lost them",
+    );
+
+    // A store that never held a pre-slot file gains no copy at all.
+    let v3_only = store_with(&Gui::new().ui_config_json().expect("a fresh Gui serializes"));
+    crate::back_up_pre_slot_config(&v3_only);
+    assert!(
+        v3_only.load(crate::UI_CONFIG_BACKUP_KEY).is_none(),
+        "there is nothing to preserve about a file already in the new shape",
+    );
+}
+
+/// The radar slot's config is the **pane's**, and a layer toggle must not
+/// touch it. Every other slot's config is overwritten from the registry on
+/// every toggle (`adopt_handler_state`), and the radar slot would lose this
+/// pane's site, product, tilt and live-chunk switch with it.
+#[test]
+fn a_layer_toggle_leaves_the_radar_slots_own_members_alone() {
+    let store = store_with(include_str!("fixtures/current_full.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+
+    let before = gui
+        .pane(1)
+        .expect("pane 1")
+        .slot(&known::RADAR)
+        .expect("every pane has a radar slot")
+        .config
+        .clone();
+    assert_eq!(
+        before,
+        serde_json::json!({
+            "site": "KOUN", "product": "Velocity",
+            "elevation": 0.9, "live_chunks": true
+        }),
+        "premise: the slot carries all four pane-owned members",
+    );
+
+    gui.set_overlay_on_pane_for_test(1, &known::CITY_LABELS, true);
+
+    let after = gui
+        .pane(1)
+        .expect("pane 1")
+        .slot(&known::RADAR)
+        .expect("the radar slot survived the toggle")
+        .config
+        .clone();
+    for key in crate::pane::RADAR_SLOT_PANE_KEYS {
+        assert_eq!(
+            after.get(key),
+            before.get(key),
+            "a layer toggle overwrote the radar slot's {key:?} with a handler \
+             state, and this pane's selection went with it: {after}",
+        );
+    }
+    assert!(
+        gui.pane(1)
+            .expect("pane 1")
+            .is_overlay_enabled(&known::CITY_LABELS),
+        "premise: the toggle really did run",
+    );
+}
+
+/// The pin under the two-owner arrangement above: the radar slot's config is
+/// split between the pane and the radar handler by **name**, so the two sets
+/// of names must stay disjoint. A handler member called `site` would be
+/// silently dropped on every swap and every save.
+#[test]
+fn the_radar_handler_and_the_pane_do_not_claim_the_same_slot_members() {
+    use rustdar_source::handler::SourceHandler;
+    let state = rustdar_radar::source::RadarSource::new().serialize_state();
+    let members: Vec<&String> = state
+        .as_object()
+        .expect("the radar handler saves an object")
+        .keys()
+        .collect();
+    assert!(
+        !members.is_empty(),
+        "premise: the radar handler saves something, or this check cannot fail",
+    );
+    for key in crate::pane::RADAR_SLOT_PANE_KEYS {
+        assert!(
+            !state.get(key).is_some(),
+            "the radar handler now saves {key:?}, which the PANE owns in that \
+             same slot ({members:?}) — one of the two loses its value on every \
+             `adopt_handler_state`; give the handler a different name or teach \
+             the split about it",
+        );
+    }
+}
+
+/// **The slot list may never be spelled `layers`.** That key is the v0
+/// per-pane toggle map, still read by the migration chain — an older build
+/// handed a list where it expects a map fails its whole pane and salvages it
+/// to defaults, which is the one downgrade outcome this shape move must not
+/// cause.
+#[test]
+fn the_slot_list_does_not_reuse_the_v0_toggle_maps_key() {
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store_with(include_str!("fixtures/current_full.json"))));
+    let saved = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    assert!(
+        v["panes"][0]["layer_slots"].is_array(),
+        "the slot list is written as a list",
+    );
+    assert!(
+        v["panes"][0]["layers"].is_object(),
+        "and `layers` is still the object an older build expects: {}",
+        v["panes"][0]["layers"],
+    );
+}
+
+/// The live-chunk switch **fans out to every pane's radar slot**. One switch
+/// has always meant every pane, and each pane carrying its own copy is only
+/// safe while the setter writes all of them.
+#[test]
+fn the_live_chunk_switch_reaches_every_panes_radar_slot() {
+    let store = store_with(include_str!("fixtures/live_chunks_off.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the two-pane fixture must load");
+    for i in 0..2 {
+        assert_eq!(
+            gui.pane(i).expect("both panes").radar_live_chunks(),
+            Some(false),
+            "pane {i} did not take the migration's fan-out of the global",
+        );
+    }
+
+    gui.set_live_chunks(true);
+    for i in 0..2 {
+        assert_eq!(
+            gui.pane(i).expect("both panes").radar_live_chunks(),
+            Some(true),
+            "pane {i} kept the old value — the setter moved the global only, \
+             and one toggle no longer means every pane",
+        );
+    }
+    assert!(gui.live_chunks_enabled(), "the active pane answers");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&gui.ui_config_json().expect("serializable")).expect("valid JSON");
+    assert_eq!(v["live_chunks"], serde_json::json!(true));
+    for i in 0..2 {
+        assert_eq!(
+            v["panes"][i]["layer_slots"]
+                .as_array()
+                .expect("a slot list")
+                .iter()
+                .find(|s| s["id"] == "Radar")
+                .expect("a radar slot")["config"]["live_chunks"],
+            serde_json::json!(true),
+            "pane {i}'s slot did not reach the file",
+        );
+    }
 }

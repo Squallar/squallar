@@ -16,8 +16,7 @@ fn only_the_radar_poll(gui: &mut Gui) {
     for kind in crate::sources::default_draw_order() {
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")
-            .enabled_overlays
-            .insert(kind.clone(), false);
+            .set_overlay_enabled(kind.clone(), false);
     }
 }
 
@@ -133,14 +132,12 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
 
     gui.pane_mut(0)
         .unwrap()
-        .enabled_overlays
-        .insert(kind.clone(), false);
+        .set_overlay_enabled(kind.clone(), false);
     assert_eq!(gui.overlay_poll_delay(&kind), None);
 
     gui.pane_mut(0)
         .unwrap()
-        .enabled_overlays
-        .insert(kind.clone(), true);
+        .set_overlay_enabled(kind.clone(), true);
     assert_eq!(
         gui.overlay_poll_delay(&kind),
         Some(std::time::Duration::ZERO),

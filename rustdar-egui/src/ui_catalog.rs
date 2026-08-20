@@ -589,8 +589,8 @@ impl super::Gui {
         // Through `apply_control` rather than a field write, so the handler's
         // own rules hold: a cached parameter re-renders without a fetch, an
         // uncached one asks for one.
-        if !pane.overlay_configs.is_empty() {
-            self.overlays.load_pane_configs(&pane.overlay_configs);
+        if pane.has_slot_configs() {
+            self.overlays.load_pane_configs(&pane.slot_config_map());
         }
         let update = ControlUpdate {
             id: "parameter",

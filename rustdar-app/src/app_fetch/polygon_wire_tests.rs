@@ -145,10 +145,11 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
         kind: id.clone(),
         data,
     });
-    let configs = app.gui.overlays.save_pane_configs();
+    let registry_snapshot = std::mem::take(&mut app.gui.overlays);
     if let Some(pane) = app.gui.pane_mut(0) {
-        pane.overlay_configs = configs;
+        pane.adopt_handler_state(&registry_snapshot);
     }
+    app.gui.overlays = registry_snapshot;
 }
 
 fn in_flight(app: &mut crate::app::App, id: &LayerId) -> bool {

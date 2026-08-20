@@ -96,8 +96,8 @@ pub(super) fn render_pane_map_content(
     zoom: f64,
     ctx: &mut PaneRenderCtx<'_>,
 ) {
-    if !ctx.pane.overlay_configs.is_empty() {
-        ctx.overlays.load_pane_configs(&ctx.pane.overlay_configs);
+    if ctx.pane.has_slot_configs() {
+        ctx.overlays.load_pane_configs(&ctx.pane.slot_config_map());
     }
 
     // Cleared every frame and re-set by the radar arm below. That arm is the
@@ -133,7 +133,7 @@ pub(super) fn render_pane_map_content(
         let mut pending_notice: Option<(RadarProduct, f32)> = None;
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
 
-        let draw_order: Vec<LayerId> = ctx.pane.draw_order.clone();
+        let draw_order: Vec<LayerId> = ctx.pane.draw_order_vec();
         for id in &draw_order {
             if !ctx.pane.is_overlay_enabled(id) {
                 continue;
@@ -939,7 +939,7 @@ pub(super) fn color_scale_gutter(
     let ticks = memoized_ticks(measure.ctx(), pane, prefs);
     let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
     let mut offset = 0.0;
-    for id in &pane.draw_order {
+    for id in pane.draw_order() {
         if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) {
             continue;
         }
@@ -1672,7 +1672,7 @@ fn render_overlay_color_scales(
     // (horizontal) the radar scale.
     let mut bar_offset = 0;
 
-    for id in &pane.draw_order {
+    for id in pane.draw_order() {
         if !pane.is_overlay_enabled(id) || *id == known::COLOR_SCALE {
             continue;
         }

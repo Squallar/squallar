@@ -3519,7 +3519,7 @@ fn touch_drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
 #[test]
 fn a_touch_drag_on_the_grip_lands_the_reorder() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    let before = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+    let before = h.gui_mut().pane(0).expect("pane 0").draw_order_vec();
     let n = before.len();
     assert!(n >= 2, "precondition: a real layer list");
     let rows = h.stack().rows;
@@ -3531,7 +3531,7 @@ fn a_touch_drag_on_the_grip_lands_the_reorder() {
     let mut expected = before.clone();
     expected.swap(n - 1, n - 2);
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        h.gui_mut().pane(0).expect("pane 0").draw_order_vec(),
         expected,
         "the touch release must land the reorder - a resolver that reads \
          latest_pos loses the landing position to the release batch's \
@@ -3549,7 +3549,7 @@ fn a_touch_drag_on_the_grip_lands_the_reorder() {
 #[test]
 fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    let before = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+    let before = h.gui_mut().pane(0).expect("pane 0").draw_order_vec();
     let n = before.len();
     assert!(n >= 3, "precondition: a real layer list");
     let rows = h.stack().rows;
@@ -3561,7 +3561,7 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let mut expected = before.clone();
     expected.swap(n - 1, n - 2);
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        h.gui_mut().pane(0).expect("pane 0").draw_order_vec(),
         expected,
         "dropping the second row above the top one must swap the draw \
          order's last two entries"
@@ -3576,7 +3576,7 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let below_second = egui::pos2(rows[1].rect.center().x, rows[1].rect.bottom() - 2.0);
     drag_stack_row(&mut h, &second, below_second);
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        h.gui_mut().pane(0).expect("pane 0").draw_order_vec(),
         before,
         "dragging the promoted row back down must put the order back"
     );
@@ -3588,19 +3588,19 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     };
     drag_stack_row(&mut h, &top, below_last);
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").draw_order[0],
+        h.gui_mut().pane(0).expect("pane 0").draw_order_vec()[0],
         top,
         "a drop below the last row must make the layer the first drawn"
     );
 
-    let reordered = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+    let reordered = h.gui_mut().pane(0).expect("pane 0").draw_order_vec();
     assert_ne!(reordered, before, "precondition: a real reorder to persist");
     let store = rustdar_kv::MemoryKvStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut fresh = crate::Gui::new();
     assert!(fresh.load_ui_config(&store), "the saved config must load");
     assert_eq!(
-        fresh.pane(0).expect("pane 0").draw_order,
+        fresh.pane(0).expect("pane 0").draw_order_vec(),
         reordered,
         "the reorder did not survive the ui_config round trip"
     );
@@ -3654,7 +3654,7 @@ fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
     h.warm_up();
 
     let expected: Vec<LayerId> = {
-        let order = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+        let order = h.gui_mut().pane(0).expect("pane 0").draw_order_vec();
         order
             .into_iter()
             .filter(|kind| h.overlay_enabled_on(0, kind))

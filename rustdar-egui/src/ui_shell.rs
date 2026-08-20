@@ -153,8 +153,8 @@ impl super::Gui {
         // frame-end reload in `Gui::ui` usually guarantees it already, but an
         // active-pane switch earlier this same frame (the top bar's segments)
         // would leave the previous pane's configs loaded.
-        if !pane.overlay_configs.is_empty() {
-            self.overlays.load_pane_configs(&pane.overlay_configs);
+        if pane.has_slot_configs() {
+            self.overlays.load_pane_configs(&pane.slot_config_map());
         }
 
         let statuses: Vec<(LayerId, Option<String>)> = if stack_slide > 0.0 {
@@ -226,8 +226,7 @@ impl super::Gui {
         if !pane.draws_map_layers() {
             return Vec::new();
         }
-        pane.draw_order
-            .iter()
+        pane.draw_order()
             .map(|kind| {
                 let line = if *kind == known::RADAR {
                     radar_row_status(pane)

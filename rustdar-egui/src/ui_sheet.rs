@@ -695,8 +695,8 @@ impl super::Gui {
         // opens on the wider widths — see `ui_shell.rs` for the discipline.
         if let Some(slot) = body_slot {
             let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
-            if !pane.overlay_configs.is_empty() {
-                self.overlays.load_pane_configs(&pane.overlay_configs);
+            if pane.has_slot_configs() {
+                self.overlays.load_pane_configs(&pane.slot_config_map());
             }
             let body_id = match page {
                 SheetPage::Layers => {
