@@ -38,10 +38,13 @@ pub struct RadarImageData {
     pub lat: f64,
     pub lon: f64,
     /// The half-width this frame was projected at, km — what the renderer
-    /// handed back, and the only statement of where these pixels are. The
-    /// texture is placed between the corners
-    /// [`rustdar_radar::types::ImageBounds::from_radar_site`] builds from it,
-    /// and the range ring is drawn on it.
+    /// handed back. The range ring is drawn on it.
+    ///
+    /// It used to be "the only statement of where these pixels are", and the
+    /// draw derived the placement from it once per frame. [`Self::placed`] is
+    /// that statement now, derived from this at delivery; what is left here is
+    /// the *radius*, which the ring genuinely needs and which no rectangle can
+    /// give it back.
     ///
     /// The hover no longer reads it, and that sentence used to be here. A
     /// readout divided the pointer's position by the rectangle the raster was
@@ -50,6 +53,15 @@ pub struct RadarImageData {
     /// in `ui_map_pane` records the same retraction in its own doc; this one
     /// outlived it.
     pub max_range_km: f64,
+    /// Where these pixels sit on the ground, worked out **once**, by whoever
+    /// delivered the frame.
+    ///
+    /// Built from `(lat, lon, max_range_km)` through
+    /// [`rustdar_radar::types::ImageBounds::from_radar_site`] — still radar's
+    /// delivery-time constructor — and then carried. The draw used to rebuild
+    /// it on every frame of every animating pane; see
+    /// [`rustdar_geo::PlacedRaster`].
+    pub placed: rustdar_geo::PlacedRaster,
     /// The gates behind these pixels, and whatever is holding their numbers.
     ///
     /// A still pane's carries the render's own values. A loop frame's carries

@@ -438,6 +438,26 @@ impl From<ImageBounds> for rustdar_geo::GeoBounds {
     }
 }
 
+/// The same four edges, as the thing a delivery hands the display: where the
+/// raster goes, worked out once.
+///
+/// Every site that places a radar raster — the plan-view delivery, the
+/// resume-restore, the loop frame — spells it `bounds.into()` and nothing else,
+/// so "these pixels belong here" has one spelling on the way out of this crate.
+///
+/// The mercator pair is **re-derived** through
+/// [`rustdar_geo::PlacedRaster::of`] rather than copied out of
+/// `mercator_y_min`/`mercator_y_max`. Same function, same latitudes, same bits,
+/// and it costs two `ln(tan(..))` once per delivered frame. Copying would make
+/// this a second path by which a placement's mercator span can be *set*, and
+/// `ImageBounds`' fields are public: a struct literal with an inconsistent pair
+/// would propagate through here silently, where re-deriving cannot.
+impl From<ImageBounds> for rustdar_geo::PlacedRaster {
+    fn from(bounds: ImageBounds) -> Self {
+        rustdar_geo::PlacedRaster::of(bounds.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
     /// Where this volume's radar is, and how high.

@@ -755,6 +755,13 @@ impl OverlayHandler for GlmHandler {
         RenderMode::Texture
     }
 
+    /// `is_dark` rides into the described job (`GlmInput`) and decides the
+    /// flash outline and the alpha the age decay fades to, so a cached raster
+    /// is a raster in one theme.
+    fn theme_sensitive(&self) -> bool {
+        true
+    }
+
     fn is_enabled(&self) -> bool {
         self.enabled
     }

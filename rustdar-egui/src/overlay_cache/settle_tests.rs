@@ -71,7 +71,7 @@ fn data_at(ctx: &egui::Context, name: &str, render_zoom: f64) -> OverlayTextureD
             egui::ColorImage::filled([1, 1], egui::Color32::RED),
             egui::TextureOptions::NEAREST,
         ),
-        geo_bounds: covered(),
+        placed: rustdar_geo::PlacedRaster::of(covered()),
         data_generation: TOKEN,
         render_zoom: current_quantized_zoom(render_zoom),
         width: W,

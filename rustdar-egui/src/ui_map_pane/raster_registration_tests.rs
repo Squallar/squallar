@@ -233,3 +233,128 @@ fn a_latitude_linear_raster_would_have_been_wrong_by_kilometres() {
          If this is now small the negative control has stopped controlling."
     );
 }
+
+/// The placement carried on the frame puts the raster exactly where projecting
+/// its corners at draw time did.
+///
+/// # What moved, and why the parity has to be asserted rather than reasoned
+///
+/// The loop playback path used to open every frame with
+/// `ImageBounds::from_radar_site(img.lat, img.lon, img.max_range_km)` and
+/// project the two corners it returned. It now reads a
+/// [`rustdar_geo::PlacedRaster`] built at delivery and hands it to
+/// `overlay_cache::placed_rect`. Those are the same four edges through the same
+/// projector *if* the delivery built the placement from the same three numbers
+/// the draw used to — and "if" is the whole content of the change: nothing else
+/// in the tree would notice a raster placed from a stale `max_range_km` or from
+/// a site the frame is not of. It would look like a radar picture, in the wrong
+/// place, forever.
+///
+/// So this compares, over (bounds × zoom × viewport) triples, the rect the
+/// production path now produces against the corner projection **written out
+/// here**, longhand, as this file's other tests deliberately write out the
+/// projection they are checking.
+#[test]
+fn the_carried_placement_is_the_projected_corners() {
+    // Exactly zero would also pass — both sides run the same `f64` corner
+    // arithmetic and end in the same `f32` `Vec2` — but the assertion is
+    // written as a tolerance because what it is claiming is "these agree to
+    // within f32 rounding", and a bit-equality that quietly became true for
+    // some other reason would be a worse pin than a stated bar.
+    const TOL_POINTS: f32 = 1.0e-3;
+
+    let mut compared = 0usize;
+    let mut widest = 0.0f32;
+
+    for &(name, site_lat, site_lon) in SITES {
+        for extent_km in [88.8f64, 230.0, 460.0] {
+            let bounds = ImageBounds::from_radar_site(site_lat, site_lon, extent_km);
+            let placed: rustdar_geo::PlacedRaster = bounds.into();
+
+            // The carried mercator span is the bounds' own — the two are
+            // derived by the same function from the same latitudes, and this is
+            // the guard on that staying true.
+            assert_eq!(
+                placed.mercator_y,
+                (bounds.mercator_y_min, bounds.mercator_y_max),
+                "{name}: the placement's mercator span must be ImageBounds' own",
+            );
+
+            for &viewport in &[
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0)),
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(432.0, 936.0)),
+                egui::Rect::from_min_size(egui::pos2(120.0, 64.0), egui::vec2(800.0, 600.0)),
+            ] {
+                for &zoom in &[3.0f64, 7.0, 11.0] {
+                    let mut memory = walkers::MapMemory::default();
+                    memory.set_zoom(zoom).expect("a zoom walkers accepts");
+                    // Off the site as well as on it, so a rect that happened to
+                    // be centred is not the only case tested.
+                    for centre in [
+                        (site_lat, site_lon),
+                        (site_lat + 1.5, site_lon - 2.0),
+                        (site_lat - 3.0, site_lon + 4.0),
+                    ] {
+                        let projector = walkers::Projector::new(
+                            viewport,
+                            &memory,
+                            walkers::lat_lon(centre.0, centre.1),
+                        );
+
+                        // The spelling this land deleted, restated.
+                        let nw = projector
+                            .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
+                            .to_pos2();
+                        let se = projector
+                            .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
+                            .to_pos2();
+                        let was = egui::Rect::from_two_pos(nw, se);
+
+                        // The spelling that replaced it, reached through the
+                        // production function.
+                        let now = crate::overlay_cache::placed_rect(&projector, &placed);
+
+                        // The rect must be a rect: a degenerate one would make
+                        // every comparison below pass for free.
+                        assert!(
+                            was.width() > 1.0 && was.height() > 1.0,
+                            "{name} at {extent_km} km, zoom {zoom}: degenerate \
+                             reference rect {was:?} — this triple compares nothing",
+                        );
+
+                        for (label, a, b) in [
+                            ("left", was.left(), now.left()),
+                            ("right", was.right(), now.right()),
+                            ("top", was.top(), now.top()),
+                            ("bottom", was.bottom(), now.bottom()),
+                        ] {
+                            let off = (a - b).abs();
+                            widest = widest.max(off);
+                            assert!(
+                                off <= TOL_POINTS,
+                                "{name} at {extent_km} km, zoom {zoom}, viewport \
+                                 {viewport:?}, centre {centre:?}: {label} edge \
+                                 moved {off} points ({a} → {b})",
+                            );
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // The loop actually ran. 8 sites × 3 extents × 3 viewports × 3 zooms × 3
+    // centres = 648; stated as a floor so adding a site does not fail it.
+    assert!(
+        compared >= 648,
+        "only {compared} triples compared — the sampling collapsed",
+    );
+    // And the comparison is not comparing a value with itself through two
+    // aliases: it is stated here rather than asserted, because zero is the
+    // honest answer and asserting non-zero would be asserting rounding error.
+    assert!(
+        widest.is_finite(),
+        "the widest edge disagreement was {widest}, which is not a number",
+    );
+}

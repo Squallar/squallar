@@ -1351,7 +1351,7 @@ fn every_pane_draws_its_color_scale_on_the_same_edge() {
     );
 
     for (idx, pane) in panes.iter().enumerate() {
-        let (horizontal, vertical) = h.color_scale_strips(*pane);
+        let (horizontal, vertical) = h.color_scale_bars(*pane);
         assert!(
             horizontal > 0,
             "pane {idx}: expected a bottom-edge colour bar, painted none"
@@ -1400,7 +1400,7 @@ fn the_color_scale_axis_comes_from_the_panel_not_a_pane() {
     );
 
     for (idx, pane) in panes.iter().enumerate() {
-        let (horizontal, vertical) = h.color_scale_strips(*pane);
+        let (horizontal, vertical) = h.color_scale_bars(*pane);
         assert!(
             vertical > 0,
             "pane {idx}: the landscape *panel* decides, so the bar belongs \
@@ -1543,9 +1543,9 @@ fn fold_line_painted(h: &InputHarness) -> Option<String> {
 /// legend has.
 ///
 /// Written out rather than read off `pane_render`'s constants for the reason
-/// `color_scale_strips` writes out its own 20: a probe sized from the code under
+/// `color_scale_bars` writes out its own 20: a probe sized from the code under
 /// test moves with it, and would go on passing over a marker drawn to the bar's
-/// own width — the one width the strip classifier cannot tell from ramp.
+/// own width — the one width the bar classifier cannot tell from ramp.
 fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
     const MARKER_LENGTH: f32 = 26.0;
     let pane = h.pane_rects()[0];
@@ -1847,17 +1847,22 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
 /// 8h. **The annotation is drawn where nothing else is, and does not change
 ///     what the bar is made of.**
 ///
-///     Two claims that are one claim in practice. `color_scale_strips`
-///     classifies the legend by shape — 20 points across the bar, ≤4 along it —
-///     and every test that reads it would be counting fold markers as ramp if
-///     they were drawn to the bar's own width. `FOLD_TICK_OVERHANG` takes them
-///     to 26 points instead, out of that classifier's reach, and the whole
-///     annotation stays inside the pane it belongs to.
+///     Two claims that are one claim in practice. `color_scale_bars`
+///     classifies the legend by shape — 20 points across the bar, more than 40
+///     along it — and a test that read it would be counting fold markers as
+///     ramp if they were drawn to the bar's own width. `FOLD_TICK_OVERHANG`
+///     takes them to 26 points instead, out of that classifier's reach, and the
+///     whole annotation stays inside the pane it belongs to.
+///
+///     The markers are `rect_filled` and the ramp is now one `painter.image`,
+///     so the two live in different lists entirely — which makes the "does not
+///     change what the bar is made of" half weaker than it was, and it is left
+///     in place because the shape reasoning is what it was always resting on.
 #[test]
-fn the_fold_annotation_leaves_the_strip_counts_and_the_pane_alone() {
+fn the_fold_annotation_leaves_the_bar_and_the_pane_alone() {
     let plain = velocity_pane("KTLX", None);
     let pane = plain.pane_rects()[0];
-    let bare = plain.color_scale_strips(pane);
+    let bare = plain.color_scale_bars(pane);
     assert!(
         bare.1 > 0,
         "precondition: a landscape panel draws a right-edge bar, got {bare:?}",
@@ -1865,7 +1870,7 @@ fn the_fold_annotation_leaves_the_strip_counts_and_the_pane_alone() {
 
     let annotated = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     assert_eq!(
-        annotated.color_scale_strips(pane),
+        annotated.color_scale_bars(pane),
         bare,
         "the fold markers or the range-folded swatch are being counted as ramp",
     );
@@ -1903,7 +1908,7 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
     let portrait = egui::vec2(900.0, 1400.0);
     let plain = velocity_pane_on(portrait, "KTLX", None);
     let pane = plain.pane_rects()[0];
-    let bare = plain.color_scale_strips(pane);
+    let bare = plain.color_scale_bars(pane);
     assert!(
         bare.0 > 0,
         "precondition: a portrait panel draws a bottom-edge bar, got {bare:?}",
@@ -1911,7 +1916,7 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
 
     let h = velocity_pane_on(portrait, "KTLX", Some(DECLARED_NYQUIST_MS));
     assert_eq!(
-        h.color_scale_strips(pane),
+        h.color_scale_bars(pane),
         bare,
         "the fold markers or the range-folded swatch are being counted as ramp",
     );
@@ -1968,28 +1973,28 @@ fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
         "precondition: a 432\u{d7}936 window must be Compact and draw the phone \
          bottom bar — without it this test proves nothing; got {bar:?}",
     );
-    let strips = h.color_scale_strips(pane);
+    let bars = h.color_scale_bars(pane);
     assert!(
-        strips.0 > 0,
+        bars.0 > 0,
         "precondition: a portrait panel draws a bottom-edge colour bar, got \
-         {strips:?}",
+         {bars:?}",
     );
 
-    // The ramp itself: 20 points across, ≤4 along, the shape
-    // `color_scale_strips` counts by.
+    // The ramp itself: one textured quad 20 points across and longer than 40,
+    // the shape `color_scale_bars` counts by. It was a run of 2x20 strips until
+    // the ramp was baked into a texture, and this looked at those.
     let ramp: Vec<egui::Rect> = h
-        .painted_rects()
-        .iter()
-        .filter(|r| pane.contains(r.center()))
-        .filter(|r| (r.height() - 20.0).abs() < 0.5 && r.width() <= 4.0)
-        .copied()
+        .painted_images_in(pane)
+        .into_iter()
+        .map(|i| i.rect)
+        .filter(|r| (r.height() - 20.0).abs() < 0.5 && r.width() > 40.0)
         .collect();
     assert!(!ramp.is_empty(), "precondition: the ramp must be painted");
 
     for strip in &ramp {
         assert!(
             strip.bottom() <= bar.top() + 0.5,
-            "a ramp strip at {strip:?} runs under the bottom bar {bar:?}, where \
+            "the ramp at {strip:?} runs under the bottom bar {bar:?}, where \
              nothing on it can be read",
         );
     }
@@ -8605,12 +8610,30 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
     h.warm_up();
 
     let pane = h.pane_rects()[0];
-    let images = h.painted_images_in(pane);
+    // The colour bar is a textured quad too since its ramp was baked
+    // (`crate::legend_ramp`), so the raster is the one that is *not* a bar.
+    // Split by the classifier the bar tests use rather than by "the biggest",
+    // so this says which quad it is looking at rather than hoping.
+    let (bars_h, bars_v) = h.color_scale_bars(pane);
+    let images: Vec<_> = h
+        .painted_images_in(pane)
+        .into_iter()
+        .filter(|i| {
+            let (w, ht) = (i.rect.width(), i.rect.height());
+            !((ht - 20.0).abs() < 0.5 && w > 40.0 || (w - 20.0).abs() < 0.5 && ht > 40.0)
+        })
+        .collect();
+    assert_eq!(
+        bars_h + bars_v,
+        1,
+        "precondition: a section pane draws exactly one colour bar, so the \
+             filter above is removing a known quad rather than an unknown one",
+    );
     assert_eq!(
         images.len(),
         1,
-        "a section pane paints exactly one textured quad, its raster; found \
-             {images:?}"
+        "a section pane paints exactly one textured quad that is not its \
+             colour bar, its raster; found {images:?}"
     );
     let raster = images[0];
     assert!(
@@ -14643,7 +14666,7 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: &LayerId) {
                 // ever produced — and the one question it exists to answer, whether
                 // a freshly landed texture covers the pane that asked for it, could
                 // not be reached from here at all.
-                geo_bounds: plan.coverage(&geo_bounds),
+                placed: rustdar_geo::PlacedRaster::of(plan.coverage(&geo_bounds)),
                 data_generation: token,
                 render_zoom: zoom,
                 width: plan.width,

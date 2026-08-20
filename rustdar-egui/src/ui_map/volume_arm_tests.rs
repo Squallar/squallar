@@ -2275,14 +2275,15 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
          nothing; it painted {:?}",
         h.painted_text_strings_in(pane_rect),
     );
-    // The bar itself, not just its title: `color_scale_strips` counts the 2×20
-    // strips `render_color_scale` lays the ramp down as, along each axis. A
-    // legend reduced to its unit label would still satisfy the marks above.
-    let bar_as_a_map = h.color_scale_strips(pane_rect);
+    // The bar itself, not just its title: `color_scale_bars` counts the ramp
+    // quad `render_color_scale` lays down, classified by the axis it runs
+    // along. A legend reduced to its unit label would still satisfy the marks
+    // above.
+    let bar_as_a_map = h.color_scale_bars(pane_rect);
     assert!(
         bar_as_a_map.0 + bar_as_a_map.1 > 0,
-        "the map pane painted no colour-scale strips at all, so the counts \
-         below would agree at zero",
+        "the map pane painted no colour bar at all, so the counts below would \
+         agree at zero",
     );
 
     h.make_pane_volume(0);
@@ -2318,16 +2319,16 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
     }
 
     assert_eq!(
-        h.color_scale_strips(pane_rect),
+        h.color_scale_bars(pane_rect),
         bar_as_a_map,
         "the 3D pane's colour bar is not the plan view's: the same pane drew \
-         {bar_as_a_map:?} strips as a map",
+         {bar_as_a_map:?} as a map",
     );
     assert_eq!(
-        h.color_scale_strips(strip),
+        h.color_scale_bars(strip),
         (0, 0),
-        "colour-bar strips were painted into the strip, so the floor is \
-         carrying a legend",
+        "a colour bar was painted into the strip, so the floor is carrying a \
+         legend",
     );
 }
 

@@ -892,10 +892,49 @@ pub(crate) fn legend_scale_static(product: RadarProduct) -> &'static LegendScale
 /// Thresholds are in the same unit domain as `get_color_for_value()`.
 ///
 /// The allocating signature every caller has always had; the borrowed
-/// reshape is E5's. The clone is of [`legend_scale_static`]'s entry, so the
-/// answer is the built-once table's, byte for byte.
+/// reshape is [`get_legend_scale_ref`]. The clone is of
+/// [`legend_scale_static`]'s entry, so the answer is the built-once table's,
+/// byte for byte.
+///
+/// The remaining callers are `rustdar-radar`'s own, where the clone is made
+/// once per volume rather than once per frame. Every per-frame caller — the
+/// colour bar, its tick layout, the gutter reservation — reads the borrowed
+/// form, and `rustdar-egui` is grep-pinned to zero uses of this one.
 pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
     legend_scale_static(product).clone()
+}
+
+/// [`LegendScale`] without the allocation: the built-once table's own entry,
+/// borrowed.
+///
+/// Every field is the same value [`get_legend_scale`] answers with; the
+/// difference is the `Vec` clone, which the allocating form paid on every
+/// call. It was paid **per frame, several times per pane** — the bar painter,
+/// the tick list, and the gutter that has to reserve room for what the painter
+/// writes each asked independently — to copy a table that has not changed
+/// since process start.
+///
+/// `Copy`, because it is four words of description over a `'static` slice, and
+/// a caller that has to think about cloning a legend description is a caller
+/// that will cache one.
+#[derive(Clone, Copy, Debug)]
+pub struct LegendScaleRef {
+    /// Colour stops, sorted ascending by value.
+    pub thresholds: &'static [(f32, [u8; 3])],
+    pub is_gradient: bool,
+    pub min_value: f32,
+    pub max_value: f32,
+}
+
+/// The borrowed [`LegendScale`] for `product`. See [`LegendScaleRef`].
+pub fn get_legend_scale_ref(product: RadarProduct) -> LegendScaleRef {
+    let scale = legend_scale_static(product);
+    LegendScaleRef {
+        thresholds: &scale.thresholds,
+        is_gradient: scale.is_gradient,
+        min_value: scale.min_value,
+        max_value: scale.max_value,
+    }
 }
 
 #[cfg(test)]

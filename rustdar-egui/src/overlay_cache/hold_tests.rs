@@ -23,12 +23,12 @@ fn data(texture: egui::TextureHandle, max_lat: f64) -> OverlayTextureData {
         // Distinct per picture, because the bounds are half of what must not
         // land ahead of the pixels: a raster placed on the next sweep's ground
         // is a wrong answer and not a late one.
-        geo_bounds: GeoBounds {
+        placed: PlacedRaster::of(GeoBounds {
             min_lat: 34.0,
             max_lat,
             min_lon: -98.0,
             max_lon: -96.0,
-        },
+        }),
         data_generation: 0,
         render_zoom: 0,
         width: 1,
@@ -61,7 +61,7 @@ fn the_picture_on_screen_is_the_previous_one_until_the_next_is_whole() {
 
     let on_screen = cache.current().expect("the pane still has a picture");
     assert_eq!(
-        on_screen.geo_bounds.max_lat, 36.0,
+        on_screen.placed.geo.max_lat, 36.0,
         "the new raster's bounds landed while its pixels were still crossing",
     );
     assert!(cache.is_holding());
@@ -73,7 +73,7 @@ fn the_picture_on_screen_is_the_previous_one_until_the_next_is_whole() {
         .take_held_if_delivered(|asked| asked == id)
         .expect("a delivered raster is handed over");
     cache.show(held.data);
-    assert_eq!(cache.current().expect("swapped").geo_bounds.max_lat, 40.0);
+    assert_eq!(cache.current().expect("swapped").placed.geo.max_lat, 40.0);
     assert!(!cache.is_holding());
 }
 
@@ -114,7 +114,7 @@ fn a_newer_raster_supersedes_one_still_arriving() {
     let stale = superseded.id();
     assert!(cache.take_held_if_delivered(|id| id == stale).is_none());
     assert_eq!(
-        cache.current().expect("still the first").geo_bounds.max_lat,
+        cache.current().expect("still the first").placed.geo.max_lat,
         36.0,
     );
 
@@ -123,7 +123,7 @@ fn a_newer_raster_supersedes_one_still_arriving() {
         .take_held_if_delivered(|asked| asked == id)
         .expect("the newest raster is the one that lands");
     cache.show(held.data);
-    assert_eq!(cache.current().expect("swapped").geo_bounds.max_lat, 44.0);
+    assert_eq!(cache.current().expect("swapped").placed.geo.max_lat, 44.0);
 }
 
 /// A superseding hold gives the replaced picture's allocation back.
@@ -163,7 +163,7 @@ fn a_superseding_hold_releases_the_picture_it_replaces() {
 
     // And the picture on screen was never touched by any of it.
     assert_eq!(
-        cache.current().expect("still showing").geo_bounds.max_lat,
+        cache.current().expect("still showing").placed.geo.max_lat,
         36.0,
     );
 }
@@ -212,7 +212,8 @@ fn releasing_a_hold_drops_it_without_showing_it() {
         cache
             .current()
             .expect("releasing a hold is not clearing the pane")
-            .geo_bounds
+            .placed
+            .geo
             .max_lat,
         36.0,
     );
@@ -234,7 +235,7 @@ fn showing_a_picture_drops_a_hold_that_was_still_arriving() {
     assert!(!cache.is_holding());
     let id = arriving.id();
     assert!(cache.take_held_if_delivered(|asked| asked == id).is_none());
-    assert_eq!(cache.current().expect("shown").geo_bounds.max_lat, 36.0);
+    assert_eq!(cache.current().expect("shown").placed.geo.max_lat, 36.0);
 }
 
 /// An undelivered hold leaves the cache untouched, so the question can be asked
@@ -255,7 +256,7 @@ fn asking_about_a_hold_that_has_not_landed_changes_nothing() {
     for _ in 0..10 {
         assert!(cache.take_held_if_delivered(nothing).is_none());
         assert!(cache.is_holding());
-        assert_eq!(cache.current().expect("kept").geo_bounds.max_lat, 36.0);
+        assert_eq!(cache.current().expect("kept").placed.geo.max_lat, 36.0);
     }
 
     let id = arriving.id();

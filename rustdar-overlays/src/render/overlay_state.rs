@@ -473,6 +473,43 @@ pub struct ClickableItem<'a> {
     pub item: Arc<dyn OverlayItem>,
 }
 
+// ── Signed presentation ───────────────────────────────────────────────────
+
+/// Something a handler hands the UI, with a number that changes when it does.
+///
+/// The signature exists so a caller can decide **not to look**. Presentation
+/// hooks are asked once per pane per frame; their answers are built from state
+/// that changes at fetch rate, which is four to six orders of magnitude slower.
+/// A caller holding `signature` from last frame and seeing the same one this
+/// frame knows the whole answer is unchanged without reading a byte of it —
+/// which is what lets it keep a baked texture, a laid-out string list, or any
+/// other derived thing instead of rebuilding it.
+///
+/// # The contract, stated as a trait property
+///
+/// **Every present and future presentation hook on [`OverlayHandler`] returns
+/// `Signed<…>`.** Not "returns `Signed` where it seemed worth it": a hook that
+/// answers bare data is a hook whose callers have no way to skip it, and the
+/// only remedy then is for each caller to hash the answer — which means
+/// building the answer first, i.e. paying the cost the signature exists to
+/// avoid. The rule is what makes the skip available by default rather than by
+/// negotiation.
+///
+/// # What a signature must satisfy
+///
+/// Equal signature ⇒ equal `items`. The converse is not required: a handler
+/// may move its signature without changing the answer, and the caller merely
+/// rebuilds something identical. Handlers spell it as whatever already tracks
+/// their content — a fetch generation, a selection discriminant — mixed
+/// together; there is deliberately no derived-hash helper here, because the
+/// number that is *cheap* to compute is the handler's own state counter and
+/// hashing the payload would be the cost being avoided.
+pub struct Signed<T> {
+    /// Changes whenever `items` would.
+    pub signature: u64,
+    pub items: T,
+}
+
 // ── Overlay handler trait ─────────────────────────────────────────────────
 
 /// Adding an overlay means: implement this, register it in `create_handlers()`,
@@ -538,6 +575,38 @@ pub trait OverlayHandler: Send {
     /// [`data_generation`]: OverlayHandler::data_generation
     fn content_signature(&self) -> u64 {
         self.data_generation()
+    }
+
+    /// Whether this handler's **cached raster** would come out differently in
+    /// the other theme — the one declaration the cache token's theme term is
+    /// read from.
+    ///
+    /// `true` costs a re-rasterize on every theme flip, and buys correctness:
+    /// a handler that bakes `RasterizeContext::is_dark` into its pixels and
+    /// answers `false` keeps compositing the old theme's colours until its
+    /// content happens to change. `false` costs nothing and is right for every
+    /// handler whose pixels do not depend on the theme.
+    ///
+    /// # This is a caching property, not a rendering one
+    ///
+    /// The two sets are not the same, and reading this method as "does this
+    /// layer look different in dark mode" gets it wrong in one specific place.
+    /// A [`RenderMode::PerFramePoint`] layer — METAR is the one — reads the
+    /// theme *inside the frame it draws*
+    /// (`render::station_model::draw_station_model` picks its text colour off
+    /// `DrawPointContext::is_dark`) and holds no cached raster and no cache
+    /// token at all. There is nothing for a flip to invalidate: the next frame
+    /// already draws in the new theme. So METAR answers `false` — not because
+    /// its appearance is theme-independent (it plainly is not), but because
+    /// its *cache* is, there being none. Declaring it `true` would be inert,
+    /// and this note is here so the `false` is not later read as an oversight
+    /// against `station_model.rs`.
+    ///
+    /// The overrides that answer `true` are therefore exactly the
+    /// [`RenderMode::Texture`] handlers whose rasterizer input carries
+    /// `is_dark`.
+    fn theme_sensitive(&self) -> bool {
+        false
     }
 
     fn has_data(&self) -> bool;
@@ -780,7 +849,15 @@ pub trait OverlayHandler: Send {
         None
     }
 
-    fn legend(&self) -> Option<OverlayLegend> {
+    /// This layer's colour bar, [`Signed`] so a caller can keep what it baked
+    /// from the last one.
+    ///
+    /// The signature is the whole point of the wrapper here: the caller draws
+    /// the bar by sampling the ramp once per pixel of its length, which is
+    /// ~1000 interpolations down a threshold list per bar per frame for an
+    /// answer that changes at fetch rate. See [`Signed`] for the contract every
+    /// presentation hook keeps.
+    fn legend(&self) -> Option<Signed<OverlayLegend>> {
         None
     }
 
@@ -1254,8 +1331,20 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.hover_value_at(lat, lon))
     }
 
-    pub fn legend(&self, id: &LayerId) -> Option<OverlayLegend> {
+    /// [`OverlayHandler::legend`] for `id`, signature and all — the wrapper is
+    /// not unwrapped on the way past, because the caller is the one that can
+    /// use it to skip.
+    pub fn legend(&self, id: &LayerId) -> Option<Signed<OverlayLegend>> {
         self.handler(id).and_then(|h| h.legend())
+    }
+
+    /// [`OverlayHandler::theme_sensitive`] for `id`.
+    ///
+    /// An id with no registered handler answers `false`: an unknown layer has
+    /// no raster in any cache, so there is nothing a theme flip could
+    /// invalidate.
+    pub fn theme_sensitive(&self, id: &LayerId) -> bool {
+        self.handler(id).is_some_and(|h| h.theme_sensitive())
     }
 
     pub fn popup_content(

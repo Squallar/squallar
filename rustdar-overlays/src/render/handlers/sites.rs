@@ -37,6 +37,14 @@ impl OverlayHandler for RadarSitesHandler {
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
     }
+
+    /// `is_dark` rides into the described job (`SitesInput`) and picks the
+    /// label plate colour (`text_bg`), so a cached raster is a raster in one
+    /// theme — exactly the class this declaration exists for, and the one the
+    /// audit's "four theme-dependent handlers" left out.
+    fn theme_sensitive(&self) -> bool {
+        true
+    }
     fn default_enabled(&self) -> bool {
         false
     }

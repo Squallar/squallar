@@ -53,7 +53,10 @@ pub mod volumetric;
 pub mod voxel;
 pub mod xsect;
 
-pub use palette::{LegendScale, RANGE_FOLDED, get_color_for_value, get_legend_scale};
+pub use palette::{
+    LegendScale, LegendScaleRef, RANGE_FOLDED, get_color_for_value, get_legend_scale,
+    get_legend_scale_ref,
+};
 
 /// The one bounds-checked cursor over untrusted payload bytes, now defined in
 /// `rustdar-source`. Crate-visible only: the frontend's duplicate `Reader`

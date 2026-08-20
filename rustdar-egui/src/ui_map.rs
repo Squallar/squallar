@@ -3262,8 +3262,10 @@ const REGION_FILL_ALPHA: f32 = 0.12;
 /// One region box's screen rect, or `None` for a box with no rectangle to draw.
 ///
 /// The corners are projected rather than the centre offset by a pixel radius, so
-/// the box stays over the same ground at every zoom — the same thing
-/// `overlay_texture_rect` does for an overlay's bounds, and for the same reason.
+/// the box stays over the same ground at every zoom — through
+/// `overlay_cache::geo_corner_rect`, which is the one place that projection is
+/// written, shared with the overlay textures, the radar frame and the basemap
+/// tiles.
 ///
 /// A degenerate box — a zero extent before the pointer has moved, or a polar
 /// centre — answers `None` rather than a dot, because a dot under the cursor at
@@ -3277,9 +3279,11 @@ fn region_screen_rect(
         return None;
     }
     let (nw, se) = crate::ui_region::corners_for(centre, half)?;
-    let project =
-        |p: rustdar_geo::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
-    Some(egui::Rect::from_two_pos(project(nw), project(se)))
+    Some(crate::overlay_cache::geo_corner_rect(
+        projector,
+        (nw.lat, nw.lon),
+        (se.lat, se.lon),
+    ))
 }
 
 /// Paint one region box: an outline, and for the drag a translucent fill.

@@ -100,7 +100,7 @@ fn park_texture(ctx: &egui::Context, pane: &mut PaneState, kind: &rustdar_source
             image,
             egui::TextureOptions::NEAREST,
         ),
-        geo_bounds: covered(),
+        placed: rustdar_geo::PlacedRaster::of(covered()),
         data_generation: TOKEN,
         render_zoom: current_quantized_zoom(ZOOM),
         width: W,

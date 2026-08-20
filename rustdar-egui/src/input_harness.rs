@@ -1699,12 +1699,12 @@ impl InputHarness {
             .overlay_cache_mut(&rustdar_source::id::known::RADAR);
         cache.show(OverlayTextureData {
             texture,
-            geo_bounds: rustdar_geo::GeoBounds {
+            placed: rustdar_geo::PlacedRaster::of(rustdar_geo::GeoBounds {
                 min_lat: bounds.min_lat,
                 max_lat: bounds.max_lat,
                 min_lon: bounds.min_lon,
                 max_lon: bounds.max_lon,
-            },
+            }),
             data_generation: 0,
             render_zoom: 0,
             width: 1,
@@ -1864,25 +1864,35 @@ impl InputHarness {
             .collect()
     }
 
-    /// The color-scale legend strips painted inside `pane`, classified by the
-    /// axis they were drawn along.
+    /// The colour-scale legend bars painted inside `pane`, classified by the
+    /// axis they run along.
     ///
-    /// `render_color_scale` paints the bar as a run of 2px strips: `(2, 20)`
-    /// for a bottom-edge bar, `(20, 2)` for a right-edge one
-    /// (`ui_map_pane.rs:632` — `SCALE_BAR_WIDTH` is 20). That signature is what
-    /// makes it possible to assert on the drawn result rather than on the value
-    /// that was supposed to produce it.
-    pub(crate) fn color_scale_strips(&self, pane: egui::Rect) -> (usize, usize) {
+    /// A gradient bar is **one** `painter.image` over a ramp baked once per
+    /// product (`crate::legend_ramp`). It used to be a run of ~1000 2×20 px
+    /// `rect_filled` strips and this counted those, which is why every caller
+    /// treats the number as "some" rather than as a quantity: the assertions
+    /// are all `> 0`, `== 0`, or "unchanged by X", and every one of them still
+    /// says exactly what it said.
+    ///
+    /// The **shape** is what identifies a bar either way, and it is written out
+    /// here rather than read off `pane_render`'s constants for the reason
+    /// `fold_markers_painted` writes out its own 26: a probe sized from the
+    /// code under test moves with it. `SCALE_BAR_WIDTH` is 20, and a bar is
+    /// only drawn at all when its length clears 40 — so a quad 20 points thick
+    /// and more than 40 long, inside the pane, is a colour bar and nothing
+    /// else on the legend has that shape.
+    pub(crate) fn color_scale_bars(&self, pane: egui::Rect) -> (usize, usize) {
         let mut horizontal = 0;
         let mut vertical = 0;
-        for rect in &self.last_rects {
+        for image in &self.last_images {
+            let rect = image.rect;
             if !pane.contains(rect.center()) {
                 continue;
             }
             let (w, h) = (rect.width(), rect.height());
-            if (h - 20.0).abs() < 0.5 && w <= 4.0 {
+            if (h - 20.0).abs() < 0.5 && w > 40.0 {
                 horizontal += 1;
-            } else if (w - 20.0).abs() < 0.5 && h <= 4.0 {
+            } else if (w - 20.0).abs() < 0.5 && h > 40.0 {
                 vertical += 1;
             }
         }

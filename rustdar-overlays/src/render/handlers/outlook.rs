@@ -606,6 +606,13 @@ impl OverlayHandler for SpcOutlookHandler {
         RenderMode::Texture
     }
 
+    /// The hatch colour branches on `RasterizeContext::is_dark` (see
+    /// `rasterize_outlook`'s `hatch_color`), so the same outlook is two
+    /// different pictures and the cached one has to be discarded on a flip.
+    fn theme_sensitive(&self) -> bool {
+        true
+    }
+
     fn is_enabled(&self) -> bool {
         !self.enabled_products.is_empty()
     }

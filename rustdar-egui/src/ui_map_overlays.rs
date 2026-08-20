@@ -136,7 +136,7 @@ impl<'a> OverlayDrawContext<'a> {
         if let Some(tex) = texture.and_then(|c| c.current())
             && let Some(ref hit_map) = tex.hit_map
         {
-            let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex);
+            let rect = crate::overlay_cache::placed_rect(self.projector, &tex.placed);
             if rect.width() > 0.0 && rect.height() > 0.0 {
                 let u = (click_pos.x - rect.left()) / rect.width();
                 let v = (click_pos.y - rect.top()) / rect.height();
@@ -270,13 +270,11 @@ pub(super) fn draw_tile_layer(
                 let se_lon = tile_to_lon(tx + 1, tile_zoom);
                 let se_lat = tile_to_lat(ty + 1, tile_zoom);
 
-                let nw_screen = projector
-                    .project(walkers::lat_lon(nw_lat, nw_lon))
-                    .to_pos2();
-                let se_screen = projector
-                    .project(walkers::lat_lon(se_lat, se_lon))
-                    .to_pos2();
-                let rect = egui::Rect::from_two_pos(nw_screen, se_screen);
+                let rect = crate::overlay_cache::geo_corner_rect(
+                    projector,
+                    (nw_lat, nw_lon),
+                    (se_lat, se_lon),
+                );
 
                 let Tile::Raster(ref tex) = twuv.tile;
                 ui.painter()

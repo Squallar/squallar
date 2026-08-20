@@ -210,6 +210,7 @@ fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
         lat: 0.0,
         lon: 0.0,
         max_range_km: 100.0,
+        placed: rustdar_radar::types::ImageBounds::from_radar_site(0.0, 0.0, 100.0).into(),
         nyquist_ms: None,
         melting_layer_source: None,
         storm_motion: None,
@@ -1176,12 +1177,12 @@ fn pane_showing_render(
     pane.overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
             texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
-            geo_bounds: rustdar_geo::GeoBounds {
+            placed: rustdar_geo::PlacedRaster::of(rustdar_geo::GeoBounds {
                 min_lat: 34.0,
                 max_lat: 36.0,
                 min_lon: -98.0,
                 max_lon: -96.0,
-            },
+            }),
             data_generation: 0,
             render_zoom: 0,
             width: 1,
