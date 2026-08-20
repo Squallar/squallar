@@ -246,8 +246,13 @@ impl SatelliteSelection {
 
 const SECS_PER_MIN: f64 = 60.0;
 
-pub(crate) struct GlmHandler {
-    pub state: OverlayState<Vec<Arc<GlmFlashItem>>, Assembled>,
+/// **Everything about this layer that differs between two panes** — the whole
+/// of what `serialize_state` used to write, moved where it belongs. Two panes
+/// can now sit on different satellites and different time windows, which is
+/// what the config swap was faking by re-installing one handler's fields
+/// before every read.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GlmPaneState {
     pub enabled: bool,
     pub satellite: SatelliteSelection,
     /// Time window in seconds, clamped to
@@ -257,6 +262,44 @@ pub(crate) struct GlmHandler {
     pub show_events: bool,
     pub show_groups: bool,
     pub show_flashes: bool,
+}
+
+impl GlmPaneState {
+    /// A pane that has saved nothing, with `enabled` supplied by the pane's
+    /// own slot flag.
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            satellite: SatelliteSelection::Both,
+            time_window_secs: 300.0,
+            show_events: false,
+            show_groups: true,
+            show_flashes: true,
+        }
+    }
+
+    /// Build the list of active data levels from the checkbox flags.
+    fn active_levels(&self) -> Vec<GlmDataLevel> {
+        let mut levels = Vec::new();
+        if self.show_events {
+            levels.push(GlmDataLevel::Event);
+        }
+        if self.show_groups {
+            levels.push(GlmDataLevel::Group);
+        }
+        if self.show_flashes {
+            levels.push(GlmDataLevel::Flash);
+        }
+        levels
+    }
+}
+
+pub(crate) struct GlmHandler {
+    pub state: OverlayState<Vec<Arc<GlmFlashItem>>, Assembled>,
+    /// **The registry's own copy**, used only where no pane is supplied. The
+    /// config swap keeps it in step until WO-M10c deletes the swap; every
+    /// answer prefers [`PaneRef::state`] when there is one.
+    pub defaults: GlmPaneState,
     /// Cached S3 file data for incremental fetching.
     pub cache: Arc<std::sync::Mutex<GlmCache>>,
     /// Satellites whose last listing returned no objects at all.
@@ -324,12 +367,7 @@ impl GlmHandler {
     pub fn new() -> Self {
         Self {
             state: OverlayState::new(),
-            enabled: false,
-            satellite: SatelliteSelection::Both,
-            time_window_secs: 300.0,
-            show_events: false,
-            show_groups: true,
-            show_flashes: true,
+            defaults: GlmPaneState::new(false),
             cache: Arc::new(std::sync::Mutex::new(GlmCache::default())),
             dead_feeds: Vec::new(),
             parse: FailureState::default(),
@@ -340,7 +378,27 @@ impl GlmHandler {
         }
     }
 
-    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::GlmStrikesInput> {
+    /// **This pane's answer, or the registry's own copy** when no pane was
+    /// supplied — which during WO-M10b is still what the config swap keeps in
+    /// step. WO-M10c deletes both the swap and `defaults`.
+    fn view<'a>(&'a self, pane: &PaneRef<'a>) -> &'a GlmPaneState {
+        pane.state_as::<GlmPaneState>().unwrap_or(&self.defaults)
+    }
+
+    /// Edit this pane's state, falling back to the registry's copy for a
+    /// caller that supplied no pane.
+    fn edit(&mut self, pane: &mut PaneMut<'_>, f: impl FnOnce(&mut GlmPaneState)) {
+        match pane.state_as::<GlmPaneState>() {
+            Some(state) => f(state),
+            None => f(&mut self.defaults),
+        }
+    }
+
+    fn paint_input(
+        &self,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> Option<rasterize::GlmStrikesInput> {
         if self.state.data.is_empty() {
             return None;
         }
@@ -358,7 +416,7 @@ impl GlmHandler {
                 .collect(),
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
-            time_window_secs: self.time_window_secs,
+            time_window_secs: self.view(pane).time_window_secs,
             now: ctx.now,
             device_scale: ctx.device_scale,
         })
@@ -560,21 +618,6 @@ impl GlmHandler {
         state.detail = failures;
     }
 
-    /// Build the list of active data levels from the checkbox flags.
-    fn active_levels(&self) -> Vec<GlmDataLevel> {
-        let mut levels = Vec::new();
-        if self.show_events {
-            levels.push(GlmDataLevel::Event);
-        }
-        if self.show_groups {
-            levels.push(GlmDataLevel::Group);
-        }
-        if self.show_flashes {
-            levels.push(GlmDataLevel::Flash);
-        }
-        levels
-    }
-
     /// Clear the file cache (needed when level selection changes).
     fn clear_cache(&self) {
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -608,24 +651,25 @@ impl OverlayHandler for GlmHandler {
         true
     }
 
-    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
-        self.enabled
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        self.view(pane).enabled
     }
 
-    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
-        self.enabled = enabled;
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        self.edit(pane, |state| state.enabled = enabled);
     }
 
     /// E.g. `"312 flashes · 10 min"`: what the layer is holding, and how wide
     /// its window is.
-    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
-        if !self.enabled {
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        let view = self.view(pane);
+        if !view.enabled {
             return None;
         }
         Some(format!(
             "{} flashes - {:.0} min",
             self.state.data.len(),
-            self.time_window_secs / SECS_PER_MIN,
+            view.time_window_secs / SECS_PER_MIN,
         ))
     }
 
@@ -714,10 +758,10 @@ impl OverlayHandler for GlmHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
         // Captures the dispatch's own `ctx.now`, which is what keeps the
         // flash ages a worker renders the ages this page computed.
-        Some(DescribedJob::new(self.paint_input(ctx)?))
+        Some(DescribedJob::new(self.paint_input(ctx, pane)?))
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -743,13 +787,14 @@ impl OverlayHandler for GlmHandler {
         )
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, pane: &PaneRef<'_>) -> Vec<FetchTask> {
         log::info!("Fetching GLM lightning data");
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
-        let satellites = self.satellite.to_satellites();
-        let time_window_secs = self.time_window_secs;
-        let levels = self.active_levels();
+        let view = self.view(pane);
+        let satellites = view.satellite.to_satellites();
+        let time_window_secs = view.time_window_secs;
+        let levels = view.active_levels();
         let cache = Arc::clone(&self.cache);
         vec![FetchTask {
             kind: known::LIGHTNING,
@@ -777,7 +822,8 @@ impl OverlayHandler for GlmHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
+    fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
+        let view = self.view(pane);
         let count = self.state.data.len();
         let label = if count == 0 {
             "GLM Lightning".to_string()
@@ -788,7 +834,7 @@ impl OverlayHandler for GlmHandler {
         let mut items = vec![ControlItem::Toggle {
             id: "enabled",
             label,
-            enabled: self.enabled,
+            enabled: view.enabled,
         }];
 
         items.push(ControlItem::Dropdown {
@@ -799,12 +845,12 @@ impl OverlayHandler for GlmHandler {
                 ("west".into(), "GOES-18 (West)".into()),
                 ("both".into(), "Both".into()),
             ],
-            selected: self.satellite.as_str().into(),
+            selected: view.satellite.as_str().into(),
         });
 
         // Time window slider, in minutes. The minimum is load-bearing —
         // see GLM_MIN_TIME_WINDOW_SECS before lowering it.
-        let mins = self.time_window_secs / SECS_PER_MIN;
+        let mins = view.time_window_secs / SECS_PER_MIN;
         items.push(ControlItem::Slider {
             id: "time_window",
             label: "Time Window".into(),
@@ -818,17 +864,17 @@ impl OverlayHandler for GlmHandler {
         items.push(ControlItem::Toggle {
             id: "show_events",
             label: "Events (highest density)".to_string(),
-            enabled: self.show_events,
+            enabled: view.show_events,
         });
         items.push(ControlItem::Toggle {
             id: "show_groups",
             label: "Groups (medium density)".to_string(),
-            enabled: self.show_groups,
+            enabled: view.show_groups,
         });
         items.push(ControlItem::Toggle {
             id: "show_flashes",
             label: "Flashes (lowest density)".to_string(),
-            enabled: self.show_flashes,
+            enabled: view.show_flashes,
         });
 
         items.push(ControlItem::ButtonRow {
@@ -855,7 +901,7 @@ impl OverlayHandler for GlmHandler {
             items.push(ControlItem::InfoText { text });
         }
 
-        let selected = self.satellite.to_satellites();
+        let selected = view.satellite.to_satellites();
         for feed in self
             .dead_feeds
             .iter()
@@ -901,8 +947,8 @@ impl OverlayHandler for GlmHandler {
             items.push(ControlItem::InfoText { text });
         }
 
-        let selected = self.satellite.to_satellites();
-        let levels = self.active_levels();
+        let selected = view.satellite.to_satellites();
+        let levels = view.active_levels();
         for failure in self
             .level_failures
             .iter()
@@ -937,7 +983,7 @@ impl OverlayHandler for GlmHandler {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
-                    self.enabled = val;
+                    self.edit(pane, |state| state.enabled = val);
                     if val
                         && self
                             .state
@@ -951,8 +997,8 @@ impl OverlayHandler for GlmHandler {
             "satellite" => {
                 if let ControlValue::String(ref val) = update.value {
                     let new_sat = SatelliteSelection::from_str(val);
-                    if new_sat != self.satellite {
-                        self.satellite = new_sat;
+                    if new_sat != self.view(&pane.as_ref()).satellite {
+                        self.edit(pane, |state| state.satellite = new_sat);
                         self.state.data_generation = self.state.data_generation.wrapping_add(1);
                         return ControlEffect::Fetch;
                     }
@@ -961,8 +1007,9 @@ impl OverlayHandler for GlmHandler {
             }
             "time_window" => {
                 if let ControlValue::Float(mins) = update.value {
-                    self.time_window_secs = (mins * SECS_PER_MIN)
+                    let secs = (mins * SECS_PER_MIN)
                         .clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
+                    self.edit(pane, |state| state.time_window_secs = secs);
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     return ControlEffect::Fetch;
                 }
@@ -970,7 +1017,7 @@ impl OverlayHandler for GlmHandler {
             }
             "show_events" => {
                 if let ControlValue::Bool(val) = update.value {
-                    self.show_events = val;
+                    self.edit(pane, |state| state.show_events = val);
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     self.clear_cache();
                     return ControlEffect::Fetch;
@@ -979,7 +1026,7 @@ impl OverlayHandler for GlmHandler {
             }
             "show_groups" => {
                 if let ControlValue::Bool(val) = update.value {
-                    self.show_groups = val;
+                    self.edit(pane, |state| state.show_groups = val);
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     self.clear_cache();
                     return ControlEffect::Fetch;
@@ -988,7 +1035,7 @@ impl OverlayHandler for GlmHandler {
             }
             "show_flashes" => {
                 if let ControlValue::Bool(val) = update.value {
-                    self.show_flashes = val;
+                    self.edit(pane, |state| state.show_flashes = val);
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     self.clear_cache();
                     return ControlEffect::Fetch;
@@ -1000,35 +1047,88 @@ impl OverlayHandler for GlmHandler {
         }
     }
 
+    // ── Per-pane state (WO-M10b) ──────────────────────────────────────
+
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        Some(Box::new(GlmPaneState::new(enabled)))
+    }
+
+    /// Field for field what `deserialize_state` does, against the pane's own
+    /// state instead of the registry's — and `enabled` falls back to the
+    /// pane's slot flag rather than to whatever another pane last left here.
+    fn deserialize_pane_state(
+        &self,
+        value: serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        let mut state = GlmPaneState::new(enabled);
+        if let Some(on) = value.get("enabled").and_then(|v| v.as_bool()) {
+            state.enabled = on;
+        }
+        if let Some(sat) = value.get("satellite").and_then(|v| v.as_str()) {
+            state.satellite = SatelliteSelection::from_str(sat);
+        }
+        if let Some(tw) = value.get("time_window_secs").and_then(|v| v.as_f64()) {
+            state.time_window_secs = tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
+        }
+        if let Some(v) = value.get("show_events").and_then(|v| v.as_bool()) {
+            state.show_events = v;
+        }
+        if let Some(v) = value.get("show_groups").and_then(|v| v.as_bool()) {
+            state.show_groups = v;
+        }
+        if let Some(v) = value.get("show_flashes").and_then(|v| v.as_bool()) {
+            state.show_flashes = v;
+        }
+        Some(Box::new(state))
+    }
+
+    /// **Byte-identical to `serialize_state`** — same members, same order,
+    /// same values. The corpus is what says so.
+    fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
+        let Some(state) = state.downcast_ref::<GlmPaneState>() else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            "enabled": state.enabled,
+            "satellite": state.satellite.as_str(),
+            "time_window_secs": state.time_window_secs,
+            "show_events": state.show_events,
+            "show_groups": state.show_groups,
+            "show_flashes": state.show_flashes,
+        })
+    }
+
     fn serialize_state(&self) -> serde_json::Value {
         serde_json::json!({
-            "enabled": self.enabled,
-            "satellite": self.satellite.as_str(),
-            "time_window_secs": self.time_window_secs,
-            "show_events": self.show_events,
-            "show_groups": self.show_groups,
-            "show_flashes": self.show_flashes,
+            "enabled": self.defaults.enabled,
+            "satellite": self.defaults.satellite.as_str(),
+            "time_window_secs": self.defaults.time_window_secs,
+            "show_events": self.defaults.show_events,
+            "show_groups": self.defaults.show_groups,
+            "show_flashes": self.defaults.show_flashes,
         })
     }
 
     fn deserialize_state(&mut self, value: serde_json::Value) {
         if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.enabled = enabled;
+            self.defaults.enabled = enabled;
         }
         if let Some(sat) = value.get("satellite").and_then(|v| v.as_str()) {
-            self.satellite = SatelliteSelection::from_str(sat);
+            self.defaults.satellite = SatelliteSelection::from_str(sat);
         }
         if let Some(tw) = value.get("time_window_secs").and_then(|v| v.as_f64()) {
-            self.time_window_secs = tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
+            self.defaults.time_window_secs =
+                tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
         }
         if let Some(v) = value.get("show_events").and_then(|v| v.as_bool()) {
-            self.show_events = v;
+            self.defaults.show_events = v;
         }
         if let Some(v) = value.get("show_groups").and_then(|v| v.as_bool()) {
-            self.show_groups = v;
+            self.defaults.show_groups = v;
         }
         if let Some(v) = value.get("show_flashes").and_then(|v| v.as_bool()) {
-            self.show_flashes = v;
+            self.defaults.show_flashes = v;
         }
     }
 }

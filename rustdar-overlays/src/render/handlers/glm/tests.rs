@@ -120,7 +120,7 @@ const WEST_ONLY: [GlmSatellite; 1] = [GlmSatellite::GoesWest];
 #[test]
 fn dead_feed_is_surfaced_in_the_control_panel() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
     let texts = info_texts(&handler);
@@ -135,7 +135,7 @@ fn dead_feed_is_surfaced_in_the_control_panel() {
 #[test]
 fn a_window_gap_is_surfaced_in_the_control_panel_in_its_own_words() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_window_gaps(
         &BOTH,
         vec![WindowGap {
@@ -166,7 +166,7 @@ fn a_closed_window_gap_clears_its_notice_but_only_if_it_was_queried() {
         }]
     };
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_window_gaps(&BOTH, gap());
     handler.report_window_gaps(&[GlmSatellite::GoesEast], Vec::new());
     assert_eq!(
@@ -185,7 +185,7 @@ fn a_closed_window_gap_clears_its_notice_but_only_if_it_was_queried() {
 #[test]
 fn a_poll_that_parsed_no_granule_does_not_clear_the_drop_notice() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_record_drops(RecordDrops {
         considered: 900,
         fill_values: 0,
@@ -217,7 +217,7 @@ fn a_poll_that_parsed_no_granule_does_not_clear_the_drop_notice() {
 #[test]
 fn recovered_feed_clears_the_control_panel_notice() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
     handler.report_feed_changes(&BOTH, Vec::new());
 
@@ -231,7 +231,7 @@ fn recovered_feed_clears_the_control_panel_notice() {
 #[test]
 fn repeated_polls_do_not_accumulate_feed_state() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
 
     for _ in 0..5 {
         handler.report_feed_changes(&BOTH, vec![dead_east()]);
@@ -255,7 +255,7 @@ fn repeated_polls_do_not_accumulate_feed_state() {
 #[test]
 fn failed_fetch_leaves_feed_verdict_untouched() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
     handler.apply_fetch_result(Box::new(GlmFetchResult(Err(
@@ -268,11 +268,11 @@ fn failed_fetch_leaves_feed_verdict_untouched() {
 #[test]
 fn deselecting_a_dead_satellite_is_not_a_recovery() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
-    handler.satellite = SatelliteSelection::Both;
+    handler.defaults.enabled = true;
+    handler.defaults.satellite = SatelliteSelection::Both;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
-    handler.satellite = SatelliteSelection::West;
+    handler.defaults.satellite = SatelliteSelection::West;
     handler.report_feed_changes(&WEST_ONLY, Vec::new());
 
     assert_eq!(
@@ -291,7 +291,7 @@ fn deselecting_a_dead_satellite_is_not_a_recovery() {
 #[test]
 fn reselecting_a_still_dead_satellite_does_not_re_report_it() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
     handler.report_feed_changes(&WEST_ONLY, Vec::new());
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
@@ -310,7 +310,7 @@ fn reselecting_a_still_dead_satellite_does_not_re_report_it() {
 #[test]
 fn recovery_is_still_reported_for_a_queried_satellite() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
     handler.report_feed_changes(&BOTH, Vec::new());
 
@@ -336,7 +336,7 @@ fn partial_failure(failed: usize) -> FetchFailures {
 #[test]
 fn total_parse_failure_is_surfaced_in_the_control_panel() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_failures(FailureKind::Parse, Some(total_failure()));
 
     let texts = info_texts(&handler);
@@ -353,7 +353,7 @@ fn total_parse_failure_is_surfaced_in_the_control_panel() {
 #[test]
 fn partial_parse_failure_is_distinguished_from_total() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_failures(FailureKind::Parse, Some(partial_failure(3)));
 
     let texts = info_texts(&handler);
@@ -370,7 +370,7 @@ fn partial_parse_failure_is_distinguished_from_total() {
 #[test]
 fn parse_failure_notice_clears_when_files_parse_again() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_failures(FailureKind::Parse, Some(total_failure()));
     handler.report_failures(FailureKind::Parse, None);
 
@@ -385,7 +385,7 @@ fn parse_failure_notice_clears_when_files_parse_again() {
 #[test]
 fn parse_health_does_not_flap_on_changing_counts() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
 
     for failed in [3usize, 7, 4, 9] {
         handler.report_failures(FailureKind::Parse, Some(partial_failure(failed)));
@@ -399,7 +399,7 @@ fn parse_health_does_not_flap_on_changing_counts() {
 #[test]
 fn transport_failure_is_not_reported_as_a_product_change() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_failures(
         FailureKind::Transport,
         Some(FetchFailures {
@@ -425,7 +425,7 @@ fn transport_failure_is_not_reported_as_a_product_change() {
 #[test]
 fn parse_and_transport_failures_are_tracked_independently() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_failures(FailureKind::Parse, Some(total_failure()));
     handler.report_failures(FailureKind::Transport, Some(partial_failure(2)));
 
@@ -528,7 +528,7 @@ fn flash_level_gone() -> LevelFailure {
 #[test]
 fn a_failed_level_is_surfaced_in_the_control_panel() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
 
     let texts = info_texts(&handler);
@@ -543,7 +543,7 @@ fn a_failed_level_is_surfaced_in_the_control_panel() {
 #[test]
 fn a_recovered_level_clears_the_control_panel_notice() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
     handler.report_level_failures(&FLASH_EVALUATED, Vec::new());
 
@@ -574,11 +574,11 @@ fn a_failed_level_warns_once_then_recovers_once() {
 #[test]
 fn a_failed_level_the_user_switched_off_is_not_shown_but_is_remembered() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
     assert!(info_texts(&handler).iter().any(|t| t.contains("Flashes")));
 
-    handler.show_flashes = false;
+    handler.defaults.show_flashes = false;
     assert!(
         !info_texts(&handler).iter().any(|t| t.contains("Flashes")),
         "a deselected layer must not keep warning"
@@ -589,7 +589,7 @@ fn a_failed_level_the_user_switched_off_is_not_shown_but_is_remembered() {
         "...but the verdict is kept, so re-selecting does not re-warn"
     );
 
-    handler.show_flashes = true;
+    handler.defaults.show_flashes = true;
     assert!(
         info_texts(&handler).iter().any(|t| t.contains("Flashes")),
         "and it returns when the layer is selected again"
@@ -599,8 +599,8 @@ fn a_failed_level_the_user_switched_off_is_not_shown_but_is_remembered() {
 #[test]
 fn a_failed_level_on_a_deselected_satellite_is_not_shown() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
-    handler.satellite = SatelliteSelection::West;
+    handler.defaults.enabled = true;
+    handler.defaults.satellite = SatelliteSelection::West;
     handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
 
     assert!(
@@ -613,7 +613,7 @@ fn a_failed_level_on_a_deselected_satellite_is_not_shown() {
 fn a_poll_with_no_new_granules_is_not_a_recovery() {
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
         handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
         handler.report_level_failures(&[], Vec::new());
 
@@ -700,7 +700,7 @@ fn two_levels_failing_on_one_satellite_are_tracked_separately() {
 
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
 
         handler.report_level_failures(&east_both, vec![east_flash.clone()]);
         handler.report_level_failures(&east_both, vec![east_flash.clone(), east_group.clone()]);
@@ -732,7 +732,7 @@ fn one_level_failing_on_both_satellites_is_tracked_separately() {
 
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
 
         handler.report_level_failures(&FLASH_EVALUATED, vec![east.clone()]);
         handler.report_level_failures(&FLASH_EVALUATED, vec![east.clone(), west.clone()]);
@@ -811,7 +811,7 @@ fn evidence_without_failure_is_a_real_recovery() {
 #[test]
 fn a_level_failure_is_not_counted_as_a_failed_file() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
     handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
 
     let texts = info_texts(&handler);
@@ -825,7 +825,7 @@ fn a_level_failure_is_not_counted_as_a_failed_file() {
 fn dead_feed_warns_once_across_many_polls() {
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
         for _ in 0..10 {
             handler.report_feed_changes(&BOTH, vec![dead_east()]);
         }
@@ -847,7 +847,7 @@ fn dead_feed_warns_once_across_many_polls() {
 fn feed_recovery_logs_once_and_re_arms() {
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
         handler.report_feed_changes(&BOTH, vec![dead_east()]);
         for _ in 0..5 {
             handler.report_feed_changes(&BOTH, Vec::new());
@@ -863,7 +863,7 @@ fn feed_recovery_logs_once_and_re_arms() {
 fn deselecting_a_dead_satellite_logs_nothing() {
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
         handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
         LOG_RECORDS
@@ -884,7 +884,7 @@ fn deselecting_a_dead_satellite_logs_nothing() {
 fn fluctuating_failure_counts_warn_once() {
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
         for failed in [1usize, 5, 2, 7, 3, 6, 4, 8, 2, 9] {
             handler.report_failures(FailureKind::Parse, Some(partial_failure(failed)));
         }
@@ -901,7 +901,7 @@ fn fluctuating_failure_counts_warn_once() {
 fn escalation_and_recovery_each_log_once() {
     let logs = captured_logs(|| {
         let mut handler = GlmHandler::new();
-        handler.enabled = true;
+        handler.defaults.enabled = true;
         handler.report_failures(FailureKind::Parse, Some(partial_failure(3)));
         handler.report_failures(FailureKind::Parse, Some(total_failure()));
         handler.report_failures(FailureKind::Parse, Some(total_failure()));
@@ -955,7 +955,7 @@ fn level_outcome(
 #[test]
 fn apply_fetch_result_forwards_both_level_fields() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
 
     handler.apply_fetch_result(level_outcome(
         vec![flash_level_gone()],
@@ -988,7 +988,7 @@ fn apply_fetch_result_forwards_both_level_fields() {
 #[test]
 fn apply_fetch_result_forwards_queried_set_and_failures() {
     let mut handler = GlmHandler::new();
-    handler.enabled = true;
+    handler.defaults.enabled = true;
 
     handler.apply_fetch_result(outcome(
         vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
@@ -1412,4 +1412,108 @@ fn a_dead_feed_is_not_charged_again_for_the_other_feeds_granules() {
         note.contains("missing 2 of 2 satellite feeds"),
         "one feed is dead and one delivered no granules — two, not three: {note}",
     );
+}
+
+/// **Two panes hold different GLM selections at the same time, and neither
+/// edit reaches the registry.** The toggle-only layers prove a flag can
+/// diverge; this proves a whole selection can — a satellite and a time window,
+/// which is what the config swap was faking by re-installing one handler's
+/// fields before every read.
+///
+/// Non-triviality floor: the two states are asserted **equal** first, so the
+/// divergence below cannot be one `create_pane_state` handed out.
+#[test]
+fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them() {
+    use rustdar_source::handler::PaneMut;
+
+    let mut handler = GlmHandler::new();
+    let mut a = handler
+        .create_pane_state(true)
+        .expect("lightning keeps per-pane state");
+    let mut b = handler
+        .create_pane_state(true)
+        .expect("lightning keeps per-pane state");
+    assert_eq!(
+        handler.serialize_pane_state(&*a),
+        handler.serialize_pane_state(&*b),
+        "premise: two fresh panes start identical",
+    );
+
+    handler.apply_control(
+        &ControlUpdate {
+            id: "time_window",
+            value: ControlValue::Float(20.0),
+        },
+        &mut PaneMut {
+            pane_idx: 0,
+            state: Some(&mut *a),
+        },
+    );
+    handler.apply_control(
+        &ControlUpdate {
+            id: "satellite",
+            value: ControlValue::String("west".into()),
+        },
+        &mut PaneMut {
+            pane_idx: 1,
+            state: Some(&mut *b),
+        },
+    );
+
+    let pane_a = PaneRef {
+        state: Some(&*a),
+        ..PaneRef::bare(0)
+    };
+    let pane_b = PaneRef {
+        state: Some(&*b),
+        ..PaneRef::bare(1)
+    };
+
+    // Read back through the trait, not through the state: this is the path the
+    // draw loop and the layer stack take.
+    assert_eq!(
+        handler.serialize_pane_state(&*a)["time_window_secs"],
+        serde_json::json!(1200.0),
+        "pane 0's window",
+    );
+    assert_eq!(
+        handler.serialize_pane_state(&*b)["time_window_secs"],
+        serde_json::json!(300.0),
+        "pane 1 took pane 0's window",
+    );
+    assert_eq!(
+        handler.serialize_pane_state(&*b)["satellite"],
+        serde_json::json!("west"),
+        "pane 1's satellite",
+    );
+    assert_eq!(
+        handler.serialize_pane_state(&*a)["satellite"],
+        serde_json::json!("both"),
+        "pane 0 took pane 1's satellite",
+    );
+
+    // `status_line` reads the window, so it is per-pane too.
+    // No data needed: the line reports a count and the window, and the count
+    // is honestly zero here.
+    assert!(
+        handler
+            .status_line(&pane_a)
+            .expect("enabled")
+            .contains("20 min"),
+        "pane 0's status line: {:?}",
+        handler.status_line(&pane_a),
+    );
+    assert!(
+        handler
+            .status_line(&pane_b)
+            .expect("enabled")
+            .contains("5 min"),
+        "pane 1's status line: {:?}",
+        handler.status_line(&pane_b),
+    );
+
+    // And the registry's own copy moved for NEITHER edit — the assertion that
+    // fails the moment a handler writes a per-pane value to `&mut self`.
+    assert_eq!(handler.defaults.time_window_secs, 300.0);
+    assert_eq!(handler.defaults.satellite, SatelliteSelection::Both);
 }
