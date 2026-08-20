@@ -106,6 +106,74 @@ enum RoundVerdict {
     Failed(crate::fetch_policy::FetchError),
 }
 
+/// **The whole per-pane state of the outlook layer**: which day this pane is
+/// looking at and which of that day's products it lets through. Both were
+/// fields of the handler, so two panes could never sit on two days.
+///
+/// There is no `enabled` beside the set — for this layer "on" **is** a
+/// non-empty product set, and a bool next to it is a second copy free to
+/// disagree with the thing it was derived from.
+///
+/// The round bookkeeping is deliberately NOT here: one fetch round is one
+/// request per product for the whole application, and every pane's selection
+/// contributes to it. It stays on the handler and is scoped by the **union**
+/// of the panes — see [`SpcOutlookHandler::union_scope`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OutlookPaneState {
+    pub selected_day: OutlookDay,
+    pub enabled_products: HashSet<OutlookProduct>,
+}
+
+impl OutlookPaneState {
+    /// A pane that has saved nothing. `enabled` is the pane's own slot flag,
+    /// and for this layer "on" means the day's first product — the same
+    /// answer `set_enabled(true)` gives.
+    fn new(enabled: bool) -> Self {
+        let mut state = Self {
+            selected_day: OutlookDay::Day1,
+            enabled_products: HashSet::new(),
+        };
+        if enabled && let Some(&first) = state.selected_day.products().first() {
+            state.enabled_products.insert(first);
+            state.sync_implied_products();
+        }
+        state
+    }
+
+    /// Bring the products that are not independently selectable into line with
+    /// the ones that are, and drop any that the selected day does not publish.
+    fn sync_implied_products(&mut self) {
+        let published = self.selected_day.products();
+        self.enabled_products
+            .retain(|p| p.is_selectable() || published.contains(p));
+        for &product in published {
+            let Some(parent) = product.implied_by() else {
+                continue;
+            };
+            if self.enabled_products.contains(&parent) {
+                self.enabled_products.insert(product);
+            } else {
+                self.enabled_products.remove(&product);
+            }
+        }
+    }
+
+    /// The `(day, product)` keys **this pane** is asking for, appended in
+    /// publication order and never duplicated — so a one-pane union is
+    /// byte-for-byte the walk this layer has always made.
+    fn extend_scope(&self, into: &mut Vec<(OutlookDay, OutlookProduct)>) {
+        for &product in self.selected_day.products() {
+            if !self.enabled_products.contains(&product) {
+                continue;
+            }
+            let key = (self.selected_day, product);
+            if !into.contains(&key) {
+                into.push(key);
+            }
+        }
+    }
+}
+
 pub(crate) struct SpcOutlookHandler {
     pub state: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>, Assembled>,
     /// Per product, so one product's refetch does not invalidate the others.
@@ -125,9 +193,10 @@ pub(crate) struct SpcOutlookHandler {
     /// Failures from the current round for products the layer has stopped
     /// asking for mid-flight. See [`Self::file_round_verdict`].
     round_stray_failures: Vec<crate::fetch_policy::FetchError>,
-    pub selected_day: OutlookDay,
-    /// Empty means the whole overlay is off — see `is_enabled`.
-    pub enabled_products: HashSet<OutlookProduct>,
+    /// **The registry's own copy**, used only where no pane is supplied. The
+    /// config swap keeps it in step until WO-M10c deletes the swap; every
+    /// answer prefers [`PaneRef::state`] when there is one.
+    pub defaults: OutlookPaneState,
 }
 
 impl SpcOutlookHandler {
@@ -140,9 +209,79 @@ impl SpcOutlookHandler {
             outstanding: 0,
             round_answered_in_scope: false,
             round_stray_failures: Vec::new(),
-            selected_day: OutlookDay::Day1,
-            enabled_products: HashSet::new(),
+            defaults: OutlookPaneState::new(false),
         }
+    }
+
+    /// **This pane's answer, or the registry's own copy** when no pane was
+    /// supplied.
+    fn view<'a>(&'a self, pane: &PaneRef<'a>) -> &'a OutlookPaneState {
+        pane.state_as::<OutlookPaneState>()
+            .unwrap_or(&self.defaults)
+    }
+
+    /// Edit this pane's state, falling back to the registry's copy for a
+    /// caller that supplied no pane.
+    fn edit(&mut self, pane: &mut PaneMut<'_>, f: impl FnOnce(&mut OutlookPaneState)) {
+        match pane.state_as::<OutlookPaneState>() {
+            Some(state) => f(state),
+            None => f(&mut self.defaults),
+        }
+    }
+
+    /// **Everything ANY pane is asking for**, in publication order, deduped.
+    ///
+    /// The round is one request per product for the whole application, so the
+    /// scope it is judged against is the union: a product pane 1 still wants
+    /// is in scope even when pane 0 has stopped asking, and a failure any
+    /// pane's selection carries keeps the layer on the ledger. Narrowing this
+    /// to one pane is how an edit in one pane takes the layer off a ledger
+    /// another pane is still on.
+    fn union_scope(&self, pane: &PaneRef<'_>) -> Vec<(OutlookDay, OutlookProduct)> {
+        let mut scope = Vec::new();
+        let mut answered = false;
+        for state in pane.all_as::<OutlookPaneState>() {
+            answered = true;
+            state.extend_scope(&mut scope);
+        }
+        if !answered {
+            self.defaults.extend_scope(&mut scope);
+        }
+        scope
+    }
+
+    /// **The one encoder** for a selection, so the registry's copy and a
+    /// pane's cannot write different bytes for the same selection.
+    ///
+    /// Declaration order, never the `HashSet`'s: set iteration order is
+    /// per-instance noise, and writing it raw makes save→load→save produce a
+    /// different file every reopen.
+    fn save_selection(state: &OutlookPaneState) -> serde_json::Value {
+        let mut enabled: Vec<OutlookProduct> = state.enabled_products.iter().copied().collect();
+        enabled.sort_by_key(|product| *product as u8);
+        serde_json::json!({
+            "selected_day": state.selected_day,
+            "enabled_products": enabled,
+        })
+    }
+
+    /// **The one decoder**, the exact inverse of [`Self::save_selection`]. A
+    /// member the value does not name is left as it was, and the implied
+    /// products are brought into line afterwards.
+    fn restore_selection(state: &mut OutlookPaneState, value: &serde_json::Value) {
+        if let Some(day) = value
+            .get("selected_day")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            state.selected_day = day;
+        }
+        if let Some(products) = value
+            .get("enabled_products")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            state.enabled_products = products;
+        }
+        state.sync_implied_products();
     }
 
     /// Move the outstanding-task count, keeping `state.fetching` in step.
@@ -151,28 +290,16 @@ impl SpcOutlookHandler {
         self.state.fetching = outstanding > 0;
     }
 
-    /// Is this key something the layer is asking for *right now*?
-    fn in_scope(&self, key: &(OutlookDay, OutlookProduct)) -> bool {
-        key.0 == self.selected_day && self.enabled_products.contains(&key.1)
-    }
-
     /// What every product's last answer adds up to, as a **property of the
     /// selection** rather than of the order its tasks resolved in.
-    fn round_verdict(&self) -> RoundVerdict {
-        let day = self.selected_day;
-        let scope: Vec<OutlookProduct> = day
-            .products()
-            .iter()
-            .copied()
-            .filter(|p| self.enabled_products.contains(p))
-            .collect();
+    fn round_verdict(&self, scope: &[(OutlookDay, OutlookProduct)]) -> RoundVerdict {
         let asked = scope.len();
 
         let mut failed: Vec<(OutlookProduct, &crate::fetch_policy::FetchError)> = Vec::new();
         let mut absent: Vec<(OutlookProduct, &crate::fetch_policy::FetchError)> = Vec::new();
         let mut drew = false;
-        for product in scope {
-            let key = (day, product);
+        for &key in scope {
+            let product = key.1;
             match self.per_product_error.get(&key) {
                 Some(e) if e.failure == crate::fetch_policy::FetchFailure::Absent => {
                     absent.push((product, e));
@@ -218,17 +345,16 @@ impl SpcOutlookHandler {
 
     /// What of this selection is **not on the map**, as distinct from what is
     /// merely out of date.
-    fn round_coverage(&self) -> crate::fetch_policy::DataCompleteness {
-        let day = self.selected_day;
+    fn round_coverage(
+        &self,
+        scope: &[(OutlookDay, OutlookProduct)],
+    ) -> crate::fetch_policy::DataCompleteness {
         let mut expected = 0;
         let mut missing = 0;
         let mut reasons = Vec::new();
-        for &product in day.products() {
-            if !self.enabled_products.contains(&product) {
-                continue;
-            }
+        for &key in scope {
+            let product = key.1;
             expected += 1;
-            let key = (day, product);
             let Some(error) = self.per_product_error.get(&key) else {
                 continue;
             };
@@ -251,7 +377,7 @@ impl SpcOutlookHandler {
 
     /// File the round's verdict on the ledger — **once**, when the last of its
     /// tasks lands.
-    fn file_round_verdict(&mut self) {
+    fn file_round_verdict(&mut self, scope: &[(OutlookDay, OutlookProduct)]) {
         let answered = std::mem::take(&mut self.round_answered_in_scope);
         let strays = std::mem::take(&mut self.round_stray_failures);
         if !answered {
@@ -266,24 +392,27 @@ impl SpcOutlookHandler {
                 self.state.retry.record_failure(&merged);
             }
         } else {
-            match self.round_verdict() {
+            match self.round_verdict(scope) {
                 RoundVerdict::Failed(e) | RoundVerdict::NotPublished(e) => {
                     self.state.retry.record_failure(&e);
                 }
                 RoundVerdict::Clear => self.state.retry.record_success(),
             }
         }
-        let coverage = self.round_coverage();
+        let coverage = self.round_coverage(scope);
         self.state.record_coverage(coverage);
     }
 
     /// Every enabled product's features, concatenated in the order they will be
     /// painted.
-    fn features_in_paint_order(&self) -> Vec<crate::types::OverlayFeature> {
-        let day = self.selected_day;
+    fn features_in_paint_order(
+        &self,
+        view: &OutlookPaneState,
+    ) -> Vec<crate::types::OverlayFeature> {
+        let day = view.selected_day;
         let mut features = Vec::new();
         for &product in day.products() {
-            if !self.enabled_products.contains(&product) {
+            if !view.enabled_products.contains(&product) {
                 continue;
             }
             if let Some(outlook) = self.state.data.get(&(day, product)) {
@@ -293,8 +422,12 @@ impl SpcOutlookHandler {
         features
     }
 
-    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::OutlooksInput> {
-        let features = self.features_in_paint_order();
+    fn paint_input(
+        &self,
+        ctx: &RasterizeContext,
+        view: &OutlookPaneState,
+    ) -> Option<rasterize::OutlooksInput> {
+        let features = self.features_in_paint_order(view);
         if features.is_empty() {
             return None;
         }
@@ -310,41 +443,25 @@ impl SpcOutlookHandler {
         })
     }
 
-    /// Bring the products that are not independently selectable into line with
-    /// the ones that are, and drop any that the selected day does not publish.
-    fn sync_implied_products(&mut self) {
-        let published = self.selected_day.products();
-        self.enabled_products
-            .retain(|p| p.is_selectable() || published.contains(p));
-        for &product in published {
-            let Some(parent) = product.implied_by() else {
-                continue;
-            };
-            if self.enabled_products.contains(&parent) {
-                self.enabled_products.insert(product);
-            } else {
-                self.enabled_products.remove(&product);
-            }
-        }
-    }
-
-    /// Drop what is no longer asked for, and take the layer back off the ledger
-    /// if nothing that is left is failing.
-    fn refile_after_selection_change(&mut self) {
-        self.sync_implied_products();
-        let day = self.selected_day;
-        let enabled = self.enabled_products.clone();
-        self.per_product_error
-            .retain(|(d, p), _| *d == day && enabled.contains(p));
+    /// Drop what **no pane** is asking for any more, and take the layer back
+    /// off the ledger if nothing that is left is failing.
+    ///
+    /// Scoped by the union, not by the pane that was just edited: the ledger
+    /// is one ledger, and clearing it because *this* pane's new selection is
+    /// clean would hide a failure another pane's selection still carries.
+    fn refile_after_selection_change(&mut self, pane: &mut PaneMut<'_>) {
+        self.edit(pane, OutlookPaneState::sync_implied_products);
+        let scope = self.union_scope(&pane.as_ref());
+        self.per_product_error.retain(|key, _| scope.contains(key));
         if self.outstanding > 0 {
             return;
         }
-        match self.round_verdict() {
+        match self.round_verdict(&scope) {
             RoundVerdict::Failed(_) => {}
             RoundVerdict::NotPublished(e) => self.state.retry.record_failure(&e),
             RoundVerdict::Clear => self.state.retry.clear(),
         }
-        let coverage = self.round_coverage();
+        let coverage = self.round_coverage(&scope);
         self.state.record_coverage(coverage);
     }
 
@@ -379,38 +496,69 @@ impl OverlayHandler for SpcOutlookHandler {
         true
     }
 
-    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
-        !self.enabled_products.is_empty()
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        !self.view(pane).enabled_products.is_empty()
     }
 
-    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
-        if enabled {
-            if self.enabled_products.is_empty()
-                && let Some(&first) = self.selected_day.products().first()
-            {
-                self.enabled_products.insert(first);
-                self.sync_implied_products();
-                self.config_generation = self.config_generation.wrapping_add(1);
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        let mut moved = false;
+        self.edit(pane, |state| {
+            if enabled {
+                if state.enabled_products.is_empty()
+                    && let Some(&first) = state.selected_day.products().first()
+                {
+                    state.enabled_products.insert(first);
+                    state.sync_implied_products();
+                    moved = true;
+                }
+            } else if !state.enabled_products.is_empty() {
+                state.enabled_products.clear();
+                moved = true;
             }
-        } else if !self.enabled_products.is_empty() {
-            self.enabled_products.clear();
+        });
+        if moved {
+            // Global on purpose: a generation is a cache-invalidation counter,
+            // and re-rasterizing a pane whose selection did not move is
+            // wasteful, never wrong. What separates two panes' textures is the
+            // pane-aware `content_signature` below, not this.
             self.config_generation = self.config_generation.wrapping_add(1);
         }
     }
 
+    /// **This pane's day and product set are in the token.** The render
+    /// dispatch groups panes by it and hands one raster to the whole group, so
+    /// a token that carried only `combined_generation` — which moves for every
+    /// pane at once — would give one pane the other's outlook.
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let view = self.view(pane);
+        let mut hasher = DefaultHasher::new();
+        (view.selected_day as u8).hash(&mut hasher);
+        // Walked from the day's own product list, never the `HashSet`'s
+        // iteration order, which is per-instance noise and would make one
+        // pane's token move between frames.
+        for &product in view.selected_day.products() {
+            if view.enabled_products.contains(&product) {
+                (product as u8).hash(&mut hasher);
+            }
+        }
+        self.combined_generation() ^ hasher.finish()
+    }
+
     /// E.g. `"Day 1 - Categorical, Tornado"`.
     fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
-        if !self.is_enabled(pane) {
+        let view = self.view(pane);
+        if view.enabled_products.is_empty() {
             return None;
         }
-        let products: Vec<String> = self
+        let products: Vec<String> = view
             .selected_day
             .products()
             .iter()
-            .filter(|p| p.is_selectable() && self.enabled_products.contains(p))
+            .filter(|p| p.is_selectable() && view.enabled_products.contains(p))
             .map(|p| p.to_string())
             .collect();
-        Some(format!("{} - {}", self.selected_day, products.join(", ")))
+        Some(format!("{} - {}", view.selected_day, products.join(", ")))
     }
 
     fn data_generation(&self) -> u64 {
@@ -418,11 +566,12 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     /// Data **this selection** can draw, not data this layer has ever fetched.
-    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
-        self.enabled_products.iter().any(|product| {
+    fn has_data(&self, pane: &PaneRef<'_>) -> bool {
+        let view = self.view(pane);
+        view.enabled_products.iter().any(|product| {
             self.state
                 .data
-                .get(&(self.selected_day, *product))
+                .get(&(view.selected_day, *product))
                 .is_some_and(|outlook| !outlook.features.is_empty())
         })
     }
@@ -433,9 +582,13 @@ impl OverlayHandler for SpcOutlookHandler {
 
     /// The host says a round has started or been abandoned; this layer's round
     /// is one task per enabled product, so the count moves by that many.
-    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
+    fn set_fetching(&mut self, fetching: bool, pane: &PaneRef<'_>) {
         if fetching {
-            self.set_outstanding(self.outstanding + self.enabled_products.len().max(1));
+            // **This pane's** count, not the union: the round that just
+            // started is the one `create_fetch_tasks` built for this pane, and
+            // that is how many answers are owed.
+            let asked = self.view(pane).enabled_products.len().max(1);
+            self.set_outstanding(self.outstanding + asked);
         } else {
             self.set_outstanding(0);
             self.round_answered_in_scope = false;
@@ -459,10 +612,11 @@ impl OverlayHandler for SpcOutlookHandler {
         self.state.data.len()
     }
 
-    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
-        let day = self.selected_day;
+    fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
+        let view = self.view(pane);
+        let day = view.selected_day;
         let mut items = Vec::new();
-        for &product in &self.enabled_products {
+        for &product in &view.enabled_products {
             let Some(outlook) = self.state.data.get(&(day, product)) else {
                 continue;
             };
@@ -482,13 +636,17 @@ impl OverlayHandler for SpcOutlookHandler {
         items
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<SpcOutlookFetchResult>(result) else {
             log::error!("SPC outlook handler received unexpected fetch result type");
             return;
         };
         let key = (fetch.day, fetch.product);
-        let in_scope = self.in_scope(&key);
+        // The union: a product pane 1 still wants is in scope even when pane
+        // 0 has stopped asking for it, and an arrival for it is this round's
+        // answer rather than a stray.
+        let scope = self.union_scope(pane);
+        let in_scope = scope.contains(&key);
         match fetch.result {
             Ok(outlook) => {
                 log::info!("Received SPC outlook: {:?} {:?}", fetch.day, fetch.product);
@@ -527,7 +685,7 @@ impl OverlayHandler for SpcOutlookHandler {
         }
         self.set_outstanding(self.outstanding.saturating_sub(1));
         if self.outstanding == 0 {
-            self.file_round_verdict();
+            self.file_round_verdict(&scope);
         }
     }
 
@@ -536,8 +694,9 @@ impl OverlayHandler for SpcOutlookHandler {
         // not on a data ID.
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        self.paint_input(ctx).map(DescribedJob::new)
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        self.paint_input(ctx, self.view(pane))
+            .map(DescribedJob::new)
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -546,16 +705,17 @@ impl OverlayHandler for SpcOutlookHandler {
             .find(|row| row.label == "overlay/outlooks")
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
-        if self.enabled_products.is_empty() {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, pane: &PaneRef<'_>) -> Vec<FetchTask> {
+        let view = self.view(pane);
+        if view.enabled_products.is_empty() {
             return Vec::new();
         }
-        let day = self.selected_day;
+        let day = view.selected_day;
         let products: Vec<OutlookProduct> = day
             .products()
             .iter()
             .copied()
-            .filter(|p| self.enabled_products.contains(p))
+            .filter(|p| view.enabled_products.contains(p))
             .collect();
         log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
         // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
@@ -588,7 +748,8 @@ impl OverlayHandler for SpcOutlookHandler {
             .collect()
     }
 
-    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
+    fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
+        let view = self.view(pane);
         let mut items = vec![ControlItem::Heading {
             text: "SPC Outlooks".into(),
         }];
@@ -610,13 +771,13 @@ impl OverlayHandler for SpcOutlookHandler {
                     id,
                     label: d.label().to_string(),
                     enabled: true,
-                    highlight: d == self.selected_day,
+                    highlight: d == view.selected_day,
                 }
             })
             .collect();
         items.push(ControlItem::ButtonRow { buttons });
 
-        for &product in self
+        for &product in view
             .selected_day
             .products()
             .iter()
@@ -633,7 +794,7 @@ impl OverlayHandler for SpcOutlookHandler {
             items.push(ControlItem::Toggle {
                 id,
                 label: product.to_string(),
-                enabled: self.enabled_products.contains(&product),
+                enabled: view.enabled_products.contains(&product),
             });
         }
 
@@ -654,7 +815,7 @@ impl OverlayHandler for SpcOutlookHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "day1" | "day2" | "day3" | "day4" | "day5" | "day6" | "day7" | "day8" => {
                 let new_day = match update.id {
@@ -668,14 +829,16 @@ impl OverlayHandler for SpcOutlookHandler {
                     "day8" => OutlookDay::Day8,
                     _ => return ControlEffect::None,
                 };
-                if new_day != self.selected_day {
-                    self.selected_day = new_day;
-                    let valid: HashSet<OutlookProduct> =
-                        new_day.products().iter().copied().collect();
-                    self.enabled_products.retain(|p| valid.contains(p));
+                if new_day != self.view(&pane.as_ref()).selected_day {
+                    self.edit(pane, |state| {
+                        state.selected_day = new_day;
+                        let valid: HashSet<OutlookProduct> =
+                            new_day.products().iter().copied().collect();
+                        state.enabled_products.retain(|p| valid.contains(p));
+                    });
                     self.config_generation = self.config_generation.wrapping_add(1);
-                    self.refile_after_selection_change();
-                    if !self.enabled_products.is_empty() {
+                    self.refile_after_selection_change(pane);
+                    if !self.view(&pane.as_ref()).enabled_products.is_empty() {
                         return ControlEffect::Fetch;
                     }
                 }
@@ -691,49 +854,80 @@ impl OverlayHandler for SpcOutlookHandler {
                     _ => return ControlEffect::None,
                 };
                 if let ControlValue::Bool(enabled) = update.value {
-                    if enabled {
-                        self.enabled_products.insert(product);
-                    } else {
-                        self.enabled_products.remove(&product);
-                    }
+                    self.edit(pane, |state| {
+                        if enabled {
+                            state.enabled_products.insert(product);
+                        } else {
+                            state.enabled_products.remove(&product);
+                        }
+                    });
                     self.config_generation = self.config_generation.wrapping_add(1);
-                    self.refile_after_selection_change();
+                    self.refile_after_selection_change(pane);
                     if enabled {
                         return ControlEffect::Fetch;
                     }
                 }
                 ControlEffect::None
             }
-            "refresh" if self.enabled_products.is_empty() => ControlEffect::None,
+            "refresh" if self.view(&pane.as_ref()).enabled_products.is_empty() => {
+                ControlEffect::None
+            }
             "refresh" => ControlEffect::Fetch,
             _ => ControlEffect::None,
         }
     }
 
+    // ── Per-pane state (WO-M10c) ──────────────────────────
+
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        Some(Box::new(OutlookPaneState::new(enabled)))
+    }
+
+    /// Field for field what `deserialize_state` does, against the pane's own
+    /// state — **except that the pane's slot flag dominates the product set.**
+    ///
+    /// For this layer the flag and the set are the *same fact* stored twice:
+    /// "on" **is** a non-empty product set. They disagree only when the config
+    /// did not come from this pane — `initialize_pane_enabled` seeds a pane
+    /// that has saved nothing with the *registry's* serialize. The flag is the
+    /// half that is the pane's, so it wins. The **day** is a fact of its own
+    /// and survives either way: a pane that is off still remembers which day
+    /// it was looking at.
+    fn deserialize_pane_state(
+        &self,
+        value: serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        let mut state = OutlookPaneState::new(enabled);
+        Self::restore_selection(&mut state, &value);
+        if !enabled {
+            state.enabled_products.clear();
+        } else if state.enabled_products.is_empty()
+            && let Some(&first) = state.selected_day.products().first()
+        {
+            state.enabled_products.insert(first);
+            state.sync_implied_products();
+        }
+        Some(Box::new(state))
+    }
+
+    /// **Byte-identical to `serialize_state`** — same members, same order,
+    /// same values. The corpus is what says so.
+    fn serialize_pane_state(&self, state: &dyn Any) -> serde_json::Value {
+        match state.downcast_ref::<OutlookPaneState>() {
+            Some(state) => Self::save_selection(state),
+            None => serde_json::Value::Null,
+        }
+    }
+
     fn serialize_state(&self) -> serde_json::Value {
-        // Declaration order, never the `HashSet`'s: set iteration order is per-instance noise.
-        let mut enabled: Vec<OutlookProduct> = self.enabled_products.iter().copied().collect();
-        enabled.sort_by_key(|product| *product as u8);
-        serde_json::json!({
-            "selected_day": self.selected_day,
-            "enabled_products": enabled,
-        })
+        Self::save_selection(&self.defaults)
     }
 
     fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(day) = value
-            .get("selected_day")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
-            self.selected_day = day;
-        }
-        if let Some(products) = value
-            .get("enabled_products")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
-            self.enabled_products = products;
-        }
-        self.sync_implied_products();
+        let mut state = std::mem::replace(&mut self.defaults, OutlookPaneState::new(false));
+        Self::restore_selection(&mut state, &value);
+        self.defaults = state;
     }
 }
 
@@ -751,7 +945,12 @@ mod tests {
 
         handler.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
-            handler.enabled_products.iter().copied().collect::<Vec<_>>(),
+            handler
+                .defaults
+                .enabled_products
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
             vec![OutlookProduct::Categorical],
             "day 1's first product is Categorical"
         );
@@ -759,10 +958,15 @@ mod tests {
         handler.set_enabled(false, &mut PaneMut::bare(0));
         assert!(!handler.is_enabled(&PaneRef::bare(0)));
 
-        handler.selected_day = OutlookDay::Day5;
+        handler.defaults.selected_day = OutlookDay::Day5;
         handler.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
-            handler.enabled_products.iter().copied().collect::<Vec<_>>(),
+            handler
+                .defaults
+                .enabled_products
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
             vec![OutlookProduct::Probabilistic],
             "day 5 publishes only the probabilistic product"
         );
@@ -770,7 +974,7 @@ mod tests {
 
     fn day3_probabilistic() -> SpcOutlookHandler {
         let mut h = SpcOutlookHandler::new();
-        h.selected_day = OutlookDay::Day3;
+        h.defaults.selected_day = OutlookDay::Day3;
         toggle(&mut h, "prob", true);
         h
     }
@@ -826,6 +1030,7 @@ mod tests {
         let handler = day3_probabilistic();
         assert!(
             handler
+                .defaults
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "ticking Probabilistic must bring the significant area into scope"
@@ -896,16 +1101,18 @@ mod tests {
         let handler = day3_probabilistic();
         assert!(
             handler
+                .defaults
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "toggle path"
         );
 
         let mut from_day5 = SpcOutlookHandler::new();
-        from_day5.selected_day = OutlookDay::Day5;
+        from_day5.defaults.selected_day = OutlookDay::Day5;
         from_day5.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
             from_day5
+                .defaults
                 .enabled_products
                 .iter()
                 .copied()
@@ -916,6 +1123,7 @@ mod tests {
         toggle(&mut from_day5, "day3", true);
         assert!(
             from_day5
+                .defaults
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "day-button path"
@@ -928,6 +1136,7 @@ mod tests {
         }));
         assert!(
             reopened
+                .defaults
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "reopen path: a pre-change session must start asking for _cigprob"
@@ -940,6 +1149,7 @@ mod tests {
         toggle(&mut handler, "prob", false);
         assert!(
             !handler
+                .defaults
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "unticking Probabilistic drops the significant area with it"
@@ -949,6 +1159,7 @@ mod tests {
         toggle(&mut handler, "day1", true);
         assert!(
             !handler
+                .defaults
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "day 1 carries its CIG features inline and publishes no such product"
@@ -980,7 +1191,7 @@ mod tests {
         }
 
         let order: Vec<String> = handler
-            .features_in_paint_order()
+            .features_in_paint_order(&handler.defaults)
             .into_iter()
             .map(|f| f.label)
             .collect();
@@ -1099,8 +1310,14 @@ mod tests {
             "off means no line"
         );
 
-        handler.enabled_products.insert(OutlookProduct::Tornado);
-        handler.enabled_products.insert(OutlookProduct::Categorical);
+        handler
+            .defaults
+            .enabled_products
+            .insert(OutlookProduct::Tornado);
+        handler
+            .defaults
+            .enabled_products
+            .insert(OutlookProduct::Categorical);
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("Day 1 - Categorical, Tornado"),
@@ -1149,7 +1366,7 @@ mod tests {
     fn four_product_handler() -> SpcOutlookHandler {
         let mut h = SpcOutlookHandler::new();
         for &p in OutlookDay::Day1.products() {
-            h.enabled_products.insert(p);
+            h.defaults.enabled_products.insert(p);
         }
         h
     }
@@ -1360,7 +1577,7 @@ mod tests {
         );
 
         let mut alone = SpcOutlookHandler::new();
-        alone.enabled_products.insert(Tornado);
+        alone.defaults.enabled_products.insert(Tornado);
         round(
             &mut alone,
             vec![(
@@ -1379,8 +1596,8 @@ mod tests {
     fn unticking_the_product_that_failed_stops_the_layer_reading_as_stale() {
         use OutlookProduct::{Categorical, Tornado};
         let mut h = SpcOutlookHandler::new();
-        h.enabled_products.insert(Categorical);
-        h.enabled_products.insert(Tornado);
+        h.defaults.enabled_products.insert(Categorical);
+        h.defaults.enabled_products.insert(Tornado);
         round(
             &mut h,
             vec![
@@ -1412,7 +1629,7 @@ mod tests {
     fn navigating_to_another_day_leaves_the_old_days_failure_behind() {
         use OutlookProduct::Categorical;
         let mut h = SpcOutlookHandler::new();
-        h.enabled_products.insert(Categorical);
+        h.defaults.enabled_products.insert(Categorical);
         round(&mut h, vec![(Categorical, Err(transient()))]);
         assert!(h.state.retry.is_unhealthy(), "premise");
 
@@ -1436,7 +1653,7 @@ mod tests {
     fn a_failure_that_lands_after_its_product_was_unticked_still_reaches_the_ladder() {
         use OutlookProduct::Tornado;
         let mut h = SpcOutlookHandler::new();
-        h.enabled_products.insert(Tornado);
+        h.defaults.enabled_products.insert(Tornado);
 
         h.set_fetching(true, &PaneRef::bare(0));
         assert!(h.is_fetching(), "premise: the request is on the wire");
@@ -1555,8 +1772,8 @@ mod tests {
     fn a_round_that_lands_wholly_out_of_scope_still_retires_its_coverage_report() {
         use OutlookProduct::{Categorical, Tornado};
         let mut h = SpcOutlookHandler::new();
-        h.enabled_products.insert(Categorical);
-        h.enabled_products.insert(Tornado);
+        h.defaults.enabled_products.insert(Categorical);
+        h.defaults.enabled_products.insert(Tornado);
         round(
             &mut h,
             vec![
@@ -1602,7 +1819,7 @@ mod tests {
         for products in 1..=OutlookDay::Day1.products().len() {
             let mut h = SpcOutlookHandler::new();
             for &p in &OutlookDay::Day1.products()[..products] {
-                h.enabled_products.insert(p);
+                h.defaults.enabled_products.insert(p);
             }
             let built = h.create_fetch_tasks(&ctx, &PaneRef::bare(0)).len();
             h.set_fetching(true, &PaneRef::bare(0));
@@ -1612,5 +1829,140 @@ mod tests {
                 h.outstanding,
             );
         }
+    }
+
+    // ── Per-pane state (WO-M10c) ──────────────────────────────────────
+
+    fn outlook_pane(day: OutlookDay, products: &[OutlookProduct]) -> FetchPayload {
+        let mut state = OutlookPaneState {
+            selected_day: day,
+            enabled_products: products.iter().copied().collect(),
+        };
+        state.sync_implied_products();
+        Box::new(state)
+    }
+
+    fn pane_ref<'a>(p: &'a FetchPayload, idx: usize) -> PaneRef<'a> {
+        PaneRef {
+            state: Some(&**p),
+            ..PaneRef::bare(idx)
+        }
+    }
+
+    /// **Two panes on two outlook days**, which the config swap could only
+    /// fake. Equal first, then diverged through the handler's own control
+    /// route; `defaults` is asserted untouched, which fires the moment one of
+    /// these methods writes a per-pane value to `&mut self`.
+    #[test]
+    fn two_panes_hold_different_outlook_days_and_the_registry_keeps_neither() {
+        let mut h = SpcOutlookHandler::new();
+        let a = outlook_pane(OutlookDay::Day1, &[OutlookProduct::Categorical]);
+        let mut b = outlook_pane(OutlookDay::Day1, &[OutlookProduct::Categorical]);
+        assert_eq!(
+            h.status_line(&pane_ref(&a, 0)),
+            h.status_line(&pane_ref(&b, 1)),
+            "premise: two panes on the same day and set answer the same",
+        );
+
+        h.apply_control(
+            &ControlUpdate {
+                id: "day3",
+                value: ControlValue::Bool(true),
+            },
+            &mut PaneMut {
+                pane_idx: 1,
+                state: Some(&mut *b),
+                peers: &[&*a],
+            },
+        );
+
+        let pane_a = pane_ref(&a, 0);
+        let pane_b = pane_ref(&b, 1);
+        assert!(
+            h.status_line(&pane_a)
+                .is_some_and(|line| line.starts_with(&OutlookDay::Day1.to_string())),
+            "pane 0's day: {:?}",
+            h.status_line(&pane_a),
+        );
+        assert!(
+            h.status_line(&pane_b)
+                .is_some_and(|line| line.starts_with(&OutlookDay::Day3.to_string())),
+            "pane 1's day: {:?}",
+            h.status_line(&pane_b),
+        );
+        // The cache token is what the render dispatch groups panes by: an
+        // equal token here is one pane drawing the other pane's outlook.
+        assert_ne!(
+            h.content_signature(&pane_a),
+            h.content_signature(&pane_b),
+            "two panes on two outlook days shared one cache token",
+        );
+        assert_eq!(
+            h.serialize_pane_state(&*a)["selected_day"],
+            serde_json::to_value(OutlookDay::Day1).unwrap(),
+            "pane 0's saved bytes",
+        );
+        assert_eq!(
+            h.serialize_pane_state(&*b)["selected_day"],
+            serde_json::to_value(OutlookDay::Day3).unwrap(),
+            "pane 1's saved bytes",
+        );
+        assert_eq!(
+            h.defaults.selected_day,
+            OutlookDay::Day1,
+            "the registry's own copy took one of the panes' edits",
+        );
+        assert!(
+            h.defaults.enabled_products.is_empty(),
+            "the registry's own copy took one of the panes' product sets",
+        );
+    }
+
+    /// **One pane's edit must not clear a failure another pane's selection is
+    /// still carrying.** The round ledger is one ledger for the whole
+    /// application, so the scope it is refiled against is the UNION of the
+    /// panes — narrowing it to the pane that was edited is the "dropping what
+    /// one pane still selects to satisfy another" failure mode.
+    ///
+    /// Non-triviality floor: the failing product is enabled in **pane 1 only**
+    /// and in neither the edited pane nor the registry's own copy, so a
+    /// pane-0-scoped refile drops it for certain.
+    #[test]
+    fn an_edit_in_one_pane_keeps_the_failure_another_panes_selection_carries() {
+        let mut h = SpcOutlookHandler::new();
+        let mut a = outlook_pane(OutlookDay::Day1, &[OutlookProduct::Categorical]);
+        let b = outlook_pane(OutlookDay::Day1, &[OutlookProduct::Tornado]);
+
+        let failing = (OutlookDay::Day1, OutlookProduct::Tornado);
+        let error = crate::fetch_policy::FetchError::transient("HTTP 500");
+        h.per_product_error.insert(failing, error.clone());
+        h.state.retry.record_failure(&error);
+        assert!(
+            h.state.retry.failures() > 0,
+            "premise: the layer is on the ledger",
+        );
+
+        // Pane 0 turns a product ON. Its own selection is clean; pane 1's is not.
+        h.apply_control(
+            &ControlUpdate {
+                id: "hail",
+                value: ControlValue::Bool(true),
+            },
+            &mut PaneMut {
+                pane_idx: 0,
+                state: Some(&mut *a),
+                peers: &[&*b],
+            },
+        );
+
+        assert!(
+            h.per_product_error.contains_key(&failing),
+            "pane 1's failing product was dropped from the ledger by pane 0's edit",
+        );
+        assert!(
+            h.state.retry.failures() > 0,
+            "the layer came off the retry ledger while pane 1's selection was \
+             still failing",
+        );
     }
 }

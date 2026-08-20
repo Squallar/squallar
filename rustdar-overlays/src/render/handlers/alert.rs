@@ -127,12 +127,41 @@ impl OverlayItem for AlertItem {
     }
 }
 
+/// **The whole per-pane state of the alerts layer**: which categories this
+/// pane lets through. There is no `enabled` beside it — for this layer "on"
+/// **is** a non-empty set, and a bool next to the set is a second copy free to
+/// disagree with the thing it was derived from.
+///
+/// `hidden_alerts` is deliberately NOT here: dismissing an alert is a
+/// statement about the alert, not about one pane's view of it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlertPaneState {
+    pub enabled_categories: HashSet<AlertCategory>,
+}
+
+impl AlertPaneState {
+    /// A pane that has saved nothing. `enabled` is the pane's own slot flag,
+    /// and for this layer it means "all categories" or "none" — the same two
+    /// answers `set_enabled` gives.
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled_categories: if enabled {
+                AlertCategory::ALL.into_iter().collect()
+            } else {
+                HashSet::new()
+            },
+        }
+    }
+}
+
 pub(crate) struct NwsAlertHandler {
     pub state: OverlayState<Vec<Arc<AlertItem>>, Assembled>,
     /// User-dismissed alert IDs, pruned on refetch.
     pub hidden_alerts: HashSet<String>,
-    /// Empty means the whole overlay is off — see `is_enabled`.
-    pub enabled_categories: HashSet<AlertCategory>,
+    /// **The registry's own copy**, used only where no pane is supplied. The
+    /// config swap keeps it in step until WO-M10c deletes the swap; every
+    /// answer prefers [`PaneRef::state`] when there is one.
+    pub defaults: AlertPaneState,
 }
 
 impl NwsAlertHandler {
@@ -140,43 +169,63 @@ impl NwsAlertHandler {
         Self {
             state: OverlayState::new(),
             hidden_alerts: HashSet::new(),
-            enabled_categories: AlertCategory::ALL.into_iter().collect(),
+            defaults: AlertPaneState::new(true),
         }
     }
 
-    /// Whether this alert would paint: category on and not hidden. The one
-    /// filter, so count, signature, status line and clickable set cannot drift.
-    fn is_drawn(&self, item: &AlertItem) -> bool {
-        self.enabled_categories.contains(&item.alert.category)
+    /// **This pane's answer, or the registry's own copy** when no pane was
+    /// supplied.
+    fn view<'a>(&'a self, pane: &PaneRef<'a>) -> &'a AlertPaneState {
+        pane.state_as::<AlertPaneState>().unwrap_or(&self.defaults)
+    }
+
+    /// Edit this pane's state, falling back to the registry's copy for a
+    /// caller that supplied no pane.
+    fn edit(&mut self, pane: &mut PaneMut<'_>, f: impl FnOnce(&mut AlertPaneState)) {
+        match pane.state_as::<AlertPaneState>() {
+            Some(state) => f(state),
+            None => f(&mut self.defaults),
+        }
+    }
+
+    /// Whether this alert would paint **in this pane**: category on there and
+    /// not hidden anywhere. The one filter, so count, signature, status line
+    /// and clickable set cannot drift.
+    fn is_drawn(&self, view: &AlertPaneState, item: &AlertItem) -> bool {
+        view.enabled_categories.contains(&item.alert.category)
             && !self.hidden_alerts.contains(&item.alert.id)
     }
 
     /// How many alerts the user's filters let through. Not the same as
     /// [`painted_count`](NwsAlertHandler::painted_count): an alert whose zone
     /// boundaries did not resolve passes every filter and paints nothing.
-    fn drawn_count(&self) -> usize {
+    fn drawn_count(&self, view: &AlertPaneState) -> usize {
         self.state
             .data
             .iter()
-            .filter(|item| self.is_drawn(item))
+            .filter(|item| self.is_drawn(view, item))
             .count()
     }
 
     /// How many alerts actually put ink on the map: let through *and* holding
     /// geometry. A zone-based alert whose boundaries all failed is `is_drawn`
     /// and paints nothing.
-    fn painted_count(&self) -> usize {
+    fn painted_count(&self, view: &AlertPaneState) -> usize {
         self.state
             .data
             .iter()
-            .filter(|item| self.is_drawn(item) && !item.alert.features.is_empty())
+            .filter(|item| self.is_drawn(view, item) && !item.alert.features.is_empty())
             .count()
     }
 
     /// What the rasterizer reads, captured once. The rows are
     /// [`rasterize::AlertPaint`], not whole [`NwsAlert`]s: prose fields the
     /// raster never draws would be bytes on the wire per raster.
-    fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::AlertsInput> {
+    fn paint_input(
+        &self,
+        ctx: &RasterizeContext,
+        view: &AlertPaneState,
+    ) -> Option<rasterize::AlertsInput> {
         if self.state.data.is_empty() {
             return None;
         }
@@ -191,10 +240,53 @@ impl NwsAlertHandler {
                     features: Arc::clone(&i.alert.features),
                 })
                 .collect(),
-            enabled_categories: self.enabled_categories.iter().copied().collect(),
+            enabled_categories: view.enabled_categories.iter().copied().collect(),
             hidden_ids: self.hidden_alerts.clone(),
             device_scale: ctx.device_scale,
         })
+    }
+
+    /// **The one encoder** for a category set, so the registry's copy and a
+    /// pane's cannot write different bytes for the same set.
+    ///
+    /// In `ALL`'s declaration order, never the `HashSet`'s: a set's iteration
+    /// order is per-instance noise, so writing it raw makes save→load→save
+    /// produce a *different file* every reopen. `known_categories` records
+    /// which categories *this build offered a toggle for*, so the decoder can
+    /// tell "the user turned this off" apart from "the build that saved this
+    /// had no way to turn it on".
+    fn save_categories(enabled: &HashSet<AlertCategory>) -> serde_json::Value {
+        let ordered: Vec<AlertCategory> = AlertCategory::ALL
+            .into_iter()
+            .filter(|category| enabled.contains(category))
+            .collect();
+        serde_json::json!({
+            "enabled_categories": ordered,
+            "known_categories": AlertCategory::ALL,
+        })
+    }
+
+    /// **The one decoder**, the exact inverse of [`Self::save_categories`].
+    /// A value that names no set at all leaves `into` as it was.
+    fn restore_categories(into: &mut HashSet<AlertCategory>, value: &serde_json::Value) {
+        let Some(cats) = value
+            .get("enabled_categories")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        else {
+            return;
+        };
+        *into = cats;
+        let known: HashSet<AlertCategory> = value
+            .get("known_categories")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if !into.is_empty() {
+            into.extend(
+                AlertCategory::ALL
+                    .into_iter()
+                    .filter(|c| !known.contains(c)),
+            );
+        }
     }
 }
 
@@ -221,8 +313,8 @@ impl OverlayHandler for NwsAlertHandler {
         true
     }
 
-    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
-        !self.enabled_categories.is_empty()
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        !self.view(pane).enabled_categories.is_empty()
     }
 
     /// The master toggle over a layer whose "enabled" is really a category set.
@@ -230,13 +322,15 @@ impl OverlayHandler for NwsAlertHandler {
     /// set is empty**, so flipping the master off and on loses the user's subset.
     fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
         let was = self.is_enabled(&pane.as_ref());
-        if enabled {
-            if self.enabled_categories.is_empty() {
-                self.enabled_categories.extend(AlertCategory::ALL);
+        self.edit(pane, |state| {
+            if enabled {
+                if state.enabled_categories.is_empty() {
+                    state.enabled_categories.extend(AlertCategory::ALL);
+                }
+            } else {
+                state.enabled_categories.clear();
             }
-        } else {
-            self.enabled_categories.clear();
-        }
+        });
         // The drawn set changed, so cached textures must know.
         if was != self.is_enabled(&pane.as_ref()) {
             self.state.data_generation = self.state.data_generation.wrapping_add(1);
@@ -250,11 +344,12 @@ impl OverlayHandler for NwsAlertHandler {
     /// [`drawn_count`]: NwsAlertHandler::drawn_count
     /// [`painted_count`]: NwsAlertHandler::painted_count
     fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
-        if !self.is_enabled(pane) {
+        let view = self.view(pane);
+        if view.enabled_categories.is_empty() {
             return None;
         }
-        let allowed = self.drawn_count();
-        let painted = self.painted_count();
+        let allowed = self.drawn_count(view);
+        let painted = self.painted_count(view);
         let shown = if painted == allowed {
             format!("{allowed}")
         } else {
@@ -263,7 +358,7 @@ impl OverlayHandler for NwsAlertHandler {
         // Walked from `AlertCategory::ALL`, not from a list spelled out here.
         let cats: Vec<&str> = AlertCategory::ALL
             .into_iter()
-            .filter(|category| self.enabled_categories.contains(category))
+            .filter(|category| view.enabled_categories.contains(category))
             .map(AlertCategory::short_name)
             .collect();
         Some(format!("{shown} shown - {}", cats.join("/")))
@@ -281,12 +376,13 @@ impl OverlayHandler for NwsAlertHandler {
     /// `features.len()` is in the fold as well as the id: a **zone-based** alert
     /// legitimately draws nothing on one poll and its counties on the next under
     /// the same id, so an id-only fold left the warning invisible.
-    fn content_signature(&self, _pane: &PaneRef<'_>) -> u64 {
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
+        let view = self.view(pane);
         let mut folded = 0u64;
         let mut visible = 0u64;
         for item in &self.state.data {
-            if self.is_drawn(item) {
+            if self.is_drawn(view, item) {
                 let mut hasher = DefaultHasher::new();
                 item.alert.id.hash(&mut hasher);
                 item.alert.features.len().hash(&mut hasher);
@@ -331,11 +427,12 @@ impl OverlayHandler for NwsAlertHandler {
 
     /// The alerts a click can land on, each borrowing its own polygons —
     /// thousands of rings on an active day, lent and never copied.
-    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
+    fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
+        let view = self.view(pane);
         self.state
             .data
             .iter()
-            .filter(|item| self.is_drawn(item))
+            .filter(|item| self.is_drawn(view, item))
             .map(|item| ClickableItem {
                 features: &item.alert.features,
                 item: item.clone() as Arc<dyn OverlayItem>,
@@ -395,8 +492,9 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        self.paint_input(ctx).map(DescribedJob::new)
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        self.paint_input(ctx, self.view(pane))
+            .map(DescribedJob::new)
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -425,6 +523,7 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
+        let view = self.view(pane);
         let mut items = vec![ControlItem::Heading {
             text: "NWS Alerts".into(),
         }];
@@ -436,7 +535,7 @@ impl OverlayHandler for NwsAlertHandler {
                 .map(|category| ControlItem::Toggle {
                     id: category.control_id(),
                     label: category.plural_label().into(),
-                    enabled: self.enabled_categories.contains(&category),
+                    enabled: view.enabled_categories.contains(&category),
                 }),
         );
 
@@ -456,8 +555,8 @@ impl OverlayHandler for NwsAlertHandler {
             });
         }
         if self.has_data(pane) {
-            let allowed = self.drawn_count();
-            let painted = self.painted_count();
+            let allowed = self.drawn_count(view);
+            let painted = self.painted_count(view);
             items.push(ControlItem::InfoText {
                 text: if painted == allowed {
                     format!("{allowed} alerts shown")
@@ -490,11 +589,13 @@ impl OverlayHandler for NwsAlertHandler {
         };
         if let ControlValue::Bool(enabled) = update.value {
             let was_enabled = self.is_enabled(&pane.as_ref());
-            if enabled {
-                self.enabled_categories.insert(category);
-            } else {
-                self.enabled_categories.remove(&category);
-            }
+            self.edit(pane, |state| {
+                if enabled {
+                    state.enabled_categories.insert(category);
+                } else {
+                    state.enabled_categories.remove(&category);
+                }
+            });
             self.state.data_generation = self.state.data_generation.wrapping_add(1);
             if !was_enabled
                 && self.is_enabled(&pane.as_ref())
@@ -508,44 +609,59 @@ impl OverlayHandler for NwsAlertHandler {
         ControlEffect::None
     }
 
-    /// `known_categories` records which categories *this build offered a toggle
-    /// for*, so `deserialize_state` can tell "the user turned this off" apart from
-    /// "the build that saved this had no way to turn it on".
+    // ── Per-pane state (WO-M10c) ──────────────────────────
+
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        Some(Box::new(AlertPaneState::new(enabled)))
+    }
+
+    /// Field for field what `deserialize_state` does, against the pane's own
+    /// state — **except that the pane's slot flag dominates.**
+    ///
+    /// For this layer the flag and the set are the *same fact* stored twice:
+    /// "on" **is** a non-empty set, and `adopt_handler_state` always writes
+    /// both together, so the pane's own saved bytes can never disagree with
+    /// its own flag. They disagree only when the config did not come from
+    /// this pane — `initialize_pane_enabled` seeds a pane that has saved
+    /// nothing with the *registry's* serialize, which knows nothing about
+    /// this pane. The flag is the half that is the pane's, so it wins: a pane
+    /// that is off comes up with an empty set whatever set the config names,
+    /// and a pane that is on and whose config names none comes up with
+    /// `ALL` — the same reading `set_enabled(true)` gives.
+    fn deserialize_pane_state(
+        &self,
+        value: serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        let mut state = AlertPaneState::new(enabled);
+        if !enabled {
+            return Some(Box::new(state));
+        }
+        Self::restore_categories(&mut state.enabled_categories, &value);
+        if state.enabled_categories.is_empty() {
+            state.enabled_categories.extend(AlertCategory::ALL);
+        }
+        Some(Box::new(state))
+    }
+
+    /// **Byte-identical to `serialize_state`** — same members, same order,
+    /// same values. The corpus is what says so.
+    fn serialize_pane_state(&self, state: &dyn Any) -> serde_json::Value {
+        match state.downcast_ref::<AlertPaneState>() {
+            Some(state) => Self::save_categories(&state.enabled_categories),
+            None => serde_json::Value::Null,
+        }
+    }
+
     fn serialize_state(&self) -> serde_json::Value {
-        // In `ALL`'s declaration order, never the `HashSet`'s: a set's iteration
-        // order is per-instance noise, so writing it raw makes save→load→save
-        // produce a *different file* every reopen.
-        let enabled: Vec<AlertCategory> = AlertCategory::ALL
-            .into_iter()
-            .filter(|category| self.enabled_categories.contains(category))
-            .collect();
-        serde_json::json!({
-            "enabled_categories": enabled,
-            "known_categories": AlertCategory::ALL,
-        })
+        Self::save_categories(&self.defaults.enabled_categories)
     }
 
     /// A category the saving build never offered is **not** a category the user
     /// declined, so it comes back on. An **empty** set is left alone: that is
     /// the master toggle off.
     fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(cats) = value
-            .get("enabled_categories")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
-            self.enabled_categories = cats;
-            let known: HashSet<AlertCategory> = value
-                .get("known_categories")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            if !self.enabled_categories.is_empty() {
-                self.enabled_categories.extend(
-                    AlertCategory::ALL
-                        .into_iter()
-                        .filter(|c| !known.contains(c)),
-                );
-            }
-        }
+        Self::restore_categories(&mut self.defaults.enabled_categories, &value);
     }
 }
 
@@ -639,7 +755,7 @@ mod tests {
         let mut handler = handler_with(vec![zone_alert("a", "Tornado Warning", 0)]);
         let unresolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
-            handler.drawn_count(),
+            handler.drawn_count(&handler.defaults),
             1,
             "fixture: the alert must count as drawn with no features, or the \
              count would move on its own and this proves nothing",
@@ -651,7 +767,7 @@ mod tests {
         );
         let resolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
-            handler.drawn_count(),
+            handler.drawn_count(&handler.defaults),
             1,
             "fixture: still one drawn alert, so only the geometry moved",
         );
@@ -729,7 +845,10 @@ mod tests {
         );
         handler.hidden_alerts.clear();
 
-        handler.enabled_categories.remove(&AlertCategory::Warning);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Warning);
         assert_ne!(
             handler.content_signature(&PaneRef::bare(0)),
             b_only,
@@ -762,7 +881,7 @@ mod tests {
             &PaneRef::across(&[]),
         );
         assert_eq!(
-            handler.drawn_count(),
+            handler.drawn_count(&handler.defaults),
             3,
             "premise: every filter lets all three through",
         );
@@ -808,20 +927,29 @@ mod tests {
             "a hidden alert is not shown, so it must not be counted as shown"
         );
 
-        handler.enabled_categories.remove(&AlertCategory::Advisory);
-        handler.enabled_categories.remove(&AlertCategory::Watch);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Advisory);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Watch);
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W/Oth")
         );
 
-        handler.enabled_categories.remove(&AlertCategory::Other);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Other);
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W")
         );
 
-        handler.enabled_categories.clear();
+        handler.defaults.enabled_categories.clear();
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)),
             None,
@@ -841,20 +969,23 @@ mod tests {
 
         handler.set_enabled(false, &mut PaneMut::bare(0));
         assert!(!handler.is_enabled(&PaneRef::bare(0)));
-        assert!(handler.enabled_categories.is_empty());
+        assert!(handler.defaults.enabled_categories.is_empty());
 
         handler.set_enabled(true, &mut PaneMut::bare(0));
         assert!(handler.is_enabled(&PaneRef::bare(0)));
         assert_eq!(
-            handler.enabled_categories.len(),
+            handler.defaults.enabled_categories.len(),
             AlertCategory::ALL.len(),
             "on from nothing restores every category"
         );
 
-        handler.enabled_categories.remove(&AlertCategory::Advisory);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Advisory);
         handler.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
-            handler.enabled_categories.len(),
+            handler.defaults.enabled_categories.len(),
             AlertCategory::ALL.len() - 1,
             "on over a live subset must not widen the user's selection"
         );
@@ -915,9 +1046,9 @@ mod tests {
             alert("c", "Flood Advisory"),
         ]);
         let agree = |h: &NwsAlertHandler, expected: usize, why: &str| {
-            assert_eq!(h.drawn_count(), expected, "{why}");
+            assert_eq!(h.drawn_count(&h.defaults), expected, "{why}");
             assert_eq!(
-                h.drawn_count(),
+                h.drawn_count(&h.defaults),
                 h.clickable_items(&PaneRef::bare(0)).len(),
                 "the count and the clickable set disagree: {why}",
             );
@@ -936,14 +1067,17 @@ mod tests {
             "a hidden alert is neither counted nor clickable",
         );
 
-        handler.enabled_categories.remove(&AlertCategory::Advisory);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Advisory);
         agree(
             &handler,
             1,
             "a category turned off takes its alerts with it",
         );
 
-        handler.enabled_categories.clear();
+        handler.defaults.enabled_categories.clear();
         agree(&handler, 0, "the whole layer off draws and answers nothing");
     }
 
@@ -979,7 +1113,7 @@ mod tests {
         let orphaned: Vec<(&str, AlertCategory)> = events
             .iter()
             .map(|e| (*e, AlertCategory::from_event(e)))
-            .filter(|(_, category)| !handler.enabled_categories.contains(category))
+            .filter(|(_, category)| !handler.defaults.enabled_categories.contains(category))
             .collect();
         assert!(
             orphaned.is_empty(),
@@ -1018,7 +1152,7 @@ mod tests {
                 &mut ctx,
             );
             assert!(
-                !handler.enabled_categories.contains(&category),
+                !handler.defaults.enabled_categories.contains(&category),
                 "{category}'s toggle did not turn it off",
             );
             handler.apply_control(
@@ -1029,7 +1163,7 @@ mod tests {
                 &mut ctx,
             );
             assert!(
-                handler.enabled_categories.contains(&category),
+                handler.defaults.enabled_categories.contains(&category),
                 "{category}'s toggle did not turn it back on",
             );
         }
@@ -1051,7 +1185,7 @@ mod tests {
         );
 
         assert_eq!(
-            handler.drawn_count(),
+            handler.drawn_count(&handler.defaults),
             2,
             "the air quality alert is missing from the count that would have \
              shown it missing from the map",
@@ -1062,8 +1196,11 @@ mod tests {
             Some("2 shown - W/Wa/Adv/Oth"),
         );
 
-        handler.enabled_categories.remove(&AlertCategory::Other);
-        assert_eq!(handler.drawn_count(), 1);
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Other);
+        assert_eq!(handler.drawn_count(&handler.defaults), 1);
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W/Wa/Adv")
@@ -1081,7 +1218,10 @@ mod tests {
         let mut handler = NwsAlertHandler::new();
         handler.deserialize_state(legacy);
         assert!(
-            handler.enabled_categories.contains(&AlertCategory::Other),
+            handler
+                .defaults
+                .enabled_categories
+                .contains(&AlertCategory::Other),
             "a category with no toggle in the saving build was never declined",
         );
 
@@ -1091,7 +1231,7 @@ mod tests {
             "known_categories": AlertCategory::ALL,
         }));
         assert_eq!(
-            handler.enabled_categories,
+            handler.defaults.enabled_categories,
             HashSet::from([AlertCategory::Warning]),
             "the user turned three categories off and they must stay off",
         );
@@ -1099,7 +1239,7 @@ mod tests {
         let mut handler = NwsAlertHandler::new();
         handler.deserialize_state(serde_json::json!({ "enabled_categories": [] }));
         assert!(
-            handler.enabled_categories.is_empty(),
+            handler.defaults.enabled_categories.is_empty(),
             "an empty set is a deliberate state, not a build to migrate",
         );
     }
@@ -1117,6 +1257,104 @@ mod tests {
         assert_eq!(
             forward.content_signature(&PaneRef::bare(0)),
             backward.content_signature(&PaneRef::bare(0))
+        );
+    }
+
+    // ── Per-pane state (WO-M10c) ──────────────────────────────────────
+
+    fn pane_with(categories: &[AlertCategory]) -> FetchPayload {
+        Box::new(AlertPaneState {
+            enabled_categories: categories.iter().copied().collect(),
+        })
+    }
+
+    /// **Two panes filtering the same alerts differently**, which the config
+    /// swap could only fake by re-installing one pane's category set before
+    /// every read.
+    ///
+    /// The panes are asserted **equal first**, and `defaults` is asserted
+    /// untouched at the end — the assertion that fires the moment one of these
+    /// methods writes a per-pane value to `&mut self`.
+    #[test]
+    fn two_panes_hold_different_alert_categories_and_the_registry_keeps_neither() {
+        let mut handler = handler_with(vec![
+            alert("w", "Tornado Warning"),
+            alert("a", "Flood Advisory"),
+        ]);
+        assert_eq!(
+            handler.state.data.len(),
+            2,
+            "premise: one alert of each category is on the map",
+        );
+
+        let all = AlertCategory::ALL;
+        let a = pane_with(&all);
+        let mut b = pane_with(&all);
+        fn ref_of<'a>(p: &'a FetchPayload, idx: usize) -> PaneRef<'a> {
+            PaneRef {
+                state: Some(&**p),
+                ..PaneRef::bare(idx)
+            }
+        }
+        assert_eq!(
+            handler.status_line(&ref_of(&a, 0)),
+            handler.status_line(&ref_of(&b, 1)),
+            "premise: two panes with the same categories answer the same",
+        );
+
+        // Diverge through the handler's own control route, not a field write.
+        handler.apply_control(
+            &ControlUpdate {
+                id: AlertCategory::Advisory.control_id(),
+                value: ControlValue::Bool(false),
+            },
+            &mut PaneMut {
+                pane_idx: 1,
+                state: Some(&mut *b),
+                peers: &[&*a],
+            },
+        );
+
+        let pane_a = ref_of(&a, 0);
+        let pane_b = ref_of(&b, 1);
+        assert_eq!(
+            handler.drawn_count(handler.view(&pane_a)),
+            2,
+            "pane 0 still lets both categories through",
+        );
+        assert_eq!(
+            handler.drawn_count(handler.view(&pane_b)),
+            1,
+            "pane 1 turned advisories off",
+        );
+        assert_eq!(
+            handler.clickable_items(&pane_a).len(),
+            2,
+            "pane 0's clickable set",
+        );
+        assert_eq!(
+            handler.clickable_items(&pane_b).len(),
+            1,
+            "pane 1's clickable set",
+        );
+        // The cache token is what the render dispatch groups panes by: an
+        // equal token here is one pane drawing the other pane's alerts.
+        assert_ne!(
+            handler.content_signature(&pane_a),
+            handler.content_signature(&pane_b),
+            "two panes filtering different categories shared one cache token",
+        );
+        assert_eq!(
+            handler.serialize_pane_state(&*b)["enabled_categories"]
+                .as_array()
+                .map(Vec::len),
+            Some(all.len() - 1),
+            "pane 1's saved bytes",
+        );
+        assert_eq!(
+            handler.defaults.enabled_categories.len(),
+            all.len(),
+            "the registry's own copy took one of the panes' edits",
         );
     }
 }

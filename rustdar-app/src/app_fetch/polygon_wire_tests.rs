@@ -2,7 +2,7 @@ use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::types::{HatchPattern, OverlayFeature};
-use rustdar_source::handler::{PaneMut, PaneRef};
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
@@ -77,6 +77,21 @@ fn a_feature() -> OverlayFeature {
     )
 }
 
+/// Turn `id` on **in pane 0's own state**, the door a layer toggle takes.
+///
+/// Not `overlays.set_enabled(.., PaneMut::bare(0))`: a converted handler keeps
+/// "on" in the pane, and a write to the registry alone is one
+/// `adopt_handler_state` away from being undone — which is exactly what
+/// happened here when the outlook took its pane in WO-M10c.
+fn enable_on_pane0(app: &mut crate::app::App, id: &LayerId) {
+    let mut registry = std::mem::take(&mut app.gui.overlays);
+    if let Some(pane) = app.gui.pane_mut(0) {
+        pane.hydrate_layer_states(&registry, 0);
+        pane.set_layer_enabled(&mut registry, 0, id, true);
+    }
+    app.gui.overlays = registry;
+}
+
 fn seed(app: &mut crate::app::App, id: &LayerId) {
     use rustdar_overlays::render::handlers::{alert, discussion, outlook};
     let data: rustdar_overlays::render::overlay_state::FetchPayload = match id {
@@ -106,9 +121,7 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
         }
         id if *id == known::SPC_OUTLOOK => {
             use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-            app.gui
-                .overlays
-                .set_enabled(id, true, &mut PaneMut::bare(0));
+            enable_on_pane0(app, id);
             Box::new(outlook::SpcOutlookFetchResult {
                 day: OutlookDay::Day1,
                 product: OutlookProduct::Categorical,
