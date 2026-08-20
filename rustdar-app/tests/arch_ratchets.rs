@@ -76,9 +76,9 @@ const PRODUCT_DEF_ANCHOR: &str = concat!("enum Radar", "Product");
 // — at-land measurements (see the table above).
 
 /// Row 1a.
-const SELF_GUI_MAX: usize = 191;
+const SELF_GUI_MAX: usize = 188;
 /// Row 1b — the same needle outside test-named paths.
-const SELF_GUI_NON_TEST_MAX: usize = 186;
+const SELF_GUI_NON_TEST_MAX: usize = 183;
 /// Row 2.
 const UI_SETTER_MAX: usize = 3;
 /// Row 4a.

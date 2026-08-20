@@ -11,7 +11,7 @@ use rustdar_radar::voxel::VoxelGrid;
 use rustdar_radar::voxel::{VoxelRequest, VoxelShape};
 use rustdar_radar::xsect::CrossSection;
 use rustdar_radar::xsect::SectionRequest;
-use rustdar_source::handler::PaneRef;
+use rustdar_source::handler::{PaneMut, PaneRef};
 use rustdar_source::job::{DescribedJob, DescribedOut, JobGeometry};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -2296,18 +2296,25 @@ fn a_seeded_reports_registry() -> rustdar_overlays::render::overlay_state::Overl
         comments: String::new(),
     };
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(&rustdar_source::id::known::STORM_REPORTS, true);
-    registry.apply_fetch_result(OverlayFetchResult {
-        kind: rustdar_source::id::known::STORM_REPORTS,
-        data: Box::new(StormReportsFetchResult(Ok(StormReportRound {
-            reports: vec![
-                report(StormReportKind::Tornado, 35.33, -97.28),
-                report(StormReportKind::Hail, 36.2, -98.5),
-                report(StormReportKind::Wind, 33.8, -96.7),
-            ],
-            failed_kinds: Vec::new(),
-        }))),
-    });
+    registry.set_enabled(
+        &rustdar_source::id::known::STORM_REPORTS,
+        true,
+        &mut PaneMut::bare(0),
+    );
+    registry.apply_fetch_result(
+        OverlayFetchResult {
+            kind: rustdar_source::id::known::STORM_REPORTS,
+            data: Box::new(StormReportsFetchResult(Ok(StormReportRound {
+                reports: vec![
+                    report(StormReportKind::Tornado, 35.33, -97.28),
+                    report(StormReportKind::Hail, 36.2, -98.5),
+                    report(StormReportKind::Wind, 33.8, -96.7),
+                ],
+                failed_kinds: Vec::new(),
+            }))),
+        },
+        &PaneRef::bare(0),
+    );
     registry
 }
 
@@ -2329,26 +2336,33 @@ fn a_seeded_glm_registry() -> rustdar_overlays::render::overlay_state::OverlayRe
         level: GlmDataLevel::Flash,
     };
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(&rustdar_source::id::known::LIGHTNING, true);
-    registry.apply_fetch_result(OverlayFetchResult {
-        kind: rustdar_source::id::known::LIGHTNING,
-        data: Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
-            flashes: vec![
-                flash(30, 35.3, -97.3),
-                flash(130, 36.2, -98.5),
-                flash(230, 33.8, -96.7),
-            ],
-            dead_feeds: Vec::new(),
-            queried: Vec::new(),
-            parse_failures: None,
-            transport_failures: None,
-            level_failures: Vec::new(),
-            evaluated_levels: Vec::new(),
-            listing_failures: Vec::new(),
-            window_gaps: Vec::new(),
-            record_drops: RecordDrops::default(),
-        }))),
-    });
+    registry.set_enabled(
+        &rustdar_source::id::known::LIGHTNING,
+        true,
+        &mut PaneMut::bare(0),
+    );
+    registry.apply_fetch_result(
+        OverlayFetchResult {
+            kind: rustdar_source::id::known::LIGHTNING,
+            data: Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
+                flashes: vec![
+                    flash(30, 35.3, -97.3),
+                    flash(130, 36.2, -98.5),
+                    flash(230, 33.8, -96.7),
+                ],
+                dead_feeds: Vec::new(),
+                queried: Vec::new(),
+                parse_failures: None,
+                transport_failures: None,
+                level_failures: Vec::new(),
+                evaluated_levels: Vec::new(),
+                listing_failures: Vec::new(),
+                window_gaps: Vec::new(),
+                record_drops: RecordDrops::default(),
+            }))),
+        },
+        &PaneRef::bare(0),
+    );
     registry
 }
 

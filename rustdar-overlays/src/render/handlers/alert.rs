@@ -221,15 +221,15 @@ impl OverlayHandler for NwsAlertHandler {
         true
     }
 
-    fn is_enabled(&self) -> bool {
+    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
         !self.enabled_categories.is_empty()
     }
 
     /// The master toggle over a layer whose "enabled" is really a category set.
     /// Off clears the set; on restores [`AlertCategory::ALL`] **only when the
     /// set is empty**, so flipping the master off and on loses the user's subset.
-    fn set_enabled(&mut self, enabled: bool) {
-        let was = self.is_enabled();
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        let was = self.is_enabled(&pane.as_ref());
         if enabled {
             if self.enabled_categories.is_empty() {
                 self.enabled_categories.extend(AlertCategory::ALL);
@@ -238,7 +238,7 @@ impl OverlayHandler for NwsAlertHandler {
             self.enabled_categories.clear();
         }
         // The drawn set changed, so cached textures must know.
-        if was != self.is_enabled() {
+        if was != self.is_enabled(&pane.as_ref()) {
             self.state.data_generation = self.state.data_generation.wrapping_add(1);
         }
     }
@@ -249,8 +249,8 @@ impl OverlayHandler for NwsAlertHandler {
     ///
     /// [`drawn_count`]: NwsAlertHandler::drawn_count
     /// [`painted_count`]: NwsAlertHandler::painted_count
-    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
-        if !self.is_enabled() {
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        if !self.is_enabled(pane) {
             return None;
         }
         let allowed = self.drawn_count();
@@ -281,7 +281,7 @@ impl OverlayHandler for NwsAlertHandler {
     /// `features.len()` is in the fold as well as the id: a **zone-based** alert
     /// legitimately draws nothing on one poll and its counties on the next under
     /// the same id, so an id-only fold left the warning invisible.
-    fn content_signature(&self) -> u64 {
+    fn content_signature(&self, _pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut folded = 0u64;
         let mut visible = 0u64;
@@ -297,7 +297,7 @@ impl OverlayHandler for NwsAlertHandler {
         folded ^ visible.rotate_left(32)
     }
 
-    fn has_data(&self) -> bool {
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
         !self.state.data.is_empty()
     }
 
@@ -305,7 +305,7 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.fetching
     }
 
-    fn set_fetching(&mut self, fetching: bool) {
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
         self.state.fetching = fetching;
     }
 
@@ -325,13 +325,13 @@ impl OverlayHandler for NwsAlertHandler {
         Some(120)
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
         self.state.data.len()
     }
 
     /// The alerts a click can land on, each borrowing its own polygons —
     /// thousands of rings on an active day, lent and never copied.
-    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
+    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         self.state
             .data
             .iter()
@@ -383,7 +383,7 @@ impl OverlayHandler for NwsAlertHandler {
         }
     }
 
-    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {
         selections.retain(|sel| {
             if sel.layer_id() != known::NWS_ALERTS {
                 return true;
@@ -424,7 +424,7 @@ impl OverlayHandler for NwsAlertHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
+    fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
         let mut items = vec![ControlItem::Heading {
             text: "NWS Alerts".into(),
         }];
@@ -455,7 +455,7 @@ impl OverlayHandler for NwsAlertHandler {
                 text: "Fetching...".into(),
             });
         }
-        if self.has_data() {
+        if self.has_data(pane) {
             let allowed = self.drawn_count();
             let painted = self.painted_count();
             items.push(ControlItem::InfoText {
@@ -479,7 +479,7 @@ impl OverlayHandler for NwsAlertHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
         if update.id == "refresh" {
             return ControlEffect::Fetch;
         }
@@ -489,7 +489,7 @@ impl OverlayHandler for NwsAlertHandler {
             return ControlEffect::None;
         };
         if let ControlValue::Bool(enabled) = update.value {
-            let was_enabled = self.is_enabled();
+            let was_enabled = self.is_enabled(&pane.as_ref());
             if enabled {
                 self.enabled_categories.insert(category);
             } else {
@@ -497,8 +497,10 @@ impl OverlayHandler for NwsAlertHandler {
             }
             self.state.data_generation = self.state.data_generation.wrapping_add(1);
             if !was_enabled
-                && self.is_enabled()
-                && self.state.enable_should_refetch(self.has_data())
+                && self.is_enabled(&pane.as_ref())
+                && self
+                    .state
+                    .enable_should_refetch(self.has_data(&pane.as_ref()))
             {
                 return ControlEffect::Fetch;
             }
@@ -635,7 +637,7 @@ mod tests {
     #[test]
     fn a_warning_that_gains_its_zone_polygons_moves_the_signature() {
         let mut handler = handler_with(vec![zone_alert("a", "Tornado Warning", 0)]);
-        let unresolved = handler.content_signature();
+        let unresolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
             handler.drawn_count(),
             1,
@@ -644,7 +646,7 @@ mod tests {
         );
 
         handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
-        let resolved = handler.content_signature();
+        let resolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
             handler.drawn_count(),
             1,
@@ -658,7 +660,7 @@ mod tests {
 
         handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 2)]));
         assert_ne!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             resolved,
             "two of three zones is not the picture three of three is",
         );
@@ -669,7 +671,7 @@ mod tests {
     #[test]
     fn a_refetch_of_the_same_warning_set_keeps_the_signature() {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
-        let first = handler.content_signature();
+        let first = handler.content_signature(&PaneRef::bare(0));
         let generation_before = handler.data_generation();
         handler.apply_fetch_result(whole(vec![alert("a", "Tornado Warning")]));
         assert_ne!(
@@ -678,7 +680,7 @@ mod tests {
             "fixture: the refetch really did bump the generation",
         );
         assert_eq!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             first,
             "an unchanged warning set across a poll must keep its signature",
         );
@@ -687,17 +689,17 @@ mod tests {
     #[test]
     fn every_change_to_the_drawn_set_moves_the_signature() {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
-        let one_warning = handler.content_signature();
+        let one_warning = handler.content_signature(&PaneRef::bare(0));
 
         handler.apply_fetch_result(whole(vec![
             alert("a", "Tornado Warning"),
             alert("b", "Severe Thunderstorm Warning"),
         ]));
-        let two_warnings = handler.content_signature();
+        let two_warnings = handler.content_signature(&PaneRef::bare(0));
         assert_ne!(two_warnings, one_warning, "a new warning must move it");
 
         handler.apply_fetch_result(whole(vec![alert("b", "Severe Thunderstorm Warning")]));
-        let b_only = handler.content_signature();
+        let b_only = handler.content_signature(&PaneRef::bare(0));
         assert_ne!(b_only, two_warnings, "an expiry must move it");
         assert_ne!(
             b_only, one_warning,
@@ -706,7 +708,7 @@ mod tests {
 
         handler.hidden_alerts.insert("b".to_string());
         assert_ne!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             b_only,
             "hiding an alert must move it",
         );
@@ -714,7 +716,7 @@ mod tests {
 
         handler.enabled_categories.remove(&AlertCategory::Warning);
         assert_ne!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             b_only,
             "disabling the category must move it",
         );
@@ -811,14 +813,17 @@ mod tests {
     #[test]
     fn the_master_toggle_clears_and_restores_the_category_set() {
         let mut handler = NwsAlertHandler::new();
-        assert!(handler.is_enabled(), "precondition: defaults on");
+        assert!(
+            handler.is_enabled(&PaneRef::bare(0)),
+            "precondition: defaults on"
+        );
 
-        handler.set_enabled(false);
-        assert!(!handler.is_enabled());
+        handler.set_enabled(false, &mut PaneMut::bare(0));
+        assert!(!handler.is_enabled(&PaneRef::bare(0)));
         assert!(handler.enabled_categories.is_empty());
 
-        handler.set_enabled(true);
-        assert!(handler.is_enabled());
+        handler.set_enabled(true, &mut PaneMut::bare(0));
+        assert!(handler.is_enabled(&PaneRef::bare(0)));
         assert_eq!(
             handler.enabled_categories.len(),
             AlertCategory::ALL.len(),
@@ -826,7 +831,7 @@ mod tests {
         );
 
         handler.enabled_categories.remove(&AlertCategory::Advisory);
-        handler.set_enabled(true);
+        handler.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
             handler.enabled_categories.len(),
             AlertCategory::ALL.len() - 1,
@@ -892,7 +897,7 @@ mod tests {
             assert_eq!(h.drawn_count(), expected, "{why}");
             assert_eq!(
                 h.drawn_count(),
-                h.clickable_items().len(),
+                h.clickable_items(&PaneRef::bare(0)).len(),
                 "the count and the clickable set disagree: {why}",
             );
         };
@@ -1030,7 +1035,7 @@ mod tests {
             "the air quality alert is missing from the count that would have \
              shown it missing from the map",
         );
-        assert_eq!(handler.clickable_items().len(), 2);
+        assert_eq!(handler.clickable_items(&PaneRef::bare(0)).len(), 2);
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("2 shown - W/Wa/Adv/Oth"),
@@ -1088,6 +1093,9 @@ mod tests {
             alert("b", "Flash Flood Warning"),
             alert("a", "Tornado Warning"),
         ]);
-        assert_eq!(forward.content_signature(), backward.content_signature());
+        assert_eq!(
+            forward.content_signature(&PaneRef::bare(0)),
+            backward.content_signature(&PaneRef::bare(0))
+        );
     }
 }

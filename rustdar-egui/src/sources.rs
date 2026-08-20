@@ -24,7 +24,7 @@ pub fn default_draw_order() -> Vec<LayerId> {
 #[cfg(test)]
 mod controls_parity_tests {
     use rustdar_overlays::render::controls::ControlItem;
-    use rustdar_overlays::render::overlay_state::{OverlayRegistry, PaneRef};
+    use rustdar_overlays::render::overlay_state::{OverlayRegistry, PaneMut, PaneRef};
     use rustdar_source::id::LayerId;
 
     use super::all;
@@ -70,9 +70,9 @@ mod controls_parity_tests {
         );
         let ctx = PaneRef::bare(0);
         for kind in kinds {
-            registry.set_enabled(&kind, true);
+            registry.set_enabled(&kind, true, &mut PaneMut::bare(0));
             let shown: Vec<String> = registry.controls(&kind, &ctx).iter().map(shape).collect();
-            registry.set_enabled(&kind, false);
+            registry.set_enabled(&kind, false, &mut PaneMut::bare(0));
             let hidden: Vec<String> = registry.controls(&kind, &ctx).iter().map(shape).collect();
             assert_eq!(
                 shown, hidden,

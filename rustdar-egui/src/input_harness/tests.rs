@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 
 /// The two durations that bracket the idle backstop, deliberately **not** derived
@@ -11727,10 +11728,13 @@ fn zone_alert_over(
 /// fetch delivers them.
 fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert::NwsAlert>) {
     use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
-    h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
-        kind: known::NWS_ALERTS,
-        data: OverlayRegistry::nws_alerts_payload(alerts),
-    });
+    h.gui_mut().overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: known::NWS_ALERTS,
+            data: OverlayRegistry::nws_alerts_payload(alerts),
+        },
+        &PaneRef::bare(0),
+    );
 }
 
 /// A click inside a warning's polygon still selects that warning.
@@ -11825,10 +11829,13 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
         ),
         concerning: None,
     };
-    h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
-        kind: known::SPC_DISCUSSIONS,
-        data: OverlayRegistry::spc_discussions_payload(vec![md]),
-    });
+    h.gui_mut().overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: known::SPC_DISCUSSIONS,
+            data: OverlayRegistry::spc_discussions_payload(vec![md]),
+        },
+        &PaneRef::bare(0),
+    );
 
     h.warm_up();
 

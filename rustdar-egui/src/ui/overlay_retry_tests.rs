@@ -5,6 +5,7 @@ use rustdar_overlays::fetch_policy::{
     BROKEN_RETRY_SECS, FetchError, FetchHealth, REFUSALS_BEFORE_BROKEN,
 };
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
+use rustdar_source::handler::PaneRef;
 use std::time::Duration;
 
 /// The layer the storm was found on.
@@ -34,13 +35,16 @@ fn failing_frame(gui: &mut Gui) -> usize {
             && kind == KIND
         {
             started += 1;
-            gui.overlays.set_fetching(&kind, true);
-            gui.overlays.apply_fetch_result(OverlayFetchResult {
-                kind,
-                data: OverlayRegistry::spc_discussions_failure_payload(FetchError::transient(
-                    "SPC MD RSS request failed: connection refused",
-                )),
-            });
+            gui.overlays.set_fetching(&kind, true, &PaneRef::bare(0));
+            gui.overlays.apply_fetch_result(
+                OverlayFetchResult {
+                    kind,
+                    data: OverlayRegistry::spc_discussions_failure_payload(FetchError::transient(
+                        "SPC MD RSS request failed: connection refused",
+                    )),
+                },
+                &PaneRef::bare(0),
+            );
         }
     }
     started
@@ -160,13 +164,16 @@ fn a_user_fetch_is_answered_immediately_however_deep_the_backoff() {
 
 /// Feed one refusal through the real ingest path.
 fn refuse(gui: &mut Gui) {
-    gui.overlays.set_fetching(&KIND, true);
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
-        data: OverlayRegistry::spc_discussions_failure_payload(FetchError::permanent(
-            "SPC returned HTTP 400 for MD RSS feed",
-        )),
-    });
+    gui.overlays.set_fetching(&KIND, true, &PaneRef::bare(0));
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: KIND,
+            data: OverlayRegistry::spc_discussions_failure_payload(FetchError::permanent(
+                "SPC returned HTTP 400 for MD RSS feed",
+            )),
+        },
+        &PaneRef::bare(0),
+    );
 }
 
 /// **One 4xx must not take a layer off the poll.**
@@ -248,11 +255,14 @@ fn a_broken_layer_recovers_on_its_own_once_the_heartbeat_comes_due() {
         "the heartbeat never came due; a broken layer is still a dead end",
     );
 
-    gui.overlays.set_fetching(&KIND, true);
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
-        data: OverlayRegistry::spc_discussions_payload(Vec::new()),
-    });
+    gui.overlays.set_fetching(&KIND, true, &PaneRef::bare(0));
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: KIND,
+            data: OverlayRegistry::spc_discussions_payload(Vec::new()),
+        },
+        &PaneRef::bare(0),
+    );
     assert_eq!(
         gui.overlays.fetch_health(&KIND),
         Some(&FetchHealth::Ok),
@@ -287,18 +297,24 @@ fn refresh_revives_a_broken_layer_immediately() {
 fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
     let mut gui = gui_with_only_discussions();
 
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
-        data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
-    });
-    assert!(gui.overlays.has_data(&KIND), "premise: something is drawn");
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: KIND,
+            data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
+        },
+        &PaneRef::bare(0),
+    );
+    assert!(
+        gui.overlays.has_data(&KIND, &PaneRef::bare(0)),
+        "premise: something is drawn"
+    );
 
     for _ in 0..REFUSALS_BEFORE_BROKEN {
         refuse(&mut gui);
         gui.overlays.rewind_retry(&KIND, Duration::from_secs(64));
     }
     assert!(
-        gui.overlays.has_data(&KIND),
+        gui.overlays.has_data(&KIND, &PaneRef::bare(0)),
         "premise: the stale data is still on screen, which is the whole danger",
     );
 
@@ -322,10 +338,13 @@ fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
          next automatic poll would still be on the heartbeat",
     );
 
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
-        data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
-    });
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: KIND,
+            data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
+        },
+        &PaneRef::bare(0),
+    );
     let mut actions = Vec::new();
     let mut pane = std::mem::take(gui.pane_mut(0).expect("one pane"));
     gui.set_pane_overlay_with_fetch(&mut pane, 0, &KIND, false, &mut actions);
@@ -373,13 +392,16 @@ fn an_absent_product_polls_at_the_ordinary_interval() {
     let mut gui = gui_with_only_discussions();
     let mut actions = Vec::new();
     gui.check_auto_polls(&mut actions);
-    gui.overlays.set_fetching(&KIND, true);
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
-        data: OverlayRegistry::spc_discussions_failure_payload(FetchError::absent(
-            "SPC returned HTTP 404",
-        )),
-    });
+    gui.overlays.set_fetching(&KIND, true, &PaneRef::bare(0));
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: KIND,
+            data: OverlayRegistry::spc_discussions_failure_payload(FetchError::absent(
+                "SPC returned HTTP 404",
+            )),
+        },
+        &PaneRef::bare(0),
+    );
 
     let interval = Duration::from_secs(gui.overlays.auto_poll_interval(&KIND).unwrap());
     let delay = gui.overlay_poll_delay(&KIND).expect("still polling");
@@ -404,11 +426,14 @@ fn a_success_clears_the_backoff() {
         drive(&mut gui, 1);
     }
 
-    gui.overlays.set_fetching(&KIND, true);
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: KIND,
-        data: OverlayRegistry::spc_discussions_payload(Vec::new()),
-    });
+    gui.overlays.set_fetching(&KIND, true, &PaneRef::bare(0));
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: KIND,
+            data: OverlayRegistry::spc_discussions_payload(Vec::new()),
+        },
+        &PaneRef::bare(0),
+    );
 
     let interval = Duration::from_secs(gui.overlays.auto_poll_interval(&KIND).unwrap());
     let delay = gui.overlay_poll_delay(&KIND).expect("still polling");

@@ -153,6 +153,7 @@ impl super::Gui {
         // frame-end reload in `Gui::ui` usually guarantees it already, but an
         // active-pane switch earlier this same frame (the top bar's segments)
         // would leave the previous pane's configs loaded.
+        pane.hydrate_layer_states(&self.overlays, self.active_pane);
         if pane.has_slot_configs() {
             self.overlays.load_pane_configs(&pane.slot_config_map());
         }

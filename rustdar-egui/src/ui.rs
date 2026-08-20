@@ -1,5 +1,6 @@
 use crate::actions::{GuiAction, RadarConfig};
 use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
+use rustdar_source::handler::PaneMut;
 
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
@@ -957,21 +958,26 @@ impl Gui {
     /// Turn an overlay on or off for `pane` — **both halves**.
     pub(super) fn write_pane_overlay(
         overlays: &mut OverlayRegistry,
+        pane_idx: usize,
         pane: &mut PaneState,
         kind: &LayerId,
         on: bool,
     ) {
+        pane.hydrate_layer_states(overlays, pane_idx);
         if pane.has_slot_configs() {
             overlays.load_pane_configs(&pane.slot_config_map());
         }
-        overlays.set_enabled(kind, on);
+        overlays.set_enabled(kind, on, &mut PaneMut::bare(pane_idx));
+        // The pane's own state is where "on" lives for a converted handler;
+        // the global above is what the swap still hands the rest.
+        pane.set_layer_enabled(overlays, pane_idx, kind, on);
         pane.adopt_handler_state(overlays);
         pane.release_disabled_overlay_textures();
     }
 
     fn set_active_pane_overlay(&mut self, kind: &LayerId, on: bool) {
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
-        Self::write_pane_overlay(&mut self.overlays, &mut pane, kind, on);
+        Self::write_pane_overlay(&mut self.overlays, self.active_pane, &mut pane, kind, on);
         self.panes[self.active_pane] = pane;
     }
 

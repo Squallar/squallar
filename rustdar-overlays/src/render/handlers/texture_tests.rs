@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::render::overlay_state::PaneRef;
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::DescribedJob;
 
@@ -239,7 +239,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
 
     // Outlook's "enabled" *is* its product set, and the set is what its data is
     // keyed by, so the toggle has to precede the payload.
-    handler.set_enabled(true);
+    handler.set_enabled(true, &mut PaneMut::bare(0));
 
     let payload: FetchPayload = match &handler.id() {
         id if *id == known::NWS_ALERTS => Box::new(super::alert::NwsAlertFetchResult(Ok(
@@ -551,7 +551,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
             assert_eq!(
-                h.has_data(),
+                h.has_data(&PaneRef::bare(0)),
                 h.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
                 "{name} disagrees with its own rasterizer while {state}. \
                  `ui_map_pane` gates both the render dispatch and the settle \
@@ -572,10 +572,10 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
 
         // Off. For every kind but outlooks the master toggle is a `bool` the
         // rasterizer never reads, so both halves stay `true`.
-        handler.set_enabled(false);
+        handler.set_enabled(false, &mut PaneMut::bare(0));
         agree(handler.as_ref(), "seeded, then switched off");
 
-        handler.set_enabled(true);
+        handler.set_enabled(true, &mut PaneMut::bare(0));
         agree(handler.as_ref(), "seeded, switched off, switched back on");
 
         checked += 1;
@@ -601,7 +601,8 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     let mut handler = super::outlook::SpcOutlookHandler::new();
     assert!(seed(&mut handler), "the outlook handler takes a fetch");
     assert!(
-        handler.has_data() && handler.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
+        handler.has_data(&PaneRef::bare(0))
+            && handler.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
         "fixture: Day 1 Categorical is both ticked and fetched",
     );
 
@@ -623,7 +624,7 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
         "fixture: there is nothing on Day 5 to rasterize",
     );
     assert!(
-        !handler.has_data(),
+        !handler.has_data(&PaneRef::bare(0)),
         "the pane would dispatch a render `spawn_overlay_render` abandons, and \
          ask for another frame 100 ms later, for as long as the app is open",
     );
@@ -675,7 +676,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
                 {
                     assert_eq!(
                         items.len(),
-                        h.item_count(),
+                        h.item_count(&PaneRef::bare(0)),
                         "{name}'s `hit_items` while {state} does not cover \
                          its data one item per row; a shorter list truncates \
                          the id space the cells index into",
@@ -702,9 +703,9 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
              cannot render at all",
         );
         agree(handler.as_ref(), "seeded and enabled");
-        handler.set_enabled(false);
+        handler.set_enabled(false, &mut PaneMut::bare(0));
         agree(handler.as_ref(), "seeded, then switched off");
-        handler.set_enabled(true);
+        handler.set_enabled(true, &mut PaneMut::bare(0));
         agree(handler.as_ref(), "seeded, switched off, switched back on");
         described += 1;
     }

@@ -1,3 +1,4 @@
+use rustdar_source::handler::{PaneMut, PaneRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1115,7 +1116,10 @@ impl super::Gui {
             .iter()
             .find_map(|pc| pc.layers.get("Radar").copied())
         {
-            self.overlays.set_enabled(&known::RADAR, enabled);
+            // The v0 toggle map's Radar entry, applied to the registry's own
+            // default before any pane exists to carry it.
+            self.overlays
+                .set_enabled(&known::RADAR, enabled, &mut PaneMut::bare(0));
         }
 
         let mut zoom_restored = false;
@@ -1157,11 +1161,14 @@ impl super::Gui {
                         // Absent → whatever the handler says now, which is
                         // what an absent `enabled_overlays` entry has always
                         // resolved to. Unknown id → false: nothing draws it.
-                        enabled: slot
-                            .enabled
-                            .unwrap_or_else(|| handler.is_some_and(|h| h.is_enabled())),
+                        enabled: slot.enabled.unwrap_or_else(|| {
+                            handler.is_some_and(|h| h.is_enabled(&PaneRef::bare(i)))
+                        }),
                         config: slot.config.clone(),
                         id,
+                        // Derived from `config` at the next hydrate, never
+                        // read off the wire.
+                        state: None,
                     }
                 })
                 .collect();

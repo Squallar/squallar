@@ -96,6 +96,7 @@ pub(super) fn render_pane_map_content(
     zoom: f64,
     ctx: &mut PaneRenderCtx<'_>,
 ) {
+    ctx.pane.hydrate_layer_states(ctx.overlays, ctx.pane_idx);
     if ctx.pane.has_slot_configs() {
         ctx.overlays.load_pane_configs(&ctx.pane.slot_config_map());
     }
@@ -262,7 +263,7 @@ pub(super) fn render_pane_map_content(
                         selected.extend(overlay_ctx.draw_overlay(
                             ctx.pane.overlay_cache(id),
                             overlays.map_labels(id),
-                            || overlays.clickable_items(id),
+                            || overlays.clickable_items(id, &ctx.pane.layer_ref(ctx.pane_idx, id)),
                         ));
                     }
                     RenderMode::PerFramePoint => {
@@ -340,7 +341,12 @@ pub(super) fn render_pane_map_content(
                 let hover_lon = map_pos.x();
                 for id in &draw_order {
                     if ctx.pane.is_overlay_enabled(id)
-                        && let Some(text) = ctx.overlays.hover_value_at(id, hover_lat, hover_lon)
+                        && let Some(text) = ctx.overlays.hover_value_at(
+                            id,
+                            hover_lat,
+                            hover_lon,
+                            &ctx.pane.layer_ref(ctx.pane_idx, id),
+                        )
                     {
                         ctx.pane.overlay_hover_value = Some(text);
                         break;
@@ -384,8 +390,10 @@ pub(super) fn render_pane_map_content(
                 continue;
             }
             let enabled = ctx.pane.is_overlay_enabled(id);
-            let token = overlay_cache_token(ctx.overlays, ctx.pane, id, is_dark);
-            let has_data = ctx.overlays.has_data(id);
+            let token = overlay_cache_token(ctx.overlays, ctx.pane_idx, ctx.pane, id, is_dark);
+            let has_data = ctx
+                .overlays
+                .has_data(id, &ctx.pane.layer_ref(ctx.pane_idx, id));
             let cache = ctx.pane.overlay_cache_mut(id);
             // Asked on every frame the overlay is live, and not gated on
             // `render_in_flight`: a skipped frame is missing from the settle clock.
@@ -461,6 +469,7 @@ pub(super) fn render_pane_map_content(
 /// when the picture would be different.
 fn overlay_cache_token(
     overlays: &OverlayRegistry,
+    pane_idx: usize,
     pane: &PaneState,
     id: &LayerId,
     is_dark: bool,
@@ -468,7 +477,10 @@ fn overlay_cache_token(
     let base = if *id == known::RADAR_SITES {
         pane.radar_sites_render_gen
     } else {
-        overlays.content_signature(id)
+        // Pane-aware since WO-M10b: two panes filtering the same layer
+        // differently draw different pictures, and one token for both would be
+        // one texture for both.
+        overlays.content_signature(id, &pane.layer_ref(pane_idx, id))
     };
     let themed = is_dark && overlays.theme_sensitive(id);
     base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 }

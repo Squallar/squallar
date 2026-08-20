@@ -5,6 +5,7 @@ use crate::Gui;
 use crate::UI_CONFIG_KEY;
 use rustdar_kv::{KvStore, MemoryKvStore};
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::known;
 
 /// A store holding exactly one era's file, as the disk would.
@@ -25,7 +26,7 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
 
     let mut gui = Gui::new();
     assert!(
-        gui.overlays.is_enabled(&known::RADAR),
+        gui.overlays.is_enabled(&known::RADAR, &PaneRef::bare(0)),
         "precondition: a fresh Gui has the radar layer on, or the migration \
          assertion below could pass without the migration running",
     );
@@ -46,8 +47,21 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
     // The legacy Radar migration: no `overlay_states` in the file, so the
     // first pane's `layers["Radar"] = false` drives the global handler.
     assert!(
-        !gui.overlays.is_enabled(&known::RADAR),
+        !gui.overlays.is_enabled(&known::RADAR, &PaneRef::bare(0)),
         "the legacy per-pane Radar toggle was not migrated to the handler",
+    );
+    // And **in the pane**, which is where WO-M10b moved the answer: the
+    // assertion above is about the registry's own copy, and a converted
+    // handler could satisfy it while the pane came up drawing radar anyway.
+    assert!(
+        !pane.is_overlay_enabled(&known::RADAR),
+        "pane 0 came back with radar on — the migrated toggle did not reach \
+         the slot the pane actually draws from",
+    );
+    assert!(
+        !gui.overlays
+            .is_enabled(&known::RADAR, &pane.layer_ref(0, &known::RADAR)),
+        "the handler answers pane 0 with radar on",
     );
 
     // The rest of the file arrived: a failed load could not have applied
@@ -983,6 +997,107 @@ fn the_live_chunk_switch_reaches_every_panes_radar_slot() {
                 .expect("a radar slot")["config"]["live_chunks"],
             serde_json::json!(true),
             "pane {i}'s slot did not reach the file",
+        );
+    }
+}
+
+/// **Two panes hold different answers for the same layer, and both survive the
+/// reopen.** The load-bearing test of WO-M10b: before it, one registry field
+/// answered for every pane, and a per-pane toggle only looked per-pane because
+/// the config swap re-installed the right value before each read.
+///
+/// It has a **non-triviality floor**: the two panes are asserted to start in
+/// agreement, so the divergence below cannot be one the fixture already had.
+#[test]
+fn two_panes_hold_different_answers_for_one_layer_and_both_survive_a_reopen() {
+    let kind = known::CITY_LABELS;
+    let store = store_with(include_str!("fixtures/live_chunks_off.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the two-pane fixture must load");
+
+    let before: Vec<bool> = (0..2)
+        .map(|i| gui.pane(i).expect("both panes").is_overlay_enabled(&kind))
+        .collect();
+    assert_eq!(
+        before[0], before[1],
+        "premise: the fixture's two panes agree about {kind:?}, or the \
+         divergence asserted below was already in the file",
+    );
+
+    gui.set_overlay_on_pane_for_test(0, &kind, true);
+    gui.set_overlay_on_pane_for_test(1, &kind, false);
+
+    // Both halves: what the pane draws, and what the HANDLER answers when
+    // asked about that pane. The second is the one that used to be a global.
+    for (idx, want) in [(0usize, true), (1usize, false)] {
+        let pane = gui.pane(idx).expect("both panes");
+        assert_eq!(
+            pane.is_overlay_enabled(&kind),
+            want,
+            "pane {idx}'s slot flag",
+        );
+        assert_eq!(
+            gui.overlays.is_enabled(&kind, &pane.layer_ref(idx, &kind)),
+            want,
+            "the handler answered pane {idx} from some other pane's state — \
+             this is exactly the bug the config swap was hiding",
+        );
+    }
+
+    // **Put the registry's own copy at odds with the panes**, then re-run the
+    // write-back every toggle and control edit ends with. Without this the
+    // check below cannot fail: the swap is still alive, and the registry
+    // happens to be holding the value the last pane wrote, so bytes taken
+    // from the registry and bytes taken from the pane are the same bytes.
+    // This is the disagreement that tells them apart.
+    gui.overlays
+        .set_enabled(&kind, true, &mut rustdar_source::handler::PaneMut::bare(0));
+    gui.readopt_panes_for_test();
+    assert!(
+        !gui.pane(1).expect("both panes").is_overlay_enabled(&kind),
+        "pane 1 took the registry's copy on the write-back — its own state is \
+         not what its slot is written from",
+    );
+
+    // The saved bytes carry both, in the shape they have always had.
+    let json = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    for (idx, want) in [(0usize, true), (1usize, false)] {
+        assert_eq!(
+            v["panes"][idx]["layer_slots"]
+                .as_array()
+                .expect("a slot list")
+                .iter()
+                .find(|s| s["id"] == kind.as_str())
+                .expect("a slot for the layer")["config"]["enabled"],
+            serde_json::json!(want),
+            "pane {idx}'s config did not reach the file",
+        );
+    }
+
+    // Reopen: a fresh build, the same file.
+    let reopened = MemoryKvStore::default();
+    reopened
+        .store(UI_CONFIG_KEY, &json)
+        .expect("the memory store accepts a write");
+    let mut again = Gui::new();
+    assert!(
+        again.load_ui_config(&reopened),
+        "the written file must reload"
+    );
+    for (idx, want) in [(0usize, true), (1usize, false)] {
+        let pane = again.pane(idx).expect("both panes");
+        assert_eq!(
+            pane.is_overlay_enabled(&kind),
+            want,
+            "pane {idx} did not come back as it was left",
+        );
+        assert_eq!(
+            again
+                .overlays
+                .is_enabled(&kind, &pane.layer_ref(idx, &kind)),
+            want,
+            "pane {idx}'s handler state did not survive the reopen",
         );
     }
 }

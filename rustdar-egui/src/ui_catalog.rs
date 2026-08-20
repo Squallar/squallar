@@ -562,12 +562,10 @@ impl super::Gui {
         // turns on with it — a product under a hidden radar layer is a click
         // that visibly did nothing. No fetch rule: radar data arrives through
         // the scan path, not `FetchOverlay`.
-        Self::write_pane_overlay(
-            &mut self.overlays,
-            &mut self.panes[idx],
-            &known::RADAR,
-            true,
-        );
+        let Self {
+            overlays, panes, ..
+        } = self;
+        Self::write_pane_overlay(overlays, idx, &mut panes[idx], &known::RADAR, true);
         let pane = &mut self.panes[idx];
         if pane.selected_product() != product {
             pane.set_selected_product(product);
@@ -588,6 +586,7 @@ impl super::Gui {
         // Through `apply_control` rather than a field write, so the handler's
         // own rules hold: a cached parameter re-renders without a fetch, an
         // uncached one asks for one.
+        pane.hydrate_layer_states(&self.overlays, idx);
         if pane.has_slot_configs() {
             self.overlays.load_pane_configs(&pane.slot_config_map());
         }
@@ -595,7 +594,13 @@ impl super::Gui {
             id: "parameter",
             value: ControlValue::String(param.as_str().to_owned()),
         };
-        let mut pane_ctx = PaneMut::bare(idx);
+        let mut pane_ctx = PaneMut {
+            pane_idx: idx,
+            state: pane
+                .slot_mut(&known::MODEL_DATA)
+                .and_then(|slot| slot.state.as_deref_mut())
+                .map(|s| s as &mut dyn std::any::Any),
+        };
         let effect = self
             .overlays
             .apply_control(&known::MODEL_DATA, &update, &mut pane_ctx);

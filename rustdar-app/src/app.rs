@@ -1,4 +1,5 @@
 use egui_wgpu::wgpu;
+use rustdar_source::handler::PaneRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -1304,7 +1305,12 @@ impl App {
     /// Drain the unified overlay fetch channel.
     fn poll_overlay_fetch_results(&mut self) {
         while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
-            self.gui.overlays.apply_fetch_result(result);
+            self.gui
+                .overlays
+                // WO-M10c owes this the pane the fetch was for: the arrival
+                // carries a layer id and no pane, and `retain_selections`
+                // filters through the pane's own selection.
+                .apply_fetch_result(result, &PaneRef::bare(0));
         }
     }
 

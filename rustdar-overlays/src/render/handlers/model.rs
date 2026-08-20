@@ -157,11 +157,11 @@ impl OverlayHandler for ModelDataHandler {
         RenderMode::Texture
     }
 
-    fn is_enabled(&self) -> bool {
+    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
         self.enabled
     }
 
-    fn set_enabled(&mut self, enabled: bool) {
+    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
         self.enabled = enabled;
     }
 
@@ -176,7 +176,7 @@ impl OverlayHandler for ModelDataHandler {
         self.state.data_generation
     }
 
-    fn has_data(&self) -> bool {
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
         self.cached_grids.contains(self.selected_param)
     }
 
@@ -184,7 +184,7 @@ impl OverlayHandler for ModelDataHandler {
         self.state.fetching
     }
 
-    fn set_fetching(&mut self, fetching: bool) {
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
         self.state.fetching = fetching;
     }
 
@@ -200,7 +200,7 @@ impl OverlayHandler for ModelDataHandler {
         self.state.fetch_time
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
         self.state
             .data
             .as_ref()
@@ -212,7 +212,10 @@ impl OverlayHandler for ModelDataHandler {
         Some(3600) // HRRR runs hourly.
     }
 
-    fn clickable_items(&self) -> Vec<crate::render::overlay_state::ClickableItem<'_>> {
+    fn clickable_items<'a>(
+        &'a self,
+        _pane: &PaneRef<'_>,
+    ) -> Vec<crate::render::overlay_state::ClickableItem<'a>> {
         Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 
@@ -257,10 +260,11 @@ impl OverlayHandler for ModelDataHandler {
     fn retain_selections(
         &self,
         _selections: &mut Vec<Arc<dyn crate::render::overlay_state::OverlayItem>>,
+        _pane: &PaneRef<'_>,
     ) {
     }
 
-    fn hover_value_at(&self, lat: f64, lon: f64) -> Option<String> {
+    fn hover_value_at(&self, lat: f64, lon: f64, _pane: &PaneRef<'_>) -> Option<String> {
         let grid = self.cached_grids.get(self.selected_param)?;
         if !grid.bounds.contains_point(lat, lon) {
             return None;
@@ -416,12 +420,16 @@ impl OverlayHandler for ModelDataHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && self.state.enable_should_refetch(self.has_data()) {
+                    if val
+                        && self
+                            .state
+                            .enable_should_refetch(self.has_data(&pane.as_ref()))
+                    {
                         return ControlEffect::Fetch;
                     }
                 }
@@ -627,15 +635,18 @@ mod tests {
     fn hover_reports_the_nearest_grid_points_value() {
         let h = hover_handler();
         assert_eq!(
-            h.hover_value_at(35.001, -97.099).as_deref(),
+            h.hover_value_at(35.001, -97.099, &PaneRef::bare(0))
+                .as_deref(),
             Some("SBCAPE: 300 J/kg"),
         );
         assert_eq!(
-            h.hover_value_at(35.099, -97.001).as_deref(),
+            h.hover_value_at(35.099, -97.001, &PaneRef::bare(0))
+                .as_deref(),
             Some("SBCAPE: 4100 J/kg"),
         );
         assert_eq!(
-            h.hover_value_at(35.001, -97.001).as_deref(),
+            h.hover_value_at(35.001, -97.001, &PaneRef::bare(0))
+                .as_deref(),
             Some("SBCAPE: 1200 J/kg"),
         );
     }
@@ -643,26 +654,35 @@ mod tests {
     #[test]
     fn hover_is_silent_outside_the_grid_bounds() {
         let h = hover_handler();
-        assert_eq!(h.hover_value_at(40.0, -97.05), None);
-        assert_eq!(h.hover_value_at(35.05, -90.0), None);
+        assert_eq!(h.hover_value_at(40.0, -97.05, &PaneRef::bare(0)), None);
+        assert_eq!(h.hover_value_at(35.05, -90.0, &PaneRef::bare(0)), None);
     }
 
     /// Inside the bounds but ~7.8 km from all four points, past the 0.05° cutoff.
     #[test]
     fn hover_is_silent_further_than_the_cutoff_from_every_point() {
-        assert_eq!(hover_handler().hover_value_at(35.05, -97.05), None);
+        assert_eq!(
+            hover_handler().hover_value_at(35.05, -97.05, &PaneRef::bare(0)),
+            None
+        );
     }
 
     /// 0.02° north of the top edge: outside the bounds but *inside* the 0.05°
     /// cutoff, so only the bounds test can reject it.
     #[test]
     fn hover_is_silent_just_outside_the_bounds_beside_a_real_point() {
-        assert_eq!(hover_handler().hover_value_at(35.12, -97.0), None);
+        assert_eq!(
+            hover_handler().hover_value_at(35.12, -97.0, &PaneRef::bare(0)),
+            None
+        );
     }
 
     #[test]
     fn hover_is_silent_before_any_data_arrives() {
-        assert_eq!(ModelDataHandler::new().hover_value_at(35.0, -97.0), None);
+        assert_eq!(
+            ModelDataHandler::new().hover_value_at(35.0, -97.0, &PaneRef::bare(0)),
+            None
+        );
     }
 
     #[test]
@@ -788,7 +808,10 @@ mod tests {
 
         for &p in panes {
             h.selected_param = p;
-            assert!(h.has_data(), "the pane showing {p:?} has no grid");
+            assert!(
+                h.has_data(&PaneRef::bare(0)),
+                "the pane showing {p:?} has no grid"
+            );
             assert!(
                 h.prepare_job(&rasterize_ctx(), &PaneRef::bare(0)).is_some(),
                 "the pane showing {p:?} would be skipped by app_fetch and left \
@@ -887,7 +910,7 @@ mod tests {
         let p = h.cached_grids.recency_order()[0];
         h.selected_param = p;
         assert!(
-            h.hover_value_at(35.0, -97.0).is_some(),
+            h.hover_value_at(35.0, -97.0, &PaneRef::bare(0)).is_some(),
             "the fixture must answer a hover, or this step proves nothing",
         );
         counted_as_a_use(&h, p, "hover_value_at");
@@ -912,7 +935,7 @@ mod tests {
 
         let p = h.cached_grids.recency_order()[0];
         h.selected_param = p;
-        assert!(h.has_data(), "{p:?} is resident");
+        assert!(h.has_data(&PaneRef::bare(0)), "{p:?} is resident");
         counted_as_a_use(&h, p, "has_data");
 
         let p = h.cached_grids.recency_order()[0];
@@ -942,7 +965,7 @@ mod tests {
         let mut h = full_cache();
         h.selected_param = oldest();
         assert!(
-            h.hover_value_at(35.0, -97.0).is_some(),
+            h.hover_value_at(35.0, -97.0, &PaneRef::bare(0)).is_some(),
             "the fixture must answer a hover",
         );
 
@@ -1030,7 +1053,7 @@ mod tests {
 
         h.selected_param = oldest();
         assert!(
-            !h.has_data(),
+            !h.has_data(&PaneRef::bare(0)),
             "{:?} must be gone, or this is not the eviction case",
             oldest(),
         );
@@ -1048,7 +1071,11 @@ mod tests {
         );
 
         h.selected_param = overflow();
-        assert!(h.has_data(), "{:?} is resident", overflow());
+        assert!(
+            h.has_data(&PaneRef::bare(0)),
+            "{:?} is resident",
+            overflow()
+        );
         h.enabled = false;
         assert_eq!(
             h.apply_control(

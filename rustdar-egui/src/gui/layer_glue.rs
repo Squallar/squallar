@@ -2,6 +2,7 @@
 //! `ui.rs` — the whole enclosing fn of each.
 use super::*;
 use rustdar_source::handler::PaneMut;
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::LayerId;
 
 impl Gui {
@@ -19,16 +20,18 @@ impl Gui {
             self.probes.control_render_passes += 1;
         }
 
+        pane.hydrate_layer_states(&self.overlays, self.active_pane);
         if pane.has_slot_configs() {
             self.overlays.load_pane_configs(&pane.slot_config_map());
         }
 
-        let ctx = self.active_pane_control_context();
-
         let mut updates: Vec<(LayerId, ControlUpdate)> = Vec::new();
         let mut probe = ControlProbe::default();
 
-        let controls = self.overlays.controls(kind, &ctx);
+        let controls = {
+            let view = pane.view(self.active_pane);
+            self.overlays.controls(kind, &view.layer(kind))
+        };
         for item in controls.iter().filter(|item| !is_master_control(item)) {
             render_control_item(ui, kind, item, &mut updates, &mut probe);
         }
@@ -45,10 +48,18 @@ impl Gui {
         #[cfg(not(test))]
         let _ = probe;
 
-        let mut pane_ctx = PaneMut::bare(self.active_pane);
-
         let active_pane = self.active_pane;
         for (kind, update) in updates {
+            // The REAL slot state, not `None`: an edit that landed in a
+            // scratch context would be silently dropped, and the control
+            // would read as applied.
+            let mut pane_ctx = PaneMut {
+                pane_idx: active_pane,
+                state: pane
+                    .slot_mut(&kind)
+                    .and_then(|slot| slot.state.as_deref_mut())
+                    .map(|s| s as &mut dyn std::any::Any),
+            };
             let effect = self.overlays.apply_control(&kind, &update, &mut pane_ctx);
             if matches!(effect, ControlEffect::Fetch) {
                 push_user_overlay_fetch(&mut self.overlays, actions, kind, active_pane);
@@ -69,12 +80,18 @@ impl Gui {
         on: bool,
         actions: &mut Vec<GuiAction>,
     ) {
-        Self::write_pane_overlay(&mut self.overlays, pane, kind, on);
+        Self::write_pane_overlay(&mut self.overlays, pane_idx, pane, kind, on);
         let stale = self
             .overlays
             .fetch_health(kind)
             .is_some_and(FetchHealth::is_unhealthy);
-        if on && (!self.overlays.has_data(kind) || stale) && !self.overlays.is_fetching(kind) {
+        if on
+            && (!self
+                .overlays
+                .has_data(kind, &pane.layer_ref(pane_idx, kind))
+                || stale)
+            && !self.overlays.is_fetching(kind)
+        {
             push_user_overlay_fetch(&mut self.overlays, actions, kind.clone(), pane_idx);
         }
     }
@@ -92,7 +109,13 @@ impl Gui {
         let mut wanted: Vec<(LayerId, u32, bool)> = self
             .overlays
             .handlers()
-            .map(|h| (h.id(), h.draw_order_weight(), h.is_enabled()))
+            .map(|h| {
+                (
+                    h.id(),
+                    h.draw_order_weight(),
+                    h.is_enabled(&PaneRef::bare(0)),
+                )
+            })
             .collect();
         // Weight order, so each insertion lands among slots that are already
         // in it — the same walk `reconcile_draw_order` made.
@@ -116,6 +139,15 @@ impl Gui {
                 }
             }
         }
+        // Every pane that has just gained slots also needs the state those
+        // slots stand for — this is the one place every pane-making site
+        // already goes through.
+        let Self {
+            panes, overlays, ..
+        } = self;
+        for (idx, pane) in panes.iter_mut().enumerate() {
+            pane.hydrate_layer_states(overlays, idx);
+        }
     }
 
     /// Set one pane's overlay state, writing the config as well as the enabled map
@@ -123,13 +155,17 @@ impl Gui {
     /// frame it runs, so a write to `enabled_overlays` alone is undone.
     #[cfg(test)]
     pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: &LayerId, on: bool) {
-        let configs = self.panes[idx].slot_config_map();
-        if !configs.is_empty() {
-            self.overlays.load_pane_configs(&configs);
+        let Self {
+            overlays, panes, ..
+        } = self;
+        let pane = &mut panes[idx];
+        pane.hydrate_layer_states(overlays, idx);
+        if pane.has_slot_configs() {
+            overlays.load_pane_configs(&pane.slot_config_map());
         }
-        self.overlays.set_enabled(kind, on);
-        let pane = &mut self.panes[idx];
-        pane.adopt_handler_state(&self.overlays);
+        overlays.set_enabled(kind, on, &mut PaneMut::bare(idx));
+        pane.set_layer_enabled(overlays, idx, kind, on);
+        pane.adopt_handler_state(overlays);
     }
 
     /// The [`ControlItem`] tree `kind`'s handler is currently offering — the
@@ -138,8 +174,8 @@ impl Gui {
     /// dropdown.
     #[cfg(test)]
     pub(crate) fn control_item_model_for_test(&self, kind: &LayerId) -> Vec<ControlItem> {
-        let ctx = self.active_pane_control_context();
-        self.overlays.controls(kind, &ctx)
+        let view = self.panes[self.active_pane].view(self.active_pane);
+        self.overlays.controls(kind, &view.layer(kind))
     }
 
     /// The `(options, selected)` a handler is currently offering under `label` —
@@ -150,7 +186,7 @@ impl Gui {
         &self,
         label: &str,
     ) -> Option<(Vec<(String, String)>, String)> {
-        let ctx = self.active_pane_control_context();
+        let view = self.panes[self.active_pane].view(self.active_pane);
         fn find(items: &[ControlItem], label: &str) -> Option<(Vec<(String, String)>, String)> {
             for item in items {
                 match item {
@@ -174,15 +210,37 @@ impl Gui {
         }
         OVERLAY_CONTROL_ORDER
             .iter()
-            .find_map(|kind| find(&self.overlays.controls(kind, &ctx), label))
+            .find_map(|kind| find(&self.overlays.controls(kind, &view.layer(kind)), label))
     }
 
     /// Turn a texture overlay on for every pane, as ticking its layer toggle does.
     #[cfg(test)]
     pub(crate) fn enable_overlay_for_test(&mut self, kind: &LayerId) {
-        self.overlays.set_enabled(kind, true);
-        for pane in &mut self.panes {
-            pane.adopt_handler_state(&self.overlays);
+        let Self {
+            overlays, panes, ..
+        } = self;
+        overlays.set_enabled(kind, true, &mut PaneMut::bare(0));
+        for (idx, pane) in panes.iter_mut().enumerate() {
+            // Through the pane, not through the registry: a converted handler
+            // keeps "on" in the pane's own state, and a write to the registry
+            // alone is one `adopt_handler_state` away from being undone.
+            pane.hydrate_layer_states(overlays, idx);
+            pane.set_layer_enabled(overlays, idx, kind, true);
+            pane.adopt_handler_state(overlays);
+        }
+    }
+
+    /// Re-run every pane's write-back against the registry as it stands **now**
+    /// — the step a layer toggle, a control edit and the autosave all end
+    /// with. Exists so a test can put the registry's own copy at odds with the
+    /// panes and prove which one the saved bytes came from.
+    #[cfg(test)]
+    pub(crate) fn readopt_panes_for_test(&mut self) {
+        let Self {
+            overlays, panes, ..
+        } = self;
+        for pane in panes.iter_mut() {
+            pane.adopt_handler_state(overlays);
         }
     }
 

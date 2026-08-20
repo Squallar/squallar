@@ -1,6 +1,7 @@
 //! What the event loop is allowed to sleep through.
 
 use super::*;
+use rustdar_source::handler::PaneRef;
 
 /// A whole second's tolerance: these read the real clock, so the assertions
 /// are bounds rather than equalities.
@@ -149,6 +150,7 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
             kind: kind.clone(),
             data: OverlayRegistry::nws_alerts_payload(Vec::new()),
         },
+        &PaneRef::bare(0),
     );
     let delay = gui.overlay_poll_delay(&kind).expect("still owed");
     let interval = std::time::Duration::from_secs(interval);
@@ -158,7 +160,7 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
          not {delay:?}"
     );
 
-    gui.overlays.set_fetching(&kind, true);
+    gui.overlays.set_fetching(&kind, true, &PaneRef::bare(0));
     assert_eq!(
         gui.overlay_poll_delay(&kind),
         None,

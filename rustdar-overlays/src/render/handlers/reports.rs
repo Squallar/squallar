@@ -1,4 +1,4 @@
-use crate::render::overlay_state::{PaneMut, PaneRef};
+use crate::render::overlay_state::{PaneMut, PaneRef, PaneToggle};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -197,12 +197,14 @@ impl OverlayHandler for StormReportsHandler {
         true
     }
 
-    fn is_enabled(&self) -> bool {
-        self.enabled
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        PaneToggle::is_on(pane, self.enabled)
     }
 
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        if !PaneToggle::set(pane, enabled) {
+            self.enabled = enabled;
+        }
     }
 
     fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
@@ -216,7 +218,7 @@ impl OverlayHandler for StormReportsHandler {
         self.state.data_generation
     }
 
-    fn has_data(&self) -> bool {
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
         !self.state.data.is_empty()
     }
 
@@ -224,7 +226,7 @@ impl OverlayHandler for StormReportsHandler {
         self.state.fetching
     }
 
-    fn set_fetching(&mut self, fetching: bool) {
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
         self.state.fetching = fetching;
     }
 
@@ -240,7 +242,7 @@ impl OverlayHandler for StormReportsHandler {
         self.state.fetch_time
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
         self.state.data.len()
     }
 
@@ -248,7 +250,7 @@ impl OverlayHandler for StormReportsHandler {
         Some(300)
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
+    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         Vec::new() // Clicks resolve through the rasterizer's `HitMap` instead.
     }
 
@@ -283,7 +285,7 @@ impl OverlayHandler for StormReportsHandler {
         }
     }
 
-    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {
         let count = self.state.data.len();
         selections.retain(|sel| {
             if sel.layer_id() != known::STORM_REPORTS {
@@ -342,7 +344,7 @@ impl OverlayHandler for StormReportsHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
+    fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
             "SPC Storm Reports".to_string()
@@ -353,7 +355,7 @@ impl OverlayHandler for StormReportsHandler {
         let mut items = vec![ControlItem::Toggle {
             id: "enabled",
             label,
-            enabled: self.enabled,
+            enabled: self.is_enabled(pane),
         }];
 
         // Ungated on enabled: a hidden layer's options stay visible and
@@ -384,12 +386,16 @@ impl OverlayHandler for StormReportsHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && self.state.enable_should_refetch(self.has_data()) {
+                    if val
+                        && self
+                            .state
+                            .enable_should_refetch(self.has_data(&pane.as_ref()))
+                    {
                         return ControlEffect::Fetch;
                     }
                 }
@@ -398,6 +404,29 @@ impl OverlayHandler for StormReportsHandler {
             "refresh" => ControlEffect::Fetch,
             _ => ControlEffect::None,
         }
+    }
+
+    // ── Per-pane state (WO-M10b) ──────────────────────────────────────
+    //
+    // This layer's only per-pane fact is whether the pane draws it, so its
+    // state IS the toggle. `self.enabled` survives as the registry's own copy
+    // until WO-M10c deletes the swap that keeps it; every answer below prefers
+    // the pane's when a pane is supplied.
+
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        PaneToggle::create(enabled)
+    }
+
+    fn deserialize_pane_state(
+        &self,
+        value: serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        PaneToggle::restore(&value, enabled)
+    }
+
+    fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
+        PaneToggle::save(state)
     }
 
     fn serialize_state(&self) -> serde_json::Value {
@@ -598,11 +627,14 @@ mod round_tests {
 
         let kind = known::STORM_REPORTS;
         let mut registry = OverlayRegistry::default();
-        registry.set_enabled(&kind, true);
-        registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.clone(),
-            data: Box::new(StormReportsFetchResult(result)) as FetchPayload,
-        });
+        registry.set_enabled(&kind, true, &mut PaneMut::bare(0));
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: kind.clone(),
+                data: Box::new(StormReportsFetchResult(result)) as FetchPayload,
+            },
+            &PaneRef::bare(0),
+        );
         let ctx = PaneRef::bare(0);
         let note = registry
             .controls(&kind, &ctx)
