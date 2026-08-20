@@ -72,7 +72,7 @@ mod round_delivery_tests {
     /// to `_result`. Scoped to that one function so a handler downcasting its
     /// **pane state** is not caught by this.
     fn round_delivery_body(src: &str) -> Option<&str> {
-        let start = src.find("fn apply_fetch_result(&mut self, result: FetchPayload)")?;
+        let start = src.find("fn apply_fetch_result(&mut self, result: FetchPayload")?;
         let rest = &src[start..];
         Some(match rest.find("\n    fn ") {
             Some(end) => &rest[..end],

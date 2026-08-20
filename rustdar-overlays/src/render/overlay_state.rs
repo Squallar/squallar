@@ -293,13 +293,19 @@ impl OverlayRegistry {
     }
 
     /// Re-runs `retain_selections` afterwards, since the data just changed.
-    /// `pane` is the pane whose fetch this answered: the selection filter a
-    /// handler applies in `retain_selections` is that pane's.
+    ///
+    /// `pane` is a [`PaneRef::across`]: an arrival names a layer and no pane,
+    /// and the two questions a handler asks of it — what is still being asked
+    /// for, what the shared cache must not evict — are about every pane at
+    /// once. Both are answered by the **union** through
+    /// [`PaneRef::all_as`]; `selected_overlays` is one global list, so a
+    /// `retain_selections` that ever starts filtering by pane must keep what
+    /// any pane keeps.
     pub fn apply_fetch_result(&mut self, result: OverlayFetchResult, pane: &PaneRef<'_>) {
         let id = result.kind;
         self.forget_loaded_config(&id);
         if let Some(idx) = self.handlers.iter().position(|h| h.id() == id) {
-            self.handlers[idx].apply_fetch_result(result.data);
+            self.handlers[idx].apply_fetch_result(result.data, pane);
             self.handlers[idx].retain_selections(&mut self.selected_overlays, pane);
         }
         if self.selected_overlay_page >= self.selected_overlays.len().max(1) {

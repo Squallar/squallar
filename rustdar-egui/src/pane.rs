@@ -436,6 +436,9 @@ impl<'a> PaneView<'a> {
                 .map(|s| s as &dyn Any),
             slots: &self.slots,
             loading_site: self.loading_site,
+            // One pane's view carries no peers: a caller that has to weigh
+            // the whole layer across panes builds a `PaneRef::across`.
+            peers: &[],
         }
     }
 
@@ -1319,6 +1322,7 @@ impl PaneState {
                 .map(|s| s as &dyn Any),
             slots: &[],
             loading_site: self.loading_site.as_deref(),
+            peers: &[],
         }
     }
 
@@ -1500,6 +1504,7 @@ impl PaneState {
                 state: Some(state as &dyn Any),
                 slots: &[],
                 loading_site: None,
+                peers: &[],
             };
             slot.enabled = registry.is_enabled(&slot.id, &view);
         }
@@ -1527,6 +1532,7 @@ impl PaneState {
         let mut write = PaneMut {
             pane_idx,
             state: Some(state as &mut dyn Any),
+            peers: &[],
         };
         registry.set_enabled(id, enabled, &mut write);
         // Asked, not assumed: for a layer whose "enabled" is a set, the set
@@ -1568,6 +1574,7 @@ impl PaneState {
                     state: Some(state as &dyn Any),
                     slots: &[],
                     loading_site: None,
+                    peers: &[],
                 };
                 slot.enabled = registry.is_enabled(&slot.id, &view);
                 let fresh = registry.serialize_pane_state(&slot.id, state);

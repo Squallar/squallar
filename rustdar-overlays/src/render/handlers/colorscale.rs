@@ -60,7 +60,7 @@ impl OverlayHandler for ColorScaleHandler {
         None
     }
 
-    fn apply_fetch_result(&mut self, _result: FetchPayload) {}
+    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {}
 
     fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {

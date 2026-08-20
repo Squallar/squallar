@@ -594,12 +594,25 @@ impl super::Gui {
             id: "parameter",
             value: ControlValue::String(param.as_str().to_owned()),
         };
+        // The other panes' state for this layer — see
+        // `render_overlay_controls_one`, which builds the same view for the
+        // same reason. `self.panes[idx]` is the `mem::take`n placeholder while
+        // `pane` is out, so the edited pane cannot appear twice.
+        let peers: Vec<&dyn std::any::Any> = self
+            .panes
+            .iter()
+            .take(self.pane_layout.pane_count)
+            .filter_map(|p| p.slot(&known::MODEL_DATA))
+            .filter_map(|slot| slot.state.as_deref())
+            .map(|s| s as &dyn std::any::Any)
+            .collect();
         let mut pane_ctx = PaneMut {
             pane_idx: idx,
             state: pane
                 .slot_mut(&known::MODEL_DATA)
                 .and_then(|slot| slot.state.as_deref_mut())
                 .map(|s| s as &mut dyn std::any::Any),
+            peers: &peers,
         };
         let effect = self
             .overlays

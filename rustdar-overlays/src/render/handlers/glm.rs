@@ -673,6 +673,26 @@ impl OverlayHandler for GlmHandler {
         ))
     }
 
+    /// **This pane's own selection is in the token.** Two panes on different
+    /// satellites, time windows or hierarchy levels draw different pictures
+    /// from the same arrival, and the render dispatch groups panes by this
+    /// token and hands one raster to the whole group — so `data_generation`
+    /// alone (which moves for every pane at once) would give one pane the
+    /// other's lightning. **Found while converting the last handlers in
+    /// WO-M10c**: WO-M10b made the divergence reachable and left this token
+    /// pane-blind.
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let view = self.view(pane);
+        let mut hasher = DefaultHasher::new();
+        view.satellite.as_str().hash(&mut hasher);
+        view.time_window_secs.to_bits().hash(&mut hasher);
+        view.show_events.hash(&mut hasher);
+        view.show_groups.hash(&mut hasher);
+        view.show_flashes.hash(&mut hasher);
+        self.data_generation() ^ hasher.finish()
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }
@@ -714,7 +734,7 @@ impl OverlayHandler for GlmHandler {
         Vec::new()
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<GlmFetchResult>(result) else {
             log::error!("GLM handler received unexpected fetch result type");
             return;
