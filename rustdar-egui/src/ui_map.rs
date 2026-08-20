@@ -369,7 +369,10 @@ impl super::Gui {
                                     actions: &mut actions,
                                 },
                             );
-                            let current_stamp = self.current_volume_for(pane.site());
+                            let current_stamp = crate::radar_layer::current_volume_for(
+                                self.liveness(),
+                                pane.site(),
+                            );
                             let chrome = self.chrome_fade();
                             let chrome_rect = pane_render::color_scale_free_rect(
                                 child_ui.painter(),
@@ -1134,7 +1137,7 @@ fn render_volume_pane(
     response: &egui::Response,
     suppress_drag: bool,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
-    current_stamp: Option<crate::ui::CurrentVolumeStamp>,
+    current_stamp: Option<crate::radar_layer::CurrentVolumeStamp>,
     chrome: Option<f32>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
     mirror_size_points: egui::Vec2,
@@ -1208,7 +1211,7 @@ fn volume_pane_outcome(
     response: &egui::Response,
     suppress_drag: bool,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
-    current_stamp: Option<crate::ui::CurrentVolumeStamp>,
+    current_stamp: Option<crate::radar_layer::CurrentVolumeStamp>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
     mirror_size_points: egui::Vec2,
     actions: &mut Vec<GuiAction>,

@@ -7,33 +7,16 @@
 use super::probes::FrameProbes;
 use super::*;
 
-// The chunk-feed status vocabulary is defined beside its producer in
-// `rustdar_radar::chunk_feed` — one name, one path.
-use rustdar_radar::chunk_feed::ChunkFeedStatus;
-
-/// One site's current-volume stamp, as the App publishes it each frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CurrentVolumeStamp {
-    /// Collection time of the newest data in the merged volume — the identity
-    /// a 3D pane names its build by. Every sealed sweep advances it, which is
-    /// what makes the 3D view rebuild in step with the map beside it.
-    pub newest: NaiveDateTime,
-    /// When the complete base volume under the merge began, where one
-    /// contributes at all. `None` while the site's first volume is still
-    /// filling: there is no complete volume yet and the caption says so.
-    pub base_started: Option<NaiveDateTime>,
-}
-
 pub struct Gui {
     pub(super) radar: RadarState,
-    /// What the real-time feed is doing, refreshed each frame by the App.
-    pub(super) chunk_status: ChunkFeedStatus,
-    /// Each site's current-volume stamp, refreshed each frame by the App and
-    /// advanced by every sealed sweep. A 3D pane names the volume it wants by
-    /// [`CurrentVolumeStamp::newest`], which is what makes its rebuilds follow
-    /// the live feed — see `App::base_scans` and `rustdar_radar::current` for
-    /// what the stamp is a stamp *of*.
-    pub(super) current_volumes: HashMap<String, CurrentVolumeStamp>,
+    /// **What each layer says it is doing**, re-stated each frame by the App.
+    ///
+    /// Opaque by construction (WO-E8c): an entry is a [`LayerId`] and the
+    /// layer's own payload, and the only readers are the layers' own glue
+    /// modules. This replaced two radar-shaped fields — the chunk-feed status
+    /// and the per-site volume stamps — which is why nothing here names
+    /// either.
+    pub(super) liveness: Vec<rustdar_source::liveness::SourceLiveness>,
     pub(super) time_dialog: TimeDialogState,
     pub(super) initial_zoom_set: bool,
     pub(super) map_tiles: MapTileState,
@@ -383,8 +366,7 @@ impl Gui {
                 fetching: false,
                 error_message: None,
             },
-            chunk_status: ChunkFeedStatus::default(),
-            current_volumes: HashMap::new(),
+            liveness: Vec::new(),
             time_dialog: TimeDialogState {
                 date_string,
                 time_string,

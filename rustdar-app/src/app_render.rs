@@ -174,8 +174,7 @@ impl super::App {
                 gps: self.user_gps.clone(),
                 user_heading: self.user_heading,
                 catalogue_pending: self.catalogue_pending,
-                chunk_status: self.chunk_feed_status,
-                current_volumes: &self.current_volume_stamps,
+                liveness: &self.liveness,
                 floor_tile_zoom_bias: self.mirror_rungs.tile_zoom_bias(),
             });
     }

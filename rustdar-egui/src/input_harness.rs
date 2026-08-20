@@ -143,8 +143,10 @@ struct FrameFactsForTest {
     gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     user_heading: Option<f32>,
     catalogue_pending: bool,
-    chunk_status: rustdar_radar::chunk_feed::ChunkFeedStatus,
-    current_volumes: std::collections::HashMap<String, crate::ui::CurrentVolumeStamp>,
+    /// The radar layer's own liveness, held in its own type and published
+    /// through the opaque seam by [`Self::liveness`] below — the harness
+    /// composes what the App composes (WO-E8c).
+    radar_liveness: crate::radar_layer::RadarLiveness,
     floor_tile_zoom_bias: u8,
 }
 
@@ -161,8 +163,7 @@ impl Default for FrameFactsForTest {
             gps: None,
             user_heading: None,
             catalogue_pending: false,
-            chunk_status: rustdar_radar::chunk_feed::ChunkFeedStatus::default(),
-            current_volumes: Default::default(),
+            radar_liveness: crate::radar_layer::RadarLiveness::default(),
             floor_tile_zoom_bias: 0,
         }
     }
@@ -401,6 +402,9 @@ impl InputHarness {
     /// (`push_frame_inputs`) does. Every fact-mutating helper funnels
     /// through here, so the `Gui` can never see half an update.
     fn apply_facts(&mut self) {
+        let liveness = vec![crate::radar_layer::liveness_entry(
+            self.facts.radar_liveness.clone(),
+        )];
         self.gui.apply_frame_inputs(crate::shell_api::FrameInputs {
             safe_area_insets: self.facts.safe_area_insets,
             supports_exit: self.facts.supports_exit,
@@ -410,8 +414,7 @@ impl InputHarness {
             gps: self.facts.gps.clone(),
             user_heading: self.facts.user_heading,
             catalogue_pending: self.facts.catalogue_pending,
-            chunk_status: self.facts.chunk_status,
-            current_volumes: &self.facts.current_volumes,
+            liveness: &liveness,
             floor_tile_zoom_bias: self.facts.floor_tile_zoom_bias,
         });
     }
@@ -1341,7 +1344,9 @@ impl InputHarness {
     }
 
     /// Say what `site`'s current-volume stamp is, or that the site has no
-    /// volume at all yet.
+    /// volume at all yet. **Intent unmoved** (WO-E8c): the same fact, now
+    /// carried in the radar layer's own payload rather than a typed member of
+    /// the seam.
     pub(crate) fn set_current_volume(
         &mut self,
         site: &str,
@@ -1351,14 +1356,14 @@ impl InputHarness {
         if let Some(collected) = collected {
             volumes.insert(
                 site.to_owned(),
-                crate::ui::CurrentVolumeStamp {
+                crate::radar_layer::CurrentVolumeStamp {
                     newest: collected,
                     // A pure base volume: what an archive arrival publishes.
                     base_started: Some(collected),
                 },
             );
         }
-        self.facts.current_volumes = volumes;
+        self.facts.radar_liveness.current_volumes = volumes;
         self.apply_facts();
         self.warm_up();
     }

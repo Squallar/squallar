@@ -104,11 +104,17 @@ pub struct App {
     user_gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     /// Compass heading in degrees, once a platform has delivered one.
     user_heading: Option<f32>,
-    /// What the real-time chunk feed is doing, restated by `drive_chunk_feeds` every frame
-    /// so the status bar never shows a stale claim.
-    chunk_feed_status: rustdar_radar::chunk_feed::ChunkFeedStatus,
-    /// Each site's current-volume stamp, rebuilt by `publish_base_volumes` every frame.
-    current_volume_stamps: HashMap<String, rustdar_egui::CurrentVolumeStamp>,
+    /// **What the radar layer says it is doing** — the chunk feed's status and
+    /// each site's current-volume stamp, in the layer's own type.
+    ///
+    /// Both halves are recomputed every frame (`drive_chunk_feeds`,
+    /// `publish_base_volumes`) so the status bar never shows a stale claim,
+    /// but the seam's entry is rebuilt only when this **changes**: see
+    /// [`Self::republish_liveness`].
+    radar_liveness: rustdar_egui::radar_layer::RadarLiveness,
+    /// The seam's own value, one entry per layer that publishes one. Rebuilt
+    /// on change, re-stated every frame.
+    liveness: Vec<rustdar_source::liveness::SourceLiveness>,
     /// The same painter [`Gui`] was handed, kept so the frame path can take its floor-
     /// magnification demand.
     volume_painter: Option<Arc<rustdar_volumetric::bridge::BridgeVolumePainter>>,
@@ -408,8 +414,8 @@ impl App {
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
             user_gps: None,
             user_heading: None,
-            chunk_feed_status: rustdar_radar::chunk_feed::ChunkFeedStatus::default(),
-            current_volume_stamps: HashMap::new(),
+            radar_liveness: rustdar_egui::radar_layer::RadarLiveness::default(),
+            liveness: Vec::new(),
             volume_painter: None,
             mirror_rungs: rustdar_gpu::egui_renderer::MirrorRungs::default(),
             budgets,
@@ -1385,7 +1391,28 @@ impl App {
                 stamps.insert(site, stamp);
             }
         }
-        self.current_volume_stamps = stamps;
+        if self.radar_liveness.current_volumes != stamps {
+            self.radar_liveness.current_volumes = stamps;
+            self.republish_liveness();
+        }
+    }
+
+    /// **Rebuild the liveness seam's entry for the radar layer.**
+    ///
+    /// Called only where a half of it actually moved. The payload sits behind
+    /// an `Arc` that every frame re-states, so a per-frame rebuild would be a
+    /// per-frame allocation and a per-frame map clone for a value that
+    /// changes on the order of once a scan.
+    fn republish_liveness(&mut self) {
+        let entry = rustdar_egui::radar_layer::liveness_entry(self.radar_liveness.clone());
+        match self
+            .liveness
+            .iter_mut()
+            .find(|existing| existing.id == entry.id)
+        {
+            Some(slot) => *slot = entry,
+            None => self.liveness.push(entry),
+        }
     }
 
     /// Drop the decoded volumes no pane is showing.
