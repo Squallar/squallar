@@ -30,6 +30,34 @@ pub(crate) struct RadarProductSpec {
     /// Whether this product's picture is a function of the environmental 0 °C / −20 °C
     /// heights ([`crate::sounding`]'s per-site pair).
     pub(crate) reads_env_heights: bool,
+    /// This product's [`rustdar_source::product::FieldId`] spelling.
+    ///
+    /// **Byte-identical to the variant's own `Serialize` output.** That equality
+    /// is what makes the move to `FieldId` keys a zero-migration change, and
+    /// `the_field_id_is_the_products_own_serde_spelling` checks it rather than
+    /// claiming it here.
+    pub(crate) field_id: &'static str,
+    /// The isosurface slider's travel, in the product's own units — ergonomics,
+    /// not physics.
+    ///
+    /// `Some` for a product with vertical extent; `None` for one the 3D editor
+    /// refuses, whose domain is then its own colour scale's span. There is no
+    /// wildcard: a product that reaches a slider states the travel it gets.
+    pub(crate) value_domain: Option<(f32, f32)>,
+    /// The unit string that follows an isosurface threshold, e.g. `" dBZ"`.
+    /// Empty where the slider's number carries no unit, and for every product
+    /// that has no slider at all.
+    pub(crate) domain_suffix: &'static str,
+    /// Whether this product exists as a field at individual tilts, as opposed
+    /// to being a whole-volume composite or a column integral.
+    ///
+    /// Not the same question as
+    /// [`RadarProduct::tilt_independent_plan_view`](crate::types::RadarProduct::tilt_independent_plan_view),
+    /// which asks whether the *plan view's* elevation argument is load-bearing.
+    /// The hybrid classification is the pair that separates them: its plan view
+    /// is one composited surface, but [`crate::hca`] computes a genuine per-tilt
+    /// classification (the RPG's product 165) underneath it.
+    pub(crate) tilted: bool,
     /// The unit domain the product's values live in.
     pub(crate) quantity: Quantity,
 }
@@ -48,6 +76,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: Some(MomentSlot::Reflectivity),
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "Reflectivity",
+            value_domain: Some((0.0, 75.0)),
+            domain_suffix: " dBZ",
+            tilted: true,
             quantity: Quantity::Unitless { label: "dBZ" },
         },
         RadarProduct::Velocity => RadarProductSpec {
@@ -61,6 +93,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: Some(MomentSlot::Velocity),
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "Velocity",
+            value_domain: Some((2.0, 60.0)),
+            domain_suffix: " m/s",
+            tilted: true,
             quantity: Quantity::SpeedMps,
         },
         RadarProduct::SpectrumWidth => RadarProductSpec {
@@ -74,6 +110,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: Some(MomentSlot::SpectrumWidth),
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "SpectrumWidth",
+            value_domain: Some((1.0, 20.0)),
+            domain_suffix: " m/s",
+            tilted: true,
             quantity: Quantity::SpeedMps,
         },
         RadarProduct::DifferentialPhase => RadarProductSpec {
@@ -87,6 +127,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: Some(MomentSlot::DifferentialPhase),
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "DifferentialPhase",
+            value_domain: Some((10.0, 350.0)),
+            domain_suffix: "\u{b0}",
+            tilted: true,
             quantity: Quantity::Unitless { label: "\u{00b0}" },
         },
         RadarProduct::CorrelationCoefficient => RadarProductSpec {
@@ -100,6 +144,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: Some(MomentSlot::CorrelationCoefficient),
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "CorrelationCoefficient",
+            value_domain: Some((0.5, 1.0)),
+            domain_suffix: "",
+            tilted: true,
             quantity: Quantity::Unitless { label: "CC" },
         },
         RadarProduct::DifferentialReflectivity => RadarProductSpec {
@@ -113,6 +161,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: Some(MomentSlot::DifferentialReflectivity),
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "DifferentialReflectivity",
+            value_domain: Some((0.5, 6.0)),
+            domain_suffix: " dB",
+            tilted: true,
             quantity: Quantity::Unitless { label: "dB" },
         },
         RadarProduct::StormRelativeVelocity => RadarProductSpec {
@@ -129,6 +181,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             // profile from every velocity tilt of the volume.
             reads_whole_volume: true,
             reads_env_heights: false,
+            field_id: "StormRelativeVelocity",
+            value_domain: Some((2.0, 60.0)),
+            domain_suffix: " m/s",
+            tilted: true,
             quantity: Quantity::SpeedMps,
         },
         RadarProduct::SpecificDifferentialPhase => RadarProductSpec {
@@ -142,6 +198,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: None,
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "SpecificDifferentialPhase",
+            value_domain: Some((0.25, 8.0)),
+            domain_suffix: "\u{b0}/km",
+            tilted: true,
             quantity: Quantity::Unitless {
                 label: "\u{00b0}/km",
             },
@@ -157,6 +217,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: None,
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "EchoTops",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::HeightKft,
         },
         RadarProduct::EchoTopsInterpolated => RadarProductSpec {
@@ -173,6 +237,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             // `volumetric::compute_echo_tops` integrates the whole reflectivity volume.
             reads_whole_volume: true,
             reads_env_heights: false,
+            field_id: "EchoTopsInterpolated",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::HeightKft,
         },
         RadarProduct::VerticallyIntegratedLiquid => RadarProductSpec {
@@ -186,6 +254,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: None,
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "VerticallyIntegratedLiquid",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::Unitless {
                 label: "kg/m\u{00b2}",
             },
@@ -204,6 +276,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: None,
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "VilDensity",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::Unitless {
                 label: "g/m\u{00b3}",
             },
@@ -221,6 +297,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             // The SHI-to-size mapping has no field at all without the 0 °C /
             // −20 °C pair: `crate::hail` renders nothing rather than guessing.
             reads_env_heights: true,
+            field_id: "ProbabilityOfSevereHail",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::Unitless { label: "%" },
         },
         RadarProduct::MaxExpectedHailSize => RadarProductSpec {
@@ -236,6 +316,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             reads_env_heights: true,
             // The field computes in mm (`crate::hail`); the render seam
             // converts to inches.
+            field_id: "MaxExpectedHailSize",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::HailSizeIn,
         },
         RadarProduct::HydrometeorClassification => RadarProductSpec {
@@ -254,6 +338,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             // `crate::hca::resolve_melting_layer`, so every class code
             // downstream of the layer moves with it.
             reads_env_heights: true,
+            field_id: "HydrometeorClassification",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: true,
             quantity: Quantity::Unitless { label: "HHC" },
         },
         RadarProduct::PrecipitationRate => RadarProductSpec {
@@ -270,6 +358,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             moment_slot: None,
             reads_whole_volume: false,
             reads_env_heights: false,
+            field_id: "PrecipitationRate",
+            value_domain: None,
+            domain_suffix: "",
+            tilted: false,
             quantity: Quantity::PrecipRateInPerHr,
         },
         RadarProduct::NormalizedRotation => RadarProductSpec {
@@ -286,6 +378,10 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             // profile from every velocity tilt of the volume.
             reads_whole_volume: true,
             reads_env_heights: false,
+            field_id: "NormalizedRotation",
+            value_domain: Some((0.25, 3.0)),
+            domain_suffix: "",
+            tilted: true,
             quantity: Quantity::Unitless { label: "NROT" },
         },
     }

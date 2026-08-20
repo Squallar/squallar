@@ -16,6 +16,7 @@ use rustdar_source::handler::{
     SourceHandler, Surface,
 };
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::product::ProductSpec;
 use rustdar_source::time::{FrameListing, FrameStamp};
 
 /// **The radar layer's registration — one row, and the only one this crate
@@ -245,6 +246,11 @@ impl SourceHandler for RadarSource {
     }
     fn display_name(&self) -> &str {
         "Radar"
+    }
+    /// The seventeen moments and derivations this crate renders, projected into
+    /// the substrate's read contract by [`crate::fields`].
+    fn products(&self) -> &'static [ProductSpec] {
+        crate::fields::products()
     }
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture

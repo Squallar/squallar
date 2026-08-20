@@ -6,6 +6,7 @@ use rustdar_source::id::LayerId;
 #[cfg(test)]
 use rustdar_source::id::known;
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::product::{FieldId, ProductSpec};
 use rustdar_source::time::{FrameListing, FrameStamp};
 use rustdar_units::UserPreferences;
 
@@ -75,6 +76,28 @@ impl OverlayRegistry {
         let mut handlers: Vec<&dyn OverlayHandler> = self.handlers().collect();
         handlers.sort_by_key(|h| h.draw_order_weight());
         handlers.iter().map(|h| h.id()).collect()
+    }
+
+    /// **The field read contract**: every registered layer's fields, in registry
+    /// order, paired with the layer that owns each.
+    ///
+    /// This is the whole surface the UI needs to build pickers, legends and
+    /// catalogue tiles. It hands out [`ProductSpec`] rows — *data* — so a
+    /// consumer never matches on which field it has, and a source crate can add
+    /// one without an arm anywhere above it.
+    pub fn fields(&self) -> impl Iterator<Item = (LayerId, &'static ProductSpec)> + '_ {
+        self.handlers()
+            .flat_map(|h| h.products().iter().map(move |s| (h.id(), s)))
+    }
+
+    /// The field `id` names, with its owning layer, or `None` for an id this
+    /// build does not register.
+    ///
+    /// An id read from a config file need not be one this build has: the
+    /// open-id doctrine says an unknown field is preserved inert, not an error,
+    /// so this answers `None` rather than refusing.
+    pub fn field(&self, id: &FieldId) -> Option<(LayerId, &'static ProductSpec)> {
+        self.fields().find(|(_, s)| s.id == *id)
     }
 
     pub fn get_handler(&self, id: &LayerId) -> Option<&dyn OverlayHandler> {

@@ -9,6 +9,7 @@ pub mod current;
 pub mod derive;
 pub(crate) mod dpprep;
 pub mod eet;
+pub mod fields;
 pub mod frame;
 pub mod hail;
 pub mod hca;
