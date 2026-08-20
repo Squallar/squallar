@@ -402,7 +402,7 @@ impl super::Gui {
             let outcome = super::pills::site_list_ui(
                 ui,
                 &self.site_query,
-                &pane.site,
+                pane.site(),
                 self.catalogue_pending,
             );
             #[cfg(test)]

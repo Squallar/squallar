@@ -1229,7 +1229,7 @@ impl App {
                             (0..count).any(|i| {
                                 self.gui
                                     .pane(i)
-                                    .is_some_and(|p| p.site == site && p.viewing_live)
+                                    .is_some_and(|p| p.site() == site && p.viewing_live)
                             })
                         };
 
@@ -1333,7 +1333,7 @@ impl App {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
-            shown.push(pane.site.as_str());
+            shown.push(pane.site());
             if let Some(info) = pane.scan_info.as_ref() {
                 shown.push(info.site.name);
             }
@@ -1504,7 +1504,7 @@ impl App {
             return;
         };
         self.site_is_provisional = false;
-        if self.gui.pane(0).is_some_and(|p| p.site == site.name) {
+        if self.gui.pane(0).is_some_and(|p| p.site() == site.name) {
             return;
         }
         log::info!(

@@ -260,7 +260,7 @@ impl super::App {
                             scan_site: si.site.name,
                             ladder: si.product_elevations.get(&rr.product).cloned(),
                         });
-                    (p.site.clone(), p.is_map(), inputs)
+                    (p.site().to_string(), p.is_map(), inputs)
                 })
                 .unwrap_or_default();
             self.render.cache_render(
@@ -291,7 +291,7 @@ impl super::App {
                 let Some(other) = self.gui.pane(other_idx) else {
                     continue;
                 };
-                if !other.is_map() || other.site != origin_site {
+                if !other.is_map() || other.site() != origin_site {
                     continue;
                 }
                 let Some((other_product, other_elevation)) = other.get_rendering_params() else {
@@ -592,7 +592,7 @@ impl super::App {
         };
         // Still a guess either way, so a later location fix may refine it.
         self.site_is_provisional = true;
-        if self.gui.pane(0).is_some_and(|pane| pane.site == site) {
+        if self.gui.pane(0).is_some_and(|pane| pane.site() == site) {
             return;
         }
         log::info!("opening on {site}, nearest to timezone {zone}");
@@ -732,7 +732,8 @@ impl super::App {
             // Trigger a re-render for panes on the same site showing anything this
             // object feeds.
             for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
-                let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
+                let pane_matches_site =
+                    self.gui.pane(idx).is_some_and(|p| p.site() == l3_resp.site);
                 if pane_matches_site
                     && self
                         .gui
@@ -748,7 +749,7 @@ impl super::App {
                 let pane_site = self
                     .gui
                     .pane(pane_idx)
-                    .map(|p| p.site.clone())
+                    .map(|p| p.site().to_string())
                     .unwrap_or_default();
                 if pane_site != l3_resp.site {
                     continue;
@@ -877,7 +878,8 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            if pane.selected_product != rustdar_radar::types::RadarProduct::StormRelativeVelocity {
+            if pane.selected_product() != rustdar_radar::types::RadarProduct::StormRelativeVelocity
+            {
                 continue;
             }
             if let Some(volume) = pane.volume_mut() {
@@ -897,7 +899,7 @@ impl super::App {
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
-            if !pane.is_map() || pane.site != site {
+            if !pane.is_map() || pane.site() != site {
                 continue;
             }
             let Some((product, elevation)) = pane.get_rendering_params() else {
@@ -982,7 +984,7 @@ impl super::App {
                     let Some(pane) = self.gui.pane(pane_idx) else {
                         continue;
                     };
-                    let pane_site = pane.site.clone();
+                    let pane_site = pane.site().to_string();
 
                     if let Some(cached) = self.render.get_cached_render(
                         &pane_site,
@@ -1216,8 +1218,8 @@ impl super::App {
         let pane = self.gui.pane(pane_idx)?;
         let section = pane.cross_section()?;
         let line = section.line?;
-        let product = pane.selected_product;
-        let site = pane.site.clone();
+        let product = pane.selected_product();
+        let site = pane.site().to_string();
         let Some(collected) = pane.scan_info.as_ref().map(|s| s.timestamp) else {
             self.mark_section_unavailable(
                 pane_idx,
@@ -1605,7 +1607,7 @@ impl super::App {
             // Whether this listing is still wanted, and what it makes of the frame
             // list, is decided in one place — including refusing a listing for a
             // site the pane's loop has since moved off.
-            let product = pane.selected_product;
+            let product = pane.selected_product();
             let Some(plan) = accept_scan_listing(
                 allocation,
                 &budgets,
@@ -2152,8 +2154,8 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            let product = pane.selected_product;
-            let elevation = pane.selected_elevation;
+            let product = pane.selected_product();
+            let elevation = pane.selected_elevation();
             let section_key = pane.cross_section().and_then(|s| s.line).map(|line| {
                 rustdar_egui::pane::SectionLoopKey::new(
                     line,

@@ -577,7 +577,7 @@ impl RenderDispatcher {
             return false;
         }
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
-            if gui.pane(idx).is_some_and(|p| p.site == site)
+            if gui.pane(idx).is_some_and(|p| p.site() == site)
                 && prs
                     .last_rendered
                     .is_some_and(|(p, _)| p.reads_env_heights())
@@ -607,7 +607,7 @@ impl RenderDispatcher {
             return false;
         }
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
-            if gui.pane(idx).is_some_and(|p| p.site == site)
+            if gui.pane(idx).is_some_and(|p| p.site() == site)
                 && prs
                     .last_rendered
                     .is_some_and(|(p, _)| p == RadarProduct::HydrometeorClassification)
@@ -638,7 +638,7 @@ impl RenderDispatcher {
             return false;
         }
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
-            if gui.pane(idx).is_some_and(|p| p.site == site)
+            if gui.pane(idx).is_some_and(|p| p.site() == site)
                 && prs
                     .last_rendered
                     .is_some_and(|(p, _)| p == RadarProduct::StormRelativeVelocity)
@@ -662,7 +662,7 @@ impl RenderDispatcher {
     /// Reset render state for panes on a specific site (e.g. after a new scan loads for that site).
     pub fn reset_panes_for_site(&mut self, site: &str, gui: &rustdar_egui::Gui) {
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
-            if gui.pane(idx).is_some_and(|p| p.site == site) {
+            if gui.pane(idx).is_some_and(|p| p.site() == site) {
                 prs.last_rendered = None;
                 prs.cached_render = None;
                 prs.render_finished();
@@ -716,7 +716,7 @@ impl RenderDispatcher {
     ) -> usize {
         let mut hit = 0;
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
-            let matches = gui.pane(idx).is_some_and(|p| p.site == site)
+            let matches = gui.pane(idx).is_some_and(|p| p.site() == site)
                 && gui
                     .get_rendering_params_for_pane(idx)
                     .is_some_and(|(product, elevation)| want(product, elevation));
@@ -852,7 +852,7 @@ impl RenderDispatcher {
         // A Level III product's own object, or — for anything read off the volume,
         // derived products included — the volume this pane has loaded.
         if render.product.is_level3() {
-            self.nearest_tilt(render.product, &pane.site, render.elevation)
+            self.nearest_tilt(render.product, pane.site(), render.elevation)
                 .and_then(|tilt| tilt.stamp.time)
         } else {
             pane.scan_info.as_ref().map(|info| info.timestamp)

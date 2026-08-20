@@ -45,7 +45,7 @@ pub(crate) fn editor_ui(
     curves: &mut AlphaCurves,
     #[cfg(test)] probe: &mut Vec<(usize, egui::Rect)>,
 ) {
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let Some(volume) = pane.volume_mut() else {
         return;
     };

@@ -670,15 +670,15 @@ impl super::Gui {
                     render,
                     cross_section,
                     volume,
-                    selected_product: pane.selected_product,
-                    selected_elevation: if pane.selected_elevation.is_finite() {
-                        pane.selected_elevation
+                    selected_product: pane.selected_product(),
+                    selected_elevation: if pane.selected_elevation().is_finite() {
+                        pane.selected_elevation()
                     } else {
                         0.0
                     },
                     layers: BTreeMap::new(),
                     spc_day: OutlookDay::Day1,
-                    site: pane.site.clone(),
+                    site: pane.site().to_string(),
                     time_step_secs: pane.time_step_secs,
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
@@ -912,12 +912,12 @@ impl super::Gui {
                 pane.config_baggage = crate::pane::PaneConfigBaggage::default();
                 continue;
             };
-            pane.selected_product = pc.selected_product;
-            pane.selected_elevation = pc.selected_elevation;
+            pane.set_selected_product(pc.selected_product);
+            pane.set_selected_elevation(pc.selected_elevation);
             if !pc.site.is_empty() {
-                pane.site = pc.site.clone();
+                pane.set_site(pc.site.clone());
             } else if !config.site.is_empty() {
-                pane.site = config.site.clone();
+                pane.set_site(config.site.clone());
             }
             pane.time_step_secs = pc.time_step_secs;
             pane.time_link = pc.time_link && config.sync_layers;
@@ -1013,7 +1013,7 @@ impl super::Gui {
     pub fn set_initial_site(&mut self, site: &str) {
         self.radar.config.site = site.to_string();
         for pane in &mut self.panes {
-            pane.site = site.to_string();
+            pane.set_site(site.to_string());
         }
     }
 }

@@ -582,7 +582,7 @@ fn update_pane_hover_value_from_meta(
             hover_lat: map_pos.y(),
             hover_lon: map_pos.x(),
         },
-        pane.selected_product,
+        pane.selected_product(),
         prefs,
     ));
 }
@@ -918,7 +918,7 @@ pub(super) fn color_scale_gutter(
     if !pane.is_overlay_enabled(&known::COLOR_SCALE) {
         return 0.0;
     }
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let legend = get_legend_scale_ref(product);
     if legend.thresholds.len() < 2 {
         return 0.0;
@@ -1070,7 +1070,7 @@ fn memoized_ticks(
     pane: &PaneState,
     prefs: &UserPreferences,
 ) -> std::sync::Arc<Vec<String>> {
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     legend_ramp::labels(
         ctx,
         egui::Id::new(("rustdar::legend_ticks::radar", product)),
@@ -1105,7 +1105,7 @@ fn memoized_overlay_ticks(
 /// palette's answer; the palette is a compile-time table, so the ramp is
 /// [`legend_ramp::IMMUTABLE`].
 fn radar_ramp(ctx: &egui::Context, pane: &PaneState, horizontal: bool) -> egui::TextureHandle {
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let scale = get_legend_scale_ref(product);
     let min = scale.min_value;
     let range = scale.max_value - min;
@@ -1310,7 +1310,7 @@ pub(super) fn render_color_scale(
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let legend = get_legend_scale_ref(product);
     if legend.thresholds.len() < 2 {
         return;
@@ -1976,7 +1976,7 @@ fn draw_long_press_tooltip(
         rustdar_geo::site_bearing_range_km(lat, lon, map_pos.y(), map_pos.x());
 
     let text = match hover.read(azimuth, ground_km) {
-        Reading::Value(value) => pane.selected_product.format_value(value, prefs),
+        Reading::Value(value) => pane.selected_product().format_value(value, prefs),
         Reading::Unpainted => "No data".to_string(),
         Reading::NotResident => "No value held for this frame".to_string(),
     };

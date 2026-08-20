@@ -156,7 +156,7 @@ impl super::Gui {
         };
 
         // `Pane N (SITE)` reads off the taken pane — the live one.
-        let title = format!("Layers - Pane {} ({})", self.active_pane + 1, pane.site);
+        let title = format!("Layers - Pane {} ({})", self.active_pane + 1, pane.site());
 
         #[cfg(test)]
         let mut probe = StackProbe {

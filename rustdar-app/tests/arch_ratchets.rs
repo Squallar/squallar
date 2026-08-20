@@ -30,7 +30,7 @@
 //!  1b  ... excluding test-named paths                  186  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //!  2   Gui setter fns in rustdar-egui/src/ui.rs          3    3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
 //!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -    -  rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs'
-//!  4a  product-enum occurrences in rustdar-egui        438  444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
+//!  4a  product-enum occurrences in rustdar-egui        440  444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
 //!  4b  ... files containing it (info)                   29   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
 //!  6   ChannelHub receiver fields                       18   18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0    0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
@@ -39,6 +39,8 @@
 //!
 //! Rows 1b, 2, 6, 7a and 7b were already pinned at their measured values and do
 //! not move: the comment pass left no prose mention of those needles to delete.
+//! Row 4a reads 440 rather than the pass's 438 because WO-E6a's two accessor
+//! signatures land in this crate — see the note on the const itself.
 //!
 //! Row 3 is recorded, not asserted, by user ruling: no count ratchets on style
 //! metrics. Row 5 (the overlay-kind enum) is retired — the enum is gone, and
@@ -80,7 +82,15 @@ const SELF_GUI_NON_TEST_MAX: usize = 186;
 /// Row 2.
 const UI_SETTER_MAX: usize = 3;
 /// Row 4a.
-const PRODUCT_IN_EGUI_MAX: usize = 438;
+///
+/// **440, not 438: WO-E6a's accessors add exactly two occurrences** — the
+/// return type of `PaneState::selected_product` and the parameter of
+/// `PaneState::set_selected_product`. There is no spelling of an accessor for
+/// a `RadarProduct`-typed field that does not name the type. The amendment
+/// ratified +2 against the pre-pass 444, i.e. 446; the comment pass then took
+/// the row down to 438, so the amendment lands at 440 and spends 6 less than
+/// it was granted. Anything beyond +2 from WO-E6a is not this amendment.
+const PRODUCT_IN_EGUI_MAX: usize = 440;
 /// Row 6.
 const HUB_RECEIVER_MAX: usize = 18;
 

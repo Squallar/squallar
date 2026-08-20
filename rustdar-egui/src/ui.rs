@@ -337,7 +337,7 @@ fn render_pane_identity(ui: &mut egui::Ui, pane: &PaneState) {
         rustdar_radar::types::RenderView::CrossSection => "Cross-section",
         rustdar_radar::types::RenderView::Volume => "3D volume",
     };
-    ui.label(egui::RichText::new(format!("{} - {}", pane.site, kind)).strong());
+    ui.label(egui::RichText::new(format!("{} - {}", pane.site(), kind)).strong());
 }
 
 /// Render a single declarative [`ControlItem`] into the UI, collecting any
@@ -527,7 +527,7 @@ impl Gui {
     /// shared `radar.config` with the active pane's site substituted in.
     pub(super) fn active_pane_fetch_config(&self) -> RadarConfig {
         let mut config = self.radar.config.clone();
-        config.site = self.active_pane().site.clone();
+        config.site = self.active_pane().site().to_string();
         config
     }
 
@@ -538,7 +538,7 @@ impl Gui {
             GuiEvent::ScanInfoForSite { site, info } => {
                 let mut any_pane_took_it = false;
                 for pane in &mut self.panes {
-                    if pane.site == site {
+                    if pane.site() == site {
                         pane.scan_info = Some(info.clone());
                         any_pane_took_it = true;
                     }
@@ -557,7 +557,7 @@ impl Gui {
             GuiEvent::ChunkScanInfo { site, info: fresh } => {
                 let mut any_pane_took_it = false;
                 for pane in &mut self.panes {
-                    if pane.site != site {
+                    if pane.site() != site {
                         continue;
                     }
                     any_pane_took_it = true;
@@ -708,8 +708,8 @@ impl Gui {
     pub fn live_sites(&self) -> Vec<String> {
         let mut sites: Vec<String> = Vec::new();
         for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-            if pane.viewing_live && !sites.iter().any(|s| s == &pane.site) {
-                sites.push(pane.site.clone());
+            if pane.viewing_live && !sites.iter().any(|s| s.as_str() == pane.site()) {
+                sites.push(pane.site().to_string());
             }
         }
         sites
@@ -854,42 +854,53 @@ impl Gui {
         {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
                 if let Some(scan_info) = &pane.scan_info {
-                    let prev_product = pane.selected_product;
+                    let prev_product = pane.selected_product();
                     let product_combo =
                         egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
-                            .selected_text(pane.selected_product.name())
+                            .selected_text(pane.selected_product().name())
                             .width(combo_width)
                             .show_ui(ui, |ui| {
                                 pills::product_list_ui(
                                     ui,
                                     &scan_info.available_products,
-                                    pane.selected_product,
+                                    pane.selected_product(),
                                 )
                                 .picked
                             });
+                    // The two writes below stay on the fields while every
+                    // other production write in this crate went to
+                    // `PaneState`'s setters (WO-E6a). `scan_info` above is an
+                    // immutable borrow of ONE field of `pane` and is still read
+                    // at the `product_elevations` lookup further down, so
+                    // field-level borrow splitting is what lets a write land
+                    // here at all; `set_selected_product`/`set_selected_elevation`
+                    // take `&mut self` and the borrow checker rejects them
+                    // (E0502, verified). Making them compile means restructuring
+                    // this block, which is WO-E6b's job when the fields go
+                    // private — not a conversion.
                     if let Some(Some(picked)) = product_combo.inner {
                         pane.selected_product = picked;
                     }
                     #[cfg(test)]
                     probes.push(("product_sel", product_combo.response.id));
-                    if prev_product != pane.selected_product {
+                    if prev_product != pane.selected_product() {
                         pane.selected_elevation = 0.0;
                     }
 
                     // The tilt picker is drawn for every listed product, including
                     // one whose angles have not arrived yet.
                     if let Some(elevations) = offer_tilt
-                        .then(|| scan_info.product_elevations.get(&pane.selected_product))
+                        .then(|| scan_info.product_elevations.get(&pane.selected_product()))
                         .flatten()
                     {
                         let selected_angle = elevations
                             .iter()
                             .min_by(|a, b| {
-                                ((**a - pane.selected_elevation).abs())
-                                    .total_cmp(&((**b - pane.selected_elevation).abs()))
+                                ((**a - pane.selected_elevation()).abs())
+                                    .total_cmp(&((**b - pane.selected_elevation()).abs()))
                             })
                             .copied()
-                            .unwrap_or(pane.selected_elevation);
+                            .unwrap_or(pane.selected_elevation());
 
                         let combo = egui::ComboBox::from_id_salt(format!("{id_prefix}elev_sel"))
                             .selected_text(format!("{:.1}\u{b0}", selected_angle))
@@ -903,10 +914,11 @@ impl Gui {
                             id
                         } else {
                             let shown = combo.show_ui(ui, |ui| {
-                                pills::tilt_list_ui(ui, elevations, pane.selected_elevation).picked
+                                pills::tilt_list_ui(ui, elevations, pane.selected_elevation())
+                                    .picked
                             });
                             if let Some(Some(angle)) = shown.inner {
-                                pane.selected_elevation = angle;
+                                pane.set_selected_elevation(angle);
                             }
                             shown.response.id
                         };
@@ -1108,7 +1120,7 @@ impl Gui {
     /// Grow or shrink the layout to `count` panes, seeding any new ones, and
     /// report whether the layout actually reached that count.
     fn set_pane_count(&mut self, count: usize) -> bool {
-        let active_site = self.panes[self.active_pane].site.clone();
+        let active_site = self.panes[self.active_pane].site().to_string();
         let active_scan_info = self.panes[self.active_pane].scan_info.clone();
         while self.panes.len() < count {
             let mut new_pane = PaneState::with_site(active_site.clone());
@@ -1550,7 +1562,7 @@ impl Gui {
 
     pub fn clear_loading_site_for_site(&mut self, site: &str) {
         for pane in &mut self.panes {
-            if pane.site == site {
+            if pane.site() == site {
                 pane.loading_site = None;
                 pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
             }
