@@ -5,7 +5,7 @@ use chrono::TimeZone;
 use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::shell_api::GuiEvent;
-use rustdar_overlays::render::overlay_state::OverlayFetchResult;
+use rustdar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
 use rustdar_radar::types::RadarProduct;
 use rustdar_source::id::{LayerId, known};
 use std::sync::atomic::Ordering;
@@ -649,10 +649,10 @@ impl super::App {
             let task_kind = task.kind;
             self.spawn_async_task(self.channels.overlay_fetch_sender.clone(), async move {
                 let data = task.future.await;
-                OverlayFetchResult {
+                SourceEvent::Data(OverlayFetchResult {
                     kind: task_kind,
                     data,
-                }
+                })
             });
         }
     }
@@ -795,14 +795,21 @@ impl super::App {
                 || *id == known::MODEL_DATA
                 || *id == known::RADAR_SITES =>
             {
+                let clock = chrono::Utc::now().naive_utc();
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
                     // Off the plan the pixel count came from, never re-read from the
                     // context.
                     device_scale: texture.pixels_per_point,
-                    // THE capture of the page's clock, and the only one on this path.
-                    now: chrono::Utc::now().naive_utc(),
+                    // THE capture of the page's clock, and the only one on
+                    // this path — read ONCE and handed to both fields, so a
+                    // live pane's depicted instant cannot drift a nanosecond
+                    // from its wall clock.
+                    now: clock,
+                    // Live posture: the picture depicts the present. WO-E7
+                    // writes a scrub instant here and leaves `now` alone.
+                    as_of: clock,
                 };
                 // **The real pane, with its siblings.** `PaneView` and not
                 // `layer_ref`: the site table reads the radar slot's `"site"`

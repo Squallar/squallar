@@ -318,25 +318,66 @@ impl Gui {
         &mut self,
         result: rustdar_overlays::render::overlay_state::OverlayFetchResult,
     ) {
+        let id = result.kind.clone();
+        self.across_panes(&id, |overlays, pane| {
+            overlays.apply_fetch_result(result, pane);
+        });
+    }
+
+    /// **A frame listing arriving for one layer.** The listing half of
+    /// `SourceEvent`, through the same door and the same
+    /// [`PaneRef::across`] union as [`Self::deliver_overlay_fetch`].
+    ///
+    /// **Dark**: nothing produces `SourceEvent::Frames` until WO-E7/WO-M12.
+    pub fn deliver_frame_listing(
+        &mut self,
+        id: &rustdar_source::id::LayerId,
+        listing: rustdar_source::time::FrameListing,
+    ) {
+        self.across_panes(id, |overlays, pane| {
+            overlays.apply_frames(id, listing, pane);
+        });
+    }
+
+    /// **One frame's data arriving for one layer.** Dark for the same reason
+    /// as [`Self::deliver_frame_listing`].
+    pub fn deliver_frame(
+        &mut self,
+        id: &rustdar_source::id::LayerId,
+        stamp: rustdar_source::time::FrameStamp,
+        data: rustdar_overlays::render::overlay_state::FetchPayload,
+    ) {
+        self.across_panes(id, |overlays, pane| {
+            overlays.apply_frame(id, stamp, data, pane);
+        });
+    }
+
+    /// **The one construction of the arrival-path pane view**, so the three
+    /// deliveries above cannot build three different unions.
+    ///
+    /// A pane whose slots have never been hydrated carries no state at all,
+    /// and would silently drop out of the union — so the union is taken over
+    /// hydrated panes, not over whatever happens to be ready.
+    fn across_panes<R>(
+        &mut self,
+        id: &rustdar_source::id::LayerId,
+        f: impl FnOnce(&mut rustdar_overlays::render::overlay_state::OverlayRegistry, &PaneRef<'_>) -> R,
+    ) -> R {
         let visible = self.pane_layout.pane_count;
         let Self {
             overlays, panes, ..
         } = self;
-        // A pane whose slots have never been hydrated carries no state at
-        // all, and would silently drop out of the union — so the union is
-        // taken over hydrated panes, not over whatever happens to be ready.
         for (idx, pane) in panes.iter_mut().enumerate().take(visible) {
             pane.hydrate_layer_states(overlays, idx);
         }
-        let id = result.kind.clone();
         let peers: Vec<&dyn std::any::Any> = panes
             .iter()
             .take(visible)
-            .filter_map(|pane| pane.slot(&id))
+            .filter_map(|pane| pane.slot(id))
             .filter_map(|slot| slot.state.as_deref())
             .map(|state| state as &dyn std::any::Any)
             .collect();
-        overlays.apply_fetch_result(result, &PaneRef::across(&peers));
+        f(overlays, &PaneRef::across(&peers))
     }
 
     /// When one overlay's auto-refresh is next due, on the same terms as

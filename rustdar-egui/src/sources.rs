@@ -209,4 +209,78 @@ mod registry_identity_tests {
             "the weight order drifted from the historical default draw order",
         );
     }
+
+    /// **Every layer's time axis, pinned by name over the composed twelve.**
+    ///
+    /// Written as the whole map rather than as "the non-Live ones", so a new
+    /// layer cannot join without this list saying what it does with the clock,
+    /// and a layer that quietly changes arm is a named diff. Alerts and
+    /// lightning are the two `EventLifetime` layers (items with validity
+    /// windows); the model is the one `FrameSeries` (hourly runs, ahead of the
+    /// clock); the other nine draw the latest thing they fetched.
+    #[test]
+    fn every_layer_declares_what_it_does_with_the_clock() {
+        use rustdar_source::time::TimeAxis;
+
+        let hourly_forecast = TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: true,
+        };
+        let expected: Vec<(&str, TimeAxis)> = vec![
+            ("ModelData", hourly_forecast),
+            ("SpcOutlook", TimeAxis::Live),
+            ("Radar", TimeAxis::Live),
+            ("SpcDiscussions", TimeAxis::Live),
+            ("NwsAlerts", TimeAxis::EventLifetime),
+            ("StormReports", TimeAxis::Live),
+            ("Lightning", TimeAxis::EventLifetime),
+            ("Metar", TimeAxis::Live),
+            ("CityLabels", TimeAxis::Live),
+            ("RadarSites", TimeAxis::Live),
+            ("UserLocation", TimeAxis::Live),
+            ("ColorScale", TimeAxis::Live),
+        ];
+
+        let mut actual: Vec<(String, TimeAxis)> = all()
+            .iter()
+            .map(|h| (h.id().as_str().to_owned(), h.time_axis()))
+            .collect();
+        actual.sort_by_key(|(id, _)| {
+            expected
+                .iter()
+                .position(|(want, _)| want == id)
+                .unwrap_or(usize::MAX)
+        });
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|(id, axis)| ((*id).to_owned(), *axis))
+                .collect::<Vec<_>>(),
+            "a layer's relationship to the clock changed, or a new layer \
+             joined without declaring one",
+        );
+    }
+
+    /// The as-of quantum, for the two layers that read the depicted instant.
+    /// Lightning's is a second because its fade ramp is sub-minute; everything
+    /// else takes the trait's minute, which is the resolution NWS lifetimes
+    /// are published at. Consumed at WO-E7c, pinned here so it cannot drift
+    /// unnoticed in the meantime.
+    #[test]
+    fn the_as_of_quantum_is_a_second_only_where_the_picture_moves_that_fast() {
+        for handler in all() {
+            let want = if handler.id().as_str() == "Lightning" {
+                std::time::Duration::from_secs(1)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            assert_eq!(
+                handler.as_of_quantum(),
+                want,
+                "{}'s as-of cache quantum",
+                handler.id().as_str(),
+            );
+        }
+    }
 }

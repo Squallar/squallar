@@ -2372,7 +2372,9 @@ fn a_zip_ctx() -> rustdar_overlays::render::overlay_state::RasterizeContext {
         is_dark: false,
         zoom: 6.5,
         device_scale: 1.0,
+        // Live posture: the depicted instant IS the clock.
         now: glm_fixture_now(),
+        as_of: glm_fixture_now(),
     }
 }
 

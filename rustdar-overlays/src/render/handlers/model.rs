@@ -16,6 +16,7 @@ use crate::render::overlay_state::{
 use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
 
 /// How many parameters' grids stay resident at once.
 ///
@@ -227,6 +228,60 @@ impl OverlayHandler for ModelDataHandler {
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
     }
+
+    /// HRRR is a run-based forecast: hourly cycles, each carrying grids valid
+    /// at the run time plus a forecast hour — discrete stamped frames, and the
+    /// stamps run **ahead** of the wall clock.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: true,
+        }
+    }
+
+    /// **The frames this pane is holding**, which for this layer is its own
+    /// selected parameter's resident grid: zero or one stamp, `valid` the
+    /// grid's valid time and `run` its reference time.
+    ///
+    /// This pane's parameter and not the cache's whole contents: the other
+    /// resident grids belong to other panes' parameters, and pooling them here
+    /// would offer this pane frames it cannot draw.
+    fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        self.cached_grids
+            .get(self.view(pane).selected_param)
+            .map(|grid| {
+                vec![FrameStamp {
+                    valid: grid.valid_time(),
+                    run: Some(grid.ref_time),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::frames_resident`] clipped to `range`, and **never
+    /// `complete`**: there is no HRRR archive listing in this build, so the
+    /// honest answer is "at least these", forever. `create_frame_list_task`
+    /// keeps the trait's `None` until something exists to fetch.
+    fn list_frames(
+        &self,
+        _ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> FrameListing {
+        let mut frames = self.frames_resident(pane);
+        frames.retain(|stamp| range.0 <= stamp.valid && stamp.valid <= range.1);
+        frames.sort_by_key(|stamp| stamp.valid);
+        FrameListing {
+            range,
+            frames,
+            complete: false,
+        }
+    }
+
+    /// A no-op: this layer's residency is the LRU grid cache's business
+    /// (`MODEL_GRID_CACHE_ENTRIES`, evicting by use), and a second eviction
+    /// authority would fight it.
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
 
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
         self.view(pane).enabled
@@ -881,14 +936,16 @@ mod tests {
     }
 
     fn rasterize_ctx() -> RasterizeContext {
+        let clock = chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(3, 0, 0)
+            .unwrap();
         RasterizeContext {
             is_dark: false,
             zoom: 5.0,
             device_scale: 1.0,
-            now: chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
-                .unwrap()
-                .and_hms_opt(3, 0, 0)
-                .unwrap(),
+            now: clock,
+            as_of: clock,
         }
     }
 
@@ -1395,6 +1452,133 @@ mod tests {
             h.cached_grids.len(),
             MODEL_GRID_CACHE_ENTRIES,
             "the cap still holds",
+        );
+    }
+
+    // ── The frame axis (WO-M11) ───────────────────────────────────────────
+
+    fn fetch_cfg() -> FetchConfig {
+        // A `reqwest::Client` cannot be built before the process has a rustls
+        // provider, and a test that builds one is otherwise green only when
+        // some EARLIER test in the same binary happened to install it.
+        rustdar_source::tls::init();
+        FetchConfig {
+            client: Default::default(),
+            zone_cache_dir: None,
+            sources: rustdar_source::origins::DataSources::default(),
+            viewport: None,
+        }
+    }
+
+    /// A grid at an explicit forecast hour, so the stamp arithmetic is pinned
+    /// against a number `ModelParameter::forecast_hour` does not supply.
+    fn grid_at_fh(parameter: ModelParameter, fh: u8) -> HrrrGridData {
+        let mut g = grid(parameter, vec![10.0]);
+        g.forecast_hour = fh;
+        g
+    }
+
+    fn seeded(parameter: ModelParameter, fh: u8) -> ModelDataHandler {
+        let mut h = ModelDataHandler::new();
+        h.defaults.enabled = true;
+        h.defaults.selected_param = parameter;
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid_at_fh(parameter, fh)))),
+            &PaneRef::across(&[]),
+        );
+        h
+    }
+
+    fn run_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(RUN_HOUR, 0, 0)
+            .unwrap()
+    }
+
+    /// **A resident grid is one frame, stamped run + forecast hour.** Two
+    /// forecast hours off the same run, so `valid` is shown to be a function
+    /// of the hour and not a second spelling of `run`.
+    #[test]
+    fn a_resident_grid_is_one_frame_stamped_at_its_run_plus_its_forecast_hour() {
+        for fh in [0u8, 2, 5] {
+            let h = seeded(ModelParameter::SurfaceBasedCape, fh);
+            assert_eq!(
+                h.frames_resident(&PaneRef::bare(0)),
+                vec![FrameStamp {
+                    valid: run_time() + chrono::Duration::hours(i64::from(fh)),
+                    run: Some(run_time()),
+                }],
+                "forecast hour {fh}",
+            );
+        }
+    }
+
+    /// A pane whose parameter has no resident grid holds no frames — the
+    /// answer is about **this pane's** selection, not the cache's contents.
+    #[test]
+    fn a_pane_on_a_parameter_with_no_grid_holds_no_frames() {
+        let mut h = seeded(ModelParameter::SurfaceBasedCape, 2);
+        h.defaults.selected_param = ModelParameter::MixedLayerCin;
+        assert_eq!(
+            h.frames_resident(&PaneRef::bare(0)),
+            Vec::new(),
+            "this pane was offered another parameter's grid as its own frame",
+        );
+    }
+
+    /// **The listing is the resident set clipped to the window, and it is
+    /// NEVER complete** — there is no HRRR archive listing in this build, so
+    /// "these are all of them" would be a claim nothing checked.
+    #[test]
+    fn the_listing_clips_to_its_window_and_never_claims_completeness() {
+        let h = seeded(ModelParameter::SurfaceBasedCape, 2);
+        let valid = run_time() + chrono::Duration::hours(2);
+        let inside = (
+            valid - chrono::Duration::hours(1),
+            valid + chrono::Duration::hours(1),
+        );
+        let before = (
+            valid - chrono::Duration::hours(4),
+            valid - chrono::Duration::hours(1),
+        );
+
+        let listing = h.list_frames(&fetch_cfg(), &PaneRef::bare(0), inside);
+        assert_eq!(listing.range, inside, "the window is echoed back");
+        assert_eq!(
+            listing.frames,
+            vec![FrameStamp {
+                valid,
+                run: Some(run_time()),
+            }],
+        );
+        assert!(
+            !listing.complete,
+            "the listing claimed to be every frame that exists, which nothing \
+             in this build could know",
+        );
+
+        assert!(
+            h.list_frames(&fetch_cfg(), &PaneRef::bare(0), before)
+                .frames
+                .is_empty(),
+            "a frame outside the window was listed anyway, so the range is \
+             decorative",
+        );
+    }
+
+    /// The axis itself: hourly cycles that run **ahead** of the wall clock.
+    #[test]
+    fn the_model_layer_declares_an_hourly_forecast_axis() {
+        assert_eq!(
+            ModelDataHandler::new().time_axis(),
+            TimeAxis::FrameSeries {
+                typical_step: std::time::Duration::from_secs(3600),
+                extends_future: true,
+            },
+            "HRRR runs hourly and its grids are valid AHEAD of the clock; a \
+             timeline reading this would offer the wrong step or refuse the \
+             future half of its own range",
         );
     }
 }

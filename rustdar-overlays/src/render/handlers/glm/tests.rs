@@ -1542,3 +1542,60 @@ fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them()
     assert_eq!(handler.defaults.time_window_secs, 300.0);
     assert_eq!(handler.defaults.satellite, SatelliteSelection::Both);
 }
+
+/// **A flash's age is measured from the instant the picture DEPICTS, not from
+/// the wall clock.** The wire field is still called `now` and its bytes are
+/// unmoved — it has always meant "what these ages are measured from", which is
+/// exactly `as_of`.
+///
+/// The two clocks are set an hour apart, so a body still reading `ctx.now`
+/// fails by 3600 s rather than by rounding. A live pane sets them equal, which
+/// is why this is a dark land.
+#[test]
+fn the_glm_job_ages_flashes_from_the_depicted_instant_not_the_wall_clock() {
+    use crate::render::overlay_state::RasterizeContext;
+
+    let mut handler = GlmHandler::new();
+    handler.defaults.enabled = true;
+    handler.apply_fetch_result(
+        Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+            flashes: vec![item(GlmDataLevel::Flash, Some(1e-14), None).flash],
+            dead_feeds: Vec::new(),
+            queried: vec![GlmSatellite::GoesEast],
+            parse_failures: None,
+            transport_failures: None,
+            level_failures: Vec::new(),
+            evaluated_levels: vec![(GlmSatellite::GoesEast, GlmDataLevel::Flash)],
+            listing_failures: Vec::new(),
+            window_gaps: Vec::new(),
+            record_drops: Default::default(),
+        }))),
+        &PaneRef::across(&[]),
+    );
+
+    let wall = chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    let depicted = wall - chrono::Duration::hours(1);
+    let job = handler
+        .prepare_job(
+            &RasterizeContext {
+                is_dark: false,
+                zoom: 7.0,
+                device_scale: 1.0,
+                now: wall,
+                as_of: depicted,
+            },
+            &PaneRef::bare(0),
+        )
+        .expect("a flash is resident, so the layer describes a job");
+    assert_eq!(
+        job.downcast_ref::<crate::render::rasterize::GlmStrikesInput>()
+            .expect("the GLM row")
+            .now,
+        depicted,
+        "the flash-age reference is the wall clock, so a scrubbed pane would \
+         fade every flash by the distance between the two",
+    );
+}

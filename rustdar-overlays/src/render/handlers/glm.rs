@@ -21,6 +21,7 @@ use crate::render::overlay_state::{
 use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::TimeAxis;
 
 /// What a poll's listings covered, in the layer-agnostic terms the UI renders.
 fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataCompleteness {
@@ -417,7 +418,11 @@ impl GlmHandler {
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
             time_window_secs: self.view(pane).time_window_secs,
-            now: ctx.now,
+            // The **depicted** instant, which on a live pane is the wall
+            // clock. The field on the wire is unchanged and still named
+            // `now`: it has always meant "the instant these ages are measured
+            // from", and that is exactly what `as_of` is.
+            now: ctx.as_of,
             device_scale: ctx.device_scale,
         })
     }
@@ -644,6 +649,22 @@ impl OverlayHandler for GlmHandler {
         RenderMode::Texture
     }
 
+    /// A flash is a point with a lifetime — it fades in over the window and
+    /// out of it — so the picture is a function of the depicted instant.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::EventLifetime
+    }
+
+    /// **One second, not the trait's minute.** The fade ramp is computed
+    /// against a 60-1800 s window, so a whole-minute quantum would step the
+    /// ramp visibly; a flash's age is the finest-grained as-of dependence any
+    /// layer has. Read only under a scrubbed posture (WO-E7c) — a live pane's
+    /// cache key carries no as-of term at all, so this does not re-raster a
+    /// live pane every second.
+    fn as_of_quantum(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+
     /// `is_dark` rides into the described job (`GlmInput`) and decides the
     /// flash outline and the alpha the age decay fades to, so a cached raster
     /// is a raster in one theme.
@@ -779,7 +800,7 @@ impl OverlayHandler for GlmHandler {
     }
 
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        // Captures the dispatch's own `ctx.now`, which is what keeps the
+        // Captures the dispatch's own `ctx.as_of`, which is what keeps the
         // flash ages a worker renders the ages this page computed.
         Some(DescribedJob::new(self.paint_input(ctx, pane)?))
     }

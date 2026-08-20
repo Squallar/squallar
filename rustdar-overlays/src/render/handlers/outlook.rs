@@ -1050,6 +1050,11 @@ mod tests {
     #[test]
     fn the_significant_area_is_its_own_task_and_its_own_ledger_entry() {
         let mut handler = day3_probabilistic();
+        // Without a rustls provider installed, building a `reqwest::Client`
+        // panics — so this test was green only when an earlier test in the
+        // same binary happened to install one. Pre-existing; found by WO-M11's
+        // tamper rounds, where a filtered single-test run made it visible.
+        rustdar_source::tls::init();
         let ctx = FetchConfig {
             client: Default::default(),
             zone_cache_dir: None,

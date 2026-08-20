@@ -6,6 +6,7 @@ use rustdar_source::id::LayerId;
 #[cfg(test)]
 use rustdar_source::id::known;
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::{FrameListing, FrameStamp};
 use rustdar_units::UserPreferences;
 
 #[cfg(test)]
@@ -16,9 +17,10 @@ use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter
 use crate::types::OverlayLabel;
 
 pub use rustdar_source::handler::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayItem, OverlayLegend, OverlayState,
-    PaneMut, PaneRef, PaneToggle, PopupAction, PopupActionKind, PopupContent, PopupSection,
-    RasterizeContext, RenderMode, Signed, SourceHandler as OverlayHandler, Surface, TaskFuture,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayFetchResult, OverlayItem,
+    OverlayLegend, OverlayState, PaneMut, PaneRef, PaneToggle, PopupAction, PopupActionKind,
+    PopupContent, PopupSection, RasterizeContext, RenderMode, Signed, SourceEvent,
+    SourceHandler as OverlayHandler, Surface, TaskFuture,
 };
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
@@ -299,6 +301,34 @@ impl OverlayRegistry {
         }
     }
 
+    /// **A frame listing's arrival**, routed to the layer that asked for it.
+    ///
+    /// The listing half of [`SourceEvent`]. Same pane discipline as
+    /// [`Self::apply_fetch_result`]: the arrival names a layer and no pane, so
+    /// `pane` is a [`PaneRef::across`] carrying every pane's state.
+    ///
+    /// **Dark**: nothing produces [`SourceEvent::Frames`] until WO-E7/WO-M12
+    /// give [`OverlayHandler::create_frame_list_task`] a caller.
+    pub fn apply_frames(&mut self, id: &LayerId, listing: FrameListing, pane: &PaneRef<'_>) {
+        if let Some(handler) = self.handler_mut(id) {
+            handler.apply_frame_listing(listing, pane);
+        }
+    }
+
+    /// **One frame's data arriving**, routed to the layer that asked for it.
+    /// The other half of [`Self::apply_frames`], and dark for the same reason.
+    pub fn apply_frame(
+        &mut self,
+        id: &LayerId,
+        stamp: FrameStamp,
+        data: FetchPayload,
+        pane: &PaneRef<'_>,
+    ) {
+        if let Some(handler) = self.handler_mut(id) {
+            handler.apply_frame(stamp, data, pane);
+        }
+    }
+
     pub fn prepare_job(
         &self,
         id: &LayerId,
@@ -459,13 +489,6 @@ impl OverlayRegistry {
             }
         }
     }
-}
-
-// ── Unified overlay fetch result ──────────────────────────────────────────
-
-pub struct OverlayFetchResult {
-    pub kind: LayerId,
-    pub data: FetchPayload,
 }
 
 #[cfg(test)]
@@ -722,6 +745,8 @@ mod retry_ledger_tests {
                 expires: String::new(),
                 onset: None,
                 ends: None,
+                valid_from: None,
+                valid_until: None,
                 affected_zones: vec!["https://api.weather.gov/zones/county/OKC001".to_string()],
                 features: std::sync::Arc::new(if i < placed {
                     vec![OverlayFeature::new(

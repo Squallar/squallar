@@ -2752,3 +2752,189 @@ fn android_resolves_the_table_when_the_config_directory_arrives() {
     });
     assert_eq!((row.lat, row.lon), (-35.0, -145.0));
 }
+
+// ── The one arrival path: SourceEvent (WO-M11) ────────────────────────────
+
+/// A layer that does nothing but write down what arrived. Registered in place
+/// of the production twelve for the drain test below, so each of the three
+/// `SourceEvent` arms is observed reaching a **handler**, not merely being
+/// consumed by the `while let`.
+#[derive(Default, Debug, PartialEq)]
+struct Recorded {
+    data: Vec<String>,
+    listings: Vec<rustdar_source::time::FrameListing>,
+    frames: Vec<(rustdar_source::time::FrameStamp, String)>,
+}
+
+struct FrameRecorder {
+    id: LayerId,
+    /// Shared with the test rather than downcast back out of the registry:
+    /// `OverlayRegistry` hands out `&dyn OverlayHandler`, and adding a
+    /// downcast door to production for one test is the wrong trade.
+    seen: std::sync::Arc<std::sync::Mutex<Recorded>>,
+}
+
+impl rustdar_overlays::render::overlay_state::OverlayHandler for FrameRecorder {
+    fn id(&self) -> LayerId {
+        self.id.clone()
+    }
+    fn surface(&self) -> rustdar_overlays::render::overlay_state::Surface {
+        rustdar_overlays::render::overlay_state::Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        999
+    }
+    fn display_name(&self) -> &str {
+        "Frame Recorder"
+    }
+    fn render_mode(&self) -> rustdar_overlays::render::overlay_state::RenderMode {
+        rustdar_overlays::render::overlay_state::RenderMode::Texture
+    }
+    fn data_generation(&self) -> u64 {
+        self.seen.lock().expect("no poisoned lock").data.len() as u64
+    }
+    fn has_data(&self, _pane: &rustdar_source::handler::PaneRef<'_>) -> bool {
+        !self.seen.lock().expect("no poisoned lock").data.is_empty()
+    }
+    fn is_fetching(&self) -> bool {
+        false
+    }
+    fn set_fetching(&mut self, _f: bool, _pane: &rustdar_source::handler::PaneRef<'_>) {}
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        None
+    }
+    fn apply_fetch_result(
+        &mut self,
+        result: rustdar_overlays::render::overlay_state::FetchPayload,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) {
+        if let Ok(tag) = result.downcast::<String>() {
+            self.seen.lock().expect("no poisoned lock").data.push(*tag);
+        }
+    }
+    fn retain_selections(
+        &self,
+        _selections: &mut Vec<
+            std::sync::Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>,
+        >,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) {
+    }
+    fn apply_frame_listing(
+        &mut self,
+        listing: rustdar_source::time::FrameListing,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) {
+        self.seen
+            .lock()
+            .expect("no poisoned lock")
+            .listings
+            .push(listing);
+    }
+    fn apply_frame(
+        &mut self,
+        stamp: rustdar_source::time::FrameStamp,
+        data: rustdar_overlays::render::overlay_state::FetchPayload,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) {
+        let tag = data.downcast::<String>().map(|t| *t).unwrap_or_default();
+        self.seen
+            .lock()
+            .expect("no poisoned lock")
+            .frames
+            .push((stamp, tag));
+    }
+}
+
+fn a_stamp(hour: u32) -> rustdar_source::time::FrameStamp {
+    rustdar_source::time::FrameStamp {
+        valid: chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(hour, 0, 0)
+            .unwrap(),
+        run: None,
+    }
+}
+
+/// **Every arm of the one arrival path reaches the layer it names.**
+///
+/// The channel carries `SourceEvent` since WO-M11, and the drain is one
+/// `match`: `Data` still lands in `apply_fetch_result`, and `Frames` /
+/// `FrameReady` land in the two frame hooks. Those two have **no producer**
+/// until WO-E7/WO-M12 — this is the test that says the route they will use is
+/// already wired and already routes by layer id.
+///
+/// A fourth event names a layer that is not registered, so the drain is also
+/// shown to survive an arrival with no owner rather than panicking or wedging.
+#[test]
+fn every_source_event_arm_reaches_the_layer_it_names() {
+    use rustdar_overlays::render::overlay_state::{
+        OverlayFetchResult, OverlayRegistry, SourceEvent,
+    };
+    use rustdar_source::time::FrameListing;
+
+    let mine = LayerId::new("test/frame-recorder");
+    let other = LayerId::new("test/nobody-owns-this");
+    let mut app = n_pane_app(1, "KTLX");
+    let seen: std::sync::Arc<std::sync::Mutex<Recorded>> = Default::default();
+    app.gui.overlays = OverlayRegistry::with_handlers(vec![Box::new(FrameRecorder {
+        id: mine.clone(),
+        seen: std::sync::Arc::clone(&seen),
+    })]);
+
+    let range = (a_stamp(12).valid, a_stamp(18).valid);
+    let listing = FrameListing {
+        range,
+        frames: vec![a_stamp(13), a_stamp(14)],
+        complete: false,
+    };
+    for event in [
+        SourceEvent::Data(OverlayFetchResult {
+            kind: mine.clone(),
+            data: Box::new("round-1".to_owned()),
+        }),
+        SourceEvent::Frames {
+            id: mine.clone(),
+            listing: listing.clone(),
+        },
+        SourceEvent::FrameReady {
+            id: mine.clone(),
+            stamp: a_stamp(13),
+            data: Box::new("frame-13".to_owned()),
+        },
+        SourceEvent::Frames {
+            id: other,
+            listing: listing.clone(),
+        },
+    ] {
+        app.channels
+            .overlay_fetch_sender
+            .send(event)
+            .expect("the receiver is alive");
+    }
+
+    app.poll_overlay_fetch_results();
+
+    let recorder = seen.lock().expect("no poisoned lock");
+
+    assert_eq!(
+        recorder.data,
+        vec!["round-1".to_owned()],
+        "the Data arm no longer reaches apply_fetch_result",
+    );
+    assert_eq!(
+        recorder.listings,
+        vec![listing],
+        "the Frames arm did not reach apply_frame_listing exactly once — a \
+         listing for a layer nobody owns must be dropped, not delivered here",
+    );
+    assert_eq!(
+        recorder.frames,
+        vec![(a_stamp(13), "frame-13".to_owned())],
+        "the FrameReady arm did not carry both the stamp and the payload",
+    );
+    assert!(
+        app.channels.overlay_fetch_receiver.try_recv().is_err(),
+        "the drain left an arrival in the channel",
+    );
+}
