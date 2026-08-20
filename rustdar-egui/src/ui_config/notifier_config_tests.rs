@@ -1,7 +1,6 @@
 use super::*;
 use crate::Gui;
 
-/// Both notification settings survive a save/load cycle.
 #[test]
 fn the_notifier_settings_round_trip() {
     let mut gui = Gui::new();
@@ -24,8 +23,7 @@ fn an_older_config_defaults_to_notifications_on() {
 }
 
 /// A cleared endpoint box falls back to the built-in default rather than
-/// acting as a silent off switch — turning the feature off is what the
-/// toggle is for.
+/// acting as a silent off switch.
 #[test]
 fn an_empty_endpoint_falls_back_to_the_default() {
     let mut gui = Gui::new();
@@ -37,15 +35,6 @@ fn an_empty_endpoint_falls_back_to_the_default() {
 
 /// A config written before the camera grew fields loads at the defaults
 /// rather than at zeros.
-///
-/// `#[serde(default)]` on the struct is what does it, and the failure it
-/// closes is silent: a missing `vertical_exaggeration` deserialized as `0.0`
-/// collapses the box to a plane and divides by zero in `box_from_world`, which
-/// the GPU accepts and draws as an empty pane.
-///
-/// The `region` key an older writer also carried is simply ignored now — the
-/// box is the pane's viewport — which is the same tolerance from the other
-/// direction: an unknown key must not fail the load either.
 #[test]
 fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
     use crate::pane::{MapRender, OrbitCamera};
@@ -54,8 +43,6 @@ fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
     let mut gui = crate::Gui::new();
     let pane = gui.pane_mut(0).expect("pane 0");
     assert!(pane.set_map_render(MapRender::Volume));
-    // Moved, so the `volume` block is written at all: an untouched camera is
-    // omitted, and a fixture with no block would exercise nothing.
     pane.map_mut()
         .expect("a map pane")
         .volume

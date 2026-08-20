@@ -44,11 +44,6 @@ fn gui_with(existing: ScanInfo) -> Gui {
     gui
 }
 
-/// The mutation this kills: replacing `product_elevations` wholesale. A
-/// volume still being assembled knows only the cuts that have completed, so
-/// a replace would shrink the picker to one entry every few seconds and let
-/// it regrow — and `get_rendering_params` snaps to the nearest *listed*
-/// angle, so every pane would walk up the VCP once per volume.
 #[test]
 fn a_partial_volume_does_not_shrink_the_tilt_list() {
     let full = info(
@@ -57,7 +52,6 @@ fn a_partial_volume_does_not_shrink_the_tilt_list() {
     );
     let mut gui = gui_with(full);
 
-    // The next volume has only completed its lowest cut.
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
         info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
@@ -77,11 +71,8 @@ fn a_partial_volume_does_not_shrink_the_tilt_list() {
     assert_eq!(merged.status, "minute 5");
 }
 
-/// Level III products and their elevations are accumulated into `ScanInfo`
-/// *in place* by `poll_level3_results`, and the chunk feed only refetches
-/// them when a volume closes. Replacing would freeze every L3 pane —
-/// `get_rendering_params` returns `None` with no elevations — for the rest
-/// of the volume.
+/// Level III products accumulate into `ScanInfo` in place; the chunk feed only
+/// refetches them when a volume closes.
 #[test]
 fn a_partial_volume_keeps_the_level3_products_already_registered() {
     let existing = info(
@@ -112,9 +103,7 @@ fn a_partial_volume_keeps_the_level3_products_already_registered() {
     );
 }
 
-/// The counterweight: a tilt the assembling volume reveals for the first
-/// time still has to appear, or a new cut in a changed VCP would never be
-/// selectable.
+/// A tilt the assembling volume reveals for the first time still has to appear.
 #[test]
 fn a_newly_seen_tilt_is_added_to_the_list() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
@@ -133,10 +122,7 @@ fn a_newly_seen_tilt_is_added_to_the_list() {
     );
 }
 
-/// A chunk round happens on its own every few seconds. Taking the spinner
-/// down would cancel a manual Refresh still in flight and unblock the
-/// auto-poll queued behind it; resetting the backoff would undo exactly the
-/// retreat the archive fallback depends on.
+/// A chunk round happens on its own every few seconds.
 #[test]
 fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
@@ -160,8 +146,7 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     );
 }
 
-/// The one behaviour it does share with the `ScanInfoForSite` event: with
-/// chunks feeding live mode, the first data of a session arrives here.
+/// With chunks feeding live mode, the first data of a session arrives here.
 #[test]
 fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
@@ -173,10 +158,7 @@ fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
     assert!(gui.initial_zoom_set);
 }
 
-/// ...but only when a pane is actually on that site. The chunk feed keeps
-/// delivering a site's volume for a round or two after the last pane on it
-/// switched away, and that data nobody is looking at must not spend the
-/// one-shot claim the pane's own first volume needs.
+/// ...but only when a pane is actually on that site.
 #[test]
 fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));

@@ -1,19 +1,3 @@
-//! The other way a 3D pane stops needing its volume: the layout stops showing
-//! it.
-//!
-//! `GuiAction::ReleaseVolume` covers the *kind* change — a pane converted out
-//! of `Volume` — and nothing covered the pane-count reduction, because that
-//! hides a pane without converting it: the `PaneState` stays in the vector so a
-//! re-split remembers it, and no action is emitted. The store went on holding
-//! that pane's resolved grid (36 MiB of GPU texture and ~8 MiB of host bytes on
-//! the desktop shape) for the rest of the session, and — worse than the bytes —
-//! `VolumeStore::enforce_budget` went on evicting *oldest first* to fit them,
-//! which is a live 3D loop's own frames.
-//!
-//! Every assertion below is in **bytes off a real `VoxelGrid`**. A store of
-//! `Refused` stubs would satisfy an entry-count assertion while giving nothing
-//! back, which is exactly the shape of test this closes rather than adds to.
-
 use crate::app::tests::{headless, two_pane_app};
 use crate::platform_double::TestBridge;
 use crate::volume_fixture::ready_grid;
@@ -39,8 +23,6 @@ fn target(minute: u32) -> VolumeTarget {
     }
 }
 
-/// GPU texture bytes one [`ready_grid`] costs the store — the figure every
-/// assertion here is denominated in.
 fn one_grid() -> usize {
     let VolumeEntry::Ready(grid) = ready_grid() else {
         unreachable!("ready_grid is Ready")
@@ -54,9 +36,6 @@ fn one_grid() -> usize {
     .expect("a fixture grid cannot overflow")
 }
 
-/// Make `pane_idx` a 3D pane, and record that it has already been served
-/// `rendered_for` — which is what stops `PrepareVolume` firing again, and so
-/// what a release has to clear.
 fn aim_at_volume(app: &mut crate::app::App, pane_idx: usize, t: &VolumeTarget) {
     let pane = app.gui.pane_mut(pane_idx).expect("the pane exists");
     pane.site = SITE.to_owned();
@@ -66,7 +45,6 @@ fn aim_at_volume(app: &mut crate::app::App, pane_idx: usize, t: &VolumeTarget) {
         .rendered_for = Some(t.clone());
 }
 
-/// Open and resolve a build for `pane_idx` the way production does.
 fn make_resident(app: &crate::app::App, pane_idx: usize, t: &VolumeTarget, hold: Hold) {
     app.volume_store.begin_build_held(pane_idx, t, hold);
     assert!(
@@ -75,16 +53,6 @@ fn make_resident(app: &crate::app::App, pane_idx: usize, t: &VolumeTarget, hold:
     );
 }
 
-/// Take the layout down to one pane, leaving the second one *remembered* —
-/// which is the whole of what a pane-count reduction does.
-///
-/// Through the config loader because that is the only route to a layout change
-/// this crate has (`Gui::set_pane_count_for_test` is `#[cfg(test)]` inside
-/// `rustdar-egui`), and it is a production path rather than a workaround: it is
-/// what a returning user's saved layout takes. The config names **one** pane,
-/// so the restore loop — bounded by `.take(count)` — never touches pane 1, and
-/// every assertion below about pane 1's state is about state this transition
-/// left alone.
 fn hide_the_second_pane(app: &mut crate::app::App) {
     let store = MemoryKvStore::default();
     store
@@ -108,10 +76,6 @@ fn hide_the_second_pane(app: &mut crate::app::App) {
     );
 }
 
-/// **The pane-count reduction gives the hidden pane's volume back.**
-///
-/// Reverting `App::release_hidden_pane_volumes` leaves the store at two grids
-/// here, which is the leak this closes.
 #[test]
 fn hiding_a_3d_pane_gives_its_grid_back_and_leaves_the_visible_one_alone() {
     let one = one_grid();
@@ -151,9 +115,6 @@ fn hiding_a_3d_pane_gives_its_grid_back_and_leaves_the_visible_one_alone() {
          and flash its first-build message",
     );
 
-    // The half that decides whether the pane can ever come back. `PrepareVolume`
-    // is level-triggered on `rendered_for`, so a pane released while it still
-    // named a target would re-split into a permanent "Building…".
     assert_eq!(
         app.gui
             .pane(1)
@@ -163,16 +124,7 @@ fn hiding_a_3d_pane_gives_its_grid_back_and_leaves_the_visible_one_alone() {
         "the released pane still names the grid it no longer has, so a re-split \
          would never ask for another one",
     );
-    // Pane 0's own `rendered_for` is deliberately *not* asserted here: the
-    // config load rebuilds the content of every pane it names, so pane 0's
-    // key was cleared by the transition rather than by the release. What
-    // matters at index 0 is that the grid survived, which is asserted above;
-    // that a *live* pane's key is left alone is
-    // `the_only_pane_on_screen_never_counts_as_hidden`, which reaches the
-    // release without going through the loader at all.
 
-    // Edge-triggered: the next frame finds nothing to do rather than repeating
-    // the sweep for the life of the split.
     app.release_hidden_pane_volumes();
     assert_eq!(
         app.volume_store.texture_bytes(),
@@ -181,17 +133,6 @@ fn hiding_a_3d_pane_gives_its_grid_back_and_leaves_the_visible_one_alone() {
     );
 }
 
-/// **A hidden 3D *loop* releases its whole resident set, and a visible one
-/// keeps every frame of its own.**
-///
-/// The two directions the set holder makes dangerous, in one drive:
-///
-///  * a hidden set holder is the one holder nothing else bounds —
-///    `dispatch_loop_renders` walks only the visible panes, so its `retain_set`
-///    is never restated and its whole set (fourteen grids, 512 MiB on desktop)
-///    outlives the layout;
-///  * and the release must detach *that* pane rather than drop the entries, or
-///    the visible loop beside it loses the frames it is animating.
 #[test]
 fn hiding_a_looping_3d_pane_releases_its_set_and_not_the_visible_loops() {
     let one = one_grid();
@@ -240,13 +181,6 @@ fn hiding_a_looping_3d_pane_releases_its_set_and_not_the_visible_loops() {
     );
 }
 
-/// A single-pane app releases nothing, whatever the store holds for pane 0.
-///
-/// The guard on the predicate itself: `hidden_holders` is an index test against
-/// the layout's count, and one that was off by one — or that read the
-/// *remembered* count instead of the visible one — would take the live pane's
-/// volume away on every frame, rebuilding an 8 MiB grid per frame with a warm
-/// machine as the only symptom.
 #[test]
 fn the_only_pane_on_screen_never_counts_as_hidden() {
     let mut app = headless(TestBridge::desktop());

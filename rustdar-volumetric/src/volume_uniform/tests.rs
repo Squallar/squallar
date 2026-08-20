@@ -13,11 +13,6 @@ fn lanes(bytes: &[u8; VOLUME_UNIFORM_BYTES]) -> [f32; VOLUME_UNIFORM_LANES] {
 }
 
 /// A uniform whose every lane is a distinct, recognisable number.
-///
-/// Distinctness is the point: a `to_bytes` that swapped two `vec4`s, or
-/// transposed the matrix, or wrote the light direction into the transfer
-/// slot would still round-trip through a decoder that mirrored it. Only
-/// absolute positions with unique values catch that.
 fn distinct() -> VolumeUniform {
     let mut matrix = [[0.0f32; 4]; 4];
     for (column, values) in matrix.iter_mut().enumerate() {
@@ -54,11 +49,6 @@ fn distinct() -> VolumeUniform {
 }
 
 /// The block is exactly 224 bytes, and the shader declares the same.
-///
-/// Both halves matter: the Rust side could be 224 while the WGSL grew a
-/// member, and then every lane after the new one is read from the wrong
-/// place with no error at all — a uniform buffer larger than the shader's
-/// block is legal.
 #[test]
 fn the_block_is_a_mat4_and_ten_vec4s_on_both_sides() {
     assert_eq!(VOLUME_UNIFORM_BYTES, 64 + 10 * 16);
@@ -86,10 +76,6 @@ fn the_block_is_a_mat4_and_ten_vec4s_on_both_sides() {
 }
 
 /// The declaration order in the WGSL is the order this file packs.
-///
-/// Reordering two `vec4<f32>` members in the shader is a one-line edit that
-/// leaves the block the same size and every test above green, while the
-/// camera reads the box size and the box size reads the camera.
 #[test]
 fn the_shader_declares_the_members_in_the_order_this_file_packs_them() {
     let source = include_str!("../volume.wgsl");
@@ -144,21 +130,6 @@ fn every_lane_lands_at_its_std140_offset() {
     );
 
     // The offsets themselves, as literals.
-    //
-    // Everything below indexes with `offset / 4` using the very constants
-    // `to_bytes` writes at, so on its own it cannot see a transposition:
-    // swap `OFFSET_BOX_SIZE_KM` and `OFFSET_GRID_DIMS` and the writer and
-    // the reader move together. A review proved it — all 103 host tests
-    // passed, and only the `#[ignore]`d GPU test noticed — which at the time
-    // ran nowhere but by hand. It runs in CI now, on lavapipe, but a
-    // transposition should not need a render to be caught at all.
-    // The realistic route in is someone reordering `struct
-    // Volume` in the WGSL and transposing two offsets to match; the shader
-    // then reads the box size out of the grid-dims slot, which is wrong
-    // step lengths and wrong gradient spacing, i.e. a merely hazy volume.
-    //
-    // So the offsets are pinned to literals here, and the loop below is
-    // what says each member reaches the offset it names.
     assert_eq!(
         (
             OFFSET_BOX_FROM_CLIP,
@@ -226,22 +197,6 @@ fn every_lane_lands_at_its_std140_offset() {
 
 /// The isosurface pair defaults to the negative sentinels that select the
 /// lit-volume march.
-///
-/// This test is the free-lane registry's tombstone: `eye_in_box.w` and
-/// `grid_dims.w` were the two reserved-zero lanes (after `box_size_km.w`
-/// and the three upper flags lanes took the exaggeration, the
-/// reconstruction level, the march step and the floor switch), and the
-/// view-mode work took both — `iso_threshold` and `iso_centre`. The block
-/// then grew for the first time, by the two `grid_from_box` members the
-/// stand-in crop needs; one lane of those (`grid_from_box_b.w`) is the only
-/// reserved-zero left. A further member is another 16 bytes and a WGSL
-/// struct change, on both sides, with every layout test above moving
-/// together.
-///
-/// The sentinel half matters most: negative — not zero — selects the lit
-/// volume, because an index-0 threshold is a real isosurface
-/// configuration ("the surface of any data"). A default of 0.0 here would
-/// put every existing pane into isosurface mode at the no-data boundary.
 #[test]
 fn the_iso_lanes_default_to_the_lit_volume_sentinels() {
     let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]);
@@ -262,18 +217,6 @@ fn the_iso_lanes_default_to_the_lit_volume_sentinels() {
 
 /// A fresh uniform draws the grid in its own box: scale 1, offset 0, no
 /// bounds test.
-///
-/// **This is the lane pair's most important property.** Every mask, silhouette
-/// and march-cost instrument in this repository builds a uniform and measures
-/// what the shader does with it, and every one of them was written before the
-/// affine existed. If the default were anything but the identity, all of them
-/// would silently start measuring a transformed field — and the arithmetic
-/// (`p · 1 + 0`) is the one transform no `f32` can move, so at the identity the
-/// instruments are not merely close to what they were but bit-identical.
-///
-/// The bounds flag is separately zero, and that is not redundant: raised at the
-/// identity it would discard any sample whose march parameter overshot the exit
-/// face by an ulp, which is a difference no instrument declares a tolerance for.
 #[test]
 fn a_fresh_uniform_draws_the_grid_in_its_own_box() {
     let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]);
@@ -328,11 +271,6 @@ fn the_shading_flag_is_one_or_zero() {
 
 /// The reconstruction LOD rides `flags.y`, and the uniform's default is
 /// the raw field.
-///
-/// The default half is the load-bearing one: 0 is the bit-exact
-/// instrument configuration the silhouette harness measures through —
-/// the coarse mip's filter weight is exactly zero there — and any other
-/// default would move alpha at every boundary of every mask.
 #[test]
 fn the_reconstruction_lod_rides_flags_y_and_defaults_to_the_raw_field() {
     let mut uniform = distinct();
@@ -356,17 +294,6 @@ fn the_reconstruction_lod_rides_flags_y_and_defaults_to_the_raw_field() {
 
 /// There is no nearest sentinel any more, and the shader has no sign
 /// branch to select one with.
-///
-/// This lane used to carry a negative sentinel selecting a
-/// nearest-neighbour snap, for the seven products whose no-data boundary a
-/// plain `R8Unorm` filter could not be trusted across. The texture is
-/// coverage-premultiplied `Rg16Float` now: the shader divides the
-/// premultiplied index by the coverage, so a filtered sample beside air
-/// lands inside the convex hull of the stored indices and every product
-/// takes the one filtering path. Both halves are asserted because either
-/// alone would pass while the other regressed — a reinstated branch with no
-/// writer is dead code, and a reinstated writer with no branch silently
-/// samples at a negative LOD.
 #[test]
 fn no_negative_reconstruction_sentinel_survives_in_the_lane_or_the_shader() {
     let shader = include_str!("../volume.wgsl");
@@ -396,12 +323,6 @@ fn no_negative_reconstruction_sentinel_survives_in_the_lane_or_the_shader() {
 }
 
 /// Grid dimensions cross as floats, not as integers reinterpreted.
-///
-/// `grid_dims` is the one member whose Rust type is an integer, and the
-/// mistake with teeth is writing `n.to_le_bytes()` for a `u32`: 256 then
-/// arrives as 3.6e-43 and the gradient's voxel step becomes astronomically
-/// large, which reads as a completely unshaded volume rather than as an
-/// error.
 #[test]
 fn the_grid_dimensions_cross_as_floats() {
     let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [256, 256, 128]);
@@ -411,11 +332,6 @@ fn the_grid_dimensions_cross_as_floats() {
 }
 
 /// `new` produces a uniform whose defaults the shader can actually march.
-///
-/// Each of these is a value that makes the raymarch degenerate rather than
-/// merely ugly: a zero axis divides by zero in the gradient's voxel step, a
-/// non-positive extinction makes every cell perfectly transparent, and an
-/// early-out at or above 1 stops the march on its first sample.
 #[test]
 fn the_defaults_are_a_marchable_configuration() {
     let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]);
@@ -434,16 +350,6 @@ fn the_defaults_are_a_marchable_configuration() {
 }
 
 /// The default light really does come from above and from the left.
-///
-/// Added after both minus signs in `DEFAULT_LIGHT_DIR` survived a mutation
-/// pass: `the_defaults_are_a_marchable_configuration` only asks that the
-/// vector is not all zeroes, which a light shining up from underneath the
-/// storm satisfies. That is not a crash and not a NaN — it is a volume
-/// whose overshooting tops read as dents, which is the failure this
-/// convention exists to avoid.
-///
-/// Box space is z-up, and x/y run east and north, so "up and over the
-/// viewer's left shoulder" is `z > 0` with `x < 0` and `y < 0`.
 #[test]
 fn the_default_light_comes_from_above_and_over_the_left_shoulder() {
     let [x, y, z] = DEFAULT_LIGHT_DIR;
@@ -467,13 +373,6 @@ fn the_default_light_comes_from_above_and_over_the_left_shoulder() {
 }
 
 /// The empty-cell threshold selects index 0 and nothing else.
-///
-/// The shader skips a cell when `index > threshold` is false, and an
-/// An eight-bit unorm fetch of palette entry `n` returns `n / 255`. So the
-/// threshold
-/// has to sit strictly between 0 and 1/255 — and it has to be *stated* as
-/// that rather than as a small number, because WP-C's whole no-data
-/// decision is that index 0 is the bottom of the ramp.
 #[test]
 fn the_empty_threshold_selects_exactly_palette_index_zero() {
     let threshold = DEFAULT_EMPTY_INDEX_THRESHOLD;
@@ -485,11 +384,6 @@ fn the_empty_threshold_selects_exactly_palette_index_zero() {
 }
 
 /// The shader's palette size is the one the LUT budget pays for.
-///
-/// `VOLUME_LUT_BYTES` sizes the upload; `LUT_ENTRIES` in the shader turns a
-/// fetched index into a texture coordinate. If they disagree the volume is
-/// painted with a table shifted by a fraction of a texel — every colour
-/// slightly wrong, nothing obviously broken.
 #[test]
 fn the_shader_and_the_lut_constant_agree() {
     let expected = format!("const LUT_ENTRIES: f32 = {LUT_ENTRIES}.0;");
@@ -502,20 +396,6 @@ fn the_shader_and_the_lut_constant_agree() {
 }
 
 /// The shader's kilometres-per-degree is the radar crate's, to the bit.
-///
-/// `floor_colour` reprojects the box floor through geography to sample the
-/// pane mirror, so its degree is the same conversion `ImageBounds` framed
-/// that mirror with and `render_gate` placed the echoes in it with. WGSL
-/// cannot read `rustdar_geo::KM_PER_DEGREE_LAT`, so `volume.wgsl`
-/// holds the workspace's only hand-written copy of that number and this is
-/// the guard that stops it becoming a second definition.
-///
-/// The comparison is on `f32` **bits** after parsing the literal out of the
-/// source, not on the decimal text: the shader is entitled to spell the value
-/// with however many digits it likes, and only entitled to spell a different
-/// value. It read `111.32` — a 6378 km sphere — while the data it draws over
-/// was placed on 6371, which put the floor's geography 0.26 km off the echoes
-/// at the raster edge.
 #[test]
 fn the_shaders_km_per_degree_is_the_radar_crates_own() {
     const DECL: &str = "const KM_PER_DEGREE_LAT: f32 = ";

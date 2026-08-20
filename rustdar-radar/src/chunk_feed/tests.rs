@@ -7,22 +7,6 @@ fn outcome() -> Result<PollOutcome, String> {
     })
 }
 
-/// **The volume must not vanish for the duration of every round.** The
-/// poller travels with the round, and before the bridge existed
-/// `snapshot` answered `None` for the ~0.1–1 s of every ~5 s poll — so
-/// everything resolved through `current::resolve` flapped between the
-/// merged volume and the base alone at the poll cadence. Measured live:
-/// 65 voxel rebuilds in 5.5 minutes against ~20 sealed sweeps, and the
-/// section re-cut key moving per round.
-///
-/// The tail matters as much as the bridge: when the poller comes home
-/// with no volume yet (a fresh feed, pre-first-chunk), the live answer is
-/// `None` and the bridge must not overrule it with the stale copy. The
-/// poller-home `snapshot` is the bridge's **only writer** — the planted
-/// copy is stale residue it must overwrite — so the round dispatched
-/// after it is what proves the refresh happened: a bridge that never
-/// refreshes serves the residue there, a volume no frame has resolved
-/// since.
 #[test]
 fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
     let volume = stub_volume();
@@ -44,15 +28,12 @@ fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
     );
 
     mgr.finish_round("KICT", poller, &empty());
-    // The poller-home call: the production refresh takes the live answer
-    // (`None` — this poller never ingested a chunk) into the bridge.
     assert!(
         mgr.snapshot("KICT").is_none(),
         "a poller home with no volume yet answers None, and a bridge that \
              never refreshes would overrule it with the stale copy",
     );
 
-    // The next round serves the bridge state that call established.
     mgr.force_due("KICT");
     let poller = mgr.take_for_round("KICT").expect("the next round leaves");
     assert!(
@@ -67,8 +48,6 @@ fn empty() -> Result<PollOutcome, String> {
     Ok(PollOutcome::default())
 }
 
-/// The smallest `Scan` the bridge can hold — for fixtures that need a
-/// volume in hand without a network to assemble one.
 fn stub_volume() -> std::sync::Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
     std::sync::Arc::new(Scan::new(
@@ -92,13 +71,6 @@ fn stub_volume() -> std::sync::Arc<nexrad_model::data::Scan> {
     ))
 }
 
-/// **The dead flight's frozen volume dies with the feed.** A retired
-/// poller keeps its assembler, so without the retired gate `snapshot`
-/// goes on serving the partial volume the flight froze on — while the
-/// archive polls roll `base_scans` forward underneath, and overlay
-/// sweeps supersede base cuts by list order rather than by time. Every
-/// consumer of the merged current volume then serves a dead flight's low
-/// tilts under a caption whose newest time reads the newer base.
 #[test]
 fn a_retired_feed_serves_no_snapshot() {
     let volume = stub_volume();
@@ -123,11 +95,6 @@ fn a_retired_feed_serves_no_snapshot() {
     );
 }
 
-/// Retirement along the real path — a stalled feed's round comes home
-/// empty — takes the bridge copy with it, so nothing can serve the frozen
-/// volume across the retirement. And recovery after the window is a
-/// genuinely fresh flight: feeding again, rounds resuming, with nothing
-/// left of the dead flight to serve while the new one assembles.
 #[test]
 fn retirement_drops_the_bridge_copy_and_recovery_starts_fresh() {
     let mut mgr = ChunkFeedManager::new();
@@ -155,8 +122,6 @@ fn retirement_drops_the_bridge_copy_and_recovery_starts_fresh() {
     );
     assert!(mgr.snapshot("KICT").is_none());
 
-    // Recovery after the window is a fresh flight, not the dead one
-    // revived.
     mgr.force_retire_at("KICT", RETRY_AFTER + std::time::Duration::from_secs(1));
     mgr.ensure("KICT");
     assert!(mgr.is_feeding("KICT"), "the retry window has passed");
@@ -173,15 +138,11 @@ fn retirement_drops_the_bridge_copy_and_recovery_starts_fresh() {
     );
 }
 
-/// Take a round, skipping the real interval — these tests are about the
-/// retirement rules, not the clock.
 fn take(mgr: &mut ChunkFeedManager, site: &str) -> Box<ChunkPoller> {
     mgr.force_due(site);
     mgr.take_for_round(site).expect("a round was available")
 }
 
-/// The first round is available immediately; a second is not, because the
-/// poller is out.
 #[test]
 fn one_round_per_site_is_in_flight_at_a_time() {
     let mut mgr = ChunkFeedManager::new();
@@ -198,9 +159,6 @@ fn one_round_per_site_is_in_flight_at_a_time() {
     assert!(!mgr.any_in_flight());
 }
 
-/// The mutation this kills: counting an empty round as a failure. No new
-/// chunk is the ordinary state between cuts, so a feed that is working
-/// perfectly would retire after fifteen seconds of it.
 #[test]
 fn an_empty_round_is_not_an_error() {
     let mut mgr = ChunkFeedManager::new();
@@ -212,7 +170,6 @@ fn an_empty_round_is_not_an_error() {
     assert!(mgr.is_feeding("KTLX"));
 }
 
-/// Three consecutive hard failures retire the site; two do not.
 #[test]
 fn three_consecutive_errors_retire_a_site_and_two_do_not() {
     let mut mgr = ChunkFeedManager::new();
@@ -238,8 +195,6 @@ fn three_consecutive_errors_retire_a_site_and_two_do_not() {
     );
 }
 
-/// And a success in between clears the count, so intermittent failures never
-/// accumulate into a retirement.
 #[test]
 fn a_successful_round_clears_the_error_count() {
     let mut mgr = ChunkFeedManager::new();
@@ -258,8 +213,6 @@ fn a_successful_round_clears_the_error_count() {
     assert!(mgr.is_feeding("KTLX"));
 }
 
-/// Rounds succeeding but delivering nothing for two minutes is a dead feed,
-/// which no error count would ever catch.
 #[test]
 fn a_feed_that_makes_no_progress_retires() {
     let mut mgr = ChunkFeedManager::new();
@@ -272,8 +225,6 @@ fn a_feed_that_makes_no_progress_retires() {
     );
 }
 
-/// A retirement is not permanent — a CORS blip should not cost the session —
-/// but it does not lift early either.
 #[test]
 fn a_retired_site_is_retried_only_after_the_window() {
     let mut mgr = ChunkFeedManager::new();
@@ -287,8 +238,6 @@ fn a_retired_site_is_retried_only_after_the_window() {
     assert!(mgr.is_feeding("KTLX"));
 }
 
-/// The feed of a site nothing is watching live holds tens of megabytes of
-/// accumulated volume and has no reader.
 #[test]
 fn feeds_for_sites_no_pane_watches_are_dropped() {
     let mut mgr = ChunkFeedManager::new();
@@ -301,8 +250,6 @@ fn feeds_for_sites_no_pane_watches_are_dropped() {
     assert!(!mgr.is_feeding("KOUN"));
 }
 
-/// A round in flight for a site that was dropped meanwhile must not
-/// resurrect it, and must not panic.
 #[test]
 fn a_round_landing_after_its_site_was_dropped_is_discarded() {
     let mut mgr = ChunkFeedManager::new();

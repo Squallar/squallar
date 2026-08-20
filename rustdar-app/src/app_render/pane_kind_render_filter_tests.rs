@@ -18,9 +18,6 @@ fn volume_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// A one-pane app on [`SITE`] with scan info, which is what
-/// `apply_render_to_pane` reads the site coordinates out of before it will
-/// place anything at all.
 fn app_on_site() -> crate::app::App {
     let mut app = headless(TestBridge::desktop());
     point_at_site(&mut app, 0);
@@ -54,9 +51,6 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
         });
 }
 
-/// The line an aimed section pane is cut along. Two distinct points on Earth is
-/// all `SectionLine::new` asks, and all any of these tests needs — none of them
-/// reaches a rasterizer.
 fn section_line() -> rustdar_egui::pane::SectionLine {
     rustdar_egui::pane::SectionLine::new(
         rustdar_geo::GeoPoint {
@@ -71,9 +65,6 @@ fn section_line() -> rustdar_egui::pane::SectionLine {
     .expect("two distinct points on Earth")
 }
 
-/// Finished pixels at the base size, already converted — which is the shape
-/// `poll_render_results` now receives, the premultiply having happened inside
-/// the job and the `ColorImage` having been built in `deliver`.
 fn finished_pixels() -> Arc<egui::ColorImage> {
     let side = rustdar_radar::types::IMAGE_SIZE;
     Arc::new(egui::ColorImage::from_rgba_unmultiplied(
@@ -82,8 +73,6 @@ fn finished_pixels() -> Arc<egui::ColorImage> {
     ))
 }
 
-/// A loop frame's pixels, which are the *loop* size and not the static one —
-/// see `constants::LOOP_IMAGE_SIZE`.
 fn loop_frame_pixels() -> egui::ColorImage {
     let side = rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
     egui::ColorImage::from_rgba_unmultiplied([side, side], &vec![0u8; side * side * 4])
@@ -100,11 +89,6 @@ fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
     }
 }
 
-/// Whether pane `pane_idx` is holding a radar texture.
-///
-/// The observable throughout this module: it is what `apply_render_to_pane`
-/// exists to produce, and the only thing that tells a pane which was served
-/// from one which was skipped.
 fn holds_radar_texture(app: &mut crate::app::App, pane_idx: usize) -> bool {
     app.gui
         .pane_mut(pane_idx)
@@ -114,14 +98,6 @@ fn holds_radar_texture(app: &mut crate::app::App, pane_idx: usize) -> bool {
         .is_some()
 }
 
-/// A finished render landing on the channel, as a render thread posts one,
-/// and then drained by the poller.
-///
-/// The bare `egui::Context` is the whole renderer these paths need —
-/// `Context::load_texture` wants no device, no surface and no window — which
-/// is what `stamping_tests` already relies on and why the frame's context is
-/// a parameter of the poller rather than something it reaches through
-/// `self.state` for.
 fn deliver(app: &mut crate::app::App, pane_idx: usize) {
     app.channels
         .render_sender
@@ -144,14 +120,6 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
     app.poll_render_results(&egui::Context::default());
 }
 
-/// `dispatch_pane_renders` skips a pane with no plan view, and skips it
-/// *before* the rendering-params branch.
-///
-/// Driven through the render cache rather than through a spawned render, so
-/// neither a thread nor a decoded volume is needed: a cache hit is one of the
-/// two ways the `if` arm places an image, and reaching it at all proves the
-/// pane got past the guard. The map case is asserted in the same run, so this
-/// cannot be satisfied by a dispatcher that skips every pane.
 #[test]
 fn the_dispatcher_skips_a_pane_with_no_plan_view() {
     for kind in [
@@ -204,16 +172,6 @@ fn the_dispatcher_skips_a_pane_with_no_plan_view() {
     }
 }
 
-/// The sibling broadcast skips a pane with no plan view.
-///
-/// It accepts on site + product + elevation with **no view term**, and all
-/// three match for a section pane sitting beside the map it was cut from —
-/// which is the ordinary arrangement rather than a corner case. Unfiltered,
-/// the section pane is handed the map's raster on the first render either of
-/// them triggers.
-///
-/// Pane 1 is asserted to take the broadcast while it is still a map, so what
-/// is observed below is the filter and not a sibling that never qualified.
 #[test]
 fn the_sibling_broadcast_skips_a_pane_with_no_plan_view() {
     for kind in [
@@ -251,14 +209,6 @@ fn the_sibling_broadcast_skips_a_pane_with_no_plan_view() {
     }
 }
 
-/// A render already in flight when its pane is converted is not placed on it.
-///
-/// `dispatch_pane_renders` no longer starts one, but conversion happens on a
-/// frame and a render takes many, so the window is real rather than
-/// theoretical. The result still clears `render_in_flight` — that is its
-/// other job, and dropping it would wedge the pane forever — and
-/// `last_rendered` stays unset, so converting back to a map re-dispatches
-/// rather than showing nothing.
 #[test]
 fn a_render_in_flight_across_a_conversion_is_not_placed() {
     let mut app = app_on_site();
@@ -279,8 +229,6 @@ fn a_render_in_flight_across_a_conversion_is_not_placed() {
     assert_eq!(app.render.pane_render[0].last_rendered, None);
 }
 
-/// A loop on [`SITE`] with one frame per timestamp, keyed to
-/// [`PRODUCT`] at [`TILT`].
 fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
     let mut ls = LoopPlaybackState::new_for_loop(
         3600,
@@ -302,9 +250,6 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
             render_failed: false,
         })
         .collect();
-    // Takes the target and reports `false`: there was nothing to discard, so
-    // there is nothing for the caller to react to. What matters here is that
-    // `rendered_for` is now set, which is what the dispatcher reads.
     ls.retarget_renders(PRODUCT, TILT);
     assert!(
         ls.rendered_for.is_some(),
@@ -313,21 +258,6 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
     ls
 }
 
-/// `dispatch_loop_renders`' **first** pass skips a pane that cannot loop, and
-/// **only** a pane that cannot loop.
-///
-/// That pass's job is to notice the pane's product moving and re-key the whole
-/// frame list to it, which also queues a fresh download plan — for a pane
-/// nobody draws, a download queue serving nobody. So the observable is
-/// `rendered_for`: it must move for a pane that animates and must not move for
-/// one that does not.
-///
-/// The classification is [`Gui::pane_cannot_loop`], **not**
-/// `pane_has_no_plan_view`, which is what it was while a loop frame could only
-/// be a plan-view tilt. The three rows below are the whole of the difference:
-/// an aimed cross-section pane has no plan view and *does* animate, an unaimed
-/// one has nothing to cut, and a 3D volume animates a sequence of resident
-/// grids with nothing to be aimed at, so it is a participant from the start.
 #[test]
 fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
     let moved_to = RadarProduct::Velocity;
@@ -344,23 +274,18 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
             false,
             Some((moved_to, 0.0)),
         ),
-        // Aimed: a section loop is a first-class participant, so its target
-        // moves with the product exactly as a map's does.
         (
             "aimed section",
             rustdar_radar::types::RenderView::CrossSection,
             true,
             Some((moved_to, 0.0)),
         ),
-        // Unaimed: nothing to cut, so it is not a loop participant at all.
         (
             "unaimed section",
             rustdar_radar::types::RenderView::CrossSection,
             false,
             Some((PRODUCT, TILT)),
         ),
-        // A 3D pane needs no aiming — the volume is the whole box — so its
-        // target moves with the product like a map's.
         (
             "volume",
             rustdar_radar::types::RenderView::Volume,
@@ -371,11 +296,6 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
         let mut app = app_on_site();
         {
             let pane = app.gui.pane_mut(0).unwrap();
-            // Converted *first*, because `set_content` tears a loop down on
-            // any kind change — the root fix for the stuck-loop family.
-            // Planting the loop afterwards is what leaves the state this
-            // filter is about, and it is reachable: `loop_state` is a public
-            // field, and the setter is not the only route to another kind.
             pane.set_view(kind);
             if aimed {
                 pane.cross_section_mut()
@@ -406,17 +326,6 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
     }
 }
 
-/// `dispatch_loop_renders`' **second** pass skips a pane that cannot loop, and
-/// examines every pane that can — through the branch its own view names.
-///
-/// That pass is the one which plans renders and clones siblings' textures. The
-/// observable is `render_failed`, which it sets on a frame whose own volume
-/// carries nothing for the selection. A scan with no sweeps at all makes
-/// `find_closest_elevation` answer `None` on the plan-view branch and
-/// `ladder_fingerprint` answer `None` on the section branch, so a frame is
-/// retired on both — which is the point: an aimed section pane's frames are
-/// *judged*, where before this work they were never looked at. No render
-/// thread and no real volume are involved.
 #[test]
 fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
     for (label, kind, aimed, expected_failed) in [
@@ -438,10 +347,6 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
             false,
             false,
         ),
-        // The 3D branch judges its frames too: the cached volume carries
-        // nothing for the product, so `extract_volume_parts` refuses and the
-        // store answers `Refused`, which retires the frame exactly as an
-        // unrenderable sweep does on the plan-view path.
         (
             "volume",
             rustdar_radar::types::RenderView::Volume,
@@ -451,8 +356,6 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
     ] {
         let mut app = app_on_site();
         app.loop_mgr = LoopDownloadManager::new();
-        // A volume that is present, so the frame is not `Pending`, and
-        // carries nothing for the product, so it is `Unrenderable`.
         app.loop_mgr.cache_scan(
             SITE,
             volume_time(),
@@ -460,7 +363,6 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
         );
         {
             let pane = app.gui.pane_mut(0).unwrap();
-            // Converted first; see the note in the test above.
             pane.set_view(kind);
             if aimed {
                 pane.cross_section_mut()
@@ -468,10 +370,6 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
                     .line = Some(section_line());
             }
             pane.loop_state = active_loop(&[volume_time()]);
-            // Each loop is planned on its own view, which the enable path
-            // takes off the pane's kind. Planted directly here for the same
-            // reason the loop itself is: this test is about the dispatch
-            // filter, not about the enable path.
             pane.loop_state.view = kind;
         }
 
@@ -486,24 +384,6 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
     }
 }
 
-/// A pane that cannot loop cannot hold another pane's loop back.
-///
-/// The worst of these, because the symptom is in the *other* panes and the
-/// cause is the filter that protects the render path.
-/// `sync_loop_playback_start`'s rule is "hold every looping pane until all of
-/// them are ready", and a pane whose frames nothing renders can never become
-/// ready — `dispatch_loop_renders` neither fills its frames nor marks them
-/// failed. So one such pane, with Sync Layers on, stops every map pane's loop
-/// from ever starting: a deadlock, silently, in panes the user did not touch.
-///
-/// The pane used to be a 3D volume one, which is now a full loop participant.
-/// The state is still reachable and still the hazard, and what reaches it now
-/// is an **unaimed cross-section** pane — the one kind-and-state combination
-/// `PaneState::can_loop` still refuses, because a section with no line has
-/// nothing to cut while its volumes download perfectly well.
-///
-/// The blocked pane is given a real textured frame so it *is* render-ready and
-/// would start on its own; the only thing that can stop it is the sync rule.
 #[test]
 fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     use rustdar_egui::pane::LoopPhase;
@@ -517,7 +397,6 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
              default, and it is what makes one pane able to hold another back"
     );
 
-    // Pane 0: a map pane whose loop is ready to play.
     {
         let ls = &mut app.gui.pane_mut(0).unwrap().loop_state;
         *ls = active_loop(&[volume_time()]);
@@ -529,9 +408,6 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
              observed being held back"
     );
 
-    // Pane 1: converted, and then given an active loop whose frames nothing
-    // will ever render — the state `set_kind` clears but a public field can
-    // still reach.
     {
         let pane = app.gui.pane_mut(1).unwrap();
         pane.set_view(rustdar_radar::types::RenderView::CrossSection);
@@ -558,15 +434,6 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     );
 }
 
-/// The loop-frame broadcast skips a pane with no plan view.
-///
-/// The fifth of these broadcasts and the direct sibling of the static one:
-/// a loop frame is a plan-view raster, so handing one to a pane that draws
-/// none buys a GPU texture per frame for nothing.
-///
-/// Driven by planting the same target on both panes and delivering one
-/// finished frame, with the map case asserted in the same run so the filter is
-/// what is observed rather than a sibling that never qualified.
 #[test]
 fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
     let textured = |app: &mut crate::app::App, idx: usize| {
@@ -588,11 +455,6 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
             "precondition: both panes are layer-linked by default"
         );
         app.loop_mgr = LoopDownloadManager::new();
-        // A volume that really carries the tilt, reusing the fixture the loop
-        // dispatch tests already build: `broadcast_sweep` resolves the
-        // *sibling's* own scan and refuses an image whose angle its data does
-        // not have, so an empty volume would refuse the broadcast for a reason
-        // that has nothing to do with pane kinds.
         app.loop_mgr.cache_scan(
             SITE,
             volume_time(),
@@ -601,13 +463,9 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
         for idx in 0..2 {
             let ls = &mut app.gui.pane_mut(idx).unwrap().loop_state;
             *ls = active_loop(&[volume_time()]);
-            // A result is only accepted for a frame that is *awaiting* one —
-            // see `frame_awaiting_render_result_mut` — which is the state
-            // `dispatch_loop_renders` leaves behind when it spawns.
             ls.frames[0].render_in_flight = true;
         }
         if let Some(kind) = kind {
-            // Converted, then re-given the loop: `set_kind` tears one down.
             let pane = app.gui.pane_mut(1).unwrap();
             pane.set_view(kind);
             pane.loop_state = active_loop(&[volume_time()]);
@@ -659,13 +517,6 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
     }
 }
 
-/// `restore_cached_render` skips a pane with no plan view.
-///
-/// `dispatch_pane_renders` deliberately *keeps* `cached_render` on a converted
-/// pane so that converting back to a map is instant, which makes this the one
-/// place the kept copy could still be uploaded — on every suspend, resume and
-/// surface loss, a full-size RGBA texture into the Radar overlay cache of a
-/// pane that draws no map.
 #[test]
 fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
     for kind in [
@@ -686,7 +537,6 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
             "precondition: the pane must be holding a cached render to restore"
         );
 
-        // The state a conversion leaves: the cached pixels are kept on purpose.
         app.gui.pane_mut(0).unwrap().set_view(kind);
         app.gui
             .pane_mut(0)
@@ -709,19 +559,6 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
     }
 }
 
-/// Converting a pane tears its loop down, on both sides of the seam.
-///
-/// The root fix for the stuck-loop family, which was eight consumers with one
-/// cause: a loop left running on a pane nothing renders frames for holds
-/// `loop_mgr` state, keeps the event loop waking at loop frame rate, reads
-/// "Rendering n/m" for ever with no transport drawn to cancel it, and goes on
-/// spending the *shared* download budget on volumes nobody will draw.
-///
-/// `PaneState::set_kind` does the pane-local half. The other half — this
-/// pane's queue inside `LoopDownloadManager`, which is keyed by index and
-/// which a `PaneState` cannot reach — is done by `dispatch_loop_renders`, so
-/// that it also covers a pane that reached a non-map kind by a route that
-/// never called the setter.
 #[test]
 fn converting_a_pane_tears_its_loop_down_on_both_sides() {
     for kind in [
@@ -755,8 +592,6 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
             "{kind:?}: the loop survived the conversion, so it will read \
                  \"Rendering\" for ever with no transport drawn to cancel it"
         );
-        // The host-side half, applied by the frame pass rather than by the
-        // setter, because a `PaneState` cannot see `loop_mgr`.
         app.dispatch_loop_renders();
         assert!(
             !app.loop_mgr.pending_pane_indices().contains(&0),
@@ -766,17 +601,6 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
     }
 }
 
-/// `App::evict_unshown_scans` needs **no** kind filter, and this is the pin
-/// on that.
-///
-/// It is the one all-panes loop where excluding a non-map pane would be the
-/// bug. It retains a decoded volume if any pane names its site, through
-/// `pane.site` and `pane.scan_info.site` — both flat fields on every pane
-/// whatever its kind. A section pane samples the whole volume, so it needs it
-/// alive *more* than a map pane does, and dropping it under one is a
-/// use-after-evict-shaped fault in the pass whose entire job is knowing what
-/// is on screen. This is why `PaneContent` is one field on a flat
-/// `PaneState` rather than an `enum PaneState`.
 #[test]
 fn a_whole_volume_pane_keeps_the_volume_it_is_sampling() {
     for kind in [

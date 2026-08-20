@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Below this ground speed (m/s), course-over-ground from a near-stationary
-/// receiver is noise. Ungated since the parser it feeds became ungated public
-/// API at WO-RL-3 (the parser needs no serial port; only the transport does).
+/// receiver is noise.
 pub(crate) const MIN_SPEED_FOR_BEARING_MPS: f64 = 0.5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

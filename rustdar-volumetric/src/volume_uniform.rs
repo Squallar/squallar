@@ -1,56 +1,4 @@
 //! The raymarch's uniform block, packed by hand.
-//!
-//! # Why by hand
-//!
-//! `rustdar-app` **is** `#![forbid(unsafe_code)]` (`lib.rs:2`), and
-//! `forbid` cannot be lifted by an inner `allow`, so `bytemuck`'s derive — which
-//! emits a bare `unsafe impl` with no allow of its own — is genuinely barred
-//! here. (An earlier draft of this comment had that backwards, and named
-//! `rustdar-egui` as the crate with the attribute; it does not have one.)
-//!
-//! But impossibility is not the reason, because there is a way round it:
-//! `f32` is already `Pod`, so `[f32; 40]` plus `cast_slice` needs no derive and
-//! no `unsafe`. The reason to write the bytes out anyway is **testability**. A
-//! hand-written `to_bytes` makes every std140 offset an assertable number
-//! rather than a property of a `#[repr(C)]` a reviewer has to trust. A
-//! transposed matrix or a swapped pair of `vec4`s is exactly the sort of
-//! mistake that produces a plausible-looking image.
-//!
-//! `every_lane_lands_at_its_std140_offset` is what catches it — and note it
-//! only does so because it pins the offsets as **literals** first. Indexing
-//! with the same `OFFSET_*` constants `to_bytes` writes at would move reader
-//! and writer together, which is a test that cannot see the mistake it is
-//! named for.
-//!
-//! # The layout
-//!
-//! One `mat4x4<f32>` and ten `vec4<f32>`: 224 bytes, all naturally 16-byte
-//! aligned, so std140 inserts no padding of its own.
-//!
-//! | offset | member               |
-//! |-------:|----------------------|
-//! |      0 | `box_from_clip`      |
-//! |     64 | `eye_in_box`         |
-//! |     80 | `box_size_km`        |
-//! |     96 | `grid_dims`          |
-//! |    112 | `light_dir_ambient`  |
-//! |    128 | `transfer`           |
-//! |    144 | `flags`              |
-//! |    160 | `floor_uv`           |
-//! |    176 | `floor_geo`          |
-//! |    192 | `grid_from_box_a`    |
-//! |    208 | `grid_from_box_b`    |
-//!
-//! Every lane is an `f32`, including the ones that carry counts and booleans
-//! (`grid_dims` goes out as floats, the flags as 0.0/1.0). That is a rule, not
-//! an accident: a mixed int/float block would make the offsets depend on which
-//! member a reader believed was which type, and the whole point of writing the
-//! bytes out by hand is that the offsets are assertable numbers.
-//!
-//! Lanes the shader does not read are written as **zero** rather than left to
-//! whatever was there. A uniform buffer is reused across frames, so a reserved
-//! lane that is never written is a stale value waiting for the day someone adds
-//! a field and reads it before writing it.
 
 use rustdar_device_profile::constants::VOLUME_LUT_BYTES;
 
@@ -63,106 +11,40 @@ pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
 /// Byte offset of each member, in declaration order. Public because the
 /// pipeline's minimum-binding-size assertion and the tests both name them.
 pub const OFFSET_BOX_FROM_CLIP: usize = 0;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_EYE_IN_BOX: usize = 64;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_BOX_SIZE_KM: usize = 80;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_GRID_DIMS: usize = 96;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_LIGHT_DIR_AMBIENT: usize = 112;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_TRANSFER: usize = 128;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_FLAGS: usize = 144;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_FLOOR_UV: usize = 160;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_FLOOR_GEO: usize = 176;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_GRID_FROM_BOX_A: usize = 192;
-/// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_GRID_FROM_BOX_B: usize = 208;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
-///
-/// Chosen so that a kilometre of the most opaque colour in the table absorbs
-/// about 63% of the light through it (`1 - exp(-1)`), which makes a 20 km deep
-/// storm core read as solid without turning a 240 km wide box into fog. It is a
-/// presentation constant, not a physical one — there is no radiative transfer
-/// happening here, only alpha compositing that happens to use the same algebra.
 pub const DEFAULT_EXTINCTION_PER_KM: f32 = 1.0;
 
 /// Palette indices at or below which a cell is skipped entirely.
-///
-/// **The palette's own transparent run, not an emptiness test.** Empty air is
-/// excluded by the reconstructed *coverage* (`volume.wgsl`'s `COVERAGE_FLOOR`),
-/// which is a property of the measurement rather than of the table, so this
-/// lane's whole job is the run of fully transparent entries at the bottom of
-/// the ramp: below it a sample's LUT entry absorbs nothing, so the march can
-/// skip it and its up-to-seven shading fetches without changing a pixel.
-///
-/// The default is the half-texel that selects exactly index 0 — which a
-/// covered sample can no longer reconstruct to, since `R̄ / Ḡ` lies in the
-/// convex hull of stored indices and `ramp_index` clamps every measurement to
-/// `1..=255`, so at the default this lane skips nothing and costs nothing.
-/// The production value comes from the effective fade band
-/// (`volume::bridge::empty_index_threshold_for`). Raising it trades faint
-/// returns for fill rate; setting it below zero disables the skip, which is
-/// how the spike measured the un-skipped worst case.
 pub const DEFAULT_EMPTY_INDEX_THRESHOLD: f32 = 0.5 / 255.0;
 
 /// Transmittance below which the march stops.
-///
-/// 0.004 is under one part in 255, so nothing behind it could change the
-/// eight-bit result. Setting it to zero disables the early-out, which is the
-/// other half of the spike's worst case.
 pub const DEFAULT_EARLY_OUT_TRANSMITTANCE: f32 = 0.004;
 
 /// Width of the opacity ramp above [`VolumeUniform::empty_index_threshold`],
 /// in the shader's 0-1 index units. **Zero here, deliberately.**
-///
-/// Zero is the hard threshold every mask-instrument test was written against:
-/// with it, a cell contributes its full palette alpha the moment the
-/// interpolated index clears the threshold, which is what makes a saturating
-/// extinction render a binary silhouette. The *production* width lives in
-/// `volume::bridge`, which anchors the threshold at the palette's own fade
-/// boundary and widens the ramp — see `EDGE_SOFT_WIDTH` there for the number
-/// and the measurement behind it. A soft default here would put a grey band on
-/// every instrument's edge instead — observed, not asserted: the index-1 shape
-/// in `tests/volume_silhouette.rs`'s mask-instrument test greys hundreds of
-/// boundary pixels the moment this is not zero.
 pub const DEFAULT_EDGE_SOFT_WIDTH: f32 = 0.0;
 
 /// Fraction of a lit surface's colour that survives facing away from the light.
-///
-/// Shading multiplies colour by `ambient + (1 - ambient) * lambert`, so this is
-/// the floor. Zero would make away-facing cells black rather than dark, which
-/// on a volume with no opaque surfaces reads as holes.
 pub const DEFAULT_AMBIENT: f32 = 0.35;
 
 /// The camera-relative light direction the volume is lit from, in box space.
-///
-/// Up and over the viewer's left shoulder, which is the convention GR2Analyst's
-/// 3D view uses and the one that makes an overshooting top read as a bump
-/// rather than a dent. Not normalised here — the shader normalises it, so a
-/// caller cannot make the light vanish by handing over a short vector.
 pub const DEFAULT_LIGHT_DIR: [f32; 3] = [-0.4, -0.5, 0.77];
 
 /// Everything the raymarch reads that is not a texture.
-///
-/// Deliberately plain data with no wgpu in it, so the packing is unit-testable
-/// on a machine with no GPU — which is every CI row this repository has. The
-/// `gpu` job does render, but on a software rasteriser, and it is not where a
-/// packing bug should first be caught.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeUniform {
     /// Clip space to box space, **column-major**: `box_from_clip[c][r]`.
-    ///
-    /// Column-major is WGSL's own convention for `mat4x4<f32>` and std140's, so
-    /// the four `[f32; 4]`s go out in order with no transpose. Getting this
-    /// backwards produces a camera that responds to drags in the wrong axis,
-    /// which is easy to mistake for a sign error in the orbit maths.
     pub box_from_clip: [[f32; 4]; 4],
     /// The perspective eye, in box space.
     pub eye_in_box: [f32; 3],
@@ -170,72 +52,14 @@ pub struct VolumeUniform {
     pub box_size_km: [f32; 3],
     /// The camera's vertical exaggeration, `>= 1`. Rides `box_size_km.w`.
     ///
-    /// Read by exactly one thing: the gradient shading, which takes its
-    /// normals against the *displayed* geometry so a slope drawn steep is lit
-    /// steep. Optical depth stays against the true `box_size_km` — the stretch
-    /// is a drawing convention and must never reach a measurement, which is
-    /// the same line `OrbitCamera::vertical_exaggeration` draws and the
-    /// `optical_depth_is_measured_against_the_unexaggerated_box` GPU test
-    /// pins — `#[ignore]`d behind a real adapter, so it is not part of a
-    /// default run. At 1.0 (the default) displayed and true geometry coincide.
-    ///
-    /// Never zero: the shader divides a cell extent by nothing else, and a
-    /// zero here would make every vertical difference infinite and every
-    /// normal NaN. The one production writer copies
-    /// `OrbitCamera::vertical_exaggeration`, whose floor is 1.
+    /// Read only by the gradient shading, which takes its normals against the
+    /// *displayed* geometry; optical depth stays against the true
+    /// `box_size_km`. Never zero — the shader divides a cell extent by it.
     pub vertical_exaggeration: f32,
-    /// Voxels along each axis.
-    ///
-    /// # It is read as a BOX-space metric, and under a crop that is a lie —
-    /// deliberately
-    ///
-    /// Every consumer treats this as *cells per unit of box space*, never as
-    /// the texture's dimensions: `1 / grid_dims` is the gradient's
-    /// central-difference step as a fraction of the box, `length(direction *
-    /// grid_dims)` is the march's `cells_per_t`, and `volume::bridge`'s `largest_cell_km` on the
-    /// host divides `box_size_km` by it to pick the reconstruction level and to
-    /// decide whether the coarse mip is uploaded at all. The two readings
-    /// coincide exactly when the box **is** the grid, which was the only case
-    /// that existed before the stand-in crop.
-    ///
-    /// Under a crop they do not: the drawn box covers `grid_from_box_scale` of
-    /// the texture, so it spans `grid_dims * scale` cells, and every one of
-    /// those four quantities is off by that factor. The honest metric is
-    /// `grid_dims * grid_from_box_scale`.
-    ///
-    /// **It is not corrected, and the reason is measured rather than argued.**
-    /// Correcting it was tried and makes the artefact it would seem to fix
-    /// *worse*. A zoom from a 100 km box to a 25 km one on a real KTLX volume,
-    /// rendered through the crop and then again from the freshly built grid,
-    /// differs by a mean of 31.49/255 per pixel. With `grid_dims` corrected to
-    /// the cells the box really spans it differs by 31.49 as well at the plan
-    /// camera, by 28.43 against 28.38 with shading on, and by 3.68 against 3.22
-    /// from the side — further every time, in all three configurations,
-    /// including the two chosen so the lane could bite.
-    ///
-    /// The reason is that `cells_per_t` is not a correctness quantity but a
-    /// **sampling rate**, and the field is band-limited: marching a held grid
-    /// at the texture's full cell count oversamples it, which is harmless and
-    /// slightly more accurate, and it happens to march at the *same* rate the
-    /// fresh grid will — so the sample comb does not change across the swap.
-    /// The corrected metric would coarsen the held grid's comb by the scale
-    /// factor and make the comb jump at the swap, which is visible. The
-    /// diagnosis behind these numbers is that nothing translates at a swap
-    /// (best shift is (0,0), the centroid moves 0.15 px); what the user sees is
-    /// the picture *re-colouring in place*, and the comb is one of the two
-    /// things that amplify it.
-    ///
-    /// So the divergence stays, and this note is here because the obvious fix
-    /// is wrong and someone will otherwise make it. If a future change removes
-    /// the amplification — a Linear-sampled palette, or a march whose stride
-    /// does not come off the grid at all — re-measure before correcting.
-    ///
-    /// The absolute figures carry about a percent of setup drift: a second
-    /// instrument, built independently against the same volume and the same
-    /// boxes, read 31.13 where the first read 31.49, and the difference is
-    /// unexplained. Each comparison above is within one run, and the margins
-    /// they turn on are far wider than the drift — but no single number here is
-    /// reproducible to better than that.
+    /// Voxels along each axis, read as *cells per unit of box space* rather
+    /// than as the texture's dimensions. Under a crop the drawn box spans
+    /// `grid_dims * grid_from_box_scale` cells; this lane is **not corrected**
+    /// for it, because correcting it measured worse across a swap.
     pub grid_dims: [u32; 3],
     /// Light direction in box space. Normalised by the shader.
     pub light_dir: [f32; 3],
@@ -254,116 +78,25 @@ pub struct VolumeUniform {
     pub gradient_shading: bool,
     /// Cells one march step advances along the ray, in the grid's own
     /// anisotropic cell metric. Rides `flags.z`.
-    ///
-    /// The default is 1 — one sample per cell, the rate the linear filter's
-    /// band limit supports and the value the silhouette harness's host-side
-    /// mirror marches at (`volume::raymarch::RAYMARCH_STEP_CELLS`; the two
-    /// are pinned together). The cloud rung halves it: a finer step buys no
-    /// resolution from a band-limited field, but it halves the per-step
-    /// opacity quantum, which is what takes the stratified jitter's residual
-    /// from a visible stipple to noise below the eight-bit level. Zero is
-    /// safe by construction — the shader's dt floor against the step ceiling
-    /// covers the span in ceiling-many steps rather than hanging — but no
-    /// writer produces it.
     pub step_cells: f32,
     /// Whether the march draws the map floor at the box's bottom face. Rides
     /// `flags.w`.
-    ///
-    /// **`false` here, deliberately**, like every other production knob on
-    /// this struct: the floor moves alpha on every ray that meets the ground,
-    /// so the instrument default is no floor, and the bridge sets this only
-    /// when it also bound a real floor texture at group 1 — a flag raised
-    /// over the placeholder would compositate a transparent ground, which is
-    /// a no-op but a lie about what was drawn.
     pub map_floor: bool,
     /// The mip level the march reconstructs the field at, `0..=1`. Rides
-    /// `flags.y`.
-    ///
-    /// The grid texture carries one hand-built level below the raw field —
-    /// each coarse texel the box mean of its eight fine ones, in both
-    /// channels, which under the shader's `R̄ / Ḡ` reconstruction is the
-    /// occupancy-weighted mean of the index, to under 4 index units (both
-    /// channels quantise to u8 before the shader divides, and the divisor
-    /// steps in units of 255/8; see `volume::raymarch::downsampled_grid`) —
-    /// and the sampler blends between the two, so this is a continuous
-    /// softness knob at no extra fetches: 0 is the raw trilinear tent, 1 is a
-    /// two-cell box convolved with a tent.
-    ///
-    /// **Zero here, deliberately**, for exactly the reason
-    /// [`DEFAULT_EDGE_SOFT_WIDTH`] is zero: the raw field is the instrument
-    /// configuration every mask harness measures against — at LOD exactly 0
-    /// the coarse level's filter weight is exactly zero — and any smoothing
-    /// moves alpha at every boundary. The production value lives in
-    /// `volume::bridge`, beside the soft width, and rides the same quality
-    /// rung as the lighting: together they are the cloud look, and the floor
-    /// rung stays the jagged-unlit raw march.
-    ///
-    /// **The isosurface march is always 0**, on every rung. The knob is a
-    /// presentation softness for an *integrated* field; an isosurface is a
-    /// level set, so smoothing the field moves the surface rather than
-    /// softening its rendering, and `volume.wgsl`'s `COVERAGE_FLOOR` is a
-    /// statement about the raw tent that erases sub-kernel features at any
-    /// level above it. `volume::bridge`'s isosurface branch holds the
-    /// reasoning and the measurement.
-    ///
-    /// **Never negative.** A negative value used to be a sentinel selecting a
-    /// nearest-neighbour snap, for the seven products whose no-data boundary a
-    /// plain `R8Unorm` filter could not be trusted across. The volume texture
-    /// is coverage-premultiplied `Rg16Float` now, so a filtered sample beside
-    /// empty air can no longer be dragged anywhere the data was not; all nine
-    /// products take one path and the sentinel is gone with the split.
+    /// `flags.y`. Never negative, and always 0 for the isosurface march.
     pub reconstruction_lod: f32,
     /// The isosurface threshold in the shader's 0-1 index units, or negative
     /// for the lit-volume march. Rides `eye_in_box.w`, one of the two lanes
     /// that were reserved-zero before the view-mode work.
-    ///
-    /// Negative — not zero — is the lit-volume sentinel, because an index-0
-    /// threshold is a real configuration ("the surface of any data at all").
-    /// [`ISO_OFF`] is the sentinel every writer uses.
-    ///
-    /// In isosurface mode the march paints the first crossing of the
-    /// threshold as an opaque, gradient-lit surface and stops. The threshold
-    /// reads the **data** (the interpolated palette index), never the LUT's
-    /// alpha — a Volume Alpha curve restyles the lit volume and leaves the
-    /// isosurface where the values put it, which the UI says in as many
-    /// words.
     pub iso_threshold: f32,
     /// The centre index a **diverging** product's isosurface measures its
     /// threshold from, in 0-1 index units, or negative for a sequential
     /// product whose threshold reads the index directly. Rides `grid_dims.w`,
     /// the other formerly-reserved lane.
-    ///
-    /// A diverging moment's interesting surfaces sit on *both* sides of its
-    /// background — a velocity couplet is an inbound lobe and an outbound
-    /// lobe — so its crossing test is `|index − centre| >= threshold`, which
-    /// renders both lobes, each wearing its own palette colour. ρHV rides
-    /// this lane too, with its centre at the **top** of its ramp, so "at or
-    /// under a bound" is the same test. Only read in isosurface mode.
     pub iso_centre: f32,
     /// Where the box's own site sits in the pane mirror, and how fast the
     /// mirror's texture coordinates run with geography: `(u_at_site,
     /// v_at_site, u_per_degree_east, v_per_mercator_y)`. Rides `floor_uv`.
-    ///
-    /// # Why the floor is sampled through geography rather than through the
-    /// box
-    ///
-    /// The mirror is a **Web Mercator** picture — it is the 2D pane's own
-    /// render, copied. The box is a **tangent plane in kilometres** east and
-    /// north of the site (`build_voxels` goes polar through
-    /// `site_bearing_range_km`). Those are different projections, so mapping
-    /// the box's bottom face onto the mirror with a scale and a translate is
-    /// wrong, and wrong in a way that hides: it is exact at the centre and
-    /// grows toward the corners. On the shipped 460 km box at 41.7°N the
-    /// error is 8.5 texels of 512 across (7.6 km) — the footprint is a
-    /// *trapezoid* in longitude, 6.65% wider along its north edge than its
-    /// south, because `cos φ` varies over the box — and 4.1 texels (3.7 km)
-    /// down, from Mercator's own curvature against a floor whose rows are
-    /// linear in latitude.
-    ///
-    /// So the march reprojects per pixel instead, and it does so by the
-    /// **direct spherical problem from the site**, because that is what the
-    /// box's kilometres mean: `build_voxels` reads `(x, y)` as
-    /// `range = hypot(x, y)`, `azimuth = atan2(x, y)` and nothing else.
     ///
     /// ```text
     /// δ      = hypot(x_km, y_km) / EARTH_RADIUS_KM
@@ -371,87 +104,16 @@ pub struct VolumeUniform {
     /// λ − λ₀ = atan2(sin az·sin δ·cos φ₀,  cos δ − sin φ₀·sin φ)
     /// (u, v) = (u₀ + (λ − λ₀)·u_per_deg,  v₀ + (mercᵧ(φ) − mercᵧ(φ₀))·v_per_merc)
     /// ```
-    ///
-    /// That is `rustdar_geo::great_circle_destination`, which is also
-    /// what `render_gate` places the echoes in the mirror with — the whole
-    /// reason this reprojection lands on them.
-    ///
-    /// # It was equirectangular, and so was the raster
-    ///
-    /// The first two lines used to read `φ = φ₀ + y_km / KM_PER_DEGREE_LAT`,
-    /// `λ = λ₀ + x_km / (KM_PER_DEGREE_LAT · cos φ)`. That is a first-order
-    /// approximation of the pair above, and it registered against the mirror
-    /// only because `render_gate` carried the identical approximation — two
-    /// wrong answers agreeing. On the default box at 41.7 °N the two mappings
-    /// stand ~15 km apart at the corners, twice the trapezoid error this
-    /// reprojection exists to remove and in the same direction as it.
-    ///
-    /// `KM_PER_DEGREE_LAT` is `rustdar_geo::KM_PER_DEGREE_LAT`, and
-    /// survives as how the shader reaches `EARTH_RADIUS_KM` without writing it
-    /// down a second time: kilometres over kilometres-per-degree is degrees of
-    /// arc, whatever the sphere. The shader holds the only hand-written copy of
-    /// the figure and
-    /// `tests::the_shaders_km_per_degree_is_the_radar_crates_own` pins it.
-    ///
-    /// Anchoring both axes at the **site** rather than at the mirror's corner
-    /// is deliberate: it keeps the quantities the shader subtracts small, so
-    /// an `f32` longitude near -93° never has to cancel against another one
-    /// to produce a texture coordinate near 0.5.
     pub floor_uv: [f32; 4],
     /// The geography the mirror is sampled with: `(site_latitude_degrees,
     /// box_west_edge_km, box_south_edge_km, gamma_encoded)`. Rides
     /// `floor_geo`.
-    ///
-    /// The two km lanes are the box's own `x_range_km.0` / `y_range_km.0` —
-    /// its west and south edges as kilometres east and north **of the site**,
-    /// which is the origin `floor_uv`'s formulas measure from. They are not
-    /// derivable from `box_size_km`, which carries extent and not position.
-    ///
-    /// `gamma_encoded` is 1.0 when the mirror holds gamma-encoded texels and
-    /// 0.0 when it holds linear ones, and it is not cosmetic. `egui_wgpu`
-    /// picks its fragment entry point from the **swapchain's** format
-    /// (`fs_main_gamma_framebuffer` when it is not sRGB, `fs_main_linear_
-    /// framebuffer` when it is), and the mirror is drawn by that same
-    /// pipeline. So what lands in the mirror depends on a format this module
-    /// never sees, and the shader has to be told rather than assume — a wrong
-    /// guess is a floor that is merely a bit too dark or too light, which is
-    /// exactly the sort of error that ships.
     pub floor_geo: [f32; 4],
     /// Where in the **grid texture** a position in the drawn box's unit cube
     /// sits: `t = grid_from_box_scale · p + grid_from_box_offset`, per axis.
-    ///
-    /// [`IDENTITY_GRID_FROM_BOX`] — scale 1, offset 0 — is the ordinary case
-    /// and the only one every instrument in this repository measures: the box
-    /// being drawn *is* the grid, so `t = p` exactly, and the arithmetic is a
-    /// multiply by one and an add of zero that no `f32` can move.
-    ///
-    /// # What the other case is for
-    ///
-    /// A zoom retargets the pane's box, and every frame of the gesture names
-    /// another one, so the pane used to stay blank for the whole scroll plus a
-    /// build — 12 frames over a 200 ms wheel turn, measured. So while a build
-    /// is in flight the pane draws the grid it already has, *in the box the
-    /// user just asked for* — and this affine is what makes that a real
-    /// picture rather than a mislabelled one. The rest of the uniform describes the
-    /// **requested** box throughout (`box_size_km`, `floor_geo`'s west and
-    /// south edges), so the floor, the camera framing and the geography are
-    /// the new ones; only where the field is fetched from is old.
-    ///
-    /// Zooming in, the requested box is inside the held grid and every fetch
-    /// lands in it — the picture magnifies and sharpens when the build lands.
-    /// Zooming out it is not, and fetches outside the grid must read as air
-    /// rather than as the sampler's clamped edge texel, which would smear the
-    /// grid's rim across ground the radar never reported. That is what the
-    /// `w` lane below is for.
     pub grid_from_box_scale: [f32; 3],
     /// Whether the drawn box reaches outside the grid, so the march has to
     /// test each fetch against the grid's bounds. Rides `grid_from_box_a.w`.
-    ///
-    /// A flag rather than an unconditional test because the test is not free
-    /// and, at [`IDENTITY_GRID_FROM_BOX`], not merely redundant but slightly
-    /// wrong: a march parameter that overshoots the exit face by one `f32`
-    /// ulp would have its last sample discarded, and the ordinary path must
-    /// stay bit-identical to what every mask instrument measured.
     pub grid_bounded: bool,
     /// See [`VolumeUniform::grid_from_box_scale`]. Rides `grid_from_box_b.xyz`;
     /// `w` is reserved and written zero.
@@ -468,10 +130,6 @@ pub const IDENTITY_GRID_FROM_BOX: ([f32; 3], [f32; 3]) = ([1.0; 3], [0.0; 3]);
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.
-    ///
-    /// Not `Default::default()`: an all-zero `box_from_clip` and an all-zero
-    /// `grid_dims` are both degenerate (the latter divides by zero in the
-    /// gradient), and a derived `Default` would hand them out silently.
     pub fn new(box_size_km: [f32; 3], grid_dims: [u32; 3]) -> Self {
         Self {
             box_from_clip: IDENTITY,
@@ -491,9 +149,8 @@ impl VolumeUniform {
             map_floor: false,
             iso_threshold: ISO_OFF,
             iso_centre: ISO_OFF,
-            // No mirror: `map_floor` is false above, so the shader never
-            // reads these. Zero rather than a plausible-looking placement,
-            // for the reason the module doc gives about unwritten lanes.
+            // No mirror: `map_floor` is false above, so the shader never reads
+            // these. Zero rather than a plausible-looking placement.
             floor_uv: [0.0; 4],
             floor_geo: [0.0; 4],
             grid_from_box_scale: IDENTITY_GRID_FROM_BOX.0,
@@ -503,10 +160,6 @@ impl VolumeUniform {
     }
 
     /// The 224 bytes the GPU reads, little-endian.
-    ///
-    /// Little-endian unconditionally: every target wgpu supports is
-    /// little-endian, and `to_le_bytes` says so at the call site rather than
-    /// depending on the host happening to agree.
     pub fn to_bytes(&self) -> [u8; VOLUME_UNIFORM_BYTES] {
         let mut out = [0u8; VOLUME_UNIFORM_BYTES];
 

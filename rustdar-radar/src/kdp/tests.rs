@@ -14,7 +14,6 @@ const Z_OFFSET: f32 = 66.0;
 const ZDR_SCALE: f32 = 16.0;
 const ZDR_OFFSET: f32 = 128.0;
 
-/// One gate of a fixture moment.
 #[derive(Clone, Copy)]
 enum G {
     V(f64),
@@ -58,10 +57,6 @@ fn m8(scale: f32, offset: f32, vals: &[G]) -> MomentData {
     MomentData::from_fixed_point(vals.len() as u16, FIRST_M, GATE_M, 8, scale, offset, bytes)
 }
 
-/// One dual-pol radial: φ and ρ per `phi_at`/`rho_at`, reflectivity per
-/// `z_at` (`None` leaves the moment off entirely), ZDR a flat 0 dB
-/// whenever reflectivity is present (the coherent recombination's
-/// vertical-power input).
 fn dp_radial(
     az: f64,
     spacing: f32,
@@ -108,9 +103,7 @@ fn params_with_isdp(isdp: f32) -> KdpParams {
 }
 
 /// A clean φ ramp of 4 °/km (1° per 0.25 km gate) over solid ρ = 0.99:
-/// interior gates read exactly half the slope, 2.0 °/km, on both the
-/// short-gate radial (45 dBZ) and the long-gate one (30 dBZ) — with no
-/// curvature the two windows agree.
+/// interior gates read exactly half the slope, 2.0 °/km, on both windows.
 #[test]
 fn a_clean_phidp_ramp_reads_half_the_slope() {
     let phi = |i: usize| G::V(100.0 + i as f64);
@@ -135,9 +128,8 @@ fn a_clean_phidp_ramp_reads_half_the_slope() {
     }
 }
 
-/// `Interpolate`'s tail rule: past the last valid group's `end − w/2`
-/// the smoothed φ holds constant, so the last gate's KDP is exactly 0
-/// on both chains even in the middle of a ramp.
+/// `Interpolate`'s tail rule: past the last valid group's `end − w/2` the
+/// smoothed φ holds constant, so the last gate's KDP is exactly 0.
 #[test]
 fn the_interpolation_tail_flattens_the_last_half_window() {
     let phi = |i: usize| G::V(100.0 + i as f64);
@@ -158,22 +150,15 @@ fn the_interpolation_tail_flattens_the_last_half_window() {
     }
 }
 
-/// The 40 dBZ window switch, observed through a φ step across a
-/// missing-φ gap (gates 150–179; φ 100 before, 200 after, ρ solid):
+/// The 40 dBZ window switch, over a φ step across a missing-φ gap (gates
+/// 150–179; φ 100 before, 200 after, ρ solid):
 ///
-/// * the 9-gate chain bridges `[145, 184]` — slope 100/39 °/gate — so
-///   at gate 182 `kdp9 = (Σ j·φ)/30` over `[178, 186]` with the last
-///   two gates flat 200: `Σ j·c = 49`, `kdp9 = (100/39)·49/30 =`
-///   **4.188034** °/km;
-/// * the 25-gate chain bridges `[137, 192]` — slope 100/55 — and over
-///   `[170, 194]` the ramp part cancels exactly (`Σ j(j+45) = 0` for
-///   j = −12..10), leaving the two flat gates: `kdp25 = (20/11)·(11 +
-///   12)·55/650 =` **3.538462** °/km;
-/// * 45 dBZ selects the short gate, 30 dBZ the long one, and a radial
-///   with **no reflectivity at all** compares low against the
-///   threshold and gets the long gate too;
-/// * the gap gates themselves stay undefined — the product keys the
-///   output level on the input φ.
+/// * 9-gate chain bridges `[145, 184]`, slope 100/39 °/gate; at gate 182
+///   `kdp9 = (Σ j·φ)/30` over `[178, 186]` with the last two flat at 200:
+///   `Σ j·c = 49`, `kdp9 = (100/39)·49/30 =` **4.188034** °/km;
+/// * 25-gate chain bridges `[137, 192]`, slope 100/55; over `[170, 194]` the
+///   ramp part cancels exactly (`Σ j(j+45) = 0` for j = −12..10), leaving the
+///   two flat gates: `kdp25 = (20/11)·(11 + 12)·55/650 =` **3.538462** °/km.
 #[test]
 fn the_40_dbz_rule_switches_between_short_and_long_windows() {
     let phi = |i: usize| match i {
@@ -217,11 +202,8 @@ fn the_40_dbz_rule_switches_between_short_and_long_windows() {
     );
 }
 
-/// RhoHV censoring runs on the 5-gate smoothed ρ: a ρ = 0.3 stretch at
-/// gates 100–119 censors 98–121 (every gate whose window average dips
-/// under 0.9), while φ itself stays a clean ramp — so every *defined*
-/// gate still reads 2.0 °/km, the interpolation bridge being collinear
-/// with the ramp.
+/// RhoHV censoring runs on the 5-gate smoothed ρ: a ρ = 0.3 stretch at gates
+/// 100–119 censors 98–121 (every gate whose window average dips under 0.9).
 #[test]
 fn low_correlation_censors_kdp_through_the_smoothed_rho() {
     let phi = |i: usize| G::V(100.0 + i as f64);
@@ -253,10 +235,7 @@ fn low_correlation_censors_kdp_through_the_smoothed_rho() {
     }
 }
 
-/// A ramp that crosses 360° past the unfold start (gate 260 = 65 km):
-/// the documented unfolder lifts the wrapped stretch a full fold, and
-/// KDP stays the ramp's half-slope straight across — on a super-res
-/// sweep whose half-degree pairs recombine to 1° first.
+/// A ramp that crosses 360° past the unfold start (gate 260 = 65 km).
 #[test]
 fn phidp_unfolds_across_the_fold_point() {
     let phi = |i: usize| G::V((100.0 + i as f64) % 360.0);
@@ -281,42 +260,33 @@ fn phidp_unfolds_across_the_fold_point() {
     }
 }
 
-/// The coherent pair combination, against hand-computed cases: equal
-/// powers average the angle, a 20 dB power imbalance pulls the average
-/// toward the strong radial (atan2 of the summed vectors: 10.0985° for
-/// 10°/20° at 50/30 dBZ), the fold seam averages circularly, and a
-/// radial whose reflectivity is missing drops out of the vector sum
-/// entirely.
+/// The coherent pair combination, hand-computed: a 20 dB power imbalance pulls
+/// the average toward the strong radial (atan2 of the summed vectors: 10.0985°
+/// for 10°/20° at 50/30 dBZ), and the fold seam averages circularly.
 #[test]
 fn coherent_recombination_is_circular_and_power_weighted() {
     let p5 = 10f64.powf(5.0); // 50 dBZ linear
     let p3 = 10f64.powf(3.0); // 30 dBZ linear
-    // Identical inputs pass through exactly.
     let (phi, rho) = coherent_phi_rho((15.0, 15.0), (0.99, 0.99), (p3, p3), (p3, p3));
     assert!((phi - 15.0).abs() < 1e-9, "got {phi}");
     assert!(
         (rho - 0.99).abs() < 1e-9,
         "identical inputs keep rho: {rho}"
     );
-    // Equal powers: plain angular mean — and the 10° phase spread
-    // shortens the mean vector, so ρ contracts by cos(5°): the
-    // decorrelation the coherent average is supposed to encode.
+    // Equal powers: the 10° phase spread shortens the mean vector, so ρ
+    // contracts by cos(5°).
     let (phi, rho) = coherent_phi_rho((10.0, 20.0), (0.99, 0.99), (p3, p3), (p3, p3));
     assert!((phi - 15.0).abs() < 1e-9, "got {phi}");
     assert!(
         (rho - 0.99 * 5f64.to_radians().cos()).abs() < 1e-9,
         "a phase spread must decorrelate: {rho}",
     );
-    // 20 dB imbalance: the strong radial dominates.
     let (phi, _) = coherent_phi_rho((10.0, 20.0), (0.99, 0.99), (p5, p3), (p5, p3));
     assert!((phi - 10.0985).abs() < 1e-3, "got {phi}");
-    // The fold seam: 359° and 1° average to 0, not 180.
     let (phi, _) = coherent_phi_rho((359.0, 1.0), (0.99, 0.99), (p3, p3), (p3, p3));
     assert!(phi.min(360.0 - phi) < 1e-9, "got {phi}");
-    // One side without reflectivity: the other's phase, unchanged.
     let (phi, _) = coherent_phi_rho((10.0, 20.0), (0.99, 0.99), (f64::NAN, p3), (f64::NAN, p3));
     assert!((phi - 20.0).abs() < 1e-9, "got {phi}");
-    // No usable vector on either side: undefined.
     let (phi, rho) = coherent_phi_rho(
         (10.0, 20.0),
         (f64::NAN, 0.99),
@@ -326,14 +296,9 @@ fn coherent_recombination_is_circular_and_power_weighted() {
     assert!(phi.is_nan() && rho.is_nan());
 }
 
-/// The A/B knob moves the documented direction: on a super-res ramp
-/// whose pair members sit 6° apart (a plausible azimuthal gradient),
-/// the members straddle the 360° seam for five consecutive gates
-/// (258–262). The coherent primary averages circularly and reads the
-/// clean half-slope straight through; the plain arithmetic mean
-/// manufactures a ~180° plateau there — too wide for the 5-gate median
-/// to heal, and below the unfolder's 180° threshold — and the slope
-/// blows up around it.
+/// Pair members 6° apart straddle the 360° seam for five gates (258–262): the
+/// coherent primary averages circularly, the arithmetic mean manufactures a
+/// ~180° plateau.
 #[test]
 fn a_plain_mean_recombination_breaks_at_the_fold_seam() {
     let phi_a = |i: usize| G::V((97.0 + i as f64) % 360.0);
@@ -361,7 +326,6 @@ fn a_plain_mean_recombination_breaks_at_the_fold_seam() {
         },
     )
     .expect("computes");
-    // The members straddle 360 across gates 258–262.
     let row_c = &coherent.values[50];
     let row_p = &plain.values[50];
     for (i, &v) in row_c.iter().enumerate().take(270 + 1).skip(250) {
@@ -379,12 +343,10 @@ fn a_plain_mean_recombination_breaks_at_the_fold_seam() {
     );
 }
 
-/// The documented ISDP estimator (`calc_system_PhiDP.c`): per radial
-/// the 360°-aware median of the first 11-gate high-quality run past
-/// 25 km, and across the sweep the `round(n/20)`-th entry of the
-/// sorted queue. Radials whose run starts inside 25 km or touches a
-/// ≥ 40 dBZ gate contribute nothing, and fewer than 40 samples
-/// conclude nothing.
+/// The documented ISDP estimator (`calc_system_PhiDP.c`): per radial the
+/// 360°-aware median of the first 11-gate high-quality run past 25 km, and
+/// across the sweep the `round(n/20)`-th entry of the sorted queue. Runs
+/// starting inside 25 km or touching a ≥ 40 dBZ gate contribute nothing.
 #[test]
 fn the_isdp_estimator_returns_the_documented_percentile() {
     let combined = |phi_val: f64, from: usize, z_val: f64| -> CombinedRadial {
@@ -403,37 +365,29 @@ fn the_isdp_estimator_returns_the_documented_percentile() {
         }
     };
 
-    // 60 radials with phases 10..69: sorted queue index round(60/20) = 3
-    // reads 13.
+    // 60 radials with phases 10..69: sorted queue index round(60/20) = 3 → 13.
     let sweep: Vec<CombinedRadial> = (0..60)
         .map(|k| combined(10.0 + k as f64, 100, 20.0))
         .collect();
     assert_eq!(estimate_isdp(&sweep), Some(13.0));
 
-    // A run starting inside 25 km (gate 60) is rejected outright.
     let close = combined(10.0, 60, 20.0);
     assert_eq!(radial_system_phi(&close.phi, &close.rho, &close.z), None);
 
-    // A ≥ 40 dBZ gate inside the run rejects the radial.
     let hot = combined(10.0, 100, 45.0);
     assert_eq!(radial_system_phi(&hot.phi, &hot.rho, &hot.z), None);
 
-    // 39 qualifying radials conclude nothing.
     let thin: Vec<CombinedRadial> = (0..39)
         .map(|k| combined(10.0 + k as f64, 100, 20.0))
         .collect();
     assert_eq!(estimate_isdp(&thin), None);
 
-    // Phases straddling 360 sort fold-aware: 350..359.5 and 0..9.5 read
-    // percentile 351, not a seam artifact.
+    // Phases straddling 360 sort fold-aware: 350..359.5 and 0..9.5 read 351.
     let wrapped: Vec<CombinedRadial> = (0..40)
         .map(|k| combined((350.0 + 0.5 * k as f64) % 360.0, 100, 20.0))
         .collect();
     assert_eq!(estimate_isdp(&wrapped), Some(351.0));
 
-    // And the wiring: a provided RDA value wins; absent one, the
-    // estimator's value is what compute reports using. Low ρ inside
-    // 25 km keeps the qualifying run from starting too close.
     let phi = |i: usize| G::V(100.0 + i as f64);
     let rho = |i: usize| {
         if i < 100 { G::V(0.5) } else { G::V(0.99) }
@@ -445,13 +399,9 @@ fn the_isdp_estimator_returns_the_documented_percentile() {
     let with = compute_kdp(&radials, &params_with_isdp(77.0)).expect("computes");
     assert_eq!(with.init_fdp_deg, 77.0);
     let without = compute_kdp(&radials, &KdpParams::default()).expect("computes");
-    // Every radial's first qualifying run is gates 100–110 with
-    // φ = 200..210, median 205; the percentile of identical values is
-    // 205.
     assert_eq!(without.init_fdp_deg, 205.0);
-    // The isdp-applied variant prefers the estimate and falls back to
-    // the RDA value exactly as the source's `isdp_est != -99` guard
-    // does: a 44-radial sweep concludes 205; a too-thin one keeps 77.
+    // Falls back to the RDA value exactly as the source's `isdp_est != -99`
+    // guard does.
     let applied = KdpOptions {
         isdp: IsdpSource::Estimated,
         ..KdpOptions::primary()
@@ -466,9 +416,6 @@ fn the_isdp_estimator_returns_the_documented_percentile() {
     );
 }
 
-/// Range-folded and missing φ gates stay undefined in the output —
-/// the product keys the gate level on the input φ — while their
-/// neighbours survive.
 #[test]
 fn rf_and_missing_phi_gates_stay_undefined() {
     let phi = |i: usize| match i {
@@ -486,12 +433,9 @@ fn rf_and_missing_phi_gates_stay_undefined() {
     assert!(!row[199].is_nan() && !row[202].is_nan());
 }
 
-/// The product's display range: a 24 °/km ramp clamps to exactly
-/// `KDP_MAX_DISPLAY`, a −10 °/km one to exactly `KDP_MIN_DISPLAY` —
-/// the caps `dualpol8bit.c` applies (10.0) and the 16-bit moment's
-/// minimum level preserves (−2.05). The steep ramp runs at 45 dBZ so
-/// the clean 9-gate window carries it (a 25-gate window on a 40-gate
-/// radial never escapes the edge-truncation bias).
+/// A 24 °/km ramp clamps to `KDP_MAX_DISPLAY`, a −10 °/km one to
+/// `KDP_MIN_DISPLAY` — the caps `dualpol8bit.c` applies (10.0) and the 16-bit
+/// moment's minimum level preserves (−2.05).
 #[test]
 fn steep_ramps_clamp_to_the_products_display_range() {
     let up = |i: usize| G::V(100.0 + 6.0 * i as f64);
@@ -519,9 +463,8 @@ fn steep_ramps_clamp_to_the_products_display_range() {
     );
 }
 
-/// `Is_high_atten_radial`'s documented thresholds, gate for gate: more
-/// than 10 qualifying gates past bin 180 flag the radial; each
-/// threshold edge disqualifies.
+/// `Is_high_atten_radial`'s documented thresholds: more than 10 qualifying
+/// gates past bin 180 flag the radial.
 #[test]
 fn high_attenuation_radials_are_detected_by_the_documented_test() {
     let n = 250;
@@ -550,7 +493,6 @@ fn high_attenuation_radials_are_detected_by_the_documented_test() {
         "gates before bin 180 do not count",
     );
 
-    // Each threshold edge in turn.
     let (mut z, v, w, r) = qualify(11, 200);
     z[205] = 29.9;
     assert!(!is_high_attenuation_radial(&z, &v, &w, &r), "z floor");
@@ -568,10 +510,8 @@ fn high_attenuation_radials_are_detected_by_the_documented_test() {
     assert!(!is_high_attenuation_radial(&z, &v, &w, &r), "rho ceiling");
 }
 
-/// [`DerivedKdp::to_polar_grid`] mirrors the twin comparator's
-/// resampling: the radial covering the cell centre, the gate whose
-/// centre falls nearest the cell centre with the earlier gate winning
-/// the exact tie, and nothing claimed outside a radial's own span.
+/// Mirrors the twin comparator's resampling: the radial covering the cell
+/// centre, the gate whose centre falls nearest it, earlier gate wins the tie.
 #[test]
 fn to_polar_grid_resamples_like_the_twin_comparator() {
     let derived = DerivedKdp {
@@ -586,20 +526,15 @@ fn to_polar_grid_resamples_like_the_twin_comparator() {
         init_fdp_deg: 0.0,
     };
     let grid = derived.to_polar_grid();
-    // Cell (0, 5): gate centres 5.375 (j 21) and 5.625 (j 22) tie at
-    // 0.125 km from the cell centre — the earlier gate wins, as in
-    // `tally_packet`.
+    // Cell (0, 5): gate centres 5.375 (j 21) and 5.625 (j 22) tie at 0.125 km
+    // from the cell centre — the earlier gate wins, as in `tally_packet`.
     assert_eq!(grid[0][5], 21.0);
     assert_eq!(grid[0][0], 1.0, "bin 0 reads gate 1 (centre 0.375)");
-    // The second radial covers cell 1 but carries only 10 gates.
     assert_eq!(grid[1][0], 1.0);
     assert!(grid[1][5].is_nan(), "gate 21 is past the short radial");
-    // No radial spans azimuth 5°: nothing may claim it.
     assert!(grid[5].iter().all(|v| v.is_nan()));
 }
 
-/// A radial with no meteorological group at all (ρ everywhere below
-/// 0.9) censors everything and panics nowhere.
 #[test]
 fn a_radial_with_no_meteo_group_is_fully_censored() {
     let phi = |i: usize| G::V(100.0 + i as f64);

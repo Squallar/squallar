@@ -1,16 +1,4 @@
-//! The pump table's contract with the `ChannelHub` (WO-E3).
-//!
-//! Three pins. **Exhaustiveness**: every receiver field the hub declares is
-//! drained by exactly one [`FRAME_PUMP`] row — a channel no row drains is a
-//! silent leak of arrivals, and one drained twice is a race over which row
-//! sees them. **The shrink pin**: the hub's channel list only ever shrinks
-//! from the 18 pairs it holds today. **The order pin**: within the table,
-//! row order is execution order, so the load-bearing edges are pinned as a
-//! literal rather than re-derived from whichever code currently runs them.
-//!
-//! Source probes, because no type carries any of it: `ChannelHub` is plain
-//! fields, and "this field is drained, once, at this point in the frame"
-//! lives nowhere the compiler looks.
+//! The pump table's contract with the `ChannelHub`.
 
 use super::{FRAME_PUMP, PumpPhase};
 use std::collections::BTreeMap;
@@ -20,15 +8,6 @@ use std::collections::BTreeMap;
 const CHANNELS: &str = include_str!("../channels.rs");
 
 /// The receiver field a line of channels.rs declares, if it declares one.
-///
-/// Deliberately strict about the shape — a trimmed `pub ` field whose name
-/// ends `_receiver` and whose type starts `Receiver<` — and pinned before
-/// use (see the sweep below), because a scanner that misreads a line fails
-/// in the worst way: silently, and the field it missed is exactly the one
-/// the exhaustiveness sweep never asks about. A field that stops matching
-/// (say, by narrowing to `pub(crate)`) vanishes from the declared set while
-/// its row still names it in `drains`, so the set-equality fails loudly in
-/// the other direction rather than passing by omission.
 fn declared_receiver_field(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix("pub ")?;
     let (name, ty) = rest.split_once(':')?;
@@ -44,14 +23,12 @@ fn declared_receiver_field(line: &str) -> Option<&str> {
 
 /// The channel-pair field a line declares — `(base name, is_receiver)` — at
 /// **any** visibility, so a pair cannot slip the shrink pin by narrowing.
-/// Comment and doc lines are refused before the visibility strip.
 fn declared_pair_field(line: &str) -> Option<(&str, bool)> {
     let mut rest = line.trim_start();
     if rest.starts_with("//") {
         return None;
     }
     if let Some(after_pub) = rest.strip_prefix("pub") {
-        // `pub`, or any restricted form: `pub(crate)`, `pub(super)`, ...
         rest = match after_pub.strip_prefix('(') {
             Some(restriction) => restriction.split_once(')')?.1,
             None => after_pub,
@@ -71,17 +48,8 @@ fn declared_pair_field(line: &str) -> Option<(&str, bool)> {
 }
 
 /// Every receiver the hub declares is owned by exactly one pump row.
-///
-/// Both directions: a declared field no row drains fails naming the field,
-/// a field two rows drain fails naming the field, and a row draining a
-/// field the hub does not declare fails naming the row's claim. The
-/// non-drain rows (`drive_chunk_feeds`, `publish_base_volumes`) ride the
-/// order with `drains: &[]` and are exempt from nothing else.
 #[test]
 fn every_hub_receiver_is_drained_by_exactly_one_row() {
-    // The scanner is the part of this guard that can fail silently, so it
-    // is pinned first, on the live spellings and on the near-misses that
-    // must not be counted.
     for (line, expected) in [
         (
             "    pub scan_receiver: Receiver<ScanResponse>,",
@@ -95,21 +63,15 @@ fn every_hub_receiver_is_drained_by_exactly_one_row() {
             "    pub scan_receiver : Receiver<ScanResponse>,",
             Some("scan_receiver"),
         ),
-        // The paired sender, one line above every receiver: not a receiver.
         ("    pub scan_sender: Sender<ScanResponse>,", None),
-        // Prose that quotes a declaration is prose.
         ("    /// pub scan_receiver: Receiver<ScanResponse>,", None),
         ("    // pub scan_receiver: Receiver<ScanResponse>,", None),
-        // Cross-wired shapes stay unmatched rather than half-matched.
         ("    pub scan_receiver: Sender<ScanResponse>,", None),
         ("    pub scan_sender: Receiver<ScanResponse>,", None),
-        // A narrowed field no longer matches — and then the set-equality
-        // below fails loudly on the drains side, which is the point.
         (
             "    pub(crate) scan_receiver: Receiver<ScanResponse>,",
             None,
         ),
-        // A struct-literal init is wiring, not a declaration.
         ("            scan_receiver: rx,", None),
     ] {
         assert_eq!(
@@ -165,8 +127,8 @@ fn every_hub_receiver_is_drained_by_exactly_one_row() {
     }
 }
 
-/// The 18 channel pairs of record, in field order. Removal is legal —
-/// that is the direction the campaign moves — and addition never is.
+/// The 18 channel pairs of record, in field order. Removal is legal;
+/// addition never is.
 const HUB_BASE_NAMES: &[&str] = &[
     "scan",
     "render",
@@ -188,12 +150,9 @@ const HUB_BASE_NAMES: &[&str] = &[
     "site_catalogue",
 ];
 
-/// The hub only ever shrinks (WO-E3 lands this pin; WO-M13b verifies the
-/// end state).
+/// The hub only ever shrinks.
 #[test]
 fn the_channel_hub_only_ever_shrinks() {
-    // Scanner pins first, same discipline as above: live spellings, then
-    // the near-misses that must not count.
     for (line, expected) in [
         (
             "    pub scan_sender: Sender<ScanResponse>,",
@@ -203,8 +162,6 @@ fn the_channel_hub_only_ever_shrinks() {
             "    pub scan_receiver: Receiver<ScanResponse>,",
             Some(("scan", true)),
         ),
-        // This scanner deliberately sees through a visibility change: a
-        // pair cannot leave the pin's sight while it still exists.
         (
             "    pub(crate) loop_l3_fetch_receiver: Receiver<LoopL3FetchResponse>,",
             Some(("loop_l3_fetch", true)),
@@ -265,13 +222,6 @@ fn the_channel_hub_only_ever_shrinks() {
 }
 
 /// The table's order of record, `(name, phase)` per row, as a literal.
-///
-/// A literal rather than anything derived, because the table IS the order:
-/// deriving the expectation from the code under test would make this the
-/// checker that agrees with whatever it checks. WO-E4.9 extended this to 22
-/// rows as planned (its extract-results drain is a dispatcher-local mpsc,
-/// not a hub pair, and registers with `drains: &[]` — amendment C3); the
-/// hub list above stays at 18.
 const EXPECTED_ROWS: &[(&str, PumpPhase)] = &[
     ("poll_scan_results", PumpPhase::Ingest),
     ("poll_chunk_results", PumpPhase::Ingest),

@@ -19,13 +19,6 @@ fn target(product: RadarProduct, minute: u32) -> VolumeTarget {
 
 /// The payload the painter hands `rustdar-egui` is one `egui_wgpu` can
 /// actually draw.
-///
-/// **This is the test the stub painter cannot be.** A wrong-typed payload is
-/// one `log::warn!` in `prepare` and a silent `continue` in `paint`, so
-/// every headless test in `rustdar-egui` — which can only ever see an
-/// `Arc<dyn Any>` — would pass against a payload that never draws a pixel.
-/// This crate is the only one that can name both ends, so the downcast is
-/// asserted here.
 #[test]
 fn the_payload_the_painter_hands_over_is_one_egui_wgpu_can_draw() {
     struct Nothing;
@@ -78,11 +71,6 @@ fn fade_lut(band: usize) -> Vec<u8> {
 /// on screen — only a `Ready` entry ever does, so a `Refused` stub cannot
 /// exercise them. Built through `build_voxels` because that is the one
 /// constructor a `VoxelGrid` has.
-///
-/// The app side's store/release tests keep a twin of this fixture
-/// (`rustdar_app`'s `volume_fixture::ready_grid`, WO-RV): a test helper
-/// does not cross a crate boundary, and this module is `cfg(test)`-gated,
-/// invisible over there. Keep the two in step with the resampler together.
 pub(crate) fn ready_grid() -> VolumeEntry {
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
@@ -314,23 +302,6 @@ fn the_old_grid_stands_in_while_its_replacement_builds_and_then_leaves() {
 /// The stand-in is scoped: a pane re-aimed at another **radar or product**
 /// must not paint its old grid under the new target's caption — the one lie
 /// the swap must never tell: another site's storm under this pane's caption.
-///
-/// A change of *region* is deliberately not on that list, and the difference
-/// is what can be done about it. A new box is still a question about this
-/// radar's reflectivity at this moment, and the held grid is a real answer to
-/// part of it — one that can be **drawn into** the new box (see [`DrawnBox`])
-/// under a caption saying what resolution it really has. A new product or a
-/// new radar cannot be transformed into an answer at all, so no crop and no
-/// caption redeems them.
-///
-/// The held entry is a **`Ready` grid**, and that is what makes the pin
-/// bite. Only a `Ready` entry can ever stand in — held as a `Refused`
-/// stub, the fallback's own `Ready`-match refuses it before any scope
-/// decision is reached, so a `same_scope` that answered always-true
-/// survived the whole suite. The layer this actually exercises is
-/// `begin_build`'s shed: `keep_old` keeps only same-scope resolved
-/// entries, and a cross-scope `Ready` hold is exactly the case that
-/// reaches that clause.
 #[test]
 fn an_out_of_scope_grid_never_stands_in() {
     let elsewhere = VolumeTarget {
@@ -383,21 +354,6 @@ fn box_target(half_width_km: f64) -> VolumeTarget {
 }
 
 /// **Zooming a 3D pane must not take its picture away.**
-///
-/// The box is the pane's own viewport, so a scroll names a new target on every
-/// frame the wheel turns. With the region inside `same_scope` each of those
-/// targets was out of scope of the grid in the pane's own hand: `begin_build`
-/// shed it, `lookup_for_pane` had nothing left to answer with, and — since no
-/// build in flight ever matched what was being asked for either — the pane
-/// blanked for the whole gesture plus a build, 12 frames over a 200 ms scroll.
-/// All of it over a floor that was already following the viewport in real
-/// time, so it read as the data falling off a moving ground.
-///
-/// Two assertions, and the pairing is what stops this passing vacuously: the
-/// held grid answers **and it is the `Ready` grid**, not the `Building` entry
-/// just opened for the new box. A `lookup_for_pane` that answered with the
-/// in-flight placeholder would satisfy "something came back" and paint
-/// nothing at all.
 #[test]
 fn a_zoom_keeps_the_grid_the_pane_is_already_painting() {
     let store = VolumeStore::new();
@@ -435,10 +391,6 @@ fn a_zoom_keeps_the_grid_the_pane_is_already_painting() {
 }
 
 /// The crop's algebra, at both zoom directions and at rest.
-///
-/// This is where a swapped axis or an inverted offset would live, and neither
-/// is visible in a screenshot — a volume drawn from the wrong corner of its
-/// own texture is still a plausible-looking storm.
 #[test]
 fn the_drawn_box_is_the_one_asked_for_and_the_crop_finds_it_in_the_grid() {
     let VolumeEntry::Ready(grid) = ready_grid() else {
@@ -520,11 +472,6 @@ fn a_superseded_builds_reply_is_dropped() {
 }
 
 /// Ids are never reused, so a stale callback cannot address a new upload.
-///
-/// A callback built on the frame a volume rolled is still in egui's shape
-/// list when `prepare` runs. If the store had reused the id, that callback
-/// would draw the *new* volume through the old one's uniform — a picture
-/// that is wrong and looks right.
 #[test]
 fn a_released_id_is_never_handed_out_again() {
     let store = VolumeStore::new();
@@ -543,27 +490,6 @@ fn a_released_id_is_never_handed_out_again() {
 }
 
 /// The floor's uniform lanes, both ways the mirror can be encoded.
-///
-/// This is the arithmetic `prepare` does and nothing else: geography in
-/// points from `paint`, the mirror's own extent in points from the frame
-/// state, out come the two `vec4`s the shader reprojects through. It is a free
-/// function precisely so it can be pinned here — the containing `prepare` needs
-/// a `wgpu::Device`, and this is where a sign or a swapped axis would live.
-///
-/// The mirror's extent is **taller than the frame** and that is the whole
-/// reason it is passed in rather than read off the frame's `ScreenDescriptor`:
-/// a 3D pane draws its own map into a strip below the frame, and the mirror has
-/// to reach it. The second block below is what fails if that quantity is ever
-/// taken from the frame again.
-///
-/// The gamma lane gets both arms because **both are live** — though not
-/// equally common. `rustdar_gpu::device::preferred_surface_format` prefers a non-sRGB
-/// format on wasm and prefers `Bgra8Unorm` (also non-sRGB) natively, taking
-/// `capabilities.formats[0]` only as a fallback. The sRGB arm is therefore the
-/// rare one, reached on an adapter that does not offer `Bgra8Unorm` —
-/// Android/Vulkan notably — rather than on every desktop. A wrong flag is a
-/// floor merely a little too dark or too light, with no validation error
-/// anywhere, so the rare arm is precisely the one that would ship broken.
 #[test]
 fn the_floor_lanes_normalise_points_against_the_mirror_and_carry_the_encoding() {
     let mirror = [1600.0, 1200.0];
@@ -597,9 +523,6 @@ fn the_floor_lanes_normalise_points_against_the_mirror_and_carry_the_encoding() 
     assert_eq!(geo, [41.7, -230.0, -230.0, 1.0], "geo lanes, gamma-encoded");
 
     // A mirror grown to hold a floor strip moves every v lane and no u lane.
-    // This is the assertion that fails if the extent is ever read off the
-    // frame again: the frame is 1200 points tall in both of these, and the
-    // strip below it is what the second mirror has and the first does not.
     let (with_strip, _) = floor_lanes(&source, [1600.0, 2400.0], true);
     assert_eq!(
         [with_strip[0], with_strip[2]],
@@ -620,18 +543,10 @@ fn the_floor_lanes_normalise_points_against_the_mirror_and_carry_the_encoding() 
     assert_eq!(linear[3], 0.0, "an sRGB swapchain leaves the mirror linear");
 }
 
-/// Every samplable moment clears the solid-block bar, and the counts here
-/// are `rustdar_radar::voxel`'s own measurements — the deliberate flip of
-/// the original `only_reflectivity_clears_the_fade_bar`, whose doc said a
-/// widened set "is a decision someone should make on purpose rather than
-/// discover". The products WP made it: each moment's transparency profile
-/// is argued at `volume_alpha_scale`, measured by
-/// `the_default_transparency_profile_is_measured_per_product` upstream,
-/// and admitted here.
-///
-/// Written as literals rather than by rebuilding six grids, and that is
-/// the point: the upstream test pins what the tables produce, and this
-/// pins what this renderer *does* about it.
+/// Every samplable moment clears the solid-block bar, and the counts here are
+/// `rustdar_radar::voxel`'s own measurements — the deliberate flip of the
+/// original `only_reflectivity_clears_the_fade_bar`, whose doc said a widened
+/// set "is a decision someone should make on purpose rather than discover".
 #[test]
 fn every_samplable_moments_default_table_clears_the_gate() {
     let measured = [
@@ -658,22 +573,19 @@ fn every_samplable_moments_default_table_clears_the_gate() {
         "an all-opaque table must still be refused",
     );
     // And a bar's-edge clearance is called out: spectrum width is the one
-    // narrow profile (its clear band is honestly small — laminar flow is
-    // a thin slice of its scale); everything else clears by 2x or more,
-    // and a profile change eroding that should be renegotiated here.
+    // narrow profile (its clear band is honestly small — laminar flow is a thin
+    // slice of its scale); everything else clears by 2x or more, and a profile
+    // change eroding that should be renegotiated here.
     for (moment, see_through) in measured {
         assert!(
             see_through >= 2 * u16::from(MINIMUM_FADE_INDICES) || moment == "Spectrum Width",
             "{moment} clears the bar by less than 2x: {see_through}",
         );
     }
-    // The production wiring reads the see-through measure, not the bottom
-    // run: velocity's fade_band is honestly 0 (its ramp bottom is the
-    // strongest inbound air), so a gate on the bottom run would refuse it
-    // in production with every literal above still green. Source-scanned
-    // for the same reason as
-    // `the_guards_paint_cannot_be_tested_through_are_still_in_it`: no
-    // test here can build a `VoxelGrid`.
+    // The production wiring reads the see-through measure, not the bottom run:
+    // velocity's fade_band is honestly 0 (its ramp bottom is the strongest
+    // inbound air), so a gate on the bottom run would refuse it in production
+    // with every literal above still green.
     assert!(
         include_str!("../volume_bridge.rs")
             .contains("palette_refusal_for(grid.see_through_indices(), grid.product().name())"),
@@ -682,10 +594,6 @@ fn every_samplable_moments_default_table_clears_the_gate() {
 }
 
 /// A refusal names the moment and says what would have to change.
-///
-/// The pane paints this text and nothing else, so a bare "unavailable" here
-/// is a user staring at an empty box with no idea whether to wait, switch
-/// product, or file a bug.
 #[test]
 fn a_refusal_names_the_moment_and_says_why() {
     let why = palette_refusal_for(0, "Velocity").expect("an opaque palette is refused");
@@ -709,25 +617,6 @@ fn a_refusal_names_the_moment_and_says_why() {
 
 /// The two guards inside `paint` that no headless test can reach are still
 /// in it, and the single-tilt one is still on the **count**.
-///
-/// # Why this is a source scan and not a behavioural test
-///
-/// Both guards read a `VoxelGrid`, and a `VoxelGrid` has no constructor
-/// outside `build_voxels` — which needs a synthetic `nexrad_model` `Scan`.
-/// So the only behavioural test would be an integration test carrying a
-/// scan builder, and until one exists these two guards can be deleted with
-/// every test in the workspace still green. Mutation testing found exactly
-/// that: removing the palette gate, and rewriting the tilt check as "the
-/// index plane is all no-data", both survived.
-///
-/// The second of those is the one that matters. A single-tilt volume *does*
-/// yield an empty grid, so the emptiness test is right almost always — and
-/// wrong without warning when a cell centre lands bit-exactly on the beam's
-/// height, which is measure-zero rather than impossible. It also loses the
-/// reason: the user gets an empty box instead of "wait for a full scan".
-///
-/// A scan is a weak test and is named as one. It is here because a guard
-/// nothing can fail is worse.
 #[test]
 fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
     let source = include_str!("../volume_bridge.rs");
@@ -756,19 +645,7 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
              table is opaque at the bottom of its ramp would render as a solid block",
     );
 
-    // The soft-edge mechanism's two production lines. Mutation testing
-    // proved that deleting both left the entire workspace suite green:
-    // the uniform's defaults (index-0 threshold, hard edge) are a
-    // renderable configuration, so nothing downstream fails — the user
-    // simply gets the hard shelf rims and the wasted marching the
-    // 2026-08-09 work exists to remove. No behavioural test can reach
-    // `paint` with a `Ready` grid (`VoxelGrid` has no constructor outside
-    // `build_voxels`), so the lines are pinned here; the *values* they
-    // assign are behaviourally pinned by
-    // `the_skip_threshold_separates_the_last_transparent_entry_from_the_first_visible_one`
-    // and `the_soft_width_is_eight_indices_half_the_fade_bar` below, and
-    // the GPU mask instrument in `tests/volume_silhouette.rs` observes
-    // the default width staying hard.
+    // The soft-edge mechanism's two production lines.
     assert!(
         body.contains(
             "empty_index_threshold_for(effective_fade_band(grid.fade_band(), frame.alpha.as_ref()))"
@@ -786,9 +663,9 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
              top reverts to the hard one-LUT-step rim the soft edge dissolves",
     );
     // The cloud rung's two production lines, pinned for the same reason:
-    // deleting either leaves every host test green (the uniform's raw
-    // defaults are a renderable configuration) and the user gets the
-    // voxel-spiked stippled render #5 was filed about.
+    // deleting either leaves every host test green (the uniform's raw defaults
+    // are a renderable configuration) and the user gets the voxel-spiked
+    // stippled render #5 was filed about.
     assert!(
         body.contains("uniform.reconstruction_lod = cloud_reconstruction_lod_for(largest_cell_km"),
         "`paint` no longer selects the cell-size-tapered smoothed \
@@ -802,15 +679,11 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
         "`paint` no longer halves the march step on the cloud rung, so the \
              jitter's per-step opacity residual returns as a visible stipple",
     );
-    // And the isosurface's exemption from it, pinned here for the same
-    // reason: no host test can reach `paint` with a `Ready` grid, and the
-    // failure is invisible in every other suite — the line's absence passed
-    // 13/13 volume_gpu, 10/10 silhouette and 151/151 lib while deleting a
-    // lone measured voxel from the 3D surface outright at the shipped region
-    // rung. The measurement lives in
-    // `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`,
-    // which is `#[ignore]`d behind a real adapter — so this host-side check is
-    // the only one of the pair CI runs.
+    // And the isosurface's exemption from it, pinned here for the same reason:
+    // no host test can reach `paint` with a `Ready` grid, and the failure is
+    // invisible in every other suite — the line's absence passed 13/13
+    // volume_gpu, 10/10 silhouette and 151/151 lib while deleting a lone
+    // measured voxel from the 3D surface outright at the shipped region rung.
     let isosurface_arm = body
         .split_once("VolumeViewMode::Isosurface")
         .map(|(_, rest)| rest)
@@ -826,26 +699,17 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
              them. Both shipped region rungs take the full LOD",
     );
     // The boundary-honesty override that used to sit here is GONE, and its
-    // absence is asserted rather than merely un-tested. It read
-    // `if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(...)` and
-    // pinned the reconstruction to nearest for the seven products whose
-    // ramp bottom is a real value — honest, and blocky. The volume texture
-    // is coverage-premultiplied `Rg16Float` now (`volume::VOLUME_TEXTURE_FORMAT`),
-    // so a filtered sample beside empty air reconstructs inside the convex
-    // hull of the stored indices for every product and there is nothing left
-    // to override. Reinstating a per-product reconstruction decision here
-    // would be a silent regression back to a blocky march for seven of the
-    // nine, so it fails.
+    // absence is asserted rather than merely un-tested.
     assert!(
         !body.contains("no_data_blends_at_ramp_bottom") && !body.contains("NEAREST"),
         "`paint` makes a per-product reconstruction decision again: the \
              coverage channel retired that split, and re-adding it sends \
              seven of the nine products back to a nearest march",
     );
-    // The floor's flag-and-texture pairing: the flag must be exactly
-    // "a floor is in hand and the pane asked", or the shader composites
-    // a ground nobody bound (a transparent no-op that claims to draw) or
-    // draws one against the pane's toggle.
+    // The floor's flag-and-texture pairing: the flag must be exactly "a floor
+    // is in hand and the pane asked", or the shader composites a ground nobody
+    // bound (a transparent no-op that claims to draw) or draws one against the
+    // pane's toggle.
     assert!(
         body.contains("uniform.map_floor = floor.is_some()"),
         "`paint` no longer ties the floor flag to the floor being in hand",
@@ -856,12 +720,10 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
              a floor up, so the per-pane escape hatch is dead",
     );
 
-    // The isosurface wiring, same untestable-through-`paint` class: the
-    // lanes must be translated against the grid's own ramp, and the skip
-    // threshold must drop to the index-0 default — the surface reads the
-    // data, so neither the palette's band nor a Volume Alpha curve may
-    // move it. Deleting the whole `if` leaves every host test green and
-    // every isosurface pane silently painting the lit volume.
+    // The isosurface wiring, same untestable-through-`paint` class: the lanes
+    // must be translated against the grid's own ramp, and the skip threshold
+    // must drop to the index-0 default — the surface reads the data, so neither
+    // the palette's band nor a Volume Alpha curve may move it.
     assert!(
         body.contains("grid.iso_uniform_params(frame.iso_threshold)"),
         "`paint` no longer translates the isosurface threshold against \
@@ -876,17 +738,6 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
 }
 
 /// The cloud rung's two constants, by value.
-///
-/// [`CLOUD_RECONSTRUCTION_LOD`] is 1.0 — the full blend into the two-cell
-/// mean, chosen on the Harvey volume because below ~0.7 the spikes
-/// survive as hairs, and there is no level past 1 to reach.
-/// [`CLOUD_STEP_CELLS`] is half the instrument default of
-/// `volume::raymarch::RAYMARCH_STEP_CELLS`, and the relation matters as
-/// much as the number: the half-cell step exists to halve the per-step
-/// opacity quantum, and the step ceiling (1024) was sized so that half-cell
-/// steps still cover the desktop grid's 384-cell diagonal — raise this
-/// without touching the ceiling and long diagonals silently fall back to
-/// stretched steps.
 #[test]
 fn the_cloud_rung_marches_the_smoothed_field_at_half_cell_steps() {
     assert_eq!(CLOUD_RECONSTRUCTION_LOD, 1.0);
@@ -917,34 +768,10 @@ const REFLECTIVITY_REACH_KM: f64 = 460.109;
 const DOPPLER_REACH_KM: f64 = 300.114;
 
 /// What a discrete desktop adapter reports for `max_texture_dimension_3d`.
-///
-/// wgpu's own default limit, and the figure `constants::tests`' own
-/// `REPORTED_LIMITS` calls "a modern desktop's". Every limit at or above 512
-/// selects the same shape, so this stands for all of them; a device reporting
-/// only the 256 GLES 3.0 guarantees gets a different shape and a different cell
-/// size, and is a case these tests deliberately do not conflate with this one.
 const DISCRETE_DESKTOP_MAX_AXIS: u32 = 2048;
 
 /// The uniform a desktop pane really hands the shader for the whole-volume box
 /// of a product reaching `reach_km`.
-///
-/// # Why this is derived and not two literals
-///
-/// It used to be `VolumeUniform::new([460.0, 460.0, 18.0], [256, 256, 128])`,
-/// called "the default desktop box", and **by the time this was written both
-/// numbers were wrong**. `f22aa220` circumscribed the box on the ring rather
-/// than inscribing it in it, so reflectivity's box is 920.22 km and not 460;
-/// `280a432b` respent the same cell budget, so the shape is 512 × 512 × 32 and
-/// not 256 × 256 × 128. The fixture went on reading the correct 1.797 km/cell
-/// for entirely the wrong reasons, because `460 / 256` and `920.22 / 512` are
-/// the same number — so a later change to *either* rule alone would have left
-/// it asserting 1.797 while production moved, on a knee it clears by 2.7%.
-///
-/// Both rules are therefore called rather than quoted: the half-width from
-/// [`rustdar_radar::voxel::box_half_width_km`], the shape from
-/// [`rustdar_device_profile::constants::volume_grid_shape`]. A change to either now moves this
-/// fixture with production, and the assertions below say what the consequence
-/// is rather than restating the arithmetic.
 fn whole_volume_uniform(reach_km: f64) -> VolumeUniform {
     let half_width_km = rustdar_radar::voxel::box_half_width_km(reach_km) as f32;
     let shape = rustdar_device_profile::constants::volume_grid_shape(DISCRETE_DESKTOP_MAX_AXIS);
@@ -958,19 +785,6 @@ fn whole_volume_uniform(reach_km: f64) -> VolumeUniform {
 
 /// The cloud smoothing is a function of cell size: full at the region
 /// rungs, **zero at the reflectivity whole-volume box**, monotone between.
-///
-/// The zero half is the data-honesty pin. A fixed LOD of 1.0 at that box's
-/// 1.8 km cells was measured erasing the Harvey eyewall — −41% of the ≥50 dBZ
-/// mask, −81% of ≥30 dBZ — while the 2D pane showed the red core (the table in
-/// [`cloud_reconstruction_lod_for`]). Restoring the fixed LOD fails the third
-/// assert; inverting the taper (smoothing the coarse grid instead of the fine)
-/// fails the first.
-///
-/// **The Doppler row is not a duplicate of the reflectivity one.** Its box is
-/// sized on a 300 km cut rather than a 460 km one, so the same cell budget buys
-/// 1.17 km/cell and the taper is *live* there — for five of the six products a
-/// 3D pane can show. Reflectivity clears the knee by 2.7% and everything else
-/// misses it by a third.
 #[test]
 fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
     // The desktop region rungs: 60 km and 160 km boxes over 256 cells.
@@ -1005,10 +819,7 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
              {default_cell:.3} km cells the two-cell kernel is wider than the \
              cores it lands on, and the smoothing erases them (measured, Harvey)",
     );
-    // How much room that has, stated rather than left implicit. It is the
-    // margin every claim about this box rests on and it is 2.7%: a box rule or
-    // a shape rule that moved cells 2.8% finer would switch the smoothing —
-    // and the coarse level with it — on the shipped default view.
+    // How much room that has, stated rather than left implicit.
     let margin = (default_cell - CLOUD_SMOOTHING_RAW_CELL_KM) / CLOUD_SMOOTHING_RAW_CELL_KM;
     assert!(
         (0.0..0.05).contains(&margin),
@@ -1019,10 +830,7 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
         100.0 * margin,
     );
 
-    // The Doppler cut's box, which is the other five products. A 300 km reach
-    // over the same cells is a third finer than reflectivity's, and lands the
-    // taper's live half — so "the whole-volume box marches the raw field" is a
-    // statement about reflectivity and not about a whole-volume box.
+    // The Doppler cut's box, which is the other five products.
     let doppler_cell = largest_cell_km(&whole_volume_uniform(DOPPLER_REACH_KM));
     assert!(
         doppler_cell < default_cell,
@@ -1039,28 +847,6 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
 
 /// The coarse mip level is allocated exactly where the taper would read it,
 /// and nowhere else.
-///
-/// The upload used to carry the level unconditionally: 4 MiB of a 36 MiB
-/// desktop grid, a second `write_texture`, and a CPU pass over the whole
-/// index plane, all to fill a level the shader reads only when
-/// `flags.y > 0`. This pins the cross-reference that makes skipping it safe,
-/// on the same predicate the paint path raises `gradient_shading` and picks
-/// `reconstruction_lod` from — so a taper change cannot leave the smoothing
-/// sampling a level that was never allocated.
-///
-/// The mobile and wasm32 rows are the platform ceilings themselves rather
-/// than a restatement of them: `capped_by` is what `paint` is subject to, and
-/// both ceilings put `GradientShading::Off` on every adapter those targets
-/// can have, so the level is dead there at every box.
-///
-/// # The whole-volume box is two cases, and only one of them omits the level
-///
-/// This test used to carry one whole-volume row and call it "the default
-/// desktop box", which read as though a lit desktop volume paid for the level
-/// only at a region box. It does not. Reflectivity's box is 1.797 km/cell and
-/// omits it; the Doppler-cut products' box is 1.172 km/cell and **builds** it,
-/// which is five of the six products a 3D pane can show. Both rows are here
-/// now, and [`crate::raymarch::CoarseLevel`]'s own doc says the same.
 #[test]
 fn the_coarse_level_is_built_only_where_something_will_sample_it() {
     use rustdar_device_profile::quality::{
@@ -1077,10 +863,7 @@ fn the_coarse_level_is_built_only_where_something_will_sample_it() {
         );
     }
 
-    // Reflectivity's whole-volume box, on that same discrete GPU. 1.797 km
-    // cells are past the taper's 1.75 km zero — by 2.7%, which the taper test
-    // above is the tripwire for — so the level is dead at the shipped default
-    // view.
+    // Reflectivity's whole-volume box, on that same discrete GPU.
     let default_cell = largest_cell_km(&whole_volume_uniform(REFLECTIVITY_REACH_KM));
     assert_eq!(
         cloud_reconstruction_lod_for(default_cell),
@@ -1094,13 +877,7 @@ fn the_coarse_level_is_built_only_where_something_will_sample_it() {
          coarse level is 4 MiB nothing samples",
     );
 
-    // The Doppler cut's whole-volume box, same device, same lit mode. 1.172 km
-    // cells sit inside the taper, so the level is read and therefore has to be
-    // built — at +4 MiB a grid and a CPU pass over the whole index plane
-    // measured at 5.9 ms in `prepare`. That is not a regression (the pre-
-    // `f22aa220` 424 km box was 1.657 km/cell and built it too) and it is not
-    // this test's decision to change; it is a cost the doc and the test both
-    // used to leave unstated.
+    // The Doppler cut's whole-volume box, same device, same lit mode.
     let doppler_cell = largest_cell_km(&whole_volume_uniform(DOPPLER_REACH_KM));
     assert!(
         cloud_reconstruction_lod_for(doppler_cell) > 0.0,
@@ -1137,16 +914,6 @@ fn the_coarse_level_is_built_only_where_something_will_sample_it() {
 
 /// [`empty_index_threshold_for`] sits strictly between the last fully
 /// transparent palette entry and the first visible one, for every band.
-///
-/// The behavioural half of the anchor: a Nearest-sampled LUT fetch of
-/// entry `n` sees the index value `n / 255`, entries `0..=band` are
-/// transparent and `band + 1` is the first visible one — so the shader's
-/// `index > threshold` test must be false at `band / 255` and true at
-/// `(band + 1) / 255`. The shipped off-by-one (`(band - 0.5) / 255`)
-/// fails the first half of this: entry `band` itself cleared the
-/// threshold, so a one-index shell of zero-alpha samples paid up to seven
-/// fetches per step for nothing and the ramp's foot sat one index below
-/// the palette's own fade boundary.
 #[test]
 fn the_skip_threshold_separates_the_last_transparent_entry_from_the_first_visible_one() {
     for band in 0..=u8::MAX {
@@ -1173,13 +940,6 @@ fn the_skip_threshold_separates_the_last_transparent_entry_from_the_first_visibl
 }
 
 /// **The untouched Volume Alpha editor is bit-exact, by construction.**
-///
-/// With no curve, [`effective_lut`] must answer with the grid's own bytes
-/// — the same allocation, not an equal copy — because "borrowed" is the
-/// one shape no alpha rewrite can quietly pass through. The mutation this
-/// exists to kill is any unconditional transform at the upload seam (a
-/// constant 0.5 alpha, a re-derived table): every one of them turns the
-/// borrow into an owned buffer or moves the bytes, and this test dies.
 #[test]
 fn an_untouched_editor_uploads_the_grids_own_bytes() {
     let lut = fade_lut(64);
@@ -1222,17 +982,6 @@ fn a_curve_replaces_only_the_alpha_channel() {
 }
 
 /// **The skip threshold follows the effective curve, exactly.**
-///
-/// For every curve, the threshold [`effective_fade_band`] anchors must
-/// separate the last transparent entry of the **uploaded** table from its
-/// first visible one — the march may never skip visible data and never
-/// pay for a guaranteed-transparent shell at the ramp's foot. Checked
-/// against [`effective_lut`]'s actual output rather than against the
-/// curve, so the two halves of the seam (what is uploaded, what is
-/// anchored) are pinned to agree with *each other*: mutating either one —
-/// anchoring on the palette band while a curve strips the low end, or
-/// uploading a curve the anchor ignores — breaks the agreement and fails
-/// here by name.
 #[test]
 fn the_skip_threshold_follows_the_effective_curve() {
     use rustdar_egui::volume_alpha::{AlphaCurve, CURVE_LEN};
@@ -1321,20 +1070,9 @@ fn the_skip_threshold_follows_the_effective_curve() {
 }
 
 /// The curve is applied on the upload path and only through the staleness
-/// comparison — the same source-scan arrangement as the painter's guards,
-/// and for the same reason: the upload needs a `wgpu::Device`, so no host
-/// test can reach it. Mutation testing on the *behavioural* seam is what
-/// pins the values ([`effective_lut`], [`effective_fade_band`] above);
-/// this pins that the upload still consults them, that the rewrite is
-/// gated on the curve actually changing rather than issued per frame, and
-/// that `prepare` still feeds it both halves.
-///
-/// **Re-anchored**: the residency step this scans used to be inline in
-/// `CallbackTrait::prepare` and is now `VolumeResources::ensure_upload`,
-/// which is what let `release_pane` be driven against real allocations
-/// (`egui_wgpu::Callback` wraps its `Box<dyn CallbackTrait>` in a private
-/// field, so nothing outside a real egui pass can call `prepare`). The
-/// callback half below is what keeps the move from having cut the wiring.
+/// comparison — the same source-scan arrangement as the painter's guards, and
+/// for the same reason: the upload needs a `wgpu::Device`, so no host test can
+/// reach it.
 #[test]
 fn the_upload_applies_the_curve_through_the_staleness_gate() {
     let source = include_str!("../volume_bridge.rs");
@@ -1380,10 +1118,6 @@ fn the_upload_applies_the_curve_through_the_staleness_gate() {
 
 /// The production ramp is eight indices wide — half the fade bar, and not
 /// the uniform's hard-edged default.
-///
-/// Flipping [`EDGE_SOFT_WIDTH`] to 0 is the one-character revert of the
-/// user-visible half of the soft edge, and before this test nothing in
-/// the workspace could see it.
 #[test]
 fn the_soft_width_is_eight_indices_half_the_fade_bar() {
     // Pinning the value pins it away from zero too: a zero production
@@ -1397,11 +1131,6 @@ fn the_soft_width_is_eight_indices_half_the_fade_bar() {
 }
 
 /// The bar is inclusive, and a table one index short of it is refused.
-///
-/// Both halves matter. Written as `>` the whole set would flip on a table
-/// sitting exactly at 16; written as `>=` on the wrong side, a 15-index
-/// token see-through region would pass and paint the block this gate
-/// exists to stop.
 #[test]
 fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
     assert!(palette_refusal_for(u16::from(MINIMUM_FADE_INDICES), "x").is_none());
@@ -1411,12 +1140,6 @@ fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
 /// **The byte-bounded eviction actually bounds.** A set holder is exempt from
 /// every shed in this file, so this is the only thing standing between a 3D
 /// loop and an unbounded store.
-///
-/// Driven past the line rather than up to it: the budget is set to two grids
-/// and four are made resident, so the check has to *evict* rather than merely
-/// find nothing to do. A store that returned 0 without freeing anything, or
-/// one that freed everything, both fail — the assertions pin the surviving
-/// count and which ones survived.
 #[test]
 fn the_store_eviction_actually_bounds() {
     let store = VolumeStore::new();
@@ -1473,14 +1196,6 @@ fn the_store_eviction_actually_bounds() {
 
 /// A set holder keeps its whole set through the events that shed a single
 /// holder's other grids.
-///
-/// Both of them, because they are different code paths and either alone would
-/// let a 3D loop lose fourteen of its fifteen frames the moment the
-/// fifteenth landed:
-///
-///  * `share`, which sheds when a pane attaches to a new target;
-///  * `complete`, whose "the grid that landed supersedes the one you were
-///    painting through the wait" rule is the seamless swap.
 #[test]
 fn a_set_holder_keeps_its_whole_set_through_a_build_landing() {
     let store = VolumeStore::new();
@@ -1585,16 +1300,6 @@ fn one_grid_host_bytes() -> usize {
 }
 
 /// **A pane the layout stopped showing is named, and nothing else is.**
-///
-/// The store is refcounted by target and keyed by pane index, and a pane-count
-/// reduction is the one way a 3D pane stops needing its grid without anything
-/// telling the store so: the `PaneState` stays in the vector for a re-split,
-/// and `ReleaseVolume` fires only on a *kind* change. This is the predicate
-/// that closes it.
-///
-/// Driven with three holders of two different kinds, and every assertion is in
-/// **bytes** rather than in entry counts — a store holding `Refused` stubs
-/// would satisfy a count assertion while giving nothing back.
 #[test]
 fn hidden_holders_names_the_panes_the_layout_dropped_and_their_bytes_go() {
     let store = VolumeStore::new();
@@ -1700,12 +1405,6 @@ fn hidden_holders_names_the_panes_the_layout_dropped_and_their_bytes_go() {
 
 /// A pane marked a set holder but holding **no entry** is named too, so the
 /// mark goes with the release.
-///
-/// `retain_set` marks the holder and then detaches it, so `release_set` leaves
-/// exactly this state behind — a live shape, not a contrivance. The mark is
-/// what exempts a pane from every shed in this file, so a hidden pane that
-/// kept it would come back as an ordinary single holder that no longer sheds:
-/// a 3D pane accumulating a grid per volume roll, for ever.
 #[test]
 fn a_hidden_pane_still_marked_a_set_holder_is_named_so_the_mark_goes_too() {
     let store = VolumeStore::new();

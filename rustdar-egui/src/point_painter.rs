@@ -1,14 +1,8 @@
 //! Egui implementation of [`rustdar_overlays::render::draw::PointPainter`].
-//!
-//! Translates abstract drawing primitives into `egui::Painter` calls,
-//! applying a screen-space center offset for each point.
 
 use egui::{Color32, FontId, Pos2, Shape, Stroke};
 use rustdar_overlays::render::draw::{PointPainter, TextAnchor};
 
-/// Wraps an `egui::Painter` reference and a screen-space center position,
-/// implementing `PointPainter` so overlay handlers can draw without depending
-/// on egui.
 pub(crate) struct EguiPointPainter<'a> {
     pub painter: &'a egui::Painter,
     pub center: Pos2,

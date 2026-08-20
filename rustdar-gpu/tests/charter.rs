@@ -1,18 +1,5 @@
 //! The crate's charter, held as tests: the dependency ceiling of the wgpu
 //! boundary and the graph position the crate exists to hold.
-//!
-//! Both read `cargo metadata --no-deps --format-version 1` from the workspace
-//! root. `packages[].dependencies` there are *declared* dependencies —
-//! feature-independent and resolution-independent — so no feature selection
-//! (default, `--all-features`, CI's llvm-cov arm) can mask or fake what these
-//! assert. Dep-name mechanics, recorded at M0 and relied on here: a
-//! workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
-//! `null` for normal deps (normalised to "normal" below); one name may
-//! legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`. Target-gated entries carry their kind like any other and
-//! are included — a gated dependency is still a dependency, which is why the
-//! per-target wgpu/egui-winit/egui-wgpu feature blocks below resolve to the
-//! same `(kind, name)` pairs the plain entries already declare.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -69,12 +56,6 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 
 /// The wgpu boundary's ceiling: the render stack and the two rustdar crates it
 /// provably imports, nothing more.
-///
-/// rustdar-gpu is the wgpu boundary — egui must never depend on it, and it
-/// must never depend on rustdar-volumetric or rustdar-app (normal); the
-/// GPU test suite's dev-dep back onto rustdar-volumetric (WO-RV land 3, the
-/// hardware quarantine) is legal because dev-deps never enter the normal
-/// graph.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata();
@@ -84,12 +65,6 @@ fn the_dependency_ceiling_holds() {
         let allowed: bool = match kind.as_str() {
             // serde_json parses `cargo metadata` in this very file; pollster
             // blocks on the adapter requests in the `#[ignore]`d GPU tests.
-            // The rest arrived with the GPU-bound integration suite (WO-RV
-            // land 3): rustdar-volumetric is the quarantined stack under
-            // test; rustdar-radar/nexrad-model/chrono/rustdar-geo feed the
-            // suites' scans and fixtures; naga translates the volumetric
-            // shader in volume_shader.rs; syn parses the single-copy guard
-            // in wgpu_guard.rs. All dev — none enters the normal graph.
             "dev" => matches!(
                 name.as_str(),
                 "serde_json"
@@ -149,9 +124,6 @@ fn the_dependency_ceiling_holds() {
 /// The graph shape WO-RG created stays: rustdar-app stands on rustdar-gpu,
 /// so the app side reaches the renderer, the upload path, the mirror and the
 /// staging ring through this boundary rather than by owning them.
-///
-/// Presence, not absence, so it doubles as this file's second falsifiability
-/// floor: a renamed package or a broken parse cannot pass it.
 #[test]
 fn the_boundary_sits_under_the_app() {
     let meta = metadata();

@@ -60,19 +60,12 @@ fn one_cut() -> ElevationCut {
     )
 }
 
-/// A one-sweep reflectivity volume. `cuts` empty is exactly what
-/// `chunks::placeholder_coverage_pattern(0)` produces — the shape a volume
-/// joined mid-scan has until its VCP message lands.
+/// A one-sweep reflectivity volume.
 fn volume(cuts: Vec<ElevationCut>) -> Arc<Scan> {
     volume_of(1, cuts)
 }
 
-/// The same volume with `sweeps` sweeps in it, for the live feed's growing
-/// `Scan`. Every sweep carries reflectivity and nothing else, so it also
-/// stands in for the surveillance-only half of a split cut. Radials carry
-/// real, distinct collection stamps because the ladder fingerprint hashes
-/// them — a fixture stamping everything `0` would make two different
-/// volumes' sweeps indistinguishable to the key under test.
+/// The same volume with `sweeps` sweeps in it, for the live feed's growing `Scan`.
 fn volume_of(sweeps: u8, cuts: Vec<ElevationCut>) -> Arc<Scan> {
     let radial = |elevation_number: u8| {
         Radial::new(
@@ -205,11 +198,6 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
             },
         });
     app.render.ensure_pane_count(1);
-    // Into the substrate's base holder, and deliberately **not** into
-    // `scan_data`: sections cut from the merged current volume, and a
-    // fixture that also filled the plan view's map would leave a
-    // regression to reading `scan_data` invisible — the pin these tests
-    // carry is precisely that a section works with the map's holder empty.
     app.base_scans
         .insert(SITE.to_owned(), (scan, Default::default(), volume_time()));
     app
@@ -225,14 +213,6 @@ fn state(app: &crate::app::App) -> &rustdar_egui::pane::CrossSectionPane {
 
 /// A volume joined mid-scan says so; a site with nothing at all says the
 /// download is in flight; and neither writes the staleness key.
-///
-/// The reason is decided by [`section_source_refusal`], a pure function of
-/// the two holders, and the two answers must stay distinct: an overlay
-/// carrying sealed sweeps under `chunks.rs`' placeholder pattern resolves
-/// itself at the next volume start, while an empty site resolves when its
-/// first download lands — and with a base in hand there is no refusal at
-/// all, however patternless the overlay, because the base alone is a
-/// complete volume to cut.
 #[test]
 fn the_section_refusal_tells_a_mid_scan_join_from_a_cold_start() {
     let mid_flight = volume(Vec::new());
@@ -257,29 +237,8 @@ fn the_section_refusal_tells_a_mid_scan_join_from_a_cold_start() {
 }
 
 /// **A volume that has started and sealed nothing has a name of its own.**
-///
-/// `current::resolve` answers "can these volumes be keyed onto one ladder",
-/// not "is there anything on it". A live feed that joins after a volume
-/// start but before the first seal, with no archive base yet, hands it a
-/// pattern it can key and zero sweeps to key — so it *succeeds*, with an
-/// empty sweep list, and the refusal used to read that as "a section can be
-/// cut".
-///
-/// What the pane then got was the wrong sentence. The extraction found no
-/// moment, the dispatch answered `NoPayload`, and the state was named
-/// `ProductMissingFromVolume`: *"this volume carries no Reflectivity to
-/// cut"* — true, and about the wrong thing. The volume carries no anything,
-/// the product is not implicated, and switching moment — which is what that
-/// message invites — changes nothing. The pane stood blank meanwhile for
-/// the rest of the first tilt, up to ~30 s.
-///
-/// Both halves are fixed by refusing *here*, before any dispatch: the
-/// second assertion below is the log-spam half, because
-/// `spawn_section_render` — the only thing that logs "no volume payload" —
-/// is unreachable for a state the refusal has already named.
 #[test]
 fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product() {
-    // A pattern, so `resolve` can key a ladder, and no sweeps to put on it.
     let started = volume_of(0, vec![one_cut()]);
     assert!(
         started.sweeps().is_empty(),
@@ -303,18 +262,12 @@ fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product(
              problem, or not reported at all"
     );
 
-    // The log-spam half. A refusal is a `Some`, and a `Some` makes
-    // `dispatch_section_renders` `continue` before it reaches
-    // `spawn_section_render` — the only caller of the "no volume payload"
-    // log. Naming the state is what silences it.
     assert!(
         section_source_refusal(None, Some(&started)).is_some(),
         "the dispatch would be entered for a volume with nothing in it, and \
              would log its refusal for as long as the volume stood"
     );
 
-    // And the message is about waiting, not about the moment: nothing in it
-    // invites the user to change product, because that would not help.
     let message = SectionUnavailable::AwaitingFirstSweep.message();
     assert!(
         message.contains("only just started"),
@@ -329,9 +282,6 @@ fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product(
         "the message still blames the product for an empty volume: {message}"
     );
 
-    // The sibling states keep their own sentences: three ways of waiting,
-    // three different things to say, and a collapse of any two is the
-    // failure this whole enum exists to prevent.
     let messages = [
         SectionUnavailable::AwaitingVolume.message(),
         SectionUnavailable::AwaitingCoveragePattern.message(),
@@ -343,8 +293,6 @@ fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product(
         }
     }
 
-    // With one sealed sweep the refusal is gone, so this really is about
-    // emptiness rather than about live volumes in general.
     let sealed = volume_of(1, vec![one_cut()]);
     assert_eq!(
         section_source_refusal(None, Some(&sealed)),
@@ -353,14 +301,11 @@ fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product(
     );
 }
 
-/// The refusal reaches the **pane**, not just the predicate: an empty live
-/// volume leaves the section labelled and un-keyed, so it asks again the
-/// moment the first tilt seals.
+/// The refusal reaches the **pane**, not just the predicate: an empty live volume
+/// leaves the section labelled and un-keyed.
 #[test]
 fn an_empty_live_volume_labels_the_pane_and_keeps_it_asking() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
-    // No archive base — the live-feed-only case — and a started volume with
-    // nothing sealed standing in for the chunk feed's snapshot.
     app.base_scans.clear();
     app.base_scans.insert(
         SITE.to_owned(),
@@ -395,8 +340,6 @@ fn an_empty_live_volume_labels_the_pane_and_keeps_it_asking() {
 #[test]
 fn a_transient_section_refusal_keeps_the_pane_asking() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
-    // No source at all: the cold-start arm of the same refusal path the
-    // mid-flight join takes.
     app.base_scans.clear();
 
     app.dispatch_section_renders();
@@ -417,34 +360,16 @@ fn a_transient_section_refusal_keeps_the_pane_asking() {
         "a render slot was spent to be told what the volume already said"
     );
 
-    // The message names the cause and says it clears itself, which is the
-    // whole reason it is not folded into a generic "no data".
     let message = SectionUnavailable::AwaitingCoveragePattern.message();
     assert!(message.contains("mid-scan"), "{message}");
     assert!(message.contains("next volume"), "{message}");
 }
 
-/// **A held line dispatches nothing, and a dropped line dispatches exactly
-/// one cut** — the dispatcher's half of the endpoint drag's
-/// re-cut-on-drop contract.
-///
-/// The egui half
-/// (`dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag`)
-/// pins that a drag in flight never touches the pane's stored line and
-/// that the drop writes it exactly once. This half pins what that buys:
-/// the stored line is the staleness key's line, so any number of polls
-/// against an unmoved line after the first cut must dispatch **nothing**
-/// — a cut walks megabytes of gate bytes, and per-frame dispatch during a
-/// drag is precisely what deferring the write to the drop exists to
-/// prevent — while the drop's single write must make the very next poll
-/// cut, or dropping a handle would do nothing until the next volume
-/// happened along.
+/// **A held line dispatches nothing, and a dropped line dispatches exactly one cut**.
 #[test]
 fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
 
-    // The first poll after the pane was aimed: one cut in flight, the key
-    // written on dispatch.
     app.dispatch_section_renders();
     assert!(
         app.render.pane_render[0].render_in_flight(),
@@ -454,14 +379,8 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
         .rendered_for
         .clone()
         .expect("the key is written on dispatch");
-    // The cut completes; the budget frees. The key stays, which is the
-    // whole staleness machine.
     app.render.pane_render[0].render_finished();
 
-    // A drag in flight: the preview lives on the map pane and the stored
-    // line holds still, so every one of these polls is the dispatcher
-    // looking at an unmoved key. Sixty of them — a second of frames —
-    // must dispatch nothing.
     for frame in 0..60 {
         app.dispatch_section_renders();
         assert!(
@@ -476,8 +395,6 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
         "an idle poll moved the staleness key"
     );
 
-    // The drop: exactly the one write `Gui::apply_pending_section_edit`
-    // makes, nothing else touched.
     let moved = SectionLine::new(
         GeoPoint {
             lat: 35.05,
@@ -515,11 +432,6 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
 }
 
 /// A product with no vertical structure says so, and **stops** asking.
-///
-/// The mirror of the test above, and the pair is the point: nothing about
-/// this volume or the next will make a column integral sliceable, so
-/// re-asking every frame is a busy loop with no output and no symptom but a
-/// warm machine.
 #[test]
 fn a_product_with_no_vertical_structure_says_so_and_stops_asking() {
     let mut app = app_with_section(RadarProduct::EchoTops, volume(vec![one_cut()]));
@@ -539,22 +451,12 @@ fn a_product_with_no_vertical_structure_says_so_and_stops_asking() {
     );
     assert!(!app.render.pane_render[0].render_in_flight());
 
-    // Named, so the message can say which product and what to do instead.
     let message =
         SectionUnavailable::ProductHasNoVerticalStructure(RadarProduct::EchoTops).message();
     assert!(message.contains(RadarProduct::EchoTops.name()), "{message}");
 }
 
-/// An edit to the storm motion override invalidates the SRV vertical
-/// views: the section's staleness key is cleared and the 3D store's SRV
-/// entries are evicted, so both re-derive with the new vector.
-///
-/// The vector is a render *parameter*, not part of any target — without
-/// this, an SRV volume and section keep painting the old vector's field
-/// until the next volume rolls, silently. The plan-view invalidation
-/// lives in `RenderDispatcher::set_storm_motion_override`; this pins its
-/// vertical counterpart, and that an unchanged vector invalidates
-/// nothing.
+/// An edit to the storm motion override invalidates the SRV vertical views.
 #[test]
 fn an_override_edit_invalidates_the_srv_vertical_views() {
     let mut app = app_with_section(RadarProduct::StormRelativeVelocity, volume(vec![one_cut()]));
@@ -594,7 +496,6 @@ fn an_override_edit_invalidates_the_srv_vertical_views() {
         "precondition: the store holds an SRV entry",
     );
 
-    // Flipping the override on is a vector change.
     app.gui.storm_motion_override.enabled = true;
     let ctx = egui::Context::default();
     app.dispatch_pane_renders(&ctx);
@@ -609,8 +510,6 @@ fn an_override_edit_invalidates_the_srv_vertical_views() {
         "the store must evict the SRV grid derived with the old vector",
     );
 
-    // Re-armed with the vector unchanged: nothing is invalidated, or
-    // every SRV pane would rebuild every frame.
     arm(&mut app);
     app.dispatch_pane_renders(&ctx);
     assert!(
@@ -639,13 +538,6 @@ fn a_section_with_no_volume_is_told_it_is_waiting() {
 
 /// A dispatch for a pane the dispatcher does not have refuses rather than
 /// panicking, and takes no budget on the way out.
-///
-/// Unreachable today: the only caller reaches `spawn_section_render` through
-/// `pane_render.get(pane_idx)` two lines earlier. It is pinned because the
-/// two `pane_render` indexes inside straddle the in-flight increment and the
-/// `RenderGuard`, so the panic a future caller would earn would leave the
-/// render budget permanently short by one as well as taking down the frame
-/// thread — and on wasm the budget is one.
 #[test]
 fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
@@ -684,18 +576,6 @@ fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
 }
 
 /// A volume that carries nothing to cut is **told so**, not left waiting.
-///
-/// The dispatcher's "no payload" answer used to be the same `false` as "the
-/// render budget is full", and the caller's reading of `false` is "write no
-/// staleness key, ask again next frame". So a section pane on a volume with
-/// no such moment re-dispatched on every frame and painted "Cutting the
-/// cross-section…" for as long as the volume stood: a permanent wait, which
-/// the pane's own doc calls the worst state a pane can be in, and which
-/// this codebase shipped once before and fixed.
-///
-/// The fixture is storm-relative velocity over a reflectivity-only volume:
-/// no velocity anywhere, so `extract_volume_parts` answers `None` — the
-/// same answer a refused derivation gives.
 #[test]
 fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
     let mut app = app_with_section(RadarProduct::StormRelativeVelocity, volume(vec![one_cut()]));
@@ -713,15 +593,12 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
         "without the staleness key the pane re-dispatches every frame — a \
              busy loop whose only symptom is a warm machine",
     );
-    // And the message is a sentence, not a spinner.
     let message = state(&app).unavailable.expect("named").message();
     assert!(
         message.contains("carries no"),
         "the state has a name but no explanation: {message:?}",
     );
 
-    // The key carries the volume stamp, so a volume that *does* carry
-    // velocity asks again rather than inheriting the refusal.
     app.base_scans.insert(
         SITE.to_owned(),
         (
@@ -740,14 +617,6 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
 }
 
 /// A product the radar *derives* tilt by tilt gets a cut, not a refusal.
-///
-/// The third of the three UI-facing gates that admit SRV, NROT and KDP to
-/// the vertical views, and the last of them to get a test. All three could
-/// be reverted to `sampler::samplable` — the exact pre-admission code —
-/// with every test in the workspace green, and every derived section pane
-/// would answer `ProductHasNoVerticalStructure` permanently, for a volume
-/// the worker can slice perfectly well. The headline feature of the
-/// products WP had no UI-facing pin at all.
 #[test]
 fn a_section_of_a_derived_product_is_cut_rather_than_refused_by_name() {
     for product in [
@@ -778,26 +647,12 @@ fn a_section_of_a_derived_product_is_cut_rather_than_refused_by_name() {
 }
 
 /// Dragging the storm motion vector re-derives the cross-section.
-///
-/// The reviewer's probe, and it failed on the shipped code with
-/// `left: Some((20.0, 240.0)), right: Some((60.0, 90.0))`. The payload
-/// cache keyed on `(site, collected, product, ladder)`, so an override
-/// edit — which clears the pane's staleness key but not the payload —
-/// left `reusable` true, skipped `extract()` and shipped the previous
-/// vector's field. On screen the section visibly redrew showing the old
-/// vector, for up to a whole volume, while the plan view and the 3D
-/// volume re-derived correctly: a silent wrong field, and the worst kind,
-/// because the redraw is the user's evidence that it worked.
 #[test]
 fn a_storm_motion_edit_re_derives_the_cross_section() {
     let mut app = app_with_section(
         RadarProduct::StormRelativeVelocity,
         velocity_volume(vec![one_cut()]),
     );
-    // Driven through the settings panel's own state and the app's own
-    // edit path, so the staleness key is cleared the way a real drag
-    // clears it — the half that already worked, and the half that made
-    // this bug invisible.
     let drag = |app: &mut crate::app::App, speed: f32, direction: f32, enabled: bool| {
         app.gui.storm_motion_override = rustdar_egui::StormMotionOverride {
             enabled,
@@ -805,9 +660,6 @@ fn a_storm_motion_edit_re_derives_the_cross_section() {
             direction_deg: direction,
         };
         assert!(app.apply_storm_motion_override(), "the vector must move");
-        // The previous cut has landed. A section pane with a cut in
-        // flight does not re-dispatch, which in the app is the arrival
-        // that clears this and in a test has to be said out loud.
         app.render.pane_render[0].render_finished();
         app.dispatch_section_renders();
         assert!(
@@ -831,25 +683,12 @@ fn a_storm_motion_edit_re_derives_the_cross_section() {
         "the section redrew from the previous vector's field",
     );
 
-    // Clearing the override back to the volume's own Bunkers fit is the
-    // same edit in the other direction, and was equally invisible.
     drag(&mut app, 60.0, 90.0, false);
     assert_eq!(app.render.section_payload_motion(), Some(None));
 }
 
 /// **Commit on release.** A vector still under the pointer is not applied, and
 /// the moment it is let go it is.
-///
-/// Every other setting that invalidates a render is a click. This one is a
-/// `DragValue`, which produces a value per frame, and applying it evicts every
-/// storm-relative grid and section: ~210 ms of re-cut per drag frame for a
-/// cross-section, and for a 3D loop the whole resident set — fourteen grids and
-/// ~1.8 s of resample, thrown away and restarted on the next frame, so the loop
-/// would never finish building while a finger was on the widget.
-///
-/// What is *not* deferred matters as much: the widget shows the new number
-/// throughout, and the picture goes on showing the vector it was actually
-/// derived with. Neither half lies while the drag is in progress.
 #[test]
 fn a_storm_motion_drag_commits_on_release_rather_than_per_frame() {
     let mut app = app_with_section(
@@ -867,8 +706,6 @@ fn a_storm_motion_drag_commits_on_release_rather_than_per_frame() {
          state for the drag below to be held against",
     );
 
-    // Mid-drag: a storm-motion widget has the pointer or the keyboard, which
-    // is what the settings rows write when they draw.
     app.gui.storm_motion_editing = true;
     assert!(
         app.gui.storm_motion_mid_edit(),
@@ -884,7 +721,6 @@ fn a_storm_motion_drag_commits_on_release_rather_than_per_frame() {
         );
     }
 
-    // Released.
     app.gui.storm_motion_editing = false;
     assert!(
         app.apply_storm_motion_override(),
@@ -967,15 +803,6 @@ fn a_finished_cut_lands_on_the_pane_that_asked_for_it() {
         "a pane that never hears back stops asking for another cut"
     );
 
-    // **And it is uploaded `NEAREST`**, which is one of the three honesty
-    // devices the section pane rests on and the only one that leaves no
-    // trace in the source of the module it protects. A section's rows are
-    // the tilt ladder's rungs stretched to fill the gaps between them;
-    // bilinear filtering blends those edges into a smooth gradient and
-    // paints exactly the impression the caption exists to refuse — that the
-    // vertical structure was measured continuously. Nothing about the
-    // picture would look broken, which is why it is asserted rather than
-    // left to a comment.
     let id = state(&app).texture.as_ref().expect("uploaded").id();
     let manager = ctx.tex_manager();
     let manager = manager.read();
@@ -992,18 +819,12 @@ fn a_finished_cut_lands_on_the_pane_that_asked_for_it() {
 
 /// A cut for a line the pane is no longer aimed along is dropped, and the
 /// key is left alone.
-///
-/// A section takes an order of magnitude longer to produce than the user
-/// takes to draw another line over it, so this is ordinary rather than
-/// exotic — and the failure is the worst kind: a section of the *previous*
-/// line, on screen, captioned with the current volume, looking authoritative.
 #[test]
 fn a_cut_for_a_line_the_pane_has_left_behind_is_dropped() {
     let ctx = egui::Context::default();
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
     let superseded = app.section_target_for_pane(0).expect("aimed with a volume");
 
-    // The pane moves on: a new line, and the key that goes with it.
     app.gui
         .pane_mut(0)
         .unwrap()
@@ -1056,22 +877,6 @@ fn a_cut_for_a_line_the_pane_has_left_behind_is_dropped() {
 
 /// **A section pane comes back from a suspend, a display change or a lost
 /// surface** — and comes back with its picture rather than with a promise.
-///
-/// The whole cycle, in the order the app runs it:
-/// `clear_graphics_state` (Android's `onPause`, a foldable unfolding, a GPU
-/// reset — `app_render.rs`'s surface-loss arm and `app.rs`'s resume path
-/// both land here) drops the handle, then `restore_cached_render` runs when
-/// the renderer is rebuilt, then the ordinary per-frame dispatch.
-///
-/// Without the restore this is the pane's worst state and it is silent: the
-/// handle is gone, the cut and its `rendered_for` are not, so
-/// `render_cross_section` paints "Cutting the cross-section…" — the *in
-/// flight* message — while `dispatch_section_renders` reads the matching key
-/// and declines to cut. Nothing is in flight and nothing ever will be. The
-/// hover readout goes with it, since the paint returns before it. Live, the
-/// next volume rescues it in about six minutes; on an archived volume it
-/// never recovers at all, which is exactly the "waiting that will never end"
-/// `ui_section_pane`'s doc calls the worst state a pane can be in.
 #[test]
 fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
     let ctx = egui::Context::default();
@@ -1096,7 +901,6 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
     app.poll_section_results(&ctx);
     let before = state(&app).texture.as_ref().expect("uploaded").id();
 
-    // Suspend, unfold, or a wgpu surface loss. Same call in all three.
     app.gui.clear_graphics_state();
     assert!(
         state(&app).texture.is_none(),
@@ -1109,7 +913,6 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
              what makes the pane look busy while nothing is running"
     );
 
-    // The renderer is rebuilt and the app restores what it can.
     app.restore_cached_render(&ctx);
 
     let after = state(&app).texture.as_ref().map(|t| t.id());
@@ -1125,10 +928,6 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
              dangling one from the context that died"
     );
 
-    // The restored raster is the honest one. `restore_section_textures` and
-    // `poll_section_results` share `upload_section_raster` for this reason —
-    // a resume that silently re-uploaded LINEAR would blend the rungs into a
-    // smooth gradient and nothing about the picture would look wrong.
     let manager = ctx.tex_manager();
     let manager = manager.read();
     assert_eq!(
@@ -1142,10 +941,6 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
     );
     drop(manager);
 
-    // And it was a **re-upload**, not a re-cut. The key is untouched, so the
-    // dispatcher stays quiet: a resume must not walk a 15.6 MB volume for a
-    // picture already in memory, and must not depend on that volume still
-    // being in memory at all.
     assert_eq!(
         state(&app).rendered_for,
         Some(target),
@@ -1161,22 +956,6 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
 
 /// **The restore reaches as far as the release does**, hidden panes
 /// included.
-///
-/// `Gui::clear_graphics_state` walks every *remembered* pane on purpose,
-/// and its own test says why: a handle belonging to a pane the user split
-/// away from is just as invalid once the context is gone, and a re-split
-/// would hand it straight back to the renderer. So the restore has to walk
-/// exactly as far. Bounding it at `pane_count()` — the *visible* count, and
-/// the natural thing to reach for — leaves a section pane that was hidden
-/// during a suspend holding a released texture with its `rendered_for`
-/// still satisfied: the same permanently-waiting pane, reached by splitting
-/// up instead of by backgrounding the app.
-///
-/// Read off the source because the two counts differ only when a pane is
-/// remembered but not shown, and the API that produces that state
-/// (`Gui::grow_panes` and the pane picker behind it) is `pub(crate)` to
-/// `rustdar-egui`. Same reason, and same technique, as
-/// `restore_describes_its_image_tests` below.
 #[test]
 fn the_section_restore_walks_every_remembered_pane() {
     let (_, rest) = include_str!("../app_render.rs")
@@ -1234,12 +1013,6 @@ fn a_cut_that_answered_nothing_says_it_failed() {
 }
 
 /// A result from a superseded *generation* is dropped **and clears the key**.
-///
-/// The opposite of the case above, and the asymmetry is the point. There the
-/// pane has already asked for something else, so its key belongs to a cut
-/// still in flight. Here the pane is still waiting and the answer has been
-/// thrown away, so leaving the key would tell the dispatcher this cut had
-/// been answered — and nothing else would ever ask again.
 #[test]
 fn a_result_from_a_dead_generation_puts_the_pane_back_to_asking() {
     let ctx = egui::Context::default();
@@ -1276,11 +1049,6 @@ fn a_result_from_a_dead_generation_puts_the_pane_back_to_asking() {
 
 /// A new volume for the site makes the section on screen stale **by the
 /// same comparison** that notices a moved endpoint or a changed moment.
-///
-/// This is what buys the absence of a `reset_panes_for_*` arm for section
-/// panes — the kind of thing that gets remembered for one of the two reset
-/// paths and not the other. Asserted on the key itself, because the key is
-/// what the dispatch decides on.
 #[test]
 fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
@@ -1289,19 +1057,15 @@ fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
         .section_target_for_pane(0)
         .expect("the pane is aimed and has a volume");
 
-    // Nothing but the volume time moves.
     if let Some(info) = app.gui.pane_mut(0).unwrap().scan_info.as_mut() {
         info.timestamp = volume_time() + chrono::Duration::minutes(6);
     }
     let after = app.section_target_for_pane(0).expect("still aimed");
     assert_ne!(before, after, "a new volume did not make the key move");
 
-    // The product picker moves it too, so the one comparison really does
-    // cover every input rather than only the one it was written for.
     app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
     assert_ne!(app.section_target_for_pane(0), Some(after));
 
-    // And so does the line, which is the input the interaction produces.
     app.gui
         .pane_mut(0)
         .unwrap()
@@ -1323,29 +1087,9 @@ fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
 
 /// A live volume that is still filling re-cuts as it fills, **even though
 /// its timestamp never moves**.
-///
-/// This is the configuration the feature actually ships in — live chunks are
-/// on by default — and it is the one the volume-time key does not cover.
-/// `ScanInfo::timestamp` is the *first* sweep's first radial, and on the
-/// chunk feed `sweeps[0]` is fixed for the whole volume, so the stamp is a
-/// constant for five to six minutes while the merged ladder refreshes rung
-/// by rung. Observed live before the original fix: a map pane full of
-/// echo, a section pane empty, and a caption reading `1 tilts` for six
-/// minutes.
-///
-/// Two preconditions carry the test. `before.volume` and `after.volume` are
-/// asserted **equal**, so a future change that makes the stamp move on the
-/// live feed fails here on the premise rather than passing for the wrong
-/// reason. And `product_elevations` is left **untouched** across the growth,
-/// because that is the source this discriminator was first written against
-/// and it is wrong: the `ChunkScanInfo` event merges angles in and never
-/// removes one, so after a session's first complete volume the pane already
-/// knows the whole VCP and the count never moves again.
 #[test]
 fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
-    // The pane already knows every angle the VCP flies — the state it is in
-    // for every volume after the first one of a session.
     if let Some(info) = app.gui.pane_mut(0).unwrap().scan_info.as_mut() {
         info.product_elevations.insert(
             RadarProduct::Reflectivity,
@@ -1358,7 +1102,6 @@ fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
         .expect("the pane is aimed and has a volume");
     assert_ne!(before.ladder, 0, "the fixture volume's ladder resolves");
 
-    // More sweeps land: the volume grows and nothing else does.
     app.base_scans.insert(
         SITE.to_owned(),
         (volume_of(4, cuts_for(4)), Default::default(), volume_time()),
@@ -1376,9 +1119,6 @@ fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
              goes on showing a one-sweep section"
     );
 
-    // And the pane really re-dispatches on it: with the one-sweep key
-    // stored, the four-sweep target no longer matches and the
-    // short-circuit at the top of `dispatch_section_renders` falls through.
     app.gui
         .pane_mut(0)
         .unwrap()
@@ -1394,17 +1134,7 @@ fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
     );
 }
 
-/// **The re-cut skip.** A seal that changes no chosen rung for the pane's
-/// moment leaves the section key exactly where it was — and the same seal
-/// moves the key of the moment it *does* change.
-///
-/// The waste this pins from the app side: a split cut's Doppler half
-/// carries a short-range reflectivity copy, and the old sweep-count key
-/// moved on its seal — ~6 byte-identical re-cuts per VCP-212 volume, each
-/// a 15.6 MB walk and a render slot. The rung-choice fingerprint cannot be
-/// moved by a seal that changes no choice; `current::tests` pin the
-/// fingerprint itself, and this pins that the section target actually
-/// rides it.
+/// **The re-cut skip.**
 #[test]
 fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
     let surveillance_only = || {
@@ -1465,8 +1195,6 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
              anyway: that is a byte-identical re-cut per split cut per volume"
     );
 
-    // The same seal is a real change for velocity — the moment it carries
-    // — and the key must move there, or the skip is a freeze.
     app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
     let vel_after = app.section_target_for_pane(0).expect("aimed at velocity");
     app.base_scans.insert(
@@ -1481,10 +1209,7 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
     );
 }
 
-/// One half of a split cut: the surveillance pass carries reflectivity
-/// alone, the Doppler pass carries reflectivity's short-range copy plus
-/// velocity — the shape whose seal used to force the byte-identical
-/// re-cut.
+/// One half of a split cut: the surveillance pass carries reflectivity alone.
 fn split_half(elevation_number: u8, doppler: bool) -> Sweep {
     let moment = || MomentData::from_fixed_point(1, 0, 250, 8, 2.0, 66.0, vec![32]);
     let radial = Radial::new(

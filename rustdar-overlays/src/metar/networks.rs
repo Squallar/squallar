@@ -483,9 +483,6 @@ mod tests {
         assert!(states.contains(&"OK"), "got {states:?}");
     }
 
-    /// Asserts the **exact set**, not just absent states: with the intersection
-    /// test removed entirely, the nearest-first cap alone still excludes ME and
-    /// AS from an Oklahoma view. Two networks against a cap of twelve cannot be.
     #[test]
     fn a_viewport_over_a_state_skips_distant_states() {
         let mut states = networks_for_viewport(&view(34.3, 36.3, -98.3, -96.3));
@@ -508,8 +505,6 @@ mod tests {
         }
     }
 
-    /// The Red River (~33.9 N) separates OK from TX; a view spanning it needs
-    /// both networks or half the stations vanish.
     #[test]
     fn a_viewport_straddling_a_border_selects_both_states() {
         let states = networks_for_viewport(&view(33.2, 34.6, -98.0, -96.5));
@@ -517,7 +512,6 @@ mod tests {
         assert!(states.contains(&"TX"), "got {states:?}");
     }
 
-    /// Uncapped, a whole-country view is 54 requests and ~3.9 MB.
     #[test]
     fn a_continental_viewport_is_capped() {
         let states = networks_for_viewport(&view(24.0, 50.0, -125.0, -66.0));
@@ -529,11 +523,8 @@ mod tests {
         assert!(!states.is_empty());
     }
 
-    /// Fails if the truncation loses its sort: the table is alphabetical, so
-    /// that returns AK/AL/AR/AS/AZ... for a view centred on Kansas.
     #[test]
     fn the_cap_keeps_the_networks_nearest_the_viewport_centre() {
-        // Centred on Kansas, wide enough to overlap far more than the cap.
         let states = networks_for_viewport(&view(30.0, 45.0, -108.0, -88.0));
         assert_eq!(states.len(), MAX_NETWORKS);
         assert!(states.contains(&"KS"), "got {states:?}");
@@ -541,11 +532,9 @@ mod tests {
             !states.contains(&"AS"),
             "American Samoa is alphabetically 4th but 8,000 km away: {states:?}",
         );
-        // The nearest network to the centre of that box is Kansas itself.
         assert_eq!(states[0], "KS", "nearest-first ordering: {states:?}");
     }
 
-    /// Fails if the comparison is exclusive, which drops stations on the seam.
     #[test]
     fn overlap_is_inclusive_at_the_boundary() {
         let ok = NETWORKS.iter().find(|n| n.state == "OK").unwrap();

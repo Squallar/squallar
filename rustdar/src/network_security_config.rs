@@ -1,25 +1,18 @@
 //! Keeps the Android Network Security Config in step with the origins rustdar
 //! fetches from.
 //!
-//! `.../res/xml/network_security_config.xml` denies cleartext per domain over a
-//! `base-config` that *permits* it, because Android's own TrustManager fetches
-//! the plain-HTTP CRL published by `api.weather.gov`'s Let's Encrypt chain. So
-//! an origin missing from the per-domain list falls through to `base-config`
-//! and is allowed to travel in the clear.
+//! `.../res/xml/network_security_config.xml` denies cleartext per domain over
+//! a `base-config` that *permits* it, because Android's own TrustManager
+//! fetches the plain-HTTP CRL published by `api.weather.gov`'s Let's Encrypt
+//! chain — so an origin missing from the per-domain list travels in the clear.
 //!
 //! The assertions run both ways: a live origin with no XML entry fails, and an
-//! XML entry no origin needs fails too. One-way would have missed the stale
-//! `aviationweather.gov` entry, and it was the stale entry that made the list
-//! look maintained while the live METAR host went uncovered.
-//!
-//! Not under `cfg(android)`: the `android` module tree compiles to nothing on
-//! the host, so a test inside it would never run in CI. This file is ungated
-//! and host-run on every row.
+//! XML entry no origin needs fails too. Not under `cfg(android)`, because the
+//! `android` module tree compiles to nothing on the host.
 
 #[cfg(test)]
 const CONFIG_PATH: &str = "../packaging/android/app/src/main/res/xml/network_security_config.xml";
 
-/// One `<domain>` entry.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct DomainRule {
@@ -29,14 +22,12 @@ struct DomainRule {
 
 #[cfg(test)]
 impl DomainRule {
-    /// Android's rule: exact match always, subdomains only with
-    /// `includeSubdomains`.
+    /// Exact match always, subdomains only with `includeSubdomains`.
     fn covers(&self, host: &str) -> bool {
         host == self.host || (self.include_subdomains && host.ends_with(&format!(".{}", self.host)))
     }
 }
 
-/// Pull every `<domain …>host</domain>` out of the config.
 #[cfg(test)]
 fn parse_domains(xml: &str) -> Vec<DomainRule> {
     let mut out = Vec::new();
@@ -60,7 +51,6 @@ fn parse_domains(xml: &str) -> Vec<DomainRule> {
     let mut rest = stripped.as_str();
     while let Some(start) = rest.find("<domain") {
         let after = &rest[start + "<domain".len()..];
-        // Guard against matching `<domain-config`.
         if after.starts_with('-') {
             rest = after;
             continue;
@@ -104,8 +94,7 @@ mod tests {
             .to_ascii_lowercase()
     }
 
-    /// Every host the shipped app requests, derived from the declarations
-    /// rather than restated — that is the whole point.
+    /// Every host the shipped app requests, derived from the declarations.
     fn live_hosts() -> BTreeSet<String> {
         let s = DataSources::production();
         let mut hosts = BTreeSet::new();
@@ -224,9 +213,8 @@ mod tests {
         );
     }
 
-    /// Android Lint's `NetworkSecurityConfig` / "Missing includeSubdomains" is
-    /// a *fatal* error: an entry without it fails `lintVitalRelease` and takes
-    /// `assembleRelease` with it.
+    /// Android Lint's "Missing includeSubdomains" is a *fatal* error: an entry
+    /// without it fails `lintVitalRelease`.
     #[test]
     fn every_domain_entry_sets_include_subdomains() {
         let narrow: Vec<_> = parse_domains(&config_xml())
@@ -242,8 +230,7 @@ mod tests {
         );
     }
 
-    /// Inverting either half silently breaks HTTPS to api.weather.gov or
-    /// silently allows plaintext to rustdar's own origins.
+    /// Inverting either half breaks HTTPS to api.weather.gov or allows plaintext.
     #[test]
     fn base_permits_cleartext_and_every_domain_block_denies_it() {
         let xml = config_xml();

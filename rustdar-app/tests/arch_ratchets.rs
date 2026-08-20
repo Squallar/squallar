@@ -1,126 +1,39 @@
-//! WO-E0c — the campaign's architectural ratchets: the enforced starting line.
+//! Architectural ratchets: ceilings on coupling metrics, enforced as tests.
 //!
-//! Six metric families were ASSERTED as ceilings from measured at-land
-//! baselines; **five are asserted here today** (row 5 RETIRED at WO-M8c,
-//! below), and one family (the wasm-cfg line counts, row 3) is RECORDED below
-//! and deliberately NOT asserted. Every ceiling may only move DOWN: the phase
-//! that earns a lower count lowers the MAX const in the same land; a MAX is
-//! never raised without a written plan amendment.
+//! Every ceiling may only move DOWN — the land that earns a lower count lowers
+//! the MAX const with it. Each ceiling sits beside a positive check on the same
+//! haystack, so a moved or renamed haystack fails loudly instead of counting
+//! zero and going silently green.
 //!
-//! A ceiling is retired only by reaching the end of its own trajectory — row
-//! 5 reached zero, where a count stops being a ceiling and becomes an absence
-//! assertion, and it was replaced by one in the same land. Retirement is
-//! never a way to stop a ceiling firing.
+//! Needle hygiene: every counted pattern here is built from split literals
+//! (`concat!("self.", "gui.")` style) and the walker skips this file, so the
+//! file never contains a counted pattern contiguously.
 //!
-//! Discipline, borrowed from the tree's two proven patterns:
-//! - grep-ratchet with presence controls: every ceiling sits beside a
-//!   positive check on the same haystack, so a moved or renamed haystack
-//!   fails loudly instead of counting zero and going silently green
-//!   (`the_opaque_overlay_path_stays_deleted`,
-//!   rustdar-app/src/app_render/frame_thread_conversion_tests.rs:200).
-//! - self-verifying inventory (`every_colour_scale_static_is_registered`,
-//!   rustdar-radar/src/palette.rs:946).
+//! Counting semantics: the asserted metrics count OCCURRENCES (`rg -o … | wc -l`
+//! on the command side, summed `str::matches` here). The wasm-cfg rows count
+//! matching LINES per crate (`rg -c` summed). Commands run from the workspace
+//! root; the walker skips dirs named `target`/`pkg` and never leaves the
+//! workspace.
 //!
-//! Needle hygiene: every counted pattern in this file is built from split
-//! literals (`concat!("self.", "gui.")` style), and the commands in the
-//! table spell their patterns with shell string concatenation — `'Radar'`
-//! immediately followed by `'Product'` is one contiguous shell argument.
-//! This file therefore never contains a counted pattern contiguously: the
-//! walker additionally skips the file itself (belt and braces), the table's
-//! commands reproduce the same values after this file lands, and the
-//! campaign-close zero-greps need no test-file exclusion.
-//!
-//! Counting semantics: the asserted metrics count OCCURRENCES — `rg -o … |
-//! wc -l` on the command side, summed `str::matches` here (identical for
-//! these needles). The wasm-cfg rows count matching LINES per crate (`rg -c`
-//! summed). Commands run from the workspace root; the walker skips dirs
-//! named `target`/`pkg` and never leaves the workspace (sibling checkouts
-//! stay out of scope by construction). Verified at land: ripgrep ignores
-//! nothing else under these trees, so the walker's file set is identical to
-//! the commands'.
-//!
-//! # Baseline of record
-//!
-//! Measured 2026-08-18 at main @ 854f4a64 (the WO-M2/E0a land — E0c runs
-//! last in Phase 0 precisely so these counts include M2's tolerance module);
-//! every value below is the command's live output at that tree, per the
-//! order's re-count-at-land rule. Reference values from 2026-08-18 @
-//! 42e90efd drifted exactly where predicted: overlay-kind 745 -> 762 and
-//! product-enum 440 -> 444 (M2's tolerance module + tests), web wasm-cfg
-//! 30 -> 31 (M1's tier-1 wasm tests).
+//! Baseline measured 2026-08-18 at main @ 854f4a64:
 //!
 //! ```text
 //!  #   metric                                        value  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-app     192  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
-//!      (204 at E0c; lowered at WO-E2 Land 1, which converted every setter
-//!      push to Gui::apply / the per-frame FrameInputs compose)
+//!  1a  App-pokes-Gui occurrences, rustdar-app          192  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
 //!  1b  ... excluding test-named paths                  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
-//!      (198 at E0c; same land)
 //!  2   Gui setter fns in rustdar-egui/src/ui.rs          3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
-//!      (23 at E0c; WO-E2 Land 2 deleted the 18 converted setters plus
-//!      apply_chunk_scan_info and clear_gps_fix, and demoted the two
-//!      armed-toggles to pub(crate) — the three chunk-settings setters
-//!      remain until WO-E8b reaches 0)
-//!  3   wasm-cfg lines per crate                          -  for c in rustdar-app rustdar-radar rustdar-egui rustdar-web rustdar-overlays rustdar-device-profile; do
-//!      [RECORDED, NOT ASSERTED]                             printf '%s ' "$c"; rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs' \
-//!      frontend 93, radar 43, egui 40, web 31,              | awk -F: '{s+=$2} END {print s+0}'; done
-//!      overlays 25, device-profile 73 (sum 305;
-//!      re-counted at WO-RD — the cascades moved
-//!      down, radar had shed 11 across the M block)
-//!  3b  ... device-profile/src/constants.rs alone        42  rg -c 'target_arch = "wasm''32"' rustdar-device-profile/src/constants.rs
-//!      [RECORDED, NOT ASSERTED] (re-keyed at WO-RD)
+//!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -  rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs'
 //!  4a  product-enum occurrences in rustdar-egui        444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
 //!  4b  ... files containing it (info)                   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
-//!  5a  overlay-kind occurrences, whole tree              0  rg -o 'Overlay''Kind' . --glob '*.rs' | wc -l
-//!      [RETIRED at WO-M8c — 762 at E0c, 766 at WO-THEME,               (0 since WO-M8c; the enum is gone)
-//!      29 at WO-M8b b3, 0 here. No test asserts it.]
-//!  5b  ... files containing it (info)                    0  rg -l 'Overlay''Kind' . --glob '*.rs' | wc -l
-//!      (61 at the E0c-era count; 56 re-counted at WO-RD)
 //!  6   ChannelHub receiver fields                       18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
-//!      (70 and 57 occurrences at E0c — 38 and 37 distinct paths — shrunk
-//!      through WO-M5/M6/M7; ZERO in both directions since WO-M7c)
 //! ```
 //!
-//! Notes:
-//! - Rows 1a/1b are transitional migration scaffolding: WO-E2/WO-E8 drive
-//!   the App-pokes-Gui coupling to 0 via GuiEvent, and these rows and their
-//!   test are DELETED at campaign close — they track migration progress, not
-//!   permanent architecture.
-//! - Row 2's trajectory: WO-E2 Land 2 leaves 3 (the chunk-settings setters);
-//!   WO-E8b reaches 0.
-//! - Row 3 is recorded, not asserted, by user ruling: no count ratchets on
-//!   style metrics ("ratchets for things like this seem super sketchy and
-//!   inappropriate for the rust ecosystem"). The qualitative rule — a cfg
-//!   may select a value, a dependency, or a type alias, never fork behaviour
-//!   inside a fn body — lives in ARCHITECTURE.md and review. constants.rs's
-//!   42 cfg lines moved into the rustdar-device-profile crate at WO-RD —
-//!   exactly the dissolution this note anticipated — still unratcheted.
-//! - Row 4a reaches 0 at WO-E9 (FieldId adoption); the enum itself stays pub
-//!   in rustdar-radar through the campaign.
-//! - **Row 5 is RETIRED at WO-M8c**, which deleted the enum. The trajectory
-//!   ran 762 (E0c) -> 766 (WO-THEME amendment) -> 29 (WO-M8b b3, when
-//!   `fn kind()` left the handler trait) -> **0**, whole tree, prose
-//!   included: rustdar-source's 17 `known`-const provenance comments were
-//!   reworded in the same land, so the command over `.` and the retired
-//!   five-crate walk now agree at zero. A ceiling of zero is an absence
-//!   assertion wearing a number, so the ceiling and its test were deleted
-//!   and replaced by one:
-//!   `rustdar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`,
-//!   which scrapes overlay_state.rs for the declaration AND the bare name,
-//!   behind a presence control on the handler trait. What the enum's closed
-//!   set used to guarantee is now held by rustdar-overlays'
-//!   `registry_identity_tests` (uniqueness, ledger membership, and the
-//!   draw-order weight pin — the last of which is also the anti-swap pin).
-//!   The five-crate walk died with this row; it was row 5's only caller.
-//! - Row 6 is a COUNT ceiling only. The literal shrink-only field-list pin
-//!   LANDS at WO-E3 and is VERIFIED at WO-M13b. WO-E4.9's extract-results
-//!   channel is a RenderOrchestrator-local mpsc, not a hub pair — the hub
-//!   stays at 18 through the campaign.
-//! - Rows 7a/7b reached 0 at WO-M7c (the reply direction joined the codec
-//!   table) and are EXACT-ZERO pins from that land on, prose included: the
-//!   funnel speaks the substrate's erased vocabulary and no source crate's.
+//! Row 3 is recorded, not asserted, by user ruling: no count ratchets on style
+//! metrics. Row 5 (the overlay-kind enum) is retired — the enum is gone, and
+//! `rustdar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`
+//! holds its absence.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -130,7 +43,6 @@ const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
 // ---------------------------------------------------------------------------
 // Needles — split literals so this file never contains what it counts.
-// ---------------------------------------------------------------------------
 
 const SELF_GUI: &str = concat!("self.", "gui.");
 const PUB_FN_SET: &str = concat!("pub fn ", "set_");
@@ -148,35 +60,22 @@ const HUB_ANCHOR: &str = concat!("struct ", "ChannelHub");
 const OFFLOAD_ANCHOR: &str = concat!("pub fn ", "offload_job(");
 const PRODUCT_DEF_ANCHOR: &str = concat!("enum Radar", "Product");
 
-// ---------------------------------------------------------------------------
-// Ceilings — at-land measurements (see the table above). Lower the MAX in
-// the land that earns it; never raise one without a written plan amendment.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Ceilings
+// — at-land measurements (see the table above).
 
-/// Row 1a. Transitional scaffolding: WO-E2/WO-E8 drive it to 0 via GuiEvent;
-/// the metric is deleted at campaign close. Lowered 204 -> 192 at WO-E2
-/// Land 1 (the setter pushes became Gui::apply / the FrameInputs compose).
+/// Row 1a.
 const SELF_GUI_MAX: usize = 192;
-/// Row 1b — the same needle outside test-named paths. 198 -> 186 at WO-E2
-/// Land 1.
+/// Row 1b — the same needle outside test-named paths.
 const SELF_GUI_NON_TEST_MAX: usize = 186;
-/// Row 2. Lowered 23 -> 3 at WO-E2 Land 2 (the chunk-settings setters
-/// remain); WO-E8b reaches 0.
+/// Row 2.
 const UI_SETTER_MAX: usize = 3;
-/// Row 4a. WO-E9 (FieldId adoption) reaches 0.
+/// Row 4a.
 const PRODUCT_IN_EGUI_MAX: usize = 444;
-// Row 5a's KIND_MAX is RETIRED at WO-M8c (762 -> 766 at WO-THEME -> 29 at
-// WO-M8b b3 -> 0, at which point the ceiling became an absence assertion).
-// See the retirement note beside row 6's test.
-/// Row 6. COUNT ceiling only — the shrink-only field-list pin lands at
-/// WO-E3 and is verified at WO-M13b; the hub stays at 18 (WO-E4.9's extract
-/// channel is orchestrator-local, not a hub pair).
+/// Row 6.
 const HUB_RECEIVER_MAX: usize = 18;
 
-// ---------------------------------------------------------------------------
-// Walker + counters (std-only, pure file reads: the coverage job runs this
-// binary, so it stays fast and hermetic).
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Walker +
+// counters (std-only, pure file reads).
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| {
@@ -189,9 +88,8 @@ fn read(path: &Path) -> String {
     })
 }
 
-/// Every `.rs` file under `dir`, recursively, skipping dirs named `target`
-/// or `pkg` (build output — the same set ripgrep ignores here, verified at
-/// land) and this ratchet file itself.
+/// Every `.rs` file under `dir`, recursively, skipping dirs named `target` or `pkg`
+/// (build output — the same set ripgrep ignores here).
 fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let entries = fs::read_dir(dir).unwrap_or_else(|e| {
@@ -240,9 +138,8 @@ fn count(files: &[(PathBuf, String)], needle: &str) -> usize {
     files.iter().map(|(_, t)| t.matches(needle).count()).sum()
 }
 
-/// The positive half of a walked-haystack check: the anchor file must be in
-/// the WALKED set (so a broken walker fails here, not by counting zero) and
-/// must still contain its anchor string.
+/// The positive half of a walked-haystack check: the anchor file must be in the WALKED
+/// set, so a broken walker fails here.
 fn assert_anchored(files: &[(PathBuf, String)], suffix: &str, anchor: &str) {
     let (path, text) = files
         .iter()
@@ -285,11 +182,8 @@ fn in_test_path(path: &Path, crate_root: &Path) -> bool {
 
 // ---------------------------------------------------------------------------
 // The ratchets.
-// ---------------------------------------------------------------------------
 
-/// Row 1 — the App-pokes-Gui coupling (occurrences of the split needle in
-/// rustdar-app). WO-E2/WO-E8 drive it to 0 via GuiEvent; transitional
-/// scaffolding, deleted at campaign close.
+/// Row 1 — the App-pokes-Gui coupling (occurrences of the split needle in rustdar-app).
 #[test]
 fn the_app_pokes_gui_coupling_never_grows() {
     let crate_root = Path::new(ROOT).join("rustdar-app");
@@ -318,10 +212,7 @@ fn the_app_pokes_gui_coupling_never_grows() {
     );
 }
 
-/// Row 2 — setter fns on the Gui shell. WO-E2 Land 2 leaves 3 (the
-/// chunk-settings setters); WO-E8b reaches 0. WO-E1 split ui.rs (the struct
-/// now lives in gui/state.rs) and re-anchored this presence control, in the
-/// same land, on the `impl` block over `Gui` that still hosts every setter.
+/// Row 2 — setter fns on the Gui shell.
 #[test]
 fn the_gui_setter_surface_never_grows() {
     let ui_rs = Path::new(ROOT).join("rustdar-egui/src/ui.rs");
@@ -336,8 +227,6 @@ fn the_gui_setter_surface_never_grows() {
 }
 
 /// Row 4 — occurrences of the product enum's name inside rustdar-egui.
-/// WO-E9 (FieldId adoption) drives this to 0; the enum itself stays pub in
-/// rustdar-radar through the campaign, so its definition anchors the needle.
 #[test]
 fn the_product_enum_never_spreads_further_into_egui() {
     let root = Path::new(ROOT);
@@ -357,17 +246,9 @@ fn the_product_enum_never_spreads_further_into_egui() {
     );
 }
 
-// Row 5 — RETIRED at WO-M8c. The ceiling reached zero when the enum was
-// deleted, and a ceiling that can only be zero is an absence assertion
-// wearing a number. Its successor is
-// `rustdar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`
-// — same subject, stronger claim, and it carries the presence control this
-// one carried.
+// Row 5 — retired; the enum it counted is gone.
 
-/// Row 6 — ChannelHub receiver-field count, ceiling 18. COUNT ceiling only:
-/// the literal shrink-only field-list pin LANDS at WO-E3 and is VERIFIED at
-/// WO-M13b. WO-E4.9's extract-results channel is a RenderOrchestrator-local
-/// mpsc, not a hub pair — the hub stays at 18 through the campaign.
+/// Row 6 — ChannelHub receiver-field count, ceiling 18.
 #[test]
 fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
     let channels_rs = Path::new(ROOT).join("rustdar-app/src/channels.rs");
@@ -383,23 +264,6 @@ fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
 }
 
 /// Row 7 — offload.rs names ZERO source-crate types, in EITHER direction.
-///
-/// The campaign's full-scope terminus (WO-M7c): the request direction went
-/// source-type-free at WO-M7.2 and the reply direction at WO-M7c, so the
-/// funnel speaks `rustdar_source::job`'s erased vocabulary and nothing
-/// else. The baseline this fell from: 70 overlays-path and 57 radar-path
-/// occurrences at E0c (38 and 37 distinct paths — the plan brief's
-/// "38+38"), pre-campaign. An EXACT zero, prose included — a doc comment
-/// that names a source-crate path is a doc comment describing a coupling
-/// this file no longer has.
-///
-/// The presence controls keep the pin non-vacuous both ways: the anchored
-/// read fails if `offload_job` ever leaves the file (the scrape is of the
-/// real funnel, not an empty or renamed file), and the same two needles
-/// must still match in `job_registry.rs` — the one rustdar-worker module
-/// that legitimately names both source crates — so a needle that rotted
-/// would fail there rather than count zero here forever. (Both paths
-/// re-keyed to rustdar-worker at WO-RW; ROOT reaches across crates.)
 #[test]
 fn offload_names_zero_source_crate_types() {
     let offload_rs = Path::new(ROOT).join("rustdar-worker/src/offload.rs");
@@ -418,9 +282,8 @@ fn offload_names_zero_source_crate_types() {
         );
     }
 
-    // Presence control: the needles are alive — the composition module
-    // names both crates by construction, so a rotted needle fails HERE
-    // rather than counting zero above forever.
+    // Presence control: the needles are alive — the composition module names both
+    // crates by construction.
     let registry_rs = Path::new(ROOT).join("rustdar-worker/src/job_registry.rs");
     let registry = read(&registry_rs);
     for (needle, what) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {

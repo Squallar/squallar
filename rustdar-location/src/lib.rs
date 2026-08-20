@@ -1,30 +1,19 @@
 //! The location facade: everything between "where am I" and the operating
-//! system (user-ruled, seam ruling 6 — WO-RL-3/RL-4).
+//! system. The app holds ONE value, [`LocationFacade`].
 //!
-//! The app holds ONE value, [`LocationFacade`] — the permission gate composed
-//! with whichever provider arm the platform shell constructed — and feeds its
-//! frame inputs from it. Default features give the vocabulary and the facade
-//! machinery at exactly the lean dependency set the charter test pins; every
-//! ARM is fenced behind a feature, each pulling only its own target-gated
-//! dependencies:
+//! Default features give the vocabulary and the facade machinery; every arm is
+//! fenced behind a feature, each pulling only its own target-gated dependencies:
 //!
 //! - `os-providers` — the desktop/mobile OS arms (`os_location`): the Linux
-//!   location portal (`ashpd`), Windows `Geolocator`/`AppCapability`
-//!   (`windows`), Apple `CLLocationManager` (`objc2` family).
-//! - `serial` — the NMEA serial reader (`serial`), wrapping
-//!   rustdar-nmea-serial (which parses in its own vocabulary and does not know
-//!   [`Fix`]; the translation lives here). Rides inside the desktop arm.
-//! - `android-provider` — the JNI arm (`android`): permission tri-state,
-//!   LocationHelper polling, initialised once via `android::init`.
-//! - `web-provider` — the browser arm (`web`): Geolocation + Permissions
-//!   APIs (the `web-sys`/`js-sys` family).
-//!
-//! Consumers that only speak the vocabulary (rustdar-egui, rustdar-app)
-//! declare `default-features = false` and no features; the `rustdar` shell
-//! and rustdar-web turn their target's arm on and hand the facade to the app.
+//!   location portal (`ashpd`), Windows `Geolocator`/`AppCapability`, Apple
+//!   `CLLocationManager`.
+//! - `serial` — the NMEA serial reader, wrapping rustdar-nmea-serial. Rides
+//!   inside the desktop arm.
+//! - `android-provider` — the JNI arm (`android`).
+//! - `web-provider` — the browser arm (`web`).
 
 /// The Android JNI arm, feature-fenced (+ host-typecheckable via
-/// `jni-typecheck`, mirroring the shell's own android module story).
+/// `jni-typecheck`).
 #[cfg(any(
     all(target_os = "android", feature = "android-provider"),
     feature = "jni-typecheck"
@@ -37,18 +26,14 @@ mod fix;
 mod gate;
 mod heading;
 mod hint;
-/// The OS location provider arms, feature-fenced. Since WO-RL-4 the shell's
-/// wiring lives here too (`os_location::OsBackend`); the provider seam
-/// types are crate-internal.
+/// The OS location provider arms, feature-fenced.
 #[cfg(feature = "os-providers")]
 pub mod os_location;
 mod permission;
 mod provider;
 #[cfg(feature = "serial")]
 pub mod serial;
-/// The browser arm, feature-fenced; its decision half is plain host-testable
-/// functions, its `web_sys` half exists only on wasm32 (the split the file
-/// was born with in rustdar-web).
+/// The browser arm, feature-fenced; its `web_sys` half exists only on wasm32.
 #[cfg(feature = "web-provider")]
 pub mod web;
 

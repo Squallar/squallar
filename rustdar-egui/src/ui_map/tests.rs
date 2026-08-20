@@ -3,17 +3,6 @@ use rustdar_radar::render::polar::{PolarField, PolarGeometry, Wedge};
 
 /// The committed ground track follows the great circle the cut follows, not
 /// the rhumb line a straight screen segment would draw.
-///
-/// Straight in Web Mercator is *constant bearing*, not shortest path, and the
-/// section is cut along a great circle. On a 229 km line at 41 °N — a
-/// full-range line at the latitude of the northern-tier sites — the two part
-/// by 894 m in the middle, three times the range-ring offset that has a doc
-/// block of its own, and the user is placed to notice it because the track is
-/// drawn over the echo the section was aimed at.
-///
-/// The projector is stubbed with a plain Web Mercator, which is what
-/// `walkers` projects with — the pane's zoom and centre are an affine
-/// transform on top and cannot turn a curve into a line.
 #[test]
 fn a_committed_track_bows_the_way_the_cut_does() {
     // 229 km due east at 41 °N, the orientation where a rhumb line and a
@@ -31,8 +20,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
 
     // Web Mercator on the crate's own sphere, scaled so that one point is one
     // metre of *ground* at this latitude — Mercator's local scale factor is
-    // `1/cos(lat)`, so the `cos` is what makes the assertion below readable
-    // in metres rather than in projected units.
+    // `1/cos(lat)`, so the `cos` makes the assertion below read in metres.
     let scale = rustdar_geo::EARTH_RADIUS_KM * 1000.0 * lat.to_radians().cos();
     let project = |p: rustdar_geo::GeoPoint| {
         let y = (std::f64::consts::FRAC_PI_4 + p.lat.to_radians() / 2.0)
@@ -66,18 +54,6 @@ fn a_committed_track_bows_the_way_the_cut_does() {
 
     // And the *residual* — what is left of that bow between two drawn
     // vertices — is inside the error budget the module already accepts.
-    //
-    // This is the assertion that says what the subdivision is for, and it is
-    // deliberately a **bar rather than a count**. 258 m is where it was set:
-    // the range ring used to sit that far outside the ground the track walked,
-    // because the ring was placed on a 6378 km sphere and the track on 6371,
-    // so a track that beat 258 m was as registered as everything else on the
-    // map. Those are one sphere now and that offset is zero, which makes this
-    // a *legacy* ceiling the track beats by two orders of magnitude rather
-    // than a live budget. It is kept at its old value on purpose: tightening
-    // it to the measurement would pin `SECTION_TRACK_SAMPLES`, and the exact
-    // count is a quality knob above the bar, not a claim — lowering it to 8
-    // would still pass, correctly.
     let sagitta = (0..SECTION_TRACK_SAMPLES)
         .map(|i| {
             let (p, q) = (track[i], track[i + 1]);
@@ -99,7 +75,6 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     );
 }
 
-/// A track with no points paints nothing rather than panicking on `first`.
 #[test]
 fn an_empty_track_paints_nothing() {
     let ctx = egui::Context::default();
@@ -111,13 +86,6 @@ fn an_empty_track_paints_nothing() {
 
 /// The string the status bar shows, for hover points at hand-checkable
 /// offsets from a real site.
-///
-/// The readout had no test of its own while it carried its own copy of the
-/// haversine and forward azimuth. `beam::tests::
-/// the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
-/// pins the two spellings against each other, which is what makes moving to
-/// the shared one provably not a change; this pins what a user reads, so the
-/// next edit to either has something behavioural to fail.
 #[test]
 fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
     // KTLX. One degree due north is Rₑ·(π/180) = 111.19 km at azimuth 0; one
@@ -127,8 +95,6 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
     let prefs = UserPreferences::default();
     let readout = |hover_lat: f64, hover_lon: f64| {
         compute_hover_info_raw(
-            // A source over no picture at all, so nothing is appended and the
-            // assertion is on the geometry alone.
             &HoverSource::empty(),
             &HoverInput {
                 site_lat,
@@ -149,8 +115,6 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
         readout(site_lat, site_lon + 1.0),
         "Lat: 35.3333\u{b0}, Lon: -96.2778\u{b0} | Range: 90.7km, Az: 89.7\u{b0} ",
     );
-    // A site to itself: zero range, and the azimuth is unconstrained rather
-    // than wrong, so only the range half is asserted.
     assert!(
         readout(site_lat, site_lon).contains("Range: 0.0km"),
         "a site is not at zero range from itself: {}",
@@ -159,17 +123,6 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
 }
 
 /// The hover reads the gate the point falls in, on the render's own geometry.
-///
-/// This replaced a test that the readout derived a raster grid's side from its
-/// length. There is no grid and no side any more: the pointer's position stops
-/// being a pixel and becomes an azimuth and a ground range, and the answer
-/// comes from the same wedge-and-gate rule
-/// [`rustdar_radar::render::polar::PolarGeometry::pick`] states once for the
-/// whole workspace.
-///
-/// The fixture gives every gate a different number, so reading the wrong one is
-/// visible in the string rather than aliasing onto the right answer — which is
-/// the same property the 64-wide grid fixture was chosen for.
 #[test]
 fn the_hover_reads_the_gate_the_point_falls_in() {
     let (site_lat, site_lon) = (35.3333, -97.2778);
@@ -196,21 +149,17 @@ fn the_hover_reads_the_gate_the_point_falls_in() {
         )
     };
 
-    // One degree due north of the site is 111.19 km, which is gate 111.
     let north = readout(site_lat + 1.0, site_lon);
     assert!(
         north.ends_with("| Reflectivity: 111.0 dBZ"),
         "one degree north is 111.19 km and so gate 111: {north}",
     );
-    // Half a degree north is 55.6 km — gate 55, not gate 111 scaled by
-    // anything, which is what a rule reading the range at the wrong interval
-    // would give.
+    // Half a degree north is 55.6 km — gate 55, not gate 111 scaled.
     let half = readout(site_lat + 0.5, site_lon);
     assert!(
         half.ends_with("| Reflectivity: 55.0 dBZ"),
         "half a degree north is 55.60 km and so gate 55: {half}",
     );
-    // Two degrees north is 222.4 km, past the last gate this field has.
     let past = readout(site_lat + 2.0, site_lon);
     assert!(
         past.ends_with("\u{b0} "),
@@ -219,16 +168,6 @@ fn the_hover_reads_the_gate_the_point_falls_in() {
 }
 
 /// **A loop frame with no numbers says so, rather than reading as no data.**
-///
-/// The state a looping pane is in for a product the volume behind it cannot
-/// answer for. A blank readout already means "the radar looked here and found
-/// nothing"; letting a frame that kept no values wear that meaning shows the
-/// reader a hole in the weather that is really a hole in the application.
-///
-/// The counterpart claim — that a looping pane of a wire moment reads a real
-/// number — is `rustdar_radar::hover::hover_tests::
-/// a_looping_pane_and_a_still_pane_read_one_point_alike`, which is where a
-/// volume is available to read from.
 #[test]
 fn a_loop_frame_with_no_values_says_so_rather_than_reading_as_no_data() {
     let (site_lat, site_lon) = (35.3333, -97.2778);
@@ -236,7 +175,6 @@ fn a_loop_frame_with_no_values_says_so_rather_than_reading_as_no_data() {
 
     let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, None, 200);
     let mut field = PolarField::from_parts(geometry, vec![7.5; 200]);
-    // What a loop frame carries: the geometry, and no numbers.
     field.strip_values();
     let source = HoverSource::from_volume(field, None);
 
@@ -254,13 +192,11 @@ fn a_loop_frame_with_no_values_says_so_rather_than_reading_as_no_data() {
         )
     };
 
-    // Inside the picture: the gate is there and its number is not.
     let inside = readout(site_lat + 1.0);
     assert!(
         inside.ends_with(NOT_RESIDENT),
         "a frame holding no values must say so: {inside}",
     );
-    // Outside it: nothing was painted, which is the ordinary blank.
     let outside = readout(site_lat + 2.0);
     assert!(
         outside.ends_with("\u{b0} "),
@@ -275,33 +211,6 @@ const WHOLE_COMPASS: Wedge = Wedge {
     half_width_deg: 180.0,
 };
 
-/// **Every digit the status bar shows, pinned.**
-///
-/// The readout is about to stop reading a `side²` raster grid and start reading
-/// the gate the render painted. That is a change of *source*, and the whole
-/// claim being made for it is that a user watching a still pane sees no
-/// difference — so the strings below were captured from the grid
-/// implementation before it was touched, and the same table is asserted against
-/// whatever the readout reads next. If a digit moves, this fails, and the digit
-/// that moved is the finding.
-///
-/// It covers the product formatters rather than the geometry — one position,
-/// seventeen rows — because the geometry half is already pinned by
-/// [`the_hover_readout_reports_range_and_azimuth_from_the_site`] and by
-/// `rustdar_radar::beam::tests::
-/// the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`.
-/// What is not pinned anywhere else is the interaction of the value with the
-/// user's units: velocity in a metric preference still reads in mph, spectrum
-/// width follows the speed unit, hail follows its own, and the distance unit
-/// changes the range half of the same string. Those are the rows that would
-/// move silently.
-///
-/// **What this deliberately does not pin is which gate is read.** No fixture
-/// here goes through a rasterizer, so the value is placed under the pointer by
-/// hand and the assertion is on the formatting alone. That the new source names
-/// the same gate as the old grid is
-/// `rustdar_radar::render::tests::the_polar_field_answers_what_the_value_grid_holds`,
-/// which is where a rasterizer is available to be asked.
 const PINNED_READOUTS: &[(&str, &str)] = &[
     (
         "reflectivity",
@@ -410,7 +319,6 @@ fn pinned_cases() -> Vec<(RadarProduct, UserPreferences, Option<f32>)> {
     ]
 }
 
-/// See [`PINNED_READOUTS`].
 #[test]
 fn the_hover_readouts_digits_do_not_move() {
     const GATES: usize = 200;
@@ -428,9 +336,6 @@ fn the_hover_readouts_digits_do_not_move() {
     );
 
     for ((product, prefs, value), &(label, expected)) in cases.iter().zip(PINNED_READOUTS) {
-        // The value goes in the gate the point actually falls in, found through
-        // the same `pick` the readout will use — so a row with a value is a row
-        // where the readout has one to find, whatever the geometry.
         let geometry = PolarGeometry::from_parts(vec![WHOLE_COMPASS], 0.5, 1.0, None, GATES);
         let mut values = vec![f32::NAN; GATES];
         if let Some(v) = value {

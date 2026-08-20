@@ -1,26 +1,11 @@
 //! What a band is, checked as arithmetic.
-//!
-//! Everything here is over [`BandPlan`], which is deliberately a function of
-//! four integers rather than of a `Band`: the shape that matters is a 217 MB
-//! raster and no unit test should be allocating one to ask how many of its rows
-//! fit in 8 MiB. The two properties a GPU could disagree with — that the copy
-//! lands where the plan says and that the bytes survive the trip — are the
-//! `#[ignore]`d GPU suites' business, not this file's.
 
 use super::*;
 
 /// The widest raster a WSR-88D surveillance cut asks for at this box's ceiling.
-/// See `budget::Budgets::raster_side_for_adapter`.
 const WIDEST: usize = 7362;
 
 /// Every band fits the budget it was sized against.
-///
-/// The whole defect was one upload costing 59 ms of frame thread, so the one
-/// thing that must be true of every plan this makes is that it does not do that
-/// again. Checked across every raster side this build can produce — the web cap,
-/// the two intermediate rungs, the derived widest cut and the desktop ceiling —
-/// and from every row offset a walk through the image reaches, not just from
-/// zero.
 #[test]
 fn no_band_carries_more_than_one_band_of_bytes() {
     for side in [2048usize, 4096, 5561, WIDEST, 8192] {
@@ -41,11 +26,6 @@ fn no_band_carries_more_than_one_band_of_bytes() {
 }
 
 /// Bands tile the image exactly: every row once, in order, none past the end.
-///
-/// A band that overshot would be a copy past the texture's last row, which wgpu
-/// rejects at submission — on the frame thread, in `prepare`, on whichever
-/// raster happened not to divide evenly. 7362 does not divide evenly by any band
-/// this makes, which is why it is in the list rather than only the powers of two.
 #[test]
 fn the_bands_of_a_raster_cover_every_row_exactly_once() {
     for side in [1usize, 2, 255, 2048, 5561, WIDEST, 8192] {
@@ -72,12 +52,6 @@ fn the_bands_of_a_raster_cover_every_row_exactly_once() {
 }
 
 /// A row wider than the whole frame budget still moves, one row at a time.
-///
-/// The liveness arm of [`BandPlan::of`], and the one that cannot be reached by
-/// any raster this build makes — one row at the 8192 ceiling is 32 KB against an
-/// 8 MiB band. It is checked because "no shipped shape reaches it" is a property
-/// of today's ceiling rather than of the arithmetic, and a plan of zero rows
-/// would be requeued unchanged forever.
 #[test]
 fn a_row_too_wide_for_the_budget_still_makes_one_row_of_progress() {
     let side = UPLOAD_BAND_BYTES; // one row is four times the whole band
@@ -95,13 +69,6 @@ fn an_image_with_no_rows_left_has_no_plan() {
 }
 
 /// The staging stride is the copy alignment, and the widest cut really needs it.
-///
-/// `copy_buffer_to_texture` is held to `COPY_BYTES_PER_ROW_ALIGNMENT` where
-/// `write_texture` repacks internally, so the DMA route pads and the fallback
-/// does not. A raster is 4 bytes a texel, so a side divisible by 64 needs no
-/// padding — and **7362 is not**: 29448 bytes a row against a 29696-byte stride.
-/// The one shape the padding exists for is the one shape that matters most, so
-/// this is not a defensive branch that never runs.
 #[test]
 fn the_staging_stride_is_aligned_and_the_widest_cut_is_not() {
     let plan = BandPlan::of(WIDEST, WIDEST as u32, 0).expect("a plan");
@@ -118,9 +85,6 @@ fn the_staging_stride_is_aligned_and_the_widest_cut_is_not() {
 }
 
 /// A ring slot is one band, and the pair is what the module claims it costs.
-///
-/// The number this replaced an un-banded ring to get: two slots of a whole
-/// 7362² raster would be 437 MB of permanently resident pinned host memory.
 #[test]
 fn the_ring_a_band_needs_is_two_slots_of_a_band() {
     let plan = BandPlan::of(WIDEST, WIDEST as u32, 0).expect("a plan");
@@ -135,11 +99,6 @@ fn the_ring_a_band_needs_is_two_slots_of_a_band() {
 }
 
 /// A frame never asks the ring for more slots than it has.
-///
-/// The derivation [`DMA_BANDS_PER_FRAME`] exists for. A slot claimed on a frame
-/// cannot drain before that frame ends, so a budget above the ring's depth buys
-/// declines rather than throughput — measured, at four bands against a ring of
-/// two, as a 6.59 ms worst frame instead of 0.61.
 #[test]
 fn a_frame_never_claims_more_slots_than_the_ring_has() {
     let depth = crate::staging_ring::STAGING_RING_DEPTH;
@@ -152,10 +111,6 @@ fn a_frame_never_claims_more_slots_than_the_ring_has() {
 }
 
 /// A device with no ring spends one band a frame, and one with a ring four.
-///
-/// The two budgets are a **runtime capability**, not a target: the same binary
-/// takes the ringless arm on a WebGL2 device and the ring arm on Vulkan, which
-/// is what keeps this out of the `cfg` cascade the parity rule forbids.
 #[test]
 fn the_frame_budget_follows_the_device_and_not_the_target() {
     let ringless = TextureUploads::without_device();
@@ -165,15 +120,6 @@ fn the_frame_budget_follows_the_device_and_not_the_target() {
 }
 
 /// A raster the app loaded `NEAREST` is bound `NEAREST`.
-///
-/// `update_egui_texture_from_wgpu_texture_with_sampler_options` is the only way
-/// to bind a texture this module owns, and it does not take the
-/// `TextureOptions` egui has — it takes a `wgpu::SamplerDescriptor` this module
-/// builds. So the mapping is restated code, and restated code is code that can
-/// drift. It matters more than a sampler usually does: `upload_section_raster`'s
-/// note spells out that a cross-section's blockiness *is* the data, and a plan
-/// view filtered `LINEAR` would blend gate edges into a gradient that claims
-/// continuous measurement.
 #[test]
 fn the_sampler_says_what_the_texture_options_said() {
     let nearest = sampler_descriptor(egui::TextureOptions::NEAREST);
@@ -202,10 +148,6 @@ fn the_sampler_says_what_the_texture_options_said() {
 }
 
 /// What the widest raster costs a frame, and how many frames it takes.
-///
-/// The claim the module docs make, as arithmetic rather than as prose. Both
-/// halves matter and they pull against each other: fewer frames means more bytes
-/// on each one, and the whole point is that no frame pays for the picture.
 #[test]
 fn the_widest_raster_takes_fourteen_frames_on_a_ring_and_twenty_six_without() {
     for (bands, expected) in [(DMA_BANDS_PER_FRAME, 14u32), (1, 27)] {
@@ -230,17 +172,6 @@ fn the_widest_raster_takes_fourteen_frames_on_a_ring_and_twenty_six_without() {
 }
 
 /// An id this module has never been shown has not been delivered.
-///
-/// The default that two of the three ways a hold ends depend on. A pane stages
-/// its hold on the frame it calls `load_texture`, and egui does not hand the
-/// delta over until `end_pass` — so the very first question a hold asks is about
-/// an id nothing here has seen, and answering it optimistically would swap the
-/// pane onto a texture with no texels in it at all.
-///
-/// It is also the answer that ends a hold after a renderer rebuild: a resumed
-/// session has a fresh `TextureUploads` whose set is empty, so every id from the
-/// dead context answers `false` here — for ever, which is why
-/// `restore_cached_render` lets go of the holds rather than waiting on them.
 #[test]
 fn an_id_that_was_never_filed_has_not_been_delivered() {
     let uploads = TextureUploads::without_device();
@@ -250,12 +181,6 @@ fn an_id_that_was_never_filed_has_not_been_delivered() {
 }
 
 /// A freed id stops being delivered, which is what bounds the set.
-///
-/// `delivered` is a `HashSet` that would otherwise hold one key per texture ever
-/// created — the map tiles alone churn a whole LRU of textures
-/// (`tile_source::TILE_CACHE_ENTRIES`, 256 on desktop) for the life of a
-/// session. `free` is called from `EguiRenderer::free_textures` with exactly the
-/// ids egui retired, so the set tracks the live textures and nothing else.
 #[test]
 fn freeing_an_id_takes_it_back_out_of_the_delivered_set() {
     let mut uploads = TextureUploads::without_device();

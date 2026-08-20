@@ -1,12 +1,6 @@
 //! When a re-render may be dispatched: the settle is a duration, the
 //! mid-gesture band is a platform policy, and the picture judged is the newest
 //! one the cache has — held or shown.
-//!
-//! Everything here drives [`OverlayTextureCache::needs_rerender`] (or its
-//! policy-parameterised body) directly, at the cache level, because the thing
-//! under test is the *decision* and not the frame loop around it. The harness
-//! tests in `input_harness::tests` drive the same decision through real frames
-//! and real repaint scheduling.
 
 use super::*;
 
@@ -98,14 +92,6 @@ fn satisfied_cache(ctx: &egui::Context) -> OverlayTextureCache {
 /// running, inside the settle window, is a coalesced input stream — not
 /// fingers at rest — and dispatches nothing. The same stillness sustained for
 /// [`SETTLE_REPAINT_DELAY`] is fingers at rest, and dispatches once.
-///
-/// The old test was `last_seen_zoom == Some(zoom)`: two frames agreeing. On a
-/// display drawing frames faster than the digitizer samples — 120 Hz, or any
-/// device whose frames have grown longer than the event interval — consecutive
-/// frames read the same `f64` mid-gesture, and each equality was a full-size
-/// raster dispatched into the middle of the gesture. The final stanza is the
-/// positive control: the clock this test holds still really is the clock the
-/// settle fires on.
 #[test]
 fn bit_identical_zoom_across_nearby_frames_is_not_a_settle() {
     let ctx = egui::Context::default();
@@ -150,9 +136,6 @@ fn bit_identical_zoom_across_nearby_frames_is_not_a_settle() {
 
 /// The settle threshold is the constant, not a number near it: still for less
 /// than [`SETTLE_REPAINT_DELAY`] is not settled, still for exactly it is.
-///
-/// Pinned against the constant itself so retuning the delay cannot silently
-/// detach the test from the code.
 #[test]
 fn the_settle_threshold_is_settle_repaint_delay_itself() {
     let ctx = egui::Context::default();
@@ -204,14 +187,6 @@ fn an_unanswered_settle_stays_owed() {
 }
 
 /// The mid-gesture band arm obeys the platform policy; the settle does not.
-///
-/// Both arms of the `cfg` are driven here through the policy parameter — that
-/// is the whole reason `needs_rerender_with_policy` exists — so what the wasm
-/// build *shares* is tested on the host: the band comparison itself, and the
-/// settle recovering the exact texture regardless of policy. What is NOT
-/// tested here, and cannot be from a host test, is `mid_gesture_rerender_
-/// allowed`'s one-line `cfg!` body on the wasm side; its coverage is the
-/// `wasm32` type-check gate plus review, and the host side is pinned below.
 #[test]
 fn the_mid_gesture_band_is_platform_policy_and_the_settle_is_not() {
     let ctx = egui::Context::default();
@@ -288,13 +263,6 @@ fn the_band_policy_keys_on_the_wasm_target() {
 
 /// A held picture is a dispatch already answered: while it satisfies the gate,
 /// nothing dispatches again — and the predecessor stays on screen.
-///
-/// The dispatch-storm control. Without judging the hold, the sequence is:
-/// result lands, is held, the on-screen texture still reads stale, the pane
-/// dispatches again, the fresh result supersedes the hold and **restarts its
-/// bands** — every frame, forever, with the upload never completing. The first
-/// stanza proves the on-screen picture alone *would* re-dispatch, so the
-/// `false` after the hold is the hold's doing and not the fixture's.
 #[test]
 fn a_fresh_hold_is_a_dispatch_already_answered() {
     let ctx = egui::Context::default();

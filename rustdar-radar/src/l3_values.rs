@@ -1,12 +1,4 @@
 //! Level III data-level codecs.
-//!
-//! The decode direction is what [`crate::render`] has always done to draw a
-//! Level III product: PDB thresholds (legacy 4-bit and Digital VIL's NEXRAD
-//! float16 hybrid) or a linear scale/offset turn gate levels into physical
-//! values. The encode direction is new: the validation harnesses
-//! ([`crate::twin`]) need to push a *derived* physical value back through the
-//! product's own encoding to compare in data levels, so every decoding here
-//! has its inverse alongside.
 
 use crate::types::RadarProduct;
 use nexrad_level3::model::ProductDescriptionBlock;
@@ -157,9 +149,6 @@ pub(crate) fn l3_physical_value(
 /// The inverse of a LUT decoding: the level whose physical value sits nearest
 /// `value_phys`, ties to the lower level. `NaN` — undefined, and the LUT's own
 /// `NaN` levels (below threshold, range folded, reserved) — encodes as 0.
-///
-/// A strictly monotone LUT makes decode → encode the identity on every defined
-/// level, which is what the round-trip tests below pin.
 pub(crate) fn quantize_via_lut(value_phys: f32, lut: &[f32]) -> u8 {
     if value_phys.is_nan() {
         return 0;
@@ -317,7 +306,6 @@ mod tests {
     }
 
     /// The inverse the DVL harness will lean on: every displayable level
-    /// survives decode → encode exactly.
     #[test]
     fn every_vil_level_round_trips_through_the_lut() {
         let lut = build_vil_lut(&pdb(134, dvl_thresholds())).expect("134 is DVL");

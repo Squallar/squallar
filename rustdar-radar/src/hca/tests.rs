@@ -115,13 +115,6 @@ fn hsda_far() -> HsdaHeights {
     }
 }
 
-// ── Transcription pins: one test per class's membership table ─────────
-//
-// Each row is asserted separately so a wrong transcription localizes to
-// the class × variable table it sits in. The expected numbers are read
-// off `cpc104/lib006/hca.alg` (`mem*` / `memFlag*`), never off this
-// module's own constants.
-
 fn assert_table(class: &str, table: &MemTable, rows: [[f64; 4]; 6], flags: [[MemFlag; 4]; 6]) {
     const VARS: [&str; 6] = ["SMZ", "ZDR", "LKDP", "RHO", "SDZ", "SDP"];
     for (i, var) in VARS.iter().enumerate() {
@@ -320,13 +313,6 @@ fn mem_table_gr_matches_hca_alg() {
 /// lines 291, 298, 305, 312, 319 and 326, quoted **verbatim** — including
 /// the source's own erratic spacing, which is left alone so the lines can be
 /// diffed against the file character for character.
-///
-/// Quoted rather than transposed by hand because the hand transposition is
-/// what went wrong: `WEIGHT`'s DS row carried Park et al. (2009)'s ρhv
-/// weight of 0.6 where `weight_RHOhv`'s ninth entry says 1.0, and the test
-/// that was supposed to catch it restated the same 0.6 in the same layout
-/// and therefore only asserted that our array equalled our array. See
-/// [`weights_match_the_alg_arrays`].
 const HCA_ALG_WEIGHT_ARRAYS: [(&str, &str); 6] = [
     (
         "weight_Z",
@@ -356,18 +342,9 @@ const HCA_ALG_WEIGHT_ARRAYS: [(&str, &str); 6] = [
 
 /// The weight matrix, derived from `hca.alg`'s own text rather than compared
 /// against a restatement of itself.
-///
-/// The `.alg` arrays are per-input, fourteen entries long, in `hca.h`'s class
-/// order `U0 U1 RA HR RH BD BI GC DS WS IC GR UK NE`. [`WEIGHT`] is the
-/// transpose, ten rows of six, with the four never-scoring classes dropped.
-/// This test does that transposition **here**, mechanically, from the quoted
-/// lines — so a wrong value, a wrong class order, a transposed pair of
-/// classes, or a silently non-zero U0/U1/UK/NE all fail, and none of them can
-/// be hidden by writing the same mistake twice.
 #[test]
 fn weights_match_the_alg_arrays() {
     /// The `.alg` class order. The four that never score are named so the
-    /// assertion below can insist they really are zero.
     const ALG_CLASS_ORDER: [&str; 14] = [
         "U0", "U1", "RA", "HR", "RH", "BD", "BI", "GC", "DS", "WS", "IC", "GR", "UK", "NE",
     ];
@@ -419,8 +396,6 @@ fn weights_match_the_alg_arrays() {
         }
     }
 
-    // The one that was wrong, called out by name so a regression reads as
-    // itself rather than as an index mismatch.
     assert_eq!(
         WEIGHT[DS - RA][RHO],
         1.0,
@@ -439,7 +414,6 @@ fn equation_coefficients_match_hca_alg() {
     assert_eq!(G2_COEF, (0.5, -22.0));
 }
 
-/// The hard thresholds and selection gates, against `hca.alg`.
 #[test]
 #[allow(clippy::assertions_on_constants)] // the pin IS a constant assert
 fn hard_thresholds_match_hca_alg() {
@@ -511,10 +485,6 @@ fn class_codes_match_the_products_convention() {
     assert_eq!(CLASS_EXTERNAL[NE], 0.0, "no echo encodes as undefined");
 }
 
-// ── Membership machinery ───────────────────────────────────────────────
-
-/// The trapezoid: plateau, both shoulders, both edges, and the
-/// non-monotonic guard.
 #[test]
 fn degree_membership_is_the_documented_trapezoid() {
     let p = [0.0, 1.0, 3.0, 5.0];
@@ -699,8 +669,6 @@ fn beam_ml_intersection_matches_the_hand_computation() {
     assert_eq!(bins.tt, 860);
 }
 
-/// The melting-layer zones gate the allowed classes exactly as
-/// `Hca_allowedHydroClass` lists them.
 #[test]
 fn allowed_classes_follow_the_melting_layer_zones() {
     let ml = MlBins {
@@ -769,7 +737,6 @@ fn break_tie_follows_the_zone_priority_lists() {
     assert_eq!(break_tie(450, ml, DS, RA), DS);
 }
 
-/// Each hard threshold kills exactly its class.
 #[test]
 fn hard_thresholds_invalidate_the_documented_classes() {
     let ml = MlBins {
@@ -818,13 +785,6 @@ fn hard_thresholds_invalidate_the_documented_classes() {
         "Z over 35 kills BI everywhere with atten_control off",
     );
 }
-
-// ── Per-class synthetic classification ─────────────────────────────────
-//
-// Each class at its membership plateau must win, and pushing any one
-// variable past the trapezoid's edges must zero that variable's
-// membership (the edge behaviour is pinned through the class's own
-// table so a failure localizes).
 
 /// A `Fields` fixture for direct gate classification.
 #[allow(clippy::too_many_arguments)]
@@ -964,9 +924,6 @@ fn plateau_inputs_classify_each_class() {
     }
 }
 
-/// Every class × variable trapezoid reads 1 at its plateau centre and
-/// 0 at and beyond both edges — the edge sweep the plateau test above
-/// leans on, pinned per table so a wrong row localizes.
 #[test]
 fn each_membership_row_peaks_on_its_plateau_and_dies_at_the_edges() {
     // A mid-range Z keeps every 2-D row monotonic.
@@ -988,7 +945,6 @@ fn each_membership_row_peaks_on_its_plateau_and_dies_at_the_edges() {
     }
 }
 
-/// Low SNR is no-echo; a hopeless gate (nothing scores) is unknown.
 #[test]
 fn low_snr_is_ne_and_hopeless_gates_are_unknown() {
     let f = fields_one_gate(30.0, 1.0, 0.99, NO_DATA, 60.0, 1.0, 5.0, NO_DATA, 3.0);
@@ -1001,11 +957,6 @@ fn low_snr_is_ne_and_hopeless_gates_are_unknown() {
     assert_eq!(classify_gate(&f, 0, BELOW, 100.0), UK);
 }
 
-// ── End-to-end synthetics through compute_hca ──────────────────────────
-
-/// A clean rain field below the melting layer: interior gates read RA
-/// (code 60) end to end, on a super-res sweep whose half-degree pairs
-/// recombine to 1° first.
 #[test]
 fn a_rain_field_below_the_layer_classifies_ra_end_to_end() {
     let z = |_: usize| G::V(30.0);
@@ -1038,8 +989,6 @@ fn a_rain_field_below_the_layer_classifies_ra_end_to_end() {
     }
 }
 
-/// The same field pushed above the melting layer reads dry snow — the
-/// height gating flips the class with identical moments.
 #[test]
 fn the_melting_layer_flips_rain_to_dry_snow_above_the_top() {
     let z = |_: usize| G::V(25.0);
@@ -1085,8 +1034,6 @@ fn the_melting_layer_flips_rain_to_dry_snow_above_the_top() {
     );
 }
 
-/// Gates with no reflectivity are no-echo and decode as undefined; the
-/// polar grid mirrors the twin comparator's resampling.
 #[test]
 fn missing_reflectivity_is_no_echo_and_the_grid_is_undefined_there() {
     let z = |i: usize| if i < 100 { G::V(30.0) } else { G::Nd };
@@ -1126,8 +1073,6 @@ fn missing_reflectivity_is_no_echo_and_the_grid_is_undefined_there() {
     assert!(grid[0][50].is_nan(), "the NE stretch stays undefined");
 }
 
-/// Without the calibration constant the SNR gate cannot run and every
-/// gate is no-echo — the documented failure mode, not a panic.
 #[test]
 fn without_dbz0_everything_is_no_echo() {
     let z = |_: usize| G::V(30.0);
@@ -1146,8 +1091,6 @@ fn without_dbz0_everything_is_no_echo() {
     assert!(derived.values[0].iter().all(|v| v.is_nan()));
 }
 
-/// The split-cut merge grafts the Doppler cut's velocity onto the
-/// surveillance radials by azimuth — the RPG's combined base data.
 #[test]
 fn merge_split_cut_doppler_grafts_velocity_by_azimuth() {
     let z = |_: usize| G::V(30.0);
@@ -1211,8 +1154,6 @@ fn merge_split_cut_doppler_grafts_velocity_by_azimuth() {
     assert!(merged.iter().all(|r| r.velocity().is_some()));
 }
 
-// ── Melting layer construction and detection ───────────────────────────
-
 /// The default layer from the environmental 0 °C height: km MSL in,
 /// km ARL out, 0.5 km deep, floored at ground.
 #[test]
@@ -1274,8 +1215,6 @@ fn the_percentile_read_off_matches_the_hand_computation() {
     );
 }
 
-/// Azimuth gaps interpolate between the valid neighbours around the
-/// circle.
 #[test]
 fn melting_layer_gaps_interpolate_between_valid_azimuths() {
     let mut weight = vec![[0.0f64; ML_MAX_HEIGHTS]; 360];
@@ -1359,9 +1298,6 @@ fn wet_snow_ring_sweep(elev: f64) -> Vec<Radial> {
         .collect()
 }
 
-/// The full MLDA on synthetic 4°–10° sweeps: a wet-snow ring, rain below it,
-/// dry snow above it. Three tilts accumulate past the 1500 floor and the
-/// detected layer lands on the ring.
 #[test]
 fn detect_melting_layer_finds_the_wet_snow_ring() {
     let sweeps: Vec<Vec<Radial>> = [4.5, 5.5, 6.5]
@@ -1396,37 +1332,6 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
 }
 
 /// **Both of this module's radial fan-outs land on the answer one thread
-/// lands on, bit for bit.**
-///
-/// [`compute_hca`] maps each radial to a row and keeps `combined`'s order, so
-/// there is nothing to reassociate; [`detect_melting_layer`] maps each radial to
-/// the heights it votes for and then *adds the votes serially*, because `weight`
-/// is a float accumulator several radials of a sweep write to.
-///
-/// Be precise about how much that last one currently buys: `elev_weight` is
-/// bound once per sweep, outside the radial loop, so every addend into a given
-/// `weight[az][h]` within a sweep is the identical `1.0 + elev_weight`, and
-/// summing identical values is permutation-invariant. Order cannot move a bit
-/// today. The serial replay is kept because it costs nothing and becomes
-/// load-bearing the moment `elev_weight` varies per radial — not because a
-/// reassociation hazard exists right now.
-///
-/// Turning either into a parallel reduction would still pass every other test
-/// in this module — they assert ranges and classes, and a last-bit difference in
-/// an accumulator is invisible to all of them — so this compares the exact bits
-/// against a one-thread pool and against repeat runs.
-///
-/// Know what that catches and what it does not. A one-thread pool runs this
-/// same map-collect-replay code, so it can observe a genuine race and nothing
-/// about the restructure: reversing the replay order passes here. What pins the
-/// order is the pre-existing behavioural suite —
-/// `a_rain_field_below_the_layer_classifies_ra_end_to_end` and its
-/// neighbours. `voxel/tests.rs` needed a
-/// restated serial loop for exactly this reason; the difference is that there
-/// the serial loop is *gone*, whereas here `combined`'s order is still the
-/// thing the surrounding tests assert against.
-// See the note in `voxel/tests.rs`: named rather than module-gated, so the rest
-// of this module keeps being type-checked for wasm32.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn the_pool_classifies_a_volume_the_way_one_thread_does() {
@@ -1439,7 +1344,6 @@ fn the_pool_classifies_a_volume_the_way_one_thread_does() {
         .build()
         .expect("a one-thread pool");
 
-    // ── One tilt through the per-radial classification ──────────────────
     let tilt = wet_snow_ring_sweep(4.5);
     let ml = MeltingLayer::flat(2.75);
     let classify = || compute_hca(&tilt, &params(), &ml, &hsda_far(), None).expect("computes");
@@ -1467,7 +1371,6 @@ fn the_pool_classifies_a_volume_the_way_one_thread_does() {
         }
     }
 
-    // ── Three tilts through the melting-layer accumulator ───────────────
     let sweeps: Vec<Vec<Radial>> = [4.5, 5.5, 6.5]
         .iter()
         .map(|&e| wet_snow_ring_sweep(e))
@@ -1506,8 +1409,6 @@ fn the_pool_classifies_a_volume_the_way_one_thread_does() {
         }
     }
 }
-
-// ── Hail size discrimination (HailSize.cpp v3) ─────────────────────────
 
 /// A `Fields` fixture of `n` identical gates for the HSDA.
 fn fields_n(n: usize, smz: f64, zdr: f64, rho: f64) -> Fields {
@@ -1552,8 +1453,6 @@ fn hsda_subclasses_a_giant_hail_core() {
     assert_eq!(external_code(RA, HailSize::NotHail), 60.0);
 }
 
-/// ZDR at or above 2 dB is never large or giant hail — the hard limit
-/// forces small regardless of the aggregation.
 #[test]
 fn hsda_zdr_hard_limit_forces_small() {
     let f = fields_n(4, 65.0, 2.5, 0.90);
@@ -1562,8 +1461,6 @@ fn hsda_zdr_hard_limit_forces_small() {
     assert_eq!(sub, vec![HailSize::Small; 4]);
 }
 
-/// A weak aggregation (nothing reaches 0.6) leaves the gate at RH, and
-/// non-RH gates are never touched.
 #[test]
 fn hsda_leaves_weak_gates_and_other_classes_alone() {
     // 46 dBZ with ZDR 1.9: the small-hail ZDR trapezoid tops out below
@@ -1577,8 +1474,6 @@ fn hsda_leaves_weak_gates_and_other_classes_alone() {
     );
 }
 
-/// A single giant gate inside a large-hail run despeckles down to
-/// large (`min_data_size = 2`).
 #[test]
 fn hsda_despeckles_single_gate_giant_runs() {
     // Large-hail pattern in regime 5: Z 57, ZDR 0, ρ 0.94 — the giant
@@ -1599,9 +1494,6 @@ fn hsda_despeckles_single_gate_giant_runs() {
     );
 }
 
-/// The height regimes move the verdict: the same moments that read
-/// giant near the surface read differently above the wet-bulb zero,
-/// where the dry-hail trapezoids apply.
 #[test]
 fn hsda_regimes_follow_the_wet_bulb_heights() {
     // ZDR 0.4 / ρ 0.97 at 60 dBZ: below tw0−3 the giant ZDR plateau
@@ -1625,8 +1517,6 @@ fn hsda_regimes_follow_the_wet_bulb_heights() {
     assert_eq!(high, vec![HailSize::Small; 2]);
 }
 
-// ── The RPG's own melting layer, from product 166 ───────────────────────
-
 mod melting_layer_product {
     use super::*;
     use nexrad_level3::model::{
@@ -1638,11 +1528,6 @@ mod melting_layer_product {
     /// degrees, each ring a closed circle of the given radius in **screen
     /// units** (1/4 km), preceded by its Set Colour Level packet as the RPG
     /// writes them.
-    ///
-    /// Circles rather than the real product's slightly wobbly rings because
-    /// a circle's radius is known exactly at every azimuth, which is what
-    /// makes the recovered height checkable against the beam-height model by
-    /// hand.
     pub(super) fn product_166(elevation_tenths: i16, rings: &[i16]) -> Level3Message {
         let mut packets = Vec::new();
         for (level, &radius) in rings.iter().enumerate() {
@@ -1710,11 +1595,6 @@ mod melting_layer_product {
     /// `bottom_km` ARL really produces at `el_deg`: the top crossed by the
     /// beam's lower edge and by its centre, and the bottom crossed by its
     /// centre and its upper edge.
-    ///
-    /// Built through `ml_range_from_height` — `Compute_range_from_height`,
-    /// the RPG's own inverse — so the rings are where the algorithm would
-    /// have drawn them and the test measures the recovery rather than a
-    /// pair of numbers chosen to match it.
     pub(super) fn layer_at(el_deg: f64, top_km: f64, bottom_km: f64) -> Level3Message {
         let units = |h: f64, e: f64| (ml_range_from_height(e, h) * 4.0).round() as i16;
         let half_bw = BEAM_WIDTH_DEG / 2.0;
@@ -1729,10 +1609,6 @@ mod melting_layer_product {
         )
     }
 
-    /// The two beam-centre rings invert to the heights that drew them, and
-    /// the two edge rings — which the recovery never reads as input — agree
-    /// with them.
-    ///
     /// Ring order is by radius, widest first: top-at-lower-edge,
     /// top-at-centre, bottom-at-centre, bottom-at-upper-edge.
     #[test]
@@ -1770,10 +1646,6 @@ mod melting_layer_product {
         assert!(recovery.looks_sound());
     }
 
-    /// The recovery reads the product's own elevation, so the same layer
-    /// drawn from a higher cut — different rings entirely — comes back the
-    /// same. This is what would break first if the elevation were assumed
-    /// rather than read.
     #[test]
     fn the_same_layer_recovers_from_a_different_cut() {
         let low =
@@ -1790,9 +1662,6 @@ mod melting_layer_product {
         }
     }
 
-    /// The rings arrive in whatever order the product wrote them; the
-    /// recovery ranks them by radius, so shuffling the packets must not
-    /// change the answer.
     #[test]
     fn ring_order_in_the_product_does_not_matter() {
         let straight =
@@ -1807,9 +1676,6 @@ mod melting_layer_product {
 
     /// A layer at or below the radar draws collapsed rings. That is the real
     /// winter answer — it is what KOKX, KATX and KBUF publish — and it must
-    /// come back as a layer at ground, accepted, not refused for having no
-    /// depth. Refusing it would throw away the whole fix at exactly the three
-    /// sites the fix is for.
     #[test]
     fn a_layer_on_the_ground_is_recovered_and_accepted() {
         let recovery = MeltingLayer::from_melting_layer_product(&product_166(5, &[8, 6, 0, 0]))
@@ -1830,9 +1696,7 @@ mod melting_layer_product {
         );
     }
 
-    /// Fewer than four contours is not a partial layer, it is no layer: a
-    /// classification that is right on some azimuths and kilometres wrong on
-    /// the rest is the failure this path exists to remove.
+/// Fewer than four contours is not a partial layer, it is no layer.
     #[test]
     fn a_product_short_of_four_contours_is_refused() {
         assert!(MeltingLayer::from_melting_layer_product(&product_166(5, &[604, 531])).is_none());
@@ -1842,8 +1706,7 @@ mod melting_layer_product {
     }
 
     /// An elevation of zero (or a nonsense one) makes the inversion
-    /// meaningless — the beam-height model degenerates — so it is refused
-    /// rather than quietly producing a layer.
+/// meaningless — the beam-height model degenerates — so it is refused.
     #[test]
     fn an_unusable_elevation_is_refused() {
         assert!(
@@ -1858,7 +1721,6 @@ mod melting_layer_product {
 
     /// Rings whose implied layer is nowhere near the algorithm's 0.5 km are
     /// not silently used. [`MeltingLayerRecovery::looks_sound`] is what
-    /// [`resolve_melting_layer`] consults before accepting a recovery.
     #[test]
     fn an_implausible_depth_fails_the_soundness_check() {
         let recovery =
@@ -1867,9 +1729,6 @@ mod melting_layer_product {
         assert!(!recovery.looks_sound());
     }
 
-    /// Rings that do not belong to one layer at all — the two routes to the
-    /// top land 2 km apart — fail the consistency check even though their
-    /// depth happens to look ordinary.
     #[test]
     fn rings_that_disagree_with_each_other_fail_the_soundness_check() {
         let mut incoherent = layer_at(0.5, 2.8, 2.3);
@@ -1900,8 +1759,6 @@ mod melting_layer_product {
     }
 }
 
-// ── The fallback chain, and what it says it did ─────────────────────────
-
 /// Every constructor records where its heights came from, because a
 /// consumer that cannot tell a measured layer from an assumed one cannot
 /// tell a 96 % classification from a 16 % one.
@@ -1931,9 +1788,6 @@ fn every_melting_layer_names_its_own_source() {
     assert!(MeltingLayerSource::Sounding < MeltingLayerSource::FleetDefault);
 }
 
-/// The chain with no sweeps to detect from: the RPG's layer when there is
-/// one, the sounding's flat layer when there is not, and the fleet default
-/// only when nothing else answered — each saying which it was.
 #[test]
 fn the_chain_falls_through_in_order_and_says_where_it_stopped() {
     let params = KdpParams {

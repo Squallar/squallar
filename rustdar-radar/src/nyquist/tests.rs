@@ -1,9 +1,5 @@
 use super::*;
 
-/// A number that arrives twice — once per radial of the same cut — must not
-/// depend on which radial the walk reached last. `declare` is first-wins, and
-/// this is the property that makes a partial walk of a sweep as good as a
-/// whole one.
 #[test]
 fn the_first_statement_of_a_cut_wins() {
     let mut table = DeclaredNyquist::empty();
@@ -12,11 +8,6 @@ fn the_first_statement_of_a_cut_wins() {
     assert_eq!(table.get(3), Some(26.42));
 }
 
-/// Two cuts under one elevation number is the one shape first-wins answers
-/// wrongly, and the answer is indistinguishable from a right one at every
-/// reader. So it is *recorded* — the value still stands, because no data
-/// justifies a rule for choosing between two waveforms, but the volume can no
-/// longer claim the number went unquestioned.
 #[test]
 fn a_second_disagreeing_declaration_is_recorded_against_its_cut() {
     let mut table = DeclaredNyquist::empty();
@@ -31,9 +22,6 @@ fn a_second_disagreeing_declaration_is_recorded_against_its_cut() {
     assert_eq!(table.contradicted().collect::<Vec<_>>(), vec![1]);
 }
 
-/// The ordinary case must stay quiet. Every radial of a cut declares the same
-/// number and the archive walk offers all 360 of them, so a repeat that agrees
-/// is the shape of a working volume, not of a broken one.
 #[test]
 fn a_repeated_agreeing_declaration_is_not_a_contradiction() {
     let mut table = DeclaredNyquist::empty();
@@ -43,10 +31,6 @@ fn a_repeated_agreeing_declaration_is_not_a_contradiction() {
     assert_eq!(table.contradicted().count(), 0, "{table:?}");
 }
 
-/// A merged volume inherits the doubt as well as the numbers. `resolve` serves
-/// each cut from whichever of the two volumes sealed it last, so a
-/// contradiction in either is a contradiction behind a value the merged table
-/// hands out.
 #[test]
 fn a_merge_carries_the_contradictions_of_both_volumes() {
     let mut base = DeclaredNyquist::empty();
@@ -59,10 +43,6 @@ fn a_merge_carries_the_contradictions_of_both_volumes() {
     assert_eq!(base.contradicted().collect::<Vec<_>>(), vec![1, 2]);
 }
 
-/// A non-finite declaration is dropped rather than stored. Stored, it would
-/// reach the guard as a comparison that is false in both directions — a guard
-/// that is off while looking armed — which is strictly worse than the absence
-/// that makes the sampler estimate.
 #[test]
 fn a_non_finite_declaration_is_refused_rather_than_stored() {
     let mut table = DeclaredNyquist::empty();
@@ -71,20 +51,14 @@ fn a_non_finite_declaration_is_refused_rather_than_stored() {
     assert!(table.is_empty(), "{table:?}");
 }
 
-/// **A zero leaves its cut unnamed.** The live case, not a defensive one:
-/// across 22 TDWR volumes from 10 sites over three days, every cut of every
-/// volume declares `nyquist_velocity = 0`, so this is the arm a TDWR takes on
-/// every radial it has.
-///
-/// Unnamed rather than stored, because `Vny = λ·PRF/4` and no cut that emitted
-/// a radial was flown at no PRF: zero is the wire spelling *not populated*, and
-/// the honest table for a TDWR is the empty one that makes every reader
-/// estimate. Stored, it reached the velocity legend — which floors nothing —
-/// as the caption `folds ±0`.
+/// A zero leaves its cut unnamed: across 22 TDWR volumes from 10 sites over
+/// three days, every cut of every volume declares `nyquist_velocity = 0`.
+/// Unnamed rather than stored, because `Vny = λ·PRF/4` and no cut that
+/// emitted a radial was flown at no PRF: zero is the wire spelling *not
+/// populated*.
 #[test]
 fn a_zero_declaration_leaves_its_cut_unnamed() {
     let mut table = DeclaredNyquist::empty();
-    // Every cut of a 16-cut TDWR volume, as `declare_from_message` offers them.
     for elevation_number in 1..=16 {
         table.declare(elevation_number, 0.0);
     }
@@ -99,9 +73,6 @@ fn a_zero_declaration_leaves_its_cut_unnamed() {
         "a zero is an absence, not two cuts disagreeing under one key",
     );
 
-    // A cut that already holds a real number is not unnamed by a later zero
-    // either, on the same footing as any other second statement: the zero is
-    // refused before first-wins is consulted, so it is not a contradiction.
     let mut mixed = DeclaredNyquist::empty();
     mixed.declare(2, 23.84);
     mixed.declare(2, 0.0);
@@ -109,10 +80,6 @@ fn a_zero_declaration_leaves_its_cut_unnamed() {
     assert_eq!(mixed.contradicted().count(), 0, "{mixed:?}");
 }
 
-/// A negative declaration cannot come off the wire — the field is a `u16` of
-/// hundredths — but it can come off [`FromIterator`], which is public. It is
-/// refused on the same test as the zero, so the table's invariant holds
-/// whichever door a value arrives through, `set`'s included.
 #[test]
 fn a_negative_declaration_is_refused_at_every_door() {
     let collected: DeclaredNyquist = [(1, -23.84), (2, 23.84)].into_iter().collect();
@@ -130,9 +97,6 @@ fn a_negative_declaration_is_refused_at_every_door() {
     assert_eq!(base.get(4), None);
 }
 
-/// The merge direction the current merged volume needs: the in-flight
-/// overlay's statement replaces the complete base's for a cut it has resealed,
-/// and cuts it has not reached keep the base's.
 #[test]
 fn an_overlay_replaces_only_the_cuts_it_names() {
     let mut base: DeclaredNyquist = [(1, 11.0), (2, 12.0), (3, 13.0)].into_iter().collect();
@@ -144,9 +108,6 @@ fn an_overlay_replaces_only_the_cuts_it_names() {
     assert_eq!(base.len(), 3);
 }
 
-/// A bare `Scan` converts into a volume that declares nothing, which is what
-/// keeps every caller holding only model types from having to spell an empty
-/// table at the call site.
 #[test]
 fn a_bare_scan_becomes_a_volume_that_declares_nothing() {
     let scan = Scan::new(

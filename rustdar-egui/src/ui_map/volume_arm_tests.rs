@@ -49,10 +49,6 @@ fn camera_of(h: &mut InputHarness, idx: usize) -> crate::pane::OrbitCamera {
 
 /// A 3D pane with a painter and a volume pushes a callback rather than an
 /// empty state.
-///
-/// The baseline the rest of this suite is measured against: every other test
-/// here asserts that some condition *stops* this happening, and would pass
-/// vacuously if the happy path never worked.
 #[test]
 fn a_volume_pane_with_a_painter_pushes_a_callback() {
     let (h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -107,10 +103,6 @@ fn losing_the_graphics_state_stops_the_pane_drawing() {
 
 /// A pane on a site with no volume at all says the first download is in
 /// flight, naming the site.
-///
-/// This is the cold-start state — a site switch fires the archive fetch
-/// immediately, so "downloading" is the truth — and the only state left in
-/// which a 3D pane waits at all.
 #[test]
 fn a_volume_pane_with_no_scan_names_the_site_it_is_waiting_for() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -136,15 +128,6 @@ fn a_volume_pane_with_no_scan_names_the_site_it_is_waiting_for() {
 
 /// **The pane builds only from the published stamp, never from the plan
 /// view's `scan_info`.**
-///
-/// The pane has a `scan_info` — the plan view beside it is drawing a
-/// perfectly good volume — and no published current-volume stamp. The pane
-/// must wait rather than build, because the stamp is the App's statement
-/// that it holds a volume worth building and the App has made none.
-///
-/// The mutation this closes is the obvious simplification: keying the
-/// target off `pane.scan_info`, which is what the code did long ago and
-/// which makes every other volume test pass.
 #[test]
 fn a_pane_with_no_published_stamp_does_not_build_from_the_plan_views_scan() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -189,16 +172,6 @@ fn a_pane_with_no_published_stamp_does_not_build_from_the_plan_views_scan() {
 
 /// **While it follows live**, the pane names the published stamp, not the
 /// plan view's own time.
-///
-/// The two differ constantly: `scan_info.timestamp` is the volume's start
-/// and freezes for the whole flight, while the stamp advances on every
-/// sealed sweep. A target built from the wrong one would ask the host for
-/// a volume it does not have.
-///
-/// The pane here is live, which is the whole scope of this rule — the
-/// other half is [`a_pane_taken_off_live_names_the_volume_it_is_showing`],
-/// and reading the stamp unconditionally is what made the timeline inert
-/// over a 3D pane.
 #[test]
 fn the_target_names_the_published_stamp_rather_than_the_displayed_time() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -234,22 +207,6 @@ fn the_target_names_the_published_stamp_rather_than_the_displayed_time() {
 }
 
 /// **A pane taken off live names the volume it is showing.**
-///
-/// The report this was written from: "changing time in the time bar does
-/// not change the 3d viewer render at all". The published current-volume
-/// stamp is per **site** and describes what the App holds *now*, so it
-/// cannot express "this pane is looking at 18:05"; a 3D pane that read it
-/// unconditionally went on naming the live volume through every scrub,
-/// never changed its target, and so never asked for a rebuild. The plan
-/// view and the cross-section beside it both moved, because both are keyed
-/// on the pane's own `scan_info.timestamp`.
-///
-/// Staged through the two setters the host really uses — `handle_navigate_time`
-/// applies `ViewingLiveForPane { live: false }` and the scan drain applies
-/// `ScanInfoForSite` with the volume that came back. The published
-/// stamp is deliberately left where it was: on a chunk-fed site the feed
-/// goes on sealing sweeps and the stamp never moves backwards at all,
-/// which is the state the report came from.
 #[test]
 fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -279,12 +236,6 @@ fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
     );
 
     // The scrub. Half an hour back, which is several volumes.
-    //
-    // Every pane on the site, because that is what a navigation does: the
-    // scan drain's `ScanInfoForSite` event writes the site's panes and
-    // `propagate_layer_sync` converges `viewing_live` across the time-linked
-    // group. Writing pane 1 alone would be undone by that pass before the
-    // frame drew, which is not a state production can be in.
     let scrubbed = live - chrono::Duration::minutes(30);
     for idx in 0..2 {
         h.gui_mut()
@@ -326,13 +277,6 @@ fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
 }
 
 /// **The Volume Alpha curve rides the frame, and only when one exists.**
-///
-/// Both halves are load-bearing. An untouched editor must send `None` —
-/// that is the painter's licence to upload the grid's own LUT bit-exactly,
-/// and a frame that carried a synthesised default curve instead would take
-/// that licence away for every user who never opened the editor. An edited
-/// product must send exactly the stored curve, keyed by the *pane's*
-/// product — the storm answering the drag is this one field arriving.
 #[test]
 fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
@@ -366,10 +310,6 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
 }
 
 /// The Volume Alpha button is on the 3D pane — the editor's only door.
-///
-/// Asserted through the painted text because that is what a user can see:
-/// a button constructed but clipped, layered under the raymarch, or
-/// simply never reached by `render_volume_pane` all fail here identically.
 #[test]
 fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
     let (h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -385,15 +325,6 @@ fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
 }
 
 /// The painter's report reaches the caption the user reads.
-///
-/// The two halves of the stand-in are pinned apart — the renderer decides
-/// what to draw (`rustdar-gpu`'s `volume_stand_in` suite) and
-/// `volume_caption` decides what to write — and this is the seam between
-/// them. It is exactly the sort of wiring that can be dropped without a
-/// compiler error: `render_volume_pane` could ignore the `showing` field and
-/// hand `Showing::SETTLED` to the caption, and every test on either side
-/// would stay green while the pane silently went back to claiming a sharpness
-/// it does not have.
 #[test]
 fn the_pane_captions_the_picture_the_painter_says_it_drew() {
     let (h, _painter) = volume_harness(StubVolumePainter::standing_in(Showing {
@@ -439,13 +370,6 @@ fn a_product_with_no_vertical_structure_is_refused_by_name() {
 
 /// A product the radar *derives* tilt by tilt is not refused by name — it
 /// is asked for.
-///
-/// The mirror of the test above, and the second of the three UI-facing
-/// gates that admit SRV, NROT and KDP to the vertical views. Until now
-/// none of the three had a test: all could be reverted to
-/// `sampler::samplable` — the exact pre-admission code — with every test
-/// in the workspace green, and every derived pane would refuse by name
-/// with the volume behind it perfectly able to render.
 #[test]
 fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
     use rustdar_radar::types::RadarProduct;
@@ -488,10 +412,6 @@ fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
 
 /// The pane asks for its grid until it has one, and stops the moment the
 /// host records that it does.
-///
-/// Level-triggered by design — see `GuiAction::PrepareVolume` — so the half
-/// worth testing is that it *stops*, which an edge-triggered implementation
-/// would get right for free and a broken level-triggered one would not.
 #[test]
 fn a_volume_pane_asks_for_its_grid_until_the_host_says_it_has_one() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -527,9 +447,6 @@ fn a_volume_pane_asks_for_its_grid_until_the_host_says_it_has_one() {
 }
 
 /// Converting a 3D pane to something else releases its volume.
-///
-/// The only moment a pane stops needing an 8 MiB grid without anything else
-/// noticing: it is still on screen, still on the same site, still live.
 #[test]
 fn converting_a_volume_pane_away_releases_its_volume() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -550,11 +467,6 @@ fn converting_a_volume_pane_away_releases_its_volume() {
 }
 
 /// Converting a pane that was never a 3D pane releases nothing.
-///
-/// The mutation this closes: dropping the `kind() == Volume` half of the
-/// guard leaves a `ReleaseVolume` on every conversion — harmless today, and
-/// a pane releasing a volume another pane is using the moment the store is
-/// keyed any other way.
 #[test]
 fn converting_a_map_pane_releases_nothing() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -570,11 +482,6 @@ fn converting_a_map_pane_releases_nothing() {
 }
 
 /// The painter is asked with the camera **after** this frame's drag.
-///
-/// The trap this closes is not a wrong picture but a *late* one: building
-/// the payload before the UI pass leaves the orbit one frame behind the
-/// pointer, which reads as input lag and gets "fixed" by turning the drag
-/// sensitivity up.
 #[test]
 fn the_painter_sees_the_camera_after_this_frames_drag() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
@@ -600,10 +507,6 @@ fn the_painter_sees_the_camera_after_this_frames_drag() {
 }
 
 /// Dragging turns the box the way the pointer went, in both axes.
-///
-/// Signs, not arithmetic. A sign error still orbits perfectly smoothly and
-/// merely feels inverted, which is the sort of defect that survives review
-/// and is reported months later as "the 3D view is backwards".
 #[test]
 fn dragging_turns_the_box_the_way_the_pointer_went() {
     for drag in [egui::vec2(120.0, 0.0), egui::vec2(0.0, 120.0)] {
@@ -659,10 +562,6 @@ fn standoff(h: &mut InputHarness, idx: usize) -> f32 {
 }
 
 /// The region a 3D pane has **stored**, or `None` for "the volume's own reach".
-///
-/// Read rather than measured, which is the whole of the change these tests are
-/// about: there is no per-frame derivation left to interrogate, so what a test
-/// asks for is what the pane is holding.
 fn stored_region(h: &mut InputHarness, idx: usize) -> Option<crate::pane::VolumeRegion> {
     h.gui_mut()
         .pane(idx)
@@ -689,12 +588,6 @@ fn picked_region(half_east_km: f64, half_north_km: f64) -> crate::pane::VolumeRe
 }
 
 /// Give pane `idx` a picked region, as the selector does.
-///
-/// A direct write rather than a driven drag, deliberately: these tests are
-/// about what a *stored* region implies, and driving the gesture would make
-/// every one of them also a test of the arm. The gesture that produces one is
-/// `ui_map::region_pick_tests`, which asserts the same zoom property again on a
-/// region that arrived that way.
 fn pick_region(h: &mut InputHarness, idx: usize, region: crate::pane::VolumeRegion) {
     h.gui_mut()
         .pane_mut(idx)
@@ -706,15 +599,6 @@ fn pick_region(h: &mut InputHarness, idx: usize, region: crate::pane::VolumeRegi
 
 /// Scrolling over the 3D pane zooms it; scrolling over another pane does
 /// not.
-///
-/// `Input::zoom_delta` and the scroll delta are **global** — they report the
-/// frame's gesture wherever on screen it happened — so the
-/// `hovered() || dragged()` gate is correctness rather than politeness.
-/// Without it a wheel over a map pane would zoom every 3D pane on screen.
-///
-/// What "zooms it" means is the pane's **eye**: the gesture divides the
-/// standoff and leaves the box, the grid inside it and the ground under it
-/// exactly where they were.
 #[test]
 fn only_a_gesture_over_the_pane_zooms_it() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -739,13 +623,6 @@ fn only_a_gesture_over_the_pane_zooms_it() {
 }
 
 /// A **pinch** outside a 3D pane leaves it alone, exactly as a wheel does.
-///
-/// The wheel half above rides on `smooth_scroll_delta`; this one rides on
-/// `zoom_delta`, and they are separate branches of `ui_region::zoom_step`
-/// with separate opportunities to lose the gate. Driven through the web
-/// backend's two-device event shape, because that is what a browser sends
-/// and what `normalize_touch_devices` exists to fold together — so this is
-/// the touch and web arm of the same rule.
 #[test]
 fn a_pinch_outside_a_3d_pane_does_not_zoom_it() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -773,33 +650,7 @@ fn a_pinch_outside_a_3d_pane_does_not_zoom_it() {
     );
 }
 
-/// **The box does not move when the user zooms.** This is the acceptance test
-/// for the defect, reported three times:
-///
-/// > The 3d viewer's region should CAP at either the size of the data in the
-/// > radar scan, or the region selected if the user did that. That region (the
-/// > selector OR the radar's ring) must never change. Zooming should keep the
-/// > rest of the region around and merely zoom into what's already there.
-///
-/// Six notches rather than one, because the defect was *cumulative*: each
-/// gesture frame re-derived the box from a viewport the previous frame had
-/// already tightened, so a single notch understated it and a held scroll took
-/// the pane from an 802 × 490 km box to 668 × 408.
-///
-/// Three things are asserted and each covers a different way to reintroduce it.
-/// The **region** is the resample key, so a change there is the box actually
-/// moving. The pane's **map memory** is what the box used to be derived from,
-/// so a write there is the defect one refactor away from coming back even while
-/// the region looks still. And the **standoff** is the precondition: without it
-/// a pass could mean the gesture had simply stopped working, which is how this
-/// shipped green twice.
-///
-/// The region is *picked* first rather than left at `None`, because `None ==
-/// None` is a comparison that holds however badly the code behaves.
-///
-/// Only the standoff may move. Yaw, pitch and pivot are checked too — a
-/// "helpful" reframe would plausibly nudge the pitch or re-centre the pivot,
-/// and an assertion aimed only at the box would not see it.
+/// **The box does not move when the user zooms.**
 #[test]
 fn zooming_moves_the_eye_and_leaves_the_box_exactly_where_it_was() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -852,18 +703,6 @@ fn zooming_moves_the_eye_and_leaves_the_box_exactly_where_it_was() {
 }
 
 /// **The user's own acceptance test, read off the pane's own caption.**
-///
-/// The defect was reported with two screenshots of one session, and what made
-/// them a bug report rather than an impression was the caption: `802 x 490 km
-/// box - 3.13 x 1.91 km/cell` as opened, `668 x 408 km box - 2.61 x 1.59
-/// km/cell` after a zoom. So the caption is what this reads, through
-/// `volume_caption` and the painter and the real text the pane puts on screen —
-/// not the field behind it, which is what a test asserting `region` alone
-/// checks. A caption that disagreed with the box would be its own defect, and
-/// it is the one the user would see.
-///
-/// The box figure must be **character-for-character identical** before and
-/// after. Anything else is the reported bug, whatever the numbers happen to be.
 #[test]
 fn the_captions_box_figure_is_identical_before_and_after_a_zoom() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -912,13 +751,6 @@ fn the_captions_box_figure_is_identical_before_and_after_a_zoom() {
 
 /// The other half of the same rule: an **unpicked** pane's box does not move
 /// either, and the thing that must not move is the one the resampler keys on.
-///
-/// `None` is the ordinary state of a 3D pane and it means "the volume's own
-/// reach", so this is the case the reporting user was actually in. It is a
-/// weaker assertion than the picked one above — `None` cannot be re-cut into a
-/// different `None` — which is exactly why the map memory is checked beside it:
-/// under the old arm a `None` pane did not exist at all, because the derivation
-/// filled the field in on the first drawn frame.
 #[test]
 fn an_unpicked_panes_box_is_the_volumes_reach_and_a_zoom_does_not_touch_it() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -958,12 +790,6 @@ fn an_unpicked_panes_box_is_the_volumes_reach_and_a_zoom_does_not_touch_it() {
 
 /// A drag orbits a 3D pane and pans a plan view — the same gesture, the two
 /// meanings the two pictures have for it.
-///
-/// Both halves in one test on one harness, because the claim is about the
-/// *pair*: a drag that orbited both, or panned both, would satisfy either
-/// half read alone. Each half also asserts the other pane's verb did **not**
-/// happen — a drag that orbited *and* slid the ground under it is the shape
-/// the two-finger cancel in `volume_pane_outcome` exists to prevent.
 #[test]
 fn a_drag_orbits_in_3d_and_pans_in_2d() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -1014,14 +840,6 @@ fn a_drag_orbits_in_3d_and_pans_in_2d() {
 
 /// A two-finger drag pans a 3D pane, and the spread in the same gesture
 /// dollies its eye.
-///
-/// The touch spelling of "right-drag pans", and the one that has to carry
-/// both verbs at once: `MultiTouchInfo` reports the translation and the
-/// pinch from one gesture, and a user who slides two fingers apart while
-/// moving them expects both to happen. This is also the pin that one finger
-/// still orbits — `normalize_touch_devices` synthesises a *primary* drag
-/// from a touch, so a two-finger gesture would be read as an orbit too if
-/// the cancel in `volume_pane_outcome` were dropped.
 #[test]
 fn a_two_finger_drag_pans_a_3d_pane_and_its_spread_dollies_the_eye() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -1072,32 +890,6 @@ fn a_two_finger_drag_pans_a_3d_pane_and_its_spread_dollies_the_eye() {
 }
 
 /// A scroll covers the same ground on a 3D pane as it does on a plan view.
-///
-/// "The same gesture means the same thing" is the whole brief, and it is not
-/// something the code can be read for: `ui_region::zoom_step` is a restatement
-/// of `walkers::Map::zoom_delta`, which a 3D pane cannot reach because its map
-/// is drawn off screen. So the two arms are driven through the real UI on one
-/// screen and their answers compared — a restatement that drifts from walkers
-/// fails here, and comparing this function against a copy of itself never
-/// would.
-///
-/// **The two answers are in different units now, and converting between them is
-/// the claim.** A plan view answers in Web Mercator zoom *levels*, where one
-/// level is a factor of two of ground per point. A 3D pane answers in
-/// `eye_distance`, and a perspective camera sees `2 · d · tan(fov/2)` of ground
-/// at its pivot plane — linear in `d`. So the same gesture means the same thing
-/// exactly when the standoff ratio is `2^-levels`, which is what
-/// `ui_region::zoom_camera` computes and what this checks end to end.
-///
-/// The tolerance is 1e-5 rather than 1e-9 because `eye_distance` is an `f32`
-/// where a zoom level is an `f64`; at the ~1.9 standoff a pane opens at, one
-/// `f32` ulp is 1.2e-7 and the log2 of a ratio of two of them is about 1e-7. A
-/// drifting restatement moves this by percent, not by ulps.
-///
-/// **One harness each, deliberately.** `smooth_scroll_delta` decays over
-/// several frames, so a second notch on the same harness lands on top of the
-/// first one's tail and reads as the two arms disagreeing by two thirds. The
-/// first version of this test did exactly that and blamed the production code.
 #[test]
 fn a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view() {
     // One notch over pane `idx`, from a harness with identical geometry, zoom
@@ -1145,18 +937,6 @@ fn a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view() {
 
 /// Zooming stops at the camera's own stops, in both directions, and the box is
 /// untouched at both of them.
-///
-/// The gesture used to be bounded by the *resampler* — below
-/// `MIN_HALF_WIDTH_KM` the derived box was refused outright, so a viewport
-/// zoomed one notch too far popped from 10 km straight to the 230 km fallback.
-/// There is no derived box left to fall through, so the only bound is
-/// `MIN_EYE_DISTANCE..=MAX_EYE_DISTANCE`, which is the honest one: what the
-/// gesture runs out of is somewhere to put the eye.
-///
-/// Forty notches each way, far past either stop, because each one is a separate
-/// opportunity for a bound to be applied once and then forgotten — and because
-/// `nudge` clamps rather than refuses, so a sign error would sail past the stop
-/// and come back on the far side.
 #[test]
 fn zooming_stops_at_the_cameras_own_stops_without_moving_the_box() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -1204,18 +984,6 @@ fn zooming_stops_at_the_cameras_own_stops_without_moving_the_box() {
 // test that cannot fail.
 
 /// A 3D pane's gesture is its own: the link does not carry it either way.
-///
-/// The **stated decision**, pinned so that it is a decision rather than an
-/// accident of `PaneState::is_map` answering `false` for a 3D pane.
-/// `sync_viewports` is defined over plan views — panes with a raster to
-/// dispatch, donate and synchronise — and a 3D pane is neither a source nor a
-/// target of it.
-///
-/// The cost of the other choice is what settles it: a 3D pane as a sync
-/// *target* would take a neighbour's wheel as a camera move, so a plan view
-/// zoomed to the street would fly the 3D pane's eye to its stop with nobody
-/// having touched it. Changing it is a one-word change (`is_map` to a predicate
-/// about having a viewport at all) and wants its own review, not this one.
 #[test]
 fn a_3d_panes_gesture_is_not_carried_by_the_link() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -1258,17 +1026,6 @@ fn a_3d_panes_gesture_is_not_carried_by_the_link() {
 }
 
 /// The painter is told the pane's size in **physical** pixels, not points.
-///
-/// The offscreen target is allocated from this number, so handing over
-/// points on a 2x display would allocate a quarter-sized texture and blit it
-/// stretched — which looks like the resolution rung working rather than like
-/// a bug.
-///
-/// **Run at 2x deliberately.** At the harness's default scale points and
-/// pixels are the same number, so an assertion that multiplies by
-/// `pixels_per_point` passes whether the production code multiplies or not.
-/// The first version of this test did exactly that and could not see the
-/// mutation it is named for.
 #[test]
 fn the_painter_is_told_the_pane_size_in_physical_pixels() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
@@ -1297,12 +1054,6 @@ fn the_painter_is_told_the_pane_size_in_physical_pixels() {
 
 /// A long explanation is wrapped inside the pane, not laid out on one line
 /// that runs off both edges.
-///
-/// Found by looking at the app rather than by reasoning: the 3D pane's
-/// palette refusal is a paragraph, and `Painter::text` centres a single
-/// unwrapped line — so it rendered as a strip of words with the start and
-/// end of every line cut away. That reads as a rendering bug, not as an
-/// explanation, which makes it worse than the empty box it replaced.
 #[test]
 fn a_long_empty_state_is_wrapped_inside_the_pane() {
     let long = "Velocity cannot be drawn as a volume yet. Its colour table is opaque at \
@@ -1331,10 +1082,6 @@ fn a_long_empty_state_is_wrapped_inside_the_pane() {
 }
 
 /// Whatever the painter says is why the pane is empty is what the pane says.
-///
-/// The renderer knows things this crate cannot name — a device error latched
-/// mid-session, a single-tilt volume, a grid still building — and every one
-/// of them is a different thing for the user to do about it.
 #[test]
 fn the_painters_own_reason_reaches_the_pane() {
     let (h, _painter) = volume_harness(StubVolumePainter::empty("a very specific reason"));
@@ -1348,10 +1095,6 @@ fn the_painters_own_reason_reaches_the_pane() {
 
 /// Cells across the grid a modern desktop adapter actually gets, which is what
 /// `VolumePainter::grid_cells_across` reports to the caption on that machine.
-///
-/// Derived rather than written as 512, so these tests go on stating "what the
-/// painter would say" if the rule ever spends the budget differently. A
-/// generous limit, because that is the device these captions are read on.
 const DESKTOP_CELLS: usize =
     rustdar_radar::voxel::shape_for_budget(rustdar_radar::voxel::DESKTOP_SHAPE, 2048).nx;
 
@@ -1361,16 +1104,6 @@ const GUARANTEE_CELLS: usize =
     rustdar_radar::voxel::shape_for_budget(rustdar_radar::voxel::DESKTOP_SHAPE, 256).nx;
 
 /// **The height the pane reports is real at every exaggeration.**
-///
-/// This is the counterweight that makes the exaggeration defensible at all.
-/// The stretch is a drawing convention; a stretched *number* would be a
-/// fabricated measurement, and 0–59 kft MSL is a figure a forecaster would
-/// read off the screen and act on.
-///
-/// The mutation this closes is the tempting one — multiplying the top of the
-/// box by the exaggeration so the caption "matches what you see". At 3× that
-/// produces "0–177 kft MSL", which is above the Kármán line and still looks
-/// like a readout.
 #[test]
 fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
     let mut seen = Vec::new();
@@ -1411,11 +1144,6 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
 /// The caption states the merged volume's freshness truthfully: "newest
 /// data" and its time in the first line, never a claim about the whole
 /// volume.
-///
-/// The word "newest" is the load-bearing one. A merged volume's low tilts
-/// can be seconds old while its top is minutes older; a first line that
-/// said only "volume 22:39Z" would let the whole picture borrow the
-/// freshest sweep's currency.
 #[test]
 fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
     let lines = volume_caption(
@@ -1437,11 +1165,6 @@ fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
 /// The caption names the base volume the un-refreshed tilts come from —
 /// and while a site's first volume is still filling, says there is no
 /// complete volume at all rather than staying quiet.
-///
-/// Both halves are honesty devices. Without the first, a reader cannot
-/// see the merged volume's span — the newest-data line alone reads as
-/// "everything is this fresh". Without the second, a ladder still filling
-/// reads as a full atmosphere.
 #[test]
 fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
     let merged = volume_caption(
@@ -1479,24 +1202,6 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
 
 /// The caption reports the resolution the box buys, and it moves with the
 /// box.
-///
-/// The grid's cell count is fixed, so a tighter box spends the same cells
-/// over less ground — 2.54 km per cell over a WSR-88D's whole reflectivity
-/// volume against 0.16 at 20 km. That is the main reason to pick a region,
-/// and it is invisible unless it is written down.
-///
-/// The sourceless figures are pinned as literals — the 920 km box a 460.125
-/// km reflectivity reach earns, and the cells it costs on each of the two
-/// devices worth naming — rather than derived from the function the caption
-/// itself reads, so a policy that drifted fails here by name instead of being
-/// restated as correct.
-///
-/// **Two devices, because there is no longer one answer.** The grid's shape is
-/// derived from the adapter's `max_texture_dimension_3d`, so the caption's
-/// figure is a fact about the machine: 512 cells and **1.80 km** on a modern
-/// desktop, 256 and 3.59 on one reporting exactly the WebGL2 guarantee. Both
-/// are asserted here because both are shipped, and the second is the one that
-/// says nothing regressed.
 #[test]
 fn the_caption_reports_the_resolution_the_box_buys() {
     let whole_volume = rustdar_radar::voxel::box_half_width_km(460.125);
@@ -1574,20 +1279,6 @@ fn the_caption_reports_the_resolution_the_box_buys() {
 
 /// While the grid on screen is not the one this box asked for, the caption
 /// reports the picture — not the request.
-///
-/// This is the honest half of the zoom's progressive refinement, and it is
-/// what licenses the picture half. A pane that has just been zoomed goes on
-/// drawing the grid it already has, put into the new box, so the "N km box"
-/// figure stays true throughout; the cell size does not, and a caption that
-/// went on dividing this box by the cell count would claim a sharpness nobody
-/// can see. Either the line says what resolution is really there, or the pane
-/// must blank — and blanking is the defect this replaced.
-///
-/// The two arms differ in what the zoom *did*. Inwards, the held grid covers
-/// the whole new box: the picture is complete and merely soft, so the line
-/// promises the sharper one. Outwards it does not: the picture is real data in
-/// the middle and nothing outside it, and a volume that simply stops is read
-/// as weather that stops, so that has to be said rather than promised away.
 #[test]
 fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
     let asked_for = format!("{:.2} km/cell", 40.0 / DESKTOP_CELLS as f64);
@@ -1654,10 +1345,6 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
 
 /// A secondary drag pans and does not orbit; a primary drag orbits and does
 /// not pan.
-///
-/// The two are separate verbs on separate buttons, and a mutation that made
-/// either drag do both would still move the picture — plausibly — while
-/// making the other gesture impossible to perform cleanly.
 #[test]
 fn the_secondary_drag_pans_and_the_primary_drag_orbits() {
     let mut h = volume_pane_harness();
@@ -1710,10 +1397,6 @@ fn the_secondary_drag_pans_and_the_primary_drag_orbits() {
 }
 
 /// The box travels the way the pointer went.
-///
-/// Through the whole shipped path rather than through `pan_for_drag` alone,
-/// so a sign inverted between the two — the gesture reading the drag one way
-/// and the maths another — cannot hide.
 #[test]
 fn a_secondary_drag_carries_the_box_the_way_the_pointer_went() {
     let mut h = volume_pane_harness();
@@ -1747,11 +1430,6 @@ fn a_secondary_drag_carries_the_box_the_way_the_pointer_went() {
 
 /// A pane collapsed to nothing by a divider drag does not put a NaN in the
 /// camera.
-///
-/// The realistic path to a zero viewport height, and the consequence of
-/// laundering it rather than refusing is a staleness key that never equals
-/// itself — a rebuild every frame, for ever, with a hot CPU as its only
-/// symptom.
 #[test]
 fn a_pane_with_no_height_pans_to_nothing_rather_than_to_nan() {
     let mut h = volume_pane_harness();
@@ -1808,16 +1486,6 @@ fn square(half_km: f64) -> rustdar_radar::voxel::HalfExtentKm {
 
 /// The mirror pass's guest list is this frame's floor strips — and nothing
 /// else.
-///
-/// The baseline for the tests below, and the first coverage
-/// `mirror_source_rects` or `map_pane_geo` have ever had. The negative cases
-/// would pass vacuously if the positive one did not work, because "no rects" is
-/// also what a guest list that never populates says.
-///
-/// The strip's *position* is the load-bearing half. A guest rect inside the
-/// frame would be the pane's own chrome — the volume, drawn over itself — and a
-/// guest rect at the pane's own coordinates would be exactly that. Both are
-/// checked, because "one rect of the right size" is true of the wrong rect too.
 #[test]
 fn the_mirror_guest_list_is_this_frames_floor_strips() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -1882,17 +1550,6 @@ fn the_mirror_guest_list_is_this_frames_floor_strips() {
 
 /// **The reported bug.** A 3D view opened from a tab — no split, no region
 /// dragged on a neighbouring map — shows its floor.
-///
-/// This is the one-pane shape, which is what a tab is and what every phone is.
-/// Under the borrowed-source arrangement it was the shape with no floor at all:
-/// the pane's `source_pane` was either unset or pointed at *itself*, and either
-/// way the registration was refused — correctly, because the only thing at that
-/// index was the 3D pane's own chrome. The strip is what gives the pane a map
-/// of its own to stand on.
-///
-/// Both halves are asserted. A `source` alone would be satisfied by registering
-/// the pane's own rect, which is the failure the old arrangement was protecting
-/// against; a strip alone would be satisfied by geometry nothing samples.
 #[test]
 fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -1948,12 +1605,6 @@ fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
 }
 
 /// Two 3D panes get two strips, and the strips do not overlap.
-///
-/// The one failure a packed layout would have that a uniform translation cannot:
-/// a strip landing on another pane's makes one pane's floor a picture of the
-/// other pane's map, which is a plausible-looking picture rather than a blank
-/// one. Also the case the mirror's size bound is written against — see
-/// `Gui::mirror_size_points`.
 #[test]
 fn two_3d_panes_get_two_strips_that_cannot_collide() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -1997,11 +1648,6 @@ fn two_3d_panes_get_two_strips_that_cannot_collide() {
 
 /// A pane that stops showing a floor stops being registered, and its index does
 /// not carry its old strip to whatever pane takes it next.
-///
-/// Indices are reused when the layout sheds panes, so a stale entry does not
-/// read as absent — it reads as *some other pane's* map. Two ways in: the pane
-/// becomes a map again, and the user hides the floor. Both must give the
-/// mirror's texels back rather than go on copying a strip nothing draws into.
 #[test]
 fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
@@ -2045,14 +1691,6 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
 }
 
 /// A radar site whose label is map content on this pane and nothing else.
-///
-/// Vance AFB, about 110 km north-west of KTLX, so on a pane centred there at
-/// [`WITNESS_ZOOM`] it lands well inside — nowhere near the 100-point cull
-/// margin `visible_radar_sites` also draws labels into, which reach outside
-/// the strip and are only clipped away later.
-///
-/// Deliberately **not** KTLX: the pane's own site is printed by the pill row
-/// too, and a witness two different things draw cannot say which one drew it.
 const GROUND_WITNESS_SITE: &str = "KVNX";
 
 /// The unit label at the head of the pane's colour scale, which is the one
@@ -2065,14 +1703,6 @@ const WITNESS_ZOOM: f64 = 7.0;
 
 /// One pane, one scan, the radar-site labels switched on and the map zoomed in
 /// far enough to draw them.
-///
-/// Those labels are the only **geography** a headless frame paints: it fetches
-/// no tiles and uploads no radar texture, and both are drawn as textures
-/// anyway, while the `RADARS` table is compiled in and its names are drawn as
-/// per-frame text. Without them a 3D pane's strip is empty — the pane's legend
-/// used to be the only thing in it, and the legend is exactly what has just
-/// been moved out — so both tests below would compare two empty sets and pass
-/// having proved nothing.
 fn ground_witness_harness() -> (InputHarness, Arc<StubVolumePainter>) {
     let painter = Arc::new(StubVolumePainter::painting());
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -2103,11 +1733,6 @@ type Mark = (At, String);
 
 /// Every mark the last frame painted inside `region`, in coordinates relative
 /// to it: painted rects, and text runs with what they said.
-///
-/// Text as well as rects because the two halves of a pane's content are drawn
-/// with different primitives — the legend is mostly filled rects, the site
-/// labels are text — and a probe that saw only one of them would be blind to
-/// whichever half it was pointed at.
 fn local_marks(h: &InputHarness, region: egui::Rect) -> Vec<Mark> {
     let local = |rect: egui::Rect| {
         let l = rect.translate(-region.min.to_vec2());
@@ -2135,10 +1760,6 @@ fn local_marks(h: &InputHarness, region: egui::Rect) -> Vec<Mark> {
 }
 
 /// The marks of one named text run, out of a set [`local_marks`] produced.
-///
-/// A run and not a single mark: every label on the map is painted twice, once
-/// as its own shadow (`draw_shadowed_text`), so a witness that took one of them
-/// would be picking a half at random.
 fn marks_saying(marks: &[Mark], text: &str) -> Vec<At> {
     marks
         .iter()
@@ -2149,36 +1770,6 @@ fn marks_saying(marks: &[Mark], text: &str) -> Vec<At> {
 
 /// The pane's **ground** really is drawn — into the strip, exactly as the same
 /// pane drew it on the glass, and no longer on the glass.
-///
-/// Every other test here is about geometry the arm *reported*. This one is
-/// about geometry the tessellator was actually handed, which is the difference
-/// between a floor and a plan for one: the mirror pass copies primitives, so a
-/// strip with no primitives in it is a transparent texture and a blank floor,
-/// and nothing above this would notice.
-///
-/// It is written as a **comparison against the same pane as a map** rather than
-/// as a count, because a count cannot tell a map from a stray highlight. The
-/// same pane is rendered both ways at the same size and the painted marks are
-/// compared in rect-local coordinates, so the claim is that every mark in the
-/// strip is a mark the map pane made at the same place within its own rect.
-///
-/// Containment rather than equality, and the direction is the honest one: the
-/// map pane's rect also has the shell's chrome over it — the layers panel, the
-/// status bar, the pills — which is drawn above the pane rather than inside
-/// `Map::show`, is not the same for a 3D pane as for a map, and must **not** be
-/// copied onto a floor. It now also has the pane's own legend, which is chrome
-/// too and stays behind for the same reason (see
-/// [`the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip`]). So
-/// the strip is a subset, and what stops a subset being vacuous is a named
-/// piece of geography — [`GROUND_WITNESS_SITE`] — required *in* the strip and
-/// required *absent* from the glass, in both cases at the local position the
-/// plan view drew it at.
-///
-/// Tiles and the radar raster are absent from both sides — a headless frame
-/// fetches no tiles and uploads no textures — so what is being compared is the
-/// rest of the map content pass. That is the point: whatever the map arm
-/// paints, the strip paints, and neither side is written down here to be kept
-/// in step by hand.
 #[test]
 fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
     let (mut h, _painter) = ground_witness_harness();
@@ -2247,21 +1838,6 @@ fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
 /// The mirror of the test above, for the other half of the pane's content: the
 /// colour scale is chrome, so it belongs **on the glass** in ordinary 2D and
 /// must never reach the strip.
-///
-/// A legend in the strip is a legend the raymarcher copies onto the floor,
-/// where it is painted flat into the ground in perspective — shrinking with
-/// distance, swinging round with the camera and unreadable from most of them.
-/// That is what this pins, and it pins it in both directions at once, because
-/// only one of the two is a regression anybody would notice: a legend that
-/// stopped being drawn at all would pass a "not in the strip" assertion.
-///
-/// The placement claim is the strong half. The legend's marks are taken from
-/// the pane drawn **as a map** and then required at the *same rect-local
-/// positions* once the pane is a volume — so "the same widget under the same
-/// placement rules" is asserted against the plan view itself rather than
-/// against a copy of the geometry written down here. A 3D pane that drew its
-/// own legend a few points off, or on the other edge, or at the floor's scale,
-/// fails.
 #[test]
 fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
     let (mut h, _painter) = ground_witness_harness();
@@ -2333,19 +1909,6 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
 }
 
 /// Every legend a 3D pane can paint, with a preference set that paints it.
-///
-/// **Every product, not the nine the volume pipeline can sample.** A 3D pane
-/// draws its legend and its Volume Alpha button from `Gui::draw_volume_glass`
-/// and `volume_alpha_editor::editor_ui`, both of which run whatever the arm
-/// decided — so a pane switched to VIL shows `no vertical structure` in the
-/// middle and a full VIL colour bar down the right edge, button and all.
-///
-/// The unit crossing is off each enum's own `ALL`, so a unit added later is
-/// exercised without anyone remembering to add it here, and it is collapsed by
-/// what each product's legend *says*: 48 preference sets over 17 products are
-/// 816 legends, of which 31 differ in a tick or a title. A preference no
-/// product's bar reads produces a legend already in the list and costs nothing;
-/// one that changes a tick or a title is a new legend and gets its own frame.
 fn every_legend_a_volume_pane_can_paint() -> Vec<(RadarProduct, UserPreferences)> {
     use rustdar_units::{HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit};
 
@@ -2386,40 +1949,6 @@ fn every_legend_a_volume_pane_can_paint() -> Vec<(RadarProduct, UserPreferences)
 
 /// Nothing prints through the Volume Alpha button — and the colour scale is
 /// what used to.
-///
-/// The pane's legend is painted onto the glass rather than allocated, so it
-/// senses nothing, takes no part in layout and cannot be pushed aside. The
-/// button, planted in `pane_rect`'s top-right corner, stood in exactly the
-/// corner the vertical scale's unit title stands in: `dBZ` printed straight
-/// through `Volume alpha` at every pane width, which is what
-/// `legend-on-the-glass/floor-after.png` shows. So the *button* moves — off
-/// `color_scale_free_rect` instead of the pane — because the legend's
-/// placement is shared with the plan view and forking it for one pane kind
-/// would trade a visible overlap for an invisible misalignment across a split.
-///
-/// # Why it is written against the marks and not against the arithmetic
-///
-/// The claim is "no text the pane paints lands inside the button, except the
-/// button's own label", which is what a user sees. A test comparing the
-/// button's rect to a second copy of the legend's geometry would agree with
-/// itself while both were wrong, and would say nothing about the value labels
-/// or a second stacked bar.
-///
-/// The last block of each round is what stops it being vacuous: the *old* rect
-/// is reconstructed from `pane_rect` and required to collide, so a legend that
-/// stopped being drawn — or a title that moved off the corner by itself —
-/// fails here rather than passing an assertion about an empty set.
-///
-/// # Why it runs every legend and not the one on screen
-///
-/// It ran reflectivity in the default units, and reflectivity's bar ends at
-/// `95`, which lays out 12.4 points wide in the 20 points of clear glass
-/// between the top tick and the button's left edge. Correlation coefficient's
-/// ends at `0.98` — 21.3 points, and a gradient bar's last stop centres on the
-/// very top of the bar, level with the button. `0.98` printed through
-/// `Volume alpha` on every 3D pane showing ρHV in every unit preference, the
-/// default included, with this test green the whole time. Velocity in km/h and
-/// differential phase (`130` and `345`, 18.6) cleared it by 1.4 points.
 #[test]
 fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
     let (mut h, _painter) = ground_witness_harness();
@@ -2516,58 +2045,9 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
 /// The Volume Alpha button is inside the pane it belongs to at **every width a
 /// pane can reach** — not only on the one full-width pane the collision test
 /// above runs.
-///
-/// # What the collision test could not see
-///
-/// It asserts `pane_rect.contains_rect(button)` on a single 1400-point pane,
-/// where the button's left edge stands over 1200 points inside the pane's and
-/// containment was never in question. The button hangs off
-/// `color_scale_free_rect`'s top-right corner, so that slack is
-///
-/// ```text
-/// slack(w) = w - gutter - (button width + margin)
-/// ```
-///
-/// and it goes negative on a narrow pane. Drawn there anyway, the half that
-/// hung over the pane's left edge was cut by the child ui's clip rect
-/// (`ui_map.rs`, `child_ui.set_clip_rect(pane_rect)`) — a sheared control,
-/// which reads as a rendering fault rather than as a layout out of room.
-///
-/// # Why it drags a divider rather than shrinking the window
-///
-/// Because that is how a pane gets narrow while its legend stays the size it
-/// is. The gutter is measured text and does not shrink with the pane, and the
-/// bars' orientation is keyed on the whole *panel* with hysteresis
-/// (`ColorScaleOrientation`), so a window shrunk far enough to narrow a pane
-/// would flip the bars to the bottom edge on the way and stop exercising the
-/// gutter at all. A divider drag moves one column and leaves the panel alone,
-/// which is exactly the user gesture that produces the widths this is about.
-///
-/// # Why `needed` is read off the frame and not computed
-///
-/// The width at which the old placement ran out of pane is `gutter + 96`, and
-/// the gutter is what the legend's own text lays out to: 52.4 points for
-/// spectrum width, 67.5 for precipitation rate in mm/hr, 60 more per stacked
-/// overlay legend, and different again in another font. Restating that here
-/// would be a second copy of `color_scale_gutter` that could agree with itself
-/// while both were wrong. One reading of the button at the wide end fixes the
-/// whole line, because `slack` moves point for point with the pane's width.
-///
-/// # Both orientations, because the room runs out in two different ways
-///
-/// Landscape puts the bars on the right edge, where the gutter is what eats the
-/// button's room, and a 900-point panel showing reflectivity needs 151.1 points
-/// of pane against the 135 `MIN_RATIO = 0.15` lets a column reach. Portrait
-/// puts them along the bottom, where the free rect is as wide as the pane and
-/// the button needs its own 96 points against the 64.8 the same floor allows.
 #[test]
 fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
     /// One pointer step of the drag, points.
-    ///
-    /// Small deliberately: `PaneLayout`'s `drag_divider` refuses a step that
-    /// would take a column under `MIN_RATIO` *whole* rather than clamping it to
-    /// the floor, so the sweep stops within one step of `MIN_RATIO` and a
-    /// coarse drag would stop well short of the narrow end this is about.
     const STEP: f32 = 3.0;
 
     /// Pane `idx`'s Volume Alpha button on the last frame, if it drew one.
@@ -2690,17 +2170,6 @@ fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
 
 /// The reset returns the **pivot** as well as the angles, and leaves the view
 /// mode alone.
-///
-/// The pivot is the one that is easy to forget: a reset that restores the
-/// angle and the zoom while leaving the eye aimed at a corner of the box is a
-/// control that visibly does something and leaves the pane still looking at
-/// the wrong place.
-///
-/// The reset also returns the **region** and its source pane — both to `None`,
-/// the volume's own reach — but that half of the contract is pinned where the
-/// region machinery lives, by
-/// `region_pick_tests::reset_view_returns_the_region_as_well_as_the_camera`.
-/// This test's subject is the camera half.
 #[test]
 fn the_reset_returns_the_pivot_as_well_as_the_angles_and_keeps_the_view_mode() {
     let mut volume = crate::pane::VolumePane {
@@ -2738,20 +2207,6 @@ fn the_reset_returns_the_pivot_as_well_as_the_angles_and_keeps_the_view_mode() {
 
 /// **The box a 3D pane resamples does not follow its viewport**, through the
 /// real render arm.
-///
-/// The inverse of the test that used to stand here, and it is the same
-/// end-to-end route: between the pane's map memory and the field the resampler
-/// is keyed on sits the whole arm — the floor strip, the `mem::take`n pane, the
-/// volume branch — and any one of them writing the region is the reported defect
-/// back again.
-///
-/// The viewport is moved **directly**, by four zoom levels on the pane's own
-/// `MapMemory`, rather than by a gesture. That is deliberate: the gesture is
-/// pinned elsewhere, and what this asks is the stronger question — if the
-/// viewport moves for *any* reason at all, including a window resize or a
-/// divider drag that no gesture test can reach, does the box move with it? Four
-/// levels is a 16× change in the ground the pane shows, which is far more than
-/// the 1.2× that took the reported session from Chattanooga to Dalton.
 #[test]
 fn a_3d_panes_box_does_not_follow_its_own_viewport() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -2790,21 +2245,6 @@ fn a_3d_panes_box_does_not_follow_its_own_viewport() {
 }
 
 /// The Map floor checkbox says so when it cannot draw a floor.
-///
-/// The floor is not a layer drawn beside the volume — it is drawn *by* the
-/// raymarch, inside the paint callback a 3D pane pushes only when it has a
-/// picture. So in every state where the arm explains itself instead of drawing
-/// (no painter, no published volume, a product with no vertical structure, a
-/// grid still building) the checkbox is a control that produces nothing, and
-/// until now it produced nothing in silence. It stays tickable — the preference
-/// is durable and takes effect the moment a picture arrives — and it now says
-/// why, quoting the pane's own reason rather than a second wording of it.
-///
-/// **Both halves, and both are what make this able to fail.** The note must be
-/// absent while the pane is drawing, or a note nailed permanently under the row
-/// would pass; and it must be present when the pane is not, or deleting the
-/// note entirely would pass. The `Map floor` anchor is checked in both states so
-/// neither half can pass by the whole block being off screen.
 #[test]
 fn the_map_floor_checkbox_says_when_there_is_no_floor_to_draw() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
@@ -2864,20 +2304,6 @@ fn the_map_floor_checkbox_says_when_there_is_no_floor_to_draw() {
 /// The other interactive surface a 3D pane carries: the Volume Alpha editor's
 /// own window. A drag inside it belongs to the editor and must not also fly the
 /// orbit camera under it.
-///
-/// The glass-layer audit's second half. Everything else drawn over a 3D pane —
-/// the colour-scale legends, the stale-image notice, the caption, the empty
-/// state, the pane border — goes through a bare `egui::Painter` and allocates
-/// no widget at all, so none of it can either take a click or block one. The
-/// corner button and this window are the whole interactive inventory, and both
-/// have to win the pointer against a pane-wide `Sense::click_and_drag`.
-///
-/// **Both halves.** The camera must not move while the window is open (the
-/// window keeps its own drag) *and* it must move on the identical drag once the
-/// window is gone (that position really is over the pane, so the first half is
-/// a window that shields rather than a dead zone in the orbit). Half one alone
-/// passes if the orbit never worked; half two alone passes if the window is not
-/// there at all.
 #[test]
 fn the_open_alpha_editor_keeps_its_drag_off_the_orbit_camera() {
     let mut h = volume_pane_harness();
@@ -2950,21 +2376,6 @@ fn the_open_alpha_editor_keeps_its_drag_off_the_orbit_camera() {
 
 /// A touch **double-tap-drag** zooms a 3D pane's geography and does not also
 /// spin its box.
-///
-/// The one gesture in the shipped inventory that already reached a 3D pane's
-/// viewport before any of this, and the one that collided with the orbit.
-/// `DoubleTapDragDetector` writes `MapMemory` directly for whichever pane is
-/// active, whatever its render mode — so on a phone this was always the way to
-/// re-cut a 3D box. But it spells the zoom with a held finger travelling up the
-/// screen, and `normalize_touch_devices` turns a finger into a synthesised
-/// *primary* drag: ungated, the ground zoomed and the camera turned at once,
-/// from one gesture.
-///
-/// `suppress_drag` is the fix and it is not a new concept — it is the same
-/// `MapPointerFrame::suppress_pan` a plan view already hands to
-/// `Map::drag_pan_buttons`, meaning "another gesture owns this pointer". The
-/// zoom half is asserted too, so a pass cannot come from the gesture being
-/// dead altogether.
 #[test]
 fn a_double_tap_drag_zooms_a_3d_panes_ground_without_spinning_its_box() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3005,33 +2416,6 @@ fn a_double_tap_drag_zooms_a_3d_panes_ground_without_spinning_its_box() {
 /// A pane nobody is touching asks for the **same box** on every frame, bit for
 /// bit — so the volume it rebuilds every sealed sweep lands on the same
 /// lattice, and the picture's only change is the new data.
-///
-/// # Why this is worth a test of its own
-///
-/// The region is derived, every frame, by unprojecting the pane rect's centre
-/// and four edge midpoints through a fresh `walkers::Projector`. That is `f32`
-/// rect arithmetic feeding `f64` geodesy, and it is *the same* arithmetic
-/// `HALF_WIDTH_STEP_KM` exists to quantise — the half-width would otherwise
-/// wander by metres between frames and make a new resample key out of nothing.
-/// The **centre** carries no such quantiser, so if it wandered at all, every
-/// frame would name a new `VolumeTarget`, every sweep would resample onto a
-/// lattice a fraction of a cell from the last, and a pane left open would
-/// re-shuffle its bands for ever while its owner sat and watched.
-///
-/// It does not wander, and that is a property of stable inputs rather than of
-/// luck or of rounding: the rect and the map memory do not move when nobody
-/// moves them, and the projection is a pure function of those. This test is
-/// what says so, because the alternative is invisible in every other suite —
-/// a wandering centre costs a rebuild, not a wrong picture, and the only
-/// symptom is a warm CPU.
-///
-/// It is also the measurement that decided **not** to anchor the resample
-/// lattice on the radar (see `rustdar_radar::voxel::horizontal_ranges_km`).
-/// Anchoring's one regime with real value would be a pitch ratio of 1, where
-/// snapping two boxes to a shared lattice makes the resampled field identical
-/// rather than merely better aligned. That is exactly the live-rebuild steady
-/// state — and this test shows the steady state already *has* an identical box,
-/// so there is nothing there for anchoring to win.
 #[test]
 fn a_settled_pane_asks_for_one_box_for_ever() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
@@ -3077,11 +2461,6 @@ fn a_settled_pane_asks_for_one_box_for_ever() {
     // pane, the same readback, a **different picked region**. A field the arm
     // had stopped reading at all would satisfy the stability check above and
     // mean nothing.
-    //
-    // The control used to be a wheel notch, back when a notch re-cut the box.
-    // It cannot be one now — the whole point is that no gesture moves this — so
-    // the control is the one thing that legitimately does: the user picking
-    // somewhere else.
     painter.seen.lock().expect("stub painter mutex").clear();
     let repicked = picked_region(45.0, 45.0);
     pick_region(&mut h, 1, repicked);

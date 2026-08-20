@@ -18,48 +18,16 @@ use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// `pub`, not `pub(crate)`: `rustdar-app`'s described-job dispatch tests
-/// seed a live registry with alerts through `apply_fetch_result`, which takes
-/// a type-erased payload the handler downcasts to exactly this — so the type
-/// has to be nameable where the test constructs it.
+/// construct this type directly.
 pub struct NwsAlertFetchResult(
     pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
 );
 
 /// [`Assembled`]: the national alert feed is one request, and the UGC zone
-/// boundaries most alerts reference instead of carrying geometry are one
-/// request **each** — a thousand or more on a busy day, any of which can fail
-/// on its own. `ActiveAlerts::zones` is the report of what that pass managed,
-/// and the layer holding this round has no `set_data` left to ignore it with.
-///
-/// Observed before it did: **212 of 297 warnings absent from the map under a
-/// fully green status line.**
-///
-/// # That number's causes are closed, and this declaration is not thereby dead
-///
-/// The zone-geometry measurement then put every cause against all 11,651
-/// published NWS zones plus two live rounds, and found the two real ones were
-/// **ours**: 227 zones served as a `GeometryCollection` the parser did not
-/// know, and a simplifier eating 26,963 of 44,579 polygon parts. Its top row is
-/// the one to read here — [`Http`], [`Unreachable`] and [`Unreadable`] fired
-/// **0** times, twice — and set beside the paragraph above, it says the
-/// opposite of what that paragraph says.
-///
-/// Both are true. A round is assembled because its parts **can** fail
-/// separately, never because they were failing on the day somebody measured.
-/// Zero across two rounds from one machine is not a property of a thousand
-/// independent requests over a network; the 212-of-297 event was itself
-/// 198 × `Http(503)`, which is the row now reading zero; and the web build
-/// reaches these same URLs through CORS, where a refusal arrives as
-/// `Unreachable` wearing the browser's opaque `TypeError`.
-///
-/// What the zone work changed is how *often* this report comes back non-empty,
-/// which was never the argument for keeping it. What would change the shape is
-/// the zone pass ceasing to be one request per zone.
-///
+/// boundaries most alerts reference are one request **each** — a thousand or
+/// more on a busy day. Observed before this: **212 of 297 warnings absent from
+/// the map under a fully green status line.**
 /// [`Assembled`]: crate::fetch_policy::Assembled
-/// [`Http`]: crate::nws::zones::ZoneFailure::Http
-/// [`Unreachable`]: crate::nws::zones::ZoneFailure::Unreachable
-/// [`Unreadable`]: crate::nws::zones::ZoneFailure::Unreadable
 impl crate::fetch_policy::FetchRound for NwsAlertFetchResult {
     type Shape = crate::fetch_policy::Assembled;
 }
@@ -99,17 +67,14 @@ impl OverlayItem for AlertItem {
                 "Expires".into(),
                 prefs.timezone.format_rfc3339(&alert.expires),
             ),
-            // The CAP triple, parsed since the beginning and never shown
-            // until now. `Debug` is the variant name — the CAP vocabulary
-            // itself ("Severe", "Immediate", "Observed") — and an alert whose
-            // value the parser did not recognise honestly reads "Unknown".
+            // The CAP triple. `Debug` is the variant name — the CAP vocabulary
+            // itself — and an unrecognised value honestly reads "Unknown".
             ("Severity".into(), format!("{:?}", alert.severity)),
             ("Urgency".into(), format!("{:?}", alert.urgency)),
             ("Certainty".into(), format!("{:?}", alert.certainty)),
         ];
         // Onset and ends are optional in the feed; a row is added only where
-        // the alert carries one — unlike the CAP triple, which every alert
-        // has, absence here is the alert's own shape rather than a gap.
+        // the alert carries one.
         if let Some(onset) = &alert.onset {
             grid.push(("Onset".into(), prefs.timezone.format_rfc3339(onset)));
         }
@@ -164,8 +129,7 @@ impl OverlayItem for AlertItem {
 
 pub(crate) struct NwsAlertHandler {
     pub state: OverlayState<Vec<Arc<AlertItem>>, Assembled>,
-    /// User-dismissed alert IDs. Pruned on refetch so an ID reused upstream
-    /// does not stay hidden forever.
+    /// User-dismissed alert IDs, pruned on refetch.
     pub hidden_alerts: HashSet<String>,
     /// Empty means the whole overlay is off — see `is_enabled`.
     pub enabled_categories: HashSet<AlertCategory>,
@@ -180,21 +144,16 @@ impl NwsAlertHandler {
         }
     }
 
-    /// Whether this alert would paint: its category is on and the user has not
-    /// hidden it. The one filter, so the count, the signature, the status line
-    /// and the clickable set cannot drift apart.
+    /// Whether this alert would paint: category on and not hidden. The one
+    /// filter, so count, signature, status line and clickable set cannot drift.
     fn is_drawn(&self, item: &AlertItem) -> bool {
         self.enabled_categories.contains(&item.alert.category)
             && !self.hidden_alerts.contains(&item.alert.id)
     }
 
-    /// How many alerts the user's filters let through — allocation-free, unlike
-    /// counting `clickable_items()`, which builds a `Vec` and an `Arc` per
-    /// alert for a number.
-    ///
-    /// Not the same as [`painted_count`](NwsAlertHandler::painted_count), and
-    /// the difference is the bug: an alert whose zone boundaries did not resolve
-    /// is let through by every filter and paints nothing.
+    /// How many alerts the user's filters let through. Not the same as
+    /// [`painted_count`](NwsAlertHandler::painted_count): an alert whose zone
+    /// boundaries did not resolve passes every filter and paints nothing.
     fn drawn_count(&self) -> usize {
         self.state
             .data
@@ -204,12 +163,8 @@ impl NwsAlertHandler {
     }
 
     /// How many alerts actually put ink on the map: let through *and* holding
-    /// geometry.
-    ///
-    /// A zone-based alert whose boundaries all failed to resolve keeps its place
-    /// in the list — it is not dropped and nothing is invented for it — so it is
-    /// `is_drawn` and paints nothing. Counting it as shown is what let the row
-    /// read `297 shown` over a map with 85 warnings on it.
+    /// geometry. A zone-based alert whose boundaries all failed is `is_drawn`
+    /// and paints nothing.
     fn painted_count(&self) -> usize {
         self.state
             .data
@@ -218,19 +173,9 @@ impl NwsAlertHandler {
             .count()
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder
-    /// `prepare_job` answers from, kept a private helper so a second dispatch
-    /// path could not quietly capture different state.
-    ///
-    /// The rows are [`rasterize::AlertPaint`], not whole [`NwsAlert`]s: the
-    /// id, the category and the geometry are everything the raster reads, and
-    /// the described job serialises this struct onto a message port — prose
-    /// fields the raster never draws would be bytes on the wire per raster.
-    ///
-    /// The geometry rides an `Arc` from parse time, so the features column of
-    /// a row is a refcount bump — this method runs per raster dispatch on the
-    /// frame thread, and the national feed is thousands of rings on an active
-    /// day.
+    /// What the rasterizer reads, captured once. The rows are
+    /// [`rasterize::AlertPaint`], not whole [`NwsAlert`]s: prose fields the
+    /// raster never draws would be bytes on the wire per raster.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::AlertsInput> {
         if self.state.data.is_empty() {
             return None;
@@ -280,12 +225,9 @@ impl OverlayHandler for NwsAlertHandler {
         !self.enabled_categories.is_empty()
     }
 
-    /// The master toggle over a layer whose "enabled" is really a category
-    /// set. Off clears the set; on restores [`AlertCategory::ALL`] **only when
-    /// the set is empty**, so flipping the master off and on loses the user's
-    /// subset — accepted, because remembering it would be a shadow copy of
-    /// `enabled_categories` that persistence and the category toggles would
-    /// both have to keep honest.
+    /// The master toggle over a layer whose "enabled" is really a category set.
+    /// Off clears the set; on restores [`AlertCategory::ALL`] **only when the
+    /// set is empty**, so flipping the master off and on loses the user's subset.
     fn set_enabled(&mut self, enabled: bool) {
         let was = self.is_enabled();
         if enabled {
@@ -295,25 +237,15 @@ impl OverlayHandler for NwsAlertHandler {
         } else {
             self.enabled_categories.clear();
         }
-        // The drawn set changed, so cached textures must know — the same bump
-        // the per-category toggles make in `apply_control`.
+        // The drawn set changed, so cached textures must know.
         if was != self.is_enabled() {
             self.state.data_generation = self.state.data_generation.wrapping_add(1);
         }
     }
 
-    /// E.g. `"3 shown - W/Wa/Adv/Oth"`: how many alerts are on the map, and which
-    /// categories are letting them through. Counted through
-    /// [`painted_count`] and [`drawn_count`], not by taking the length of
-    /// `clickable_items`, which builds a `Vec` and an `Arc` per alert for a
-    /// number this reads straight off the data.
-    ///
-    /// **`"85 of 297 shown"`** when the two disagree, which is the honest
-    /// reading of a poll whose zone boundaries did not all resolve. It used to
-    /// say `297 shown` there: every one of those alerts passed every filter, and
-    /// 212 of them had no shape to put on the map. The registry adds the
-    /// `! incomplete` mark ahead of this line and the reasons behind the layer's
-    /// options; the split count is the part that is countable at a glance.
+    /// E.g. `"3 shown - W/Wa/Adv/Oth"`. **`"85 of 297 shown"`** when
+    /// [`painted_count`] and [`drawn_count`] disagree, which is the honest
+    /// reading of a poll whose zone boundaries did not all resolve.
     ///
     /// [`drawn_count`]: NwsAlertHandler::drawn_count
     /// [`painted_count`]: NwsAlertHandler::painted_count
@@ -328,9 +260,7 @@ impl OverlayHandler for NwsAlertHandler {
         } else {
             format!("{painted} of {allowed}")
         };
-        // Walked from `AlertCategory::ALL`, not from a list spelled out here:
-        // a hand-written list is what let `Other` be enabled and still go
-        // unnamed, and before that unenabled and uncounted.
+        // Walked from `AlertCategory::ALL`, not from a list spelled out here.
         let cats: Vec<&str> = AlertCategory::ALL
             .into_iter()
             .filter(|category| self.enabled_categories.contains(category))
@@ -343,41 +273,14 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.data_generation
     }
 
-    /// The **warning-set** signature: a fold over the alerts that would draw —
-    /// category-enabled and not hidden — rather than the fetch counter. NWS
-    /// alerts auto-poll every two minutes and the active set is usually
-    /// unchanged, so a consumer keyed on [`data_generation`] would re-render on
-    /// every poll for nothing; this token moves when the drawn set moves (a
-    /// warning issued, expired, hidden, or a whole category toggled off). XOR
-    /// of per-alert hashes, so it is order-free the way a set is, and ids are
-    /// unique within a response.
+    /// The **warning-set** signature: a fold over the alerts that would draw,
+    /// rather than the fetch counter — NWS alerts poll every two minutes and the
+    /// active set is usually unchanged. XOR of per-alert hashes, so it is
+    /// order-free the way a set is.
     ///
-    /// # The id alone is not the picture, and that made a warning invisible
-    ///
-    /// Folding only the id was wrong for a **zone-based** alert, and those are
-    /// ordinary: [`crate::nws::alert`] admits an alert with `affectedZones` and
-    /// no `geometry`, carrying **no features at all**, and
-    /// [`crate::nws::zones::resolve_zone_geometries`] fills them in per poll —
-    /// silently dropping any zone whose fetch failed, with no retry. So the
-    /// same id legitimately arrives drawing nothing on one poll and drawing its
-    /// counties on the next. Same id, same drawn count, and before
-    /// `features.len()` joined the fold, the same token: the consumer kept its
-    /// raster and the warning stayed invisible until the user happened to pan
-    /// or zoom. Counting the features also catches the partial case — three of
-    /// five zones resolved, then all five.
-    ///
-    /// What it does **not** distinguish is a same-length set of *different*
-    /// zones (one zone's fetch failing as another's recovers). That is a
-    /// narrower residue than the bug it closes, and the alternative — hashing
-    /// the rings themselves — is a walk over every polygon in the country on a
-    /// national-coverage day, on a method whose contract is that it is cheap
-    /// enough to call every frame.
-    ///
-    /// A polygon *moving* under a stable id is not a case at all: `id` is the
-    /// NWS per-message URN, and an updated warning arrives as a new message
-    /// under a new id.
-    ///
-    /// [`data_generation`]: OverlayHandler::data_generation
+    /// `features.len()` is in the fold as well as the id: a **zone-based** alert
+    /// legitimately draws nothing on one poll and its counties on the next under
+    /// the same id, so an id-only fold left the warning invisible.
     fn content_signature(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut folded = 0u64;
@@ -426,11 +329,8 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.data.len()
     }
 
-    /// The alerts a click can land on, each borrowing its own polygons.
-    ///
-    /// The national feed carries one feature per affected zone, so this is
-    /// thousands of rings on an active day; they are lent, never copied, and
-    /// the call only happens on a frame with a click to resolve.
+    /// The alerts a click can land on, each borrowing its own polygons —
+    /// thousands of rings on an active day, lent and never copied.
     fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         self.state
             .data
@@ -472,8 +372,7 @@ impl OverlayHandler for NwsAlertHandler {
                     .map(|alert| Arc::new(AlertItem { alert }))
                     .collect();
                 // The coverage report travels with the data it describes: a
-                // round that placed 85 of 297 warnings is a good answer, keeps
-                // its fresh clock, and is still marked for the 212 it did not.
+                // round that placed 85 of 297 warnings keeps its fresh clock.
                 self.state
                     .set_data_with_coverage(items, zones.completeness());
             }
@@ -529,9 +428,8 @@ impl OverlayHandler for NwsAlertHandler {
         let mut items = vec![ControlItem::Heading {
             text: "NWS Alerts".into(),
         }];
-        // One toggle per category, walked from `AlertCategory::ALL` rather
-        // than written out: a category with no toggle is a category the user
-        // cannot turn on, and `Other` had none.
+        // One toggle per category, walked from `AlertCategory::ALL`: a category
+        // with no toggle is a category the user cannot turn on.
         items.extend(
             AlertCategory::ALL
                 .into_iter()
@@ -542,11 +440,8 @@ impl OverlayHandler for NwsAlertHandler {
                 }),
         );
 
-        // Ungated on enabled (the every-option rule, M9.1): a hidden
-        // layer's options stay visible and editable - edits take effect
-        // when the eye shows it again - Refresh still fetches (nothing
-        // on the fetch path reads enabled), and the status lines keep
-        // reporting.
+            // Ungated on enabled: a hidden layer's options stay visible and
+            // editable, and the status lines keep reporting.
         items.push(ControlItem::ButtonRow {
             buttons: vec![ControlButton {
                 id: "refresh",
@@ -561,19 +456,12 @@ impl OverlayHandler for NwsAlertHandler {
             });
         }
         if self.has_data() {
-            // `drawn_count`, not `clickable_items().len()`: the inspector
-            // panel rebuilds its controls every frame it is open, and the old
-            // spelling allocated a `Vec` and an `Arc` per alert to read a
-            // length off it.
             let allowed = self.drawn_count();
             let painted = self.painted_count();
             items.push(ControlItem::InfoText {
                 text: if painted == allowed {
                     format!("{allowed} alerts shown")
                 } else {
-                    // The same split the stack row carries. The completeness
-                    // note above says why; this says how many, in the same
-                    // words as the row that sent the user here.
                     format!("{painted} of {allowed} alerts shown")
                 },
             });
@@ -599,10 +487,8 @@ impl OverlayHandler for NwsAlertHandler {
         if update.id == "refresh" {
             return ControlEffect::Fetch;
         }
-        // Resolved through `AlertCategory::from_control_id`, so the set of
-        // toggles this accepts is the same enumeration `controls` offers. The
-        // two used to be independent lists of three ids each, which is how a
-        // fourth category ended up with no way to turn it on.
+        // Resolved through `AlertCategory::from_control_id`, so the toggles this
+        // accepts are the same enumeration `controls` offers.
         let Some(category) = AlertCategory::from_control_id(update.id) else {
             return ControlEffect::None;
         };
@@ -624,20 +510,13 @@ impl OverlayHandler for NwsAlertHandler {
         ControlEffect::None
     }
 
-    /// `known_categories` records which categories *this build offered a
-    /// toggle for*, beside the ones the user left on. It exists so
-    /// [`deserialize_state`] can tell "the user turned this off" apart from
-    /// "the build that saved this had no way to turn it on" — see there.
-    ///
-    /// [`deserialize_state`]: OverlayHandler::deserialize_state
+    /// `known_categories` records which categories *this build offered a toggle
+    /// for*, so `deserialize_state` can tell "the user turned this off" apart from
+    /// "the build that saved this had no way to turn it on".
     fn serialize_state(&self) -> serde_json::Value {
-        // In `ALL`'s declaration order, never the `HashSet`'s: a set's
-        // iteration order is per-instance noise, so writing it raw makes
-        // save→load→save produce a *different file* every reopen — the
-        // instability the config fixpoint test
-        // (`a_current_config_reaches_its_save_fixpoint_in_one_round_trip`)
-        // exists to catch. The value is a set either way; only the wire
-        // order is pinned here.
+        // In `ALL`'s declaration order, never the `HashSet`'s: a set's iteration
+        // order is per-instance noise, so writing it raw makes save→load→save
+        // produce a *different file* every reopen.
         let enabled: Vec<AlertCategory> = AlertCategory::ALL
             .into_iter()
             .filter(|category| self.enabled_categories.contains(category))
@@ -648,18 +527,9 @@ impl OverlayHandler for NwsAlertHandler {
         })
     }
 
-    /// A category the saving build never offered is **not** a category the
-    /// user declined, so it comes back on.
-    ///
-    /// Without this, the fix for the unreachable `Other` category would have
-    /// reached only new installs: every existing user carries a persisted set
-    /// of exactly three, saved by a build whose control list had three
-    /// toggles, and restoring it verbatim would keep every Air Quality Alert
-    /// off their map forever while the new toggle sat there reading "off" as
-    /// though they had chosen it.
-    ///
-    /// An **empty** set is left alone: that is the master toggle off, a
-    /// deliberate state, and widening it would turn the whole layer back on.
+    /// A category the saving build never offered is **not** a category the user
+    /// declined, so it comes back on. An **empty** set is left alone: that is
+    /// the master toggle off.
     fn deserialize_state(&mut self, value: serde_json::Value) {
         if let Some(cats) = value
             .get("enabled_categories")
@@ -688,7 +558,6 @@ mod tests {
     use crate::nws::zones::ZoneResolution;
     use crate::types::{HatchPattern, OverlayFeature};
 
-    /// A minimal alert with geometry, identified by `id`.
     fn alert(id: &str, event: &str) -> NwsAlert {
         let polygons = vec![vec![vec![(35.0, -97.0), (35.5, -97.0), (35.5, -96.5)]]];
         let (fill, stroke) = crate::nws::colors::alert_color(event);
@@ -720,15 +589,10 @@ mod tests {
         }
     }
 
-    /// One good round of alerts that asked nothing of zone resolution — every
-    /// alert carrying its own geometry.
     fn whole(alerts: Vec<NwsAlert>) -> FetchPayload {
         Box::new(NwsAlertFetchResult(Ok(ActiveAlerts::whole(alerts))))
     }
 
-    /// A round whose zone resolution came up short, exactly as the fetch path
-    /// delivers one: the alerts that did resolve, beside the report of what did
-    /// not.
     fn with_zones(alerts: Vec<NwsAlert>, zones: ZoneResolution) -> FetchPayload {
         Box::new(NwsAlertFetchResult(Ok(ActiveAlerts { alerts, zones })))
     }
@@ -740,8 +604,7 @@ mod tests {
     }
 
     /// A **zone-based** alert exactly as the parser admits one: `affectedZones`
-    /// listed, no `geometry`, and `zone_count` features — which is `0` on a
-    /// poll whose zone fetches all failed, and one per zone once they resolve.
+    /// listed, no `geometry`, and `zone_count` features.
     fn zone_alert(id: &str, event: &str, zone_count: usize) -> NwsAlert {
         let mut alert = alert(id, event);
         alert.affected_zones = (0..3)
@@ -771,19 +634,8 @@ mod tests {
     }
 
     /// **A warning that gains its polygons across a poll must move the token,
-    /// or it stays invisible.**
-    ///
-    /// The id alone cannot see this and the drawn count cannot either.
-    /// `nws::alert` admits a zone-based warning with no geometry and no
-    /// features; `nws::zones::resolve_zone_geometries` fills them per poll and
-    /// silently drops a zone whose fetch failed, with no retry. So poll *N* is
-    /// the same id drawing nothing and poll *N+1* is the same id drawing three
-    /// counties — one alert either way, `is_drawn` true either way. A consumer
-    /// keyed on a token that did not move keeps its raster, and the warning is
-    /// absent from the map until the user happens to pan or zoom.
-    ///
-    /// The partial recovery is asserted too: two of three zones is not the same
-    /// picture as three of three, and the fetch really does deliver that.
+    /// or it stays invisible.** Poll *N* is the same id drawing nothing and poll
+    /// *N+1* the same id drawing three counties.
     #[test]
     fn a_warning_that_gains_its_zone_polygons_moves_the_signature() {
         let mut handler = handler_with(vec![zone_alert("a", "Tornado Warning", 0)]);
@@ -808,7 +660,6 @@ mod tests {
              nothing re-rasterizes and the warning stays off the map",
         );
 
-        // And the partial case: some zones resolved, then the rest.
         handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 2)]));
         assert_ne!(
             handler.content_signature(),
@@ -817,12 +668,8 @@ mod tests {
         );
     }
 
-    /// The signature names the **set**, not the fetch: a refetch returning
-    /// the same warning ids must keep it, which is exactly what
-    /// `data_generation` — bumped on every `set_data` — cannot do. This is
-    /// the mutation the method exists to be different from: swap the body
-    /// for `self.data_generation()` and this test fails on the second
-    /// fetch.
+    /// The signature names the **set**, not the fetch: a refetch returning the
+    /// same warning ids must keep it, which `data_generation` cannot do.
     #[test]
     fn a_refetch_of_the_same_warning_set_keeps_the_signature() {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
@@ -841,14 +688,11 @@ mod tests {
         );
     }
 
-    /// Every way the drawn set can change moves the signature: a new
-    /// warning, an expiry, a hide, a category turned off.
     #[test]
     fn every_change_to_the_drawn_set_moves_the_signature() {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
         let one_warning = handler.content_signature();
 
-        // A second warning issues mid-session.
         handler.apply_fetch_result(whole(vec![
             alert("a", "Tornado Warning"),
             alert("b", "Severe Thunderstorm Warning"),
@@ -856,7 +700,6 @@ mod tests {
         let two_warnings = handler.content_signature();
         assert_ne!(two_warnings, one_warning, "a new warning must move it");
 
-        // The first expires out of the feed.
         handler.apply_fetch_result(whole(vec![alert("b", "Severe Thunderstorm Warning")]));
         let b_only = handler.content_signature();
         assert_ne!(b_only, two_warnings, "an expiry must move it");
@@ -865,7 +708,6 @@ mod tests {
             "a different single warning is a different set",
         );
 
-        // The user hides the survivor.
         handler.hidden_alerts.insert("b".to_string());
         assert_ne!(
             handler.content_signature(),
@@ -874,7 +716,6 @@ mod tests {
         );
         handler.hidden_alerts.clear();
 
-        // The whole category goes off.
         handler.enabled_categories.remove(&AlertCategory::Warning);
         assert_ne!(
             handler.content_signature(),
@@ -883,16 +724,9 @@ mod tests {
         );
     }
 
-    /// **`shown` means on the map, not past the filters.**
-    ///
-    /// The two used to be the same number and they are not: an alert whose zone
+    /// **`shown` means on the map, not past the filters.** An alert whose zone
     /// boundaries did not resolve is let through by every filter and paints
-    /// nothing. Counting it as shown is what let this row read `297 shown` over
-    /// a map with 85 warnings on it — a lie assembled entirely out of true
-    /// statements about the feed.
-    ///
-    /// The split spelling appears only when the two disagree, so a healthy layer
-    /// still reads `2 shown` rather than the arithmetic `2 of 2`.
+    /// nothing. The split spelling appears only when the two disagree.
     #[test]
     fn the_status_line_splits_what_is_on_the_map_from_what_passed_the_filters() {
         let mut handler = NwsAlertHandler::new();
@@ -922,8 +756,6 @@ mod tests {
             "two alerts with no shape must not be counted as shown",
         );
 
-        // The user hides the one alert that *is* drawn: now nothing is on the
-        // map and only two alerts are even eligible.
         handler.hidden_alerts.insert("a".to_string());
         assert_eq!(
             handler.status_line().as_deref(),
@@ -931,7 +763,6 @@ mod tests {
             "both numbers must move with the filters, not just the denominator",
         );
 
-        // And once the boundaries arrive, the split spelling goes away.
         handler.hidden_alerts.clear();
         handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
         assert_eq!(
@@ -940,9 +771,6 @@ mod tests {
         );
     }
 
-    /// The status line counts what would *draw* — category-filtered and
-    /// hide-filtered — and names the categories letting it, so the row under
-    /// "NWS Alerts" reads as the map's own state rather than the feed's.
     #[test]
     fn the_status_line_counts_the_drawn_set_and_names_the_categories() {
         let mut handler = handler_with(vec![
@@ -976,9 +804,8 @@ mod tests {
         );
     }
 
-    /// The master toggle round-trips through the category set: off clears it,
-    /// on restores the defaults — and on over a *partial* set leaves the
-    /// user's subset alone, because the layer is already on.
+    /// The master toggle round-trips through the category set: off clears it, on
+    /// restores the defaults, and on over a *partial* set changes nothing.
     #[test]
     fn the_master_toggle_clears_and_restores_the_category_set() {
         let mut handler = NwsAlertHandler::new();
@@ -1005,9 +832,6 @@ mod tests {
         );
     }
 
-    /// The popup's grid carries the CAP severity/urgency/certainty triple —
-    /// parsed since the beginning, displayed only now — and the optional
-    /// onset/ends rows exactly where the alert carries them.
     #[test]
     fn the_popup_grid_carries_the_cap_triple_and_the_optional_times() {
         let mut with_times = alert("a", "Tornado Warning");
@@ -1055,12 +879,6 @@ mod tests {
 
     /// The count the inspector reads and the set a click can land on are the
     /// same set, under every combination of the two filters.
-    ///
-    /// The panel used to say `clickable_items().len()`, which was the same
-    /// number by construction and built a `Vec` and an `Arc` per alert, every
-    /// frame the panel was open, to read a length off it. Now that they are
-    /// two pieces of code they can disagree, so this is the pin that they do
-    /// not.
     #[test]
     fn the_shown_count_is_the_clickable_set() {
         let mut handler = handler_with(vec![
@@ -1114,22 +932,11 @@ mod tests {
             .collect()
     }
 
-    /// **Every product NWS can send must be paintable by a fresh install.**
-    ///
-    /// This is the check that was missing, and it is deliberately driven by
-    /// *NWS's* enumeration rather than by `AlertCategory::ALL`: asserting that
-    /// our four variants are all enabled would only assert that our list
-    /// equals our list, and the defect lived precisely in the gap between the
-    /// enum and the set of toggles somebody wrote out by hand.
-    ///
-    /// Before the fix, 11 of the 111 published event types classified as
-    /// `Other` — Air Quality Alert, Civil Emergency Message, Evacuation
-    /// Immediate, Child Abduction Emergency, Blue Alert, Local Area Emergency,
-    /// 911 Telephone Outage, Administrative Message, Extreme Fire Danger,
-    /// Short Term Forecast, Test — and no code path anywhere inserted `Other`
-    /// into `enabled_categories`, so all 11 were unpaintable by construction.
-    /// In the live sample that found it, 25 of 271 active alerts were Air
-    /// Quality Alerts.
+    /// **Every product NWS can send must be paintable by a fresh install**, and
+    /// driven by *NWS's* enumeration rather than by `AlertCategory::ALL`:
+    /// asserting our four variants are all enabled would only assert that our
+    /// list equals our list. 11 of the 111 published event types classify as
+    /// `Other`, and 25 of 271 active alerts in the live sample were Air Quality.
     #[test]
     fn every_nws_event_type_lands_in_a_category_a_fresh_install_draws() {
         let handler = NwsAlertHandler::new();
@@ -1153,13 +960,9 @@ mod tests {
         );
     }
 
-    /// **Every category must have a toggle, and the toggle must work.**
-    ///
-    /// The other half of the same defect: `Other` had no `ControlItem::Toggle`
-    /// and `apply_control` accepted no id that resolved to it, so even a user
-    /// who knew alerts were missing had no way to ask for them. Driving both
-    /// the control list and the handler from `AlertCategory::ALL` is what
-    /// makes that unrepresentable; this pins it.
+    /// **Every category must have a toggle, and the toggle must work.** `Other`
+    /// had no `ControlItem::Toggle` and `apply_control` accepted no id resolving
+    /// to it.
     #[test]
     fn every_category_has_a_toggle_that_turns_it_on_and_off() {
         let mut handler = NwsAlertHandler::new();
@@ -1210,13 +1013,9 @@ mod tests {
         }
     }
 
-    /// **The count that would have revealed the gap excluded it too.**
-    ///
+    /// **The count that would have revealed the gap excluded it too**:
     /// `drawn_count` and `painted_count` both filter on `is_drawn`, which was
-    /// permanently false for `Other`, so the status line reported a confident
-    /// number that was wrong by exactly the set the user could not see. An Air
-    /// Quality Alert now counts and is clickable like any other product, and
-    /// turning its category off takes it out of both.
+    /// permanently false for `Other`.
     #[test]
     fn an_air_quality_alert_is_drawn_counted_and_clickable() {
         let mut handler = handler_with(vec![
@@ -1241,19 +1040,14 @@ mod tests {
             Some("2 shown - W/Wa/Adv/Oth"),
         );
 
-        // And it is a real filter, not an unconditional pass.
         handler.enabled_categories.remove(&AlertCategory::Other);
         assert_eq!(handler.drawn_count(), 1);
         assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Wa/Adv"));
     }
 
     /// A set persisted by a build that had three toggles is not a user who
-    /// turned the fourth off — they were never offered it — so restoring it
-    /// must not carry the invisible category forward. Without this the fix
-    /// reaches new installs only, and every existing user keeps a map with no
-    /// air quality alerts on it.
-    ///
-    /// An empty set is the master toggle off and stays off.
+    /// turned the fourth off — they were never offered it. An empty set is the
+    /// master toggle off and stays off.
     #[test]
     fn a_category_the_saved_build_never_offered_comes_back_on() {
         let legacy = serde_json::json!({
@@ -1266,7 +1060,6 @@ mod tests {
             "a category with no toggle in the saving build was never declined",
         );
 
-        // A choice this build *did* offer is honoured.
         let mut handler = NwsAlertHandler::new();
         handler.deserialize_state(serde_json::json!({
             "enabled_categories": ["Warning"],
@@ -1278,7 +1071,6 @@ mod tests {
             "the user turned three categories off and they must stay off",
         );
 
-        // The master toggle off stays off.
         let mut handler = NwsAlertHandler::new();
         handler.deserialize_state(serde_json::json!({ "enabled_categories": [] }));
         assert!(
@@ -1287,8 +1079,6 @@ mod tests {
         );
     }
 
-    /// The fold is order-free: the same set in another order is the same
-    /// signature — feed order is not part of what gets drawn.
     #[test]
     fn the_signature_is_a_set_signature_not_a_sequence_signature() {
         let forward = handler_with(vec![

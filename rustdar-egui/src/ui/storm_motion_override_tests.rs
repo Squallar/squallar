@@ -1,6 +1,5 @@
 use super::*;
 
-/// Disabled means "use the vector the RPG published", not "use zero".
 #[test]
 fn a_disabled_override_yields_no_sample() {
     let o = StormMotionOverride::default();
@@ -13,10 +12,8 @@ fn a_disabled_override_yields_no_sample() {
     assert!(!s.motion.is_scit_average, "a typed vector is not the RPG's");
 }
 
-/// `DragValue` parses "nan" and "inf", and `f32::clamp` propagates NaN.
-/// A NaN reaching the dispatcher renders an all-NaN field *and*, because
-/// `NaN != NaN`, makes its change detector fire every frame — an unbounded
-/// re-render of every storm-relative pane that never settles.
+/// `DragValue` parses "nan" and "inf", and `f32::clamp` propagates NaN — a
+/// NaN fires the dispatcher's change detector every frame.
 #[test]
 fn a_non_finite_override_is_refused_rather_than_propagated() {
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
@@ -33,8 +30,6 @@ fn a_non_finite_override_is_refused_rather_than_propagated() {
         };
         assert!(dir.sample().is_none(), "direction {bad}");
     }
-    // The counterweight: ordinary values still pass, so "reject everything"
-    // is not how the test above is satisfied.
     let ok = StormMotionOverride {
         enabled: true,
         speed_kt: 0.0,
@@ -43,8 +38,7 @@ fn a_non_finite_override_is_refused_rather_than_propagated() {
     assert!(ok.sample().is_some(), "zero is a legitimate vector");
 }
 
-/// Two equal overrides must produce equal samples, or the dispatcher's
-/// change detector re-renders every frame even without a NaN.
+/// Two equal overrides must produce equal samples.
 #[test]
 fn equal_overrides_produce_equal_samples() {
     let a = StormMotionOverride {
@@ -61,9 +55,7 @@ fn equal_overrides_produce_equal_samples() {
     assert_ne!(a.sample(), c.sample());
 }
 
-/// The widget's ceiling is the one `DERIVED_OFFSET` was sized against. If
-/// this drifts upward, the worst-case derived value starts clamping and
-/// paints as data at the clamp instead of at its real magnitude.
+/// The widget's ceiling is the one `DERIVED_OFFSET` was sized against.
 #[test]
 fn the_speed_ceiling_is_the_one_the_encoding_was_sized_for() {
     assert_eq!(rustdar_radar::srm::MAX_OVERRIDE_SPEED_KT, 200.0);

@@ -2,19 +2,14 @@ use chrono::NaiveDateTime;
 use rustdar_geo::GeoBounds;
 use rustdar_source::id::LayerId;
 
-/// Configuration for radar site and time selection
 #[derive(Debug, Clone)]
 pub struct RadarConfig {
-    /// The radar site code (e.g., "KTLX" for Oklahoma City)
     pub site: String,
-    /// The timestamp for the radar scan (defaults to current time)
     pub timestamp: NaiveDateTime,
 }
 
 impl Default for RadarConfig {
     fn default() -> Self {
-        // Get current local time as naive datetime (without timezone info)
-        // This represents the local wall clock time
         let now = chrono::Local::now();
         let timestamp = now.naive_local();
 
@@ -33,17 +28,14 @@ pub enum GuiAction {
         site: String,
         pane_idx: usize,
     }, // Switch to a different radar site
-    /// Fetch overlay data for the given kind (initial load when layer enabled).
     FetchOverlay {
         kind: LayerId,
         pane_idx: usize,
     },
-    /// Re-fetch overlay data for the given kind (manual refresh).
     RefreshOverlay {
         kind: LayerId,
         pane_idx: usize,
     },
-    /// Request a background overlay rasterization for a pane.
     RenderOverlay {
         pane_idx: usize,
         overlay_kind: LayerId,
@@ -51,114 +43,56 @@ pub enum GuiAction {
         /// `texture.overdraw` — never by `OVERDRAW_FRACTION`, which the adapter
         /// may not have been able to honour.
         geo_bounds: GeoBounds,
-        /// Pixel dimensions and the overdraw they were sized for, already
-        /// reconciled with the adapter's `max_texture_dimension_2d`.
         texture: crate::overlay_cache::OverlayTexturePlan,
         /// The cache token this raster is being asked for — see
-        /// `ui_map_pane::overlay_cache_token`: the handler's content signature
-        /// (or the pane's own counter for `RadarSites`) mixed with the theme
-        /// the raster was asked in. Travels out with the request and
-        /// back onto [`crate::overlay_cache::OverlayTextureData`], which is
-        /// what makes a later frame able to say the picture has not moved.
+        /// `ui_map_pane::overlay_cache_token`.
         data_generation: u64,
         zoom: i32,
     },
-    /// Enable radar loop for a pane — triggers historical scan listing + fetch.
     EnableLoop {
         pane_idx: usize,
         lookback_secs: u64,
     },
-    /// Disable radar loop for a pane and drop cached frames.
     DisableLoop {
         pane_idx: usize,
     },
-    /// Toggle play/pause of the loop animation for a pane.
     ToggleLoopPlayback {
         pane_idx: usize,
     },
-    /// Step the loop one frame forward or backward.
     StepLoopFrame {
         pane_idx: usize,
         forward: bool,
     },
-    /// Seek to a specific frame index in the loop.
     SeekLoopFrame {
         pane_idx: usize,
         frame_index: usize,
     },
-    /// Navigate forward or backward by a time step (seconds).
     NavigateTime {
         pane_idx: usize,
         step_secs: i64,
     },
-    /// Step to the next or previous adjacent scan.
     NavigateOneScan {
         pane_idx: usize,
         forward: bool,
     },
-    /// Jump back to live mode (display latest available scan).
     JumpToLive {
         pane_idx: usize,
     },
-    /// Start the desktop serial GPS reader with the given config.
     StartGps {
         config: rustdar_nmea_serial::SerialConfig,
     },
-    /// Stop the desktop serial GPS reader.
     StopGps,
-    /// Turn the platform location service on at the user's request.
-    ///
-    /// A *gesture*, not a command: it clears the app's memory of having asked
-    /// and lets the location gate decide what that means, which on a platform
-    /// that has already refused is nothing at all. Raised by the Location
-    /// control and by `Reset to defaults`, which is the obvious way somebody
-    /// tries to get a dismissed prompt back.
-    ///
-    /// Deliberately not `StartGps`'s sibling. That one opens a serial port; this
-    /// one asks the operating system for a privilege.
     RequestLocation,
-    /// Turn the platform location service off at the user's request.
-    ///
-    /// Stops the stream. It cannot hand the permission back — no platform
-    /// offers an app a way to do that — so the control says "turn off" rather
-    /// than anything about revoking.
     StopLocation,
-    /// Open the system location settings page.
-    ///
-    /// The only thing on offer in the `Denied` state, and only on a platform
-    /// that has such a page. It is not a way to ask again — nothing this app
-    /// does can reverse a refusal — it is a shortcut to the place where the
-    /// user can, and it is raised from a click so it can never be mistaken for
-    /// the app opening Settings on its own.
     OpenLocationSettings,
     /// Build the voxel grid a 3D pane needs, if it is not already in hand.
-    ///
-    /// Emitted from inside the pane's own render arm, on every frame the pane
-    /// does not yet have the grid it wants. That sounds like a request storm and
-    /// is not: the handler is idempotent against the store it fills, and the
-    /// pane stops asking the moment the grid lands. Making it edge-triggered
-    /// instead would mean remembering across `reset_panes_for_site`,
-    /// `SwitchRadarSite` and a surface loss, which is three places to forget.
-    ///
-    /// A whole-volume grid is expensive — **150–200 ms** at the desktop shape,
-    /// measured — so the handler must dedupe on the target before it builds,
-    /// not after.
-    ///
-    /// **Level-triggered is safe only while that handler is synchronous**, and a
-    /// handler that posts the build to a worker has to add state of its own or
-    /// this fires a fresh job every frame until the first returns. The handler
-    /// carries the full note; it is repeated here because this variant's own
-    /// contract is what makes the requirement.
+    /// Level-triggered: re-emitted every frame until the grid lands, so the
+    /// handler must dedupe on the target before it builds (150–200 ms at the
+    /// desktop shape, measured) — safe only while that handler is synchronous.
     PrepareVolume {
         pane_idx: usize,
         target: crate::pane::VolumeTarget,
     },
-    /// This pane no longer needs whatever volume it was holding.
-    ///
-    /// Refcounted **by target** on the other side, not by pane: two panes on one
-    /// volume share one build and one GPU upload, so the grid goes when the last
-    /// of them lets go. Emitted when a 3D pane stops being one, and when the
-    /// volume it wants changes.
     ReleaseVolume {
         pane_idx: usize,
     },

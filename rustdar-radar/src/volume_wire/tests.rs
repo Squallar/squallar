@@ -20,8 +20,6 @@ fn moment(scale: f32, offset: f32, gates: &[u8]) -> MomentData {
     )
 }
 
-/// A pattern with a **distinctive value in every field**, so a round trip that
-/// quietly carried one of them would be visible.
 fn opinionated_pattern(angles: &[f64]) -> VolumeCoveragePattern {
     VolumeCoveragePattern::new(
         212,
@@ -69,7 +67,6 @@ fn opinionated_pattern(angles: &[f64]) -> VolumeCoveragePattern {
     )
 }
 
-/// Two sweeps, every moment slot exercised, every radial header distinct.
 fn a_volume() -> DecodedScan {
     let mut sweeps = Vec::new();
     for (sweep_index, elevation_number) in [1u8, 2u8].into_iter().enumerate() {
@@ -77,9 +74,6 @@ fn a_volume() -> DecodedScan {
             .map(|i| {
                 let has_dualpol = i % 2 == 0;
                 Radial::new(
-                    // Distinct per radial *within* a sweep: this is the field
-                    // `RenderInput::to_scan` stamps per sweep and this codec
-                    // does not.
                     1_600_000_000_000 + i64::from(i) + (sweep_index as i64) * 1000,
                     i * 7,
                     f32::from(i) * 0.5,
@@ -99,8 +93,7 @@ fn a_volume() -> DecodedScan {
                     has_dualpol.then(|| moment(2.8, 2.0, &[7, 8, 9])),
                     has_dualpol.then(|| moment(300.0, 0.0, &[11])),
                     // The seventh slot. Real WSR-88D volumes populate it on
-                    // every radial, and an earlier version of this codec
-                    // dropped it.
+                    // every radial.
                     (i != 1).then(|| {
                         nexrad_model::data::CFPMomentData::from_fixed_point(
                             2,
@@ -229,17 +222,12 @@ fn the_declared_nyquist_table_travels_including_what_contradicted_it() {
     );
 }
 
-/// The whole pattern crosses, field for field. Every one of these was set to
-/// a distinctive value on the way in, and an earlier version of this codec
-/// answered a neutral default for all but the first two.
 #[test]
 fn the_coverage_pattern_crosses_whole() {
     let original = a_volume();
     let back = DecodedScan::from_bytes(&original.to_bytes()).expect("round trip");
     let pattern = back.scan.coverage_pattern();
     assert_eq!(pattern, original.scan.coverage_pattern());
-    // Named individually as well, so a failure says which field moved rather
-    // than printing two 23-cut patterns side by side.
     assert_eq!(pattern.pattern_number().number(), 212);
     assert_eq!(pattern.version(), 13);
     assert_eq!(pattern.doppler_velocity_resolution(), 0.25);
@@ -275,8 +263,6 @@ fn the_coverage_pattern_crosses_whole() {
     assert!(cut.is_base_tilt_cut());
 }
 
-/// Whole-value equality, which is the property everything above is a
-/// readable decomposition of: a rebuilt volume **is** the decoded one.
 #[test]
 fn a_volume_is_equal_to_itself_through_the_wire() {
     let original = a_volume();
@@ -312,10 +298,6 @@ fn a_foreign_magic_or_version_is_refused() {
     assert!(DecodedScan::from_bytes(&wrong_version).is_none());
 }
 
-/// Every prefix is refused rather than decoding into a shorter volume. This is
-/// 60 MiB of untrusted bytes arriving in a browser tab; a truncation that
-/// produced a plausible half-volume would draw a picture of weather that
-/// stopped early.
 #[test]
 fn every_truncation_is_refused() {
     let bytes = a_volume().to_bytes();
@@ -328,12 +310,9 @@ fn every_truncation_is_refused() {
     }
 }
 
-/// An eighth moment from a newer sender sets a mask bit this build has no
-/// reader for. Skipping it would leave its bytes to be read as the next
-/// radial's header, which decodes into plausible nonsense.
 /// One sweep, one radial, no site, no cuts, no declared table and no moments —
 /// so every byte before the moment mask is fixed-width and the mask's offset
-/// can be *stated* rather than searched for.
+/// can be stated rather than searched for.
 fn a_minimal_volume() -> DecodedScan {
     let radial = Radial::new(
         0,
@@ -384,9 +363,6 @@ fn a_minimal_volume() -> DecodedScan {
 const MINIMAL_MASK_OFFSET: usize =
     2 + 1 + 1 + (2 + 1 + 4 + 1 + 1 + 3 + 4) + 4 + 4 + 4 + 1 + 4 + 8 + 2 + 4 + 4 + 2 + 1 + 4;
 
-/// An eighth moment from a newer sender sets a mask bit this build has no
-/// reader for. Skipping it would leave its bytes to be read as the next
-/// radial's header, which decodes into plausible nonsense.
 #[test]
 fn a_moment_mask_bit_this_build_does_not_have_is_refused() {
     let mut bytes = a_minimal_volume().to_bytes();
@@ -402,49 +378,17 @@ fn a_moment_mask_bit_this_build_does_not_have_is_refused() {
     assert!(DecodedScan::from_bytes(&bytes).is_none());
 }
 
-/// The bytes this version ships are **these** bytes.
-///
-/// # What was blind, exactly
-///
-/// [`a_foreign_magic_or_version_is_refused`] flips the version byte and checks
-/// that a decoder refuses it. That shows *a* check exists; it says nothing
-/// about what the number means. Nothing above fires for the developer who
-/// changes what [`DecodedScan::to_bytes`] writes and leaves [`VERSION`] alone —
-/// and every round-trip test here is written against `to_bytes` and
-/// `from_bytes` **together**, so a change made to both in step passes all of
-/// them. That is the whole of the danger: a same-width reorder, or a field
-/// appended with `byte_len` updated to match, leaves this file green while a
-/// page and a worker from opposite sides of a deploy read each other's volumes
-/// with the fields shifted.
-///
-/// A version bump is the safe act, and forgetting one is what ships that pair.
-/// This fails for the person who forgets, which is the direction the constant
-/// exists to cover and the direction nothing here covered.
-///
-/// # Why [`a_volume`] and not a fixture of its own
-///
-/// The three codecs beside this one keep a dedicated `layout_fixture` because
-/// their other fixtures go through beam geometry, and a digest of one of those
-/// would be a digest of whichever libm ran it. Nothing in [`a_volume`] is
-/// computed: every field is a literal, and the two arithmetic expressions in it
-/// (`f32::from(i) * 0.5` and `0.5 + elevation_number as f32`) are exact in
-/// binary at these magnitudes on every target. So the libm argument does not
-/// apply, and a second fixture would be strictly worse — [`a_volume`] already
-/// exercises every branch this encoder has (site present, all seven moment
-/// slots, both mask states for the clutter-filter moment, all four radial
-/// statuses, every coverage-pattern field, and a Nyquist table with a
-/// contradiction in it), and a smaller dedicated one would pin fewer of them.
-///
-/// The cost is that an edit to [`a_volume`] for some other test's sake moves
-/// this digest. That is a re-pin without a version bump, and the message below
-/// says so; it is the one case where writing the numbers alone is right.
-///
-/// # What travels inside this that has no pin of its own
-///
+/// The bytes this version ships are **these** bytes. Every round-trip test
+/// here is written against `to_bytes` and `from_bytes` together, so a
+/// same-width reorder made to both in step passes all of them and leaves a
+/// page and a worker from opposite sides of a deploy reading fields shifted.
+/// [`a_volume`] rather than a dedicated fixture: nothing in it is computed —
+/// every field is a literal, and its two arithmetic expressions are exact in
+/// binary at these magnitudes on every target — and it already exercises every
+/// branch this encoder has. An edit to it for another test's sake moves this
+/// digest; the message below says so.
 /// [`crate::nyquist::DeclaredNyquist::to_bytes`] is written into the middle of
-/// this payload and carries no version — it borrows this one. Its two halves
-/// are both exercised by [`a_volume`]'s table, so a change to *its* layout
-/// moves this digest, which is the pin it would otherwise need.
+/// this payload and carries no version — it borrows this one.
 #[test]
 fn the_volume_wire_layout_is_the_one_this_version_ships() {
     let bytes = a_volume().to_bytes();

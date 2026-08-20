@@ -1,63 +1,25 @@
 //! A render never inherits a texel from the render before it.
 //!
 //! `into_output` carries the RGBA texture and the value grid from one plan-view
-//! render to the next — see `POOLED_IMAGE` for why — and what makes that safe is
-//! that a buffer coming out of a slot is indistinguishable from a fresh
-//! allocation: zeroed everywhere for the texture, empty for the grid, and as
-//! long as the raster asking for it in both cases.
+//! render to the next, and what makes that safe is that a buffer coming out of
+//! a slot is indistinguishable from a fresh allocation: zeroed everywhere for
+//! the texture, empty for the grid, and as long as the raster asking for it.
 //!
-//! # Why this one has teeth, and where they are
+//! **Where the teeth are.** The texture's colouring pass has no `else` arm: a
+//! pixel whose value is `NaN` and whose bits are not the range-folded sentinel
+//! is left exactly as the buffer delivered it, and every real sweep leaves most
+//! of the raster that way. So a pooled texture handed out unreset shows the
+//! previous render, and the `blank` renders below claim no gate, so every one
+//! of their 4 M texels comes straight from whatever the slot held. The value
+//! grid is filled by `extend`, which **appends**, so a checkout that skipped
+//! the `clear` leaves every grid after the first longer than the raster it
+//! describes.
 //!
-//! The texture's colouring pass has **no `else` arm**. A pixel whose value is
-//! `NaN` and whose bits are not the range-folded sentinel is left exactly as the
-//! buffer delivered it, and every real sweep leaves most of the raster that way
-//! — the corners outside the disc, the gaps between radials, the whole of a
-//! sweep that paints nothing at all. `vec![0u8; n]` is what used to make those
-//! pixels transparent. So a pooled texture handed out unreset does not merely
-//! *risk* showing the previous render, it shows it, and the `blank` renders
-//! below are what see it: they claim no gate, so every one of their 4 M texels
-//! comes straight from whatever the slot held.
-//!
-//! That is the opposite of the position `tests/render_cell_pool.rs` and
-//! `tests/section_plane_pool.rs` are in. In both of those the pass that fills
-//! the buffer covers every element of it, so an end-to-end assertion about a
-//! pooled buffer's *contents* cannot fail however the reset is broken — and
-//! both files say so about themselves.
-//! The **value grid** is a different shape of claim and not a weaker one. It is
-//! filled by `extend`, which writes every element it produces, so nothing this
-//! file renders will ever observe a *stale value* — but `extend` **appends**,
-//! and that is what gives this file teeth on the grid too. A checkout that
-//! skipped the `clear` would leave every grid after the first longer than the
-//! raster it describes, which the length assertions below read directly and the
-//! `painted` counts read as a blank render claiming pixels: the assertion at the
-//! blank render is the first to fail, not the last. So the vacuity here is
-//! narrow — it covers what a *value* is, not how many there are.
-//!
-//! What this file cannot reach is the arithmetic:
-//! `render::tests::a_checked_out_value_grid_is_empty_at_every_length` poisons the
-//! slot directly at five lengths, including ones no raster side takes, and that
-//! is what fails a checkout which is right for the sides production happens to
-//! use and wrong in general. The two are deliberately not the same test: this one
-//! is about what a render *shows*, that one about what a checkout *is*.
-//!
-//! # Why this is an integration test
-//!
-//! The claim is about **process-wide** values. Two slots hold one buffer each,
-//! and which render receives them depends on which renders are running: inside
-//! the library's own test binary other tests rasterize on other threads and any
-//! of them can take a slot in between, so the buffer a render here gives back is
-//! not reliably the one the next render here receives, and the file would pass
-//! without ever exercising the case it is named for. An integration test file is
-//! its own process, and this is the only test in it, so the renders below are
-//! the only renders there are.
-//!
-//! Adding a second `#[test]` to this file would silently undo that: libtest
-//! would run the two in parallel and put the interleaving back.
-//!
-//! `tests/render_output_slot.rs` is the sibling that needed the same solitude
-//! for the other half of the claim — what the slot *is*, rather than what a
-//! render shows — and is a second binary rather than a second test here for
-//! exactly that reason.
+//! **Why an integration test.** The claim is about process-wide values, and
+//! inside the library's own test binary other tests rasterize on other threads
+//! and can take a slot in between. An integration test file is its own process,
+//! and this is the only test in it. Adding a second `#[test]` here would put
+//! the interleaving back.
 
 use nexrad_level3::model::{RadialPacket, RadialRun};
 use rustdar_radar::render::{recycle_image, recycle_values, render_level3_radial_to_image};
@@ -73,26 +35,13 @@ const RADIALS: usize = 360;
 /// Quarter-kilometre gates, so `bins` is four bins to the kilometre.
 const SCALE_FACTOR: f32 = 4.0;
 
-/// A side the pool has to serve that is not the base one. 1024 is what a browser
-/// renders its loop frames at, so this is a production size rather than an
+/// A side the pool has to serve that is not the base one. 1024 is what a
+/// browser renders its loop frames at.
 /// invented one.
 const SMALL_SIDE: usize = 1024;
 
 /// A full sweep of `bins` gates per radial, of which the first `painted_bins`
 /// carry a value and the rest are 0.
-///
-/// **Every packet here declares the same `bins`, so every render is projected
-/// at the same extent onto the same raster.** `plan_view_extent_km` frames a
-/// raster at the range its data reaches, so packets declaring different bin
-/// counts come back on different frames with each echo filling its own, and a
-/// small render stops being a small *picture*. What has to differ is how much
-/// of the shared frame is claimed, which is `painted_bins`. See
-/// `rustdar-radar/tests/render_cell_pool.rs`, whose fixture this mirrors.
-///
-/// `painted_bins` of 0 leaves every gate at 0, which the rasterizer skips
-/// (`<= 1`), so the packet is well-formed and renders successfully while
-/// claiming no pixel at all — the sharpest probe there is of what the texture
-/// arrived holding.
 fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
     assert!(
         painted_bins <= bins,
@@ -108,8 +57,8 @@ fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
                         return 0;
                     }
                     // A field that varies with both range and azimuth, so the
-                    // wide packet's outer ring cannot happen to agree with the
-                    // narrow one's.
+                    // wide packet's outer ring cannot agree with the narrow
+                    // one's.
                     let dbz =
                         20.0 + (j as f64 / 30.0).sin() * 25.0 + (i as f64 / 45.0).cos() * 15.0;
                     ((dbz * SCALE as f64 + OFFSET as f64).round() as i64).clamp(2, 250) as u16
@@ -131,12 +80,8 @@ fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
 }
 
 /// Render, then hand both buffers back exactly as the frontend does at their
-/// death sites — which is the only reason there is anything in the slots for the
+/// death sites.
 /// next call to inherit.
-///
-/// The value grid comes back as raw bits, which is what "byte-identical" has to
-/// mean for it: the grid is `NaN` wherever nothing was painted, and `NaN != NaN`
-/// would make a plain comparison of two correct results fail.
 fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> (Vec<u8>, Vec<u32>) {
     let out =
         render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side_ceiling_px)
@@ -165,31 +110,18 @@ fn painted(values: &[u32]) -> usize {
 fn a_render_never_inherits_a_texel_from_the_one_before_it() {
     // Every packet declares 920 bins, so every render below is a 230 km frame
     // on the same raster; what differs is how much of it is claimed. 120
-    // painted bins is a 30 km disc, and 920 is the whole paintable image — the
-    // render maps that radius onto `IMAGE_SIZE / 2` pixels and no sweep can
-    // claim a pixel outside it. Reaching the edge is load-bearing rather than
-    // tidiness: a reset that covered only the middle of the buffer, or missed
-    // the last few rows, has to fail here.
-    //
-    // The declared count is what holds the two on one frame. With 120 and 920
-    // *declared*, each render is framed at its own reach and fills 78.5% of its
-    // own raster — 3 236 167 against 3 293 133 pixels, 1.8% apart — and the
-    // annulus a leak has to show up in stops existing.
+    // painted bins is a 30 km disc, and 920 is the whole paintable image.
     const BINS: usize = 920;
     let narrow = packet(BINS, 120);
     let wide = packet(BINS, BINS);
     let blank = packet(BINS, 0);
 
-    // The reference: the narrow render on buffers nothing has used, because this
-    // is the process's first render and both slots are empty.
     let (narrow_image, narrow_values) = render(&narrow);
     let narrow_pixels = painted(&narrow_values);
 
     let (wide_image, wide_values) = render(&wide);
     let wide_pixels = painted(&wide_values);
 
-    // Neither claim below means anything unless both renders actually paint, and
-    // unless the wide one really is the larger of the two.
     assert!(
         narrow_pixels > 10_000,
         "the narrow packet has to paint for this test to say anything: {narrow_pixels} pixels"
@@ -204,9 +136,9 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         "the two packets have to render differently, or nothing below can fail"
     );
 
-    // The sharpest case, and the one an unreset texture cannot survive: a render
-    // that claims no gate at all, on the buffer the *wide* render has just given
-    // back. Every texel here is one the colouring pass does not write.
+    // The sharpest case: a render that claims no gate at all, on the buffer the
+    // *wide* render has just given back. Every texel here is one the colouring
+    // pass does not write.
     let (blank_image, blank_values) = render(&blank);
     assert_eq!(
         painted(&blank_values),
@@ -221,11 +153,7 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         blank_image.len()
     );
 
-    // And the ordinary case: the same render, on the buffers a wider one has
-    // just given back, is the render it was on fresh ones.
     let (again_image, again_values) = render(&narrow);
-    // The count first: it is the coarsest way a leak shows up and the only one of
-    // the three that prints something a reader can act on.
     assert_eq!(
         painted(&again_values),
         narrow_pixels,
@@ -240,9 +168,8 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         "the narrow render's value grid changed when it followed a wider one"
     );
 
-    // Now the shape half. This render needs a quarter of the bytes the last one
-    // gave back, so a slot has to be fitted to the render taking it rather than
-    // hand over the length it happens to be holding.
+    // This render needs a quarter of the bytes the last one gave back, so a slot
+    // has to be fitted to the render taking it.
     let (small_image, small_values) = render_at(&wide, SMALL_SIDE);
     assert_eq!(
         small_values.len(),
@@ -260,8 +187,7 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         painted(&small_values)
     );
 
-    // Truncating a buffer keeps whatever the cut-off bytes held, so a render at
-    // the smaller side has to come out as clean as one at the base side does.
+    // Truncating a buffer keeps whatever the cut-off bytes held.
     let (small_blank_image, small_blank_values) = render_at(&blank, SMALL_SIDE);
     assert_eq!(
         small_blank_values.len(),
@@ -281,10 +207,9 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         small_blank_image.len()
     );
 
-    // And back up. The slots now hold SMALL_SIDE² pixels against the IMAGE_SIZE²
+    // And back up: the slots hold SMALL_SIDE² pixels against the IMAGE_SIZE²
     // this asks for, so everything past the first quarter is memory the fit has
-    // just grown into place — and a blank render over it is what says the grown
-    // tail was zeroed rather than merely reserved.
+    // just grown into place.
     let (grown_blank_image, grown_blank_values) = render(&blank);
     assert_eq!(
         grown_blank_values.len(),
@@ -299,7 +224,6 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         grown_blank_image.len()
     );
 
-    // The same growth, painted, is byte-for-byte the render on fresh buffers.
     let (grown_image, grown_values) = render(&narrow);
     assert_eq!(
         painted(&grown_values),

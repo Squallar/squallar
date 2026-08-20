@@ -1,9 +1,4 @@
 //! What size a loop frame is dispatched at.
-//!
-//! The observable is the job that goes on the wire, read back through the same
-//! `JobRequest::from_bytes` a worker uses — because "the loop renders leaner"
-//! is a property of what is *asked for*, and by the time a frame comes back
-//! there is nothing left to distinguish a policy from a coincidence.
 
 use super::*;
 use crate::platform_double::TestBridge;
@@ -17,19 +12,15 @@ const SITE: &str = "KTLX";
 struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl JobSink for Recorder {
-    /// Serialises here, as the browser's own sink does, so what these tests
-    /// read back has been through `to_bytes`/`from_bytes` exactly as a job
-    /// crossing a real worker boundary has. The funnel stopped doing it on
-    /// every sink's behalf; a recorder standing in for the browser still must.
+    /// Serialises here, as the browser's own sink does.
     fn send(&self, _id: u64, request: JobRequest) -> Result<(), JobRequest> {
         self.0.lock().unwrap().push(request.to_bytes());
         Ok(())
     }
 }
 
-/// The smallest real volume a `RenderInput` extracts from, copied from
-/// `offload::tests` because it is the same requirement: a VCP that declares
-/// its cuts, so the extraction reaches a tilt rather than the refusal path.
+/// The smallest real volume a `RenderInput` extracts from, copied from `offload::tests`
+/// because it is the same requirement.
 fn sample_scan() -> nexrad_model::data::Scan {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, PulseWidth, Radial, RadialStatus, Scan, Sweep,
@@ -115,20 +106,9 @@ fn sample_scan() -> nexrad_model::data::Scan {
 
 /// A loop frame is dispatched at the loop ceiling, and a still frame on the
 /// same app at the one the device reported.
-///
-/// The pairing is the test. Asserting the loop's ceiling alone would pass
-/// against a dispatcher that never reads the device at all, which is a display
-/// that quietly lost the long-range raster; asserting both from one app says
-/// the ceiling is a decision the two paths make differently rather than a
-/// constant.
 #[test]
 fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    // Retired by the guard rather than by the call that used to sit below the
-    // decode: an `assert!`, two `expect`s and four `unwrap`s stand between the
-    // install and that call, and any of them unwinding past it would hand this
-    // port to the next test on this harness thread. See
-    // `offload::InstalledTestWorker`.
     let _worker =
         rustdar_worker::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
@@ -138,10 +118,6 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         .clone();
     app.gui.pane_mut(0).unwrap().site = SITE.to_string();
     app.render.ensure_pane_count(1);
-    // What the device said it can hold, which is what makes the still frame's
-    // ceiling meaningful — see `RenderDispatcher::set_raster_side_ceiling_px`.
-    // Deliberately not the long-range constant: a still frame that came back at
-    // 4096 here would be reading a literal rather than this number.
     const DEVICE_CEILING: usize = 8192;
     app.render.set_raster_side_ceiling_px(DEVICE_CEILING);
 
@@ -152,7 +128,6 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         lon: site.lon,
     };
 
-    // The loop path.
     assert!(
         app.spawn_loop_frame_render(
             0,
@@ -170,7 +145,6 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         "the fixture must actually reach the dispatch",
     );
 
-    // The still path, through the site's own render params.
     let (sender, _rx) = std::sync::mpsc::channel();
     app.render.spawn_level2_render(
         0,

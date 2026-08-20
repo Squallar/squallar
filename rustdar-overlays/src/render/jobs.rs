@@ -1,38 +1,12 @@
-//! The seven overlay codec rows — the overlay half of the job boundary,
-//! beside the rasterizers the rows run (WO-M6.2).
-//!
-//! Each row is a [`JobSpec`] over one of the wire-form inputs `rasterize`
-//! already defines, monomorphized into a [`JobCodec`] in [`JOB_CODECS`]. The
-//! codec bodies moved here **verbatim** (post-WO-M6.1 text) from
-//! `rustdar_worker::offload`, which keeps byte-identical duplicates until
-//! WO-M6.3 flips the frontend onto this table and deletes them — until that
-//! flip nothing routes through this module, and the frontend's framing
-//! digests over the duplicate bodies are the byte gate the flip must pass.
-//!
-//! **The code byte stays with the caller.** A row's payload is its kind's
-//! bytes *minus* the leading `OVERLAY_INPUT_*` code byte the frontend wire
-//! writes: codes are frontend-owned until WO-M7b's dense flip, so the caller
-//! consumes the code, selects the row, and hands the cursor over. The row
-//! order in [`JOB_CODECS`] — sites, alerts, outlooks, discussions, reports,
-//! glm, model — is load-bearing for exactly that flip, which assigns codes
-//! by registry index.
+//! The seven overlay codec rows — the overlay half of the job boundary.
 //!
 //! **The refusal contract**, shared by every `decode` here: `None` for a
 //! flag or enum byte outside this build's values, a string that is not
-//! UTF-8, or a buffer shorter than its own counts claim. The counts are read
-//! but never trusted with an allocation: rows, features, rings and points
-//! are pushed as they decode, so a count claiming four billion of anything
-//! fails on [`Reader::take`]'s first short read instead of reserving for a
-//! list the buffer cannot hold.
+//! UTF-8, or a buffer shorter than its own counts claim.
 //!
 //! **No clock.** GLM's `now` is captured at dispatch and travels on the
 //! wire; nothing in this module may read a clock of its own — a worker that
-//! did would render a picture the direct call would not. WO-M7.2 lands the
-//! grep ratchet that pins this for every jobs module.
-//!
-//! **No egui.** `run` answers each rasterizer's own alpha convention
-//! untouched; the premultiply that follows is egui arithmetic and stays in
-//! `rustdar_worker::offload`.
+//! did would render a picture the direct call would not.
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,10 +21,7 @@ use crate::render::rasterize::{
 };
 
 /// The seven overlay rows, in dispatch order: **sites, alerts, outlooks,
-/// discussions, reports, glm, model**. The order is load-bearing — WO-M7b's
-/// dense code flip assigns wire codes by index into the composed registry —
-/// and the labels are the shipped kind strings the frontend's framing rows
-/// print, byte for byte.
+/// discussions, reports, glm, model**. The order is load-bearing.
 pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<SitesJob>(),
     JobCodec::of::<AlertsJob>(),
@@ -74,12 +45,6 @@ impl JobSpec for SitesJob {
         out.extend_from_slice(&sites.zoom.to_le_bytes());
         out.push(u8::from(sites.is_dark));
         out.extend_from_slice(&sites.device_scale.to_le_bytes());
-        // Count-prefixed, then each row; the name last per row, length-
-        // prefixed. A name is a catalogue identifier — four bytes for
-        // every WSR-88D — so the `u16` is generous; the truncation keeps
-        // the encoder total on input it will never see, and a cut that
-        // split a multi-byte character is refused by the decoder's UTF-8
-        // check rather than misread.
         out.extend_from_slice(&(sites.sites.len() as u32).to_le_bytes());
         for site in &sites.sites {
             out.extend_from_slice(&site.lat.to_le_bytes());
@@ -171,9 +136,6 @@ impl JobSpec for AlertsJob {
             encode_str(out, &alert.id);
             out.push(AlertCategoryWire(alert.category).wire_code());
             out.extend_from_slice(&(alert.features.len() as u32).to_le_bytes());
-            // `features` rides an `Arc` since parse time; iteration derefs
-            // to the same rows in the same order — the bytes are those of
-            // the plain `Vec` this field used to be.
             for feature in alert.features.iter() {
                 encode_feature(out, feature);
             }
@@ -205,9 +167,6 @@ impl JobSpec for AlertsJob {
             alerts.push(crate::render::rasterize::AlertPaint {
                 id,
                 category,
-                // A fresh `Arc` per decode: equality with the encoded side
-                // is value equality through the deref, never pointer
-                // identity.
                 features: std::sync::Arc::new(features),
             });
         }
@@ -365,12 +324,8 @@ impl JobSpec for ReportsJob {
 
     fn encode(reports: &ReportsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         // One of the two hit-map kinds. **Row order is load-bearing**: a
-        // row's position is its hit-map id, and the page zips the reply's
-        // cells with an item list captured in this order — so this loop
-        // appends in input order and the decoder pushes in read order, like
-        // every list on this wire, and unlike every other list a reorder
-        // here would not merely move pixels, it would hand hovers to the
-        // wrong items.
+        // row's position is its hit-map id, so a reorder would hand hovers to
+        // the wrong items.
         out.extend_from_slice(&reports.zoom.to_le_bytes());
         out.push(u8::from(reports.is_dark));
         out.extend_from_slice(&reports.device_scale.to_le_bytes());
@@ -439,12 +394,8 @@ impl JobSpec for GlmJob {
 
     fn encode(glm: &GlmStrikesInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         // One of the two hit-map kinds. **Row order is load-bearing**: a
-        // row's position is its hit-map id, and the page zips the reply's
-        // cells with an item list captured in this order — so this loop
-        // appends in input order and the decoder pushes in read order, like
-        // every list on this wire, and unlike every other list a reorder
-        // here would not merely move pixels, it would hand hovers to the
-        // wrong items.
+        // row's position is its hit-map id, so a reorder would hand hovers to
+        // the wrong items.
         out.extend_from_slice(&glm.zoom.to_le_bytes());
         out.push(u8::from(glm.is_dark));
         out.extend_from_slice(&glm.device_scale.to_le_bytes());
@@ -538,10 +489,6 @@ impl JobSpec for ModelJob {
         // stable `as_str` identifier — the same exhaustive pair the persisted
         // pane config round-trips through), the grid shape, the coordinates,
         // the window, and then the window's values as the one bulk block.
-        // Whichever carry arrives — the dispatch's `Whole` or an
-        // already-windowed form — what leaves is the same window form, so
-        // the bytes are a function of the picture and the framing digest can
-        // pin them.
         encode_str(out, input.parameter().as_str());
         let (ni, nj) = input.shape();
         out.extend_from_slice(&(ni as u32).to_le_bytes());
@@ -626,13 +573,6 @@ impl JobOutCodec for ModelJob {
 
 // ── The shared reply pair ────────────────────────────────────────────────
 
-/// The reply adapter every row's [`JobOutCodec::encode_out`] shares, over
-/// the codec body below — writing straight into the codec's `head` sink
-/// since WO-M7d: the intermediate whole-reply `Vec` (one extra memcpy of
-/// the raster, kept at WO-M6.3 to hold [`encode_overlay_out`]'s moved
-/// signature exact) died as the note here forecast. The overlay reply
-/// nominates NO tails: its byte stream is exactly what it was, one framed
-/// head.
 fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
     encode_overlay_out(&v.rgba, v.hit_cells.as_ref(), head);
 }
@@ -642,12 +582,6 @@ fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
 /// Refuses a non-empty `tails` first: this adapter writes none, and on a
 /// same-build wire a tail count the encoder did not write is a corrupt or
 /// foreign message (the `JobOutCodec` convention, WO-M7d).
-///
-/// `alpha` is not on the reply wire because only one convention ever crosses
-/// it: `rustdar_worker::offload::execute`'s output stage converts the one
-/// straight-alpha producer (the model grid) to premultiplied before any
-/// reply is encoded, so a decoded reply states [`AlphaMode::Premultiplied`]
-/// — the only value that is ever true of these bytes.
 fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
     if !tails.is_empty() {
         return None;
@@ -665,14 +599,7 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 ///
 /// The cells are written **sorted by cell index** — a `HashMap`'s iteration
 /// order is seeded per process, and these bytes have to be a function of the
-/// value for two encodes of one reply to agree and for the framing digest in
-/// `rustdar_worker::offload::tests` to pin them. The RGBA takes the rest,
-/// so no length prefix can lie about it; its one guard stays the dispatch's
-/// length check.
-///
-/// Writes into `out` rather than returning a `Vec` since WO-M7d, reserving
-/// the raster plus framing up front — the reply adapter hands it the
-/// codec's head sink directly, which is what killed the whole-reply copy.
+/// value for two encodes of one reply to agree. The RGBA takes the rest.
 pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>, out: &mut Vec<u8>) {
     out.reserve(rgba.len() + 64);
     match hit_cells {
@@ -743,8 +670,7 @@ pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<HitCells>)> {
 
 // ── The field codecs the rows share ──────────────────────────────────────
 
-/// A byte that must be a `bool`: `None` for anything but `{0, 1}`, refused
-/// rather than coerced. The moved decode bodies' one shared refusal helper.
+/// A byte that must be a `bool`: `None` for anything but `{0, 1}`, refused rather than coerced.
 fn flag(byte: u8) -> Option<bool> {
     match byte {
         0 => Some(false),
@@ -753,10 +679,7 @@ fn flag(byte: u8) -> Option<bool> {
     }
 }
 
-/// A row of `f32`s, little-endian, in one pass straight off the grid's own
-/// storage — the closest thing to zero-copy a byte codec has. On the
-/// little-endian targets this workspace ships (x86_64, aarch64, wasm32),
-/// `to_le_bytes` is the identity and the loop compiles down to a bulk copy.
+/// A row of `f32`s, little-endian, straight off the grid's own storage.
 fn encode_f32s(out: &mut Vec<u8>, values: &[f32]) {
     out.reserve(values.len() * 4);
     for v in values {
@@ -783,11 +706,7 @@ fn decode_f32s(r: &mut Reader, count: usize) -> Option<Vec<f32>> {
 /// constants and the measured wrap flag included — so the far side restores
 /// bits and never consults libm; see `LambertGridParts`.
 const GRID_COORDS_LAMBERT: u8 = 1;
-/// Grid-coordinate tag: materialised per-point arrays. No production HRRR
-/// fetch produces one, and such a grid never has a proper-subset window
-/// (only the Lambert case can be narrowed), so this arm always carries its
-/// full 30.5 MB-per-1.9M-points arrays — the honest cost of a source that
-/// materialises its coordinates.
+/// Grid-coordinate tag: materialised per-point arrays; no proper-subset window is possible.
 const GRID_COORDS_EXPLICIT: u8 = 2;
 
 fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
@@ -892,9 +811,7 @@ fn decode_f64s(r: &mut Reader, count: usize) -> Option<Vec<f64>> {
 /// A UTC timestamp as twelve bytes: the `i64` Unix seconds and the `u32`
 /// subsecond nanoseconds. Two fields rather than one `i64` of nanoseconds
 /// because the pair is total — every `NaiveDateTime` chrono can represent
-/// encodes, where nanoseconds-since-epoch overflows in 2262 — and exact, so
-/// a request round-trips to itself and the parity gates compare identical
-/// inputs on both paths.
+/// encodes, where nanoseconds-since-epoch overflows in 2262 — and exact.
 fn encode_datetime(out: &mut Vec<u8>, t: &chrono::NaiveDateTime) {
     let utc = t.and_utc();
     out.extend_from_slice(&utc.timestamp().to_le_bytes());
@@ -913,9 +830,7 @@ fn decode_datetime(r: &mut Reader) -> Option<chrono::NaiveDateTime> {
 
 /// A `u16` length prefix and then the bytes, truncated to what the prefix can
 /// carry — the sites-name convention, spelled once for every string on this
-/// wire. Every string here is an identifier or a short label, so the
-/// truncation is over input it will never see; a cut that split a multi-byte
-/// character is refused by [`decode_str`]'s UTF-8 check rather than misread.
+/// wire. A cut that split a multi-byte character is refused by [`decode_str`]'s UTF-8 check.
 fn encode_str(out: &mut Vec<u8>, s: &str) {
     let bytes = &s.as_bytes()[..s.len().min(usize::from(u16::MAX))];
     out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
@@ -933,11 +848,6 @@ fn decode_str(r: &mut Reader) -> Option<String> {
 /// optional geo-AABB, and last the multi-polygon — every ring of every
 /// polygon, holes included, since a hole dropped here is a hole filled on
 /// the far side and the parity tests are what would catch it.
-///
-/// The AABB is **carried, not recomputed**: it is stored state of the value
-/// (`OverlayFeature::geo_bounds`), the round trip compares whole requests,
-/// and a decode that re-derived it would make a request with a hand-built
-/// bounds come back a different request instead of itself.
 fn encode_feature(out: &mut Vec<u8>, feature: &crate::types::OverlayFeature) {
     encode_str(out, &feature.label);
     encode_str(out, &feature.label2);
@@ -1029,9 +939,7 @@ fn decode_polygon(r: &mut Reader) -> Option<rustdar_geo::GeoPolygon> {
 
 // ── The wire enums ───────────────────────────────────────────────────────
 
-/// An [`AlertCategory`](crate::nws::alert::AlertCategory) as a number, in
-/// the newtype-pair shape `MeltingLayerWire` (in `rustdar_radar::frame`,
-/// beside the frame codec since WO-M7c) set: both directions are exhaustive
+/// An [`AlertCategory`](crate::nws::alert::AlertCategory) as a number: both directions are exhaustive
 /// over the same arms, so a variant added upstream fails this build rather
 /// than silently encoding as something else. The numbering is the enum's own
 /// declaration order, most severe first.
@@ -1049,7 +957,6 @@ impl AlertCategoryWire {
         }
     }
 
-    /// The inverse of [`wire_code`](Self::wire_code).
     fn from_wire_code(code: u8) -> Option<Self> {
         use crate::nws::alert::AlertCategory as C;
         let category = match code {
@@ -1081,7 +988,6 @@ impl StormReportKindWire {
         }
     }
 
-    /// The inverse of [`wire_code`](Self::wire_code).
     fn from_wire_code(code: u8) -> Option<Self> {
         use crate::spc::reports::StormReportKind as K;
         let kind = match code {
@@ -1109,7 +1015,6 @@ impl MdTypeWire {
         }
     }
 
-    /// The inverse of [`wire_code`](Self::wire_code).
     fn from_wire_code(code: u8) -> Option<Self> {
         use crate::spc::discussion::MdType as M;
         let md_type = match code {
@@ -1141,7 +1046,6 @@ impl HatchWire {
         }
     }
 
-    /// The inverse of [`wire_code`](Self::wire_code).
     fn from_wire_code(code: u8) -> Option<Self> {
         use crate::types::HatchPattern as H;
         let hatch = match code {
@@ -1183,10 +1087,6 @@ mod tests {
         }
     }
 
-    /// Encode `job` through `row`, decode it back, and require the identity:
-    /// the decoded job equals the original, the geometry passes through
-    /// unchanged, and the cursor sits exactly at the end of what encode
-    /// wrote.
     fn assert_round_trips(row: &JobCodec, job: &DescribedJob) {
         let geo = test_geometry();
         let mut bytes = Vec::new();
@@ -1228,8 +1128,6 @@ mod tests {
         }
     }
 
-    /// A second feature exercising the arms the first does not: a hatch and
-    /// an absent AABB.
     fn hatched_boundless_feature_fixture() -> OverlayFeature {
         OverlayFeature {
             polygons: vec![vec![
@@ -1274,9 +1172,6 @@ mod tests {
                 "every overlay row is a raster job (`{}`)",
                 row.label,
             );
-            // The reply codecs ride every row by construction since WO-M7c
-            // de-Optioned the pair; the reply round-trip tests in this
-            // module are what pin their behaviour.
         }
         let distinct: std::collections::HashSet<std::any::TypeId> =
             JOB_CODECS.iter().map(|row| (row.input_type)()).collect();
@@ -1366,9 +1261,6 @@ mod tests {
         assert_round_trips(&JOB_CODECS[3], &job);
     }
 
-    /// The row order IS the hit-map id on this kind, so the identity here is
-    /// doing more than usual: `Vec` equality is ordered, and a decoder that
-    /// reordered rows would fail it.
     #[test]
     fn the_reports_row_round_trips_in_order() {
         let job = DescribedJob::new(ReportsInput {
@@ -1396,9 +1288,6 @@ mod tests {
         assert_round_trips(&JOB_CODECS[4], &job);
     }
 
-    /// GLM's `now` is dispatch-captured input and rides the wire like any
-    /// other field — the round trip proves the codec carries it rather than
-    /// any clock re-deriving it.
     #[test]
     fn the_glm_row_round_trips_in_order() {
         let job = DescribedJob::new(GlmStrikesInput {
@@ -1446,9 +1335,6 @@ mod tests {
         assert_round_trips(&JOB_CODECS[6], &job);
     }
 
-    /// The Lambert arm of the grid-coords codec: stored constants travel as
-    /// stored and restore bits — `from_parts` accepts these literals, so the
-    /// identity is over the constants themselves, no libm anywhere.
     #[test]
     fn the_model_row_round_trips_lambert_constants() {
         let grid =
@@ -1486,10 +1372,6 @@ mod tests {
         assert_round_trips(&JOB_CODECS[6], &job);
     }
 
-    /// Round-trip the reply through one row's out codecs, comparing the two
-    /// wire-borne fields; `alpha` is not on the wire and must come back
-    /// [`AlphaMode::Premultiplied`] — the only convention the reply wire
-    /// ever carries.
     fn assert_reply_round_trips(row: &JobCodec, rgba: Vec<u8>, hit_cells: Option<HitCells>) {
         let reply = DescribedOut(Box::new(RasterizeOutput {
             rgba: rgba.clone(),
@@ -1499,9 +1381,6 @@ mod tests {
         let mut head = Vec::new();
         let mut tails = Vec::new();
         (row.encode_out)(reply, &mut head, &mut tails);
-        // Handing the tails straight back through is itself the emptiness
-        // check: the shared decoder refuses any tail this adapter never
-        // writes, so a stray push here would fail the expect below.
         let back = (row.decode_out)(&head, tails)
             .expect("a row must decode its own reply encode")
             .take::<RasterizeOutput>()
@@ -1537,10 +1416,6 @@ mod tests {
         assert_reply_round_trips(&JOB_CODECS[2], vec![9, 8, 7, 6], None);
     }
 
-    /// Two equal cell maps built in different insertion orders (and so with
-    /// different iteration orders — each `HashMap` is independently seeded)
-    /// must encode to one byte string: the sort in the encoder is what makes
-    /// the bytes a function of the value.
     #[test]
     fn two_encodes_of_one_reply_value_agree() {
         let indices = [21u32, 3, 17, 8, 30, 11, 26, 5];

@@ -93,19 +93,6 @@ fn env(h0_km: f64, hm20_km: f64) -> EnvHeights {
 /// * tilt 2: 1.1201513 – 1.6538062;
 /// * tilt 3: 1.6538062 – 2.1749803 (half-power flank cap).
 ///
-/// Each boundary is 0.2–5.9 m above the slant-range figure it replaced
-/// (0.5870331 / 1.1191491 / 1.6509408 / 2.1690515), because a column over
-/// 30.5 km of ground is reached by a beam slightly longer than 30.5 km and
-/// so stands slightly higher. SHI integrates those depths, so the products
-/// move with them — see each test's own arithmetic.
-///
-/// The four rose again — by 0.05, 0.16, 0.34 and 0.57 m from 0.5871958 /
-/// 1.1199906 / 1.6534689 / 2.1744143 — when `beam::ground_range_km` became
-/// the spherical arc rather than the tangent-plane `r·cos e`. Same cause one
-/// step further: reaching 30.5 km of ground *arc* takes a longer beam still
-/// than reaching 30.5 km on the tangent plane, and every SHI, POSH and MEHS
-/// figure in this file moved a few parts in ten thousand with them.
-///
 /// Columns:
 ///
 /// * az 10: 50 dBZ ×4 — the full ramp, every layer case;
@@ -436,10 +423,6 @@ fn a_single_tilt_column_is_capped_at_the_beam_flank() {
 /// reaches 0.5738793 km over 30.5 km of ground where 0.275° reaches
 /// 0.4673699 — 107 m less ceiling. SHI integrates depth above `H₀ = 0.2`, so
 /// it falls 0.692330 → 0.354059, a **49 %** cut on this column.
-///
-/// That is the size of the error a TDWR was carrying: the fleet's wider beam
-/// bought its ceiling layer depth the antenna never illuminated, and PoSH and
-/// MEHS read hot at the top of every TDWR volume as a result.
 #[test]
 fn a_narrower_antenna_caps_the_ceiling_layer_lower() {
     let scan = Scan::new(
@@ -587,13 +570,6 @@ fn the_paper_constants_are_pinned() {
 /// its 11 sites in file order, a values-blind pick, one row per site. The
 /// fields are the RPG's own: published offset, `H₀` km ARL, published POSH %,
 /// published MEHS in.
-///
-/// The oracle is quantised (POSH 10 points, MEHS ¼ in), so no single row
-/// reconstructs exactly and the test does not ask one to. It asserts the
-/// thing quantisation cannot manufacture: **pooled across the fleet, the
-/// published per-site offset reproduces the RPG's own POSH far better than
-/// the paper's −121 does.** That fails if `WT_OFFSET_OTHER_SITES` is reverted
-/// to −121, and it never consults our SHI, our grid, or our constant.
 #[test]
 fn the_rpg_reconstructs_its_own_posh_only_under_the_site_offset() {
     // site, published WTSM OFFSET, H₀ km ARL, published POSH %, MEHS in

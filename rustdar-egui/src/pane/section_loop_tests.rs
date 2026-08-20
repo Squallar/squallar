@@ -1,25 +1,4 @@
 //! The section loop's identity, and the collision it exists to stop.
-//!
-//! # The defect these are written against
-//!
-//! [`RenderTarget`] is `(site, product, elevation)` with **no view term**. That
-//! was complete while a loop frame could only ever be a plan-view tilt. It is
-//! not complete now: a map pane and a cross-section pane on the same site,
-//! product and elevation produce two targets that [`RenderTarget::matches`]
-//! calls equal — so every predicate that decides "may this finished picture go
-//! into that frame?" would say yes across the two kinds.
-//!
-//! The visible failure is a 2048² plan-view raster animating inside a section
-//! pane's axes, captioned with a height scale and a tilt ladder describing a
-//! vertical slice that is not there — and the reverse, a 2048×1024 section
-//! stretched across a map pane's geographic bounds. It is the loop path's form
-//! of the collision `RenderKey`'s view axis closes on the static path,
-//! where the same mistake is a wrong-shaped buffer reaching
-//! `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the main thread.
-//!
-//! [`LoopPlaybackState::view`] is the fix, and every test below fails without
-//! it: each one builds two loops that agree on the whole `RenderTarget` and
-//! differ only in what kind of picture they hold.
 
 use super::*;
 use rustdar_geo::GeoPoint;
@@ -31,17 +10,6 @@ const TILT: f32 = 0.5;
 
 /// The row every loop below is keyed to, built here rather than read out of
 /// the process-wide table.
-///
-/// `rustdar-radar` carries no list of the network, so that table holds
-/// whatever some *other* test in this binary happened to resolve — and nothing
-/// in this file resolves anything, because nothing in it builds an
-/// `InputHarness`, which is where this crate's tests place their radars.
-/// Reading the table therefore made every test below pass or fail on the order
-/// the harness scheduled them in: `cargo test -p rustdar-egui --lib -- --exact`
-/// on any one of them found an empty table and panicked here.
-///
-/// Nothing below reads the position. What these tests need is a row named
-/// `KTLX`, and a literal is the honest way to have one.
 fn site() -> RadarSite {
     RadarSite {
         name: SITE,
@@ -146,12 +114,6 @@ fn axes() -> rustdar_radar::xsect::SectionAxes {
 
 /// A plan-view result must not be placed into a section loop, however exactly
 /// the two targets agree.
-///
-/// This is the headline collision. `frame_awaiting_render_result` is what
-/// `accept_render_result` calls to find the frame a finished plan-view raster
-/// belongs in; without the view test it finds one here, because the section
-/// loop's `rendered_for` is the same site, product and elevation and the frame
-/// carries the same timestamp and is in flight.
 #[test]
 fn a_plan_view_result_finds_no_frame_in_a_section_loop_with_the_same_target() {
     let mut section = loop_in(RenderView::CrossSection, 3);
@@ -174,8 +136,6 @@ fn a_plan_view_result_finds_no_frame_in_a_section_loop_with_the_same_target() {
          animate inside a vertical slice's axes"
     );
 
-    // The same call against a plan-view loop in the same state does find it, so
-    // the assertion above is about the view and not about the frame's state.
     let mut plan = loop_in(RenderView::PlanView, 3);
     plan.frames[1].render_in_flight = true;
     assert_eq!(plan.frame_awaiting_render_result(ts(1), &target), Some(1));
@@ -204,11 +164,6 @@ fn a_section_result_finds_no_frame_in_a_plan_view_loop_with_the_same_target() {
 
 /// The sibling broadcast is the other half, and it is the one that reaches
 /// panes nobody dispatched anything for.
-///
-/// `poll_loop_render_results` offers a finished plan-view texture to every
-/// sibling loop that `is_rendered_for` the result's target. A section loop
-/// answers *yes* to that question — it is the same target — so the authority
-/// under it has to say no.
 #[test]
 fn a_plan_view_broadcast_is_refused_by_a_section_loop_with_the_same_target() {
     let section = loop_in(RenderView::CrossSection, 3);
@@ -262,8 +217,6 @@ fn neither_kind_of_loop_donates_a_frame_to_the_other() {
         "a map pane's loop offered a plan-view raster to a section loop"
     );
 
-    // Each still donates to its own kind, so the refusals above are about the
-    // view rather than about the frames being empty.
     assert_eq!(plan.frame_donatable_to(ts(1), &target), Some(1));
     assert_eq!(
         section.section_frame_donatable_to(ts(1), &target, &key(), 77),
@@ -310,13 +263,6 @@ fn moving_the_line_discards_every_frame() {
 }
 
 /// **The stale-vector bug, one frame at a time.**
-///
-/// A storm-relative section is not a slice of a measured moment: the derivation
-/// runs on the way out of the volume, so the picture *is* a function of the
-/// vector. That cost `SectionInputKey` a review cycle on the live pane, where
-/// the symptom was one visibly wrong redraw. A loop keyed on time alone would
-/// reproduce it once per frame — and unlike the live pane, the wrong picture
-/// would then sit in a list and animate.
 #[test]
 fn editing_the_storm_motion_vector_discards_every_frame() {
     let ctx = egui::Context::default();
@@ -378,20 +324,6 @@ fn sectionable_products() -> Vec<RadarProduct> {
 /// the same product's plan-view loop.** One test, two loops, because the claim
 /// is that the answer belongs to the *view*: a fix that simply stopped asking
 /// would pass half of this and fail the other half.
-///
-/// The tilt cannot reach a section at three separate points — `SectionRequest`
-/// has no elevation field, `RenderInput::extract_volume_parts` stores
-/// `NO_ELEVATION_DEG` instead of any caller's angle, and `render_section` goes
-/// through `derive::prepare` rather than `render::find_sweep` — so every frame
-/// re-cut here came back byte-identical, up to `MAX_LOOP_RENDER_BUDGET` of them
-/// per click, and a loop's re-cuts never consult the shared `RenderCache` that
-/// had this right all along.
-///
-/// Walked over every sectionable product, **including NROT and SRV**. Those two
-/// are the trap: they rasterize the sweep `find_sweep` picks in a *plan* view,
-/// so they are genuinely tilt-dependent there, and a reader checking only
-/// "does this product read the whole volume" would conclude the section had to
-/// be re-cut too. The section path never runs that rasterizer.
 #[test]
 fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
     let ctx = egui::Context::default();
@@ -408,7 +340,6 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
     }
 
     for product in products {
-        // The section half: the tilt moved and every cut must survive.
         let mut section = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
         section.phase = LoopPhase::Rendering;
         section.frames = (0..3)
@@ -434,8 +365,6 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
              byte-identical",
         );
 
-        // The plan-view half of the same product, over the same two tilts.
-        // These *are* pictures of one sweep, so they must go.
         let mut plan = loop_in(RenderView::PlanView, 3);
         plan.retarget_renders(product, TILT);
         for frame in &mut plan.frames {
@@ -486,13 +415,6 @@ fn rewriting_the_same_storm_motion_vector_invalidates_nothing() {
 }
 
 /// A raster cut from a different tilt ladder must not be handed across.
-///
-/// The newest frame's volume is re-cached under the same `(site, timestamp)`
-/// key as more of it seals, so one loop can hold a cut from a two-rung ladder
-/// while a sibling is about to cut the fourteen-rung one. This is the section's
-/// stand-in for the snapped-sweep comparison a plan-view broadcast makes, and
-/// it reuses `sampler::ladder_fingerprint` rather than inventing a second
-/// notion of section staleness.
 #[test]
 fn a_broadcast_cut_from_another_ladder_is_refused() {
     let ls = loop_in(RenderView::CrossSection, 3);
@@ -546,10 +468,6 @@ fn a_broadcast_cut_along_another_line_is_refused() {
 
 /// The classification itself: which views can animate, and what each one's
 /// frame *is*.
-///
-/// Asked of the **view** rather than the pane kind, which is where the
-/// classification moved when a map pane came to have two of them: a loop's
-/// frames are pictures of one shape, and the shape is the view.
 #[test]
 fn every_view_can_loop_and_each_frame_is_its_own_shape() {
     assert!(RenderView::PlanView.can_loop());
@@ -566,8 +484,6 @@ fn every_view_can_loop_and_each_frame_is_its_own_shape() {
     );
     // The classification is not "everything loops" — it is that each view's
     // frame is a different shape, and the shapes must not be interchangeable.
-    // Without this the enum could grow a fourth variant that answered every
-    // accessor with `None` and nothing above would notice.
     for (image, view) in [
         (
             LoopFrameImage::Volume(VolumeFrameGrid {
@@ -610,12 +526,6 @@ fn volume_target() -> crate::pane::VolumeTarget {
 
 /// A section pane cannot loop until it has been aimed, and the refusal is on
 /// the pane rather than on the kind.
-///
-/// Without it, enabling a loop on an unaimed section pane fills a frame list
-/// nothing can cut. The volumes download perfectly well, so
-/// `render_set_settled` never calls the batch settled and the loop sits in
-/// `Rendering` for the session — a permanent wait, which this codebase calls
-/// the worst state a pane can be in.
 #[test]
 fn a_section_pane_cannot_loop_until_it_has_a_line() {
     let mut pane = PaneState::new();

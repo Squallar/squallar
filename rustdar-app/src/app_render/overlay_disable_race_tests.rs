@@ -1,43 +1,12 @@
 //! The window between dispatching an overlay render and switching that layer
 //! off.
-//!
-//! `Gui::write_pane_overlay` releases a disabled layer's texture the moment the
-//! decision is made, but a render already on a worker thread cannot be
-//! recalled. It arrives at `poll_overlay_render_results` some frames later,
-//! carrying a freshly uploaded full-size texture, for a layer the pane no
-//! longer draws — and the poller used to store every result it received. The
-//! release would therefore undo itself, and permanently for a pane the viewport
-//! loop in `ui_map_pane` never repaints: hidden past the split's visible count,
-//! or converted to a cross-section.
-//!
-//! Both directions are covered here off **one fixture and one delivery**, which
-//! is what makes the pair mean anything. Dropping too little is the leak;
-//! dropping too much is a live layer whose picture never lands, and a guard
-//! written slightly too wide would show exactly that and nothing else.
-//!
-//! The in-flight mark is the third assertion and the one with the worst failure
-//! mode. `ui_map_pane` dispatches on `stale && !cache.render_in_flight`, so a
-//! mark left standing over a result that was dropped is a layer that can never
-//! be re-rendered again — a re-enable that stays blank for the rest of the
-//! session, which is worse than the residency this change is about.
-//!
-//! That assertion carries more weight than it looks, because this is the *only*
-//! place an `offload`ed render's mark is cleared.
-//! `PaneState::release_disabled_overlay_textures` deliberately leaves it alone
-//! — clearing it there opens the dispatch gate and buys a second render of the
-//! same content on a fast off/on, see that function — so the drop path here is
-//! what has to undo it, and `the_release_leaves_a_render_already_in_flight_marked`
-//! in `rustdar_egui`'s sibling module is the other half of that division.
 
 use super::*;
 use rustdar_egui::overlay_cache::OverlayTextureData;
 use rustdar_geo::GeoBounds;
 use rustdar_source::id::{LayerId, known};
 
-/// The layer raced. A texture-mode overlay that `poll_overlay_render_results`
-/// really serves — the radar raster never reaches this poller at all
-/// (`ui_map_pane`'s viewport loop skips `Radar`; the picture comes from
-/// `apply_render_to_pane`).
+/// The layer raced.
 const KIND: LayerId = known::NWS_ALERTS;
 
 const W: u32 = 8;
@@ -65,14 +34,6 @@ fn image(ctx: &egui::Context, name: &str) -> egui::TextureHandle {
 
 /// An app whose single pane is showing an overlay texture and waiting on a
 /// second one.
-///
-/// The parked texture is the test's instrument, not a claim about production:
-/// after a real toggle the cache is empty, and an empty cache cannot tell
-/// "the poller dropped the result" from "the poller stored it into a cache
-/// nothing looked at". Something already in the slot makes both outcomes
-/// visible in the same field — the id either changed or it did not.
-///
-/// Returns the app and the id of the parked texture.
 fn app_awaiting_a_render(ctx: &egui::Context) -> (crate::app::App, egui::TextureId) {
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     let parked = image(ctx, "parked");
@@ -90,8 +51,6 @@ fn app_awaiting_a_render(ctx: &egui::Context) -> (crate::app::App, egui::Texture
         radar_meta: None,
         hit_map: None,
     });
-    // The state a dispatched render leaves behind, set exactly as
-    // `ui_map_pane` sets it.
     cache.render_in_flight = true;
     (app, id)
 }
@@ -139,11 +98,6 @@ fn in_flight(app: &mut crate::app::App) -> bool {
 
 /// **The race.** A render dispatched before the layer was switched off lands
 /// after it, and is thrown away rather than parked.
-///
-/// The layer is switched off by writing the pane's map directly rather than
-/// through `Gui::write_pane_overlay`, and that is the point: the toggle path
-/// would clear the cache, and what is under test here is the *poller's* own
-/// guard, in the one state that isolates it.
 #[test]
 fn a_late_result_for_a_disabled_layer_is_dropped() {
     let ctx = egui::Context::default();
@@ -184,9 +138,6 @@ fn a_late_result_for_a_disabled_layer_is_dropped() {
 
 /// The over-filtering control, off the same fixture and the same delivery: a
 /// layer that is still on gets its picture.
-///
-/// Without this, a guard that dropped *everything* would pass the test above
-/// and take every overlay on the map with it.
 #[test]
 fn a_result_for_an_enabled_layer_still_lands() {
     let ctx = egui::Context::default();
@@ -200,10 +151,6 @@ fn a_result_for_an_enabled_layer_still_lands() {
 
     deliver(&mut app, &ctx);
 
-    // Kept, not dropped — but *held*, because the pane already has a picture
-    // and the new one's pixels are not on the GPU yet. The parked texture
-    // staying on screen here is the hold doing its job, not the guard
-    // over-filtering; the promotion below is what tells the two apart.
     assert_eq!(
         current_id(&mut app),
         Some(parked),
@@ -228,18 +175,7 @@ fn a_result_for_an_enabled_layer_still_lands() {
     );
 }
 
-/// **The un-wedge.** A described render (`offload::JobRequest::Overlay`) can
-/// fail — a worker lost mid-job, a lapsed wait for one, a reply the dispatch's
-/// length check refused — and the failure arrives as a response carrying no
-/// image at all. It must clear the in-flight mark for every named pane exactly
-/// as a kept result does, and place nothing: `ui_map_pane` dispatches on
-/// `stale && !render_in_flight`, so a failure that skipped the clear would
-/// leave the layer un-dispatchable for the life of the session — wedged blank,
-/// with no error anywhere.
-///
-/// Off the same fixture as its two siblings, and the parked texture is the
-/// same instrument: whether the pane's picture survived is visible in the same
-/// field as whether something replaced it.
+/// **The un-wedge.**
 #[test]
 fn a_failed_render_clears_the_in_flight_mark_and_touches_nothing() {
     let ctx = egui::Context::default();

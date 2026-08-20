@@ -1,7 +1,5 @@
 //! Fetching the three Storm Prediction Center products.
 //!
-//! # The requests must stay "simple"
-//!
 //! Probed with curl 2026-07-25 on `/products/spcmdrss.xml`,
 //! `/products/outlook/*.lyr.geojson` and `/climo/reports/today_*.csv`:
 //! `www.spc.noaa.gov` answers a plain `GET` with `Access-Control-Allow-Origin: *`
@@ -70,9 +68,7 @@ pub async fn fetch_outlook(
 
 /// A 404 here is **broken**, not routine: `spcmdrss.xml` is a standing feed, so
 /// its absence means the path moved rather than that no discussion is active.
-/// An active-MD-free day still serves the feed, with no `<item>` elements — the
-/// empty-versus-unreachable distinction the panel draws is made there, not by a
-/// missing file.
+/// An active-MD-free day still serves the feed, with no `<item>` elements.
 pub async fn fetch_active_discussions(
     client: &reqwest::Client,
     sources: &DataSources,

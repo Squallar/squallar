@@ -2,19 +2,12 @@
 //!
 //! Drives the real UI through a real [`egui::Context`] with hand-constructed
 //! [`egui::RawInput`] — no window, no winit, no wgpu. Each [`InputHarness::frame`]
-//! runs one full egui pass (`Gui::ui`, all panels, dialogs and map panes), and
-//! `render_panes` records the pointer state it resolved for each pane on the way
-//! through. [`FrameOutcome::resolved`], [`FrameOutcome::resolved_inactive`],
-//! [`FrameOutcome::modality`] and [`FrameOutcome::resolved_zoom`] are reads of
-//! *that* — the shipped decision, not a second one taken here.
-//!
-//! # Do not resolve anything a second time
-//!
-//! This harness used to drive its own `ModalityLatch` and `InteractionState`
-//! beside `Gui::ui` and assert on those. Nothing compared the two, so the
-//! pointer suite validated a replica and every pointer decision in `ui_map.rs`
-//! could be broken with it green. Anything claiming to be what the app does
-//! must be read back out of [`Gui`].
+//! runs one full egui pass, and `render_panes` records the pointer state it
+//! resolved for each pane. [`FrameOutcome::resolved`],
+//! [`FrameOutcome::resolved_inactive`], [`FrameOutcome::modality`] and
+//! [`FrameOutcome::resolved_zoom`] are reads of *that* — the shipped decision,
+//! not a second one taken here. Anything claiming to be what the app does must
+//! be read back out of [`Gui`].
 //!
 //! [`FrameOutcome::mouse`] and [`FrameOutcome::touch`] are the exceptions: they
 //! drive each pipeline directly to say what it *would* have done. They are
@@ -23,12 +16,7 @@
 //! # Event fidelity
 //!
 //! The pointer helpers emit exactly the event sequences the real integrations
-//! produce, which is what makes the cancellation tests meaningful. They do not
-//! agree with each other, and the disagreements are the whole reason the
-//! tracker is shaped the way it is.
-//!
-//! `egui-winit` 0.35.0 (`src/lib.rs`) — `on_touch`'s body is byte-identical to
-//! 0.34.1's, so every row below survived the bump unchanged:
+//! produce. `egui-winit` 0.35.0 (`src/lib.rs`):
 //!
 //! | winit event                | emitted here                                          |
 //! |----------------------------|-------------------------------------------------------|
@@ -39,8 +27,7 @@
 //! | `WindowEvent::CursorLeft`  | `PointerGone` alone — and the position is forgotten,  |
 //! |                            | so a release out there is dropped (`lib.rs:784`)      |
 //!
-//! eframe 0.35.0's web canvas (`src/web/events.rs`) — the four touch handlers
-//! are likewise byte-identical to 0.34.1's:
+//! eframe 0.35.0's web canvas (`src/web/events.rs`):
 //!
 //! | DOM event     | emitted here                                                |
 //! |---------------|-------------------------------------------------------------|
@@ -50,11 +37,9 @@
 //! | `touchcancel` | `Touch{Cancel}` **alone** — no release, no `PointerGone`    |
 //! | `mousemove`   | `PointerMoved`                                              |
 //!
-//! Two rows carry the weight. A cancelled touch never reports a release and
-//! egui does not clear `pointer.down` on `PointerGone`, so any gesture that
-//! only exits on "pointer up" stays stuck forever — and on the web there is no
-//! `PointerGone` either, so a tracker keying on that alone never notices the
-//! cancellation at all.
+//! A cancelled touch never reports a release and egui does not clear
+//! `pointer.down` on `PointerGone`, so any gesture that only exits on "pointer
+//! up" stays stuck forever; on the web there is no `PointerGone` either.
 
 use crate::Gui;
 use crate::pane::{PaneKind, SectionLine};
@@ -74,10 +59,6 @@ const FRAME_DT: f64 = 1.0 / 60.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FrameOutcome {
     /// Pointer resolution from the mouse path, driven unconditionally.
-    ///
-    /// This and `touch` bypass the modality gate on purpose — they exercise
-    /// each pipeline directly, whatever is actually pointing at the screen.
-    /// For what the app really does with this frame's input, use `resolved`.
     pub mouse: MapPointerFrame,
     /// Pointer resolution from the touch pipeline, driven unconditionally.
     pub touch: MapPointerFrame,
@@ -102,7 +83,6 @@ pub(crate) struct InputHarness {
     gui: Gui,
     /// Touch gesture detectors driving the **ungated** `touch` probe, so one
     /// frame can be observed through that pipeline whatever the real UI chose.
-    /// The gated answer is read out of `Gui`, never resolved here.
     gestures: TouchGestures,
     /// Map viewport the ungated zoom gesture acts on.
     map_memory: walkers::MapMemory,
@@ -131,7 +111,6 @@ pub(crate) struct InputHarness {
     /// `RawInput::max_texture_side` — what `egui_winit` is handed from
     /// `device.limits().max_texture_dimension_2d`, and what
     /// `plan_overlay_texture` reads back through `ui.ctx().input(..)`.
-    /// `None` leaves egui on its own default of 2048.
     max_texture_side: Option<usize>,
     /// The [`GuiAction`]s `Gui::ui` returned from the last frame.
     last_actions: Vec<crate::actions::GuiAction>,
@@ -142,33 +121,19 @@ pub(crate) struct InputHarness {
     /// Every line segment painted during the last frame, with its stroke.
     last_segments: Vec<(egui::Pos2, egui::Pos2, egui::Stroke)>,
     /// The soonest repaint any viewport asked for on the last frame.
-    ///
-    /// `Duration::MAX` means "nothing asked", which is egui's own idle answer
-    /// and the only one that matters here: the overlay cache's settle render
-    /// needs a *second* frame at the same zoom to notice, and a reactive UI only
-    /// draws one if something asks. See `overlay_cache::SETTLE_REPAINT_DELAY`.
     last_repaint_delay: std::time::Duration,
     /// Rects that came back under a different widget id between passes,
     /// accumulated over every frame since the last [`InputHarness::clear_id_changes`].
-    /// See [`InputHarness::id_changes`].
     id_changes: Vec<egui::Rect>,
     /// The previous pass's widget bookkeeping, diffed against each new pass by
     /// [`id_changes_between`] to feed [`InputHarness::id_changes`].
     prev_widgets: egui::WidgetRects,
     /// The frame-input facts this harness owns, mirroring the `App`'s own
-    /// fields (WO-E2). See [`FrameFactsForTest`].
+    /// fields. See [`FrameFactsForTest`].
     facts: FrameFactsForTest,
 }
 
 /// The harness's copy of the App-owned frame-input facts.
-///
-/// Helpers mutate one fact and re-apply the whole set through
-/// `Gui::apply_frame_inputs` — exactly how the App composes every frame — so
-/// the harness can never half-update the snapshot-shaped state. Defaults
-/// mirror `Gui::new`, so the first re-apply changes nothing a test did not
-/// ask for. Every frame-input-shaped write in this file and its tests must go
-/// through these facts: a direct `Gui` write would be silently overwritten by
-/// the next helper's re-apply.
 struct FrameFactsForTest {
     safe_area_insets: (f32, f32, f32, f32),
     supports_exit: bool,
@@ -205,14 +170,6 @@ impl Default for FrameFactsForTest {
 
 /// A textured quad the last frame painted: where it went, and **which way up**
 /// its texture was mapped onto it.
-///
-/// The second half is the whole reason this exists. `Painter::image` takes a uv
-/// rect, and swapping its corners flips the picture vertically with no error, no
-/// layout change and no visible fault — a flipped section of a mature storm
-/// still looks like a storm, which the section module's own doc calls the single
-/// most likely mistake in it and the least likely to be noticed. Reading the uv
-/// back off the mesh is the only way a test can see it: the shape carries no
-/// image identity beyond a texture id, and the pixels never reach a test at all.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PaintedImage {
     /// The screen rect the quad covers.
@@ -222,14 +179,10 @@ pub(crate) struct PaintedImage {
     /// left.
     pub uv_at_top_left: egui::Pos2,
     /// The texture coordinate at [`rect`](Self::rect)'s bottom-right corner.
-    /// `(1,1)` for an unflipped image.
     pub uv_at_bottom_right: egui::Pos2,
 }
 
 /// Read a textured quad's geometry back off the mesh `Painter::image` built.
-///
-/// `None` for any mesh that is not one — egui tessellates fonts, shadows and
-/// rounded rectangles into meshes too, and none of them is a four-corner image.
 fn painted_image(mesh: &egui::epaint::Mesh) -> Option<PaintedImage> {
     if mesh.vertices.len() != 4 {
         return None;
@@ -259,9 +212,6 @@ fn painted_image(mesh: &egui::epaint::Mesh) -> Option<PaintedImage> {
 }
 
 /// The finished pass's widget bookkeeping, read back out of the context.
-///
-/// [`egui::Context::end_pass`] swaps the pass it just closed into `prev_pass`,
-/// so immediately after it returns this is the pass that just painted.
 fn pass_widgets(ctx: &egui::Context) -> egui::WidgetRects {
     ctx.viewport(|viewport| viewport.prev_pass.widgets.clone())
 }
@@ -271,15 +221,6 @@ fn pass_widgets(ctx: &egui::Context) -> egui::WidgetRects {
 /// `Widget rect … changed id between passes` on device — mirrored condition
 /// for condition (`egui-0.35.0/src/context.rs:4177`) over the same
 /// [`egui::WidgetRects`] bookkeeping it runs on.
-///
-/// Mirrored rather than read, because egui's own check is `#[cfg(debug_assertions)]`
-/// — the function *and* its call site — so in a release build it is compiled
-/// out entirely, no runtime option can enable it, and the red marker rect it
-/// paints in debug never exists to be matched. The bookkeeping is maintained
-/// in every profile, so this reader answers identically under `cargo test`
-/// and `cargo test --release`, and
-/// `the_id_change_probe_reports_a_real_id_change` holds it against a real id
-/// change in whichever profile is running.
 fn id_changes_between(prev: &egui::WidgetRects, new: &egui::WidgetRects) -> Vec<egui::Rect> {
     use std::collections::BTreeMap;
 
@@ -340,33 +281,11 @@ fn id_changes_between(prev: &egui::WidgetRects, new: &egui::WidgetRects) -> Vec<
 }
 
 /// The radars every harness in this crate draws, placed once.
-///
-/// # Why a harness has to do this at all
-///
-/// `rustdar-radar` carries no list of the network — see
-/// [`SiteTable`](rustdar_radar::sites::SiteTable). A process learns which
-/// radars exist from a volume it decoded or from the catalogue it fetched, and
-/// a test binary does neither, so without this every harness runs against an
-/// empty table: `get_radar_site` answers `None`, the map draws no site icons,
-/// and a test about clicking one has nothing to click.
-///
-/// This is the harness standing in for the application's own startup
-/// resolution, which the real app performs in `App::with_instance` before its
-/// first frame. It is not a fixture the tests assert numbers against — nothing
-/// here is compared to a measured figure — it is the set of identifiers the
-/// tests name, at plausible positions, far enough apart that a click on one
-/// site icon cannot land on another.
-///
-/// Positions are real so that a map that draws them is drawing something
-/// shaped like the network. Heights are the volumes' own metres.
 fn install_radars() {
     use rustdar_radar::site_position::SitePosition;
     use rustdar_radar::sites::SiteFix;
 
     /// `(ICAO, latitude, longitude, site_height_m, tower_height_m)`.
-    ///
-    /// `TOKC` states one height twice, which is how a TDWR reports itself and
-    /// what gives the site list a row that is marked as one.
     const SITES: [(&str, i32, i32, i32, i32); 12] = [
         ("KTLX", 35_333_060, -97_277_500, 370, 19),
         ("TOKC", 35_276_000, -97_510_000, 386, 386),
@@ -507,10 +426,6 @@ impl InputHarness {
     }
 
     /// Report host safe-area insets, as the Android side channel does.
-    ///
-    /// `egui-winit` fills `RawInput::safe_area_insets` only under
-    /// `cfg(target_os = "ios")`, so Android pushes its `WindowInsets` through
-    /// the frame-input compose instead. This is that route.
     pub(crate) fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
         self.facts.safe_area_insets = (top, bottom, left, right);
         self.apply_facts();
@@ -552,20 +467,11 @@ impl InputHarness {
 
     /// Whether egui has a real widget registered under `id` from the last
     /// frame.
-    ///
-    /// This is what stops an id probe from shadowing: a probe that reported a
-    /// constant, or an id rebuilt from a format string the widget no longer
-    /// uses, compares equal to itself across a resize and pins nothing. If
-    /// egui knows the id, the widget really is keyed on it.
     pub(crate) fn widget_exists(&self, id: egui::Id) -> bool {
         self.ctx.read_response(id).is_some()
     }
 
     /// The scroll offset egui has stored under `id`, if any.
-    ///
-    /// Reading it back through the *probed* id is what makes the breakpoint
-    /// test real: if the panel stopped salting its `ScrollArea`, the state
-    /// would live under some other id and this returns `None`.
     pub(crate) fn scroll_offset(&self, id: egui::Id) -> Option<egui::Vec2> {
         egui::scroll_area::State::load(&self.ctx, id).map(|s| s.offset)
     }
@@ -662,17 +568,9 @@ impl InputHarness {
     }
 
     // --- scripted user routes ------------------------------------------------
-    //
-    // Shared by the parity walk and any test that wants to arrive somewhere
-    // the way a user does, rather than by poking state. Each one drives the
-    // real chrome: real clicks on really-drawn rects, never a setter.
 
     /// Scroll at `pos` in `step` increments until `pred` passes, or give up
     /// after `max_steps` frames. Returns whether the predicate ever passed.
-    ///
-    /// The bound is the point: a `ScrollArea` lays content out beyond the
-    /// viewport (and may cull it), so "keep scrolling until it shows up" has
-    /// to terminate when the thing is genuinely absent rather than spin.
     pub(crate) fn scroll_until(
         &mut self,
         pos: egui::Pos2,
@@ -876,7 +774,7 @@ impl InputHarness {
         self.gui.click_consumed_for_test()
     }
 
-    /// Whether the UI is faded (plan §1.8) — the state the fade contracts
+    /// Whether the UI is faded — the state the fade contracts
     /// assert beside the probes' drawn/not-drawn evidence.
     pub(crate) fn faded(&self) -> bool {
         self.gui.ui_faded_for_test()
@@ -951,11 +849,6 @@ impl InputHarness {
 
     /// Take the layers panel off screen the user's way — the same toggle, or
     /// the same bottom-bar item on the phone.
-    ///
-    /// Since the full-bleed flip the panel floats *over* the map's left side,
-    /// so a map-interaction test whose positions land under it must close it
-    /// first: a click there belongs to the panel, exactly as it does for a
-    /// user.
     pub(crate) fn close_layers(&mut self) {
         if self.is_phone() {
             if self.sheet().page != Some(crate::ui::SheetPage::Layers) {
@@ -1064,10 +957,6 @@ impl InputHarness {
     }
 
     /// Every text run the last frame painted inside `rect`.
-    ///
-    /// The whole-screen list above cannot tell a colour-bar tick from a number
-    /// in the chrome, which matters when the assertion is "this pane's bar is
-    /// labelled in millimetres and in nothing else".
     pub(crate) fn painted_text_strings_in(&self, rect: egui::Rect) -> Vec<String> {
         self.last_texts
             .iter()
@@ -1077,32 +966,17 @@ impl InputHarness {
     }
 
     /// Lay the frames out at a scale other than 1 physical pixel per point.
-    ///
-    /// The harness runs at 1 by default, which makes points and pixels the same
-    /// number — and therefore makes any test that multiplies by
-    /// [`Self::pixels_per_point`] pass whether the production code multiplies or
-    /// not. A test about *pixels* has to run at a scale where the two differ.
     pub(crate) fn set_pixels_per_point(&mut self, ppp: f32) {
         self.ctx.set_pixels_per_point(ppp);
         self.warm_up();
     }
 
     /// Every text run the last frame painted, with the rect it occupies.
-    ///
-    /// The rect is the part [`Self::painted_text_strings_in`] throws away, and
-    /// it is what a test needs to ask whether something *fits* rather than
-    /// merely whether it was drawn. `Painter::text` will happily lay a sentence
-    /// out on one line twice as wide as its pane.
     pub(crate) fn painted_text_rects(&self) -> Vec<(egui::Rect, String)> {
         self.last_texts.clone()
     }
 
     /// Every textured quad the last frame painted whose rect is inside `rect`.
-    ///
-    /// The other end of [`Self::painted_text_strings_in`]: a section pane's
-    /// picture is not text and cannot be read back as any, so without this the
-    /// only thing a harness test could say about a rendered section was what its
-    /// caption said about it.
     pub(crate) fn painted_images_in(&self, rect: egui::Rect) -> Vec<PaintedImage> {
         self.last_images
             .iter()
@@ -1112,11 +986,6 @@ impl InputHarness {
     }
 
     /// Every line segment the last frame painted inside `rect` with `color`.
-    ///
-    /// Filtered by colour because a section pane draws three different things
-    /// with `line_segment` — the axis grid, the tilt ladder's halo and the
-    /// ladder itself — and a count that mixed them could not tell a missing
-    /// ladder from a grid with more ticks on it.
     pub(crate) fn painted_segments_in(
         &self,
         rect: egui::Rect,
@@ -1132,10 +1001,6 @@ impl InputHarness {
     }
 
     /// Whether `needle` was painted anywhere inside `rect`.
-    ///
-    /// The other end of a probe: a `DrawnDropdown` says what the renderer was
-    /// *handed*, this says what egui put on the glass, so a test can require
-    /// the two to agree.
     pub(crate) fn text_painted_in(&self, rect: egui::Rect, needle: &str) -> bool {
         self.last_texts
             .iter()
@@ -1207,10 +1072,6 @@ impl InputHarness {
 
     /// What kind each visible pane *is* — the **input** to `render_panes`' kind
     /// branch, read off the live pane state.
-    ///
-    /// Deliberately not the same thing as [`Self::pane_content_probes`], which
-    /// reports the arm that ran. A test that only asserted on this would agree
-    /// with a branch that ignored it.
     pub(crate) fn pane_kinds(&self) -> Vec<rustdar_radar::types::RenderView> {
         self.gui
             .panes()
@@ -1234,11 +1095,6 @@ impl InputHarness {
 
     /// Convert pane `idx` to a cross-section pane cut along `a` → `b`, as the
     /// draw interaction will.
-    ///
-    /// Goes through `PaneState::set_kind` and `SectionLine::new` rather than
-    /// assembling a `PaneContent` here, so the fixture cannot construct a state
-    /// the shipped writers refuse — a line with a non-finite endpoint, in
-    /// particular, which is the one that would make the pane re-render forever.
     pub(crate) fn make_pane_cross_section(&mut self, idx: usize, a: GeoPoint, b: GeoPoint) {
         let line = SectionLine::new(a, b)
             .expect("a fixture line must be finite and have two distinct ends");
@@ -1256,16 +1112,6 @@ impl InputHarness {
     /// Put a finished cut on pane `idx`, as `poll_section_results` does — a
     /// full-size raster and a texture for it — so the pane draws its picture
     /// rather than its "cutting…" state.
-    ///
-    /// `axes` is the caller's, because the caption is computed from it and the
-    /// numbers in the caption are the whole reason the caption exists.
-    ///
-    /// `rungs` likewise, and it is not decoration: the drawn tilt ladder is the
-    /// section's *first* honesty device and it is drawn from the elevations the
-    /// cut carries, so a fixture that left them out would paint a picture with
-    /// the device missing and no test could tell.
-    /// `CrossSection::from_parts` refuses a ladder that is not `tilt_count`
-    /// long, so the two cannot drift apart here either.
     pub(crate) fn place_section(
         &mut self,
         idx: usize,
@@ -1308,12 +1154,6 @@ impl InputHarness {
 
     /// Convert pane `idx` to a cross-section pane that has **not been aimed**,
     /// as arming the draw and then converting a pane would leave it.
-    ///
-    /// The distinction from [`make_pane_cross_section`](Self::make_pane_cross_section)
-    /// is behavioural rather than cosmetic: a section pane with no line paints
-    /// the "draw a line" instruction, and one *with* a line and no render yet
-    /// paints that it is cutting. Both are correct and they are different
-    /// screens, so a test about either has to say which pane it means.
     pub(crate) fn make_pane_unaimed_cross_section(&mut self, idx: usize) {
         self.gui
             .pane_mut(idx)
@@ -1328,9 +1168,6 @@ impl InputHarness {
     }
 
     /// Arm or disarm the cross-section draw.
-    ///
-    /// The menu entry's own end-to-end click has its own test; this is for the
-    /// pointer tests, whose subject is the drag rather than the checkbox.
     pub(crate) fn set_section_draw_armed(&mut self, armed: bool) {
         self.gui.set_section_draw_armed(armed);
     }
@@ -1341,10 +1178,6 @@ impl InputHarness {
     }
 
     /// Arm or disarm the 3D region pick.
-    ///
-    /// The toggle's own end-to-end click has its own test; this is for the
-    /// pointer tests, whose subject is the drag rather than the checkbox —
-    /// `set_section_draw_armed`'s arrangement exactly.
     pub(crate) fn set_region_pick_armed(&mut self, armed: bool) {
         self.gui.set_region_pick_armed(armed);
     }
@@ -1362,17 +1195,6 @@ impl InputHarness {
 
     /// Drag a square out while the region pick is armed: press at `centre`,
     /// move to `corner`, release there.
-    ///
-    /// No pane argument, because the drag does not take one: which pane the box
-    /// belongs to is decided by where the press lands, which is the whole
-    /// design — the user arms the mode and *then* chooses a map.
-    ///
-    /// A helper rather than six lines per test, because the *frame cadence* is
-    /// load-bearing and easy to get subtly wrong. The pointer has to be moved
-    /// and a frame drawn before the press, or the press frame's `interact_pos`
-    /// is the last position the harness knew about rather than the one under
-    /// the finger — which puts the box's centre somewhere the test never asked
-    /// for and makes the failure look like a projection bug.
     pub(crate) fn drag_region(&mut self, centre: egui::Pos2, corner: egui::Pos2) {
         self.mouse_move(centre);
         self.frame();
@@ -1390,18 +1212,11 @@ impl InputHarness {
     }
 
     /// Pane `idx`'s own map centre, as the shipped `render_panes` left it.
-    ///
-    /// Read off `Gui` rather than off the harness' parallel `map_memory`, so a
-    /// test asking "did the map pan?" is asking about the map on screen.
     pub(crate) fn pane_center(&self, idx: usize) -> Option<walkers::Position> {
         self.gui.pane(idx)?.map_memory.detached()
     }
 
     /// Where pane `idx` is looking at `pos`, on the ground.
-    ///
-    /// Built from the pane's live `MapMemory` and the rect the layout gave it —
-    /// the same two inputs `Map::show` builds its own projector from, which is
-    /// what makes this the map's answer rather than a second Mercator.
     pub(crate) fn ground_at(&self, idx: usize, pos: egui::Pos2) -> walkers::Position {
         let rect = self.pane_rects()[idx];
         let memory = &self.gui.pane(idx).expect("no such pane").map_memory;
@@ -1444,10 +1259,6 @@ impl InputHarness {
     }
 
     /// What the 3D arm decided for each volume pane on the last frame.
-    ///
-    /// The only thing that can tell a pane that drew a volume from one that drew
-    /// nothing: both paint the same number of egui shapes, and a callback whose
-    /// payload the renderer cannot use looks exactly like an empty state.
     pub(crate) fn volume_arms(&self) -> Vec<crate::ui::VolumeArmProbe> {
         self.gui.volume_arms_for_test().to_vec()
     }
@@ -1493,11 +1304,6 @@ impl InputHarness {
     }
 
     /// Deliver a scan for `site`, through the host's own delivery path.
-    ///
-    /// The `ScanInfoForSite` event is what the app applies when a fetch
-    /// completes: it fills the matching panes, clears `fetching` *and* calls
-    /// `auto_poll.on_success()`. Hand-rolling those would leave the harness in
-    /// a state the app never reaches.
     pub(crate) fn load_scan(&mut self, site: &str) {
         let radar_site = rustdar_radar::sites::get_radar_site(site).expect("unknown radar site");
         let info = rustdar_radar::types::ScanInfo {
@@ -1530,19 +1336,12 @@ impl InputHarness {
         // same arm and publishes the current-volume stamp each frame. A harness
         // that filled only the plan view's half would leave a 3D pane waiting
         // for a volume that, in production, had already landed.
-        //
-        // Use `set_current_volume` to take them apart — that is how a stamp
-        // that trails or leads the plan view's own time is staged.
         self.set_current_volume(site, Some(collected));
         self.warm_up();
     }
 
     /// Say what `site`'s current-volume stamp is, or that the site has no
     /// volume at all yet.
-    ///
-    /// The 3D pane's only input, and deliberately separable from
-    /// [`Self::load_scan`]: the pane names the volume it builds from by this
-    /// stamp alone, never by the plan view's `scan_info`.
     pub(crate) fn set_current_volume(
         &mut self,
         site: &str,
@@ -1555,8 +1354,6 @@ impl InputHarness {
                 crate::ui::CurrentVolumeStamp {
                     newest: collected,
                     // A pure base volume: what an archive arrival publishes.
-                    // Tests staging a merged or still-filling state build the
-                    // stamp themselves and stage it through these facts.
                     base_started: Some(collected),
                 },
             );
@@ -1579,11 +1376,6 @@ impl InputHarness {
 
     /// Offer `product` at `elevation` on pane `idx`'s loaded scan, as a landed
     /// Level II volume or Level III object does.
-    ///
-    /// `ScanInfo::from_scan` lists the volume's own moments and
-    /// `poll_level3_results` adds each bucket product with the angle off its PDB;
-    /// this is the state either leaves behind, which is what makes the product
-    /// selectable and gives `get_rendering_params` an angle to snap to.
     pub(crate) fn offer_product(
         &mut self,
         idx: usize,
@@ -1632,27 +1424,6 @@ impl InputHarness {
     /// Place a finished radar image on pane `idx`, as `apply_render_to_pane` does
     /// when a render lands: a texture in the pane's Radar overlay cache, with the
     /// metadata that says what it depicts.
-    ///
-    /// The metadata is the point — `PaneState::stale_image_on_screen` reads
-    /// `product` and `elevation` off it, `PaneState::displayed_nyquist_ms` reads
-    /// `nyquist_ms` — and the fields are filled the way the host fills them,
-    /// from the render's own product, *snapped* elevation and declared fold
-    /// limit rather than from the pane's selection. There is one such assignment
-    /// in production, shared by both datasources, and
-    /// `a_placed_render_describes_what_it_depicts` in `rustdar-app` holds
-    /// this fixture to it.
-    ///
-    /// `nyquist_ms` is `None` for everything a real render has no declaration
-    /// for — every Level III product, every volume product, and any Level II
-    /// cut whose volume declared nothing — so a test that does not care states
-    /// `None` and gets a pane with nothing to annotate.
-    ///
-    /// `melting_layer_source` is the same shape for the other unmeasurable:
-    /// `None` for every product but the hybrid classification, which is what a
-    /// test that is not about the melting layer states. `storm_motion`
-    /// is the third of the same shape — `None` for every product but
-    /// storm-relative velocity — and the two are mutually exclusive by product,
-    /// so no fixture legitimately states both.
     pub(crate) fn place_radar_image(
         &mut self,
         idx: usize,
@@ -1669,11 +1440,6 @@ impl InputHarness {
         // bounds and the metadata, because production derives both from the
         // render's single `max_range_km` and a fixture that let them drift
         // would be modelling a state the host cannot reach.
-        //
-        // Any positive value would do — a real render's extent is its sweep's
-        // own reach, so there is no one number a fixture should prefer — and
-        // this stays `BASE_EXTENT_KM` because these tests' expected pixel
-        // positions were computed at it.
         let extent_km = BASE_EXTENT_KM;
 
         let (lat, lon) = {
@@ -1732,13 +1498,6 @@ impl InputHarness {
 
     /// Rects that came back under a different widget id between passes, since
     /// the last [`InputHarness::clear_id_changes`].
-    ///
-    /// The same verdict egui logs as `Widget rect … changed id between passes`
-    /// on device, computed by [`id_changes_between`] from the per-pass widget
-    /// bookkeeping egui maintains in every build profile. egui's own check is
-    /// compiled out of release builds, so reading its painted debug marker
-    /// instead would leave `cargo test --release` asserting on a probe that
-    /// cannot fire.
     pub(crate) fn id_changes(&self) -> &[egui::Rect] {
         &self.id_changes
     }
@@ -1756,10 +1515,6 @@ impl InputHarness {
 
     /// Report `side` as the adapter's `max_texture_dimension_2d`, the way
     /// `EguiRenderer::new` reports the real device's limit to `egui_winit`.
-    ///
-    /// This is how a WebGL2-class limit is exercised without a wasm target: the
-    /// number reaches `plan_overlay_texture` through exactly the path it does in
-    /// the real app, `RawInput` -> `InputState` -> `ui.ctx().input(..)`.
     pub(crate) fn set_max_texture_side(&mut self, side: usize) {
         self.max_texture_side = Some(side);
         self.warm_up();
@@ -1795,17 +1550,6 @@ impl InputHarness {
 
     /// Pan pane `idx` until `site`'s icon is drawn at `target`, as dragging the
     /// map there does.
-    ///
-    /// Solved with walkers' own [`walkers::Projector`], built from the pane's
-    /// live `MapMemory` and the rect the layout gave it — the same two inputs
-    /// `Map::show` builds the projector the icon is placed with from. A
-    /// hand-rolled Mercator here would be a second implementation, and the one
-    /// the test depends on would be the wrong one.
-    ///
-    /// `Projector::unproject` is anchored on the *current* centre, so the
-    /// centring pass below is not redundant: it is what makes the reflection
-    /// `2·centre − target` solve for the position that puts the site at
-    /// `target`.
     pub(crate) fn place_site_at(&mut self, idx: usize, site: &str, target: egui::Pos2) {
         let radar = rustdar_radar::sites::get_radar_site(site).expect("unknown radar site");
         let geo = walkers::lat_lon(radar.lat, radar.lon);
@@ -1850,11 +1594,6 @@ impl InputHarness {
 
     /// The fill colours of every rect the last frame painted whose bounds sit
     /// inside `rect` (with `slack` points of tolerance), in paint order.
-    ///
-    /// This is how a styling claim is proven off the glass rather than off
-    /// the flag that was supposed to produce it: a widget's background frame
-    /// is a filled `Shape::Rect` at (approximately) the widget's own rect,
-    /// and its colour is the style arm the renderer really took.
     pub(crate) fn painted_fills_within(&self, rect: egui::Rect, slack: f32) -> Vec<egui::Color32> {
         self.last_rects
             .iter()
@@ -1866,21 +1605,6 @@ impl InputHarness {
 
     /// The colour-scale legend bars painted inside `pane`, classified by the
     /// axis they run along.
-    ///
-    /// A gradient bar is **one** `painter.image` over a ramp baked once per
-    /// product (`crate::legend_ramp`). It used to be a run of ~1000 2×20 px
-    /// `rect_filled` strips and this counted those, which is why every caller
-    /// treats the number as "some" rather than as a quantity: the assertions
-    /// are all `> 0`, `== 0`, or "unchanged by X", and every one of them still
-    /// says exactly what it said.
-    ///
-    /// The **shape** is what identifies a bar either way, and it is written out
-    /// here rather than read off `pane_render`'s constants for the reason
-    /// `fold_markers_painted` writes out its own 26: a probe sized from the
-    /// code under test moves with it. `SCALE_BAR_WIDTH` is 20, and a bar is
-    /// only drawn at all when its length clears 40 — so a quad 20 points thick
-    /// and more than 40 long, inside the pane, is a colour bar and nothing
-    /// else on the legend has that shape.
     pub(crate) fn color_scale_bars(&self, pane: egui::Rect) -> (usize, usize) {
         let mut horizontal = 0;
         let mut vertical = 0;
@@ -1933,7 +1657,6 @@ impl InputHarness {
     }
 
     /// Whether a floating layer (dialog / popup) currently covers `pos`.
-    /// Used by tests to assert their own preconditions.
     pub(crate) fn is_floating_layer_at(&self, pos: egui::Pos2) -> bool {
         self.ctx
             .layer_id_at(pos)
@@ -1974,11 +1697,6 @@ impl InputHarness {
 
     /// Run input-free frames for `seconds` of wall clock, asserting `check` on
     /// **every** frame.
-    ///
-    /// Watching only the last frame is how a re-arming gesture slips through: a
-    /// stuck long press needs [`LONG_PRESS_DURATION_S`] to come back, so any
-    /// "it stayed released" assertion has to cover well past that, frame by
-    /// frame.
     pub(crate) fn assert_every_frame_for(
         &mut self,
         seconds: f64,
@@ -2039,15 +1757,6 @@ impl InputHarness {
     }
 
     /// Raw device motion (`DeviceEvent::MouseMotion` → [`egui::Event::MouseMoved`]).
-    /// It carries a delta and **no position**, so egui has nothing to put in
-    /// `interact_pos()` on such a frame.
-    ///
-    /// No integration in this workspace actually produces this:
-    /// `egui-winit`'s `on_mouse_motion` (`lib.rs:759`) is reachable only from
-    /// `DeviceEvent`, and `rustdar-gpu/src/egui_renderer.rs:79` forwards
-    /// `on_window_event` only. It is here to exercise the tracker's defensive
-    /// position fallback, and to prove a delta with no coordinates cannot
-    /// resurrect a cancelled touch.
     pub(crate) fn mouse_moved_raw(&mut self, delta: egui::Vec2) {
         self.events.push(egui::Event::MouseMoved(delta));
     }
@@ -2127,12 +1836,6 @@ impl InputHarness {
     // --- multi-touch (mirrors winit's web backend) --------------------------
 
     /// A second finger lands while the first stays down.
-    ///
-    /// `egui-winit` emits pointer emulation only for the finger held in
-    /// `pointer_touch_id` (`lib.rs:882`), so the second finger is a bare
-    /// `Touch` — and winit's web backend gives it **its own device id**, which
-    /// is the whole reason pinch needed fixing. Both fingers keep their web
-    /// device ids here so the tests run against the real event shape.
     pub(crate) fn web_second_finger_down(&mut self, pos: egui::Pos2) {
         self.events
             .push(web_touch(WEB_FINGER_B, egui::TouchPhase::Start, pos));
@@ -2226,11 +1929,6 @@ impl InputHarness {
     }
 
     /// Give keyboard focus to the widget behind `id`, as tabbing to it would.
-    ///
-    /// For the widgets a click does not focus — egui's `Slider` reads its
-    /// arrow keys only `if response.has_focus()`, and only `TextEdit`
-    /// requests focus from a click. The id must come from a probe the
-    /// renderer reported, so the focus lands on the widget egui really keyed.
     pub(crate) fn focus_widget(&mut self, id: egui::Id) {
         self.ctx.memory_mut(|mem| mem.request_focus(id));
         self.frame_after(FRAME_DT);
@@ -2279,7 +1977,6 @@ impl InputHarness {
         // the pipeline, so the multi-touch tests exercise the shipped function.
         crate::ui_input::normalize_touch_devices(&mut raw_input);
         // Likewise, and at the same point: the web build's wheel-unit rewrite.
-        // `zoom_factor` is 1.0 here, matching an unscaled UI.
         crate::ui_input::normalize_wheel_units(&mut raw_input, 1.0);
 
         // `begin_pass`/`end_pass` rather than `run_ui`, so the body runs exactly

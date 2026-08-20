@@ -12,33 +12,11 @@ const CANVAS_ID: &str = "rustdar-canvas";
 /// called by `index.html` once the DOM exists.
 ///
 /// Not `run_app`: it never returns, and winit's web backend implements that
-/// signature by throwing a JS exception to unwind out of Rust, so every caller
-/// sees an exception. [`EventLoopExtWebSys::spawn_app`] returns normally.
-///
-/// `Wait`, not `Poll`: `Poll` schedules through winit's web scheduler
-/// (`Scheduler.postTask`), whose teardown via `AbortController.abort()` is a
-/// large fraction of Firefox main-thread time — all wasted for an app that only
-/// redraws on change. Every async completion here asks for a frame when it
-/// lands, so nothing depends on an unbidden one.
-///
-/// # What used to be here, and why it is not
-///
-/// This function used to open an `mpsc` channel, call `geolocation::start_watch`
-/// on it and hand the receiver to the app — three lines that between them
-/// produced the browser's location prompt **on first paint, with no user
-/// gesture**, before the page had shown the user anything at all. A refusal was
-/// logged at `info!` and reached nothing, so a denial and a device with no
-/// signal were the same empty channel forever and the app could never re-ask,
-/// explain, or offer a way back.
-///
-/// [`WebPlatform`] owns all of it now: the permission state, the query that
-/// reads it without prompting, and the watch. The prompt happens from
-/// `request_location`, which the gate in `rustdar_location`
-/// reaches only from a state that licenses one — never before the browser has
-/// answered, never more than once per install unprompted, and never again after
-/// a refusal.
-///
-/// [`WebPlatform`]: crate::bridge::WebPlatform
+/// signature by throwing a JS exception. [`EventLoopExtWebSys::spawn_app`]
+/// returns normally.
+/// `Wait`, not `Poll`: `Poll` schedules through winit's web scheduler, whose
+/// teardown via `AbortController.abort()` is a large fraction of Firefox
+/// main-thread time.
 #[wasm_bindgen]
 pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -55,19 +33,12 @@ pub fn start() -> Result<(), JsValue> {
         EventLoop::new().map_err(|e| JsValue::from_str(&format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    // Started before the app so the handshake is in flight while the event loop
-    // and WebGL context come up. It never blocks: a job dispatched before the
-    // worker answers waits out `worker_port::HANDSHAKE_WINDOW` and then runs on
-    // this thread, and a worker that is lost later is replaced rather than
-    // written off — which is what keeps one mid-session error from putting
-    // every later scan, scrub and loop frame back on this thread.
+    // Started before the app so the handshake is in flight while the event loop and
+    // WebGL context come up. It never blocks.
     crate::worker_port::attach();
 
-    // Nothing about location happens here beyond construction.
-    // `WebBackend::new` starts a *permission query*, which prompts nobody;
-    // `App` hands the facade the wake its callbacks fire, and the watch waits
-    // for the gate. See the note above, and the boot probe in this file's
-    // tests.
+    // `WebBackend::new` starts a *permission query*, which prompts nobody; the
+    // watch waits for the gate.
     let platform = crate::bridge::WebPlatform::new(canvas);
     let location =
         rustdar_location::LocationFacade::new(Box::new(rustdar_location::web::WebBackend::new()));
@@ -78,8 +49,7 @@ pub fn start() -> Result<(), JsValue> {
 }
 
 /// Fetched by id rather than created here: the canvas has to be sized by CSS
-/// before winit reads its dimensions, and an element created in Rust would be
-/// appended unstyled at the 300x150 default.
+/// before winit reads its dimensions.
 fn canvas_by_id(id: &str) -> Result<web_sys::HtmlCanvasElement, JsValue> {
     web_sys::window()
         .ok_or_else(|| JsValue::from_str("no window"))?

@@ -1,10 +1,9 @@
 //! Pure-Rust HDF5 access to a GLM granule.
 //!
 //! GOES GLM L2 LCFA files are NetCDF4, which *is* HDF5: every netCDF variable
-//! is an HDF5 dataset in the root group and every netCDF attribute is an HDF5
-//! attribute on it. Nothing here needs the netCDF layer above that, so
+//! is an HDF5 dataset in the root group and every attribute an HDF5 attribute.
 //! [`hdf5_pure`] replaces `netcdf`/`netcdf-sys`/`hdf5-metno-sys` and their
-//! bundled C sources — which is what lets the overlay build for wasm32 and iOS.
+//! bundled C sources, which is what lets the overlay build for wasm32 and iOS.
 //!
 //! Does steps 1 and 2 of the CF rules in [`super::cf`] — read in the declared
 //! width, bit-reinterpret through `_Unsigned` — and hands off to [`cf::unpack`].
@@ -14,7 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::cf::{self, CfAttr, RawVar, VarType};
 use hdf5_pure::{AttrValue, DType};
 
-/// An open GLM granule, read straight from the downloaded bytes.
 pub(crate) struct Granule {
     file: hdf5_pure::File,
     /// Root-group dataset names, captured once so that "is this variable
@@ -23,7 +21,6 @@ pub(crate) struct Granule {
 }
 
 impl Granule {
-    /// Parse the superblock and root group of an in-memory granule.
     pub(crate) fn open(data: &[u8]) -> Result<Self, String> {
         // `hdf5_pure` wants ownership; a GLM granule is a few hundred KB.
         let file = hdf5_pure::File::from_bytes(data.to_vec())
@@ -37,7 +34,6 @@ impl Granule {
         Ok(Granule { file, datasets })
     }
 
-    /// A root-group (global) attribute, if it is text.
     pub(crate) fn global_str(&self, name: &str) -> Option<String> {
         let attrs = self.file.root().attrs().ok()?;
         match attrs.get(name)? {
@@ -46,8 +42,6 @@ impl Granule {
         }
     }
 
-    /// Read a variable and apply CF packing conventions.
-    ///
     /// Returns `Ok(None)` when the variable is absent from the file, which is
     /// not the same as "present but all-missing": the L2 LCFA product has no
     /// `event_area` variable at all.
@@ -85,15 +79,12 @@ impl Granule {
         let shape = ds
             .shape()
             .map_err(|e| format!("Failed to read the shape of {name}: {e}"))?;
-        // A scalar has an empty shape and one element, so `product()` of no
-        // dimensions is 1; `product()` of `[0]` is already 0.
         let count: u64 = shape.iter().product();
 
-        // An empty variable has no storage allocated and `hdf5_pure` errors
-        // rather than returning nothing, but a granule that caught no lightning
-        // declares `number_of_flashes = 0` and its `flash_*` variables are
-        // legitimately empty. Short-circuit on the *declared* count only: a
-        // variable claiming 148 elements it cannot produce is still an error.
+        // An empty variable has no storage allocated and `hdf5_pure` errors, but
+        // a granule that caught no lightning declares `number_of_flashes = 0`.
+        // Short-circuit on the *declared* count only: a variable claiming 148
+        // elements it cannot produce is still an error.
         if count == 0 {
             return Ok(Some(RawVar {
                 raw: Vec::new(),
@@ -121,8 +112,6 @@ impl Granule {
 
 /// Read a variable's values into the raw (pre-scale) domain as `f64`,
 /// reinterpreting the bits through `_Unsigned` where required.
-///
-/// `f64` holds every `u32`/`i32` and every 16-bit value exactly.
 ///
 /// The width must be the variable's *declared* one: reading a packed `short` as
 /// `f32` and reinterpreting afterwards bakes the sign in.
@@ -217,7 +206,6 @@ fn read_raw(
     })
 }
 
-/// Map an HDF5 datatype onto the distinction CF unpacking needs.
 fn var_type(dtype: &DType) -> Option<VarType> {
     Some(match dtype {
         DType::F32 | DType::F64 => VarType::Float,
@@ -232,8 +220,7 @@ fn var_type(dtype: &DType) -> Option<VarType> {
 
 /// Normalize an `hdf5_pure` attribute into the backend-neutral form.
 ///
-/// `None` for attribute types CF never uses (string arrays, object references),
-/// so they read as absent rather than as numbers.
+/// `None` for attribute types CF never uses, so they read as absent.
 fn convert_attr(v: &AttrValue) -> Option<CfAttr> {
     Some(match v {
         AttrValue::F64(x) => CfAttr::Nums(vec![*x]),

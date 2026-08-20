@@ -9,20 +9,6 @@ fn setup_body() -> &'static str {
 }
 
 /// Nothing a poller applies may land after the frame has been laid out.
-///
-/// A result applied afterwards misses the frame it was applied to, and
-/// nothing schedules the one that would show it: the re-arm at the end of
-/// `handle_redraw` covers a render still in flight, auto-poll and an active
-/// loop, and the last result of a batch is none of those. With auto-poll off
-/// it sat there, applied and unpresented, until a mouse move repainted.
-///
-/// Since WO-E3 the pollers are `FRAME_PUMP` rows, so the literal list this
-/// test used to walk lives in the table and its order is pinned by
-/// `frame_pump::tests::the_pump_rows_are_in_the_pinned_order`. What is left
-/// to hold here is the run moments: the three phase runners, in phase
-/// order, before the frame's facts are composed and before `Gui::ui` lays
-/// the frame out — and the `Ingest` phase a whole call earlier, in
-/// `handle_redraw`, before layout is even reachable.
 #[test]
 fn every_poller_runs_before_the_frame_is_laid_out() {
     let body = setup_body();
@@ -57,9 +43,9 @@ fn every_poller_runs_before_the_frame_is_laid_out() {
          poller's results are one frame late",
     );
 
-    // The `Ingest` half: `poll_data_channels` runs the pump's ingest rows
-    // at `handle_redraw`'s earlier moment, before the renderer-state early
-    // returns and before layout begins at all.
+    // The `Ingest` half: `poll_data_channels` runs the pump's ingest rows at
+    // `handle_redraw`'s earlier moment, before the renderer-state early returns and before
+    // layout begins at all.
     let (_, redraw) = include_str!("../app.rs")
         .split_once("fn handle_redraw(")
         .expect("handle_redraw is gone from app.rs");

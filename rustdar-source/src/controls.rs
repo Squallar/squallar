@@ -18,7 +18,6 @@ pub enum ControlItem {
     Dropdown {
         id: &'static str,
         label: String,
-        /// `(value, display_label)`.
         options: Vec<(String, String)>,
         selected: String,
     },
@@ -29,7 +28,6 @@ pub enum ControlItem {
         max: f64,
         value: f64,
         logarithmic: bool,
-        /// e.g. "{:.0} fps", "{:.1}°".
         format: String,
     },
     ButtonRow {
@@ -49,7 +47,6 @@ pub struct ControlButton {
     pub id: &'static str,
     pub label: String,
     pub enabled: bool,
-    /// e.g. "Live" while a loop is running.
     pub highlight: bool,
 }
 
@@ -64,7 +61,6 @@ pub enum ControlValue {
     Bool(bool),
     String(String),
     Float(f64),
-    /// Stateless press; the `id` carries the whole meaning.
     Action,
 }
 
@@ -72,8 +68,7 @@ pub enum ControlValue {
 /// products that pane has data for.
 pub struct PaneControlContext<'a> {
     pub pane_idx: usize,
-    /// Present only if the handler defined `create_pane_state()`; the handler
-    /// downcasts it.
+    /// Present only if the handler defined `create_pane_state()`.
     pub pane_state: Option<&'a dyn std::any::Any>,
 }
 
@@ -84,7 +79,6 @@ pub struct PaneControlContextMut<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlEffect {
-    /// A bumped `data_generation` already triggers re-render on its own.
     #[default]
     None,
     Fetch,

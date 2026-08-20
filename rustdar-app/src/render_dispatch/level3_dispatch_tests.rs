@@ -5,8 +5,6 @@ use nexrad_level3::model::{
 };
 use rustdar_radar::level3::ProductStamp;
 
-/// A minimal Level III product: enough PDB for tilt selection plus one
-/// radial so a render would have something to work on.
 fn product(product_code: i16, elevation_tenths: i16, elevation_number: u16) -> Level3Product {
     let pdb = ProductDescriptionBlock {
         block_divider: -1,
@@ -71,27 +69,14 @@ fn product(product_code: i16, elevation_tenths: i16, elevation_number: u16) -> L
             }),
         },
         stamp: ProductStamp::from_key("MPX_EET_2026_07_26_01_55_52"),
-        // No render in these tests, so nothing decodes them.
         bytes: std::sync::Arc::new(Vec::new()),
     }
 }
 
-/// Land an object for one `(code, site)`, as `poll_level3_results` does. No
-/// product: the cache does not take one, because every product that reads the
-/// code reads this entry.
 fn cache(d: &mut RenderDispatcher, code: &str, site: &str, l3: Level3Product) {
     d.cache_level3(code.to_string(), site.to_string(), l3);
 }
 
-/// Every single-object Level III product resolves from its cache — none is
-/// filtered. Storm-relative velocity is deliberately absent: it is a
-/// Level II product now and never reaches this cache at all — and the
-/// hydrometeor classification joined it (the hybrid composite derives
-/// from Level II; see `rustdar_radar::hhc`).
-///
-/// VIL density is absent for the opposite reason: it resolves **two**
-/// objects by AWIPS code rather than one by nearest tilt, and
-/// `vil_density_needs_both_of_its_objects` covers it.
 #[test]
 fn every_level3_product_resolves_from_its_cache() {
     let mut d = RenderDispatcher::new();
@@ -108,9 +93,6 @@ fn every_level3_product_resolves_from_its_cache() {
             .unwrap_or_else(|| panic!("{code} must render"));
         assert_eq!(picked.message.pdb.product_code, product_code);
     }
-    // Every object is now in one shared map, and each product still resolves
-    // only what it names: the filter is the product's own code list, so
-    // nothing above picked up a neighbour's field once the map filled up.
     for (radar_product, code, product_code) in [
         (RadarProduct::SpecificDifferentialPhase, "N0K", 163i16),
         (RadarProduct::EchoTops, "EET", 135),
@@ -131,9 +113,6 @@ fn every_level3_product_resolves_from_its_cache() {
         "nothing was cached for SRV, and nothing ever is: it derives from Level II",
     );
 
-    // The whole Level III roster is accounted for by exactly one of the
-    // two shapes, so a product added to `is_level3` cannot land here
-    // unresolvable.
     for p in RadarProduct::all().iter().filter(|p| p.is_level3()) {
         let codes = p
             .level3_products()
@@ -156,14 +135,6 @@ fn every_level3_product_resolves_from_its_cache() {
     }
 }
 
-/// VIL density resolves its two inputs **by AWIPS code**, and needs both:
-/// it is `DVL` over `EET` (`rustdar_radar::vild`), so one object alone
-/// draws nothing rather than half a field.
-///
-/// By code, not by nearest tilt, because both objects are whole-volume
-/// products whose PDB elevation is the same — a nearest-tilt selection
-/// would resolve by hash order and hand the numerator's object over as the
-/// denominator's half the time.
 #[test]
 fn vil_density_needs_both_of_its_objects() {
     let mut d = RenderDispatcher::new();
@@ -191,36 +162,21 @@ fn vil_density_needs_both_of_its_objects() {
             .map(|p| p.message.pdb.product_code),
         Some(135),
     );
-    // The numerator is still its own object: caching the second must not
-    // displace the first.
     assert_eq!(
         d.cached_by_code(RadarProduct::VilDensity, "KMPX", "DVL")
             .map(|p| p.message.pdb.product_code),
         Some(134),
     );
 
-    // Another site's objects are never borrowed.
     assert!(
         d.cached_by_code(RadarProduct::VilDensity, "KTLX", "DVL")
             .is_none(),
     );
 
-    // And it is not a whole-volume Level II product any more.
     assert!(!RadarProduct::VilDensity.reads_whole_volume());
     assert!(RadarProduct::VilDensity.is_level3());
 }
 
-/// **One `DVL` serves both the products that read it.**
-///
-/// This is the de-duplication, seen from the cache. The object is filed under
-/// its code, so the single fetch a poll now issues for `DVL` is the numerator
-/// VIL density divides *and* the field VIL draws — the same `Arc`, compared by
-/// pointer, not two copies of the same ~100 KB download.
-///
-/// The premise this replaces was the opposite: the cache was keyed by
-/// product, so `VerticallyIntegratedLiquid`'s `DVL` and `VilDensity`'s `DVL`
-/// were separate entries and each product fetched its own. That is precisely
-/// what cost two extra GETs per site poll.
 #[test]
 fn one_object_serves_every_product_that_reads_it() {
     let mut d = RenderDispatcher::new();
@@ -247,8 +203,6 @@ fn one_object_serves_every_product_that_reads_it() {
         .expect("VIL density's denominator is the same EET");
     assert!(Arc::ptr_eq(&eet, &denominator));
 
-    // Sharing the map does not let a product reach an object it does not
-    // name: the resolution filter is the product's own code list.
     assert!(
         d.cached_by_code(RadarProduct::EchoTops, "KMPX", "DVL")
             .is_none(),
@@ -270,9 +224,6 @@ fn one_object_serves_every_product_that_reads_it() {
     );
 }
 
-/// Another site's products must never be borrowed. Both sites carry the
-/// same elevations, so a filter that dropped the site would still return
-/// something plausible.
 #[test]
 fn a_tilt_is_never_taken_from_another_site() {
     let mut d = RenderDispatcher::new();
@@ -298,28 +249,9 @@ fn a_tilt_is_never_taken_from_another_site() {
     );
 }
 
-/// Two cached objects a product could resolve either of pick the same one
-/// every time: the angle alone leaves the choice to hash order, so the tie
-/// breaks on elevation number and then on the AWIPS code.
-///
-/// VIL density is the live case, and the reason the code is in the ordering
-/// at all. Its two inputs are whole-volume objects — same elevation angle,
-/// and real `DVL`/`EET` product description blocks number them both 0 — so
-/// angle and cut number both compare `Equal` and only the code separates
-/// them. `data_time_for_render` resolves through here, so without a
-/// total order the age the status bar reports for a VIL density pane would
-/// flip between the numerator's stamp and the denominator's from one process
-/// to the next.
-///
-/// Asserted across **freshly built maps**, not repeated calls on one map:
-/// `std`'s `RandomState` re-seeds per `HashMap` instance, so one map
-/// iterates in the same order every time and a stability loop over it
-/// cannot see the tie-break at all.
 #[test]
 fn two_resolvable_objects_pick_the_same_one_every_time() {
     for round in 0..60 {
-        // Same angle, same cut number, insertion order alternating: exactly
-        // the shape a real DVL/EET pair arrives in.
         let mut d = RenderDispatcher::new();
         let mut inputs = [("DVL", 134i16), ("EET", 135)];
         if round % 2 == 1 {
@@ -339,8 +271,6 @@ fn two_resolvable_objects_pick_the_same_one_every_time() {
                  every time, not from whichever input the hash happened to yield",
         );
 
-        // And with the cut numbers differing — a split cut or a SAILS/MRLE
-        // repeat of one field — the lower one still wins, ahead of the code.
         let mut d = RenderDispatcher::new();
         let mut cuts = [("DVL", 9u16), ("EET", 3)];
         if round % 2 == 1 {
@@ -362,8 +292,6 @@ fn two_resolvable_objects_pick_the_same_one_every_time() {
     }
 }
 
-/// A pane-sized render of `product` at `elevation`. Only the two fields
-/// the age lookup reads carry anything.
 fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     CachedPaneRender {
         image: Arc::new(egui::ColorImage::default()),
@@ -377,15 +305,10 @@ fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     }
 }
 
-/// A pane on `site`, as `apply_render_to_pane` hands one over.
 fn pane_on(site: &str) -> rustdar_egui::pane::PaneState {
     rustdar_egui::pane::PaneState::with_site(site.to_string())
 }
 
-/// The volume time a pane with no Level III object reports. Distinct from every
-/// Level III stamp in these tests (`MPX_EET_2026_07_26_01_55_52`, seven minutes
-/// later), so a branch that read the wrong one is a wrong *value*, not a
-/// coincidence.
 fn volume_time() -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
         .unwrap()
@@ -393,8 +316,6 @@ fn volume_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// A pane on `site` with a volume loaded, so the volume arm of the data-time
-/// stamp has something to report.
 fn pane_with_volume(site: &str) -> rustdar_egui::pane::PaneState {
     let mut pane = pane_on(site);
     pane.scan_info = Some(rustdar_radar::types::ScanInfo {
@@ -417,14 +338,6 @@ fn pane_with_volume(site: &str) -> rustdar_egui::pane::PaneState {
     pane
 }
 
-/// The time a pane is stamped with belongs to the data it is showing: its own
-/// site's Level III object where the product is fetched, its own volume where
-/// the product is derived.
-///
-/// Both arms, because the point of the field is that **every** product has one.
-/// It used to be `None` for anything read off the volume, which let the status
-/// bar's age line double as a datasource indicator — drawn for the bucket
-/// products, absent for the rest.
 #[test]
 fn a_render_stamps_its_pane_with_its_own_datas_time() {
     let mut d = RenderDispatcher::new();
@@ -448,8 +361,6 @@ fn a_render_stamps_its_pane_with_its_own_datas_time() {
              substitute for the object it has not got",
     );
 
-    // Storm-relative velocity derives from the volume, so its data time is the
-    // volume's — not the last Level III object's, and not nothing.
     let srv = pane_with_volume("KMPX");
     assert_eq!(
         d.data_time_for_render(&srv, &rendered(RadarProduct::EchoTops, 0.5)),
@@ -463,10 +374,6 @@ fn a_render_stamps_its_pane_with_its_own_datas_time() {
     );
 }
 
-/// A key whose tail does not parse is an **unknown** time, not a fresh one —
-/// and not the volume's either. Falling back to the scan time for a Level III
-/// product would report a bucket object, possibly from the previous UTC day, as
-/// being exactly as current as the volume beside it.
 #[test]
 fn an_unreadable_key_reports_no_time_rather_than_the_volumes() {
     let mut d = RenderDispatcher::new();
@@ -491,13 +398,6 @@ fn an_unreadable_key_reports_no_time_rather_than_the_volumes() {
     );
 }
 
-/// The override wins, routes into the Level II render parameters, and
-/// only for the product that reads it.
-///
-/// `storm_motion_override_kt` is the exact value `spawn_level2_render`
-/// hands `RenderInput::extract`, read from the same field
-/// `set_storm_motion_override` invalidates on — so the vector a pane is
-/// invalidated for cannot differ from the one it is redrawn with.
 #[test]
 fn the_override_routes_into_the_level2_render_params() {
     let mut d = RenderDispatcher::new();
@@ -512,8 +412,6 @@ fn the_override_routes_into_the_level2_render_params() {
     assert_eq!(d.storm_motion_override_kt(), None);
 }
 
-/// Editing the vector changes nothing else about a pane, so both the
-/// per-pane state and the shared render cache have to be dropped by hand.
 #[test]
 fn changing_the_override_invalidates_the_storm_relative_renders() {
     let mut d = RenderDispatcher::new();
@@ -568,8 +466,6 @@ fn changing_the_override_invalidates_the_storm_relative_renders() {
     );
 }
 
-/// Re-applying the same override must not invalidate anything, or every
-/// frame re-renders every storm-relative pane.
 #[test]
 fn an_unchanged_override_invalidates_nothing() {
     let mut d = RenderDispatcher::new();
@@ -582,7 +478,6 @@ fn an_unchanged_override_invalidates_nothing() {
         d.pane_render[0].last_rendered,
         Some((RadarProduct::StormRelativeVelocity, 1.3))
     );
-    // Turning it back off is a change again.
     assert!(d.set_storm_motion_choice_default(None));
     assert_eq!(d.pane_render[0].last_rendered, None);
 }

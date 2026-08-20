@@ -1,22 +1,4 @@
 //! What a theme flip may and may not invalidate.
-//!
-//! A flip *must* re-rasterize the theme-dependent overlay textures — the egui
-//! crate's `ui_map_pane::theme_flip_tests` pins that half through the cache
-//! token. This file pins the other half: the radar picture is theme
-//! *independent* (its palette is the product's, not the UI's), and its
-//! `RenderCache` entries are 32 MiB apiece at the base side and 128 MiB at
-//! the long-range one, so a flip that flushed them would re-decode and
-//! re-render every visible product for a change that cannot alter one of
-//! their pixels.
-//!
-//! `adopt_theme` touches only `radar_sites_render_gen`, and since WO-E5c the
-//! key itself says why that is safe: `is_dark` is a *handler-declared*
-//! `SelectKey` part, filled from the layer's own
-//! `OverlayHandler::theme_sensitive` and therefore absent from radar's key
-//! entirely. `render_key::tests::the_radar_key_is_the_same_in_dark_and_light`
-//! pins that half against the live declaration; this file pins the behaviour it
-//! buys. A change that wires the theme into the radar's key or flushes the LRU
-//! on a flip goes red in one of the two.
 
 use crate::platform_double::TestBridge;
 use crate::render_dispatch::CachedRenderOutput;
@@ -70,8 +52,6 @@ fn a_theme_flip_never_touches_the_radar_render_cache() {
         "the first reading from a None start is a change",
     );
 
-    // A resident radar render, inserted through the cache's owner
-    // (`RenderDispatcher::render_cache`) exactly where a landed render puts one.
     let (key, entry) = a_radar_entry();
     app.render.render_cache.insert(key.clone(), entry);
     let entries_before = app.render.render_cache.entry_count();
@@ -105,10 +85,6 @@ fn a_theme_flip_never_touches_the_radar_render_cache() {
         );
     }
 
-    // The change-guard: Android's poll thread re-sends its reading every two
-    // seconds whether or not it moved, so a repeated reading must not count
-    // as a change — an unguarded bump would re-rasterise every site label on
-    // every pane twice a second, forever.
     let gens_after_flip = radar_sites_gens(&mut app);
     assert!(
         !app.adopt_theme(false),

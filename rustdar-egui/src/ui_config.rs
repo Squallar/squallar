@@ -4,10 +4,6 @@ use std::collections::{BTreeMap, HashMap};
 use rustdar_kv::KvStore;
 
 /// Key the UI layout is persisted under.
-///
-/// The filesystem backend turns this into `ui.json`, which is the name the
-/// config has always had on disk — the key was chosen to keep it that way so
-/// existing configs keep loading.
 pub const UI_CONFIG_KEY: &str = "ui";
 
 use rustdar_overlays::render::overlay_state::OverlayRegistry;
@@ -55,39 +51,19 @@ struct PaneConfig {
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
     time_step_secs: i64,
-    /// Whether this pane follows shared time (plan §3.7). Defaults **true**:
-    /// a config written before the field existed described panes that all
-    /// behaved as linked, and a downgrade dropping the field degrades to
-    /// exactly that.
+    /// Whether this pane follows shared time (plan §3.7). Defaults **true**.
     #[serde(default = "default_true")]
     time_link: bool,
-    /// Whether this pane's viewport belongs to the linked group (M11).
-    /// Defaults **true** on the same reasoning as `time_link` — with the
-    /// legacy `UiConfig::viewport_sync` global folded in on load, so an old
-    /// config that had the global off comes back with every pane unlinked.
+    /// Whether this pane's viewport belongs to the linked group.
     #[serde(default = "default_true")]
     viewport_link: bool,
-    /// Whether this pane's layer state belongs to the linked group (M11).
-    /// Defaults **true**; the legacy `UiConfig::sync_layers` global is
-    /// folded in on load exactly as `viewport_link`'s is.
+    /// Whether this pane's layer state belongs to the linked group.
     #[serde(default = "default_true")]
     layer_link: bool,
     /// Visual stacking order for all map layers (bottom to top).
-    ///
-    /// A [`KindList`], not a bare `Vec`: one malformed entry from any build
-    /// build used to fail this list, and with it the whole file. The unknown
-    /// names ride in [`KindList::unknown`] and are written back on save.
     #[serde(default = "KindList::default_draw_order")]
     draw_order: KindList,
     /// Per-pane overlay enabled state (master visibility per overlay kind).
-    ///
-    /// String-keyed on the wire: a typed-key map fails the
-    /// *whole map* on one key it cannot name, which fails the whole file.
-    /// Known keys are parsed on load; unknown ones ride in the pane's
-    /// [`crate::pane::PaneConfigBaggage`] and are merged back on save. A
-    /// `BTreeMap` rather than a `HashMap` so the save is byte-stable — the
-    /// autosave's has-anything-changed comparison is a string compare, and a
-    /// freshly built `HashMap`'s iteration order differs per instance.
     #[serde(default)]
     enabled_overlays: BTreeMap<String, bool>,
     /// Per-pane overlay handler config snapshots — string-keyed and
@@ -95,67 +71,27 @@ struct PaneConfig {
     #[serde(default)]
     overlay_configs: BTreeMap<String, serde_json::Value>,
     /// Map zoom level, as `walkers::MapMemory` reports it.
-    ///
-    /// `Option` rather than a defaulted `f64` so a config written before the
-    /// viewport was persisted is distinguishable from one that genuinely saved
-    /// the default zoom. The former must leave `PaneState::with_site`'s choice
-    /// alone; the latter must override it.
     #[serde(default)]
     zoom: Option<f64>,
     /// Where the map is centred, as `(lat, lon)`, when the user has panned away
     /// from the site.
-    ///
-    /// `None` means the map is following the radar site rather than sitting at a
-    /// detached centre — the state `MapMemory::detached` reports as `None` — and
-    /// restoring it has to re-establish *following*, not centre on the site's
-    /// coordinates and call it the same thing. The two look identical until the
-    /// pane changes site.
     #[serde(default)]
     center: Option<(f64, f64)>,
     /// What kind of pane this is: a patch of ground, or a vertical
     /// cross-section through one.
-    ///
-    /// `PaneKindConfig::default()` is `Map`, so a config written before pane
-    /// kinds existed loads as a screen full of maps — which is what it was. A
-    /// kind this build does not *know* falls back the same way rather than
-    /// failing the load — see [`kind_or_default`].
     #[serde(default, deserialize_with = "kind_or_default")]
     kind: PaneKindConfig,
     /// How a map pane draws its ground: the plan view or the 3D volume.
-    ///
-    /// Separate from [`Self::kind`] because it is a separate question — the
-    /// pane is the same place either way. Absent from every config written
-    /// while 3D was a pane *kind*, and `#[serde(default)]` makes that absence
-    /// the plan view; what carries those panes into the 3D mode instead is
-    /// `kind: "Volume"`. See [`PaneKindConfig::Volume`].
     #[serde(default, deserialize_with = "render_or_default")]
     render: MapRender,
     /// A cross-section pane's own state, present only when [`Self::kind`] is
     /// `CrossSection`.
-    ///
-    /// Two fields that must agree, which the in-memory representation
-    /// deliberately does not allow — `PaneContent` derives the kind from the
-    /// content precisely so they cannot disagree. On the wire they can, because a
-    /// file can say anything, so `restore_content` treats a mismatch as a corrupt
-    /// pane and falls back to `Map`.
     #[serde(default)]
     cross_section: Option<CrossSectionConfig>,
     /// A map pane's 3D state, present when it is not the default one.
-    ///
-    /// Written for a pane in **either** render mode, unlike
-    /// [`Self::cross_section`], because a plan-view pane keeps the camera it
-    /// had in 3D and flipping back to 3D must return the same view — across a
-    /// restart as well as within a session. Absent means "the default camera",
-    /// which is what a pane that has never been in 3D has.
     #[serde(default)]
     volume: Option<VolumeConfig>,
     /// Every pane-level key this build does not know, verbatim.
-    ///
-    /// Carried through [`crate::pane::PaneConfigBaggage::fields`] between
-    /// load and save, so a file written by a newer build survives a session
-    /// under this one — the same downgrade safety the unknown overlay kinds
-    /// get. Without this, serde silently *drops* unrecognized keys, and the
-    /// next autosave makes the loss permanent.
     #[serde(flatten)]
     unknown: serde_json::Map<String, serde_json::Value>,
 }
@@ -163,16 +99,6 @@ struct PaneConfig {
 /// A draw-order list as it appears on the wire: every layer id — a string
 /// entry names a layer whether or not this build has a handler for it —
 /// plus, verbatim, any list element that is not a string at all.
-///
-/// Since M8b the ids are OPEN strings, so the old known/unknown partition of
-/// *names* is gone: a name from a newer build is an ordinary [`LayerId`] and
-/// rides IN [`Self::known`], keeping its position through load and save (the
-/// interleaved-position refinement the pre-M8b wrapper could not offer).
-/// Only a list element that is not a JSON string — malformed by every
-/// build's lights — lands in [`Self::unknown`], appended after the ids on
-/// the way back out. Serialization writes the ids **through serde** (a
-/// `LayerId` is `#[serde(transparent)]`, the bare string) — never
-/// `format!("{:?}")`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct KindList {
     /// Every layer id in the list, in wire order — registered or not.
@@ -184,9 +110,7 @@ pub(crate) struct KindList {
 
 impl KindList {
     /// The default draw order, wrapped — what a config with no `draw_order`
-    /// key reads as: the registry weight order (M8b; byte-identical to the
-    /// enum-era default this replaced — the draw-weight order pin in
-    /// rustdar-overlays holds them equal).
+    /// key reads as: the registry weight order.
     fn default_draw_order() -> Self {
         Self::from(crate::sources::default_draw_order())
     }
@@ -246,37 +170,16 @@ impl<'de> Deserialize<'de> for KindList {
 }
 
 /// A pane kind, as it appears on the wire.
-///
-/// Its own enum rather than [`PaneKind`] because the wire has to keep reading a
-/// name the program no longer has. Serializing goes the other way: only the two
-/// live variants are ever written, so a file round-trips into the current
-/// vocabulary the first time it is saved.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PaneKindConfig {
     #[default]
     Map,
     CrossSection,
     /// Written by builds in which a 3D view was a pane kind of its own.
-    ///
-    /// Loads as a **map pane in the 3D render mode**, which is the same picture
-    /// the file was describing — the pane was always looking at a patch of
-    /// ground, and the collapse only changed where that fact is recorded.
-    /// Dropping it to a plan view instead would be a silent downgrade of the
-    /// user's layout on first launch after an update; failing the load, which
-    /// is what an unknown variant did before `kind_or_default`, would lose the
-    /// whole file.
-    ///
-    /// Never written. There is no way back to a 3D pane kind, so a config saved
-    /// by this build names `Map` with `render: "Volume"`, and this variant is
-    /// read-only from here on.
     Volume,
 }
 
 /// A cross-section pane, as persisted.
-///
-/// The rendered raster is deliberately not here and never will be: it is derived
-/// from the volume and the line, and a volume is not persisted either. What is
-/// worth keeping is the *question* the pane is asking.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct CrossSectionConfig {
@@ -290,12 +193,6 @@ struct CrossSectionConfig {
 }
 
 /// A section line's endpoints, in degrees.
-///
-/// Four flat `f64`s rather than a `SectionLine`, because `SectionLine`'s fields
-/// are private and its only constructor *validates* — which is exactly what
-/// wants to happen on the way back in, and must not be bypassed by a
-/// `Deserialize` impl. So the wire form is dumb and
-/// [`SectionLine::new`](crate::pane::SectionLine::new) is the gate.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct SectionLineConfig {
@@ -306,35 +203,6 @@ struct SectionLineConfig {
 }
 
 /// A 3D pane's picked region, as persisted.
-///
-/// Absent for the ordinary case — the volume's own data reach, which is a fact
-/// about the scan rather than a choice and would be wrong to freeze into a file:
-/// a site switched to a TDWR must get the TDWR's ring, not the WSR-88D's ring
-/// the last session happened to be looking at.
-///
-/// Flat `f64`s rather than the domain types, for [`SectionLineConfig`]'s reason:
-/// serde reads any number into these and
-/// [`VolumeRegion::new`](crate::pane::VolumeRegion::new) is the gate on the way
-/// back in.
-///
-/// # Why a missing extent is not zero
-///
-/// A `region` block has existed under this name before, describing a **square**
-/// box dragged out on another pane: `centre_lat`, `centre_lon`, `half_width_km`,
-/// with a `source_pane` beside it. Its extent key is not one of these, so
-/// `#[serde(default)]` reads both axes as `0.0` — and `VolumeRegion::new`
-/// *clamps* rather than refuses, so a straight construction turns that old block
-/// into a **10 km** box centred where the old drag was. A pane that opened onto
-/// a twentieth of a county would be a far worse outcome than one that opened
-/// onto the whole ring, and it would be indistinguishable from the user having
-/// asked for it.
-///
-/// So [`Self::restore`] requires a positive extent on both axes, which is the
-/// property that separates "a region was written here" from "this block is
-/// something else". The old drag's box is deliberately *not* migrated: it named
-/// a source pane and a gesture that no longer exist, and inventing a new-style
-/// pick out of it would be restoring a decision the user never made in these
-/// terms.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct VolumeRegionConfig {
@@ -347,12 +215,6 @@ struct VolumeRegionConfig {
 impl VolumeRegionConfig {
     /// The region this block names, or `None` for one that names none —
     /// including every block written by the square-drag form this replaced.
-    ///
-    /// `VolumeRegion::new` is still the gate on the centre and on the extent's
-    /// upper end; this only adds the lower one, which it deliberately does not
-    /// have. Clamping up is right for a live control wound to its stop and
-    /// wrong for a file, where the same arithmetic launders a missing key into
-    /// a plausible-looking box.
     fn restore(&self) -> Option<VolumeRegion> {
         if !(self.half_east_km > 0.0 && self.half_north_km > 0.0) {
             return None;
@@ -372,25 +234,6 @@ impl VolumeRegionConfig {
 
 /// A 3D pane, as persisted: where the eye is, how far the vertical is stretched,
 /// and what ground was picked.
-///
-/// The voxel grid is not here for the same reason the section raster is not:
-/// it is derived from a volume, and rebuilding it is what opening the pane does.
-/// The *region* is here rather than derived, and that is the difference between
-/// it and the grid — it is a choice the user made, and losing it on restart
-/// would silently put a carefully aimed 20 km box back to the whole ring with
-/// the pane still claiming to be a 3D view of a storm.
-///
-/// That claim was false twice over and is now true. First the region was
-/// measured off the viewport every frame, so there was nothing here to save.
-/// Then it was stored and these keys were written — but nothing in the program
-/// could put a `Some` in the field, so the block was never exercised by
-/// anything a user could do. The region selector is what closed the second gap:
-/// a picked box is written here, and comes back.
-///
-/// Flat `f64`s and `f32`s throughout, never the domain types, for the reason
-/// [`SectionLineConfig`] gives: serde reads any number into these, and the
-/// validating constructors (`VolumeRegion::new`, `OrbitCamera::restore`) are the
-/// gate on the way back in.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct VolumeConfig {
@@ -403,13 +246,6 @@ struct VolumeConfig {
     vertical_exaggeration: f32,
     /// Whether this pane has turned the map floor **off**, in
     /// [`crate::pane::VolumePane::hide_floor`]'s own inverted sense.
-    ///
-    /// Inverted on the wire as well as in memory so that `Default::default()` —
-    /// `false` — is the floor showing: a config written before this field
-    /// existed has no key, `#[serde(default)]` supplies `false`, and the pane
-    /// comes back with its floor, which is the shipped default. Storing the
-    /// positive `show_floor` instead would make every pre-existing config
-    /// restore with the floor *off*.
     hide_floor: bool,
     /// Lit volume or isosurface. `#[serde(default)]` on the struct makes an
     /// older config a lit volume; the lenient deserializer makes a *newer*
@@ -418,20 +254,9 @@ struct VolumeConfig {
     #[serde(deserialize_with = "view_mode_or_default")]
     view_mode: crate::pane::VolumeViewMode,
     /// The ground this pane resamples, or absent for the volume's own reach.
-    /// See [`crate::pane::VolumePane::region`] and [`VolumeRegionConfig`].
     region: Option<VolumeRegionConfig>,
     /// Which map pane the region was dragged on, or absent for a pane nobody
     /// aimed. See [`crate::pane::VolumePane::source_pane`].
-    ///
-    /// Beside the region rather than inside [`VolumeRegionConfig`], mirroring
-    /// the memory representation exactly — and for the same reason it is
-    /// outside `VolumeRegion` there: it is a fact about where the choice came
-    /// from, not about the box, and the two go stale at different times. A
-    /// restore into a narrower layout drops this and keeps the region, which is
-    /// only expressible if they are separate keys.
-    ///
-    /// A bare `usize`, validated on the way back in against the restored pane
-    /// count, exactly as [`SectionLineConfig::source_pane`] is.
     source_pane: Option<usize>,
 }
 
@@ -456,13 +281,6 @@ where
 
 impl VolumeConfig {
     /// Whether this says anything a freshly opened pane does not already say.
-    ///
-    /// The gate on writing a `volume` block at all. Field-by-field against
-    /// [`Self::default`] rather than a `PartialEq` derive, because the floats
-    /// here are compared for *equality with a constant this program produced*,
-    /// which is the one comparison of `f32`s that is exact — and a derive would
-    /// invite the same comparison to be used on two values that had been
-    /// arithmetic.
     fn differs_from_default(&self) -> bool {
         let default = Self::default();
         self.yaw_deg != default.yaw_deg
@@ -472,15 +290,7 @@ impl VolumeConfig {
             || self.vertical_exaggeration != default.vertical_exaggeration
             || self.hide_floor != default.hide_floor
             || self.view_mode != default.view_mode
-            // `is_some` rather than a comparison: the default is "no region
-            // picked", so *having* one is the whole of the difference, and
-            // comparing four `f64`s against a default that has none would be
-            // arithmetic where a presence test is exact.
             || self.region.is_some()
-            // Not folded into the line above: a pane can hold a source with no
-            // region only transiently, but the *file* must round-trip whatever
-            // it was handed rather than deciding that one field implies the
-            // other. A presence test for the same reason.
             || self.source_pane.is_some()
     }
 }
@@ -490,12 +300,6 @@ impl Default for VolumeConfig {
     /// second copy of the angles would drift, and the drift would show up as a
     /// 3D pane that opened at a different angle depending on whether its config
     /// predated the field.
-    ///
-    /// This is also what a config written before the pan and the exaggeration
-    /// existed deserializes to, because of `#[serde(default)]` on the struct: an
-    /// old file has no `pivot` and no `vertical_exaggeration`, and it comes back
-    /// centred and at the default stretch rather than at a zeroed 0× that would
-    /// collapse the box.
     fn default() -> Self {
         let camera = OrbitCamera::default();
         Self {
@@ -504,14 +308,9 @@ impl Default for VolumeConfig {
             eye_distance: camera.eye_distance(),
             pivot: camera.pivot(),
             vertical_exaggeration: camera.vertical_exaggeration(),
-            // The floor shows. Matches `VolumePane`'s derived default through
-            // the same inversion — see the field's own doc.
             hide_floor: false,
             view_mode: crate::pane::VolumeViewMode::default(),
-            // No region picked: the volume's own reach. Matches
-            // `VolumePane`'s derived default, which is the same `None`.
             region: None,
-            // Nobody aimed it, so it came from nowhere.
             source_pane: None,
         }
     }
@@ -534,12 +333,6 @@ impl Default for PaneConfig {
         Self {
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
-            // Empty, not the all-layer-kinds population the retired enum
-            // used to seed here — behavior identical: every real file
-            // carries its own map (or, since the overlay registry,
-            // `overlay_states` instead), the save has written it empty for
-            // as long, and the only reader is the legacy `"Radar"` capture,
-            // which treats absent as "nothing to migrate" either way.
             layers: BTreeMap::new(),
             spc_day: OutlookDay::Day1,
             site: String::new(),
@@ -576,29 +369,17 @@ struct UiConfig {
     config_version: u32,
     pane_count: usize,
     active_pane: usize,
-    /// **Read-only legacy** (M11): the retired global viewport-sync toggle.
-    /// Never written again — `skip_serializing` — but still read, so an old
-    /// config that had it off loads with every restored pane's
-    /// `viewport_link` seeded off (see `load_ui_config`). Absent on the wire
-    /// (every config this build writes) it defaults true, which folds into
-    /// the per-pane fields as a no-op.
+    /// **Read-only legacy**: the retired global viewport-sync toggle.
     #[serde(skip_serializing, default = "default_true")]
     viewport_sync: bool,
-    /// **Read-only legacy** (M11): the retired global layer-sync toggle,
+    /// **Read-only legacy**: the retired global layer-sync toggle,
     /// on the same terms as `viewport_sync`. On load, false seeds every
-    /// restored pane's `layer_link` **and** `time_link` off — under the old
-    /// model this one global gated the whole shared-time fan-out too, so the
-    /// pane's stored `time_link` was inert while it was off, and honouring
-    /// the observed behaviour means seeding both.
+    /// restored pane's `layer_link` **and** `time_link` off.
     #[serde(skip_serializing, default = "default_true")]
     sync_layers: bool,
     auto_poll: bool,
     /// Feed live panes from the real-time chunk bucket rather than polling the
     /// archive for completed volumes.
-    ///
-    /// The container carries `#[serde(default)]`, so a config written before
-    /// this field existed takes `UiConfig::default()`'s value — the same
-    /// mechanism `auto_poll` relies on.
     live_chunks: bool,
     /// Subscribe to the push-notification service for new chunks.
     chunk_notifications: bool,
@@ -630,22 +411,10 @@ struct UiConfig {
     /// The user's storm-motion override — the audit's known persistence gap,
     /// closed here. `#[serde(default)]` makes an older config load as
     /// "override off, default vector", which is what those sessions were.
-    /// Lenient for [`Self::preferences`]' reason.
     #[serde(default, deserialize_with = "lenient_or_default")]
     storm_motion_override: super::StormMotionOverride,
     /// Which derived rung storm-relative velocity falls to when no override and
     /// no NWS vector applies — the Storm motion section's first control.
-    ///
-    /// Persisted because reopening is 1:1 with how the app was closed, and this
-    /// one is invisible until a volume arrives without an NWS vector: a reader
-    /// who chose the right-mover and found the mean wind after a restart would
-    /// have no way to tell the setting had been lost from the setting having
-    /// never applied.
-    ///
-    /// `#[serde(default)]` loads an older config as the mean wind, which is
-    /// both the shipped default and what those sessions were getting once the
-    /// rungs were reordered. Read leniently for [`product_or_default`]'s
-    /// reason: a rung name from a newer build must not cost the whole file.
     #[serde(default, deserialize_with = "srv_fallback_or_default")]
     srv_fallback: rustdar_radar::srv::SrvFallback,
     /// Whether the pane pill rows render at full opacity unconditionally —
@@ -658,11 +427,6 @@ struct UiConfig {
     #[serde(default)]
     presets: Vec<super::PresetConfig>,
     /// The user's Volume Alpha curves, one entry per *edited* product.
-    ///
-    /// A list of exceptions rather than a curve per product, because absence
-    /// is the meaningful default: a product with no entry renders through its
-    /// palette's own alpha bit-exactly, and an old config without this field
-    /// loads as "nothing edited" through the container's `#[serde(default)]`.
     #[serde(default)]
     volume_alpha: Vec<VolumeAlphaConfig>,
     /// The user's isosurface thresholds, one entry per *edited* product —
@@ -694,14 +458,6 @@ struct VolumeIsoConfig {
 }
 
 /// One product's persisted Volume Alpha curve.
-///
-/// The alphas are stored as the same 256 bytes the LUT's alpha channel holds
-/// — **deliberately not floats**. The finiteness filter every persisted float
-/// goes through (see [`content_config`]) exists because `serde_json` writes a
-/// NaN as `null` and the next load loses the whole file; a `u8` has no
-/// non-finite values, so this encoding closes that class of loss by
-/// construction instead of by filter. It is also exact: the render quantises
-/// alpha to these bytes anyway, so nothing finer would survive the round trip.
 #[derive(Serialize, Deserialize)]
 struct VolumeAlphaConfig {
     /// `None` when the saved name is a product this build does not know — the
@@ -712,28 +468,11 @@ struct VolumeAlphaConfig {
     #[serde(default, deserialize_with = "known_product_or_none")]
     product: Option<RadarProduct>,
     /// Exactly [`crate::volume_alpha::CURVE_LEN`] alphas, entry 0 first.
-    /// Validated on load — a wrong length is dropped with a warning, and
-    /// entry 0 is re-clamped to transparent by `AlphaCurve::from_alphas`, so
-    /// a hand-edited file cannot make the no-data index visible.
     alpha: Vec<u8>,
 }
 
 /// Deserialize a [`RadarProduct`], falling back to the default product when
 /// the name is unknown.
-///
-/// A bare `#[derive(Deserialize)]` enum fails on an unknown variant, and that
-/// error propagates up and fails the *entire* config load. One product name
-/// from a newer build would cost the user their site, layout and curves,
-/// permanently, because the autosave then rewrites the file from defaults.
-///
-/// See [`kind_or_default`] for the same fallback on pane kinds, and
-/// [`KindList`] for the layer ids. (An earlier version of this comment
-/// claimed unknown layer names were "filtered out" — false: serde failed
-/// the containing list or map before any filter downstream could run, and
-/// one unknown name cost the whole file. The tolerance has to live in the
-/// deserializer itself, which is where `KindList` and the string-keyed
-/// overlay maps put it.) The worker wire's `from_wire_code` returning `None`
-/// covers that boundary on its own.
 pub(crate) fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -754,11 +493,6 @@ where
 
 /// Deserialize the persisted derived-rung preference, falling back to the
 /// shipped default on a name this build does not know.
-///
-/// [`product_or_default`]'s reason exactly: a bare derived `Deserialize` fails
-/// the *entire* config load on an unknown variant, and a reader who ran a newer
-/// build once would lose their site, layout and curves permanently — the
-/// autosave rewrites the file from defaults straight afterwards.
 pub(crate) fn srv_fallback_or_default<'de, D>(
     deserializer: D,
 ) -> Result<rustdar_radar::srv::SrvFallback, D::Error>
@@ -782,29 +516,6 @@ where
 
 /// Deserialize a persisted radar site, dropping one built out of bytes no
 /// identifier contains.
-///
-/// This is the boundary the panic in [`site_code`](rustdar_radar::level3::site_code)
-/// arrived through. `ui.json` is a file on the user's disk with a `site` field
-/// in it, and until this existed nothing between an edit to that field and
-/// `site_code`'s `&id[1..]` looked at what the field held: a four-*byte*
-/// identifier whose first character is multi-byte — `"éab"` — put that byte
-/// range through the middle of a UTF-8 sequence and killed the process on the
-/// next Level III fetch.
-///
-/// Rejected rather than repaired, because there is no repair. A radar
-/// identifier is issued, not derived, and no transformation of `"éab"` names a
-/// radar; anything this could invent would be a different site's data drawn
-/// under the name of the one that was asked for. Rejected *here* rather than at
-/// each byte range downstream, because this file is the only place the value is
-/// unconstrained — identifiers off the network are already filtered to four
-/// uppercase characters by `parse_bucket_ids`, and every other writer of the
-/// field copies a `RadarSite`'s own name.
-///
-/// Empty rather than an error, for the reason [`product_or_default`] falls back
-/// instead of failing: one bad field must not cost the user their layout,
-/// curves and camera. Empty is already this field's [`default_site`], and
-/// `apply_to` reads it as "not set" and leaves whichever site startup picked —
-/// the nearest radar, exactly as on a first run.
 pub(crate) fn site_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -819,27 +530,6 @@ where
 
 /// Deserialize a [`PaneKindConfig`], falling back to `Map` when the name is one
 /// this build does not know.
-///
-/// The same class of loss [`product_or_default`] closes, on the field that is
-/// most likely to grow a variant next: pane kinds are what this application is
-/// currently adding to, and until this existed a config naming a kind from a
-/// later build failed the *whole* load — layout, sites, curves, camera, every
-/// setting — because `serde` refuses an unknown unit variant and `load_ui_config`
-/// has one `Result` for the whole file.
-///
-/// It is what a kind *removed* by a later build goes through too, and that is
-/// the direction this refactor exercised: `"Volume"` is still a name
-/// [`PaneKindConfig`] knows, deliberately, so it lands on a real variant here
-/// rather than on this fallback and keeps its 3D view. A name that reaches the
-/// fallback is one nothing in this build has ever written.
-///
-/// `Map` rather than "drop the pane", because a pane is a position in a layout:
-/// dropping it would renumber every pane after it and silently move the user's
-/// windows around. A pane whose kind is unreadable is still a pane, and a map is
-/// what every pane starts as. The kind-specific state (`cross_section`) is then
-/// a mismatch, which `restore_content` already treats as a corrupt pane and
-/// falls back to `Map` for — so the fallback lands in a state the loader already
-/// knows how to make consistent.
 fn kind_or_default<'de, D>(deserializer: D) -> Result<PaneKindConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -859,11 +549,6 @@ where
 
 /// Deserialize a [`MapRender`], falling back to the plan view when the name is
 /// one this build does not know.
-///
-/// [`kind_or_default`]'s argument, one field over: a render mode from a later
-/// build must cost the pane its picture, not the user their whole config. The
-/// plan view is the safe landing because it is what every map pane can always
-/// draw.
 fn render_or_default<'de, D>(deserializer: D) -> Result<MapRender, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -883,11 +568,6 @@ where
 
 /// Deserialize a [`RadarProduct`] as `None` when the name is unknown, so the
 /// caller can drop the entry it keys rather than misassign it.
-///
-/// The distinction from [`product_or_default`] matters: a pane with an unknown
-/// product can honestly show the default product, but an alpha curve saved for
-/// an unknown product must not be *reassigned* — applied to Reflectivity it
-/// would silently change what the user sees, which is worse than losing it.
 fn known_product_or_none<'de, D>(deserializer: D) -> Result<Option<RadarProduct>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -925,9 +605,7 @@ where
 }
 
 /// The wire key a layer's state is filed under — the id string
-/// ([`LayerId::as_str`]), which is byte-identical to the enum-era serde
-/// spelling this replaced (the spelling-pin test in rustdar-overlays holds
-/// them equal until the enum goes at M8c). Never `format!("{:?}")`.
+/// ([`LayerId::as_str`]). Never `format!("{:?}")`.
 fn layer_key(id: &LayerId) -> String {
     id.as_str().to_string()
 }
@@ -966,13 +644,6 @@ impl Default for UiConfig {
 
 impl super::Gui {
     /// Save UI layout configuration to `store`, waiting for the write.
-    ///
-    /// [`KvStore::store_now`] rather than `store`, because both callers are
-    /// save points where the process may be gone a moment later — the exit
-    /// path, and the Android suspend that the system is free to follow with a
-    /// kill. A backend that defers writes to another thread would never get to
-    /// run this one. The periodic autosave, which is on the frame thread and
-    /// has a next tick to fall back on, deliberately uses `store` instead.
     pub fn save_ui_config(&self, store: &dyn KvStore) {
         let Some(json) = self.ui_config_json() else {
             return;
@@ -983,46 +654,7 @@ impl super::Gui {
     }
 
     /// The configuration this `Gui` would persist, as JSON.
-    ///
-    /// Exposed separately from [`save_ui_config`](Self::save_ui_config) so the
-    /// periodic autosave can ask "has anything changed?" without a storage
-    /// write. Comparing this against the last written string is what keeps a
-    /// three-second timer from becoming a three-second write loop.
-    ///
-    /// `None` only if serialization fails, which is already logged.
-    ///
-    /// # An asymmetry, examined and deliberately left
-    ///
-    /// This writes `self.panes` **unbounded** while `load_ui_config` restores only
-    /// `.take(count)`. So a session split down from six panes to two writes six
-    /// `PaneConfig`s and reads two back, and the four extra entries are dead
-    /// weight in the file.
-    ///
-    /// Both of the tidy fixes are worse. Writing only `count` would delete the
-    /// hidden panes' state permanently on the next autosave — the very state
-    /// `Gui::panes` keeps them around for, so that re-splitting restores what they
-    /// were showing. Reading all of them would resurrect panes past the layout's
-    /// clamp, which is what the clamp exists to prevent. The asymmetry is what
-    /// makes a re-split after a restart remember anything at all, and it costs a
-    /// few hundred bytes.
-    ///
-    /// It does have one live consequence, handled where it lands rather than here:
-    /// `config.panes` can be longer than the restored `pane_count`, so a section
-    /// pane's `source_pane` has to be validated against the count and not against
-    /// the list — see `restore_content`.
     pub fn ui_config_json(&self) -> Option<String> {
-        // Guard every float against NaN and infinity on the way out.
-        //
-        // Not because `serde_json` fails on them — it does not, which is the
-        // correction to what this comment used to say. It writes `null`, the save
-        // succeeds, and it is the *next load* that chokes, because `null` will
-        // not deserialize back into a number. The per-unit salvage in
-        // `load_ui_config` has since shrunk the blast radius from the whole
-        // file to the unit carrying the `null` — a pane resets to defaults in
-        // place, a top-level number still refuses the file — but "the user's
-        // pane silently reset, one run later, with nothing to connect the two"
-        // is still a loss worth four comparisons at the source. Pinned by
-        // `a_non_finite_float_would_poison_the_config_file_permanently`.
         let fps = if self.loop_speed_fps.is_finite() {
             self.loop_speed_fps
         } else {
@@ -1032,7 +664,6 @@ impl super::Gui {
             .panes
             .iter()
             .map(|pane| {
-                // Filtered, not written out and hoped for: see `content_config`.
                 let (kind, render, cross_section, volume) = content_config(pane);
                 PaneConfig {
                     kind,
@@ -1052,9 +683,6 @@ impl super::Gui {
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
-                    // The live ids in place — an id with no handler rides in
-                    // `pane.draw_order` itself since M8b; the baggage half
-                    // carries only non-string residue (see `KindList`).
                     draw_order: KindList {
                         known: pane.draw_order.clone(),
                         unknown: pane.config_baggage.draw_order.clone(),
@@ -1070,8 +698,6 @@ impl super::Gui {
                         .map(|(id, val)| (layer_key(id), val.clone()))
                         .collect(),
                     unknown: pane.config_baggage.fields.clone(),
-                    // Same NaN guard as `loop_speed_fps` above, and for the same
-                    // reason, stated there.
                     zoom: pane
                         .map_memory
                         .zoom()
@@ -1086,15 +712,9 @@ impl super::Gui {
             })
             .collect();
         let config = UiConfig {
-            // Always this build's own version, whatever the loaded file
-            // said: with the unknown-field and unknown-kind preservation
-            // above and below, this build's version is the honest
-            // description of the file it writes — see `migrate`.
             config_version: migrate::CONFIG_VERSION,
             pane_count: self.pane_layout.pane_count,
             active_pane: self.active_pane,
-            // Dead values behind `skip_serializing`: the legacy globals are
-            // never written again — the per-pane links above are the state.
             viewport_sync: true,
             sync_layers: true,
             auto_poll: self.auto_poll.enabled,
@@ -1121,9 +741,6 @@ impl super::Gui {
             },
             serial_config: self.serial_config.clone(),
             heading_source: self.heading_source,
-            // The same NaN guard every persisted float gets (see the note on
-            // this function): `DragValue` parses "nan", and one non-finite
-            // number costs the whole file on the *next* load.
             storm_motion_override: {
                 let motion = self.storm_motion_override;
                 let default = super::StormMotionOverride::default();
@@ -1143,8 +760,6 @@ impl super::Gui {
             },
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
-            // The elevations go through the same finiteness door; the capture
-            // path already filters, so this guards only hand-poked state.
             presets: self
                 .presets
                 .iter()
@@ -1167,9 +782,6 @@ impl super::Gui {
                 })
                 .collect(),
             volume_alpha: {
-                // Sorted by product code so the autosave's "has anything
-                // changed?" string comparison cannot be defeated by
-                // `HashMap` iteration order.
                 let mut curves: Vec<VolumeAlphaConfig> = self
                     .volume_alpha
                     .entries()
@@ -1182,9 +794,6 @@ impl super::Gui {
                 curves
             },
             volume_iso: {
-                // Sorted for the same autosave-comparison reason as the
-                // curves; non-finite thresholds cannot exist in the store
-                // (`IsoThresholds::set` refuses them), so no filter here.
                 let mut thresholds: Vec<VolumeIsoConfig> = self
                     .volume_iso
                     .entries()
@@ -1208,27 +817,10 @@ impl super::Gui {
     }
 
     /// Load UI layout configuration from `store`.
-    ///
-    /// A missing or unparseable config leaves `self` untouched, so the caller
-    /// keeps whatever defaults it was constructed with.
-    ///
-    /// Returns whether a config was actually applied. The caller uses that to
-    /// tell a returning user from a first run: only a first run may have its
-    /// radar site chosen for it, because on any later run the stored site is the
-    /// user's own choice and overriding it would be the bug, not the feature.
-    ///
-    /// An unparseable config counts as *not* loaded. That is the honest answer —
-    /// nothing was applied — and it means a corrupted store still gets a sensibly
-    /// located default rather than the compiled-in one.
     pub fn load_ui_config(&mut self, store: &dyn KvStore) -> bool {
         let Some(content) = store.load(UI_CONFIG_KEY) else {
             return false;
         };
-        // Stage one: the raw JSON tree. This parse is the one remaining
-        // whole-file refusal — a file that is not JSON at all has no units
-        // to salvage. Everything past this point fails *per unit*: a corrupt
-        // pane costs that pane, a corrupt preset costs that preset, a corrupt
-        // container costs its own settings, and nothing costs the file.
         let mut value = match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(v) => v,
             Err(e) => {
@@ -1241,22 +833,11 @@ impl super::Gui {
         let config = match UiConfig::deserialize(&value) {
             Ok(c) => c,
             Err(e) => {
-                // Structurally unreachable for an object-rooted file — the
-                // sanitize pass above repaired or shed every unit that could
-                // fail — so what lands here is a file whose *root* is not a
-                // config at all (a bare array, a string), and nothing in it
-                // can be honestly applied.
                 log::warn!("Failed to read config: {}", e);
                 return false;
             }
         };
 
-        // Clamp to the *absolute* maximum, not the current screen's. Clamping
-        // to what this device would offer silently destroys the user's layout:
-        // a 5-pane config opened once on a phone comes back as 4 panes and is
-        // written back as 4 on the next save. The config is shared state, so it
-        // is clamped to what the format allows; the pane picker does the
-        // per-device narrowing at the point of *editing*.
         let count = config.pane_count.clamp(1, WidthClass::max_panes_absolute());
         while self.panes.len() < count {
             let site = config
@@ -1292,18 +873,8 @@ impl super::Gui {
         self.pin_pane_controls = config.pin_pane_controls;
         self.presets = config.presets;
 
-        // The Volume Alpha curves. Replaced wholesale rather than merged —
-        // the store starts empty and a load is the session's beginning — and
-        // validated entry by entry: a curve of the wrong length is a config
-        // from a different format (or a hand edit) and is dropped with its
-        // name in the log, not truncated into a curve the user never drew.
-        // An old config simply has no entries, which is the untouched,
-        // bit-exact state.
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();
         for entry in config.volume_alpha {
-            // `None` is a product name this build does not know — already
-            // logged by the deserializer; the curve is dropped rather than
-            // applied to a product the user never drew it for.
             let Some(product) = entry.product else {
                 continue;
             };
@@ -1315,18 +886,12 @@ impl super::Gui {
                 );
                 continue;
             };
-            // `from_alphas` re-clamps entry 0, so a hand-edited file cannot
-            // make the no-data index visible.
             self.volume_alpha.set(
                 product,
                 crate::volume_alpha::AlphaCurve::from_alphas(alphas),
             );
         }
 
-        // The isosurface thresholds, replaced wholesale for the same reason.
-        // A `None` product (unknown name) is dropped; a non-finite threshold
-        // is refused by `set` itself, the same door every persisted float
-        // goes through.
         self.volume_iso = crate::volume_iso::IsoThresholds::default();
         for entry in config.volume_iso {
             let Some(product) = entry.product else {
@@ -1335,32 +900,15 @@ impl super::Gui {
             self.volume_iso.set(product, entry.threshold);
         }
 
-        // Restore per-pane state.
-        // Migrate legacy per-pane Radar toggle from old `layers` map to the
-        // global RadarHandler, using the first pane's value (all panes were
-        // synced anyway when there was a per-pane layer manager).
         let mut legacy_radar_enabled: Option<bool> = None;
-        // Whether any pane came back carrying a zoom the user chose. Folded up
-        // out of the loop because `Gui::claim_initial_zoom` is the *later*
-        // writer of the same value: it fires on the session's first scan, which
-        // arrives seconds after this load, and without being told it overwrites
-        // every restored zoom with `DEFAULT_INITIAL_ZOOM` — which the next
-        // autosave then writes back to disk. Accumulated rather than assigned
-        // inside the loop only because `self.panes` is borrowed there.
         let mut zoom_restored = false;
         for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
             let pc = config.panes.get(i);
             let Some(pc) = pc else {
-                // Fall back to global time_step_secs for panes without PaneConfig
                 pane.time_step_secs = config.time_step_secs;
-                // The legacy-global fold below, for a pane the config never
-                // described: its links are the defaults ANDed with the same
-                // globals, so a legacy sync-off layout cannot grow a linked
-                // pane out of thin air.
                 pane.viewport_link = config.viewport_sync;
                 pane.layer_link = config.sync_layers;
                 pane.time_link = config.sync_layers;
-                // A pane the config never described carries nothing for it.
                 pane.config_baggage = crate::pane::PaneConfigBaggage::default();
                 continue;
             };
@@ -1372,40 +920,16 @@ impl super::Gui {
                 pane.site = config.site.clone();
             }
             pane.time_step_secs = pc.time_step_secs;
-            // The M11 migration fold: the per-pane links ANDed with the
-            // legacy globals. A config this build wrote carries no globals,
-            // serde defaults them true, and the AND is the identity; an old
-            // config with a global **off** loads with every pane's
-            // corresponding link off — which is the behaviour that config
-            // described. `sync_layers` folds into `time_link` too: under the
-            // old model that one global gated the whole shared-time fan-out,
-            // so a stored `time_link` was inert while it was off, and
-            // honouring observed behaviour means seeding both. The globals
-            // are never written again (`skip_serializing`), so this fold
-            // runs at most once per legacy file.
             pane.time_link = pc.time_link && config.sync_layers;
             pane.viewport_link = pc.viewport_link && config.viewport_sync;
             pane.layer_link = pc.layer_link && config.sync_layers;
-            // Capture the first pane's legacy Radar toggle for migration.
             if legacy_radar_enabled.is_none()
                 && let Some(&enabled) = pc.layers.get("Radar")
             {
                 legacy_radar_enabled = Some(enabled);
             }
-            // `set_content` rather than a write to `content`, because the kind and
-            // the per-kind state arrive together here and `restore_content` has
-            // already decided both — and because that setter is what enforces what
-            // a kind implies, so a restored non-map pane arrives with the same
-            // invariants as a converted one. This is the legitimate writer outside
-            // the UI pass; `Gui::request_pane_view` exists for the writers *inside*
-            // it, where the pane may be `mem::take`n.
             pane.set_content(restore_content(i, pc, count));
             pane.draw_order = reconcile_draw_order(&pc.draw_order.known, &self.overlays);
-            // Every string key is an ordinary LayerId since M8b — an id with
-            // no registered handler rides IN the pane maps (applied to
-            // nothing, written back verbatim) instead of in a baggage
-            // sidecar. The baggage keeps only what no build could name: the
-            // non-string draw_order residue, and whole unknown pane fields.
             pane.config_baggage = crate::pane::PaneConfigBaggage {
                 draw_order: pc.draw_order.unknown.clone(),
                 fields: pc.unknown.clone(),
@@ -1433,12 +957,6 @@ impl super::Gui {
                     unregistered.join(", "),
                 );
             }
-            // Restore per-pane overlay enabled state. REPLACING gated on
-            // naming at least one REGISTERED id: a map that names only
-            // layers this build cannot serve says nothing about the ones it
-            // can, and must not blank their defaults — but its unregistered
-            // entries still land in the pane map either way, or the next
-            // save loses them (they have no other carrier since M8b).
             if enabled
                 .keys()
                 .any(|id| self.overlays.handler_by_id(id).is_some())
@@ -1447,7 +965,6 @@ impl super::Gui {
             } else {
                 pane.enabled_overlays.extend(enabled);
             }
-            // Restore per-pane overlay handler configs, on the same gate.
             if configs
                 .keys()
                 .any(|id| self.overlays.handler_by_id(id).is_some())
@@ -1459,26 +976,12 @@ impl super::Gui {
             zoom_restored |= restore_viewport(pane, pc);
         }
 
-        // Claim the latch on the load's behalf, so the first scan of the
-        // session leaves the restored viewport alone. Deliberately *not* a
-        // blanket `true`: a first run with no config, and a config written
-        // before the viewport was persisted, both arrive here with no saved
-        // zoom to defend, and those are the two cases `claim_initial_zoom`
-        // still exists for — a fresh pane sits at a continental
-        // `DEFAULT_PANE_ZOOM`, and the first scan is what makes it a radar
-        // view.
         if zoom_restored {
             self.initial_zoom_set = true;
         }
 
-        // Every top-level key this build could not name, kept verbatim for
-        // the save to hand back — the downgrade half of the version story.
         self.config_unknown_fields = config.unknown;
 
-        // The `overlay_states` entries no handler will consume, likewise.
-        // Filed by the serde spelling — the same name the handlers' own
-        // `{:?}` keys spell today, which the spelling-pin test in
-        // rustdar-overlays holds equal.
         let handler_keys: std::collections::HashSet<String> = self
             .overlays
             .handlers()
@@ -1491,33 +994,15 @@ impl super::Gui {
             .map(|(name, state)| (name.clone(), state.clone()))
             .collect();
 
-        // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
         if !config.overlay_states.is_empty() {
             self.overlays
                 .deserialize_handler_states(&config.overlay_states);
         } else if let Some(enabled) = legacy_radar_enabled {
-            // Migrating from legacy config: no overlay_states saved yet.
-            // Apply the old per-pane Radar toggle to the global handler.
             self.overlays
                 .set_enabled(&rustdar_source::id::known::RADAR, enabled);
         }
 
-        // Fill in any overlay kinds not yet in per-pane enabled maps
-        // (e.g. newly added overlays or first load after migration).
         self.initialize_pane_enabled();
-        // The third wholesale writer of a pane's enabled map, and the one it is
-        // easiest to assume is startup-only. It is not: on web and Android the
-        // kv store is not readable when `App::new` runs, so
-        // `App::set_config_dir`'s reload reaches here **mid-session**, after frames
-        // have been drawn and overlay textures cached. A restored config that
-        // turns a layer off has to release it exactly as the toggle would — and
-        // `ui_map_pane`'s per-frame clear is no backstop here, because the same
-        // restore can convert the pane to a cross-section, which is a pane that
-        // loop never runs for again.
-        //
-        // After `initialize_pane_enabled` rather than beside the assignment in
-        // the loop above, so that a kind the stored map simply omits is judged
-        // by the default that pass fills in rather than by its absence.
         for pane in &mut self.panes {
             pane.release_disabled_overlay_textures();
         }
@@ -1525,10 +1010,6 @@ impl super::Gui {
     }
 
     /// Point every pane at `site`, for a first run with no stored config.
-    ///
-    /// Only legitimate before the user has seen anything: it overwrites the site
-    /// on each pane and on the fetch config unconditionally. Guarding that is
-    /// the caller's job — see [`load_ui_config`](Self::load_ui_config).
     pub fn set_initial_site(&mut self, site: &str) {
         self.radar.config.site = site.to_string();
         for pane in &mut self.panes {
@@ -1538,36 +1019,6 @@ impl super::Gui {
 }
 
 /// What a pane's kind and per-kind state should be persisted as.
-///
-/// # Every float goes through the finiteness filter
-///
-/// `serde_json` does not refuse a non-finite float — it writes `null` — so the
-/// save succeeds and the **next load** is what fails, because `null` will not
-/// deserialize back into a number. A single NaN in a camera angle therefore costs
-/// the user the site, the layout, the layers and everything else, one run later,
-/// permanently, with nothing at the time to connect the two. `loop_speed_fps` and
-/// the map zoom already carry the same guard for the same reason.
-///
-/// Belt and braces, deliberately, and **not covered by any test** — which is
-/// worth stating rather than leaving to be discovered. `SectionLine` and
-/// `OrbitCamera` both have private fields and exactly one validating writer
-/// apiece (`SectionLine::new`, `OrbitCamera::{restore, nudge}`), so a non-finite
-/// value in either is *unconstructible*: no test can build one to feed these two
-/// branches, and mutating them away therefore fails nothing. The only way to pin
-/// them would be a `#[cfg(test)]` constructor that skips validation — a backdoor
-/// into the very invariant they exist to back up, which is a worse trade than an
-/// unpinned branch.
-///
-/// They stay because the cost of being wrong is asymmetric and the guarantees
-/// they lean on live in another module: a filter drops one pane's kind, a missing
-/// filter drops the user's entire configuration. What *is* pinned is the
-/// mechanism and the outcome —
-/// `a_non_finite_float_would_poison_the_config_file_permanently`.
-///
-/// A pane whose floats do not pass is written as a plain `Map` with no sub-config
-/// rather than as its own kind with the sub-config omitted. The latter is the
-/// shape `restore_content` treats as corrupt, so it would be a file that reads as
-/// broken rather than as simple.
 fn content_config(
     pane: &PaneState,
 ) -> (
@@ -1604,25 +1055,11 @@ fn content_config(
                 }),
                 source_pane: map.volume.source_pane,
             };
-            // Every float that reaches the file, not merely the three angles:
-            // `serde_json` writes a non-finite `f32` as `null`, which comes back
-            // through `#[serde(default)]` as the *default* rather than as an
-            // error — so a NaN pivot would be laundered into a centred one and a
-            // NaN exaggeration into 3×, and the pane would silently move. The
-            // constructors make this unreachable today; it is here because the
-            // failure is a silent one and the check is four comparisons.
             if !config.yaw_deg.is_finite()
                 || !config.pitch_deg.is_finite()
                 || !config.eye_distance.is_finite()
                 || !config.pivot.iter().all(|p| p.is_finite())
                 || !config.vertical_exaggeration.is_finite()
-                // The region's four, for the same reason and with the same
-                // unreachability: `VolumeRegion::new` refuses a non-finite
-                // centre and `HalfExtentKm::clamped` a non-finite extent, so
-                // nothing can put one here — but a `null` in the file would come
-                // back through `#[serde(default)]` as a region centred on
-                // 0°N 0°E with no width, which is a *different pane*, not a
-                // failed load.
                 || !config.region.as_ref().is_none_or(|region| {
                     region.centre_lat.is_finite()
                         && region.centre_lon.is_finite()
@@ -1633,11 +1070,6 @@ fn content_config(
                 log::warn!("a map pane's 3D camera is not finite; saving it as a plain map");
                 return AS_MAP;
             }
-            // Omitted when it says nothing a fresh pane does not already say.
-            // A pane that has never been in 3D therefore writes exactly the file
-            // it wrote before this state existed, and a pane that has keeps its
-            // camera whichever mode it is currently in — which is what makes
-            // flipping back to 3D after a restart return the same view.
             let volume = (config.differs_from_default()).then_some(config);
             (PaneKindConfig::Map, map.render, None, volume)
         }
@@ -1672,16 +1104,6 @@ fn content_config(
 }
 
 /// Restore a map pane in `render`, with whatever 3D state the file carries.
-///
-/// # Why a bad camera costs the mode and not the pane
-///
-/// A pane with an unreadable camera still knows where it is looking — its site,
-/// its viewport and its product are all flat fields that loaded perfectly well.
-/// So the honest repair is to show it flat, which is a picture, rather than to
-/// discard the pane, which is a hole in the user's layout. That is the whole
-/// difference the collapse makes here: while 3D was a pane *kind*, a bad camera
-/// left nothing for the pane to be and it had to become a map; now falling back
-/// to the plan view **is** the same pane.
 fn restore_map(
     pane_idx: usize,
     pc: &PaneConfig,
@@ -1689,17 +1111,11 @@ fn restore_map(
     pane_count: usize,
 ) -> PaneContent {
     let Some(saved) = pc.volume.as_ref() else {
-        // No 3D state at all. Ordinary for a pane that has never been in the
-        // mode, and for every config written before it existed — the camera is
-        // then the default one, which is what a pane opens with.
         return PaneContent::Map(Box::new(MapPane {
             render,
             volume: VolumePane::default(),
         }));
     };
-    // `OrbitCamera::restore` is the gate: it refuses non-finite angles outright
-    // and wraps or clamps merely out-of-range ones, so a restored camera can
-    // never hold a value `nudge` would not produce.
     let Some(camera) = OrbitCamera::restore(
         saved.yaw_deg,
         saved.pitch_deg,
@@ -1716,27 +1132,7 @@ fn restore_map(
         render,
         volume: VolumePane {
             camera,
-            // Persisted, because it is a choice rather than a measurement —
-            // see the field. `VolumeRegion::new` is the gate, exactly as
-            // `OrbitCamera::restore` is above, and a region it refuses becomes
-            // `None`: the volume's own reach, which crops nothing. That is the
-            // right failure for a hand-edited or truncated file, and it is a
-            // *narrower* consequence than the camera's, which drops the pane to
-            // a plain plan view — a pane that cannot place its region is still
-            // a perfectly good 3D view of the whole ring.
             region: saved.region.as_ref().and_then(VolumeRegionConfig::restore),
-            // A layout saved wider than the one being restored — six panes
-            // opened on a phone — brings back indices that now name a different
-            // pane or no pane at all. Dropped rather than clamped, for the
-            // reason a section's is: re-aiming a 3D view from whichever map
-            // happens to sit at a nearby index is worse than treating it as
-            // never having been aimed from anywhere.
-            //
-            // The region itself survives this. It is ground, and ground does
-            // not stop existing because the map it was drawn on did — the pane
-            // comes back showing exactly what it showed, which is the whole of
-            // the 1:1 reopen rule. What is lost is only the *preference* that a
-            // future drag on that map re-aims this pane.
             source_pane: saved.source_pane.filter(|idx| {
                 let inside = *idx < pane_count;
                 if !inside {
@@ -1747,24 +1143,8 @@ fn restore_map(
                 }
                 inside
             }),
-            // A restored pane holds nothing built, so `rendered_for: None` is
-            // what makes the dispatcher resample against whatever volume the
-            // pane's site loads.
             rendered_for: None,
-            // Persisted, like every other choice that changes *what the pane is
-            // a picture of*. Reopening the app is 1:1 with how it was closed,
-            // live data excepted, and a floor the user turned off coming back
-            // on is a visible difference on launch.
-            //
-            // The inversion is `VolumePane::hide_floor`'s own and is carried
-            // straight through rather than flipped here, so a config written
-            // before the field existed reads `false` through `#[serde(default)]`
-            // and keeps the shipped default: the floor shows. No finiteness
-            // filter applies — it is a `bool`, and the `null`-for-non-finite
-            // hazard the camera floats carry has no analogue here.
             hide_floor: saved.hide_floor,
-            // Not persisted — the curves are (per product, below the pane
-            // list); an open tool window is session posture.
             alpha_editor_open: false,
             view_mode: saved.view_mode,
         },
@@ -1773,54 +1153,20 @@ fn restore_map(
 
 /// The pane content a saved [`PaneConfig`] describes, or `Map` where it describes
 /// nothing usable.
-///
-/// # Why every refusal is a fall back to `Map` rather than a refusal to load
-///
-/// A config file can say anything: it is hand-editable, it is shared between
-/// versions of the app, and it is written by a *later* version than the one
-/// reading it as often as the reverse. The in-memory representation deliberately
-/// cannot express a kind that disagrees with its state — `PaneContent` derives
-/// the kind from the content — so every one of these cases is a shape that only
-/// exists on the wire, and the honest reading of it is "this pane's kind was not
-/// recoverable".
-///
-/// `Map` is the right fallback because it is the kind that needs nothing: it has
-/// no per-kind state to be missing, every all-panes path in the app already
-/// serves it, and a user who finds a map where they left a 3D view can convert it
-/// back in one click. The alternative — refusing the whole config — would throw
-/// away the site, the layout and every layer setting over one bad number.
-///
-/// Each case gets a `log::warn!` naming the pane, because a pane quietly coming
-/// back as the wrong kind is otherwise indistinguishable from a user having
-/// converted it themselves and forgotten.
 fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneContent {
     match pc.kind {
-        // `render` says which of the two pictures, and `volume` — absent for a
-        // pane that has never been in 3D — says how the 3D one is posed.
         PaneKindConfig::Map => restore_map(pane_idx, pc, pc.render, pane_count),
-        // A build in which 3D was a pane kind of its own wrote no `render` key
-        // at all, so the mode has to come from the kind. Same pane, same
-        // ground, same camera: only where the fact is written has changed.
         PaneKindConfig::Volume => restore_map(pane_idx, pc, MapRender::Volume, pane_count),
         PaneKindConfig::CrossSection => {
-            // A kind with no sub-config. Not merely missing state: it says the
-            // file was written by something that did not agree with itself, and a
-            // section pane invented here would have no line and no source.
             let Some(section) = pc.cross_section.as_ref() else {
                 log::warn!(
                     "pane {pane_idx} is a cross-section with no section state; loading it as a map"
                 );
                 return PaneContent::default();
             };
-            // `None` is the ordinary state of a pane converted but not yet aimed,
-            // and must not be confused with a line that failed to load.
             let line = match section.line.as_ref() {
                 None => None,
                 Some(saved) => {
-                    // Through `SectionLine::new`, which is where non-finite,
-                    // out-of-range and coincident endpoints are all refused —
-                    // rather than by re-deriving those checks here, where they
-                    // would be a second copy free to disagree.
                     let restored = SectionLine::new(
                         GeoPoint {
                             lat: saved.a_lat,
@@ -1841,11 +1187,6 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                     restored
                 }
             };
-            // A layout saved wider than the one being restored — six panes opened
-            // on a phone — brings back indices that now name a different pane or
-            // no pane at all. Dropped rather than clamped: retargeting a section
-            // onto whichever map happens to sit at a nearby index is worse than
-            // treating it as never having been aimed from anywhere.
             let source_pane = section.source_pane.filter(|idx| {
                 let inside = *idx < pane_count;
                 if !inside {
@@ -1859,11 +1200,6 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
             PaneContent::CrossSection(Box::new(CrossSectionPane {
                 line,
                 source_pane,
-                // A restored pane holds nothing rendered, so it holds no reason
-                // for that either: `rendered_for: None` is what makes the
-                // dispatcher cut the section again against whatever volume the
-                // pane's site loads, and `unavailable: None` is what stops a
-                // reason from a previous session outliving its cause.
                 ..Default::default()
             }))
         }
@@ -1871,23 +1207,6 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
 }
 
 /// Put a pane's map back where it was left: same zoom, same centre.
-///
-/// Both fields are restored only when present, so a config written before the
-/// viewport was persisted leaves `PaneState::with_site`'s defaults intact rather
-/// than snapping every pane to zoom 0 over the Atlantic.
-///
-/// A rejected zoom is not an error worth propagating. `walkers` clamps to a
-/// valid range and refuses anything outside it; the saved value came from
-/// `walkers` in the first place, so the only way to land here is a hand-edited
-/// or version-skewed config, where keeping the default is the right answer.
-///
-/// Returns whether a saved zoom was **actually applied** — not merely present.
-/// `Gui::claim_initial_zoom` overwrites every pane's zoom on the session's first
-/// scan, which lands seconds after this runs, so the load has to be able to tell
-/// the latch that the user's own zoom is already on screen. A `None` zoom and a
-/// rejected one both leave `PaneState::with_site`'s continental default in
-/// place, and that default is exactly the case the latch still exists to fix, so
-/// both report `false`.
 fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
     let mut zoom_restored = false;
     if let Some(zoom) = pc.zoom {
@@ -1897,10 +1216,6 @@ fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
             zoom_restored = true;
         }
     }
-    // No `else`: a saved `None` means the map was following its site, which is
-    // already the state a fresh `MapMemory` is in. Calling `follow_my_position`
-    // here would be a no-op on a fresh pane and would fight the pane-reuse path
-    // on a reload, so leaving it alone is both simpler and more correct.
     if let Some((lat, lon)) = pc.center {
         pane.map_memory.center_at(walkers::lat_lon(lat, lon));
     }
@@ -1909,27 +1224,8 @@ fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
 
 /// Repair the raw config tree unit by unit, so `UiConfig::deserialize`
 /// cannot fail on anything short of a root that is not a config at all.
-///
-/// The salvage rules, unit by unit:
-/// - a **pane** that cannot be read is replaced with `{}` — the defaults —
-///   **in place**, never removed: a pane is a position in a layout, and
-///   dropping one renumbers every pane after it and silently moves the
-///   user's windows around (the argument at [`kind_or_default`]);
-/// - a **preset** that cannot be read is dropped with a warning: presets are
-///   a named list, not positions, so removal moves nothing;
-/// - a container that is not even the right JSON *shape* (a `panes` that is
-///   not an array, an `overlay_states` that is not an object, a
-///   `config_version` that is not a number) is shed so its absence reads as
-///   the default, rather than left to fail the whole file.
-///
-/// The rich top-level containers (`preferences`, `serial_config`,
-/// `storm_motion_override`) are not probed here — their fields carry
-/// [`lenient_or_default`], which is the same salvage applied at the same
-/// granularity by the deserializer itself.
 fn sanitize_config_tree(value: &mut serde_json::Value) {
     let Some(root) = value.as_object_mut() else {
-        // Not an object: nothing here is a config unit to salvage, and
-        // `UiConfig::deserialize` will refuse the root honestly.
         return;
     };
     if root.get("config_version").is_some_and(|v| !v.is_u64()) {
@@ -1977,17 +1273,6 @@ fn sanitize_config_tree(value: &mut serde_json::Value) {
 }
 
 /// Reconcile a saved draw order with the registered handlers.
-///
-/// - Preserves the saved ordering — INCLUDING ids with no registered handler
-///   (M8b's deliberate change: the pre-M8b version filtered them out; an
-///   unknown id is retained in place and skipped at draw, so a newer build's
-///   layer keeps its position through a session under this build — the
-///   MysteryLayer fixture is the pin).
-/// - Inserts each registered-but-missing id at its weight position: before
-///   the first saved id whose handler weight is greater (unknown ids carry
-///   no weight and are skipped in that comparison); appended if none is.
-/// - An empty save therefore reconciles to exactly the registry weight
-///   order — the fresh-pane default.
 fn reconcile_draw_order(saved: &[LayerId], registry: &OverlayRegistry) -> Vec<LayerId> {
     let mut result: Vec<LayerId> = saved.to_vec();
     let mut registered: Vec<(LayerId, u32)> = registry

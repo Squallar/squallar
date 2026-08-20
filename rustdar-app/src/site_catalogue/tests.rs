@@ -20,11 +20,6 @@ fn catalogue() -> SiteCatalogue {
 
 /// The round trip, through a real store rather than through the struct's own
 /// fields.
-///
-/// The write is the interesting half: it must have happened by the time
-/// [`store_if_changed`] returns, not on some later tick. The session that
-/// matters most is the one that ends immediately afterwards, and the whole
-/// point of the cache is that the *next* launch has it.
 #[test]
 fn a_fetched_catalogue_is_written_at_once_and_read_back_next_run() {
     let store = MemoryKvStore::default();
@@ -50,13 +45,8 @@ fn a_fetched_catalogue_is_written_at_once_and_read_back_next_run() {
     );
 }
 
-/// Nothing floating-point ever reaches the blob, so nothing in it can be
-/// `null` on the way back in — except the one `null` that means "unplaced",
-/// which is a value and not a failure.
-///
-/// A non-finite `f64` is written by `serde_json` as `null` and then fails to
-/// deserialize on the *next* load, which costs the whole catalogue a run after
-/// the bug that produced it.
+/// Nothing floating-point ever reaches the blob, so nothing in it can be `null` on the
+/// way back in.
 #[test]
 fn the_persisted_form_is_integers() {
     let store = MemoryKvStore::default();
@@ -75,10 +65,6 @@ fn the_persisted_form_is_integers() {
 }
 
 /// Rewriting an unchanged catalogue is skipped.
-///
-/// The ordinary case is a launch whose fetch confirms what is already cached,
-/// and ~15 KB into `localStorage` per launch for a value that has not moved is
-/// a cost with no benefit.
 #[test]
 fn an_unchanged_catalogue_is_not_rewritten() {
     let store = MemoryKvStore::default();
@@ -95,20 +81,12 @@ fn an_unchanged_catalogue_is_not_rewritten() {
 }
 
 /// **A failed fetch degrades to the cache**, silently.
-///
-/// This is the offline path and the one that must not be allowed to rot: the
-/// fetch answers `None`, nothing is written, and the next `load` still returns
-/// everything the last successful fetch left behind. The alternative — writing
-/// an empty catalogue over a good one — would cost every position on a launch
-/// that happened to start in a tunnel.
 #[test]
 fn a_failed_fetch_leaves_the_cache_intact() {
     let store = MemoryKvStore::default();
     let cached = catalogue();
     store_if_changed(Some(&store), &SiteCatalogue::default(), &cached);
 
-    // What `poll_site_catalogue` does with `SiteCatalogueResponse { catalogue:
-    // None }`: nothing at all.
     let failed: Option<SiteCatalogue> = None;
     if let Some(fetched) = failed {
         store_if_changed(Some(&store), &cached, &fetched);
@@ -119,9 +97,6 @@ fn a_failed_fetch_leaves_the_cache_intact() {
 }
 
 /// An unreadable blob degrades to nothing rather than propagating.
-///
-/// The cost is one session on the compiled-in seed, which is where the app was
-/// before any of this existed, and the launch's fetch replaces it.
 #[test]
 fn an_unreadable_blob_is_dropped() {
     for raw in ["", "not json", "[1,2,3]", r#"{"KTLX":{"lat_udeg":1}}"#] {
@@ -134,9 +109,6 @@ fn an_unreadable_blob_is_dropped() {
 }
 
 /// An implausibly large blob is refused rather than loaded.
-///
-/// `localStorage` is a few megabytes for the whole origin, and a catalogue four
-/// times the size of the real network is junk rather than growth.
 #[test]
 fn an_absurdly_large_catalogue_is_refused() {
     let store = MemoryKvStore::default();
@@ -155,9 +127,8 @@ fn an_absurdly_large_catalogue_is_refused() {
     assert!(load(Some(&store)).is_empty());
 }
 
-/// No store — the web build before `localStorage` is reachable, and Android
-/// before `set_config_dir` — is an empty catalogue and a dropped write, not a
-/// panic.
+/// No store — the web build before `localStorage` is reachable, and Android before
+/// `set_config_dir` — is an empty catalogue and a dropped write.
 #[test]
 fn no_store_is_not_an_error() {
     assert!(load(None).is_empty());

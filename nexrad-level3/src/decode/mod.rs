@@ -174,10 +174,9 @@ fn decompress_after_pdb(
 mod tests {
     use super::*;
 
-    /// A minimal message header + PDB, all zeroes except the symbology
-    /// offset, which is `u32::MAX` halfwords. Doubling it overflows a
-    /// 32-bit `usize` (wasm32); on 64-bit it points far past the buffer.
-    /// Either way: an error, never a panic.
+    /// A minimal message header + PDB, all zeroes except the symbology offset,
+    /// which is `u32::MAX` halfwords. Doubling it overflows a 32-bit `usize`;
+    /// on 64-bit it points far past the buffer. Either way: an error, not a panic.
     #[test]
     fn a_symbology_offset_that_overflows_when_doubled_is_an_error() {
         // 18-byte message header + 102-byte PDB.

@@ -14,12 +14,6 @@ fn every_content_variant_reports_its_own_kind() {
 }
 
 /// A map pane's *view* depends on its render mode; its *kind* does not.
-///
-/// This is the whole shape of the collapse, in one assertion. Both modes are
-/// the same kind of pane — same site, same viewport, same place — and they
-/// produce different pictures, which is what a render mode is. A predicate
-/// asking the kind cannot tell them apart, so every predicate that used to ask
-/// for a `Volume` pane kind now asks the view.
 #[test]
 fn a_map_panes_view_follows_its_render_mode_and_its_kind_does_not() {
     for (render, view) in [
@@ -49,12 +43,6 @@ fn a_map_panes_view_follows_its_render_mode_and_its_kind_does_not() {
 }
 
 /// Switching a map pane's render mode keeps the other mode's state.
-///
-/// The two modes are two ways of looking at *one* pane, so flipping to the plan
-/// view and back must return the same 3D view — the camera the user aimed, the
-/// floor they turned off, the isosurface they chose. State held behind the enum
-/// variant would be destroyed on every toggle, which would make the modes feel
-/// like two panes after all, which is the thing this change exists to stop.
 #[test]
 fn leaving_the_volume_mode_and_returning_keeps_the_camera() {
     let mut camera = OrbitCamera::default();
@@ -88,52 +76,16 @@ fn leaving_the_volume_mode_and_returning_keeps_the_camera() {
 /// variants derive `Default` too, so only `derive(Default)`'s `#[default]`
 /// attribute picks this one, and a hand-written impl yielding a section pane
 /// would compile.
-///
-/// Pinned because of what the value is *for*. Six `mem::take` sites leave it
-/// in `Gui::panes[idx]` for the rest of the UI pass, and the all-panes
-/// filters that key off `PaneState::is_map` read that slot — so a default
-/// section pane would make every one of them silently skip whichever pane is
-/// being drawn, with no error to say why.
 #[test]
 fn the_default_content_is_a_plan_view_map() {
     assert_eq!(PaneContent::default().kind(), PaneKind::Map);
     assert_eq!(PaneKind::default(), PaneKind::Map);
-    // The *view*, not merely the kind, and this is the half that matters now
-    // that `Map` denotes two pictures. `PaneState::is_map` — the filter every
-    // all-panes loop keys off — reads the view, so a default in the 3D mode
-    // would make the placeholder answer `false` and silently exclude whichever
-    // pane is currently being drawn.
     assert_eq!(PaneContent::default().render_view(), RenderView::PlanView);
     assert_eq!(MapRender::default(), MapRender::Plan);
 }
 
 /// The stand-in box is the resampler's own fallback, it survives un-clamped,
 /// and it still covers the whole scan.
-///
-/// A pane reaches it two ways, and they are the same state: it has not been
-/// drawn in the 3D mode yet, or its viewport cannot be measured — collapsed to
-/// nothing by a divider drag, projecting off Earth. Either way there is no
-/// measurement to size a box from, and three things have to hold.
-///
-/// **One fallback, not two.** While there is no grid the pane poses its camera
-/// against [`BASE_HALF_WIDTH_KM`]; if that were a different number from the one
-/// `build_voxels` reaches for when it cannot read a reach, the pane's
-/// arithmetic would describe a box nothing is building — a pan that drifts
-/// against the picture.
-///
-/// **Honoured un-clamped**, so the caption, the camera arithmetic and the
-/// resample all describe one box.
-///
-/// **It still covers the raster's floor.** The plan view beside it draws echo
-/// out to at least `types::BASE_EXTENT_KM`, and a fallback under that range
-/// crops the scan: echo past the box's edge vanishes from the 3D picture, which
-/// reads as a resample gone wrong rather than as a choice.
-///
-/// What can *not* be pinned here is the box a measurable pane ends up with.
-/// That is its viewport's inscribed square, bounded by the volume's own reach
-/// ([`rustdar_radar::voxel::box_half_width_km`]) — 325.4 km of half-width for a
-/// WSR-88D's 460 km reflectivity, 212.1 for its 300 km Doppler moments — and
-/// this crate sees neither a viewport nor a volume from here.
 #[test]
 #[allow(clippy::assertions_on_constants)] // the covering bound IS a constant pin
 fn the_stand_in_box_is_the_resamplers_own_fallback_and_survives_it_unclamped() {
@@ -163,18 +115,11 @@ fn the_stand_in_box_is_the_resamplers_own_fallback_and_survives_it_unclamped() {
 /// A plan view reads one sweep; the other two read the whole ladder, and
 /// giving either of them a volume with cuts deliberately skipped fabricates
 /// layers rather than failing.
-///
-/// Asked of the **view**, which is where the classification moved when a map
-/// pane came to have two of them. Asking the kind would answer once for both of
-/// a map pane's pictures, and the wrong answer for the 3D one is a download
-/// narrowed to a single tilt under a raymarch that interpolates the gap.
 #[test]
 fn only_a_plan_view_is_content_with_one_tilt() {
     assert!(!RenderView::PlanView.reads_whole_volume());
     assert!(RenderView::CrossSection.reads_whole_volume());
     assert!(RenderView::Volume.reads_whole_volume());
-    // And a map pane really does answer both ways, through its mode: the fact
-    // the kind can no longer carry.
     for (render, whole) in [(MapRender::Plan, false), (MapRender::Volume, true)] {
         assert_eq!(
             render.render_view().reads_whole_volume(),
@@ -183,7 +128,6 @@ fn only_a_plan_view_is_content_with_one_tilt() {
             if whole { "all" } else { "one tilt" },
         );
     }
-    // A section's answer comes off its kind, which has only the one view.
     assert_eq!(
         PaneKind::CrossSection.render_view(),
         Some(RenderView::CrossSection),
@@ -196,17 +140,11 @@ fn only_a_plan_view_is_content_with_one_tilt() {
     );
 }
 
-/// A line that cannot be cut is not representable. Every refusal matters:
-/// a NaN endpoint would make [`SectionTarget`] never equal itself and
-/// re-render the pane on every frame forever, a finite-but-absurd one would
-/// render as empty coverage that looks like an out-of-range line, and a
-/// zero-length line has no bearing to walk along.
+/// A line that cannot be cut is not representable.
 #[test]
 fn a_section_line_refuses_endpoints_it_cannot_be_cut_along() {
     assert!(SectionLine::new(point(35.3, -97.3), point(35.6, -97.0)).is_some());
 
-    // Non-finite, and finite-but-nowhere. The second group is the one a
-    // bare `is_finite` guard let through.
     for bad_lat in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e9, 90.001] {
         assert!(
             SectionLine::new(point(bad_lat, -97.3), point(35.6, -97.0)).is_none(),
@@ -220,7 +158,6 @@ fn a_section_line_refuses_endpoints_it_cannot_be_cut_along() {
         );
     }
 
-    // The bounds are inclusive: a pole and the antimeridian are places.
     assert!(SectionLine::new(point(90.0, 180.0), point(-90.0, -180.0)).is_some());
 
     assert!(
@@ -230,12 +167,6 @@ fn a_section_line_refuses_endpoints_it_cannot_be_cut_along() {
 }
 
 /// `release_textures` is total over the kinds, and callable on each.
-///
-/// Every arm is empty today; the point is that the call site in
-/// `Gui::clear_graphics_state` is already wired, so the field that needs
-/// releasing lands inside a function that is already called on every
-/// suspend and every surface loss. A `match` with no wildcard is what makes
-/// a fourth kind stop the build rather than leak quietly.
 #[test]
 fn releasing_textures_is_total_over_the_kinds() {
     for kind in [PaneKind::Map, PaneKind::CrossSection] {
@@ -251,27 +182,6 @@ fn releasing_textures_is_total_over_the_kinds() {
 
 /// A section pane really gives up its texture — and really keeps everything
 /// else, **including its staleness key**.
-///
-/// Three decisions, and the third is the one with a mutant of its own. The
-/// handle has to go, because a texture outliving its context is a leak
-/// nothing reports: not a panic, not a blank pane, just memory that never
-/// comes back across a suspend/resume cycle. The `CrossSection` behind it
-/// has to *stay*, because it is plain memory rather than a GPU handle, it is
-/// what a hover reads, and re-cutting it on resume needs the volume — which
-/// may well have been evicted by then.
-///
-/// And `rendered_for` has to stay too, which is the half that looks
-/// optional. Clearing it here is the one-line way to make the pane recover:
-/// the dispatcher would see no key, ask again, and the picture would come
-/// back. It is also a 15.6 MB volume walk plus an 8–13 ms raster on the
-/// resume frame, for a picture already in memory, and it fails outright when
-/// the volume is gone. Keeping the key is what makes the recovery a
-/// re-upload — `App::restore_section_textures` — instead of a re-cut, so
-/// this asserts the key survives rather than merely that the pane recovers.
-/// Both would pass the second claim; only this one fails the mutant.
-///
-/// The empty-arm version of this test passed for a build that released
-/// nothing at all; found by mutation.
 #[test]
 fn a_section_pane_drops_its_texture_and_keeps_its_cut() {
     let ctx = egui::Context::default();
@@ -281,14 +191,6 @@ fn a_section_pane_drops_its_texture_and_keeps_its_cut() {
         egui::TextureOptions::NEAREST,
     );
     let line = SectionLine::new(point(35.3, -97.3), point(35.6, -97.0)).expect("valid line");
-    // The cut itself is in the fixture, and it is the half the test is
-    // *named* for. Without it, `section` is `None` before and after and the
-    // assertion below holds for a `release_textures` that drops it — which
-    // is the exact mutant that survived: the resume path would re-cut from a
-    // volume that may have been evicted instead of re-uploading a raster it
-    // still had.
-    // Likewise the key: with `rendered_for: None` in the fixture it is
-    // `None` before and after, and an arm that cleared it would pass.
     let target = SectionTarget {
         volume: VolumeStamp {
             site: "KTLX".to_owned(),
@@ -343,10 +245,6 @@ fn a_section_pane_drops_its_texture_and_keeps_its_cut() {
 
 /// A cut of the right shape and no content, so a fixture can hold a picture
 /// for a release or a retarget to act on.
-///
-/// Full size — `from_parts` refuses anything else, because a mis-shaped
-/// section reaches `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on
-/// the main thread.
 fn blank_section() -> CrossSection {
     use rustdar_radar::sampler::SampleStatus;
     use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
@@ -406,12 +304,6 @@ fn a_section_target_goes_stale_when_the_volume_does() {
         target("KOUN", 30, 9),
         "the same volume time at another site is a different picture"
     );
-    // The live-feed arm, and the reason `ladder` is in the key at all.
-    // The volume time here is *identical* — it is the first sweep's, and
-    // on the feed that is frozen for five to six minutes while the merged
-    // ladder refreshes underneath it. Without the ladder fingerprint
-    // these two keys are equal and the section cut from the first chunk
-    // stands for the whole volume.
     assert_ne!(
         target("KTLX", 30, 1),
         target("KTLX", 30, 9),
@@ -425,7 +317,6 @@ fn a_section_target_goes_stale_when_the_volume_does() {
 /// the life of the pane, silently.
 #[test]
 fn a_non_finite_nudge_leaves_the_camera_exactly_where_it_was() {
-    // The premise, stated so nobody "simplifies" the guard back into a clamp.
     assert!(f32::NAN.clamp(-89.0, 89.0).is_nan());
 
     let start = OrbitCamera::default();
@@ -453,8 +344,6 @@ fn a_non_finite_nudge_leaves_the_camera_exactly_where_it_was() {
         }
     }
 
-    // A zero or negative zoom factor is refused for the same reason: it is
-    // a ratio, and a degenerate gesture span produces one.
     for factor in [0.0, -1.0] {
         let mut camera = start;
         camera.nudge(OrbitDelta {
@@ -467,11 +356,6 @@ fn a_non_finite_nudge_leaves_the_camera_exactly_where_it_was() {
 
 /// A persisted camera comes back exactly, and a corrupt one comes back as
 /// nothing.
-///
-/// `restore` is the only way a camera can be built from numbers off disk, so
-/// it is where a hand-edited or version-skewed config is stopped. The refusal
-/// half matters for the same reason [`OrbitCamera::nudge`]'s does: a NaN
-/// camera makes the re-render comparison fire every frame for ever, silently.
 #[test]
 fn a_restored_camera_is_the_one_that_was_saved_or_none_at_all() {
     let start = OrbitCamera::default();
@@ -485,15 +369,11 @@ fn a_restored_camera_is_the_one_that_was_saved_or_none_at_all() {
     .expect("a camera's own values must restore");
     assert_eq!(round_tripped, start);
 
-    // A camera that had been moved, so the round trip is not just the default
-    // agreeing with itself.
     let mut moved = start;
     moved.nudge(OrbitDelta {
         yaw_deg: -47.5,
         pitch_deg: 12.25,
         zoom_factor: 1.5,
-        // Panned as well, so the round trip covers the pivot rather than
-        // agreeing with itself about a zero.
         pan: [0.2, -0.35, 0.1],
     });
     moved.set_vertical_exaggeration(5.5);
@@ -542,9 +422,6 @@ fn a_restored_camera_is_the_one_that_was_saved_or_none_at_all() {
         }
     }
 
-    // Finite but out of range: wrapped and clamped rather than refused, and
-    // through the same expressions `nudge` uses — so a restored camera cannot
-    // hold a value `nudge` would never produce.
     let stretched = OrbitCamera::restore(-30.0, 1_000.0, 0.001, [9.0, -9.0, 9.0], 1_000.0)
         .expect("finite, so restorable");
     assert_eq!(stretched.yaw_deg(), 330.0);
@@ -573,16 +450,12 @@ fn a_finite_nudge_moves_the_camera_and_stays_in_range() {
     assert_eq!(camera.pitch_deg(), 35.0);
     assert!(camera.eye_distance() < OrbitCamera::default().eye_distance());
 
-    // Yaw wraps rather than clamping — a camera that stuck at 360 could not
-    // be spun all the way round.
     camera.nudge(OrbitDelta {
         yaw_deg: 200.0,
         ..Default::default()
     });
     assert_eq!(camera.yaw_deg(), 95.0);
 
-    // Pitch and distance clamp, and stop just short of vertical: at exactly
-    // ±90 the camera basis is degenerate and the image rolls arbitrarily.
     camera.nudge(OrbitDelta {
         pitch_deg: 1_000.0,
         zoom_factor: 0.000_01,
@@ -602,16 +475,6 @@ fn a_finite_nudge_moves_the_camera_and_stays_in_range() {
 
 /// The zoom's near stop is 0.05 framing radii — inside the box, by the
 /// literal.
-///
-/// Pinned as a number rather than as `MIN_EYE_DISTANCE`, because the
-/// property is the *value*: at 1.05 (the old floor) the eye can never enter
-/// the box and "zoom in as far as I want" stops a whole box away from the
-/// storm; at 0.05 the eye ends up inside it, which the raymarch supports by
-/// clamping its slab entry to zero. A symbolic assertion would follow the
-/// constant wherever it went and could not see this regress. Checked at 1x
-/// and 12x exaggeration: the limit is in framing radii of the box's *true*
-/// north–south extent, which the stretch does not touch, so the stop is the
-/// same standoff whatever the knob is set to.
 #[test]
 fn the_zoom_stops_at_a_twentieth_of_a_framing_radius() {
     for exaggeration in [1.0, 12.0] {
@@ -629,20 +492,11 @@ fn the_zoom_stops_at_a_twentieth_of_a_framing_radius() {
                  1.0 locks the eye out of the box again",
         );
     }
-    // And the same literal from the restore path, so a persisted camera
-    // cannot come back with a closer zoom than the wheel can reach.
     let restored = OrbitCamera::restore(225.0, 25.0, 0.001, [0.0; 3], 3.0).expect("finite");
     assert_eq!(restored.eye_distance(), 0.05);
 }
 
 /// The exaggeration knob clamps a finite value and refuses a non-finite one.
-///
-/// The asymmetry is the same one `nudge` draws. A slider that reaches the end
-/// of its travel should stop, so an out-of-range number is wound back. A NaN
-/// has no nearest legal value, and `f32::clamp` **propagates** it — so a
-/// clamp on the way in would launder it into a camera that looks checked, and
-/// it would arrive at `box_from_world` as a divide-by-NaN. The GPU accepts
-/// that matrix, renders an empty pane, and reports nothing anywhere.
 #[test]
 fn the_exaggeration_knob_clamps_the_finite_and_refuses_the_rest() {
     let mut camera = OrbitCamera::default();

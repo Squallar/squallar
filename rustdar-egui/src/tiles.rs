@@ -5,8 +5,6 @@ use walkers::{
 };
 
 /// CartoDB tile source variants.
-/// Base maps use `nolabels` so city/road names are not obscured by the radar
-/// overlay. A separate `labels-only` layer is drawn on top of the radar.
 #[derive(Clone)]
 pub enum CartoDbStyle {
     LightNoLabels,
@@ -55,7 +53,6 @@ impl TileSource for CartoDb {
             CartoDbStyle::DarkLabelsOnly => "dark_only_labels",
         };
 
-        // Use one of the available subdomains (a, b, c, d)
         let subdomain = match tile_id.x % 4 {
             0 => "a",
             1 => "b",
@@ -82,20 +79,12 @@ impl TileSource for CartoDb {
 // Slippy-map tile coordinates (standard OSM / Web Mercator formulas), from
 // the workspace's geodesy floor.
 
-// The tile transforms and `MERCATOR_LAT_LIMIT_DEG` live in `rustdar-geo`
-// (moved at WO-G2/G3; the re-exports here died at WO-G4 — `rustdar_geo::` is
-// the one spelling). The mercantile reference vectors in `tiles/tests.rs` pin
-// their exact bits directly at the floor.
+// The tile transforms and `MERCATOR_LAT_LIMIT_DEG` live in `rustdar-geo`.
+// The mercantile reference vectors in `tiles/tests.rs` pin their exact bits.
 
-// ---------------------------------------------------------------------------
-// MapTileState — shared map tile management
 // ---------------------------------------------------------------------------
 
 /// Shared map tile state across all panes.
-///
-/// Keeps both light and dark tile caches alive so theme toggles don't discard
-/// already-fetched tiles. Label-only tiles are lazily initialized when any
-/// pane enables the city-labels layer.
 pub struct MapTileState {
     pub tiles_light: Option<HttpsTiles>,
     pub tiles_dark: Option<HttpsTiles>,
@@ -180,35 +169,15 @@ impl MapTileState {
         self.tiles_dark = None;
         self.label_tiles_light = None;
         self.label_tiles_dark = None;
-        // Flip theme tracking to force tile recreation on next render
         self.current_theme_is_dark = !self.current_theme_is_dark;
     }
 }
 
 /// The side of one slippy tile in **points**, at zoom bias 0.
-///
-/// 256 is the tile grid's own unit and is hard-coded inside `walkers`'
-/// projector (`mercator.rs`'s `TILE_SIZE`), which is why a tile source cannot
-/// change it without desynchronising the raster from `Projector::project`. See
-/// `draw_tile_layer`.
 pub const TILE_SIDE_POINTS: f32 = 256.0;
 
 /// How many tiles a rect keeps resident, at a zoom bias, across `layers` raster
 /// layers.
-///
-/// The `+ 1` on each axis is the tile the rect straddles at each edge: a pane
-/// whose width is an exact multiple of the tile side still overlaps one more
-/// column unless it happens to start on a tile boundary, and it never does.
-///
-/// # What it is for
-///
-/// `tile_source::TILE_CACHE_ENTRIES` is a single LRU shared by every pane and
-/// every layer, and each zoom bias level costs four times the tiles. A bias
-/// applied to a working set larger than the LRU does not merely fail to help —
-/// it evicts the tiles still being drawn, on every frame, so the fetcher never
-/// settles and the pane flickers between levels. So the bias is only taken when
-/// this fits, which makes it a computed decision rather than an argument about a
-/// hypothetical pane size.
 pub fn tiles_resident_for(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usize {
     let side = TILE_SIDE_POINTS / 2f32.powi(i32::from(zoom_bias));
     if side <= 0.0 || !rect.width().is_finite() || !rect.height().is_finite() {

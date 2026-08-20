@@ -1,44 +1,9 @@
 //! What the tile has to be, rather than what it happens to contain — and,
 //! once, that what ships is what the generator says.
-//!
-//! Four of the five tests here pin no byte. What the march actually depends on
-//! is four properties, and each of those tests is paired with the mistake it
-//! exists to catch — a constant offset (the slithering comes back), a lattice
-//! hash (the diagonal weave comes back), a white hash (the low-frequency
-//! mottling arrives), and a non-toroidal filter (a seam every 64 pixels). Every
-//! one of them runs over `blue_noise_tile()`, which is to say over the bytes
-//! that actually ship.
-//!
-//! The fifth is the one the `include_bytes!` needs:
-//! `the_shipped_bytes_are_the_ones_void_and_cluster_produces` runs
-//! void-and-cluster here, at test time, and asserts byte-for-byte equality with
-//! `tile.bin`. That is what keeps "a blob can only be pinned against itself"
-//! from being true of this one — the generator is the pin, and the four
-//! property tests are still the reviewable statement of *why* these bytes and
-//! not some others.
 
 use super::*;
 
 /// **The shipped bytes are void-and-cluster's, and nothing else's.**
-///
-/// The test that licenses the `include_bytes!`. `tile.bin` is not a constant
-/// somebody typed and it is not the output of a script that has since been
-/// lost: it is what the generator twelve inches above this file produces, and
-/// this runs that generator and compares all 4096 bytes.
-///
-/// So the whole of the module's old reason for computing at startup survives —
-/// the properties are pinned, and now the contents are pinned to the code that
-/// justifies them too — at no run-time cost. Regenerating after a deliberate
-/// change to the algorithm is `void_and_cluster`'s output written back to
-/// `tile.bin`; the four property tests below are what say whether the new one
-/// is any good.
-///
-/// **If this fails and nothing in this module changed**, read the module doc's
-/// caveat before touching `tile.bin`. `gaussian_kernel` calls `f32::exp`, four
-/// libm implementations were compared and two of them disagree by one ULP, and
-/// a host with a fifth is the one way this can fail without anything being
-/// wrong. Re-baking against that host would ship a tile no other target
-/// reproduces, which is the exact failure this test exists to make visible.
 #[test]
 fn the_shipped_bytes_are_the_ones_void_and_cluster_produces() {
     let generated = generated_tile();
@@ -206,11 +171,8 @@ fn neighbour_correlation(values: &[f64], dx: i32, dy: i32) -> f64 {
 
 #[test]
 fn the_tile_is_a_uniform_distribution() {
-    // Sixteen texels per byte value, exactly — the tile is a permutation of
-    // the ranks, so the offsets it hands the march are uniform over the step.
-    // That is what keeps the march unbiased: the expected sample count over
-    // the jitter is the span over `dt`, and it stops being that the moment
-    // some offsets are likelier than others.
+    // Sixteen texels per byte value, exactly — the tile is a permutation of the
+    // ranks, so the offsets it hands the march are uniform over the step.
     let mut histogram = [0usize; 256];
     for &byte in blue_noise_tile() {
         histogram[byte as usize] += 1;
@@ -227,15 +189,7 @@ fn the_tile_is_a_uniform_distribution() {
 
 #[test]
 fn neighbouring_texels_are_decorrelated() {
-    // The property the jitter exists for. Without it the comb is phase-locked
-    // to the eye and the iso-`t` shells crawl across the screen as the volume
-    // slides under them — the slithering of the 2026-08-09 recording, which is
-    // a worse artefact than any of the ones this module is about.
-    //
-    // Blue noise does better than merely uncorrelated: it is *anti*-correlated
-    // at one texel, because void-and-cluster spends its whole effort keeping
-    // like values apart. So the bar is a negative correlation, not just a
-    // small one.
+    // The property the jitter exists for.
     let tile = normalised();
     for (dx, dy) in [(1, 0), (0, 1), (1, 1)] {
         let correlation = neighbour_correlation(&tile, dx, dy);
@@ -246,14 +200,7 @@ fn neighbouring_texels_are_decorrelated() {
              is back",
         );
     }
-    // The mistake this rejects, made concrete. A jitter that varies smoothly
-    // across the screen instead of per-pixel is precisely the phase-locked
-    // comb, and it is what a "smoother, less noisy jitter" change would
-    // produce; one low-frequency wave over the tile correlates at
-    // `cos(2 pi / 64)`. A *constant* offset — the other way to break this — is
-    // not testable through a correlation at all, because its variance is zero
-    // and the ratio is 0/0; `the_tile_is_a_uniform_distribution` is what
-    // catches that one.
+    // The mistake this rejects, made concrete.
     let n = BLUE_NOISE_EDGE as usize;
     let wave: Vec<f64> = (0..TEXELS)
         .map(|at| (std::f64::consts::TAU * (at % n) as f64 / n as f64).sin())
@@ -269,9 +216,7 @@ fn neighbouring_texels_are_decorrelated() {
 fn no_frequency_bin_dominates_the_tile() {
     // The test that rejects a return to interleaved gradient noise, or to any
     // other lattice: a periodic hash puts its energy in a handful of bins and
-    // the eye reads those as a weave. Measured 2026-08-11, IGN comes in near
-    // 14000 against this tile's ~25, so the threshold has three orders of
-    // magnitude of room and is not a tuned number.
+    // the eye reads those as a weave.
     let measured = peak_over_median(&normalised());
     assert!(
         measured < 200.0,
@@ -292,8 +237,7 @@ fn the_tiles_energy_sits_above_the_visible_band() {
     // What makes it *blue*, and the reason a plain white hash is not an
     // acceptable substitute: the eye is most sensitive at low spatial
     // frequency, and the half-resolution rungs blit through a 2x `Linear`
-    // upscale that keeps the low band and attenuates the high one. A white
-    // hash measured 7.43% here and 51.82% after that upscale.
+    // upscale that keeps the low band and attenuates the high one.
     let measured = low_band_percent(&normalised(), 0.15);
     assert!(
         measured < 1.0,
@@ -306,11 +250,8 @@ fn the_tiles_energy_sits_above_the_visible_band() {
 #[test]
 fn the_tile_wraps_without_a_seam() {
     // The shader repeats this tile across the whole frame, so the join has to
-    // be as unremarkable as the interior — void-and-cluster's filter is
-    // wrapped for exactly this. Compare the mean absolute step across the
-    // wrap column against the mean absolute step inside the tile: a filter
-    // that stopped wrapping would leave the edges unrelaxed and the join
-    // would stand out.
+    // be as unremarkable as the interior — void-and-cluster's filter is wrapped
+    // for exactly this.
     let tile = normalised();
     let n = BLUE_NOISE_EDGE as usize;
     let mut across = 0.0;

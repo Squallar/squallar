@@ -1,12 +1,6 @@
 use super::*;
 
 /// Drives [`PointerTracker`] directly, one hand-built frame at a time.
-///
-/// The end-to-end probes live in `input_harness.rs`; this is for the event
-/// orderings that pipeline cannot easily produce — a `PointerButton` for a
-/// button other than the primary one, in particular, which is the only way
-/// a *release* can reach the tracker while egui still reports the primary
-/// as down.
 struct TrackerDriver {
     ctx: egui::Context,
     tracker: PointerTracker,
@@ -65,8 +59,8 @@ fn touch(id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
     }
 }
 
-/// `egui-winit`'s `TouchPhase::Started`: the raw touch, then the emulated
-/// pointer (`egui-winit-0.34.1/src/lib.rs:897`).
+/// `egui-winit`'s `TouchPhase::Started`: the raw touch, then the emulated pointer
+/// (`egui-winit-0.34.1/src/lib.rs:897`).
 fn touch_down(id: u64, pos: egui::Pos2) -> Vec<egui::Event> {
     vec![
         touch(id, egui::TouchPhase::Start, pos),
@@ -76,13 +70,6 @@ fn touch_down(id: u64, pos: egui::Pos2) -> Vec<egui::Event> {
 }
 
 /// A `PointerGone` is terminal until a press, whichever kind it was.
-///
-/// For the excursion half this is a policy choice between two failures, and
-/// it takes the benign one. The integration discards a release that happens
-/// out of the window (`lib.rs:796`), so a cursor that comes back hovering
-/// and one that comes back still dragging are the same event stream: the
-/// cost of being wrong one way is re-pressing to carry on, and the other
-/// way is a hold nobody asked for suppressing panning until they click.
 #[test]
 fn an_excursion_is_terminal_until_a_press() {
     let mut d = TrackerDriver::new();
@@ -111,9 +98,9 @@ fn an_excursion_is_terminal_until_a_press() {
     );
 }
 
-/// A cancellation is terminal. Motion afterwards is some *other* input
-/// source — the next finger, a mouse on a hybrid device, `mousemove` on the
-/// web — and must never be read as the cancelled finger returning.
+/// A cancellation is terminal. Motion afterwards is some *other* input source — the
+/// next finger, a mouse on a hybrid device, `mousemove` on the web — and must never
+/// be read as the cancelled finger returning.
 #[test]
 fn a_cancelled_touch_is_not_revived_by_motion() {
     for motion in [
@@ -134,22 +121,18 @@ fn a_cancelled_touch_is_not_revived_by_motion() {
 
         let after = d.frame(vec![motion.clone()]);
         assert!(!after.down, "a cancelled touch stays cancelled");
-        // ...and keeps staying cancelled.
         assert!(!d.frame(vec![motion]).down);
     }
 }
 
-/// The web is the case a `PointerGone`-keyed rule missed entirely:
-/// `touchcancel` there is a lone `Touch{Cancel}`
-/// (`eframe/src/web/events.rs:788`) — no release, no `PointerGone` — so
-/// nothing ever clears egui's latched `down`.
+/// The web is the case a `PointerGone`-keyed rule missed entirely: `touchcancel`
+/// there is a lone `Touch{Cancel}` (`eframe/src/web/events.rs:788`) — no release,
+/// no `PointerGone` — so nothing ever clears egui's latched `down`.
 #[test]
 fn a_bare_touch_cancel_for_the_primary_finger_is_a_cancellation() {
     let mut d = TrackerDriver::new();
     let pos = egui::pos2(100.0, 100.0);
 
-    // eframe pushes the press *before* the raw touch — the opposite order
-    // to egui-winit — so the pairing must not depend on it.
     assert!(
         d.frame(vec![
             button(egui::PointerButton::Primary, true, pos),
@@ -170,16 +153,6 @@ fn a_bare_touch_cancel_for_the_primary_finger_is_a_cancellation() {
 }
 
 /// A whole gesture can arrive in one frame.
-///
-/// eframe's touch listeners only request a repaint (`events.rs:695`)
-/// instead of running a frame synchronously, so every DOM event between two
-/// animation frames lands in a single `RawInput` — and on a map app
-/// decoding tiles those frames are long. A browser taking the gesture over
-/// on the first move (an iOS Safari edge swipe, Android Chrome
-/// pull-to-refresh) delivers `touchstart` and `touchcancel` exactly that
-/// way. Comparing the cancel against the identity held at frame *entry*
-/// misses it, even though the adoption has already run earlier in the same
-/// walk.
 #[test]
 fn a_touchstart_and_touchcancel_in_one_frame_is_a_cancellation() {
     let mut d = TrackerDriver::new();
@@ -202,11 +175,6 @@ fn a_touchstart_and_touchcancel_in_one_frame_is_a_cancellation() {
 }
 
 /// Non-primary buttons must not touch the sequence at all.
-///
-/// `down` is `primary_down()`, so a right-click says nothing about the
-/// finger or left button being tracked. A press that cleared the latch
-/// would revive a loss documented as terminal, while egui's `down` is still
-/// stale-`true`.
 #[test]
 fn a_non_primary_press_does_not_revive_a_lost_pointer() {
     let mut d = TrackerDriver::new();
@@ -224,12 +192,6 @@ fn a_non_primary_press_does_not_revive_a_lost_pointer() {
 }
 
 /// …and a non-primary *release* must not close the sequence either.
-///
-/// Closing it would let the very next press re-adopt — and eframe emits a
-/// press for every `touchstart`, so a second finger arriving after a
-/// right-button release would take the identity. The finger id is the
-/// entire cancellation signal on the web, so losing it that way makes the
-/// real finger's cancel invisible.
 #[test]
 fn a_non_primary_release_does_not_close_the_sequence() {
     let mut d = TrackerDriver::new();
@@ -242,7 +204,6 @@ fn a_non_primary_release_does_not_close_the_sequence() {
         "a right-button release is not this sequence ending"
     );
 
-    // eframe's re-emitted press for a second finger.
     let second = pos + egui::vec2(80.0, 0.0);
     d.frame(vec![
         button(egui::PointerButton::Primary, true, pos),
@@ -261,11 +222,8 @@ fn a_non_primary_release_does_not_close_the_sequence() {
 }
 
 /// A mouse click inside the window emits **no** `PointerGone`
-/// (`egui-winit-0.34.1/src/lib.rs:791` pushes the button event alone), so
-/// the release is the only thing that says the sequence ended. If it did
-/// not close it, the next press would be treated as mid-sequence and the
-/// finger opening it would never be adopted — on a hybrid device, a click
-/// followed by a touch.
+/// (`egui-winit-0.34.1/src/lib.rs:791` pushes the button event alone), so the
+/// release is the only thing that says the sequence ended.
 #[test]
 fn a_mouse_release_lets_the_next_touch_adopt_its_finger() {
     let mut d = TrackerDriver::new();
@@ -281,20 +239,16 @@ fn a_mouse_release_lets_the_next_touch_adopt_its_finger() {
     );
 }
 
-/// An excursion leaves no release behind to close the sequence, so the next
-/// press has to be able to adopt its own finger anyway. Otherwise the old,
-/// **recycled** id sticks — and a different finger carrying it, cancelled
-/// anywhere on screen, kills a live sequence it has nothing to do with.
+/// An excursion leaves no release behind to close the sequence, so the next press
+/// has to be able to adopt its own finger anyway.
 #[test]
 fn a_new_sequence_after_an_excursion_adopts_its_own_finger() {
     let mut d = TrackerDriver::new();
     let pos = egui::pos2(100.0, 100.0);
 
     assert!(d.frame(touch_down(0, pos)).down);
-    // Mid-sequence excursion: `PointerGone` with no release at all.
     assert!(!d.frame(vec![egui::Event::PointerGone]).down);
 
-    // A new touch, with a different id.
     assert!(d.frame(touch_down(1, pos)).down);
 
     assert!(
@@ -307,9 +261,9 @@ fn a_new_sequence_after_an_excursion_adopts_its_own_finger() {
     );
 }
 
-/// When two fingers start in one frame, the first is the primary — that is
-/// what eframe picks (`all_touches.first()`, `web/input.rs:30`) and it
-/// pushes changed touches in the same order (`:85`).
+/// When two fingers start in one frame, the first is the primary — that is what
+/// eframe picks (`all_touches.first()`, `web/input.rs:30`) and it pushes changed
+/// touches in the same order (`:85`).
 #[test]
 fn the_first_touch_start_in_a_frame_is_the_primary() {
     let mut d = TrackerDriver::new();
@@ -339,10 +293,9 @@ fn the_first_touch_start_in_a_frame_is_the_primary() {
     );
 }
 
-/// A *secondary* finger's cancel must still do nothing: it is not the touch
-/// backing the emulated pointer, and killing the primary's live gesture is
-/// the failure the old "never act on raw `Touch{Cancel}`" rule was
-/// protecting against.
+/// A *secondary* finger's cancel must still do nothing: it is not the touch backing
+/// the emulated pointer, and killing the primary's live gesture is the failure the
+/// old "never act on raw `Touch{Cancel}`" rule was protecting against.
 #[test]
 fn a_secondary_finger_cancel_leaves_the_primary_alone() {
     let mut d = TrackerDriver::new();
@@ -359,12 +312,6 @@ fn a_secondary_finger_cancel_leaves_the_primary_alone() {
 }
 
 /// The idle backstop may only *add* a reason to distrust the pointer.
-///
-/// After a cancellation nothing else arrives, so the backstop's condition
-/// goes on being true forever. If it were allowed to overwrite the cause,
-/// a cancelled touch would quietly become an idle one a minute later — and
-/// idle is the cause motion is allowed to clear, so the phantom would come
-/// back on the next stray event.
 #[test]
 fn the_backstop_does_not_downgrade_a_cancellation() {
     let mut d = TrackerDriver::new();
@@ -379,7 +326,6 @@ fn the_backstop_does_not_downgrade_a_cancellation() {
         .down
     );
 
-    // Well past POINTER_IDLE_TIMEOUT_S of complete silence.
     assert!(!d.frame_after(90.0, vec![]).down);
 
     assert!(
@@ -390,11 +336,6 @@ fn the_backstop_does_not_downgrade_a_cancellation() {
 }
 
 /// A real release forgets which finger owned the sequence.
-///
-/// Touch ids are reused. If the tracker kept the old one, a later
-/// *mouse* press would inherit it — and then a fresh touch reusing that id,
-/// cancelled somewhere else on a hybrid device, would kill the mouse
-/// gesture that has nothing to do with it.
 #[test]
 fn a_release_forgets_the_finger_that_owned_the_sequence() {
     let mut d = TrackerDriver::new();
@@ -407,7 +348,6 @@ fn a_release_forgets_the_finger_that_owned_the_sequence() {
         egui::Event::PointerGone,
     ]);
 
-    // A mouse press: no touch involved at all.
     assert!(
         d.frame(vec![button(egui::PointerButton::Primary, true, pos)])
             .down
@@ -425,11 +365,6 @@ fn a_release_forgets_the_finger_that_owned_the_sequence() {
 }
 
 /// Adopting the primary finger must survive a second finger arriving.
-/// eframe re-emits a primary press for *every* `touchstart`
-/// (`events.rs:676`), and that frame carries the *new* finger's
-/// `Touch{Start}` — so a naive "the press frame's touch id is the primary"
-/// rule would hand the identity to the wrong finger, and then honour that
-/// finger's cancel while ignoring the real one's.
 #[test]
 fn a_second_finger_does_not_steal_the_primary_identity() {
     let mut d = TrackerDriver::new();
@@ -437,8 +372,6 @@ fn a_second_finger_does_not_steal_the_primary_identity() {
 
     assert!(d.frame(touch_down(0, pos)).down);
 
-    // Web-shaped second touchstart: a redundant primary press at the
-    // *first* finger's position, plus the second finger's raw touch.
     d.frame(vec![
         button(egui::PointerButton::Primary, true, pos),
         touch(1, egui::TouchPhase::Start, pos + egui::vec2(80.0, 0.0)),
@@ -459,9 +392,7 @@ fn a_second_finger_does_not_steal_the_primary_identity() {
     );
 }
 
-/// Only a *press* re-arms a lost pointer. A release is not evidence that
-/// the pointer came back — it is the opposite — so it must leave the latch
-/// alone even when it arrives for a button egui is not tracking as down.
+/// Only a *press* re-arms a lost pointer.
 #[test]
 fn a_release_does_not_re_arm_a_lost_pointer() {
     let mut d = TrackerDriver::new();
@@ -476,22 +407,17 @@ fn a_release_does_not_re_arm_a_lost_pointer() {
         "precondition: pressed and down"
     );
 
-    // Cancelled: `PointerGone` with no release. egui goes on reporting the
-    // primary button as down from here.
     assert!(
         !d.frame(vec![egui::Event::PointerGone]).down,
         "precondition: the cancelled pointer is distrusted"
     );
 
-    // A secondary-button release arrives. It clears nothing in egui's
-    // primary `down`, and it says nothing about the primary finger.
     assert!(
         !d.frame(vec![button(egui::PointerButton::Secondary, false, pos)])
             .down,
         "a release must not resurrect a cancelled pointer"
     );
 
-    // A press, however, does — that is a new sequence.
     assert!(
         d.frame(vec![button(egui::PointerButton::Primary, true, pos)])
             .down,
@@ -499,16 +425,15 @@ fn a_release_does_not_re_arm_a_lost_pointer() {
     );
 }
 
-/// Motion un-latches, but a sequence that really ended stays ended: the
-/// pointer is only "down" while egui says a button is down *and* we still
-/// believe it, so a bare hover after a release re-arms nothing.
+/// Motion un-latches, but a sequence that really ended stays ended: the pointer is
+/// only "down" while egui says a button is down *and* we still believe it, so a
+/// bare hover after a release re-arms nothing.
 #[test]
 fn hovering_after_a_real_release_does_not_re_arm() {
     let mut d = TrackerDriver::new();
     let pos = egui::pos2(100.0, 100.0);
 
     d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
-    // A normal touch-up: release *and* `PointerGone`, in that order.
     d.frame(vec![
         button(egui::PointerButton::Primary, false, pos),
         egui::Event::PointerGone,
@@ -518,13 +443,7 @@ fn hovering_after_a_real_release_does_not_re_arm() {
     assert!(!hovered.down, "hovering is not holding");
 }
 
-/// A hand-built [`PointerFrame`], for driving [`ArmedDragDetector`]
-/// directly.
-///
-/// Straight construction rather than through [`PointerTracker`], because
-/// the detector's contract is with the *frame* — the tracker's own
-/// behaviour has its own suite above, and routing through it would make
-/// these tests fail for its reasons as well as their own.
+/// A hand-built [`PointerFrame`], for driving [`ArmedDragDetector`] directly.
 fn frame(pressed: bool, released: bool, down: bool, x: f32) -> PointerFrame {
     PointerFrame {
         pressed,
@@ -564,13 +483,6 @@ fn a_press_a_move_and_a_release_are_an_anchor_a_drag_and_a_line() {
 }
 
 /// A pointer that goes away without releasing cancels the draw.
-///
-/// This is not hypothetical tidiness. `down` here is the tracker's
-/// *corrected* answer, and correcting it is the whole reason that type
-/// exists: after an OS-cancelled touch egui's own `primary_down()` stays
-/// `true` for ever. A detector keyed on egui's flag would leave `drawing`
-/// set, and `ArmedDragFrame` makes `suppress_pan` unconditional — so the
-/// map would stay un-pannable with nothing on screen to say why.
 #[test]
 fn a_pointer_that_vanishes_cancels_the_draw_rather_than_finishing_it() {
     let mut d = ArmedDragDetector::default();
@@ -590,9 +502,6 @@ fn a_pointer_that_vanishes_cancels_the_draw_rather_than_finishing_it() {
 }
 
 /// A press part-way through a draw starts a new one.
-///
-/// The only ways to produce one are a fresh finger and a fresh button, and
-/// both mean "start here" more plausibly than they mean "ignore me".
 #[test]
 fn a_second_press_re_anchors_rather_than_being_ignored() {
     let mut d = ArmedDragDetector::default();
@@ -609,10 +518,6 @@ fn a_second_press_re_anchors_rather_than_being_ignored() {
 }
 
 /// A tap — press and release inside one frame — never becomes a line.
-///
-/// egui batches a whole gesture into one `RawInput` whenever frames are
-/// long, which on a map app decoding tiles is routine, so this ordering is
-/// ordinary rather than exotic.
 #[test]
 fn a_press_and_release_in_one_frame_does_not_finish_a_line() {
     let mut d = ArmedDragDetector::default();
@@ -629,13 +534,6 @@ fn a_press_and_release_in_one_frame_does_not_finish_a_line() {
 }
 
 /// The two properties of an armed frame are properties of the **type**.
-///
-/// `ArmedDragFrame::new` is the only constructor and the field is
-/// private, so there is no inhabitant for which panning is allowed or an
-/// overlay click fires. The alternative — returning a bare
-/// [`MapPointerFrame`] and asking each caller to clear two fields — is the
-/// shape of rule that gets obeyed at the site it was written for and
-/// nowhere else.
 #[test]
 fn every_armed_frame_suppresses_panning_and_fires_no_overlay_click() {
     for gesture in [

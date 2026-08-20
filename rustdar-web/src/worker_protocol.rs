@@ -1,110 +1,54 @@
 //! The message shapes the page and the rasterization worker agree on.
 //!
 //! Both halves are in this crate and compile from the same source, so the
-//! field names here are the whole specification — there is no second
-//! implementation to keep in step. What they cannot assume is that they are the
-//! same *build*: see [`build_token`].
+//! field names here are the whole specification. What they cannot assume is
+//! that they are the same *build*: see [`build_token`].
 
 use wasm_bindgen::prelude::*;
 
 /// Message tags. Read off `kind` on every message in both directions.
 pub const KIND: &str = "kind";
-/// Worker → page, once, when it is ready to take jobs.
 pub const HELLO: &str = "hello";
-/// Worker → page, when it could not start at all.
 pub const FATAL: &str = "fatal";
-/// Page → worker: rasterize this.
 pub const JOB: &str = "job";
-/// Worker → page: the answer to a job.
 pub const DONE: &str = "done";
 
 pub const ID: &str = "id";
-/// Page → worker: the framed job, as `rustdar_worker`'s
-/// `JobRequest::to_bytes` writes it.
-///
-/// As of WO-M7b the leading byte of that payload is a **composed-registry
-/// index plus one** (`rustdar_worker::job_registry`, codes 1..=13 with 0
-/// unallocated), followed by the one canonical envelope every kind shares.
-/// The sparse `TAG_*` era — its per-tag numbering and the retired-tag holes
-/// — and the hand-versioned changelog that once narrated it are git history
-/// (the changelog was deleted with the protocol's version number at WO-M5);
-/// what stands over the framing now is the [`build_token`] below, never a
-/// hand-kept number.
+/// Page → worker: the framed job, as `rustdar_worker`'s `JobRequest::to_bytes`
+/// writes it. Its leading byte is a **composed-registry index plus one**
+/// (codes 1..=13, 0 unallocated), then the canonical envelope every kind
+/// shares.
 pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
 
-/// Worker → page: **the answer's HEAD** — scalars and framing in the
-/// dispatched codec row's own `encode_out` form, every kind alike, as one
-/// transferred `Uint8Array` — or null for a job that produced nothing (a
-/// `None` result writes all three reply fields null explicitly, because
-/// the page holds a slot per id and silence would strand it).
-///
-/// One head for every kind since WO-M7c closed the reply direction onto
-/// the codec table: the plan-view frame, whose reply used to ride eight
-/// named fields beside this one, travels in its own wire form like every
-/// other output. Since WO-M7d the row's nominated LARGE buffers ride
-/// [`TAILS`] beside the head rather than being concatenated into it (the
-/// frame's polar block and image — a 21 MiB concatenating memcpy per
-/// widest still frame, gone). The head's payload still carries its own
-/// counts and refusals — no second description of its lengths rides this
-/// message — and the tail COUNT is judged by the row's own decoder, which
-/// refuses a count it did not write.
+/// Worker → page: **the answer's HEAD** — scalars and framing in the dispatched
+/// codec row's own `encode_out` form, as one transferred `Uint8Array`; null
+/// for a job that produced nothing (all three reply fields are written null
+/// explicitly, because the page holds a slot per id). The row's nominated
+/// LARGE buffers ride [`TAILS`], whose count the row's own decoder judges.
 pub const OUT: &str = "out";
-/// Worker → page: which codec row's `encode_out` wrote [`OUT`] — the row's
-/// **dense composed-registry code** (index plus one), the same one code
-/// space the request direction's leading byte speaks, so one table names
-/// every kind in both directions.
-///
-/// The page does not route on it: the reply is decoded through the row
-/// recorded when the job was dispatched, and this tag is *verified* against
-/// that row's code (`offload::deliver_encoded_reply`) — a mismatch is a
-/// corrupt message or another build's reply, refused as "nothing to draw"
-/// rather than decoded as whatever the tag claims.
+/// Worker → page: which codec row's `encode_out` wrote [`OUT`]. The page does
+/// not route on it — the reply is decoded through the row recorded at
+/// dispatch and this tag is *verified* against that row's code.
 pub const OUT_KIND: &str = "outkind";
-/// Worker → page: the row's nominated large flat buffers — the frame's
-/// `[polar, image]`, an empty array for every current non-frame row — as a
-/// `js_sys::Array` of per-tail `Uint8Array`s, EACH transferred, so the
-/// page adopts every big buffer instead of copying it out of a
-/// concatenation (WO-M7d); null on the nothing arm (the both-arms-write
-/// posture, see `worker::post_result`).
-///
-/// Order within the array is the row's own convention — the frame-reply
-/// digest rows (`rustdar_worker::wire_identity`) are what pin it, and a
-/// count the dispatched row's decoder did not write is refused whole.
+/// Worker → page: the row's nominated large flat buffers as a `js_sys::Array`
+/// of per-tail `Uint8Array`s, EACH transferred, so the page adopts every big
+/// buffer instead of copying it out of a concatenation; null on the nothing
+/// arm. Order is the row's own convention, pinned by the wire-identity rows.
 pub const TAILS: &str = "tails";
 
 /// What the page and the worker compare before the page trusts the worker.
 ///
-/// They can differ. A dedicated worker is its own service-worker client, so
-/// `sw.js`'s per-client shell pin — which exists precisely to keep one page on
-/// one `(glue, wasm)` generation — does not cover it, and a worker started
-/// across a deploy can fetch a *newer* generation's module than the page is
-/// running. Two separate wasm instances do not produce the linker error that
-/// mismatch would cause inside one; they produce a protocol disagreement,
-/// which is silent and much worse.
-///
-/// `GITHUB_SHA` is what actually distinguishes two deploys; it is present in
-/// CI and absent locally, where the token's second segment is a digest of the
-/// wire's pinned identity rows instead
-/// (`rustdar_worker::wire_identity::wire_digest`). Both halves of one build
-/// digest the same module, so the fallback cannot false-mismatch a matched
-/// pair — and a local pair whose pinned wire rows differ now diverges, where
-/// the deleted hand-kept protocol number matched any two local builds alike.
-/// What the digest deliberately does not cover — the nested payload layouts,
-/// pinned by `rustdar-radar`'s own suites — leaves a rasterizer-only local
-/// staleness reading as the same build: a missed detection, accepted, because
-/// locally there is no service-worker deploy skew to create such a pair and
-/// production always has the SHA. (A cached CI build can bake a stale SHA,
-/// but it bakes the *same* stale SHA into both halves — still only ever a
-/// missed detection, never a false one.)
+/// They can differ: a dedicated worker is its own service-worker client, so
+/// `sw.js`'s per-client shell pin does not cover it, and a worker started
+/// across a deploy can fetch a newer generation's module — a silent protocol
+/// disagreement rather than a linker error. `GITHUB_SHA` distinguishes two
+/// deploys in CI; locally the second segment is a digest of the wire's pinned
+/// identity rows, which does not cover the nested payload layouts.
 pub fn build_token() -> String {
     match option_env!("GITHUB_SHA") {
-        // CI/production: the SHA distinguishes deploys — finer than any
-        // hand-kept number, and it cannot be forgotten.
         Some(sha) => format!("{}/{}", env!("CARGO_PKG_VERSION"), sha),
-        // Local dev: no SHA. Digest the wire's pinned identity rows instead —
-        // see rustdar_worker::wire_identity for scope and residuals.
         None => format!(
             "{}/wire-{:016x}",
             env!("CARGO_PKG_VERSION"),
@@ -123,11 +67,9 @@ pub fn string_field(object: &JsValue, key: &str) -> Option<String> {
     field(object, key)?.as_string()
 }
 
-/// Set `key` on `object`, or log why it could not be.
-///
-/// `Reflect::set` fails only on a frozen or non-object target, neither of which
-/// a freshly built `Object` is — but the result is `#[must_use]` and swallowing
-/// it silently would hide a message that arrived half-built.
+/// Set `key` on `object`, or log why it could not be: `Reflect::set` fails only
+/// on a frozen or non-object target, but swallowing a `#[must_use]` error
+/// would hide a message that arrived half-built.
 pub fn set_field(object: &js_sys::Object, key: &str, value: &JsValue) {
     if js_sys::Reflect::set(object, &JsValue::from_str(key), value).is_err() {
         log::error!("could not set {key} on a worker message");

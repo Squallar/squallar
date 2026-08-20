@@ -1,5 +1,5 @@
-//! What the typed key promises: no theme term on radar, an elevation part
-//! exactly where the tilt selects the picture, and one bucket per tenth.
+//! What the typed key promises: no theme term on radar, an elevation part exactly where the
+//! tilt selects the picture, and one bucket per tenth.
 
 use super::*;
 use rustdar_overlays::render::overlay_state::OverlayRegistry;
@@ -14,31 +14,14 @@ fn plan_key(site: &str, elevation: f32) -> RenderKey {
     )
 }
 
-/// Radar's key is byte-identical under either theme, and the constant saying so
-/// is checked against the live declaration rather than trusted.
-///
-/// m11: a `RenderCache` entry is 32 MiB at the base side and 128 MiB at the
-/// long-range one. A theme term on the radar key means an OS theme flip misses
-/// every resident entry and re-decodes and re-renders every visible product —
-/// for a change that cannot alter one of their pixels, because a radar picture's
-/// palette is the product's and not the interface's.
-///
-/// The sibling half is `app::theme_flip_tests::
-/// a_theme_flip_never_touches_the_radar_render_cache`, which flips a real `App`
-/// and watches the cache. This one pins the *key* that makes that survival
-/// structural.
+/// Radar's key is byte-identical under either theme, and the constant saying so is checked
+/// against the live declaration rather than trusted.
 #[test]
 fn the_radar_key_is_the_same_in_dark_and_light() {
-    // The COMPOSED registry, not `OverlayRegistry::default()`: since WO-M9
-    // that default is the overlay crate's eleven and does not contain radar
-    // at all — and a missing handler answers `theme_sensitive` `false`, which
-    // is the same answer this test is trying to verify radar declares. The
-    // control below could not tell those apart either, because it asks about
-    // a different layer.
     let overlays = OverlayRegistry::with_handlers(rustdar_egui::sources::all());
 
-    // Non-vacuity control FIRST: the reader must be able to answer `true`, or
-    // every assertion below passes on a registry that lost its handlers.
+    // Non-vacuity control FIRST: the reader must be able to answer `true`, or every
+    // assertion below passes on a registry that lost its handlers.
     assert!(
         overlays.theme_sensitive(&known::RADAR_SITES),
         "control: the site-label layer bakes `is_dark` into its raster and must \
@@ -60,7 +43,6 @@ fn the_radar_key_is_the_same_in_dark_and_light() {
          is the assertion that keeps it one",
     );
 
-    // The formula itself, driven with the live declaration and both readings.
     assert_eq!(
         SelectKey::theme_part(declared, true),
         SelectKey::theme_part(declared, false),
@@ -72,8 +54,8 @@ fn the_radar_key_is_the_same_in_dark_and_light() {
         None,
         "a layer declaring `theme_sensitive() == false` acquired a theme term",
     );
-    // ...and the control's declaration proves the formula is not simply
-    // constant: a `true` declaration must carry the reading through.
+    // ...and the control's declaration proves the formula is not simply constant: a `true`
+    // declaration must carry the reading through.
     assert_eq!(
         SelectKey::theme_part(true, true),
         Some(true),
@@ -82,7 +64,6 @@ fn the_radar_key_is_the_same_in_dark_and_light() {
          assertion above",
     );
 
-    // And the key a render is actually filed under.
     let key = plan_key("KTLX", 0.5);
     assert_eq!(
         key.select.theme, None,
@@ -92,13 +73,8 @@ fn the_radar_key_is_the_same_in_dark_and_light() {
     assert_eq!(key.kind, known::RADAR, "the radar key names another layer");
 }
 
-/// The elevation part is present exactly when the tilt is what picks the
-/// picture, over the whole `(view, product)` grid.
-///
-/// A section cuts across every tilt and a voxel grid resamples all of them, so
-/// keying those by tilt would store one picture once per tilt the pane's
-/// selector visits and evict the plan views to do it. The arbiter is
-/// [`RenderView::elevation_selects_picture`] and nothing here restates it.
+/// The elevation part is present exactly when the tilt is what picks the picture, over the
+/// whole `(view, product)` grid.
 #[test]
 fn the_elevation_part_is_present_exactly_when_the_tilt_selects_the_picture() {
     let mut present = 0usize;
@@ -128,8 +104,8 @@ fn the_elevation_part_is_present_exactly_when_the_tilt_selects_the_picture() {
         }
     }
 
-    // Non-triviality floor: a grid that had drifted to all-present or
-    // all-absent would satisfy every assertion above while pinning nothing.
+    // Non-triviality floor: a grid that had drifted to all-present or all-absent would
+    // satisfy every assertion above while pinning nothing.
     assert!(
         present > 0 && absent > 0,
         "the (view, product) grid no longer contains both answers \
@@ -138,12 +114,8 @@ fn the_elevation_part_is_present_exactly_when_the_tilt_selects_the_picture() {
     );
 }
 
-/// One key per tenth of a degree: two selections inside a bucket are the same
-/// render, one bucket apart are two.
-///
-/// Exercised through a `HashMap`, because that is what the cache is — equality
-/// and hashing have to agree, and a key that compared equal while hashing apart
-/// would miss its own entry.
+/// One key per tenth of a degree: two selections inside a bucket are the same render, one
+/// bucket apart are two.
 #[test]
 fn selections_in_one_tenths_bucket_are_one_key_and_a_bucket_apart_are_two() {
     let inside = plan_key("KTLX", 0.51);
@@ -186,8 +158,8 @@ fn selections_in_one_tenths_bucket_are_one_key_and_a_bucket_apart_are_two() {
         "a selection a bucket away hit its neighbour's entry",
     );
 
-    // The site axis, to keep the two assertions above from passing on a key
-    // that ignores everything but the angle.
+    // The site axis, to keep the two assertions above from passing on a key that ignores
+    // everything but the angle.
     assert_ne!(
         inside,
         plan_key("KOUN", 0.51),

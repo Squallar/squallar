@@ -21,14 +21,6 @@ use rustdar_source::id::{LayerId, known};
 pub(crate) struct MetarFetchResult(
     pub Result<crate::metar::fetch::MetarRound, crate::fetch_policy::FetchError>,
 );
-/// [`Assembled`]: one request per state network, refused as a round only when
-/// every one of them was. A single state's network declining takes every
-/// station in that state off the map while the round still returns `Ok`,
-/// because the rest of the country's observations are real — and a viewport
-/// centred on the one dead state then drew nothing at all under `Updated 0s
-/// ago`.
-///
-/// [`Assembled`]: crate::fetch_policy::Assembled
 impl crate::fetch_policy::FetchRound for MetarFetchResult {
     type Shape = crate::fetch_policy::Assembled;
 }
@@ -312,12 +304,6 @@ impl OverlayHandler for MetarHandler {
         match fetch.0 {
             Ok(round) => {
                 log::info!("Received {} METAR observations", round.observations.len());
-                // A state network that did not answer takes every station in
-                // that state off the map, whole, and the round still returns
-                // `Ok` because the rest are real. That is the coverage axis,
-                // not the health one — it used to go through `set_data`, which
-                // declares an answer whole, and a viewport centred on the one
-                // dead state drew nothing under a green `Updated 0s ago`.
                 let coverage = round.completeness();
                 let items = round
                     .observations
@@ -328,13 +314,6 @@ impl OverlayHandler for MetarHandler {
             }
             Err(e) => {
                 log::error!("METAR fetch failed: {e}");
-                // The round's verdict is computed where the per-request ones
-                // are, by `FetchFailure::of_round` in `metar::fetch`, and is
-                // refused only if every state network was. This used to be
-                // hardcoded `transient` on the argument that one verdict for a
-                // whole round could not be sharper than that — which cost the
-                // sharpness in the wrong direction: a METAR endpoint that is
-                // gone stays on the poll for ever.
                 self.state.record_failure(&e);
             }
         }
@@ -414,11 +393,6 @@ impl OverlayHandler for MetarHandler {
             enabled: self.enabled,
         }];
 
-        // Ungated on enabled (the every-option rule, M9.1): a hidden
-        // layer's options stay visible and editable - edits take effect
-        // when the eye shows it again - Refresh still fetches (nothing
-        // on the fetch path reads enabled), and the status lines keep
-        // reporting.
         items.push(ControlItem::ButtonRow {
             buttons: vec![ControlButton {
                 id: "refresh",
@@ -497,8 +471,6 @@ mod tests {
         );
     }
 
-    /// Fails if `metar_client` is hardwired to `simple_client`, which passes
-    /// the test above while `metar_sends_user_agent` is read by nothing.
     #[test]
     fn the_metar_client_follows_the_origins_recorded_rule() {
         let sources = rustdar_source::origins::DataSources {
@@ -582,7 +554,6 @@ mod tests {
         assert_eq!(field(ob(None), "Visibility"), None);
     }
 
-    /// Fails if a variable wind renders as the bearing "000°".
     #[test]
     fn the_popup_says_vrb_for_a_variable_wind() {
         let wind = field(wind_ob(Some(WindDir::Variable), Some(6), None), "Wind").unwrap();
@@ -612,8 +583,6 @@ mod round_tests {
     use crate::render::controls::PaneControlContext;
     use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
 
-    /// A viewport spanning several plains ASOS networks, so a round really is
-    /// several requests and one of them can be refused on its own.
     fn plains() -> rustdar_geo::GeoBounds {
         rustdar_geo::GeoBounds {
             min_lat: 33.0,
@@ -623,7 +592,6 @@ mod round_tests {
         }
     }
 
-    /// Serve `currents.json` from loopback, refusing exactly one state network.
     fn iem_refusing(dead: Option<&'static str>) -> rustdar_source::origins::DataSources {
         use std::io::{Read, Write};
         fn http(status_line: &str, body: &str) -> String {
@@ -657,8 +625,6 @@ mod round_tests {
         }
     }
 
-    /// Fetch over the socket and push the result through the production ingest
-    /// path, returning the row and the options note a user would see.
     fn round(dead: Option<&'static str>) -> (Option<String>, Option<String>) {
         rustdar_source::tls::init();
         let client = reqwest::Client::builder()
@@ -697,13 +663,6 @@ mod round_tests {
         (registry.status_line(&kind), note)
     }
 
-    /// **A state network that did not answer blanks that state.**
-    ///
-    /// The round returns `Ok` because the other seven networks are real, which
-    /// is right. What was wrong is that it then said nothing: measured over
-    /// this socket against the shipped code, eight networks asked, Oklahoma's
-    /// refused 503, health `Ok`, `is_incomplete()` false, no mark — and every
-    /// Oklahoma station absent from a map most likely centred on Oklahoma.
     #[test]
     fn a_state_network_that_did_not_answer_marks_the_layer_and_names_it() {
         assert!(
@@ -731,8 +690,6 @@ mod round_tests {
         );
     }
 
-    /// The control: every network answering carries no mark. Without it the
-    /// assertion above would pass on a report that always claimed incomplete.
     #[test]
     fn a_whole_round_carries_no_mark() {
         let (line, note) = round(None);

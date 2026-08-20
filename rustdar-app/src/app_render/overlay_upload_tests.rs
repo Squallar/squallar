@@ -1,45 +1,8 @@
-//! What `poll_overlay_render_results` puts on the GPU.
-//!
-//! Driven against a bare `egui::Context`, which is the whole renderer this path
-//! needs, and read back through the texture manager's own delta — the very
-//! buffer egui hands its painter. That is what makes "the pixels are identical"
-//! an observation rather than an argument: the conversion moved to another
-//! thread, and the bytes that reach the GPU are compared against the conversion
-//! written out by hand.
-//!
-//! # What this does *not* cover
-//!
-//! The **poller-to-GPU leg only.** These tests hand
-//! `poll_overlay_render_results` a converted response; they do not drive
-//! `spawn_overlay_render` itself (the wire tests beside it do —
-//! `sites_wire_tests`, `polygon_wire_tests`, `hitmap_wire_tests`,
-//! `model_wire_tests`).
-//!
-//! So the claim "the poller does not convert" rests on two separate things,
-//! and neither substitutes for the other: the bytes below, and
-//! `frame_thread_conversion_tests::every_overlay_dispatch_is_described_and_converts_nothing`,
-//! which is a **source-text** assertion that no dispatch arm converts at all
-//! — `offload::execute` converts inside the job, at the rasterizer's own
-//! declaration. A conversion that changed shape there would be caught
-//! textually and not by comparison. Anyone strengthening this should start
-//! there.
-//!
-//! The conversion the fixture below hands in is `from_rgba_unmultiplied`, and
-//! it stays that way deliberately. What is under test is that the poller
-//! uploads *whatever image it was given*, byte for byte, so which arm a real
-//! rasterizer's output would have taken is beside the point — and an
-//! unmultiplied fixture keeps the three arms of `Color32`'s slow path in the
-//! comparison. Which arm each rasterizer gets is
-//! `rustdar_overlays::render::rasterize::alpha_tests`' subject, against the
-//! bytes those rasterizers actually write.
-
 use super::*;
 use crate::app::tests::drain_uploads;
 use rustdar_geo::GeoBounds;
 use rustdar_source::id::known;
 
-/// A small overlay, and small on purpose: this is about which bytes arrive, and
-/// a viewport-sized buffer would only make the comparison slower to run.
 const W: u32 = 8;
 const H: u32 = 5;
 
@@ -52,11 +15,6 @@ fn bounds() -> GeoBounds {
     }
 }
 
-/// RGBA covering the three arms of `Color32::from_rgba_unmultiplied`, because
-/// they are not one code path: `a == 0` and `a == 255` are early returns and
-/// everything between them takes the multiply. `palette.rs` sets
-/// `TRANSPARENCY = 180`, so the slow arm is the one nearly every real pixel
-/// takes — and it is the arm a premultiplied shortcut would silently change.
 fn rasterizer_output() -> Vec<u8> {
     let mut rgba = Vec::with_capacity((W * H) as usize * 4);
     for i in 0..(W * H) {
@@ -76,14 +34,10 @@ fn rasterizer_output() -> Vec<u8> {
     rgba
 }
 
-/// An app with `n` map panes, so an overlay result naming several of them has
-/// somewhere to land.
 fn n_pane_app(n: usize) -> crate::app::App {
     crate::app::tests::n_pane_app(n, "KTLX")
 }
 
-/// Post one finished overlay for `pane_indices`, converted where the rasterizer
-/// converts it, and drain the poller.
 fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usize>) {
     let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
         [W as usize, H as usize],
@@ -115,11 +69,6 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
         .id()
 }
 
-/// The bytes that reach the GPU are the rasterizer's, unmultiplied exactly as
-/// `poll_overlay_render_results` used to unmultiply them.
-///
-/// The move off the frame thread is a relocation of one call, and this is the
-/// statement that it was only a relocation.
 #[test]
 fn the_uploaded_pixels_are_the_rasterizers_own() {
     let ctx = egui::Context::default();
@@ -143,8 +92,6 @@ fn the_uploaded_pixels_are_the_rasterizers_own() {
     );
 }
 
-/// The texture the panes are given is the size the picture is, not a pair of
-/// numbers that travelled beside it.
 #[test]
 fn the_placed_overlay_is_described_by_its_own_picture() {
     let ctx = egui::Context::default();
@@ -161,11 +108,6 @@ fn the_placed_overlay_is_described_by_its_own_picture() {
     assert_eq!((entry.width, entry.height), (W, H));
 }
 
-/// One rasterization, one upload, however many panes asked for it.
-///
-/// This has always been true of the overlay path — it is the pattern the
-/// plan-view path was missing — and it is pinned here because the conversion
-/// moving off the frame thread rewrote the statement that does it.
 #[test]
 fn four_panes_share_one_overlay_texture() {
     let ctx = egui::Context::default();

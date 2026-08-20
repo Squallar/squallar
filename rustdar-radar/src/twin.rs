@@ -1,65 +1,15 @@
 //! Validation twins: score a locally derived polar product against the RPG's
-//! own Level III rendition of the **same volume**.
+//! own Level III rendition of the same volume.
 //!
-//! Two layers. [`compare`] is pure math — wasm-safe, no network — shipped
-//! code called at runtime by the render and VILD paths, and shared by the
-//! product harnesses (EET, DVL, KDP, HCA, DPR). `live` was the native,
-//! test-only layer that finds the twin in the first place: the archived
-//! Level II volume nearest a moment, and the Level III bucket object
-//! generated from that very volume — never merely the newest key, which
-//! SAILS republishing makes a mid-volume repeat more often than not.
-//!
-//! **The live rigs live on branch `campaign-harness`**, not here: `l3_twin`,
-//! the site roster and its two Level II fetchers, the per-product
-//! `live_validation` harnesses, their `validation_policy` modules and offline
-//! policy pins, the `compare_l3` example, and `live_elevation_audit`. Check
-//! that branch out and run a rig with e.g.
-//!
-//! ```text
-//! cargo test -p rustdar-radar --release --lib -- --ignored --nocapture live_
-//! ```
-//!
-//! Because those rigs are not here, **every agreement percentage quoted in a
-//! doc comment in this crate is a historical reading, not something a check-out
-//! of this tree can reproduce.** The modules that quote one say so where they
-//! quote it. What re-running means is concrete and the same everywhere: check
-//! out `campaign-harness`, which carries `l3_twin`, the roster, the fetchers
-//! and each product's `validation_policy`, and run the command above. Nothing
-//! in this tree can stand in for that — the offline suites pin formulas and
-//! transcriptions, never agreement with a twin.
+//! [`compare`] is pure math — wasm-safe, no network — shipped code called at
+//! runtime by the render and VILD paths. The live rigs that find the twin in
+//! the first place (`l3_twin`, the site roster, the per-product
+//! `live_validation` harnesses and their `validation_policy` modules) are not
+//! in this tree, so every agreement percentage quoted in a doc comment in this
+//! crate is a historical reading rather than something a check-out can
+//! reproduce.
 
-/// Pure-math comparison of a derived grid against a decoded Level III radial
-/// product. Everything here is deterministic and network-free.
-///
-/// # Provenance: this is our instrument, not anyone's standard
-///
-/// **No authority defines the resampling below, so there is nothing external
-/// to check it against.** The ICD says how a Level III packet is laid out; it
-/// does not say how to put a 360 × 230 km derived grid and a packet of
-/// arbitrary radial width and gate spacing onto one grid so the two can be
-/// differenced. The four rules that decide that — the tenth-of-a-degree
-/// azimuth table read at the cell centre, nearest-gate-centre range selection,
-/// the 230 km cut, and levels 0/1 read as undefined — were chosen here. The
-/// azimuth mapping is [`crate::srm`]'s resampler reused, which is the only
-/// part with a stated ancestor; the rest carries no record of having been
-/// arbitrated against an alternative.
-///
-/// That matters more than the size of the code suggests. **Every "% exact" and
-/// "% within one level" anywhere in this crate is computed by this module**,
-/// so a systematic bias here moves every product's score in one direction at
-/// once and is invisible in all of them — including in the product-to-product
-/// comparisons the campaign uses to arbitrate cell statistics. One bug of
-/// exactly that shape is on the record: product 135's levels read through the
-/// scaled fallback instead of its LUT painted every EET bin 2 kft high, in
-/// every EET score, until it was found by hand — the codec selection that
-/// stops it is pinned by `for_message_selects_the_eet_lut_for_product_135`.
-///
-/// The check this class of instrument admits is an independent regrid — a
-/// second implementation written from the packet layout rather than from this
-/// file, differenced against this one. That does not exist in this tree and
-/// nothing here is a substitute for it, so read the level statistics as
-/// **self-consistent and unarbitrated**: they compare products to each other
-/// on equal terms; they do not establish an absolute agreement figure.
+/// Pure-math comparison of a derived grid against a decoded Level III radial product.
 pub mod compare {
     use crate::l3_values;
     use crate::volumetric::RANGE_BINS;
@@ -76,12 +26,8 @@ pub mod compare {
     }
 
     impl ValueCodec {
-        /// The codec a message's own PDB and packet declare — the same
-        /// selection [`crate::render`] makes to draw the product: Digital
-        /// VIL's hybrid LUT for product 134, EET's mask/scale/offset LUT for
-        /// product 135, the legacy threshold table for RLE packets, otherwise
-        /// packet-28 XDR scale/offset falling back to the PDB's pair. `None`
-        /// when the message carries no radial packet.
+        /// The codec a message's own PDB and packet declare, as
+        /// [`crate::render`] selects it to draw the product.
         pub fn for_message(msg: &Level3Message) -> Option<Self> {
             let packet = crate::srm::radial_packet(msg)?;
             if let Some(lut) =
@@ -103,10 +49,7 @@ pub mod compare {
             Some(Self::Scaled { scale, offset })
         }
 
-        /// Gate level → physical value. Levels 0 and 1 are below-threshold
-        /// and range-folded across the whole family — the renderer skips them
-        /// too — so they decode `NaN`, as do a LUT's own `NaN` levels and any
-        /// level past the table.
+        /// Gate level → physical value.
         pub fn decode(&self, gate: u16) -> f32 {
             if gate <= 1 {
                 return f32::NAN;
@@ -117,10 +60,7 @@ pub mod compare {
             }
         }
 
-        /// Physical value → gate level; `NaN` encodes as 0. Byte-sized, which
-        /// every LUT product is; a 16-bit product's levels above 255 clamp,
-        /// so score wide products with [`Tally`] (which compares levels at
-        /// full width) rather than through this.
+        /// Physical value → gate level; `NaN` encodes as 0.
         pub fn encode(&self, value: f32) -> u8 {
             match self {
                 Self::Lut(table) => l3_values::quantize_via_lut(value, table),
@@ -130,9 +70,8 @@ pub mod compare {
             }
         }
 
-        /// The level a physical value lands on, at full width — what the
-        /// tally compares. Identical to [`encode`](Self::encode) for byte
-        /// products, but a 16-bit product (DPR) keeps its upper levels.
+        /// The level a physical value lands on, at full width — what the tally
+        /// compares.
         fn encode_level(&self, value: f32) -> i64 {
             match self {
                 Self::Lut(table) => i64::from(l3_values::quantize_via_lut(value, table)),
@@ -153,18 +92,9 @@ pub mod compare {
 
     /// The PDB's volume scan start as a timestamp — re-exported from
     /// [`crate::level3`], where the pairing that reads it lives.
-    ///
-    /// Kept in this namespace because the product harnesses (on branch
-    /// `campaign-harness`) reach it here, and because it belongs to the same
-    /// idea as the rest of `compare`: a twin is the object of *this* volume, not the newest
-    /// one. There is one implementation, in production code, so the frontend's
-    /// Level III loop and the harnesses cannot disagree about which volume an
-    /// object names.
     pub use crate::level3::volume_scan_started;
 
-    /// Whether level distance means anything. A numeric product's levels are
-    /// ordered, so within-±1 is "one shade off"; a class product's levels are
-    /// codes, where only equality and the confusion matrix carry information.
+    /// Whether level distance means anything.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ProductKind {
         Numeric,
@@ -186,8 +116,7 @@ pub mod compare {
         pub within_two: usize,
         /// Cells defined on exactly one side.
         pub presence_disagreements: usize,
-        /// `(derived level, L3 level) → count`, filled only for
-        /// [`ProductKind::Class`]. Levels above 255 clamp.
+        /// `(derived level, L3 level) → count`, filled only for [`ProductKind::Class`].
         pub confusion: BTreeMap<(u8, u8), usize>,
     }
 
@@ -215,12 +144,6 @@ pub mod compare {
     /// Why a derived grid was refused: the comparison lattice is exactly 360
     /// azimuth rows of [`RANGE_BINS`] range cells, and this names the first
     /// dimension that was not.
-    ///
-    /// Returned by [`PolarGrid::new`] rather than asserted, so the caller
-    /// learns *which* dimension is wrong and what it actually had. The two
-    /// variants are the two directions the old `take(360)` / `take(RANGE_BINS)`
-    /// walk failed silently in: a short grid shrank the denominator and scored
-    /// better, a tall one was truncated and scored against the wrong azimuths.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum GridShape {
         /// The grid does not have 360 azimuth rows.
@@ -249,24 +172,6 @@ pub mod compare {
 
     /// A derived field **on the comparison lattice**: exactly 360 azimuth-major
     /// rows of exactly [`RANGE_BINS`] cells, `NaN` undefined.
-    ///
-    /// # Why this is a type and not an assertion
-    ///
-    /// The lattice is not a property of any one product — it is the coordinate
-    /// system every twin score is quoted in, and the denominator of every
-    /// `% exact` this crate publishes. Expressing it as a type moves the
-    /// question from *"did this function remember to check?"* to *"where did
-    /// this grid become a comparison grid?"*, which has exactly one answer
-    /// ([`PolarGrid::new`]) and is checked once, at the boundary, instead of
-    /// once per scorer.
-    ///
-    /// It is a **borrow**, not an owned grid: every producer in the tree
-    /// already allocates `vec![vec![f32::NAN; RANGE_BINS]; 360]` and fills it,
-    /// so requiring them to change representation would buy nothing. What the
-    /// borrow buys is that [`tally_packet`] can no longer be *reached* with a
-    /// mis-shape — there is no expressible call that gets past the constructor
-    /// — and that its inner loop needs no bounds cap, so nothing in it can
-    /// silently iterate fewer cells than the domain.
     #[derive(Debug, Clone, Copy)]
     pub struct PolarGrid<'a> {
         rows: &'a [Vec<f32>],
@@ -277,10 +182,6 @@ pub mod compare {
         pub const AZIMUTHS: usize = 360;
 
         /// Borrow `rows` as a comparison grid, or say why it is not one.
-        ///
-        /// Every row is checked, not just the first: a ragged grid is as
-        /// unscoreable as a short one, and costs the same walk to rule out
-        /// as the tally itself does to index.
         pub fn new(rows: &'a [Vec<f32>]) -> Result<Self, GridShape> {
             if rows.len() != Self::AZIMUTHS {
                 return Err(GridShape::Azimuths { found: rows.len() });
@@ -299,9 +200,6 @@ pub mod compare {
         }
 
         /// Row `az`, [`RANGE_BINS`] cells wide — guaranteed by construction.
-        ///
-        /// # Panics
-        /// If `az >= 360`, like any slice index.
         pub fn row(&self, az: usize) -> &'a [f32] {
             &self.rows[az]
         }
@@ -315,13 +213,8 @@ pub mod compare {
         }
     }
 
-    /// Score `derived` against a Level III message, using the message's own
-    /// codec and gate spacing. `None` when the message carries no radial
-    /// packet.
-    ///
-    /// The 360 × 230 azimuth-major contract is carried by [`PolarGrid`], which
-    /// is the only way to build the argument — it is no longer a sentence in
-    /// this comment that nothing enforces.
+    /// Score `derived` against a Level III message, using the message's own codec and
+    /// gate spacing.
     pub fn tally_against_l3(
         derived: PolarGrid<'_>,
         msg: &Level3Message,
@@ -340,23 +233,6 @@ pub mod compare {
 
     /// The packet's own gate levels on the 360° × 230 km comparison grid,
     /// `None` where the packet has no gate for a cell.
-    ///
-    /// Levels, not values: what [`tally_packet`] compares is the level, so
-    /// the resampling has to stop short of the codec — a rate product's
-    /// tolerance-based harness decodes them itself.
-    ///
-    /// Resampling, cell for cell of the derived grid:
-    ///
-    /// * **azimuth** through a tenth-of-a-degree table of which packet radial
-    ///   covers each 0.1° (the [`crate::srm`] resampler's mapping), read at
-    ///   the cell centre `az + 0.5°`, so radials that do not start on whole
-    ///   degrees land correctly;
-    /// * **range** by taking, per 1-km cell, the packet gate whose centre
-    ///   [`RadialPacket::gate_range_km`] reports falls nearest the cell
-    ///   centre — both sides' first-bin offsets honoured, sub-kilometre
-    ///   products represented by their centre gate.
-    ///
-    /// The domain is always ≤ 230 km: packet gates beyond it are ignored.
     pub fn resample_packet_levels(packet: &RadialPacket, l3_gate_km: f64) -> Vec<Vec<Option<u16>>> {
         // Which packet radial covers each tenth of a degree; later radials
         // overwrite earlier ones, as in the SRM resampler.
@@ -409,15 +285,6 @@ pub mod compare {
 
     /// The lower-level entry point: explicit packet, gate spacing and codec,
     /// scoring the derived grid against [`resample_packet_levels`].
-    ///
-    /// Both sides are the full 360 × [`RANGE_BINS`] domain and neither walk is
-    /// capped: the derived side because [`PolarGrid`] cannot be built any other
-    /// shape, the reference side because [`resample_packet_levels`] builds its
-    /// own grid from those two constants whatever the packet's radial count and
-    /// gate spacing are (pinned by
-    /// `the_reference_side_is_always_the_full_domain`). So `compared` counts
-    /// over a domain fixed in advance, not over however many cells the caller
-    /// happened to supply.
     pub fn tally_packet(
         derived: PolarGrid<'_>,
         packet: &RadialPacket,
@@ -426,12 +293,8 @@ pub mod compare {
         kind: ProductKind,
     ) -> Tally {
         let levels = resample_packet_levels(packet, l3_gate_km);
-        // The reference side is the full domain for every packet, by the same
-        // two constants `PolarGrid` holds the derived side to. Asserted rather
-        // than assumed because the walk below reads the two together, and a
-        // short *reference* would shrink `compared` exactly the way a short
-        // derived grid used to — the defect this commit closes, arriving from
-        // the other side.
+        // The reference side is the full domain for every packet, by the same two
+        // constants `PolarGrid` holds the derived side to.
         assert_eq!(
             levels.len(),
             PolarGrid::AZIMUTHS,
@@ -527,15 +390,11 @@ mod tests {
         vec![vec![f32::NAN; 230]; 360]
     }
 
-    /// The tests' own way onto the comparison lattice. A fixture that is not
-    /// 360 × 230 is a bug in the test, so it panics here rather than
-    /// producing a score — which is the whole change these tests exercise.
+    /// The tests' own way onto the comparison lattice.
     fn grid(rows: &[Vec<f32>]) -> PolarGrid<'_> {
         PolarGrid::new(rows).expect("test fixture is a 360 × 230 grid")
     }
 
-    /// A derived grid decoding exactly what the packet encodes scores 100%
-    /// exact with no presence disagreement.
     #[test]
     fn a_perfect_derivation_scores_exact_everywhere() {
         let p = packet(360, 230, 0, 1.0, |az, r| ((az + r) % 200 + 20) as u16);
@@ -555,7 +414,6 @@ mod tests {
         assert!(t.confusion.is_empty(), "numeric products fill no matrix");
     }
 
-    /// One level off everywhere: 0% exact, 100% within one.
     #[test]
     fn a_one_level_shift_is_within_one_but_never_exact() {
         let p = packet(360, 230, 0, 1.0, |_, _| 100);
@@ -578,22 +436,16 @@ mod tests {
         assert_eq!(t.within_two, 0, "three levels is outside every band");
     }
 
-    /// Levels 0 and 1 are undefined on the Level III side; a derived value
-    /// there is a presence disagreement, as is a defined Level III gate under
-    /// a derived NaN.
     #[test]
     fn presence_disagreements_count_cells_defined_on_exactly_one_side() {
-        // Radial 0: level 0 (undefined). Radial 1: level 100 (defined).
         let p = packet(360, 230, 0, 1.0, |az, _| if az == 0 { 0 } else { 100 });
         let mut derived = empty_grid();
-        // Derived defined on radials 0 and 1 only.
         for az in [0usize, 1] {
             for v in derived[az].iter_mut() {
                 *v = (100.0 - OFFSET) / SCALE;
             }
         }
         let t = tally_packet(grid(&derived), &p, 1.0, &codec(), ProductKind::Numeric);
-        // az 0: derived-only (230 cells). az 1: both. az 2..: L3-only.
         assert_eq!(t.compared, 230);
         assert_eq!(t.exact, 230);
         assert_eq!(t.presence_disagreements, 230 + 358 * 230);
@@ -607,12 +459,8 @@ mod tests {
         );
     }
 
-    /// Half-degree radials: the cell centre at az + 0.5° must land in the
-    /// *second* of the two runs covering the degree, since it starts there.
     #[test]
     fn sub_degree_radials_resolve_through_the_tenth_degree_table() {
-        // 720 radials, 0.5° wide. Runs 2k and 2k+1 cover degree k; the cell
-        // centre k + 0.5° belongs to run 2k+1. Encode run parity in the level.
         let p = packet(720, 230, 0, 1.0, |i, _| if i % 2 == 0 { 100 } else { 110 });
         let mut derived = empty_grid();
         for row in derived.iter_mut() {
@@ -627,9 +475,6 @@ mod tests {
         );
     }
 
-    /// Both first-bin offsets shift the range mapping: packet gate j sits at
-    /// (first_range_bin + j + 0.5) km, so with first_range_bin = 2 the cell
-    /// at 5 km reads gate 3.
     #[test]
     fn the_range_mapping_honours_the_packets_first_bin_offset() {
         let p = packet(360, 10, 2, 1.0, |_, j| 100 + j as u16);
@@ -649,13 +494,8 @@ mod tests {
         assert_eq!(t.presence_disagreements, 0);
     }
 
-    /// A 0.25-km product: each 1-km cell is represented by the sub-gate
-    /// nearest its centre, and gates beyond 230 km never enter the domain.
     #[test]
     fn quarter_km_gates_resample_to_the_cell_centre_and_stop_at_230() {
-        // 4 gates/km out to 250 km. Level = 20 + km, on every sub-gate of
-        // that km, so any in-cell choice reads the right level — what is
-        // pinned is the mapping, plus the domain cut at 230.
         let p = packet(360, 1000, 0, 4.0, |_, j| 20 + (j / 4) as u16);
         let mut derived = empty_grid();
         for row in derived.iter_mut() {
@@ -668,7 +508,6 @@ mod tests {
         assert_eq!(t.exact, t.compared);
     }
 
-    /// Class products fill the confusion matrix; the level stats still count.
     #[test]
     fn class_products_get_a_confusion_matrix() {
         // L3 says class 60 everywhere; the derivation says 60 on even
@@ -688,49 +527,8 @@ mod tests {
         assert_eq!(t.exact, 180 * 230);
     }
 
-    // ---- AUDIT DEMONSTRATIONS (campaign/oracle-round2), REFUTED ---------
-    //
-    // These arrived as *demonstrations*: each built a mis-shaped grid and
-    // asserted the flattering number the old walk produced for it. Their
-    // premises — the grids — are preserved below cell for cell, and each
-    // one's original assertions are quoted verbatim in its doc comment.
-    //
-    // They cannot pass as written under a correct scorer, and they never
-    // failed: on `main` before this commit both PASSED, because what they
-    // assert *is* the old behaviour. A grid that scores 100% while missing
-    // 359 of its 360 rows is the defect; a fix that keeps that assertion
-    // true is not a fix. So each has been turned into its own refutation —
-    // same fixture, same name, the expectation inverted from "this is what
-    // it scores" to "this is refused, and here is which dimension was
-    // wrong". The unchanged demonstration remains in this branch's parent
-    // commit as the record of the old behaviour.
-
-    /// AUDIT, REFUTED: a grid that is *physically short* is now refused by
-    /// [`PolarGrid::new`] naming the dimension, instead of scoring a perfect
-    /// 100% exact and 0% presence disagreement off a shrunken denominator.
-    ///
-    /// The demonstration this replaces asserted, on the same three fixtures:
-    ///
-    /// ```text
-    /// assert_eq!(t.compared, 230, "only the row that exists was compared");
-    /// assert_eq!(t.exact_pct(), 100.0, "a 1/360-height grid scores perfect");
-    /// assert_eq!(t.presence_disagreement_pct(), 0.0, …);
-    /// assert_eq!(t.l3_defined, 230, "the reference's other 359 rows vanished");
-    /// assert_eq!(t.exact_pct(), 100.0, "a 1-bin-wide grid scores perfect");
-    /// assert_eq!(t.exact_pct(), 0.0, "0/max(1) reads 0%, not 100%");
-    /// ```
-    ///
-    /// Every one of those was true, and none of them can be reached now:
-    /// there is no `Tally` to interrogate, because there is no scoring call
-    /// to make. Contrast
-    /// `presence_disagreements_count_cells_defined_on_exactly_one_side`: a
-    /// full-height grid whose rows are `NaN` is still correctly penalised.
-    /// The difference between "360 rows, 359 of them NaN" (0.28% of the
-    /// union) and "1 row" is no longer invisible — it is the difference
-    /// between a score and a refusal.
     #[test]
     fn audit_a_short_grid_scores_perfect() {
-        // One single row, agreeing exactly. 359 rows simply absent.
         let derived: Vec<Vec<f32>> = vec![
             (0..230)
                 .map(|r| ((r % 200 + 20) as f32 - OFFSET) / SCALE)
@@ -743,7 +541,6 @@ mod tests {
             "a 1/360-height grid is refused, not scored perfect",
         );
 
-        // The same holds for a short *row*: 1 bin of 230.
         let narrow: Vec<Vec<f32>> = (0..360)
             .map(|az| vec![((az % 200 + 20) as f32 - OFFSET) / SCALE])
             .collect();
@@ -753,8 +550,6 @@ mod tests {
             "a 1-bin-wide grid is refused, and the row is named",
         );
 
-        // A ragged grid — full height, one short row at 200 — is refused
-        // too. Nothing about the old walk would have noticed this one.
         let mut ragged = vec![vec![f32::NAN; 230]; 360];
         ragged[200].truncate(229);
         assert_eq!(
@@ -766,8 +561,6 @@ mod tests {
             "one short row of 360 is refused, and it is named",
         );
 
-        // And the degenerate case: an empty grid was 0/0 and read as 0%.
-        // It is now refused for what it is — no rows at all.
         assert_eq!(
             PolarGrid::new(&[]).unwrap_err(),
             GridShape::Azimuths { found: 0 },
@@ -775,24 +568,6 @@ mod tests {
         );
     }
 
-    /// AUDIT, REFUTED: a *tall* grid is no longer truncated to its first 360
-    /// rows and scored against azimuths it does not correspond to — it is
-    /// refused, naming 720.
-    ///
-    /// The demonstration this replaces built the same *correct* 720-row
-    /// half-degree derivation and asserted:
-    ///
-    /// ```text
-    /// assert_eq!(t.compared, 360 * 230, "only half the grid was even read");
-    /// assert_eq!(t.exact, 230, "1 of 360 scored rows landed on its own azimuth");
-    /// assert!(t.exact_pct() < 1.0, "a *correct* 720-row derivation scores {:.2}%", …);
-    /// ```
-    ///
-    /// This is the case that defeats the obvious defence: `compared` came
-    /// back at 82,800 — the full domain, exactly what a healthy score looks
-    /// like — while every cell was mis-registered by a factor of two in
-    /// azimuth, so the 0.28% would have been read as a catastrophic
-    /// *algorithm* failure with nothing to distinguish it from one.
     #[test]
     fn audit_a_720_row_grid_is_scored_against_the_wrong_azimuths() {
         // A 720-row half-degree grid that is *correct*: row i is azimuth
@@ -808,8 +583,6 @@ mod tests {
         );
     }
 
-    /// The refusals say which dimension was wrong and what it actually was —
-    /// the whole point of returning [`GridShape`] rather than asserting.
     #[test]
     fn a_refusal_names_the_dimension_and_the_count() {
         assert_eq!(
@@ -822,12 +595,6 @@ mod tests {
         );
     }
 
-    /// The reference side needs no such view: [`resample_packet_levels`]
-    /// builds the full domain from the two constants whatever the packet
-    /// carries, so `tally_packet`'s uncapped walk cannot index past it.
-    ///
-    /// Not circular — the packets here are deliberately *unlike* the domain:
-    /// 720 radials, and 1832 gates at a quarter of the grid's spacing.
     #[test]
     fn the_reference_side_is_always_the_full_domain() {
         for (radials, gates, gate_km) in [(720, 1832, 0.25), (360, 230, 1.0), (1, 4, 4.0)] {
@@ -841,8 +608,6 @@ mod tests {
         }
     }
 
-    /// The codec round trip and its undefined levels, through the public
-    /// surface the example uses.
     #[test]
     fn the_scaled_codec_decodes_and_encodes_symmetrically() {
         let c = codec();
@@ -859,9 +624,6 @@ mod tests {
         assert_eq!(lut.encode(9.0), 3);
     }
 
-    /// Product 135 selects the EET mask/scale/offset LUT — its thresholds
-    /// are `[127, 1, 2, 128]`, not floats, and decoding them as the scaled
-    /// fallback painted every bin 2 kft high and topped bins as 130–199 kft.
     #[test]
     fn for_message_selects_the_eet_lut_for_product_135() {
         use nexrad_level3::model::{
@@ -905,11 +667,6 @@ mod tests {
         assert_eq!(codec.decode(199), 69.0);
         assert!(codec.decode(100).is_nan(), "outside the encodable band");
     }
-
-    // The volume stamp conversion is asserted where it now lives, beside the
-    // pairing that reads it: `level3::the_volume_stamp_reads_day_one_as_the_epoch`
-    // makes the same three claims (MJD 20661 → 2026-07-26 01:58:28, day 1 is the
-    // epoch, day 0 is `None`) against the one implementation.
 
     /// A PDB carrying only the fields the twin pairing reads.
     fn pdb_with_volume(date: u16, time: u32) -> nexrad_level3::model::ProductDescriptionBlock {

@@ -1,132 +1,63 @@
 //! The phone shell's bottom cluster: the bottom bar, and the bottom sheet
 //! every panel and dialog presents in below the Compact breakpoint.
-//!
-//! # The sheet is a projection, not a state machine
-//!
-//! There is no "current sheet page" field anywhere. [`Gui::top_sheet_page`]
-//! *derives* the visible page from the same shared flags the desktop shell
-//! reads — `selected_overlays`, `time_dialog.show`, `catalog_open`,
-//! `menu_open`, `insp_open`, `drawer_open` — so a desktop modal and a phone
-//! sheet page are literally one state observed through two presentations
-//! (plan §3.4). Opening the inspector opens the Inspector page; a map tap
-//! that selects a feature opens the Feature page; `dismiss_top_layer` pops
-//! pages because it pops flags. The only state this module owns is *how the
-//! sheet sits*: its snap extent and the drag in flight.
-//!
-//! The priority order is fixed (Feature → Time → Catalog → Menu → Inspector
-//! → Layers): the dialogs outrank the panels because they are the more
-//! recently asked-for thing wherever both are open, and the Menu sits
-//! between because its commands open the dialogs above it and its host — the
-//! bottom bar — sits beside the panels below it.
-//!
-//! # The bodies are the desktop's bodies
-//!
-//! The Layers and Inspector pages do not re-render their content under sheet
-//! ids: the page positions the *same* `egui::Area`s — `layers_panel`,
-//! `inspector_panel` — inside the sheet's body rect, so every widget id,
-//! scroll offset and combo state is byte-identical either side of the 600 pt
-//! breakpoint (the id doctrine in `ui_shell.rs`;
-//! `crossing_a_breakpoint_does_not_move_any_widget_id` pins the hardest
-//! case). The Menu page is `render_menu_drawer` over the one menu model, the
-//! Catalog, Time and Feature pages are the same body functions the modal
-//! hosts call — the sheet supplies chrome, never content.
-//!
-//! # Layering
-//!
-//! The scrim, the sheet and the hosted body areas are all
-//! `Order::Foreground`, chained with [`egui::Context::set_sublayer`] every
-//! frame — scrim → sheet → body — which is egui's own device for "these
-//! surfaces stack as one": the children are spliced directly above their
-//! parent whatever the sticky area order remembers, so a session that
-//! showed the layers panel before the scrim ever existed cannot leave the
-//! scrim on top of it. Nothing calls `move_to_top` here: newly-visible
-//! areas rise on their own, and a per-frame raise would pin the cluster
-//! above the combo popups the inspector's own body opens. The scrim covers
-//! only what the sheet leaves uncovered above it, so the bottom bar — the
-//! way between pages — stays clickable beside the open sheet.
 
 use crate::actions::GuiAction;
 
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, ui_menu};
 
-/// The error toast's inset from the map's top edge — the old bar inset,
-/// which the bar itself no longer keeps: the second user test's direction is
-/// a **full-bleed** bottom bar, touching the left, right and bottom edges.
 const TOAST_INSET: f32 = 8.0;
 
-/// The sheet's clearance from the map's *top* edge. The gap between the
-/// sheet's bottom and the bar died with the bar's insets (the same user
-/// direction): the sheet sits flush on the bar.
+/// The sheet's clearance from the map's *top* edge; it sits flush on the bar.
 const SHEET_TOP_GAP: f32 = 8.0;
 
-/// Inside padding of a bar item, each side.
 const BAR_ITEM_PADDING: egui::Vec2 = egui::vec2(10.0, 4.0);
-/// Vertical gap between a bar item's icon and its label.
 const BAR_ITEM_GAP: f32 = 2.0;
 
 /// The sheet's two snap heights, as fractions of the map (plan §1.13).
 const SHEET_HALF_FRACTION: f32 = 0.5;
 const SHEET_FULL_FRACTION: f32 = 0.93;
 
-/// A release below this fraction of the Half height dismisses the sheet —
-/// "drag-down past ~25% below Half" in the plan's words.
+/// A release below this fraction of the Half height dismisses the sheet.
 const SHEET_DISMISS_FRACTION: f32 = 0.75;
 
-/// The floor a mid-drag sheet cannot shrink under: enough to keep the handle
-/// and the title on screen until the release decides what the drag meant.
+/// The floor a mid-drag sheet cannot shrink under: handle and title stay on screen.
 const MIN_SHEET_HEIGHT: f32 = 96.0;
 
-/// The Layers page's own floor: its header carries the Panes/Pane segments
-/// row the phone top bar does not (plan §1.3), and a sheet small enough to
-/// cut that row off is a sheet that hid the pane controls (the second user
-/// test). Handle + title + segments + separator + margins, with slack.
+/// The Layers page's own floor: handle + title + segments + separator +
+/// margins, with slack.
 const LAYERS_MIN_SHEET_HEIGHT: f32 = 148.0;
 
-/// The drag handle's hit strip, and the painted bar inside it.
 const HANDLE_HEIGHT: f32 = 16.0;
 const HANDLE_BAR: egui::Vec2 = egui::vec2(40.0, 4.0);
 
-/// The inset the hosted body areas keep from the sheet's sides.
 const BODY_INSET: f32 = 8.0;
 
-/// What the catalog body's own header (title + search + separator) costs
-/// above its scroll, when the sheet is the host.
+/// What the catalog body's own header costs above its scroll in the sheet.
 const CATALOG_HEADER_ALLOWANCE: f32 = 48.0;
 
-/// The scrim's fill — the same alpha egui's `Modal` dims its backdrop with,
-/// so the two presentations of "a dialog is open" read the same.
+/// The scrim's fill — the same alpha egui's `Modal` dims its backdrop with.
 const SCRIM_COLOR: egui::Color32 = egui::Color32::from_black_alpha(100);
 
-/// The bottom bar's four page items, icon above label (the demo's vertical
-/// stack, per the second user test). The Layers glyph matches the top
-/// bar's toggle and the Pane glyph is a carried 2×2 grid — the demo's `▤`
-/// and `▦` have no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
+/// The bottom bar's four page items, icon above label. The demo's `▤` and
+/// `▦` have no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
 const MENU_ITEM: (&str, &str) = ("\u{2630}", "Menu");
 const LAYERS_ITEM: (&str, &str) = ("\u{25a3}", "Layers");
 const PANE_ITEM: (&str, &str) = ("\u{229e}", "Pane");
 const APP_ITEM: (&str, &str) = ("\u{2699}", "App");
 
-/// The close button's glyph — the same × the inspector's deselect uses.
 const CLOSE_LABEL: &str = "\u{d7}";
 
-/// One drawn bottom-bar item: the whole click target, and where its icon
-/// and label landed (the icon-above-label pin reads them).
 struct BarItemDraw {
     response: egui::Response,
-    /// Read by the icon-above-label pin's probe only.
     #[cfg_attr(not(test), allow(dead_code))]
     icon: egui::Rect,
-    /// See [`Self::icon`].
     #[cfg_attr(not(test), allow(dead_code))]
     label: egui::Rect,
 }
 
-/// A bar item: icon above label, one click target (plan §1.13 as revised by
-/// the second user test — the demo's vertical stack). Painted rather than a
-/// `selectable_label`, because a label lays its text on one line; the
-/// selected and hovered fills are the stock selectable visuals, so the item
-/// reads exactly like the row it replaces.
+/// A bar item: icon above label, one click target (plan §1.13). Painted
+/// rather than a `selectable_label`, which lays its text on one line.
 fn bar_item(ui: &mut egui::Ui, selected: bool, (icon, label): (&str, &str)) -> BarItemDraw {
     let icon_font = egui::TextStyle::Button.resolve(ui.style());
     let label_font = egui::TextStyle::Small.resolve(ui.style());
@@ -183,54 +114,35 @@ fn bar_item(ui: &mut egui::Ui, selected: bool, (icon, label): (&str, &str)) -> B
     }
 }
 
-/// Which page the sheet is showing — derived, never stored. See the module
-/// note: this is a reading of the shared open-surface flags, in the fixed
-/// priority order.
+/// Which page the sheet is showing — derived, never stored: a reading of the
+/// shared open-surface flags, in a fixed priority order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SheetPage {
-    /// A map feature's details (`selected_overlays` non-empty).
     Feature,
-    /// The Set Time dialog (`time_dialog.show`).
     Time,
-    /// The Add-layer catalog (`catalog_open`).
     Catalog,
-    /// The app menu (`menu_open` — the phone's own flag; the ☰ dropdown is
-    /// desktop and tablet chrome).
     Menu,
-    /// The inspector (`insp_open`), whichever of its three bodies is
-    /// selected.
     Inspector,
-    /// The layer stack (`drawer_open` — Compact has no persistent sidebar,
-    /// so the drawer flag is the stack's open flag here).
     Layers,
 }
 
-/// The sheet's snap position. Session-only, like every open-surface flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SheetExtent {
-    /// About half the map.
     Half,
-    /// Nearly all of it.
     Full,
 }
 
-/// What the bottom bar drew last frame, as it was drawn. Reported by the
-/// renderer, never rebuilt by a test — see `ui_menu::DrawnMenuLeaf` for the
-/// pattern. Each item carries the highlight state it was drawn showing.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BottomBarProbe {
-    /// The floating bar's whole rect, off its own response.
     pub rect: egui::Rect,
     pub menu: (egui::Rect, bool),
     pub layers: (egui::Rect, bool),
     pub pane: (egui::Rect, bool),
     pub app: (egui::Rect, bool),
-    /// Each item's icon and label rects as painted, bar order
-    /// [menu, layers, pane, app] — the icon-above-label pin's read side.
     pub icon_label: [(egui::Rect, egui::Rect); 4],
     /// The Live/timestamp chip, and whether the inline transport was
-    /// expanded when it drew. [`egui::Rect::NOTHING`] when the bar had no
+    /// expanded when it drew. [`egui::Rect::NOTHING`] when the bar had no room.
     /// room for it — the chip hides rather than overlap the items.
     pub live_chip: (egui::Rect, bool),
 }
@@ -250,22 +162,14 @@ impl Default for BottomBarProbe {
     }
 }
 
-/// What the sheet drew last frame.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SheetProbe {
-    /// The sheet area's whole rect.
     pub rect: egui::Rect,
-    /// The page that was on screen — `None` while the sheet was closed.
     pub page: Option<SheetPage>,
-    /// The title row's text, verbatim.
     pub title: String,
-    /// The × close button — clears every page flag.
     pub close: egui::Rect,
-    /// The drag handle's hit strip.
     pub handle: egui::Rect,
-    /// The extent the sheet drew at — Full is forced while the Catalog page
-    /// is up, whatever the stored snap says.
     pub extent: SheetExtent,
 }
 
@@ -284,21 +188,16 @@ impl Default for SheetProbe {
 }
 
 /// What the phone error toast drew last frame — `None` while no toast was on
-/// screen: no error set, or a wider width hosting the error in the status
+/// screen.
 /// bar's slot instead.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ErrorToastProbe {
-    /// The toast area's whole rect.
     pub rect: egui::Rect,
-    /// The × that clears the error — the status bar's own dismiss.
     pub close: egui::Rect,
 }
 
 impl super::Gui {
-    /// The page the sheet is showing, derived from the shared open-surface
-    /// flags — the projection the module note describes. `None` means the
-    /// sheet is closed.
     pub(crate) fn top_sheet_page(&self) -> Option<SheetPage> {
         if !self.overlays.selected_overlays.is_empty() {
             return Some(SheetPage::Feature);
@@ -322,12 +221,7 @@ impl super::Gui {
     }
 
     /// Clear every page flag — what the × and a drag-down dismissal mean:
-    /// the whole sheet goes, not one page. The inspector's selection resets
-    /// on the same terms as `dismiss_top_layer`'s inspector arm: this is a
-    /// dismissal, and what was backed out of should not lie in wait.
-    ///
-    /// `pub(super)` for the phone top bar's arm toggles, which close the
-    /// sheet on arming exactly as the Menu page's own arm entries do.
+    /// the whole sheet goes, not one page.
     pub(super) fn clear_sheet_pages(&mut self) {
         self.overlays.selected_overlays.clear();
         self.overlays.selected_overlay_page = 0;
@@ -339,9 +233,6 @@ impl super::Gui {
         self.drawer_open = false;
     }
 
-    /// Close the three dialog pages that outrank every bottom-bar target —
-    /// the shared first step of switching pages: without it a tap on Layers
-    /// under an open catalog would set a flag the projection never shows.
     fn clear_sheet_dialogs(&mut self) {
         self.overlays.selected_overlays.clear();
         self.overlays.selected_overlay_page = 0;
@@ -349,11 +240,9 @@ impl super::Gui {
         self.catalog_open = false;
     }
 
-    /// A bar item's switch step: the dialogs above and every *other* bar
-    /// page yield, so the bar's four pages are mutually exclusive (contract
-    /// 64 as revised — no stacking from the bar). The inspector's selection
-    /// is left alone: a switch is not a dismissal, and the crumb keeps what
-    /// it was about for the next open.
+    /// A bar item's switch step: the dialogs above and every *other* bar page
+    /// yield, so the bar's four pages are mutually exclusive. The inspector's
+    /// selection is left alone: a switch is not a dismissal.
     fn switch_to_bar_page(&mut self) {
         self.clear_sheet_dialogs();
         self.menu_open = false;
@@ -363,25 +252,12 @@ impl super::Gui {
 
     /// The floating bottom bar (plan §1.13). Returns the bar's top edge, so
     /// the inline timeline and the sheet can sit above it.
-    ///
-    /// Toggle semantics (revised by the second user test — contract 64):
-    /// tapping a different item **switches** to its page, clearing every
-    /// other bar page's flag — the bar never stacks its own pages, so a
-    /// close cannot fall through to a page the user left minutes ago — and
-    /// tapping the item of the page currently shown **closes the sheet
-    /// entirely**. The dialog pages (Feature, Time, Catalog) still stack
-    /// above by their own routes; only the four bar pages are exclusive.
-    /// The Pane and App items are both the Inspector page and differ only in
-    /// the selection they assert, so "same item" for them means "same body".
     pub(super) fn render_bottom_bar(&mut self, ctx: &egui::Context, map_rect: egui::Rect) -> f32 {
         #[cfg(test)]
         let mut probe = BottomBarProbe::default();
 
         // The fade (§1.8): the phone bottom cluster fades with the rest of
-        // the floating chrome. Fully faded it does not render at all; the
-        // returned "top" is the map's bottom edge, and nothing anchored on it
-        // renders either (the inline transport and the sheet are gated on the
-        // same fade, and the sheet's pages are closed while faded).
+        // the floating chrome. Fully faded it does not render at all.
         let Some(fade) = self.chrome_fade() else {
             #[cfg(test)]
             {
@@ -391,9 +267,6 @@ impl super::Gui {
         };
 
         let page = self.top_sheet_page();
-        // Full-bleed (the second user test's direction): the bar spans the
-        // whole width and touches the bottom edge — no insets, no gap, and
-        // square bottom corners; the stock rounding stays on top only.
         let mut frame = super::shell::chrome_frame(&ctx.global_style());
         frame.corner_radius.sw = 0;
         frame.corner_radius.se = 0;
@@ -409,15 +282,6 @@ impl super::Gui {
                     super::fade::dim(ui, fade);
                     ui.set_width(inner_width);
                     ui.horizontal(|ui| {
-                        // The items first, fixed-size, left to right; the
-                        // chip takes the right edge only if the items left
-                        // it room — it hides rather than overlap them (the
-                        // second user test's bleed-through screenshot).
-                        //
-                        // Each item: a tap on the page already shown closes
-                        // the sheet whole (`clear_sheet_pages`); a tap on
-                        // anything else switches, through the exclusive
-                        // step (`switch_to_bar_page`) — contract 64.
                         let on = page == Some(SheetPage::Menu);
                         let item = bar_item(ui, on, MENU_ITEM);
                         #[cfg(test)]
@@ -484,9 +348,6 @@ impl super::Gui {
                             }
                         }
 
-                        // The Live/timestamp chip, right-aligned in what is
-                        // left — or absent when even its own width does not
-                        // fit there.
                         let expanded = !self.timeline_collapsed;
                         let live = self.panes[self.active_pane].viewing_live;
                         let chip_text = if live {
@@ -540,12 +401,6 @@ impl super::Gui {
 
     /// The sheet: scrim, frame, handle, title row, and whichever page the
     /// projection says is on top.
-    ///
-    /// Runs from [`Gui::ui`](super::Gui::ui) after the pane loop and the
-    /// pending appliers, so the Layers and Inspector pages may open their
-    /// take window here on the same terms the shell's pass has on the wider
-    /// widths — and the Catalog page's apply paths, which take panes
-    /// themselves, run with no window already open.
     pub(super) fn render_phone_sheet(
         &mut self,
         ctx: &egui::Context,
@@ -556,7 +411,6 @@ impl super::Gui {
         // The rise and fall (§3.3): the open state animates, and the fall
         // keeps rendering the page the flags just closed — remembered in
         // `sheet_last_page`, dead to input — until the slide is off screen.
-        // Under test the factor snaps and only real pages ever render.
         let open = self.top_sheet_page();
         let open_factor = ctx.animate_bool_with_time(
             egui::Id::new("sheet_open"),
@@ -572,13 +426,9 @@ impl super::Gui {
         } else {
             None
         }) else {
-            // No page, no drag: a gesture cannot outlive the surface it was
-            // adjusting.
             self.sheet_drag = None;
             return;
         };
-        // The fade closes the pages; the falling remnant then dims with the
-        // rest of the chrome, and fully faded nothing renders at all.
         let Some(fade) = self.chrome_fade() else {
             self.sheet_drag = None;
             return;
@@ -587,8 +437,7 @@ impl super::Gui {
             self.sheet_drag = None;
         }
 
-        // Flush on the bar — the gap died with the bar's insets (the second
-        // user test's direction).
+        // Flush on the bar — the gap died with the bar's insets.
         let sheet_bottom = bar_top;
         // The Layers page's floor covers its segments header too — a sheet
         // that cannot cut the pane controls off however far it is dragged.
@@ -600,9 +449,8 @@ impl super::Gui {
         let avail = (sheet_bottom - map_rect.top() - SHEET_TOP_GAP).max(min_height);
         let half = (map_rect.height() * SHEET_HALF_FRACTION).min(avail);
         let full = (map_rect.height() * SHEET_FULL_FRACTION).min(avail);
-        // The catalog is a full-height page (plan §1.10): its groups are the
-        // longest list the sheet hosts, and a half sheet would be a search
-        // box with two tiles under it.
+        // The catalog is a full-height page (plan §1.10): a half sheet would
+        // be a search box with two tiles under it.
         let extent = if page == SheetPage::Catalog {
             SheetExtent::Full
         } else {
@@ -619,19 +467,14 @@ impl super::Gui {
             egui::pos2(map_rect.right(), sheet_bottom),
         );
         // The slide itself: at factor zero the surface has travelled its own
-        // height down past the bottom edge (it stops rendering there); in
-        // between, the whole cluster — scrim rect and hosted body included —
+        // height down past the bottom edge; in between the whole cluster
         // follows this one rect.
         let sheet_rect = sheet_rect.translate(egui::vec2(0.0, (1.0 - open_factor) * height));
 
         // The scrim, over what the sheet leaves uncovered above it — not
-        // over the bottom bar, which is the way between pages (§1.13). With
-        // the sheet flush on the full-bleed bar (the second user test's
-        // direction) the cluster is sealed: no bare-map sliver remains below
-        // the scrim for a tap to slip through while a page is open —
-        // contract 61b pins the geometry. Dismissal on Compact stays
-        // projection-first (`dismiss_top_layer`) regardless, because flags
-        // can still stack out of the bar's order through a resize.
+        // over the bottom bar, which is the way between pages (§1.13). The
+        // cluster is sealed: no bare-map sliver for a tap to slip through.
+        // Dismissal on Compact stays projection-first (`dismiss_top_layer`).
         let scrim_rect =
             egui::Rect::from_min_max(map_rect.min, egui::pos2(map_rect.right(), sheet_rect.top()));
         // A falling scrim thins with the slide and takes no clicks: the
@@ -695,8 +538,7 @@ impl super::Gui {
         };
         // Everything the frame adds around the content: margins *and* the
         // stroke, which egui 0.35 lays outside the inner margin — without it
-        // the sheet overhangs the map by a stroke width each side, and the
-        // full-bleed contract is exact containment.
+        // the sheet overhangs the map by a stroke width each side.
         let margin = frame.inner_margin.sum()
             + frame.outer_margin.sum()
             + egui::vec2(2.0, 2.0) * frame.stroke.width;
@@ -717,8 +559,6 @@ impl super::Gui {
                     ui.set_width(sheet_rect.width() - margin.x);
                     ui.set_min_height(height - margin.y);
 
-                    // The drag handle: the whole strip is the hit target,
-                    // the painted bar just names it.
                     let (handle_rect, handle) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), HANDLE_HEIGHT),
                         egui::Sense::drag(),
@@ -745,7 +585,6 @@ impl super::Gui {
                         self.sheet_drag = None;
                     }
 
-                    // Title row: page title, × clears every page flag.
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let close = ui.button(CLOSE_LABEL).on_hover_text("Close the sheet");
@@ -775,9 +614,7 @@ impl super::Gui {
 
                     // The phone-only Panes/Pane header (plan §1.3): the
                     // phone top bar has no segments, so the Layers page
-                    // carries them — the top bar's own renderer, rules
-                    // included (the active-pane row hides while there is one
-                    // pane).
+                    // carries them — the top bar's own renderer.
                     if page == SheetPage::Layers {
                         ui.horizontal(|ui| self.render_pane_segments(ui, true));
                     }
@@ -828,14 +665,8 @@ impl super::Gui {
                             // A deliberate exception to the id doctrine, with
                             // `catalog_search`/`catalog_scroll` (see
                             // `render_catalog_body`): the salt is stable, but
-                            // the parent layer is the pager window above
-                            // 600 pt and this sheet below it, so the id
-                            // resolves differently either side and egui-side
-                            // scroll state does not carry across the
-                            // breakpoint. Gui-side state (the selection, the
-                            // page index) does. Contract 14's probed set
-                            // (`widget_id_probes`) excludes all three on
-                            // purpose.
+                            // the parent layer differs either side of 600 pt, so
+                            // egui-side scroll state does not carry across it.
                             egui::ScrollArea::vertical()
                                 .scroll_source(super::shell::panel_scroll_source())
                                 .id_salt("sheet_feature_scroll")
@@ -892,9 +723,7 @@ impl super::Gui {
     /// The Menu page: the whole menu model as the drawer list — woken from
     /// its dormancy for exactly this host. Commands close the sheet (the
     /// thing they opened is what the user wants to see); toggles keep it up,
-    /// the dropdown's own reasoning — flipping two of them must not be three
-    /// opens — except the armed draw, which closes it because the next thing
-    /// the user does is a drag on the map the sheet is covering.
+    /// except the armed draw, which closes it for the drag that follows.
     fn render_sheet_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -933,11 +762,6 @@ impl super::Gui {
     /// Snap the released sheet to Full, Half, or gone — the release decides
     /// what the drag meant; a "gone" release falls through the sheet's own
     /// close animation like every other dismissal.
-    ///
-    /// `forced_full` is the Catalog page: it draws at Full whatever the
-    /// stored snap says, so a release there can still mean "dismiss" but
-    /// must not write the forced extent over the snap the user chose — the
-    /// pages that honour it get it back untouched.
     fn sheet_snap(&mut self, released_height: f32, half: f32, full: f32, forced_full: bool) {
         if released_height < half * SHEET_DISMISS_FRACTION {
             self.clear_sheet_pages();
@@ -953,22 +777,7 @@ impl super::Gui {
 
     /// The phone's error surface: a small banner under the top bar, with the
     /// status bar's own dismissable body. The phone shell has no status bar
-    /// to host the error slot, and an error a phone user cannot see is the
-    /// worst of the options.
-    ///
-    /// Also the wide widths' error surface **while faded** (`Gui::ui`): the
-    /// status bar that normally hosts the error fades with the chrome, and
-    /// the error outranks the fade — the deliberate §1.8 refinement recorded
-    /// in `ui_fade.rs`. One area id at every width, per the id contract.
-    ///
-    /// `carries` is whether this toast is the error's presenter right now —
-    /// always on the phone, only while faded on the wide widths, where the
-    /// status bar otherwise hosts the error. Passed rather than gated at the
-    /// call site so the rise and fall below tick every frame: the toast
-    /// fades in and out like every other surface (§3.3), and the fall keeps
-    /// rendering the message the state just dropped — remembered in
-    /// `toast_last_error`, dead to input (`fade::dim`) — until it is gone.
-    /// Under test the factor snaps and only a carried, live error renders.
+    /// to host the error slot.
     pub(super) fn render_phone_error_toast(
         &mut self,
         ctx: &egui::Context,
@@ -991,9 +800,8 @@ impl super::Gui {
             return;
         }
         // What the banner shows: the live message, or the fall's remembered
-        // one. The remnant copy is what `render_error_display` mutates on the
-        // (unreachable — the ui is disabled) dismiss, so the real state is
-        // only ever written back from its own live copy.
+        // one — the remnant copy is what `render_error_display` mutates.
+        // dismiss, so the real state is only ever written back from its live copy.
         let mut shown = if present {
             self.radar.error_message.clone()
         } else {
@@ -1002,15 +810,10 @@ impl super::Gui {
         // `Order::Tooltip`, so the toast reads over the sheet cluster: the
         // scrim, sheet and hosted bodies are all `Order::Foreground`, and an
         // error banner under a scrim is an error the user can neither see
-        // nor dismiss. A higher order rather than a splice into the scrim →
-        // sheet → body sublayer chain, because the chain only exists while a
-        // page is open — the toast must outrank it whether or not there is
-        // one — and rather than a per-frame `move_to_top` at Foreground,
-        // which would pin the toast above the combo popups the sheet bodies
-        // open (the hazard the module's layering note avoids). Tooltip is
-        // egui's shelf for transient surfaces that read over whatever sits
-        // beneath, which is exactly what a toast is, and nothing else in the
-        // phone shell lives on it to be shadowed.
+        // nor dismiss. A higher order rather than a splice into the chain,
+        // which only exists while a page is open, and rather than a per-frame
+        // `move_to_top` at Foreground, which would pin the toast above the
+        // combo popups the sheet bodies open.
         let area = egui::Area::new(egui::Id::new("phone_error_toast"))
             .order(egui::Order::Tooltip)
             .pivot(egui::Align2::CENTER_TOP)

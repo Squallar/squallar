@@ -2,17 +2,8 @@ use super::*;
 
 /// Which sites a Level II load spends four S3 requests on, and which it does
 /// not.
-///
-/// The rows that carry the decision are `TPIT` and the two that bracket it.
-/// `TJUA` is the one site a naive `T` prefix gets wrong — San Juan's WSR-88D,
-/// which has an RPG like any other — and an id in no row of the resolved table
-/// keeps fetching, because an unrecognised four-letter id is far likelier to be
-/// a WSR-88D this build's table predates than a TDWR.
 #[test]
 fn only_a_site_with_an_rpg_behind_it_fetches_level3_objects() {
-    // The rows the gate reads. There is no compiled-in table under them —
-    // see `rustdar_radar::sites::SiteTable` — so a test that did not place
-    // them would find `ZZZZ`'s "not in the table" answer for every row.
     crate::test_sites::install();
     for (site, offers, why) in [
         (
@@ -42,19 +33,6 @@ fn only_a_site_with_an_rpg_behind_it_fetches_level3_objects() {
 }
 
 /// The gate skips the four object fetches and **not** the sounding above them.
-///
-/// A source probe for the same reason the completed-volume probe in
-/// `app_chunks` is one: `spawn_level3_fetches` reaches the network through
-/// `spawn_async_task` and leaves nothing on `App` to assert against, so the only
-/// thing that can be checked without a live bucket is where the `return` sits.
-///
-/// Its position is the whole correctness of the change. The two spawns want
-/// opposite answers for a TDWR: the objects are not generated for it, but the
-/// 0 °C / −20 °C environmental heights are what PoSH and MEHS integrate the
-/// local reflectivity volume against, and those two are among the eight
-/// products a TDWR *does* offer. A gate placed one block earlier would mute
-/// them at every TDWR — silently, since the hail pair returns `None` on missing
-/// heights exactly as it does on a volume with no echo.
 #[test]
 fn the_gate_skips_the_objects_and_leaves_the_sounding_alone() {
     let source = include_str!("../app_fetch.rs");
@@ -92,22 +70,11 @@ fn the_gate_skips_the_objects_and_leaves_the_sounding_alone() {
         gate < objects,
         "the object loop runs before the gate, which is the same as no gate",
     );
-    // The melting layer sits on the *other* side of the gate from the
-    // sounding, and deliberately so: it is a Level III object, published by an
-    // RPG, and a TDWR's Supplemental Product Generator makes none. Outside the
-    // gate it would be a fifth doomed request per scan load and per poll at
-    // every TDWR — the exact cost this gate was added to remove.
     assert!(
         gate < melting_layer,
         "the melting-layer fetch runs before the RPG gate, so a TDWR asks S3 \
              for an N0M its SPG never generates",
     );
-    // The storm motion vector is the melting layer's twin in every respect
-    // that matters here: a Level III object, published by an RPG, fetched once
-    // per volume. `N0S` is a *storm-relative velocity* product, and an SPG
-    // generates no storm-relative products at all — SCIT does not run there —
-    // so outside the gate it would be a sixth doomed request per scan load and
-    // per poll at every TDWR.
     assert!(
         gate < storm_motion,
         "the storm-motion fetch runs before the RPG gate, so a TDWR asks S3 \

@@ -1,23 +1,5 @@
 //! Gates the shape of the single-copy wgpu guard in `src/lib.rs`. The guard's
 //! own `on_unimplemented` notes say what it is for.
-//!
-//! It is inert code nothing references, and edits exist that leave it compiling
-//! while it asserts nothing — dropping the leading `::` is the one to know
-//! about, since bare `wgpu::` in the boundary crate rides the `egui_wgpu::wgpu` re-export, per its
-//! top of the file. So: parse `lib.rs`, resolve the two types it compares, and
-//! check they are different crates. Parsing rather than scanning is what makes
-//! decoys in comments and string literals inert; matching on structure rather
-//! than on the aliases' names is what keeps renames and side-swaps passing.
-//!
-//! The second test here closes the hole the first one's *premise* leaves open.
-//! `guard_compares_two_different_crates` proves `lib.rs` compares this crate's
-//! `wgpu` against egui-wgpu's — and that is the whole check, for the whole
-//! crate. It says nothing about any *other* file, and any other file naming
-//! `::wgpu` reaches the direct dependency rather than the re-export. Today they
-//! resolve to the same package, so such a file compiles and behaves identically;
-//! the day they do not, it renders through a copy this crate's backend features
-//! never configured, with the guard still passing. See
-//! `every_wgpu_path_outside_the_guard_goes_through_egui_wgpu`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::HashMap;
@@ -201,12 +183,6 @@ fn guard_compares_two_different_crates() {
 }
 
 /// Whether a syntax tree names `::wgpu` — the direct dependency, `::`-rooted.
-///
-/// Two node kinds reach it and they are not the same shape: ordinary paths in
-/// type and expression position are `syn::Path`, while `use ::wgpu::…;` is an
-/// `ItemUse` whose leading `::` sits beside a `UseTree` rather than inside a
-/// path. Visiting only the first misses the import that would make every later
-/// `wgpu::` in the file mean the direct dependency.
 #[derive(Default)]
 struct RootedWgpuPaths(Vec<String>);
 
@@ -258,21 +234,6 @@ fn source_files(dir: &FsPath, into: &mut Vec<PathBuf>) {
 }
 
 /// `lib.rs` must be the only file in this crate that names `::wgpu`.
-///
-/// The guard above establishes that *one* pair of paths in *one* file resolves
-/// to two different crates. That is the entire single-copy check, and its blast
-/// radius is that file. A second wgpu-touching module writing `::wgpu::Whatever`
-/// compiles today only because the direct dependency and egui-wgpu's re-export
-/// currently resolve to the same package — and on the day a bump splits them,
-/// that module renders through a copy whose backend features nobody set, while
-/// `guard_compares_two_different_crates` keeps passing. The failure has no
-/// compiler diagnostic and no runtime error; it is `request_adapter` returning
-/// nothing, or a texture that never appears.
-///
-/// So the rule is: reach wgpu through `egui_wgpu::wgpu`, everywhere except the
-/// guard itself. `lib.rs` is exempt because naming the direct dependency is
-/// precisely what it is for — that is what keeps `cargo machete` and `cargo
-/// udeps` from reporting the manifest entry as dead.
 #[test]
 fn every_wgpu_path_outside_the_guard_goes_through_egui_wgpu() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");

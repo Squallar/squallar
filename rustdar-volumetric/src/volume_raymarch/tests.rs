@@ -1,16 +1,6 @@
 use super::*;
 
 /// [`VOLUME_SHADER_WGSL`] with its comments removed.
-///
-/// Every "the shader must NOT contain X" assertion runs against this rather
-/// than the raw source, because the comments in `volume.wgsl` deliberately
-/// name the things the shader must not do — `textureNumLevels`,
-/// `dt * length(box_size_km)` — so that a reader learns why. Scanning the
-/// raw text would make those explanations trip their own guards, and the
-/// fix a hurried reader would reach for is deleting the explanation.
-///
-/// `//` to end of line is the only comment form `volume.wgsl` uses, and
-/// WGSL has no string literals for a `//` to hide inside.
 fn shader_code() -> String {
     VOLUME_SHADER_WGSL
         .lines()
@@ -20,10 +10,6 @@ fn shader_code() -> String {
 }
 
 /// The comment-stripper actually strips something, and keeps the code.
-///
-/// Without this, a `shader_code` that returned an empty string would make
-/// every absence assertion below pass vacuously — which is the failure mode
-/// of every scan-based test and the reason they need a control.
 #[test]
 fn the_comment_stripper_removes_prose_and_keeps_code() {
     let code = shader_code();
@@ -45,11 +31,6 @@ fn the_comment_stripper_removes_prose_and_keeps_code() {
 }
 
 /// The quad is 48 bytes of `vec2<f32>`, and it covers all of clip space.
-///
-/// The size is the claim the module doc makes; the coverage is the claim
-/// the blit's viewport trick rests on. A quad that covered only part of
-/// clip space would blit a fraction of the offscreen into the whole pane,
-/// which reads as a zoomed-in volume rather than as a broken quad.
 #[test]
 fn the_quad_is_forty_eight_bytes_covering_all_of_clip_space() {
     assert_eq!(QUAD_BYTES, 48);
@@ -75,11 +56,6 @@ fn the_quad_is_forty_eight_bytes_covering_all_of_clip_space() {
 }
 
 /// The two triangles [`QUAD_CORNERS`] describes, in draw order.
-///
-/// A test helper rather than production code: nothing that draws needs the
-/// quad grouped into triangles, but a coverage assertion has to talk about
-/// triangles — a quad that names all four corners can still fail to tile
-/// the rectangle.
 fn quad_triangles() -> [[[f32; 2]; 3]; 2] {
     [
         [QUAD_CORNERS[0], QUAD_CORNERS[1], QUAD_CORNERS[2]],
@@ -89,20 +65,6 @@ fn quad_triangles() -> [[[f32; 2]; 3]; 2] {
 
 /// The two triangles tile clip space exactly once, with no gap and no
 /// overlap.
-///
-/// Added after a mutation survived the test above. `QUAD_CORNERS` has six
-/// negative components; deleting the minus from **four** of them leaves all
-/// four clip-space corners present and the bounding box unchanged, so every
-/// assertion up there still passes — while turning the pair into two
-/// triangles that both cover the upper half and leave a quadrant of the
-/// volume simply not drawn. (The other two are vertex 0's, and the corner
-/// check does catch those, because removing either loses `[-1, -1]`
-/// entirely.) Corner presence is not coverage, so assert coverage: this
-/// test catches all six.
-///
-/// Sampled at points chosen to miss every edge: the shared diagonal is
-/// `x + y = 0`, and `-1.88 + 0.19 * (i + j)` is zero only at a
-/// non-integer `i + j`.
 #[test]
 fn the_two_triangles_tile_clip_space_exactly_once() {
     /// Which side of the directed line `a -> b` the point falls on.
@@ -155,12 +117,6 @@ fn the_quad_packs_its_corners_in_draw_order() {
 }
 
 /// sRGB targets get the decoding blit and non-sRGB ones the pass-through.
-///
-/// This is the whole of bug #2's mitigation on the Rust side, and both arms are
-/// reachable — `rustdar_gpu::device::preferred_surface_format` prefers a non-sRGB format
-/// on wasm32 and prefers `Bgra8Unorm` natively, taking `capabilities.formats[0]`
-/// only as a fallback, so an sRGB surface is the rare case rather than the
-/// routine native one.
 #[test]
 fn the_blit_entry_point_follows_the_surfaces_srgb_ness() {
     for format in [
@@ -188,24 +144,6 @@ fn the_blit_entry_point_follows_the_surfaces_srgb_ness() {
 
 /// A mirror holds gamma-encoded texels exactly when its format is **not**
 /// sRGB, over every format the swapchain can actually be.
-///
-/// The companion to the blit test above, and for the same reason: the mirror is
-/// drawn by the very pipeline whose entry point that test pins, so the two
-/// answers have to be the same fact read from the two ends. What this adds is
-/// that the fact is a property of *sRGB-ness*, not of a particular format.
-///
-/// Without it the predicate's only coverage is a fixture precondition inside an
-/// `#[ignore]`d GPU test, which exercises one arm at one format. Two mutations
-/// that would survive that and die here:
-///
-///  * dropping the negation (`format.is_srgb()`), which inverts every arm;
-///  * narrowing to one format (`format != TextureFormat::Rgba8UnormSrgb`),
-///    which is *correct* for `MIRROR_FORMAT` and for the fixture's own arm, and
-///    wrong for a `Bgra8UnormSrgb` swapchain — the one an adapter without
-///    `Bgra8Unorm` actually lands on.
-///
-/// The failure mode either way is a floor a little too dark or too light beside
-/// a 2D pane that looks right, with no validation error to notice it by.
 #[test]
 fn a_mirror_is_gamma_encoded_exactly_when_its_format_is_not_srgb() {
     for format in [
@@ -241,10 +179,6 @@ fn a_mirror_is_gamma_encoded_exactly_when_its_format_is_not_srgb() {
 }
 
 /// The offscreen is not itself an sRGB format.
-///
-/// It holds bytes the raymarch has already encoded. An `Rgba8UnormSrgb`
-/// target would have the hardware decode them on the way out, undoing that
-/// encode — and the result is plausible, merely washed out.
 #[test]
 fn the_offscreen_format_is_not_srgb() {
     assert!(!OFFSCREEN_FORMAT.is_srgb());
@@ -252,15 +186,6 @@ fn the_offscreen_format_is_not_srgb() {
 }
 
 /// The blend state is egui's, component for component.
-///
-/// Written out rather than compared against a copy: `egui_wgpu` does not
-/// export the value, so the only thing that can be pinned locally is the
-/// literal. The measurement that actually proves the match is
-/// `the_blit_matches_egui_exactly_on_both_surface_formats`, which needs a
-/// GPU and is `#[ignore]`d for it — so on a default `cargo test` run this
-/// literal is pinned and the match it stands for is not.
-/// The alpha component is the half worth staring at — `OneMinusDstAlpha`
-/// and `One`, not the `OneMinusSrcAlpha` symmetry invites.
 #[test]
 fn the_blend_state_is_the_one_egui_uses() {
     assert_eq!(EGUI_BLEND.color.src_factor, wgpu::BlendFactor::One);
@@ -278,12 +203,6 @@ fn the_blend_state_is_the_one_egui_uses() {
 }
 
 /// Every entry point this file names exists in the WGSL, and vice versa.
-///
-/// Both directions are load-bearing. A name here that the shader does not
-/// declare is a pipeline that fails to create, from a call with no `Result`.
-/// A name in the shader that is missing from [`ENTRY_POINTS`] is worse: it
-/// is an entry point that ships to a browser having never been translated
-/// to GLSL by `tests/volume_shader.rs`.
 #[test]
 fn the_entry_point_list_is_exactly_what_the_shader_declares() {
     for (name, stage) in ENTRY_POINTS {
@@ -321,11 +240,6 @@ fn the_entry_point_list_is_exactly_what_the_shader_declares() {
 }
 
 /// The shader binds exactly the group-0 slots this file declares.
-///
-/// A binding number that drifts between the WGSL and the bind group layout
-/// is a validation error at pipeline creation — from `create_render_pipeline`,
-/// which returns no `Result`, so it arrives asynchronously through the
-/// uncaptured-error sink instead.
 #[test]
 fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
     for (group, binding, name) in [
@@ -360,11 +274,6 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
 }
 
 /// The shader's tile mask and the tile's edge are the same number.
-///
-/// WGSL cannot read a Rust constant, so `JITTER_TILE_MASK` is a literal and
-/// this is the only thing keeping it honest. It is a *mask*, so it is the edge
-/// minus one — and the edge has to stay a power of two for that to be the same
-/// operation as a wrap at all, which is the second half of what this checks.
 #[test]
 fn the_shader_and_the_blue_noise_tile_agree() {
     assert!(
@@ -382,17 +291,6 @@ fn the_shader_and_the_blue_noise_tile_agree() {
 }
 
 /// One sampler per **sampled** texture, in each pipeline, as naga requires.
-///
-/// `Error::ImageMultipleSamplers` is a real naga error, not a convention:
-/// a texture sampled through two samplers in one entry point does not
-/// translate to GLSL at all, because GLSL's `sampler3D` fuses the two.
-///
-/// The counts are deliberately unequal. `jitter_texture` is read with
-/// `textureLoad` and has no sampler at all, which the naga rule does not reach
-/// — it is about textures that are *sampled*. So the assertion below is not
-/// "five textures, four samplers" on its own, which a genuinely mismatched
-/// pair could also satisfy; it is that the one unsampled texture is exactly
-/// the one that is supposed to be unsampled.
 #[test]
 fn each_sampled_texture_has_exactly_one_sampler() {
     let code = shader_code();
@@ -405,10 +303,8 @@ fn each_sampled_texture_has_exactly_one_sampler() {
              naga refuses a texture sampled through two samplers in one entry \
              point"
     );
-    // The unsampled one is the jitter tile, and it is unsampled *because* it
-    // is loaded. Both halves are checked: a `textureSample` of it would be a
-    // texture with no sampler, and a `textureLoad` appearing anywhere else
-    // would mean some other texture had quietly lost its sampler.
+    // The unsampled one is the jitter tile, and it is unsampled *because* it is
+    // loaded.
     assert!(
         code.contains("textureLoad(jitter_texture"),
         "nothing loads `jitter_texture`; it is the texture that carries no sampler, so if it \
@@ -424,11 +320,6 @@ fn each_sampled_texture_has_exactly_one_sampler() {
 }
 
 /// The shader samples with an explicit level everywhere.
-///
-/// Implicit-LOD sampling under the march's data-dependent break is
-/// `FunctionError::NonUniformControlFlow` — a hard validator failure on
-/// every target, not a driver quirk. `textureSample` compiles in a shader
-/// with no branching, so this is exactly the edit that would pass review.
 #[test]
 fn every_sample_gives_an_explicit_level() {
     let implicit = shader_code().matches("textureSample(").count();
@@ -442,10 +333,6 @@ fn every_sample_gives_an_explicit_level() {
 }
 
 /// `textureNumLevels` appears nowhere.
-///
-/// naga gates it on GLSL core 130 with no ES version at all, so it is
-/// unreachable on WebGL2 forever — and the failure would be at translation
-/// time on the browser only, i.e. on the target CI covers least.
 #[test]
 fn the_shader_never_asks_how_many_mip_levels_there_are() {
     assert!(
@@ -456,14 +343,6 @@ fn the_shader_never_asks_how_many_mip_levels_there_are() {
 }
 
 /// The step ceiling is a `const`, so it folds to a literal in the loop.
-///
-/// The ceiling is the loop bound — a naga requirement, since the *real*
-/// termination is the data-dependent break at the box exit, and a
-/// non-constant bound plus that break is exactly the shape WebGL2 drivers
-/// refuse. The step length itself arrives per frame in `flags.z`, so
-/// there is deliberately no `(span.y - span.x) / STEPS` here to pin — the
-/// dt *floor* against the ceiling is pinned instead, because deleting it
-/// would truncate any span that outruns the ceiling mid-box.
 #[test]
 fn the_step_count_is_a_constant_the_loop_bound_names() {
     assert!(
@@ -483,11 +362,9 @@ fn the_step_count_is_a_constant_the_loop_bound_names() {
         shader_code().contains("volume.flags.z / cells_per_t"),
         "the march no longer takes its step from the uniform's step lane"
     );
-    // The host-side restatements, against the same literals rather than
-    // against the constants themselves — pinning a constant to itself is
-    // the mistake `every_lane_lands_at_its_std140_offset` documents. The
-    // step-cells half now pins the *uniform default*, which is what the
-    // silhouette harness's mirror marches at.
+    // The host-side restatements, against the same literals rather than against
+    // the constants themselves — pinning a constant to itself is the mistake
+    // `every_lane_lands_at_its_std140_offset` documents.
     assert_eq!(
         (RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS),
         (1024, 1.0),
@@ -506,75 +383,6 @@ fn the_step_count_is_a_constant_the_loop_bound_names() {
 /// The hand-built mip is the plain box mean of BOTH channels — and that,
 /// under the shader's `R_bar / G_bar`, IS the occupancy-weighted mean of
 /// the index, with no special case anywhere.
-///
-/// This is the property the coverage channel bought. The previous version
-/// of this function excluded no-data zeros from the mean by hand, and it
-/// had to: index 0 is *no data*, not a measurement of zero, and averaging
-/// it in erased the Harvey eyewall at the default box's 1.8 km cells
-/// (-41% of >=50 dBZ pixels, -81% of >=30 dBZ). Premultiplied, a fine cell
-/// is `(c*x, c)`; the box mean is `(sum(c*x)/8, sum(c)/8)`; the ratio is
-/// `sum(c*x)/sum(c)`. So the exclusion is the arithmetic, not a branch —
-/// and the coarse texel *additionally* carries the block's occupancy,
-/// which the one-channel level had nowhere to put.
-///
-/// Five properties, each with a mutation it closes:
-///
-/// * A uniform fully-covered grid downsamples to itself — a stride error
-///   mixing neighbouring blocks cannot be seen on a uniform grid, so this
-///   is the control, not the test.
-/// * **A lone 255 among seven empties reconstructs to 255.** The
-///   data-honesty half: the coarse texel is `(1/8, 1/8)` — an eighth of
-///   each — and their ratio is 1, the lone cell's own value. The old
-///   full-cube mean landed at 32 and is what erased the core.
-/// * A mixed block reconstructs to its measured cells' own mean: 100 and
-///   105 among six empties store `(205/2040, 1/4)`, which reconstructs to
-///   their 102.5 rather than to the full-cube 25.6. The assertion is
-///   anchored on 102.5 — the contract — with the quantisation tolerance
-///   stated, not on whatever this implementation happens to produce.
-/// * **The quantisation bound.** Both channels round to the texel format
-///   before the shader divides, so the stored ratio is not the occupancy
-///   mean exactly. Binary16 rounds *relatively*, at half an ulp of an
-///   11-bit significand, and the coverage channel's `n/8` is exact in it —
-///   so the error is bounded by `2⁻¹¹ x 255` index units over every
-///   reachable `(n, Σx)`, wherever the block sits between empty and full.
-///   Pinning the derived bound rather than the sample keeps the test honest
-///   about which of the two numbers is the promise. Under the `Rg8Unorm`
-///   this format replaced the same bound was 4 index units, worst on the
-///   sparse blocks, and it broke the hull outright below index 4.
-///
-/// * The block that is averaged is the one under the coarse cell —
-///   checked with a value planted in a *different* block, which is what a
-///   transposed dimension order pushes into the wrong coarse cell.
-/// * An all-empty block stays `(0, 0)`: no data, and zero coverage, which
-///   is what keeps the shader's floored divisor from inventing an index.
-///
-/// # Every number here is the contract's, not the implementation's
-///
-/// `downsampled_grid` sums the grid's own index bytes as integers, where it
-/// used to sum eight already-rounded binary16 channels out of the widened
-/// level-0 plane. That is a different sequence of roundings, so an assertion
-/// pinning what one of them happened to emit would fail on the other while
-/// both were correct. Nothing here does: the reconstructed index is checked
-/// against the true mean of the block's measured cells to the stated
-/// tolerance, and the equalities that *are* exact — the coverage channel's
-/// `n/8`, an all-empty block's zeros, and a lone 255's eighth of full scale —
-/// are exact because binary16 represents them exactly, under either summing
-/// order.
-///
-/// The bound sweep goes through `downsampled_grid` itself, on a 2x2x2 grid —
-/// one coarse block, which is what the bound is about. It used to model the
-/// arithmetic inline instead, and a model can be right about a function that
-/// is wrong: the path this replaced summed eight *already rounded* channels,
-/// so what it really stored was `half(Σ half(x_i) / 8)` and it exceeded this
-/// very tolerance (0.142 index units against a 0.124 budget, measured over a
-/// desktop-shaped random plane) while the sweep beside it passed. Driving the
-/// production function over every reachable `(n, Σx)` closes that gap: with
-/// integer sums the block is fully described by those two numbers, so the
-/// 9,152 cases below are not a sample. (Not 16,320: that is eight `n` over the
-/// full `1..=2040`, before the `n..=` floor drops the sums too small for `n`
-/// cells of at least 1 and the `255 * n` cap drops the ones too large for `n`
-/// cells of at most 255. The sweep asserts its own count, so this number
-/// cannot drift from the loop again.)
 #[test]
 fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     /// One texel of a packed plane, as `(R, G)`, through the production
@@ -663,10 +471,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     );
 
     // The bound itself, over every reachable block, THROUGH `downsampled_grid`:
-    // what the shader really divides, against the true occupancy mean. A coarse
-    // block is `n` measured cells summing to `sum`, and integer summing makes
-    // those two numbers all of it — how the sum is spread over the cells cannot
-    // change the answer — so this sweep is exhaustive rather than sampled.
+    // what the shader really divides, against the true occupancy mean.
     let mut worst = 0.0f32;
     let mut worst_at = (0u32, 0u32);
     let mut cases = 0u32;
@@ -754,22 +559,6 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
 
 /// The premultiplied plane is the index and a binary coverage beside it —
 /// the texture's whole contract, in one place.
-///
-/// Coverage is `index != NO_DATA_INDEX` and nothing else, which is what
-/// licenses the wire format to carry one byte per cell:
-/// `rustdar_radar::voxel::ramp_index` clamps every finite measurement to
-/// `1..=255`, so the second channel is a function of the first and storing
-/// it would be redundancy rather than information.
-///
-/// The **precision** half is checked here too, and it is not decoration.
-/// `volume::VOLUME_TEXTURE_FORMAT` is a float format precisely so that the
-/// error on each channel scales with that channel's own value rather than
-/// with the format's full scale — the march divides `R̄` by `Ḡ`, so an
-/// absolute error becomes a `1/Ḡ` error in the palette index and the shell
-/// around every echo paints bands the data never held. Storing index 1 as
-/// `1/255` to a *relative* half-ulp is what that property looks like at the
-/// encoder, and the assertion below fails for every fixed-point channel
-/// width: an eight-bit one carries 1/255 to a relative 1/2, not 2⁻¹¹.
 #[test]
 fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
     /// Half an ulp of binary16's 11-bit significand, as a relative error.
@@ -806,9 +595,9 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
     }
     // The faintest measurable echo, called out because it is the value an
     // eight-bit channel loses first once the filter has weighted it: `1/255`
-    // scaled by any coverage under a half rounds to zero, the shell around
-    // the echo reconstructs to the no-data index, and the silhouette's reach
-    // starts reading the stored value again.
+    // scaled by any coverage under a half rounds to zero, the shell around the
+    // echo reconstructs to the no-data index, and the silhouette's reach starts
+    // reading the stored value again.
     let faintest = super::read_channel(plane, GRID_BYTES_PER_CELL as usize);
     assert!(
         faintest > 0.0 && (faintest * 255.0 - 1.0).abs() < 0.01,
@@ -820,19 +609,6 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
 
 /// The 256-entry texel table is the conversion it replaces, **byte for byte**,
 /// over the whole of its input domain.
-///
-/// `coverage_premultiplied_into` no longer calls `half::f16::from_f32` per cell;
-/// it
-/// gathers from [`super::coverage_texels`]. That is a speed change and it is
-/// only allowed to be a speed change — the plane the GPU is handed has to be
-/// the same 32 MiB it was before, not a rounding of it. The domain is one byte
-/// wide, so "over the whole input domain" is 256 cases and this test is
-/// exhaustive rather than a sample: there is no residual risk to argue about.
-///
-/// The right-hand side is written out as the arithmetic on purpose. Comparing
-/// the table against itself through `coverage_premultiplied_into` would pass
-/// with
-/// both halves wrong together, which is the failure mode a table introduces.
 #[test]
 fn the_texel_table_is_the_conversion_it_replaces() {
     let indices: Vec<u8> = (0..=255u8).collect();
@@ -857,48 +633,6 @@ fn the_texel_table_is_the_conversion_it_replaces() {
 
 /// A widening buffer carried across uploads gives the same plane a fresh one
 /// would — **including when a smaller grid follows a larger one**.
-///
-/// `coverage_premultiplied_into` reuses the caller's buffer and only ever grows
-/// it, which is what makes the upload cheap and is also the one thing that can
-/// make it wrong. After a 256 × 256 × 128 grid the buffer holds 32 MiB of that
-/// grid's texels; the 64 × 64 × 32 grid after it writes 512 KiB and leaves
-/// 31.5 MiB of the previous volume behind it. The contract that keeps that
-/// harmless is
-/// that the function hands back the **used prefix** and never the buffer, and
-/// this is where that is on the hook — the mistake it catches is returning
-/// `&out[..]`, or having the caller reach past the return value to the `Vec`.
-///
-/// Every case is checked against the same function on an *empty* buffer rather
-/// than against a second opinion about the encoding: what is being proved here
-/// is that pooling changed nothing, and `the_texel_table_is_the_conversion_it_
-/// replaces` above is what proves the encoding itself. The shapes include the
-/// odd and partial extents the upload accepts — `[7, 5, 3]` is not a shipped
-/// rung, but nothing in this function knows that.
-///
-/// # Why the order is not largest-first
-///
-/// It was, and that made the **grow** half of the contract unreachable: with
-/// the widest shape first, `out.len() < plane_bytes` is true on call one and
-/// never again, so `if out.capacity() < plane_bytes` and even `if
-/// out.is_empty()` pass the whole test. Neither is correct — the first because
-/// `Vec::resize` over-allocates, so capacity outruns length and a later grow is
-/// skipped while the buffer is still too short; the second because a session's
-/// first upload is simply not guaranteed to be its widest. Nothing makes it so:
-/// the extent follows the region box, and the mobile and wasm rungs ship
-/// narrower grids than the desktop one. A regression there panics on the frame
-/// thread, in `prepare`.
-///
-/// So the walk interleaves both directions. It grows from empty, grows from a
-/// **non-empty smaller** buffer, shrinks onto a tail, and grows again — and the
-/// `[64, 64, 48]` → `[128, 64, 32]` pair is placed deliberately: the first
-/// leaves `Vec`'s amortised doubling holding spare capacity, and the second
-/// asks for more than the length but less than that capacity, which is the one
-/// arrangement a `capacity()` test gets wrong.
-///
-/// The staleness is asserted to be **real**, not assumed: without the length
-/// check on the buffer this test would still pass on a version that shrank the
-/// buffer to fit, and would then be proving nothing about the case it is named
-/// for.
 #[test]
 fn a_reused_widening_buffer_is_the_plane_a_fresh_one_would_be() {
     let stride = GRID_BYTES_PER_CELL as usize;
@@ -962,28 +696,6 @@ fn a_reused_widening_buffer_is_the_plane_a_fresh_one_would_be() {
 }
 
 /// The step length puts the ray direction inside the `length`.
-///
-/// This is spike 0a's first bug and it is worth the source scan, because
-/// `dt * length(box_size_km)` compiles, reads plausibly, and on the
-/// 240 x 240 x 20 km box makes a vertical ray roughly twelve times more
-/// opaque per step than a horizontal one — which looks like haze.
-///
-/// `opacity_accumulates_per_kilometre_not_per_box_diagonal`, in
-/// `tests/volume_gpu.rs`, is the property test; this is the one that runs
-/// without a GPU. That one is `#[ignore]`d because it needs an adapter, so on
-/// a row without one this scan is the only cover the property has.
-///
-/// The anisotropy, in numbers, so a future reader who wants to simplify the
-/// shader can see what it costs: The wrong formula gives every direction
-/// the box's diagonal — 340 km on the 240 x 240 x 20 km box the volume
-/// actually uses — where the right one gives each axis-aligned ray that
-/// axis' own extent. A vertical step is therefore ~17x too long (340/20)
-/// and a horizontal one ~1.4x (340/240), leaving a vertical ray ~12x more
-/// opaque relative to a horizontal one — exactly the box's aspect ratio
-/// (240/20). Both figures are worth having: the absolute one says how far
-/// off a vertical ray is, and the relative one is why the result reads as
-/// haze rather than as a bug — the whole image gets denser together, so
-/// nothing looks inconsistent.
 #[test]
 fn the_step_length_scales_the_direction_not_just_the_box() {
     assert!(
@@ -1000,11 +712,6 @@ fn the_step_length_scales_the_direction_not_just_the_box() {
 }
 
 /// The sRGB blit decodes the premultiplied value, without un-premultiplying.
-///
-/// Spike 0a's second finding, and the counter-intuitive one: the principled
-/// version measured 60/255 off against egui's own `rect_filled`, and
-/// decoding the premultiplied value directly took the delta to 0. A future
-/// reader who "fixes" this is making the output wrong, so pin it.
 #[test]
 fn the_srgb_blit_decodes_the_premultiplied_value_directly() {
     let body = entry_point_body(ENTRY_FS_BLIT_LINEAR);
@@ -1036,9 +743,6 @@ fn the_non_srgb_blit_is_a_pass_through() {
 }
 
 /// The raymarch un-premultiplies before encoding and re-premultiplies after.
-///
-/// The other half of the colour rule, and the half that *is* principled:
-/// encoding an already-premultiplied value is wrong at every alpha but 1.
 #[test]
 fn the_raymarch_encodes_a_straight_colour_and_premultiplies_after() {
     let body = entry_point_body(ENTRY_FS_RAYMARCH);
@@ -1055,10 +759,6 @@ fn the_raymarch_encodes_a_straight_colour_and_premultiplies_after() {
 }
 
 /// The transfer functions are egui's, character for character.
-///
-/// Rewriting either — a different cutoff, a 2.2 exponent instead of 2.4 —
-/// produces output that is wrong by a few counts everywhere, which reads as
-/// a slightly different theme rather than as a bug.
 #[test]
 fn the_transfer_functions_match_eguis_own() {
     for line in [
@@ -1080,19 +780,6 @@ fn the_transfer_functions_match_eguis_own() {
 /// Grid byte counts — one byte per cell on the wire, four in the texture, and
 /// what the *device* reserves for those four — including the overflow the
 /// multiplication can hit.
-///
-/// The three figures are deliberately separate. `cell_count` is what
-/// `upload_refusal` measures the caller's index plane against; `grid_bytes`
-/// sizes the one-level upload; `grid_bytes_with_mips` is the allocation.
-/// Collapsing any two of them was how the coarse level came to be missing from
-/// the budget entirely, and then how the mip tail came to be missing from the
-/// eviction figure.
-///
-/// The allocation figures are the driver's own, read through
-/// `generate_allocator_report` on the adapter [`TEXTURE_TILE_TEXELS_X`] names.
-/// `the_charged_grid_bytes_are_never_under_what_the_device_reserved` in
-/// `tests/volume_gpu.rs` is what holds this arithmetic to a real allocation
-/// rather than to itself; it is `#[ignore]`d behind a real adapter.
 #[test]
 fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
     assert_eq!(cell_count([256, 256, 128]), Some(8 * 1024 * 1024));
@@ -1125,32 +812,6 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
 }
 
 /// **A second mip level buys the whole pyramid, and the count says so.**
-///
-/// The 601,600 B under-count this closes, stated as the property that was
-/// missing rather than as the number it produced: a two-level descriptor is
-/// laid out with every level down to 1×1×1, so the charge for one level has to
-/// be the charge for all of them. Swept on a real device, the allocation for a
-/// 256×256×128 grid is identical at `mip_level_count` 2 through 9 — see
-/// [`grid_bytes_at`]'s doc for the readings.
-///
-/// **On the device it was swept on.** lavapipe reserves each named level and
-/// nothing under it, so the pyramid is not what *it* lays out; the charge counts
-/// it anyway because it is the larger of the two layouts and this figure may
-/// only err upwards. Which layout a given backend uses is read off the device by
-/// `the_charged_grid_bytes_are_never_under_what_the_device_reserved`, which is
-/// `#[ignore]`d behind a real adapter — `cargo test -p rustdar-gpu --test
-/// volume_gpu -- --ignored` — while this test needs none and asserts the
-/// arithmetic alone.
-///
-/// An inequality against the packed two-level sum rather than a literal, so it
-/// holds for every shape: whatever the tiling does, the count may never be
-/// those two levels alone again. The upper bound is the other half — a full 3D
-/// pyramid is 8/7 of its base, so a count that had started charging for
-/// something else entirely would show here rather than passing for being big.
-/// **It is also where a growing over-charge is caught**: the GPU test above can
-/// only pin the surplus against whatever the device in front of it reserves, and
-/// on a backend that does not tile there is nothing there to bound the tile
-/// model with. This one runs on every target, with no adapter.
 #[test]
 fn a_second_mip_level_is_charged_as_the_whole_pyramid() {
     for cells in [
@@ -1178,25 +839,6 @@ fn a_second_mip_level_is_charged_as_the_whole_pyramid() {
 
 /// An omitted coarse level is one level in the descriptor — the allocation,
 /// not merely the write.
-///
-/// Skipping the `write_texture` alone would leave the 4 MiB resident and
-/// zeroed, which is the worse of both outcomes: the memory is still held, and
-/// a uniform that did ask for level 1 would march empty space instead of being
-/// clamped back to the raw field. `mip_level_count` is the thing that has to
-/// move.
-///
-/// What this asserts is [`grid_mip_levels`] — the expression the descriptor's
-/// `mip_level_count` is set from — on every shipped shape. It is deliberately
-/// not the same statement: the field itself is only observable through a
-/// `create_texture`, so a descriptor that had stopped reading this function
-/// would pass here. `an_omitted_coarse_level_marches_the_raw_field_at_the_
-/// cloud_rung` in `tests/volume_gpu.rs` is where the descriptor is on the
-/// hook, against a device, and it is the only thing standing under that half —
-/// and being `#[ignore]`d, it stands there only under `-- --ignored`.
-///
-/// The budget arithmetic deliberately does *not* follow: `grid_bytes_with_mips`
-/// is a ceiling and an eviction figure, and both want the level that may be
-/// there. See its doc.
 #[test]
 fn an_omitted_coarse_level_leaves_the_texture_with_one_level() {
     for cells in [[256, 256, 128], [192, 192, 96], [128, 128, 64]] {
@@ -1207,10 +849,7 @@ fn an_omitted_coarse_level_leaves_the_texture_with_one_level() {
             "the {cells:?} grid still allocates a coarse level nothing on \
              this device will sample",
         );
-        // What the saving is, on the shape it is largest. Not the coarse level
-        // alone: leaving it out of the descriptor takes the whole pyramid with
-        // it, which is why this is measured against `grid_bytes_at` rather
-        // than reconstructed from `coarse_cells`.
+        // What the saving is, on the shape it is largest.
         let with = grid_bytes_with_mips(cells).expect("a shipped shape fits");
         let without = grid_bytes_at(cells, CoarseLevel::Omitted).expect("a shipped shape fits");
         let raw = grid_bytes(cells).expect("a shipped shape fits");
@@ -1235,10 +874,6 @@ fn an_omitted_coarse_level_leaves_the_texture_with_one_level() {
 }
 
 /// An offscreen never has a zero axis, and a real size passes through.
-///
-/// Both halves: clamping unconditionally to 1 would be as wrong as not
-/// clamping at all, and `create_texture` — where this lands — returns no
-/// `Result` for either.
 #[test]
 fn an_offscreen_extent_is_clamped_up_from_zero_and_left_alone_otherwise() {
     assert_eq!(offscreen_extent([0, 0]), [1, 1]);
@@ -1248,10 +883,6 @@ fn an_offscreen_extent_is_clamped_up_from_zero_and_left_alone_otherwise() {
 }
 
 /// A held offscreen is rebuilt for a new size and kept for the same one.
-///
-/// The mistake this catches is the comparison inverted: a pane-sized
-/// texture reallocated on every frame is invisible in a screenshot and
-/// reads as a driver problem rather than as an application one.
 #[test]
 fn an_offscreen_is_rebuilt_only_when_its_size_changed() {
     assert!(
@@ -1272,11 +903,6 @@ fn an_offscreen_is_rebuilt_only_when_its_size_changed() {
 }
 
 /// An upload whose shapes disagree is refused, and one that agrees is not.
-///
-/// The three ways to get this wrong are all here: too few index bytes, too
-/// many, and a colour table of the wrong length. `write_texture` is a
-/// validation error for the first and **silently ignores the tail** for the
-/// second, which uploads a plausible volume shifted by a slice.
 #[test]
 fn an_upload_whose_shapes_disagree_is_refused() {
     let cells = [8u32, 8, 8];
@@ -1319,11 +945,6 @@ fn the_colour_tables_texture_is_as_wide_as_the_budget_pays_for() {
 }
 
 /// Every wgpu label this module writes is under the latch's prefix.
-///
-/// `install_error_latch` re-panics on any uncaptured error whose message
-/// does not carry `rustdar.volume`, under `debug_assertions`. So a resource
-/// created here without the prefix converts a survivable driver refusal
-/// into an abort — on the target where an abort is a dead browser tab.
 #[test]
 fn every_label_this_module_writes_carries_the_latch_prefix() {
     let source = include_str!("../volume_raymarch.rs");
@@ -1380,12 +1001,11 @@ fn entry_point_body(name: &str) -> &'static str {
     panic!("`{name}`'s body is not brace-balanced")
 }
 
-/// The budget-agreement proofs that bridge to this module's arithmetic —
-/// moved here from the floor crate's `constants::tests` at WO-RD. The
-/// resolver lives below the raymarch and must not call up into it, so every
-/// byte proof that reads [`resident_grid_bytes`]/[`grid_bytes_with_mips`]
-/// lives beside the arithmetic instead. They ride to rustdar-volumetric with
-/// this module at WO-RV.
+/// The budget-agreement proofs that bridge to this module's arithmetic — moved
+/// here from the floor crate's `constants::tests` at WO-RD. The resolver lives
+/// below the raymarch and must not call up into it, so every byte proof that
+/// reads [`resident_grid_bytes`]/[`grid_bytes_with_mips`] lives beside the
+/// arithmetic instead.
 mod budget_agreement {
     use crate::budget_arms::{SHIPPED_VOLUME_LOOP_FRAMES, arms, volume_bytes};
     use egui_wgpu::wgpu;
@@ -1395,10 +1015,6 @@ mod budget_agreement {
     };
 
     /// The limits a real adapter might report, which every sweep below runs.
-    ///
-    /// The guarantee, the two powers of two either side of it, the 704 an
-    /// unaligned reading of the desktop budget lands on, and a modern desktop's
-    /// own figure.
     const REPORTED_LIMITS: [u32; 5] = [256, 512, 704, 1024, 2048];
 
     /// The three budget triples, whatever this target's cascade selected.
@@ -1420,11 +1036,6 @@ mod budget_agreement {
     }
 
     /// The **3D volume** row of the loop table, executed.
-    ///
-    /// The third loop kind, and the one whose frames are resident inputs rather
-    /// than cached pictures — so this is a claim about GPU texture memory that is
-    /// actually enforced at runtime by `VolumeStore::enforce_budget`, unlike the
-    /// two rows above.
     #[test]
     fn volume_loop_grids_fit_the_application_texture_budget() {
         for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
@@ -1442,28 +1053,6 @@ mod budget_agreement {
     }
 
     /// **A full 3D loop leaves room for one live 3D grid beside it.**
-    ///
-    /// Fitting the set alone is not enough, and the ~1.5% of headroom desktop had
-    /// under it was not slack — it was a defect one ordinary layout away. A second
-    /// 3D pane showing a live volume is one more grid in the same
-    /// application-wide store, and `VolumeStore::enforce_budget` evicts **oldest
-    /// first**: the loop started first, so what goes is the loop's frame 0, not
-    /// the live grid that pushed the store over. The dispatcher then re-plans that
-    /// frame on the very next pass, rebuilds it (a frame-thread extraction and an
-    /// ~89 ms worker resample), and the store evicts frame 1 to make room. That is
-    /// a permanent rebuild treadmill with a hot CPU and a loop visibly missing a
-    /// frame as its only symptoms.
-    ///
-    /// So the frame count is chosen against `budget − one grid`, which
-    /// `the_3d_loop_holds_exactly_what_it_marches` computes. This is the same
-    /// claim stated as the property rather than as the formula, because it is the
-    /// property that is load-bearing: the formula could be changed to agree with a
-    /// wrong count and this would still fail.
-    ///
-    /// It bounds the *reachable* layouts rather than every conceivable one — a
-    /// third distinct live grid is over the line again, and the eviction's answer
-    /// there is the same. What it buys is that the common two-pane case never
-    /// reaches the eviction at all.
     #[test]
     fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
         for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
@@ -1483,36 +1072,14 @@ mod budget_agreement {
 
     /// A 3D loop holds exactly what it marches: the frame list **is** the resident
     /// set.
-    ///
-    /// The other two loop kinds hold `MAX_LOOP_FRAMES` and texture
-    /// `MAX_LOOP_RENDER_BUDGET` of them, re-rendering as the playhead walks back
-    /// into a window it had left. Re-entering a resident 3D window costs ~140 ms
-    /// against a 200 ms interval at `DEFAULT_LOOP_SPEED_FPS` and 33 ms at
-    /// `MAX_LOOP_SPEED_FPS`, so that treadmill does not close here.
-    ///
-    /// What this pins is that a 3D loop's count is *one* number rather than a held
-    /// count and a resident count that could drift apart — and that it is at or
-    /// under the budget the arm above just checked, with no second number in
-    /// between. The dispatcher reads `LoopAllocation::volume_frames` for both, and
-    /// `app_render::volume_loop_tests` drives it end to end.
     #[test]
     fn the_3d_loop_holds_exactly_what_it_marches() {
         for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
             assert!(frames >= 2, "{}: a one-frame loop is not a loop", arm.name,);
-            // The frame count is the tighter of two bounds, computed rather than
-            // restated, and it is an *equality* — a list shorter than both bounds
-            // allow is history thrown away for nothing, and a longer one is the
-            // treadmill this loop kind cannot afford.
-            //
-            //  * what the byte budget admits **beside one live grid**, which binds
-            //    desktop (14 of the 36 frames a plan-view loop may texture). The
-            //    subtracted grid is not padding: see
-            //    `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` for the
-            //    layout it is there for and what happens without it.
-            //  * `MAX_LOOP_RENDER_BUDGET`, which binds wasm32 and mobile — a 3D
-            //    loop is not licensed to hold *more* history than the plan-view
-            //    loop beside it on the same device just because its grids happen
-            //    to be small there.
+            // The frame count is the tighter of two bounds, computed rather
+            // than restated, and it is an *equality* — a list shorter than both
+            // bounds allow is history thrown away for nothing, and a longer one
+            // is the treadmill this loop kind cannot afford.
             let admits =
                 arm.volume_loop_bytes().saturating_sub(volume_bytes(&arm)) / volume_bytes(&arm);
             assert_eq!(
@@ -1548,21 +1115,6 @@ mod budget_agreement {
     /// The sibling of `the_budget_is_not_slack_enough_to_hide_a_doubling`, and for
     /// the same reason: a ceiling several times the real figure passes the check
     /// above while permitting any axis to be silently doubled.
-    ///
-    /// Doubling one axis is the realistic regression here, not doubling the whole
-    /// grid — and it is exactly what this catches, because doubling any single
-    /// axis doubles the total.
-    ///
-    /// **What it no longer covers, since the grid's shape became a runtime
-    /// answer.** `arm.grid_cells` is the *budget* triple now, not the shape the frontend
-    /// requests, so this is a claim about two constants: that the ceiling is snug
-    /// against the budget. It is still worth making — a loose ceiling is how a term
-    /// inside it doubles unnoticed — but the tripwire half, the one that would have
-    /// caught the Android build asking for 2.4× what it budgeted, has moved to
-    /// [`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`],
-    /// which sweeps what a device is actually asked for against what its arm was
-    /// sized at. Neither is redundant: this one binds the ceiling to the budget,
-    /// that one binds the request to the budget.
     #[test]
     fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
         for arm in arms() {
@@ -1579,25 +1131,6 @@ mod budget_agreement {
 
     /// **The shape the frontend requests never costs more than the budget it was
     /// computed against — on any device.**
-    ///
-    /// # What this replaces, and why it is stronger
-    ///
-    /// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` asserted that
-    /// each arm's ceiling was under twice what it bounds, so a silently doubled
-    /// grid axis could not hide inside the headroom. That test is the tripwire for
-    /// the shipped Android overrun — a build budgeting 192×192×96 while the radar
-    /// was asked for 256×256×128, 2.4× over — and it went **vacuous** the moment
-    /// the shape stopped being a constant: it compares two constants, and the thing
-    /// that can now be wrong is a *function of the device*.
-    ///
-    /// So it is re-expressed rather than deleted, against the property the whole
-    /// rebalance rests on: rearranging a budget's cells is free because there are
-    /// never more of them. For every arm and every limit an adapter might report,
-    /// what is requested must fit the budget every allocation was sized against —
-    /// in cells, and in the bytes those cells actually cost with the coarse level
-    /// beside them. That is stronger than the doubling test in two directions: it
-    /// catches any overrun rather than only a factor of two, and it catches one
-    /// that only appears on some devices.
     #[test]
     fn the_requested_shape_never_outgrows_the_budget_it_was_computed_against() {
         for (name, budget) in ALL_ARMS {
@@ -1628,15 +1161,6 @@ mod budget_agreement {
 
     /// `voxel::HORIZONTAL_AXIS_MULTIPLE` is the copy alignment expressed in cells,
     /// and this is the only crate that can say so.
-    ///
-    /// `rustdar-radar` rounds the grid's horizontal axis to 64 and documents why —
-    /// `copy_buffer_to_texture` holds every row to
-    /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`, and the staging ring's `PlaneLayout`
-    /// pads to it — but it has no `wgpu` to check the arithmetic against. This is
-    /// the binding, in the shape `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
-    /// already uses for the triples: a number in two crates, tied by name so a
-    /// drift fails here rather than as 6% of a permanently resident staging ring
-    /// spent on padding.
     #[test]
     fn the_horizontal_axis_multiple_is_the_copy_alignment_in_cells() {
         assert_eq!(
@@ -1652,14 +1176,6 @@ mod budget_agreement {
 
     /// `voxel::VERTICAL_AXIS_MULTIPLE` is the depth block a 3D texture is laid out
     /// in, and this is the only crate that can say so.
-    ///
-    /// The twin of the test above, and tied the same way: `rustdar-radar` rounds
-    /// the vertical down to 16 and documents why, but it has no texture arithmetic
-    /// to check itself against. The binding is deliberately made against the
-    /// *charging function* rather than against a second constant — what has to
-    /// stay true is that a vertical on the multiple costs what it asks for and one
-    /// off it costs a whole block more, which is a property a renamed or retuned
-    /// tile constant cannot quietly satisfy.
     #[test]
     fn the_vertical_axis_multiple_is_the_texture_depth_block() {
         use crate::raymarch::{CoarseLevel, grid_bytes, grid_bytes_at};
@@ -1693,12 +1209,12 @@ mod budget_agreement {
         assert_eq!(rustdar_radar::voxel::NZ_MIN % multiple, 0);
     }
 
-    /// The two grid-byte invariants the floor crate's `check_invariants` had
-    /// to give up at WO-RD — the byte figure is this module's arithmetic and
-    /// the resolver must not call up into it — swept at every promotion a
-    /// bracket can reach rather than only at the three shipped floors: the
-    /// wasm bracket's ceiling pairs the mobile grid with the wasm pool floor,
-    /// a pair no shipped arm exhibits.
+    /// The two grid-byte invariants the floor crate's `check_invariants` had to
+    /// give up at WO-RD — the byte figure is this module's arithmetic and the
+    /// resolver must not call up into it — swept at every promotion a bracket
+    /// can reach rather than only at the three shipped floors: the wasm
+    /// bracket's ceiling pairs the mobile grid with the wasm pool floor, a pair
+    /// no shipped arm exhibits.
     #[test]
     fn every_reachable_grid_fits_its_budgets_in_bytes() {
         use crate::budget_arms::shipped_profile;
@@ -1749,14 +1265,6 @@ mod budget_agreement {
     }
 
     /// A pixel costs what the offscreen's format actually costs.
-    ///
-    /// Tied to nothing until now: `OFFSCREEN_BYTES_PER_PIXEL` is a 4 in the
-    /// floor crate's `quality` module and `OFFSCREEN_FORMAT` is an
-    /// `Rgba8Unorm` here, and every budget figure over there is the product of
-    /// the two. Moving the format to sixteen bits a channel would leave every
-    /// budget test passing while under-counting the real allocation by half.
-    /// (Moved beside the format at WO-RD: the floor crate cannot name a wgpu
-    /// type.)
     #[test]
     fn a_pixel_costs_what_the_offscreen_format_costs() {
         use rustdar_device_profile::quality::OFFSCREEN_BYTES_PER_PIXEL;

@@ -1,20 +1,12 @@
-//! The crate's charter, held as tests: the facade's dependency discipline —
-//! a lean DEFAULT set for the vocabulary every consumer pays for, and named,
-//! feature-fenced allowances for the provider arms (WO-RL-3/RL-4, seam ruling
-//! 6: "everything between 'where am I' and the operating system"; amended in
-//! writing at RL-4 when the android/web arms came home and the parser dep
-//! became unconditional).
+//! The crate's charter, held as tests: a lean DEFAULT dependency set for the
+//! vocabulary every consumer pays for, and named, feature-fenced allowances for
+//! the provider arms.
 //!
-//! The helpers read `cargo metadata --no-deps --format-version 1` from the
-//! workspace root. `packages[].dependencies` there are *declared*
-//! dependencies — feature-independent and resolution-independent — so no
-//! feature selection (default, `--all-features`, CI's llvm-cov arm) can mask
-//! or fake what these assert. Dep-name mechanics, recorded at M0 and relied
-//! on here: a workspace-internal dep appears with `"req": "*"` and a `path`;
-//! `kind` is `null` for normal deps (normalised to "normal" below); one name
-//! may legitimately appear once per kind, so entries are judged per
-//! `(kind, name)` — plus, since WO-RL-3, the `optional` flag, which is what
-//! separates the lean default set from the fenced arms.
+//! The helpers read `cargo metadata --no-deps --format-version 1`, whose
+//! `packages[].dependencies` are *declared* — feature-independent and
+//! resolution-independent — so no feature selection can mask what these assert.
+//! A workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
+//! `null` for normal deps; entries are judged per `(kind, name, optional)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -43,11 +35,9 @@ fn metadata() -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("cargo metadata emits valid JSON")
 }
 
-/// `(kind, name, optional)` for every dependency `package` declares.
-/// `kind: null` is a normal dependency; target-gated entries carry their kind
-/// like any other and are included — a gated dependency is still a dependency.
-/// `optional: true` marks the feature-fenced arms: they are declared, judged
-/// here, and pulled only where a feature names them.
+/// `(kind, name, optional)` for every dependency `package` declares. `kind:
+/// null` is a normal dependency; target-gated entries are included, since a
+/// gated dependency is still one. `optional: true` marks the arms.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String, bool)> {
     let packages = meta["packages"]
         .as_array()
@@ -72,27 +62,17 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
         .collect()
 }
 
-/// The facade sits under every consumer of "where am I", so the DEFAULT cost
-/// of naming it must stay the vocabulary's lean set: the geo floor, the kv
-/// blob floor (the gate persists its memo through it — the whole reason WO-RK
-/// preceded this crate), time, logging and serde. Amended in writing at
-/// WO-RL-2 (the gate moved in) and WO-RL-3 (the crate became the facade; the
-/// provider arms below are OPTIONAL, so they never enter a default build).
-///
-/// The fenced set is the providers' own dependencies and nothing else: the
-/// OS arms' target-gated bindings behind `os-providers`, and the NMEA
-/// parser/transport behind `serial`. Every fenced entry must be `optional` —
-/// an arm dependency that stopped being optional would silently join the
-/// default cost of every vocabulary consumer.
+/// The facade sits under every consumer of "where am I", so the DEFAULT cost of
+/// naming it must stay the vocabulary's lean set: the geo floor, the kv blob
+/// floor, time, logging and serde. The fenced set is the providers' own
+/// dependencies and nothing else, and every fenced entry must be `optional` —
+/// one that stopped being optional would join that default cost.
 #[test]
 fn the_dependency_ceiling_holds() {
     const DEFAULT_NORMAL: &[&str] = &[
         "rustdar-geo",
         "rustdar-kv",
-        // The parser and SerialConfig only (its default is off workspace-wide;
-        // the transport and serialport stay behind the `serial` fence). Joined
-        // the default set at WO-RL-4: the facade's serial verbs name the
-        // config type.
+        // Parser and SerialConfig only; the transport stays behind the fence.
         "rustdar-nmea-serial",
         "chrono",
         "log",
@@ -145,8 +125,8 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares its named deps, so a
-    // broken parse or a renamed package cannot pass as an empty set.
+    // Falsifiability floor: a broken parse or a renamed package cannot pass as
+    // an empty set.
     assert!(
         deps.iter()
             .any(|(k, n, o)| k == "normal" && n == "rustdar-geo" && !o),
@@ -157,9 +137,7 @@ fn the_dependency_ceiling_holds() {
 }
 
 /// The two fences themselves: the `[features]` table maps each arm to exactly
-/// the optional dependencies the ceiling above allows, so a fenced dependency
-/// cannot quietly migrate out from behind its feature (or a feature grow an
-/// arm the charter never granted).
+/// the optional dependencies the ceiling above allows.
 #[test]
 fn the_feature_fences_map_the_arms() {
     let meta = metadata();
@@ -241,8 +219,8 @@ fn the_feature_fences_map_the_arms() {
          set",
     );
 
-    // No default feature: naming the facade must cost the lean set and
-    // nothing else, without consumers having to remember to opt out.
+    // No default feature: naming the facade must cost the lean set and nothing
+    // else, without consumers having to remember to opt out.
     assert!(
         features["default"].as_array().is_none_or(|d| d.is_empty()),
         "rustdar-location grew a default feature; the vocabulary's default \
@@ -251,10 +229,8 @@ fn the_feature_fences_map_the_arms() {
     );
 }
 
-/// The flipped edge (WO-RL-3): the facade stands on its serial provider, and
-/// the provider does not know the facade. Both halves asserted — presence
-/// here, absence there — so this doubles as a falsifiability floor for the
-/// parse (a renamed package cannot pass the presence half).
+/// The facade stands on its serial provider, and the provider does not know the
+/// facade. Both halves asserted, so this doubles as a falsifiability floor.
 #[test]
 fn the_facade_stands_on_the_provider_and_not_the_reverse() {
     let meta = metadata();

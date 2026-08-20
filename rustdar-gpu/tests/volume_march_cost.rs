@@ -1,19 +1,9 @@
 //! What one raymarched frame costs on this GPU, measured rather than modelled.
 //!
-//! rustdar-device-profile's `quality.rs` carries Spike 0a's cost table (0.774 ms at 1440 x 900 on
-//! an RTX 3090, 96 steps, shaded) and extrapolates every other device from it.
-//! This harness is how such a number is measured again after the march changes:
-//! it renders **a real Level II volume** through the production pipeline with
-//! GPU timestamp queries around the raymarch pass, at the two offscreen sizes
-//! the quality ladder actually uses, with shading both on and off.
-//!
-//! It is `#[ignore]`d and env-driven for the same single reason: its input is a
-//! Level II file on someone's disk. That, not the absence of a GPU, is what
-//! keeps it out of CI — the `gpu` job in `test.yaml` runs the adapter-only
-//! tests on lavapipe but cannot run this one, because no such file is in this
-//! repository and radar data is not going into git. It would also want
-//! `Features::TIMESTAMP_QUERY` and a timing worth reading, neither of which a
-//! software rasteriser offers.
+//! Renders a real Level II volume through the production pipeline with GPU
+//! timestamp queries around the raymarch pass, at the two offscreen sizes the
+//! quality ladder uses, with shading on and off. `#[ignore]`d: its input is a
+//! Level II file on someone's disk.
 //!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 \
@@ -21,20 +11,9 @@
 //! cargo test -p rustdar-gpu --test volume_march_cost -- --ignored --nocapture
 //! ```
 //!
-//! | variable | required | default | meaning |
-//! |---|---|---|---|
-//! | `VOL` | yes | — | Uncompressed NEXRAD Level II archive file. |
-//! | `SITE` | no | the identifier the volume's own radials carry | Radar ICAO. Its **position** always comes from the volume. |
-//! | `CENTRE_LAT` / `CENTRE_LON` | yes | — | Region centre, degrees. |
-//! | `HALF_KM` | no | `75` | Region half-width, km. |
-//! | `YAW`/`PITCH`/`DIST`/`EXAG` | no | `225/25/2.5/3` | Orbit camera. |
-//! | `SWEEP_OUT` | no | — | If set: also write a 60-frame yaw pan (0.05°/frame) as PPMs under this prefix, for the screen-locked-banding diagnosis. |
-//!
-//! The pan sweep exists because the banding artifact this file was written
-//! against is only visible **in motion**: iso-`t` step shells are locked to the
-//! eye, so under a pan the shell contours stay put in screen space while the
-//! volume slides beneath them. Phase-correlating two sweep frames is the
-//! diagnostic; the sweep writes the frames.
+//! `VOL`, `CENTRE_LAT`, `CENTRE_LON` are required; `SITE`, `HALF_KM` (75),
+//! `YAW`/`PITCH`/`DIST`/`EXAG` (225/25/2.5/3) and `SWEEP_OUT` (write a 60-frame
+//! yaw pan as PPMs) are optional. The site position always comes from the volume.
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
@@ -47,18 +26,14 @@ use rustdar_volumetric::raymarch::VolumePipelines;
 use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_volumetric::uniform::VolumeUniform;
 
-/// The volume reader and the site it learns, shared with the other two live
-/// instruments in this directory. See `live_volume/mod.rs` for why the site
-/// comes out of the volume rather than out of a lookup.
+/// The volume reader and the site it learns. See `live_volume/mod.rs`.
 mod live_volume;
 use live_volume::{scan_from_archive, site_of};
 
-/// Timed render passes per configuration. The reported figure is the mean;
-/// the minimum is printed beside it as the "nothing else was scheduled" bound.
+/// Timed render passes per configuration; the reported figure is the mean.
 const TIMED_FRAMES: usize = 30;
 
-/// Warm-up passes before timing, so pipeline and cache compilation is not
-/// billed to frame one.
+/// Warm-up passes, so compilation is not billed to frame one.
 const WARMUP_FRAMES: usize = 5;
 
 #[test]
@@ -93,11 +68,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             grid_dims,
             grid.indices(),
             grid.lut(),
-            // One upload, so nothing to reuse across. Production holds one
-            // across every grid — `VolumeResources::staging`. Built from the
-            // device so this bench uploads by the route production does; the
-            // device below asks for `STAGING_RING_FEATURE` alongside the
-            // timestamps it exists for.
+            // Built from the device, so this uploads by production's route.
             &mut VolumeStaging::new(&device),
         )
         .expect("the grid and palette were refused");
@@ -125,19 +96,13 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = shading;
-            // The cloud rung is lighting plus the smoothed reconstruction, and
-            // the two ride one quality decision in the bridge — so the timed
-            // pair is the shipped pair: cloud against the raw unlit floor.
+            // The timed pair is the shipped pair: cloud against the raw floor.
             if shading {
                 uniform.reconstruction_lod = rustdar_volumetric::bridge::CLOUD_RECONSTRUCTION_LOD;
                 uniform.step_cells = rustdar_volumetric::bridge::CLOUD_STEP_CELLS;
             }
             uniform.vertical_exaggeration = camera.vertical_exaggeration();
-            // The bridge's own transfer edge, imported rather than restated,
-            // so the timed march is the shipped march — the fade-anchored
-            // skip changes what the empty shell costs, and that saving is
-            // production behaviour. An anchor change in the bridge cannot
-            // leave this instrument measuring a different threshold.
+            // The bridge's own transfer edge, imported rather than restated.
             uniform.empty_index_threshold =
                 rustdar_volumetric::bridge::empty_index_threshold_for(grid.fade_band());
             uniform.edge_soft_width = rustdar_volumetric::bridge::EDGE_SOFT_WIDTH;
@@ -225,8 +190,7 @@ fn timed_passes(
     let mut samples_ms = Vec::with_capacity(TIMED_FRAMES);
     for frame in 0..WARMUP_FRAMES + TIMED_FRAMES {
         let mut encoder = device.create_command_encoder(&Default::default());
-        // The very pass the application records, with timestamps bracketing it
-        // through the seam `encode_raymarch_with_timestamps` provides.
+        // The very pass the application records, timestamps bracketing it.
         pipelines.encode_raymarch_with_timestamps(
             &mut encoder,
             target,
@@ -362,8 +326,7 @@ fn read_back(
     pixels
 }
 
-/// The offscreen's colour over black, binary P6. Premultiplied over black is
-/// the premultiplied value itself.
+/// The offscreen's colour over black, binary P6.
 fn write_ppm(path: &str, size: [u32; 2], pixels: &[[u8; 4]]) {
     assert_eq!(pixels.len(), (size[0] * size[1]) as usize);
     let mut out = format!("P6\n{} {}\n255\n", size[0], size[1]).into_bytes();

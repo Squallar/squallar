@@ -1,40 +1,4 @@
 //! A theme flip must move the overlay cache token — the live bug this pins.
-//!
-//! # The bug
-//!
-//! Overlay handlers rasterize *in* the theme: the SPC outlook branches on
-//! `RasterizeContext::is_dark` for its hatch colour
-//! (`rustdar-overlays/src/render/handlers/outlook.rs`), the GLM and
-//! storm-report handlers carry `is_dark` into their described jobs, and the
-//! METAR station model picks its text colour by it
-//! (`rustdar-overlays/src/render/station_model.rs`). Those sites were always
-//! correct — at raster time. What was broken was invalidation: on a theme
-//! flip `App::adopt_theme` bumped only `radar_sites_render_gen`, and
-//! `overlay_cache_token` answered the bare content signature for every other
-//! layer, so `needs_rerender` compared equal and the pane kept compositing
-//! rasters baked in the *old* theme's colours — dark-grey hatches on a dark
-//! map — until the next content change happened to move the signature.
-//!
-//! # The fix these tests hold in place
-//!
-//! The token mixes in the theme (a fixed odd 64-bit XOR) for the layers that
-//! **declare** themselves theme-sensitive, and the caller reads the live
-//! `dark_mode` off the egui context every frame. The SPC outlook is the layer
-//! the first test uses because its raster is theme-dependent in this exact way
-//! — the hatch-colour branch is the pixels that go stale.
-//!
-//! The term was uniform when the fix first landed, which was the right shape
-//! for a repair that had to be sure it missed nothing. It is
-//! `OverlayHandler::theme_sensitive` now, so which layers a flip invalidates is
-//! a set rather than "all of them", and
-//! `a_theme_flip_invalidates_exactly_the_declared_layers` is the walk that
-//! holds the set to the declaration in both directions. Note the module note
-//! above names METAR as a theme-reading layer and it still is — per frame, with
-//! no cached raster and no token, which is why it is deliberately **not** in
-//! the declared set.
-//!
-//! The frontend's `app::theme_flip_tests` holds the other half: a flip must
-//! *not* touch the radar's theme-independent `RenderCache`.
 
 use crate::ui::Gui;
 use rustdar_overlays::render::handlers::outlook::SpcOutlookFetchResult;
@@ -53,10 +17,6 @@ const SITES: rustdar_source::id::LayerId = rustdar_source::id::known::RADAR_SITE
 /// `apply_fetch_result` — the same door a live fetch uses, the
 /// `ui::overlay_retry_tests` way — so the content signature under test is the
 /// one a live session would carry.
-///
-/// The outlook's "enabled" *is* its product set and its data is keyed by
-/// `(day, product)`, so the toggle has to precede the payload for the two to
-/// meet.
 fn gui_with_an_outlook() -> Gui {
     let mut gui = Gui::new();
     gui.overlays.set_enabled(&OUTLOOK, true);
@@ -95,9 +55,6 @@ fn gui_with_an_outlook() -> Gui {
 /// different themes — the move that buys the re-rasterize a flip is owed —
 /// and the token is a pure function of its inputs, so nothing *else* moves
 /// it: equal inputs answer equal tokens, in both themes.
-///
-/// Before the fix the two tokens were equal and `needs_rerender` kept the
-/// stale-theme raster on screen indefinitely.
 #[test]
 fn a_theme_flip_changes_the_overlay_cache_token() {
     let gui = gui_with_an_outlook();
@@ -128,22 +85,6 @@ fn a_theme_flip_changes_the_overlay_cache_token() {
 
 /// **The registry walk.** A theme flip moves the cache token of exactly the
 /// layers that declared themselves theme-sensitive, and of no others.
-///
-/// # Why a walk and not four assertions
-///
-/// The term used to be uniform, so "which layers does a flip invalidate" had
-/// one answer and needed no test: all of them. Making it a handler declaration
-/// makes it a *set*, and a set has two ways to be wrong — a handler that bakes
-/// the theme into its pixels and forgot to declare it (stale colours after a
-/// flip, indefinitely) and a handler that declares it and does not need it (a
-/// full re-rasterize of every enabled overlay on every flip). Naming four ids
-/// in a test would catch the first and not the second, because a fifth
-/// handler's `true` would sit outside the assertion entirely.
-///
-/// So the walk asks every registered handler both questions and requires them
-/// to agree: token moves ⟺ `theme_sensitive()`. The expected set is written
-/// down as well, because the walk alone would still pass if every handler
-/// silently flipped to `false`.
 #[test]
 fn a_theme_flip_invalidates_exactly_the_declared_layers() {
     let gui = gui_with_an_outlook();
@@ -203,13 +144,6 @@ fn a_theme_flip_invalidates_exactly_the_declared_layers() {
 }
 
 /// The radar-sites arm keeps **both** of its invalidations.
-///
-/// Its base is the pane's own `radar_sites_render_gen`, which `adopt_theme`
-/// bumps on a flip, and it also declares `theme_sensitive`. Either alone would
-/// invalidate the raster today. The pin is that the *declaration* is one of
-/// them: the gen bump is scheduled to move, and a token that had quietly become
-/// single-sourced on it would lose its theme invalidation at that moment with
-/// nothing failing to say so.
 #[test]
 fn the_radar_sites_arm_is_invalidated_by_the_declaration_as_well_as_the_gen() {
     let gui = Gui::new();

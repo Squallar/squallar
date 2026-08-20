@@ -42,20 +42,7 @@ const BARB_STROKE_WIDTH: f32 = 1.5;
 ///
 /// Returns `None` when the observation carries no MSLP, which is most of the
 /// network — the feed published one for 572 of 1324 records across 20 state
-/// ASOS networks. An empty slot is the honest answer there. The three
-/// alternatives were each measured and each is worse:
-///
-///   * the altimeter setting in hundredths of inHg, which is what this slot
-///     drew before: agrees with the convention on 0 of 572 records, and a
-///     reader who applies the convention misreads it by a median 13.7 hPa;
-///   * the altimeter setting relabelled as MSLP: out by a median 0.49 hPa
-///     (max 11.6) and it silently mixes two quantities in one slot;
-///   * MSLP derived from the altimeter with the station's elevation and
-///     temperature: lands on the right printed code 8.2% of the time, and the
-///     stations needing it are lower-instrumented and higher-elevation than
-///     the ones it could be scored against.
-///
-/// The altimeter setting is still shown, labelled, in the station popup.
+/// ASOS networks. An empty slot is the honest answer there.
 fn pressure_code(mslp_hpa: Option<f64>) -> Option<i32> {
     let mslp = mslp_hpa?;
     if !mslp.is_finite() {
@@ -240,9 +227,7 @@ fn draw_cloud_cover_circle(
         let half_w = radius * open_fraction * 2.0;
         // The overpaint is a circular *segment* — a chord at x = radius-half_w
         // closed by arc samples through the circle's rightmost point — drawn
-        // as a polygon inscribed in the circle, so it cannot leave it. The
-        // full-height rect this replaces put its corners at r·√2 from the
-        // centre, blotting out map and radar pixels beneath the station.
+        // as a polygon inscribed in the circle, so it cannot leave it.
         let x0 = radius - half_w;
         let theta = (x0 / radius).clamp(-1.0, 1.0).acos();
         const ARC_STEPS: usize = 8;
@@ -686,7 +671,6 @@ mod tests {
         wind_ob(None, None, vis)
     }
 
-    /// A tier-3 context, the only tier that draws the pressure code.
     fn tier3() -> DrawPointContext {
         DrawPointContext {
             zoom: TIER3_ZOOM,
@@ -721,8 +705,6 @@ mod tests {
         }
     }
 
-    /// The defect this replaced. Pinning it stops the altimeter encoding coming
-    /// back by way of "the popup shows inHg, so the plot should match".
     #[test]
     fn the_altimeter_encoding_disagrees_with_the_convention_at_every_site() {
         let mut agreed = 0;
@@ -732,8 +714,6 @@ mod tests {
             if old == *expected {
                 agreed += 1;
             }
-            // And the misreading is large: decode the old digits by the
-            // convention and compare against the station's real MSLP.
             let decoded = old.parse::<f64>().expect("three digits") / 10.0;
             let misread = if decoded < 50.0 {
                 1000.0 + decoded
@@ -786,8 +766,6 @@ mod tests {
         );
     }
 
-    /// The wrap is the whole point of a three-digit code, and it is where an
-    /// `as i32` truncation instead of a `round` would show up.
     #[test]
     fn the_code_wraps_across_the_thousand_boundary() {
         assert_eq!(pressure_code(Some(999.9)), Some(999));
@@ -850,7 +828,6 @@ mod tests {
         p
     }
 
-    /// Fails if the plot drops the `+` from an "or greater" visibility.
     #[test]
     fn the_plot_shows_the_or_greater_marker() {
         let p = plot(Some(Visibility {
@@ -899,11 +876,6 @@ mod tests {
 
     // ── Sky-cover circle ──────────────────────────────────────────────────
 
-    /// The BKN "open slice" is faked by overpainting in the background colour,
-    /// and that overpaint must stay inside the sky-cover circle: the full-height
-    /// rect it used to be put its corners at r·√2 from the centre, blotting out
-    /// map and radar pixels beneath the station. Vertex containment is
-    /// sufficient — the vertices lie on the circle, and their hull is inside it.
     #[test]
     fn the_bkn_open_slice_overpaint_stays_inside_the_circle() {
         let mut bkn = ob(None);
@@ -949,7 +921,6 @@ mod tests {
         p
     }
 
-    /// The staff is always the first line drawn.
     fn staff_end(p: &RecordingPainter) -> Option<[f32; 2]> {
         p.lines.first().map(|(_, to)| *to)
     }
@@ -973,7 +944,6 @@ mod tests {
         assert!(barb(None, None).lines.is_empty());
     }
 
-    /// Fails if variable renders identically to dead calm.
     #[test]
     fn a_variable_wind_is_marked_apart_from_dead_calm() {
         let calm = barb(Some(WindDir::Calm), Some(0));
@@ -986,7 +956,6 @@ mod tests {
         );
     }
 
-    /// The counterpart: 360° is a real bearing and must still draw a staff.
     #[test]
     fn a_genuine_northerly_still_draws_a_northward_staff() {
         let p = barb(Some(WindDir::Degrees(360)), Some(10));
@@ -1016,7 +985,6 @@ mod tests {
 
     // ── Hover text ────────────────────────────────────────────────────────
 
-    /// Fails if the hover reads "000°" for a variable wind.
     #[test]
     fn hover_text_says_vrb_for_a_variable_wind() {
         let text = hover_text_for_metar(&wind_ob(Some(WindDir::Variable), Some(6), None), &knots());

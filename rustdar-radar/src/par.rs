@@ -1,28 +1,5 @@
 //! The crate's parallel-iteration prelude: rayon everywhere it has threads,
 //! sequential stand-ins where it does not.
-//!
-//! wasm32-unknown-unknown is single-threaded — rayon compiles there but cannot
-//! build a thread pool — so every module that parallelises has to carry a
-//! sequential arm. The stand-ins below have the same names and the same
-//! signatures as the rayon entry points they replace, which is what lets the
-//! call sites stay identical instead of cfg'ing a dozen rasterization loops
-//! that would then drift apart. The closures need no changes either: rayon
-//! requires `Fn + Send + Sync`, strictly stronger than the `FnMut` these want.
-//!
-//! **One `use crate::par::*;`, no `cfg` at the consumer.** That is the point of
-//! this module. The fallback previously existed twice — in [`crate::render`]
-//! and [`crate::nrot`] — each with its own copy of the traits *and* its own
-//! pair of `cfg` attributes choosing between them. Two copies had already
-//! diverged in coverage (`render` grew four traits, `nrot` kept one), and two
-//! more consumers are on the way. A consumer now writes one unconditional
-//! import and cannot get the target split wrong, because the split is made
-//! here.
-//!
-//! **This is a cfg split, not a removal.** Rasterization is the hot path on
-//! desktop, and this fallback silently becoming the native arm is a large
-//! regression that no test catches — the native arm is a glob re-export of
-//! `rayon::prelude`, and the stand-ins are not even compiled off wasm32, so
-//! there is no configuration in which they can be reached by mistake.
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use rayon::prelude::*;
@@ -62,23 +39,12 @@ mod seq {
         }
     }
 
-    /// The owning arm of the same trait, for a caller that builds its work
-    /// items first and consumes them — `voxel`'s per-row output slices, which
-    /// have to be cut out of the grid before any row runs and then moved into
-    /// the tasks.
     impl<T> IntoParIterFallback for Vec<T> {
         type Item = T;
         fn into_par_iter(self) -> impl Iterator<Item = T> {
             self.into_iter()
         }
     }
-
-    // There is no `par_chunks` stand-in. The crate had exactly one caller —
-    // `render::RenderBuffers::into_output`, reading the value grid while
-    // writing the texture — and that pass now walks the grid mutably so it can
-    // erase the range-folded sentinel it just coloured. A borrowed arm with no
-    // consumer is dead code on wasm32 and a warning under this repo's
-    // `-D warnings` gate, so it stays absent until something wants it.
 
     /// Stands in for `rayon::slice::ParallelSliceMut::par_chunks_mut`.
     pub trait ParChunksMutFallback<T> {
@@ -97,16 +63,6 @@ mod seq {
     }
 
     /// Stands in for `rayon::iter::ParallelIterator::for_each_init`.
-    ///
-    /// The point of the rayon entry point is that `init` runs once per job the
-    /// pool splits off rather than once per item, so a consumer can hold
-    /// per-row scratch without allocating per row. One thread is one job, so
-    /// the sequential arm is one `init` for the whole walk — the same
-    /// guarantee at its limit, and strictly the cheapest end of it.
-    ///
-    /// `Fn` on the operator rather than `FnMut`, matching rayon: the mutation
-    /// a caller wants goes through `&mut T`, and requiring the weaker bound
-    /// here would let a wasm-only closure compile that the native arm rejects.
     pub trait ForEachInitFallback: Iterator + Sized {
         fn for_each_init<T, INIT, OP>(self, init: INIT, op: OP)
         where

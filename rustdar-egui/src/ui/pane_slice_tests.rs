@@ -12,7 +12,6 @@ fn the_pane_slices_stop_at_the_visible_count() {
         pane.site = format!("PANE{idx}");
     }
 
-    // Split back down: panes 2 and 3 are remembered but no longer shown.
     gui.set_pane_count_for_test(2);
 
     assert_eq!(gui.panes().len(), 2);
@@ -38,8 +37,6 @@ fn the_pane_slices_stop_at_the_visible_count() {
 fn the_pane_slices_never_outrun_the_vector() {
     let mut gui = Gui::new();
     assert_eq!(gui.panes().len(), 1, "a fresh Gui has one pane");
-    // A layout claiming more panes than the vector holds, as a config whose
-    // pane_count ran ahead of its pane list would leave it.
     gui.claim_pane_count_for_test(4);
 
     assert_eq!(gui.panes().len(), 1);
@@ -76,13 +73,8 @@ fn viewport_sync_never_outruns_the_pane_vector() {
     gui.set_pane_count_for_test(2);
     gui.claim_pane_count_for_test(4);
 
-    // Snapshots sized to the layout's claim, exactly as `render_panes` would
-    // have taken them had it trusted the raw count too. All-zero zooms
-    // make every pane look interacted, so the source scan runs as deep as
-    // its bound allows.
     gui.sync_viewports(&[0.0; 4], &[None; 4]);
 
-    // The panes that are really there still synced to a common zoom.
     assert_eq!(
         gui.pane(0).unwrap().map_memory.zoom(),
         gui.pane(1).unwrap().map_memory.zoom(),
@@ -139,9 +131,6 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
         PaneKind::Map,
         "precondition: the pane starts as a map"
     );
-    // Something on the real pane that the placeholder does not have, so the
-    // restore below can be shown to have really put the original back rather
-    // than to have left a default in place.
     gui.pane_mut(1).unwrap().site = "KDDC".to_owned();
 
     let held = std::mem::take(&mut gui.panes[gui.active_pane]);
@@ -157,7 +146,6 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
         &mut actions,
     );
 
-    // The restore, which throws the placeholder away.
     gui.panes[gui.active_pane] = held;
     gui.apply_pending_pane_view(&mut Vec::new());
 
@@ -186,10 +174,6 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
 }
 
 /// A request naming a pane the layout no longer has is dropped, not clamped.
-///
-/// Reachable in one frame: the pane picker can shrink the layout after the
-/// menu event was recorded. Converting whichever pane happens to be at a
-/// nearby index would convert one the user never pointed at.
 #[test]
 fn a_pane_kind_request_for_a_pane_that_is_gone_converts_nothing() {
     use crate::pane::PaneKind;
@@ -219,11 +203,6 @@ fn drawn_line() -> crate::pane::SectionLine {
 
 /// A cut of the right shape and no content, so a fixture can hold a picture
 /// for a retarget to throw away.
-///
-/// Full size — `from_parts` refuses anything else, because a mis-shaped
-/// section reaches `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on
-/// the main thread. `NoCoverage` everywhere, which is what an empty volume
-/// really renders as.
 fn blank_section() -> rustdar_radar::xsect::CrossSection {
     use rustdar_radar::sampler::SampleStatus;
     use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
@@ -295,12 +274,6 @@ fn a_second_line_on_one_map_re_aims_the_section_it_already_feeds() {
 
 /// Step 2: with no section fed by *this* map, the layout grows — even when
 /// another map's section is sitting right there.
-///
-/// The pane count is the load-bearing assertion, and the second half of the
-/// fixture is what makes it one: a section pane exists, but it belongs to
-/// pane 1, and stealing it would silently re-aim a picture the user is
-/// still using. Only once the layout cannot grow (the test below) is that
-/// the right answer.
 #[test]
 fn a_line_with_nowhere_to_go_grows_the_layout_rather_than_taking_a_map() {
     let mut gui = wide(1);
@@ -329,9 +302,6 @@ fn a_line_with_nowhere_to_go_grows_the_layout_rather_than_taking_a_map() {
         "the pane the user just asked for is not the one they are looking at"
     );
 
-    // The same, with another map's section already on screen and room still
-    // to grow. Growing must still win: re-aiming pane 2 would throw away a
-    // picture pane 1 is still using, silently.
     let mut gui = wide(3);
     gui.panes[2].set_kind(crate::pane::PaneKind::CrossSection);
     gui.panes[2].cross_section_mut().unwrap().source_pane = Some(1);
@@ -363,7 +333,6 @@ fn a_line_with_nowhere_to_go_grows_the_layout_rather_than_taking_a_map() {
 fn a_full_layout_re_aims_a_section_before_it_takes_a_map() {
     let full = crate::ui_layout::WidthClass::Expanded.max_panes();
 
-    // Step 3: a section exists somewhere, aimed from another map.
     let mut gui = wide(full);
     gui.panes[2].set_kind(crate::pane::PaneKind::CrossSection);
     gui.panes[2].cross_section_mut().unwrap().source_pane = Some(1);
@@ -383,8 +352,6 @@ fn a_full_layout_re_aims_a_section_before_it_takes_a_map() {
         "a map was converted while a section was there to re-aim"
     );
 
-    // Step 4: no section anywhere. The highest-indexed pane converts, and
-    // the map the line was drawn on is left alone.
     let mut gui = wide(full);
     gui.pending_section_line = Some((0, drawn_line()));
     gui.apply_pending_section_line();
@@ -401,20 +368,6 @@ fn a_full_layout_re_aims_a_section_before_it_takes_a_map() {
 
 /// The rule is **total**: a drawn line always lands somewhere, at every
 /// pane count either width class can reach.
-///
-/// The one that most needs saying is a compact layout already at its own
-/// ceiling — a phone that has split as far as it is allowed to. There, every
-/// earlier step has failed and the only answer left is to convert a map. A
-/// silent no-op is the failure this is written against: a drag that produced
-/// nothing, with nothing on screen to explain it, after the user had gone to
-/// the menu to arm a mode.
-///
-/// **What is not covered, and cannot be.** The final `unwrap_or(source)` —
-/// converting the pane drawn on — needs `max_panes() == 1`, and no
-/// [`WidthClass`](crate::ui_layout::WidthClass) reports that: `Compact` is 4
-/// and the others 6. It is unreachable today and stays because
-/// `highest_pane_other_than` returning `None` must mean *something* other
-/// than dropping the line.
 #[test]
 fn a_drawn_line_lands_somewhere_at_every_reachable_pane_count() {
     use crate::ui_layout::WidthClass;
@@ -441,7 +394,6 @@ fn a_drawn_line_lands_somewhere_at_every_reachable_pane_count() {
                 crate::pane::PaneKind::Map,
                 "{width:?} with {count} panes took the map the line was drawn on"
             );
-            // Grown while it could, and only converted once it could not.
             let expected = (count + 1).min(width.max_panes());
             assert_eq!(
                 gui.pane_count(),
@@ -454,12 +406,6 @@ fn a_drawn_line_lands_somewhere_at_every_reachable_pane_count() {
 
 /// The section a line lands in adopts the drawing map's site and moment, and
 /// throws away the picture it was showing.
-///
-/// A section is cut from a *site's* volume, so a target pane that kept its
-/// own site would cut the line's ground out of the wrong radar — a picture
-/// that renders perfectly and means nothing. Clearing the old raster matters
-/// for the interval before the new cut lands: a section of the previous line
-/// left on screen is of ground the user is no longer pointing at.
 #[test]
 fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
     let ctx = egui::Context::default();
@@ -472,12 +418,6 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
         let section = gui.panes[1].cross_section_mut().unwrap();
         section.source_pane = Some(0);
         section.unavailable = Some(crate::pane::SectionUnavailable::RenderFailed);
-        // A picture and a key for the *previous* line, which is the state a
-        // retarget has to clear. Without them in the fixture both fields are
-        // `None` before and after, and the assertions below hold for a build
-        // that clears neither — the exact shape of test that looks like it
-        // is watching something and is not. (Found by mutation: dropping
-        // both clears survived until this fixture had something to drop.)
         section.rendered_for = Some(crate::pane::SectionTarget {
             volume: crate::pane::VolumeStamp {
                 site: "KINX".to_owned(),
@@ -491,11 +431,6 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
             ladder: 9,
         });
         section.section = Some(std::sync::Arc::new(blank_section()));
-        // And the raster, which needs a `Context` and is the reason the
-        // first repair of this fixture stopped at `section`. Without it,
-        // deleting `section.texture = None` from the retarget passes: the
-        // pane would go on painting the *previous* line's picture, with the
-        // new line's caption over it, for as long as the re-cut takes.
         section.texture = Some(ctx.load_texture(
             "retarget-fixture",
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
@@ -532,10 +467,6 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
 
 /// Escape and Android's back cancel the armed draw — last, below every
 /// painted layer, because it is a mode rather than something on screen.
-///
-/// Being in the chain at all is what stops the back button from exiting the
-/// app while a mode is on, which is the reading of a back press least likely
-/// to be what was meant.
 #[test]
 fn a_back_press_cancels_an_armed_draw_after_it_has_closed_every_layer() {
     let mut gui = Gui::new();
@@ -557,18 +488,6 @@ fn a_back_press_cancels_an_armed_draw_after_it_has_closed_every_layer() {
 
 /// Converting a pane keeps everything it was looking at, and tears down the
 /// one thing a non-map pane cannot have: a running animation loop.
-///
-/// The root fix for a family of eight consumers with one cause. A loop left
-/// running on a pane nothing renders frames for is not idle: it blocks every
-/// *other* pane's loop through `sync_loop_playback_start`'s all-or-nothing
-/// rule, keeps `Gui::any_loop_active` true so the event loop wakes at loop
-/// frame rate, reads "Rendering n/m" for ever with no transport drawn to
-/// cancel it, and goes on spending the shared download budget. Enforced at the
-/// transition so the state is not representable, rather than filtered at each
-/// consumer. `SwitchRadarSite` resets `loop_state` for the same reason.
-///
-/// The counterweight matters as much: every *other* field must survive, which
-/// is the promise `set_kind` exists to make.
 #[test]
 fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
     use crate::pane::LoopPhase;
@@ -607,8 +526,6 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
         assert!(!pane.viewing_live);
         assert_eq!(pane.time_step_secs, 1800);
 
-        // …and converting back does not resurrect it. A torn-down loop is torn
-        // down; re-enabling it is the transport's job.
         gui.pane_mut(0)
             .unwrap()
             .set_view(rustdar_radar::types::RenderView::PlanView);
@@ -618,32 +535,6 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
 
 /// Overlay auto-poll and the pane a fetch is attributed to both skip panes
 /// with no **ground**, while the panes keep their layer toggles.
-///
-/// Both questions are "is this overlay being *drawn* anywhere?", and every
-/// overlay is a layer positioned against a projector — so a pane with no
-/// projector anywhere in its frame must not keep an auto-poll timer alive or be
-/// handed a `FetchOverlay`.
-///
-/// # A 3D pane's floor is drawn, and used not to count
-///
-/// The filter read `is_map`, which is the question about the flat picture, and
-/// it was written while a 3D view was a pane kind with no map of its own. A 3D
-/// pane's floor now runs the same `Map::show` and the same
-/// `render_pane_map_content` a plan view does, and asks for its own overlay
-/// rasters at its own bounds. So a **lone** 3D pane answered no here and
-/// nothing polled: the warnings and discussions on its floor never refreshed as
-/// they issued and expired, which the Map floor checkbox's hover text promises
-/// they do. Beside a plan-view pane wanting the same layer it worked, which is
-/// what kept it hidden.
-///
-/// A floor the user switched off still answers no — nothing is drawn, so
-/// nothing needs refreshing — and that arm is what keeps this a filter rather
-/// than "every pane counts".
-///
-/// `enabled_overlays` is deliberately *not* cleared, which is the second half
-/// here: it is the user's remembered answer to "which layers do I want", it
-/// becomes meaningful again the moment the pane converts back, and it is the
-/// same choice `set_kind` makes about the viewport and the tilt.
 #[test]
 fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     use crate::pane::PaneKind;
@@ -663,8 +554,6 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     );
     assert_eq!(gui.first_pane_with_overlay_enabled(&kind), Some(0));
 
-    // Pane 0 goes 3D. It still draws this layer — on its floor — so it is still
-    // the pane the fetch is attributed to.
     gui.pane_mut(0)
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
@@ -675,8 +564,6 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     );
     assert!(gui.any_pane_has_overlay_enabled(&kind));
 
-    // Its floor switched off, it draws nothing, and the attribution moves to
-    // the map pane beside it.
     gui.pane_mut(0)
         .unwrap()
         .volume_mut()
@@ -697,8 +584,6 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     );
     assert_eq!(gui.first_pane_with_overlay_enabled(&kind), None);
 
-    // The toggles themselves are untouched, so converting back restores the
-    // layer rather than losing the user's choice.
     for idx in 0..2 {
         assert!(
             gui.pane(idx).unwrap().is_overlay_enabled(&kind),
@@ -714,18 +599,6 @@ fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
 /// A loop on a pane the layout no longer shows is not "active": it is
 /// stranded, and saying otherwise pins the event loop at loop frame rate for
 /// the life of the process.
-///
-/// The same slice discipline as `is_any_pane_live` and
-/// `any_pane_has_overlay_enabled`, and the consequence is the sharpest of the
-/// three. `advance_loop_playback` walks `0..pane_count`, so a loop left
-/// playing on a hidden pane is one nothing advances and no transport is drawn
-/// to stop — it answers this predicate forever, the frontend re-arms an
-/// unconditional redraw on it forever, and the animation never moves a frame.
-/// Its textures go with it: thirty rendered tilts at 16 MiB apiece, held past
-/// every eviction path.
-///
-/// Splitting back down is the whole premise — `set_pane_count` only ever grows
-/// the vector, so the pane and its loop are still there to be found.
 #[test]
 fn a_loop_on_a_hidden_pane_stops_holding_the_event_loop_awake() {
     use crate::pane::LoopPhase;
@@ -753,30 +626,10 @@ fn a_loop_on_a_hidden_pane_stops_holding_the_event_loop_awake() {
 }
 
 /// A pane with no map neither drives the shared viewport nor follows it.
-///
-/// This is the all-panes site that goes live the instant a non-map pane can
-/// exist, and it fails in the direction that looks like a bug in the *other*
-/// panes. `render_panes` hands the active pane's `map_memory` to
-/// `InteractionState::resolve_active` whatever kind the pane is, and on the
-/// touch path `TouchGestures::update` writes a zoom into it — so a
-/// double-tap-drag on a section pane moves a viewport nothing draws.
-/// Unfiltered, `sync_viewports` then reads that pane as the **source**,
-/// because it is the first whose zoom moved, and re-centres and re-zooms
-/// every map pane on screen. `viewport_link` defaults *on*, so this is the
-/// shipped default rather than something a user opts into.
-///
-/// Both directions are asserted, and each one fails on its own: the source
-/// scan skipping non-map panes, and the write loop skipping them. The second
-/// matters because a converted pane's viewport is what it comes back to —
-/// `a_converted_pane_keeps_its_site_and_viewport` is the promise — and it is
-/// persisted per pane.
 #[test]
 fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
     use crate::pane::PaneKind;
 
-    // Zoom 4.0 is `DEFAULT_PANE_ZOOM`; 4.0 +/- 2.0 is well inside walkers'
-    // accepted range, so `set_zoom` below cannot silently clamp and turn a
-    // real move into no move at all.
     let moved_to = 6.0;
     let untouched = 4.0;
 
@@ -791,8 +644,6 @@ fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
         );
     }
 
-    // The gesture: the *section* pane's viewport moved and nobody else's,
-    // exactly as a double-tap-drag on it leaves things.
     gui.pane_mut(1)
         .unwrap()
         .map_memory
@@ -814,8 +665,6 @@ fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
         "a gesture on a pane with no map re-zoomed the map panes to it"
     );
 
-    // The same pane as the *target*: now a map pane moves, and the section
-    // pane must not be dragged along with the other map.
     gui.pane_mut(0)
         .unwrap()
         .map_memory
@@ -832,11 +681,6 @@ fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
 }
 
 /// With nothing moved and a non-map pane active, there is no source at all.
-///
-/// The fallback used to be `source_idx.unwrap_or(self.active_pane)`, which
-/// made a non-map active pane the source on *every* frame — the same failure
-/// as the source scan, reached with no interaction whatsoever, and therefore
-/// the more likely of the two to be seen.
 #[test]
 fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
     let mut gui = Gui::new();
@@ -846,9 +690,6 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
         .set_view(rustdar_radar::types::RenderView::Volume);
     gui.active_pane = 1;
 
-    // Deliberately out of step with pane 0, and deliberately *not* reported
-    // as moved: `pre_zooms` says nothing changed this frame, so the only way
-    // this value can escape is through the no-source fallback.
     gui.pane_mut(1)
         .unwrap()
         .map_memory
@@ -868,12 +709,6 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
 /// M11-1. **The viewport group is per-pane: a move on a linked pane drives
 /// the linked panes and only them; a move on an unlinked pane moves nobody
 /// else.**
-///
-/// Three map panes, pane 1's `viewport_link` off. Both directions asserted
-/// in one run, each failing on its own: the write loop skipping the
-/// unlinked target, and the unlinked source returning before it can drive —
-/// or fall through to the active-pane hold, which is the subtle half (the
-/// scan *found* a source, so the fallback must not run at all).
 #[test]
 fn the_viewport_group_is_per_pane_on_both_ends() {
     let untouched = 4.0;
@@ -882,8 +717,6 @@ fn the_viewport_group_is_per_pane_on_both_ends() {
     gui.set_pane_count_for_test(3);
     gui.pane_mut(1).unwrap().viewport_link = false;
 
-    // A linked pane moves: the linked panes converge, the unlinked one is
-    // left where it was.
     gui.pane_mut(0)
         .unwrap()
         .map_memory
@@ -898,7 +731,6 @@ fn the_viewport_group_is_per_pane_on_both_ends() {
         "a linked move must reach the linked panes and skip the unlinked one"
     );
 
-    // The unlinked pane moves: nobody follows, and nobody snaps it back.
     gui.pane_mut(1)
         .unwrap()
         .map_memory
@@ -916,11 +748,6 @@ fn the_viewport_group_is_per_pane_on_both_ends() {
 }
 
 /// M11-2. **An unlinked active pane holds nobody.**
-///
-/// The no-motion fallback — "the active pane holds the others where they
-/// are" — is a group behaviour, and an unlinked pane is not in the group:
-/// with its link off, its parked viewport must not be re-imposed on the
-/// linked panes frame after frame.
 #[test]
 fn an_unlinked_active_pane_is_not_the_fallback_hold_source() {
     let mut gui = Gui::new();
@@ -933,8 +760,6 @@ fn an_unlinked_active_pane_is_not_the_fallback_hold_source() {
         .set_zoom(9.0)
         .expect("in range");
 
-    // Nothing moved this frame; the only escape for pane 0's zoom is the
-    // fallback hold.
     gui.sync_viewports(&[9.0, 4.0], &[None; 2]);
 
     assert_eq!(
@@ -946,26 +771,6 @@ fn an_unlinked_active_pane_is_not_the_fallback_hold_source() {
 }
 
 /// Loop actions target every pane that can animate, and only those.
-///
-/// A pane in this list that nothing renders frames for would be put into
-/// `is_active()` with a frame list nothing ever fills: a loop transport stuck
-/// at "waiting", and a download queue fetching volumes for a pane nobody is
-/// looking at. A pane *missing* from it that could animate is simply a feature
-/// that does not work.
-///
-/// The classification is `PaneState::can_loop`, and the three non-map rows
-/// below are the whole of it: an **aimed** cross-section pane animates a
-/// sequence of vertical slices and belongs in the fan-out; an **unaimed** one
-/// has no line and so nothing to cut; a 3D volume pane animates a sequence of
-/// resident grids and belongs in it from the moment it exists, because unlike a
-/// section it needs no aiming — the volume is the whole box.
-///
-/// The active pane is included without being asked, which the second half
-/// below pins. The caller is now the floating timeline, outside every
-/// `mem::take` window, but the unconditional include stands: it is the
-/// pane whose own toggle was clicked, and the timeline disables that
-/// toggle for an active pane that cannot loop — see `loop_sync_targets`' own
-/// note.
 #[test]
 fn loop_actions_skip_panes_that_draw_no_frames() {
     use crate::pane::{PaneKind, SectionLine};
@@ -986,8 +791,6 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
          3D pane is one from the start, having nothing to be aimed at"
     );
 
-    // Aim it, and it joins the fan-out — a section loop is a first-class
-    // participant, not a pane the machinery routes around.
     gui.pane_mut(1).unwrap().cross_section_mut().unwrap().line = SectionLine::new(
         GeoPoint {
             lat: 35.0,
@@ -1004,39 +807,21 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
         "an aimed section pane was left out of the loop fan-out, so enabling \
          the loop animates every pane beside it and not this one"
     );
-    // The line the section needed is not a thing a 3D pane has, so aiming one
-    // must not have changed the other's answer.
     assert!(gui.loop_sync_targets().contains(&2));
 
-    // Every other pane time-unlinked narrows to the active pane, whatever
-    // kind it is: it is the pane whose own checkbox was clicked.
     for idx in [0, 1, 3] {
         gui.pane_mut(idx).unwrap().time_link = false;
     }
     gui.active_pane = 2;
     assert_eq!(gui.loop_sync_targets(), vec![2]);
 
-    // And with the links back on, the active pane is still in the list even
-    // though its slot says it is not a map — because the index is included
-    // rather than tested.
     for idx in [0, 1, 3] {
         gui.pane_mut(idx).unwrap().time_link = true;
     }
     assert_eq!(gui.loop_sync_targets(), vec![0, 1, 2, 3]);
 }
 
-/// The composed fan-out rule (M11's per-pane link × the can-loop widening):
-/// a pane is a loop target only when **both** gates pass — its own
-/// [`crate::pane::PaneState::time_link`] on *and*
-/// [`crate::pane::PaneState::can_loop`] — and the two failures are
-/// independent.
-///
-/// This is the cross-product neither parent change pinned: an **unlinked
-/// volume pane**. The per-pane link landed against the old is-a-map
-/// classification and the widening landed against the global sync toggle, so
-/// a merge that gated links over map panes only — or fanned out to every
-/// loopable kind regardless of its link — would pass both parents' tests and
-/// still animate a pane whose user asked it to sit out.
+/// The composed fan-out rule.
 #[test]
 fn an_unlinked_pane_is_no_loop_target_whatever_its_kind() {
     let mut gui = Gui::new();
@@ -1046,8 +831,6 @@ fn an_unlinked_pane_is_no_loop_target_whatever_its_kind() {
         .set_view(rustdar_radar::types::RenderView::Volume);
     gui.active_pane = 0;
 
-    // A volume pane can loop from the moment it exists — but its link is
-    // off, so the fan-out must leave it alone.
     gui.pane_mut(2).unwrap().time_link = false;
     assert_eq!(
         gui.loop_sync_targets(),
@@ -1056,27 +839,12 @@ fn an_unlinked_pane_is_no_loop_target_whatever_its_kind() {
          override the pane's own time link"
     );
 
-    // The same link off on a map pane gives the same answer, so the
-    // exclusion above is the link's and not the kind's.
     gui.pane_mut(3).unwrap().time_link = false;
     assert_eq!(gui.loop_sync_targets(), vec![0, 1]);
 }
 
 /// The graphics-state reset reaches panes of every kind, including the ones
 /// the layout is not currently showing.
-///
-/// [`Gui::clear_graphics_state`] is the only place a pane-held
-/// `egui::TextureHandle` is released when the egui context dies, and
-/// `PaneContent::release_textures` is called from inside this same loop —
-/// so if the loop skipped non-map panes, or stopped at the visible count,
-/// that guard would read as covered while never running. Asserted through
-/// `radar_sites_render_gen`, which the loop bumps on its way past: it is a
-/// side effect of *this* loop body, so it cannot agree with a loop that
-/// stopped short.
-///
-/// Hidden panes are included deliberately. A handle belonging to a pane the
-/// user split away from is just as invalid once the context is gone, and a
-/// re-split would hand it straight back to the renderer.
 #[test]
 fn clearing_graphics_state_reaches_panes_of_every_kind() {
     use crate::pane::PaneKind;
@@ -1087,7 +855,6 @@ fn clearing_graphics_state_reaches_panes_of_every_kind() {
     gui.pane_mut(2)
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
-    // Split back down, so panes 2 and 3 are remembered but not shown.
     gui.set_pane_count_for_test(2);
 
     let before: Vec<u64> = gui

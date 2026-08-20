@@ -24,26 +24,16 @@ use rustdar_source::id::{LayerId, known};
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
 
 /// Which of a pane's surfaces one call to [`render_pane_map_content`] paints.
-///
-/// Two passes exist, not four: a plan view paints both surfaces onto its own
-/// rect, and a 3D pane's floor strip paints only the ground. The glass half of
-/// a 3D pane is painted by the volume arm instead, on the pane's rect and
-/// *after* the volume — see `Gui::draw_volume_glass`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum PaneSurfaces {
-    /// A plan-view pane: ground and glass, both onto the pane's own rect.
     GroundAndGlass,
-    /// A 3D pane's off-screen floor strip: geography only. Chrome down here
-    /// would be mirrored onto the floor, which is the whole reason the split
-    /// is written down.
+    /// A 3D pane's off-screen floor strip: geography only — chrome down here
+    /// would be mirrored onto the floor.
     GroundOnly,
 }
 
 impl PaneSurfaces {
-    /// Whether this pass paints `surface` — the handler-declared
-    /// [`Surface`] (see rustdar-overlays; the old egui-side per-kind
-    /// match is deleted, the handler is the one place the ground/glass call
-    /// is made).
+    /// Whether this pass paints `surface` — the handler-declared [`Surface`].
     const fn paints(self, surface: Surface) -> bool {
         match self {
             Self::GroundAndGlass => true,
@@ -64,43 +54,20 @@ pub(super) struct PaneRenderCtx<'a> {
     /// How many slippy zoom levels deeper than this pane's own zoom its raster
     /// tile layers should fetch — see
     /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer).
-    ///
-    /// Non-zero only for a pane some 3D pane is standing on, and only while the
-    /// mirror was actually sized to show the extra detail. Resolved once per
-    /// pane by `Gui::tile_zoom_bias_for_pane`.
     pub tile_zoom_bias: u8,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     /// Which halves of the pane's content this pass is for. See
-    /// [`PaneSurfaces`] — and
-    /// [`OverlayHandler::surface`](rustdar_overlays::render::overlay_state::OverlayHandler::surface)
-    /// for the rule that decides which half anything is in. (It named
-    /// `PaneSurface`, a type deleted at WO-M8b when the handler took over the
-    /// declaration; the rule survived the type.)
+    /// [`PaneSurfaces`].
     pub surfaces: PaneSurfaces,
     /// Whether this frame's color scale bars run along the bottom edge
-    /// (`true`) or the right edge (`false`). Resolved once for the whole map
-    /// panel by `ColorScaleOrientation`, so every pane agrees.
+    /// (`true`) or the right edge (`false`). Resolved once per map panel.
     pub horizontal_color_scale: bool,
     /// The lowest screen y the colour-scale legend may draw on: the map's
-    /// bottom edge, less whatever the phone shell's bottom bar covered last
-    /// frame. Equal to the map's bottom edge on every width class that draws
-    /// no bar, which makes this a no-op everywhere but a phone.
-    ///
-    /// One number for the whole grid rather than a rect per pane, because the
-    /// bar it describes is one full-bleed strip across the bottom of the map;
-    /// [`clear_of_bottom_chrome`] turns it into the right answer for a pane
-    /// that sits above the strip (unchanged) and for one that runs under it
-    /// (shortened).
+    /// bottom edge, less whatever the phone shell's bottom bar covered.
     pub color_scale_floor: f32,
     pub pointer_available: bool,
     /// Rects of chrome painted over the map with no egui layer of its own.
-    /// Clicks there are not map clicks. Empty since the top bar replaced the
-    /// hamburger — everything left is a panel or a floating layer, which
-    /// `is_pos_blocked` catches without plumbing — but the mechanism stays for
-    /// the next painted-in-pane chrome (see `ShellOutput::excluded_rects`).
-    /// Map content that is itself clickable does **not** belong here — see
-    /// `visible_sites` in `render_pane_map_content`.
     pub excluded_rects: Vec<egui::Rect>,
     /// Screen position of an active long-press (for the radar value tooltip),
     /// or `None`. Only the touch pipeline ever produces one.
@@ -110,29 +77,13 @@ pub(super) struct PaneRenderCtx<'a> {
     /// on Android from the deferred single-tap detector.
     pub overlay_click_pos: Option<egui::Pos2>,
     /// Set by every handler that **acts** on
-    /// [`overlay_click_pos`](Self::overlay_click_pos) — an overlay feature
-    /// hit, a radar-site icon click. One flag for the whole frame's pane
-    /// loop, owned by `render_panes`: the fade trigger (`ui_fade.rs`) is a
-    /// click nothing consumed, and this is the consumption half of it. See the CONVENTION
-    /// comment in `ui_map.rs`.
+    /// [`overlay_click_pos`](Self::overlay_click_pos) — the consumption half of
+    /// the fade trigger in `ui_fade.rs`.
     pub click_consumed: &'a mut bool,
-    /// User unit and timezone preferences.
     pub preferences: &'a UserPreferences,
     /// The kinds this pane dispatched, in the order they painted, with the
-    /// egui layer each **arm** painted into. The layer is the honest half:
-    /// the sequence alone restates the loop, but two kinds on *different*
-    /// layers composite in `GraphicLayers::drain`'s order — same-`Order`
-    /// non-area layers drain in hash order, egui's own "safety net" — not in
-    /// this sequence, which is exactly how the old color-scale sub-layer
-    /// ignored `draw_order`. One paint list is what makes the sequence the
-    /// truth.
-    ///
-    /// What the layer record covers, exactly: the arm's *own* painter — the
-    /// loop's `ui.painter()` default, overwritten by an arm that constructs
-    /// another (the ColorScale arm does). That is the seam the old bug lived
-    /// on, and the seam contract 95 pins. Below it the record is on honour:
-    /// a paint helper that built its own layer painter *internally* would
-    /// not be reflected here, and no test claims otherwise.
+    /// egui layer each **arm** painted into. Two kinds on *different* layers
+    /// composite in `GraphicLayers::drain`'s order, not in this sequence.
     #[cfg(test)]
     pub paint_order: Vec<(LayerId, egui::LayerId)>,
 }
@@ -145,30 +96,17 @@ pub(super) fn render_pane_map_content(
     zoom: f64,
     ctx: &mut PaneRenderCtx<'_>,
 ) {
-    // Load this pane's overlay config snapshot so handler queries
-    // (clickable_items, hover_value_at, per_frame_points, etc.) reflect
-    // the per-pane settings.
     if !ctx.pane.overlay_configs.is_empty() {
         ctx.overlays.load_pane_configs(&ctx.pane.overlay_configs);
     }
 
-    // Cleared every frame and re-set by the radar arm below, exactly as
-    // `overlay_hover_value` is. The radar arm is the only writer, and it only
-    // runs while Radar is enabled, in `draw_order`, and has an image — clearing
-    // only inside that arm left the last readout frozen in the status bar
-    // whenever any of those stopped being true.
+    // Cleared every frame and re-set by the radar arm below. That arm is the
+    // only writer, and it runs only while Radar is enabled and has an image.
     ctx.pane.hover_value = None;
 
-    // Sites take priority over the overlays beneath them, so those skip a click
-    // that lands on an icon. Kept out of `ctx.excluded_rects`, which
-    // `handle_radar_site_interactions` reads itself: with the icons in there,
-    // every site click was blocked by its own icon.
-    //
-    // Projected **once**. This used to build the rect list and then throw the
-    // projections away, leaving `handle_radar_site_interactions` to walk all
-    // 207 sites again and re-derive the identical `icon_rect` — two Mercator
-    // passes over the site table per map pane per frame for one answer. The
-    // list is now the answer, and the interaction pass reads it.
+    // Sites take priority over the overlays beneath them. Kept out of
+    // `ctx.excluded_rects`, which `handle_radar_site_interactions` reads
+    // itself: with the icons in there, every site click was self-blocked.
     let visible_sites = visible_radar_sites(ui, projector, zoom, ctx.pane);
     // What the overlays *under* the sites must not be clicked through.
     let overlay_excluded_rects: Vec<egui::Rect> = ctx
@@ -178,7 +116,6 @@ pub(super) fn render_pane_map_content(
         .chain(visible_sites.iter().map(|s| s.icon_rect))
         .collect();
 
-    // --- Phase 1: immutable-ui work (ordered layer dispatch) ---
     // RadarSites requires `allocate_rect` (&mut ui), so it is deferred to Phase 2.
     {
         let overlay_ctx = OverlayDrawContext::new(
@@ -192,10 +129,7 @@ pub(super) fn render_pane_map_content(
 
         let mut selected: Vec<Arc<dyn OverlayItem>> = Vec::new();
         // The stale-image notice, deferred out of the Radar arm's position:
-        // it must read over every overlay drawn after the radar, and with the
-        // whole pane on one paint list "over everything" means "submitted
-        // after the loop" — not a sub-layer, whose compositing order against
-        // the pane's list is egui's hash-order safety net (see `paint_order`).
+        // it must read over every overlay drawn after the radar.
         let mut pending_notice: Option<(RadarProduct, f32)> = None;
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
 
@@ -205,37 +139,21 @@ pub(super) fn render_pane_map_content(
                 continue;
             }
             // An id with no registered handler is RETAINED in the list and
-            // skipped at draw (M8b's deliberate unknown-id behavior — the
-            // old reconcile dropped it from the list instead), so a newer
-            // build's layer keeps its place through a session here.
+            // skipped at draw, so a newer build's layer keeps its place.
             let Some(handler) = ctx.overlays.handler_by_id(id) else {
                 continue;
             };
-            // The ground/glass split, applied where the layers are dispatched
-            // rather than inside the arms: a pass that is not painting this
-            // layer's surface skips the arm entirely, so it also skips the
-            // arm's paint-order record — which is the honest thing to record,
-            // because nothing was painted. The surface is the HANDLER's
-            // declaration (`OverlayHandler::surface`) since M8b.
+            // The ground/glass split: a pass not painting this layer's surface
+            // skips the arm entirely, so it also skips the paint-order record.
             if !ctx.surfaces.paints(handler.surface()) {
                 continue;
             }
             // Every arm below paints through `ui.painter()` — the pane's own
-            // paint list — so submission order IS `draw_order`. The layer is
-            // recorded per arm, from the arm's own painter (one that builds
-            // another overwrites the default), so an *arm* moved onto a
-            // sub-layer fails the paint-order pin rather than silently
-            // leaving its stacking to egui's hash-order layer drain. The
-            // record stops at the arm seam — a helper's internal painter is
-            // not reflected; see `PaneRenderCtx::paint_order`.
+            // paint list — so submission order IS `draw_order`.
             #[cfg(test)]
             let mut painted_layer = ui.painter().layer_id();
             match id {
-                // Radar image layer — special handling for loop playback.
-                // Guards over the known:: consts rather than string-literal
-                // patterns: the consts are the ONE spelling of each id.
                 id if *id == known::RADAR => {
-                    // Loop playback: draw the active loop frame instead
                     if ctx.pane.loop_state.is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
                             render_radar_overlay(
@@ -248,7 +166,6 @@ pub(super) fn render_pane_map_content(
                             );
                         }
                     } else {
-                        // Extract metadata before drawing (avoids borrow conflict)
                         let meta_snapshot = ctx
                             .pane
                             .overlay_cache(id)
@@ -268,7 +185,6 @@ pub(super) fn render_pane_map_content(
                             draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                         }
 
-                        // Per-frame: range ring + hover value from radar metadata
                         if let Some((lat, lon, extent_km, hover)) = meta_snapshot {
                             render_radar_range_ring(ui, projector, lat, lon, extent_km);
                             update_pane_hover_value_from_meta(
@@ -286,51 +202,21 @@ pub(super) fn render_pane_map_content(
                         }
                     }
 
-                    // The pixels above are not the selection every other label on
-                    // this pane is already describing — say which product they
-                    // are. Decided inside the Radar arm, so it appears only while
-                    // the radar layer is actually on screen and only for a pane
-                    // that has an image to disown; *painted after the loop*, so
-                    // an overlay drawn later in `draw_order` cannot paint over
-                    // the notice — deferred submission on the pane's own paint
-                    // list, not a sub-layer (see `PaneRenderCtx::paint_order`).
-                    //
-                    // Not branched on the datasource, and it must never be: this
-                    // is the same call for a Level II and a Level III product,
-                    // and `PaneState::stale_image_on_screen` answers from the
-                    // same texture metadata either way.
+                    // The pixels above are not the selection every other label
+                    // on this pane is describing — say which product they are.
                     pending_notice = ctx.pane.stale_image_on_screen();
-                    // And, when the pixels *are* the selection, what the
-                    // classification behind them is standing on — but only
-                    // when nobody measured it. Decided in the same arm and
-                    // deferred the same way, because it is a sentence about
-                    // the same pixels. The two can never both be `Some`: see
-                    // `draw_melting_layer_notice`.
+                    // And what the classification behind them is standing on,
+                    // when nobody measured it. Never both `Some`.
                     melting_layer_caveat = ctx
                         .pane
                         .displayed_melting_layer_source()
                         .filter(|source| !source.is_measured());
-                    // There used to be a third sentence here, for the other
-                    // product with an unrecoverable render input: a wrapped
-                    // two-line plate saying which vector the storm-relative
-                    // field had been shifted by, when it was not the RPG's
-                    // own. It is gone, and not reworded. It apologised for a
-                    // fallback that measurement has since replaced, it named
-                    // no number the reader could use, and it offered no
-                    // recourse — so the vector itself moved into the legend
-                    // (`legend_second_line`), on every rung, where a reader
-                    // can read `SRM 32 kt @ 240°` and judge the picture
-                    // instead of being told to distrust it.
                 }
-                // City label tiles — the same projector-driven tile pass the
-                // basemap goes through, at the same bias, so the names sit on
-                // the roads they name at every level.
                 id if *id == known::CITY_LABELS => {
                     if let Some(ltiles) = ctx.label_tiles.as_mut() {
                         draw_tile_layer(ui, projector, zoom, ltiles, ctx.tile_zoom_bias);
                     }
                 }
-                // Radar sites: texture + per-frame interactions (text labels, clicks)
                 id if *id == known::RADAR_SITES => {
                     if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {
                         let screen_rect = ui.max_rect();
@@ -338,7 +224,6 @@ pub(super) fn render_pane_map_content(
                     }
                     handle_radar_site_interactions(ui, zoom, &visible_sites, ctx);
                 }
-                // User location blue dot
                 id if *id == known::USER_LOCATION => {
                     if let Some((user_lat, user_lon)) = ctx.user_location {
                         render_user_location(
@@ -352,15 +237,7 @@ pub(super) fn render_pane_map_content(
                     }
                 }
                 // Color scale legend (screen-space HUD) — painted through the
-                // pane's own paint list at this loop position, like every
-                // other kind, so `draw_order` genuinely places it: the old
-                // dedicated sub-layer composited in `GraphicLayers::drain`'s
-                // hash order regardless of the loop, which is why moving City
-                // Labels above the Color Scale used to change nothing. Within
-                // one paint list submission order is paint order — egui
-                // batches without reordering — so "later in `draw_order`"
-                // now means "on top" for the bars exactly as it does for a
-                // texture.
+                // pane's own paint list, so `draw_order` genuinely places it.
                 id if *id == known::COLOR_SCALE => {
                     let painter = ui.painter().with_clip_rect(ctx.pane_rect);
                     #[cfg(test)]
@@ -376,13 +253,10 @@ pub(super) fn render_pane_map_content(
                         ctx.preferences,
                     );
                 }
-                // All other overlays dispatched by render mode
                 _ => match handler.render_mode() {
                     RenderMode::Texture => {
-                        // Shared, not mutable: the labels are borrowed out of
-                        // the handler for the length of the draw, and the
-                        // clickable set is only asked for if a click needs
-                        // resolving — see `OverlayDrawContext::draw_overlay`.
+                        // Shared, not mutable: the clickable set is only asked
+                        // for if a click needs resolving.
                         let overlays = &*ctx.overlays;
                         selected.extend(overlay_ctx.draw_overlay(
                             ctx.pane.overlay_cache(id),
@@ -413,13 +287,8 @@ pub(super) fn render_pane_map_content(
         }
 
         // The deferred stale-image notice, submitted after every kind so
-        // nothing in `draw_order` can paint over it — see the Radar arm.
-        //
-        // Glass, by the rule in [`Surface`]: a plate pinned to the top of
-        // the pane, cleared past the pane's *own* pill row, saying which
-        // product the pixels are. It has no latitude, so a floor strip does
-        // not draw it — a 3D pane gets it from `Gui::draw_volume_glass`
-        // instead, over the volume where it can be read.
+        // nothing in `draw_order` can paint over it. Glass: a floor strip does
+        // not draw it — `Gui::draw_volume_glass` does instead.
         if let Some((on_screen, elevation)) = pending_notice
             && ctx.surfaces.paints(Surface::Glass)
         {
@@ -428,16 +297,15 @@ pub(super) fn render_pane_map_content(
                 &notice_painter,
                 ctx.pane_rect,
                 // The pill row's measured clearance, not the one-row
-                // constant: a narrow pane wraps the row (M9-18).
+                // constant: a narrow pane wraps the row.
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
                 on_screen,
                 elevation,
             );
         }
 
-        // The other half of the same plate, on the same terms — see the Radar
-        // arm. Glass, and mutually exclusive with the notice above, so this is
-        // the one place either sentence is drawn and they cannot stack.
+        // The other half of the same plate — mutually exclusive with the
+        // notice above, so they cannot stack.
         if let Some(source) = melting_layer_caveat
             && ctx.surfaces.paints(Surface::Glass)
         {
@@ -453,12 +321,9 @@ pub(super) fn render_pane_map_content(
         if !selected.is_empty() {
             ctx.overlays.selected_overlays = selected;
             ctx.overlays.selected_overlay_page = 0;
-            // A feature answered this frame's click — the consumption half
-            // of the fade trigger (see `PaneRenderCtx::click_consumed`).
             *ctx.click_consumed = true;
         }
 
-        // --- Check overlay hover values (model data, etc.) ---
         {
             let hover_pos = ui.ctx().pointer_hover_pos();
             ctx.pane.overlay_hover_value = None;
@@ -483,27 +348,18 @@ pub(super) fn render_pane_map_content(
             }
         }
 
-        // --- Check if any texture overlays need background re-rendering ---
         let screen_rect = ui.max_rect();
         let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
         let qzoom = current_quantized_zoom(zoom);
-        // Compute render dimensions with as much overdraw as the adapter's texture
-        // limit allows. `max_texture_side` is `max_texture_dimension_2d`, handed to
-        // egui when the renderer was built; egui only `debug_assert!`s the bound in
-        // `load_texture`, so a release build that ignored it would reach
-        // `Device::create_texture` and fail as a wgpu validation error at runtime.
+        // As much overdraw as the adapter's texture limit allows; egui only
+        // `debug_assert!`s the bound, so exceeding it is a wgpu validation error.
         let max_texture_side = ui.ctx().input(|i| i.max_texture_side) as u32;
-        // In physical pixels, not points: the framebuffer this is composited
-        // into is at the display's density and an overlay sized in points is
-        // one texel per `ppp²` physical pixels. `ui_map`'s volume arm already
-        // multiplies by this for the 3D offscreen; the 2D path did not.
+        // In physical pixels, not points: an overlay sized in points is one
+        // texel per `ppp²` physical pixels.
         let tex_plan =
             plan_overlay_texture(screen_rect, max_texture_side, ui.ctx().pixels_per_point());
         // The frame's clock, for the settle test: `needs_rerender` calls the
-        // gesture settled once the zoom has been still for
-        // `SETTLE_REPAINT_DELAY` of this time — the same clock the
-        // `request_repaint_after` below schedules against, so the frame that
-        // repaint buys is a frame on which the settle can actually pass.
+        // gesture settled once the zoom has been still for `SETTLE_REPAINT_DELAY`.
         let now = ui.input(|i| i.time);
 
         // Whether any overlay on this pane is showing a texture rasterised at a
@@ -511,9 +367,7 @@ pub(super) fn render_pane_map_content(
         let mut settle_owed = false;
 
         // The live theme, read once per frame and mixed into every overlay's
-        // cache token below. Reading it *here* — not caching it app-side — is
-        // what makes a theme flip re-rasterize on the very next frame: the
-        // token moves the moment the style does. See `overlay_cache_token`.
+        // cache token below — a theme flip re-rasterizes on the next frame.
         let is_dark = ui.ctx().global_style().visuals.dark_mode;
 
         let texture_ids: Vec<LayerId> = ctx
@@ -532,13 +386,8 @@ pub(super) fn render_pane_map_content(
             let token = overlay_cache_token(ctx.overlays, ctx.pane, id, is_dark);
             let has_data = ctx.overlays.has_data(id);
             let cache = ctx.pane.overlay_cache_mut(id);
-            // Asked on every frame the overlay is live, and *not* gated on
-            // `render_in_flight` the way it used to be. `needs_rerender` is also
-            // what records the zoom it was shown and when it last moved — so a
-            // frame skipped here is a frame missing from the settle clock, and
-            // a gesture that ends while a render is in flight would take longer
-            // to notice. The flight check moved to the dispatch below, where it
-            // belongs.
+            // Asked on every frame the overlay is live, and not gated on
+            // `render_in_flight`: a skipped frame is missing from the settle clock.
             let stale = enabled
                 && has_data
                 && cache.needs_rerender(token, zoom, now, &viewport_bounds, &tex_plan);
@@ -553,21 +402,8 @@ pub(super) fn render_pane_map_content(
                 });
             }
             // `enabled && has_data` and not just `enabled`. A repaint asked for
-            // on a frame that cannot dispatch anything is a 10 Hz wakeup that
-            // nothing can ever satisfy — and an overlay whose data has gone
-            // while its texture has not is precisely that state.
-            //
-            // Matching the dispatch above is *not* what makes this right, and
-            // the first version of this line matched it exactly and was still
-            // wrong. What has to hold is that a dispatched render can actually
-            // land: `spawn_overlay_render` asks the handler for its described
-            // input and abandons the render if it declines, which clears
-            // nothing and leaves `zoom_is_stale` true for ever. `has_data` is
-            // that condition only because
-            // `every_texture_handler_agrees_with_its_own_rasterizer` holds it
-            // to each handler's own `prepare_job` —
-            // `SpcOutlookHandler`'s did not, and unticking its products left
-            // this pane asking for a frame every 100 ms until the app closed.
+            // on a frame that cannot dispatch anything is a 10 Hz wakeup nothing
+            // can satisfy.
             if enabled && has_data && cache.zoom_is_stale(zoom) {
                 settle_owed = true;
             }
@@ -577,36 +413,17 @@ pub(super) fn render_pane_map_content(
         }
 
         // Ask for one more frame while any overlay is still at the wrong zoom.
-        //
-        // This is what makes the settle render in `needs_rerender` reachable
-        // rather than lucky. That test fires when a cache sees the same zoom
-        // twice running, and egui is *reactive*: the last frame of a wheel or
-        // pinch gesture is driven by the input event that ended it, and if
-        // nothing asks for another one, none arrives — the cache never gets its
-        // second look, and the overlay stays soft until the user pans, changes
-        // a layer, or a poll lands. That is the failure this whole change has to
-        // not have, and it is silent when it happens.
-        //
-        // A delay rather than an immediate repaint, so it is also the gesture's
-        // debounce: during a gesture the input frames arrive first and supersede
-        // it, and the settle happens a beat after the fingers stop. It is
-        // self-limiting — the moment the settle render lands, `zoom_is_stale` is
-        // false and nothing here asks again.
         if settle_owed {
             ui.ctx()
                 .request_repaint_after(crate::overlay_cache::SETTLE_REPAINT_DELAY);
         }
     }
-    // overlay_ctx (and its shared borrow of ui) is dropped here
 
     // Long-press tooltip: show the radar value above the finger. Reached only
-    // when the touch pipeline ran this frame, which is now a runtime decision
-    // (`InteractionState`) rather than a target one — a touchscreen laptop and
-    // a phone browser both get here.
+    // when the touch pipeline ran this frame (`InteractionState`).
     if let Some(touch_pos) = ctx.long_press_pos
         && ctx.pane_rect.contains(touch_pos)
     {
-        // Try overlay cache meta first (non-loop static render), then loop frame
         let raw_meta = ctx
             .pane
             .overlay_cache(&known::RADAR)
@@ -640,74 +457,7 @@ pub(super) fn render_pane_map_content(
 }
 
 /// The token a texture overlay's cached raster is keyed by: it moves exactly
-/// when the picture would be different, and a move is what buys a re-rasterize.
-///
-/// # It is the content signature, not the fetch counter
-///
-/// [`OverlayHandler::content_signature`] exists for this call and had no other
-/// caller. Every texture overlay that auto-polls returns the same content most
-/// of the time — NWS alerts poll every 120 s and the active warning set is
-/// usually unchanged — and [`OverlayRegistry::data_generation`] is bumped by
-/// `set_data` on *every* successful poll, so keying on it re-rasterized a
-/// byte-identical overlay twice a minute per pane, then converted the result to
-/// a `ColorImage` on the frame thread: ~47 ms of frame-thread work at 5760×3240
-/// for a picture nobody could tell had been redrawn. The trait's default
-/// implementation *is* `data_generation`, so a handler that cannot tell the
-/// difference is unaffected and still refreshes on every poll.
-///
-/// # `RadarSites` keys on the pane instead
-///
-/// Its handler holds no fetched data at all — the site table is resident — so
-/// neither token says anything about it. What invalidates its raster is the
-/// pane's own `radar_sites_render_gen`, bumped when the egui context is torn
-/// down and every texture handle with it (`Gui::clear_graphics_state`).
-///
-/// # The theme is a coordinate of the picture
-///
-/// Some handlers rasterize *in* the theme: the SPC outlook's hatch colour, the
-/// GLM and storm-report glyphs, and the radar-site plates all branch on
-/// `RasterizeContext::is_dark` at raster time. So for those, a dark-mode raster
-/// and a light-mode raster of identical content are different pictures, and the
-/// token says so by XOR-ing in a fixed odd 64-bit constant when the theme is
-/// dark. The caller reads the **live** theme each frame — off the egui context,
-/// not off any app-side cached copy — which is what makes a flip propagate on
-/// the frame it happens with no plumbing; the collision worst case of the XOR
-/// is one redundant raster.
-///
-/// # Which handlers, and who decides
-///
-/// [`OverlayHandler::theme_sensitive`] does — the handler, in its own file,
-/// beside the branch it is describing. The term used to be applied *uniformly*
-/// to every layer, which was the right shape for a fix that had to be certain
-/// it missed nothing, and the wrong shape to keep: a layer whose pixels are
-/// theme-independent paid a full re-rasterize on every flip, and the only
-/// record of which layers actually needed it was this comment.
-///
-/// It answers `true` for exactly the four `RenderMode::Texture` handlers whose
-/// job input carries `is_dark` — SPC outlook, lightning, storm reports and
-/// radar sites. **METAR is not among them**, and that is not an omission: it is
-/// `RenderMode::PerFramePoint`, it has no cached raster and reaches no branch
-/// of this function, and its theme read is per frame and already correct. See
-/// that method's own doc for why a layer that plainly *looks* different in dark
-/// mode still declares `false` here.
-///
-/// # RadarSites is invalidated twice, and stays that way
-///
-/// Its base is the pane's own `radar_sites_render_gen`, which
-/// `App::adopt_theme` bumps on a flip, **and** it declares `theme_sensitive`,
-/// so the XOR applies too. Either alone would do it today. Both are kept
-/// deliberately: the gen bump is scheduled to move to the pane-ref work, and a
-/// token that quietly became single-sourced on it in the meantime would lose
-/// its theme invalidation at the moment that bump moves, with nothing failing
-/// to say so.
-///
-/// The radar image itself is not a layer this function is ever asked about —
-/// the draw loop's radar arm never calls it — so radar's 32-128 MiB-per-entry
-/// `RenderCache` LRU still cannot be flushed by a theme flip, which is the
-/// property `app::theme_flip_tests` holds from the other side.
-///
-/// [`OverlayHandler::content_signature`]: rustdar_overlays::render::overlay_state::OverlayHandler::content_signature
-/// [`OverlayHandler::theme_sensitive`]: rustdar_overlays::render::overlay_state::OverlayHandler::theme_sensitive
+/// when the picture would be different.
 fn overlay_cache_token(
     overlays: &OverlayRegistry,
     pane: &PaneState,
@@ -725,21 +475,6 @@ fn overlay_cache_token(
 
 /// Render the radar image overlay, range ring, and hover tooltip (loop playback
 /// path).
-///
-/// # This is the loop's per-frame path, and it no longer computes a placement
-///
-/// It used to open with `ImageBounds::from_radar_site(img.lat, img.lon,
-/// img.max_range_km)` — a `cos`, two `tan`s and two `ln`s — to rebuild, on
-/// every frame of every animating pane, the four edges the delivery had already
-/// worked out from the very same three numbers. The frame carries
-/// [`RadarImageData::placed`] now and this reads it.
-///
-/// **No off-screen cull, deliberately.** [`draw_overlay_texture`] skips a
-/// submission whose rect misses the pane and this does not; the two share the
-/// rect arithmetic (`overlay_cache::placed_rect`) and nothing else. Adding one
-/// here would change what loop playback draws, unmeasured, on the strength of a
-/// convergence that was about arithmetic — see `draw_overlay_texture`'s own
-/// note for the other half of the decision.
 fn render_radar_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -771,19 +506,6 @@ fn render_radar_overlay(
 }
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
-///
-/// `extent_km` is the half-width the frame beneath it was projected at — the
-/// render's own `max_range_km`, not a constant. The ring is the edge of the
-/// picture, and it has to keep being that: on a TDWR long-range cut the
-/// picture ends at 417 km, and a ring still drawn at 230 would cut a circle
-/// through the middle of the echo it is supposed to bound.
-///
-/// The northward offset is [`KM_PER_DEGREE_LAT`], the same sphere `render_gate`
-/// places the gates on and [`ImageBounds`] frames them with. It read `111.32`
-/// until those were unified, which drew the ring ~258 m *outside* the coverage
-/// the data actually reached — see `rustdar_geo::KM_PER_DEGREE_LAT`.
-/// The extent is the multiplier and the sphere is the divisor, so the two
-/// changes are independent: a wider frame moves the ring, not the planet.
 fn render_radar_range_ring(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -808,11 +530,6 @@ fn render_radar_range_ring(
 
 /// The picture's gates and the site they were measured from — what a hover
 /// query needs.
-///
-/// The extent went with the value grid. A readout used to divide the pointer's
-/// position by the rectangle the raster was drawn into, so it had to be told
-/// which frame that was; it asks the gates where a *point* is now, and a gate
-/// knows its own range.
 struct RadarHoverData<'a> {
     hover: &'a HoverSource,
     lat: f64,
@@ -840,7 +557,6 @@ fn update_pane_hover_value_from_meta(
         return;
     };
 
-    // Suppress hover when cursor is over a floating dialog or popup window.
     if ui
         .ctx()
         .layer_id_at(hover_pos)
@@ -852,9 +568,7 @@ fn update_pane_hover_value_from_meta(
     }
 
     // Recomputed every frame the pointer is over the pane, stationary or not:
-    // `render_pane_map_content` clears `hover_value` at its top, so a value
-    // cached behind a did-the-pointer-move gate would blank the readout the
-    // moment the mouse rested.
+    // `render_pane_map_content` clears `hover_value` at its top.
     pane.last_hover_pos = Some(hover_pos);
 
     let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
@@ -874,11 +588,6 @@ fn update_pane_hover_value_from_meta(
 }
 
 /// A hover readout pinned to the pointer, on a layer that cannot claim it.
-///
-/// `egui::Tooltip` puts its `Area` up **interactable**, so `layer_id_at`
-/// reports it at the pointer it is anchored to and the dialog gate
-/// (`filter_dialog_blocked`, `is_pos_blocked`) then throws away the click that
-/// follows. Hovering a thing on the map is what made it unclickable.
 fn map_hover_tooltip(
     ctx: &egui::Context,
     id: egui::Id,
@@ -901,19 +610,9 @@ fn map_hover_tooltip(
 
 /// One radar site that landed near enough to this pane to matter, with the
 /// projection already done.
-///
-/// The single product of the site table walk: both consumers — the exclusion
-/// list the overlays under the sites are hit-tested against, and the label /
-/// click / hover pass — read this rather than re-projecting.
 struct VisibleSite {
-    /// The row itself, not its position in the table.
-    ///
-    /// This used to be a `usize` index back into the compiled-in array, which
-    /// was safe only because the array could never change length. The table is
-    /// resolved at runtime now and a later one can be longer, so an index
-    /// minted during the walk would name a different radar by the time the
-    /// interaction pass read it. The reference cannot: the rows are leaked, so
-    /// it stays valid and keeps naming the radar it was minted for.
+    /// The row itself, not its position in the table: a table resolved at
+    /// runtime can change length, so an index would name a different radar.
     site: &'static RadarSite,
     /// Screen position of the site marker's centre.
     screen: egui::Pos2,
@@ -922,11 +621,7 @@ struct VisibleSite {
 }
 
 /// Project the radar site table once, keeping the sites within a 100 px margin
-/// of this pane.
-///
-/// Empty when the layer is off, which is the same condition the sites arm of
-/// the draw loop runs under — nothing downstream pays for a walk whose result
-/// would be discarded.
+/// of this pane. Empty when the layer is off.
 fn visible_radar_sites(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -937,8 +632,7 @@ fn visible_radar_sites(
         return Vec::new();
     }
     // The margin is what lets a site just off the edge still draw its label and
-    // take a click on the icon straddling the boundary — see the harness's
-    // `a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge`.
+    // take a click on the icon straddling the boundary.
     let near = ui.max_rect().expand(100.0);
     let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
     visible_sites_in(
@@ -949,13 +643,9 @@ fn visible_radar_sites(
     )
 }
 
-/// The walk itself, over whichever table it is handed.
-///
-/// Split out from [`visible_radar_sites`] so the table is an argument rather
-/// than a global read: that is what lets a test hand it two tables of
-/// different lengths and check that each [`VisibleSite`] still names the row
-/// it was built from. `project` stands in for the map projection, which is the
-/// only part of the caller that needs a live `egui::Ui`.
+/// The walk itself, over whichever table it is handed. The table is an argument
+/// rather than a global read so a test can hand it two tables of different
+/// lengths.
 fn visible_sites_in(
     rows: &'static [RadarSite],
     near: egui::Rect,
@@ -978,28 +668,14 @@ fn visible_sites_in(
 }
 
 /// Per-frame radar site label rendering and interaction detection.
-///
-/// The site circles and background pills are in the background-rasterized
-/// texture; this function draws text labels (tiny-skia cannot render text)
-/// and handles interactive hits (clicks → site switch, hover → tooltip/cursor).
-///
-/// `sites` is [`visible_radar_sites`]' output for this pane and frame: the
-/// projection and the on-screen test are already done, so this walks only the
-/// sites that can be seen.
-///
-/// `overlay_click_pos` must be taken from `PaneRenderCtx::overlay_click_pos`
-/// (pre-filtered — dialog clicks are already stripped). Never pass a raw
-/// `ctx.input()` click position here.
 fn handle_radar_site_interactions(
     ui: &egui::Ui,
     zoom: f64,
     sites: &[VisibleSite],
     ctx: &mut PaneRenderCtx<'_>,
 ) {
-    // Everything below used to arrive as seven separate parameters, all of
-    // them copied out of `PaneRenderCtx` at the single call site. Destructuring
-    // borrows the fields disjointly, so `pane` and `actions` stay mutable while
-    // `excluded_rects` is read.
+    // Destructuring borrows the fields disjointly, so `pane` and `actions` stay
+    // mutable while `excluded_rects` is read.
     let PaneRenderCtx {
         pane,
         actions,
@@ -1033,7 +709,6 @@ fn handle_radar_site_interactions(
         let site_screen = site.screen;
         let icon_rect = site.icon_rect;
 
-        // Draw the text label below the marker (background pill is in the texture)
         if zoom >= 5.0 {
             let text_pos = egui::pos2(site_screen.x, site_screen.y + icon_size / 2.0 + 3.0);
             ui.painter().text(
@@ -1055,8 +730,6 @@ fn handle_radar_site_interactions(
                 site: radar_site.name.to_string(),
                 pane_idx,
             });
-            // An icon answered this frame's click — the consumption half of
-            // the fade trigger (see `PaneRenderCtx::click_consumed`).
             **click_consumed = true;
         }
 
@@ -1066,8 +739,7 @@ fn handle_radar_site_interactions(
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             // The feedhorn, not the ground: it is the figure a published
-            // station record quotes as the radar's elevation, so it is the
-            // one a reader can check this tooltip against.
+            // station record quotes as the radar's elevation.
             let elev_str = match radar_site.height_ft(rustdar_radar::sites::Datum::Feedhorn) {
                 Some(e) => {
                     let converted = prefs.height.convert_from_feet(e as f32);
@@ -1112,7 +784,6 @@ fn render_user_location(
 
     let blue = egui::Color32::from_rgb(30, 130, 255);
 
-    // Draw heading wedge behind the dot if a heading is available
     if let Some(heading_deg) = heading {
         let wedge_radius = 28.0;
         let half_angle = 22.5_f32.to_radians(); // 45° total wedge
@@ -1139,7 +810,6 @@ fn render_user_location(
         ));
     }
 
-    // Blue dot (same as before)
     ui.painter().circle_filled(
         user_screen,
         14.0,
@@ -1152,7 +822,6 @@ fn render_user_location(
     );
     ui.painter().circle_filled(user_screen, 7.0, blue);
 
-    // Hover/tap popup with fix details
     if let Some(fix) = fix {
         let dot_rect = egui::Rect::from_center_size(user_screen, egui::vec2(28.0, 28.0));
         if let Some(hover_pos) = ui.ctx().pointer_hover_pos()
@@ -1213,14 +882,6 @@ const SCALE_STACK_GAP: f32 = 40.0;
 /// How thick a fold marker is across the bar's long axis, logical pixels.
 const FOLD_TICK_THICKNESS: f32 = 2.0;
 /// How far a fold marker sticks out past each face of the bar, logical pixels.
-///
-/// **The overhang is load-bearing, not decoration.** `InputHarness::
-/// color_scale_bars` classifies a legend by shape — a rect 20 points across
-/// the bar and ≤4 along it is one strip of the ramp — and a marker drawn to the
-/// bar's own width would be counted as one more strip of colour by every test
-/// that asserts on those counts. Standing 3 points proud of both faces takes
-/// the marker to 26 points, out of that classifier's reach, and is also what
-/// makes it legible against the saturated red and green it is drawn over.
 const FOLD_TICK_OVERHANG: f32 = 3.0;
 /// Side of the range-folded key swatch, logical pixels — small enough to stand
 /// in the [`SCALE_MARGIN`] past the end of the bar, and nowhere near the
@@ -1233,64 +894,17 @@ const RF_SWATCH_LABEL: &str = "RF";
 /// title, logical pixels — [`SCALE_FONT_SIZE`] plus the shadow's own offset.
 const FOLD_TITLE_LINE: f32 = SCALE_FONT_SIZE + SHADOW_OFFSET + 1.0;
 /// The gap between a **vertical** bar's inner face and the value labels read
-/// against it, logical pixels. They are drawn `RIGHT_CENTER` at this offset, so
-/// each one runs from here further in by however wide it lays out.
+/// against it, logical pixels. Drawn `RIGHT_CENTER` at this offset.
 const SCALE_LABEL_GAP: f32 = 4.0;
 /// The gap between a **horizontal** bar's top edge and the value labels read
-/// against it, logical pixels. They are drawn `CENTER_BOTTOM` at this offset,
-/// so each one stands this much plus one row height above the bar.
+/// against it, logical pixels. Drawn `CENTER_BOTTOM` at this offset.
 const SCALE_LABEL_LIFT: f32 = 2.0;
 /// How far in from the pane's own edge the fold annotation is hung, logical
-/// pixels — see the note at its draw site for why it hangs off the pane rather
-/// than off the bar it annotates.
+/// pixels.
 const FOLD_TITLE_INSET: f32 = 2.0;
 
 /// How far in from the pane edge it stands on the colour-scale block reaches,
 /// logical pixels — `0.0` when this pane draws no legend at all.
-///
-/// # What this is for
-///
-/// A pane's *floating* chrome has to know where the legend is, because the
-/// legend is not a widget and cannot fight for the space: it is painted
-/// straight onto the glass, senses nothing, and is drawn before the chrome. The
-/// 3D pane's Volume Alpha button was planted in the pane's top-right corner,
-/// which in the vertical orientation is the corner the scale's unit title
-/// stands in — the two overlapped at every pane width, `dBZ` printed through
-/// the button's label.
-///
-/// The button moves rather than the legend, and the asymmetry is the point.
-/// A 3D pane draws its legend by exactly the placement rules a plan view uses,
-/// with the panel-wide orientation resolved once for the whole grid, so that a
-/// 3D pane's bar lines up with its neighbour's in a split — see
-/// `Gui::draw_volume_glass`. Forking that for one pane kind would trade a
-/// visible overlap for an invisible inconsistency. The button, by contrast,
-/// exists on 3D panes alone and has no such contract to keep.
-///
-/// # Why it counts the overlay bars too
-///
-/// `render_overlay_color_scales` stacks a bar per overlay layer that publishes
-/// a legend, each one [`SCALE_STACK_GAP`] further in, each with a title of its
-/// own at the same height as the radar scale's. So the block's inner edge moves
-/// with the layer stack, and a gutter that only knew about the radar bar would
-/// leave the button over the *second* title instead of the first.
-///
-/// # Why it lays the text out instead of reserving a constant
-///
-/// Every mark past the bar is text, and how far past the bar it reaches is how
-/// wide that text lays out — which is a function of the product, of the unit
-/// preference its ticks are converted into, and of the font. A constant can
-/// only be the widest of those, and until this was measured it was not even
-/// that: the reserve was [`SCALE_BAR_WIDTH`] plus 16 points for the *title*,
-/// with the value labels beside the bar left out of the sum entirely.
-///
-/// Correlation coefficient is what that cost. Its bar ends at `0.98`, which
-/// lays out 21.3 points wide against the 12 the old sum left between the label
-/// and the gutter's inner edge, and — being a gradient scale whose last stop is
-/// its `max_value` — that label centres on the very top of the bar, level with
-/// the Volume Alpha button. `0.98` printed through the button on every 3D pane
-/// showing ρHV, in every unit preference, the default included. Velocity's
-/// `130` in km/h (18.6) and differential phase's `345` (18.6) cleared the
-/// button's own 8-point margin by under a point and a half.
 pub(super) fn color_scale_gutter(
     measure: &egui::Painter,
     pane_rect: egui::Rect,
@@ -1321,9 +935,7 @@ pub(super) fn color_scale_gutter(
     }
 
     // The radar bar stands on the margin; each stacked overlay bar stands one
-    // bar-and-gap further in. Every one of them is measured rather than the
-    // innermost alone, because which block reaches deepest is a question about
-    // their titles and ticks and not only about their offsets.
+    // bar-and-gap further in. Every one is measured, not the innermost alone.
     let ticks = memoized_ticks(measure.ctx(), pane, prefs);
     let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
     let mut offset = 0.0;
@@ -1350,18 +962,8 @@ pub(super) fn color_scale_gutter(
     let mut gutter = SCALE_MARGIN + reach;
 
     // The legend's second line is hung off the pane's own edge rather than off
-    // a bar, so it is a floor under the whole gutter rather than a term in one
-    // block's reach. Read through `legend_second_line` — the same function the
-    // painter draws from, not a restatement of it, so the reservation cannot
-    // come to disagree with what is drawn.
-    //
-    // It matters more since storm-relative velocity started drawing its vector
-    // there. `folds \u{b1}229` is the widest the fold line ever got, at ten
-    // characters; `SRM 32 kt @ 240\u{b0} (mean wind)` is nearly three times as
-    // many, and the widest tag is the one the chain defaults to. The width is
-    // measured here rather than estimated, because a pane narrow enough for it
-    // to matter is exactly the pane whose floating chrome would otherwise print
-    // through it.
+    // a bar, so it is a floor under the whole gutter. Read through
+    // `legend_second_line`, the same function the painter draws from.
     if !horizontal && let Some(line) = legend_second_line(pane, prefs) {
         gutter = gutter.max(FOLD_TITLE_INSET + laid_out_width(measure, &line, SCALE_FONT_SIZE));
     }
@@ -1382,21 +984,6 @@ fn laid_out_width(measure: &egui::Painter, text: &str, size: f32) -> f32 {
 
 /// How far in from the pane edge one bar's block reaches: the bar itself, the
 /// value labels read against it, and the unit title centred on it.
-///
-/// `offset` is how far in the bar's own outer face already stands — `0.0` for
-/// the radar bar, one [`SCALE_BAR_WIDTH`] + [`SCALE_STACK_GAP`] more for each
-/// overlay bar stacked inside it. The [`SCALE_MARGIN`] the outermost bar stands
-/// on is the caller's to add, since every block shares it.
-///
-/// The two orientations put the marks on different sides of the bar, so they
-/// measure different things:
-///
-/// * **Vertical** — the labels run down the bar's inner face and the title is
-///   centred above it, so the block is as wide as the wider of the two.
-/// * **Horizontal** — the labels stand above the bar and the title is written
-///   under it, inside the [`SCALE_MARGIN`] the bar already stands on, so the
-///   labels alone set the height. Their width does not matter here: they are
-///   centred along a bar that spans the pane, not stacked past its end.
 fn legend_block_reach(
     measure: &egui::Painter,
     horizontal: bool,
@@ -1416,9 +1003,8 @@ fn legend_block_reach(
         SCALE_LABEL_LIFT + row
     } else {
         // Every threshold, not the drawn subset: `MIN_LABEL_SPACING` thinning
-        // drops labels a short bar has no room for, and reserving for one that
-        // was thinned costs a few points of glass while re-deriving which
-        // survived would be a second copy of the painter's own arithmetic.
+        // drops labels a short bar has no room for, and re-deriving which
+        // survived would be a second copy of the painter's arithmetic.
         let widest = ticks
             .iter()
             .map(|tick| laid_out_width(measure, tick, SCALE_FONT_SIZE))
@@ -1430,10 +1016,8 @@ fn legend_block_reach(
 }
 
 /// The part of `pane_rect` the colour scale has *not* claimed: where a pane's
-/// floating chrome may sit without printing through a legend.
-///
-/// See [`color_scale_gutter`] for which edge it comes off and why the chrome is
-/// what moves.
+/// floating chrome may sit without printing through a legend. See
+/// [`color_scale_gutter`].
 pub(super) fn color_scale_free_rect(
     measure: &egui::Painter,
     pane_rect: egui::Rect,
@@ -1450,9 +1034,7 @@ pub(super) fn color_scale_free_rect(
     } else {
         free.max.x -= gutter;
     }
-    // A pane too small for both keeps its own rect rather than an inverted one:
-    // an overlap is better than chrome laid out backwards, and the bail above
-    // has already covered the pane that draws no bar.
+    // A pane too small for both keeps its own rect rather than an inverted one.
     if free.width() < 1.0 || free.height() < 1.0 {
         return pane_rect;
     }
@@ -1470,18 +1052,8 @@ fn short_tick(value: f32) -> String {
 }
 
 /// Every value label `render_color_scale` writes beside `product`'s bar, in
-/// order, before `MIN_LABEL_SPACING` thinning takes out the ones a short bar
-/// has no room for.
-///
-/// Named once because three callers want it: the painter, the gutter that has
-/// to leave room for what the painter writes, and the tests that check the
-/// wording. Two spellings of the tick list is how the gutter comes to reserve
-/// room for labels the bar is no longer labelled with.
-///
-/// The **formatting**, not the per-frame answer: [`memoized_ticks`] is what the
-/// painter and the gutter call, and it calls this on a miss. Tests call it
-/// directly, which is the point of it staying a plain function of its
-/// arguments.
+/// order, before `MIN_LABEL_SPACING` thinning. The **formatting**, not the
+/// per-frame answer: [`memoized_ticks`] calls this on a miss.
 pub(super) fn legend_ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
     get_legend_scale_ref(product)
         .thresholds
@@ -1490,14 +1062,9 @@ pub(super) fn legend_ticks(product: RadarProduct, prefs: &UserPreferences) -> Ve
         .collect()
 }
 
-/// [`legend_ticks`], formatted at most once per preferences change.
-///
-/// The bar's labels are a `Vec<String>` per call, and both per-frame callers
-/// want the same one — a preference the user changes by opening a settings
-/// sheet, rebuilt sixty times a second by two functions each. The version key
-/// is the preferences themselves rather than a hash of them: a collision here
-/// would show as a bar labelled in the wrong unit, and there is nothing to be
-/// gained by risking one.
+/// [`legend_ticks`], formatted at most once per preferences change. The version
+/// key is the preferences themselves rather than a hash: a collision would show
+/// as a bar labelled in the wrong unit.
 fn memoized_ticks(
     ctx: &egui::Context,
     pane: &PaneState,
@@ -1513,10 +1080,6 @@ fn memoized_ticks(
 }
 
 /// An overlay bar's value labels, formatted at most once per legend signature.
-///
-/// `{val:.0}` is the form these have always been written in: an overlay legend
-/// carries no product, so there is no unit preference to convert through — its
-/// `unit_label` is a fixed string it supplies itself.
 fn memoized_overlay_ticks(
     ctx: &egui::Context,
     id: &LayerId,
@@ -1537,13 +1100,10 @@ fn memoized_overlay_ticks(
     )
 }
 
-/// The baked ramp for `pane`'s radar colour bar.
-///
-/// Sampled through [`get_color_for_value`] — the same function the per-pixel
-/// draw called, at the same values — so the bar is the palette's own answer and
-/// not a re-interpolation of the legend's stops. The palette is a compile-time
-/// table, so the ramp is [`legend_ramp::IMMUTABLE`]: baked on the frame the
-/// product changes, and never again.
+/// The baked ramp for `pane`'s radar colour bar. Sampled through
+/// [`get_color_for_value`] at the legend's own values, so the bar is the
+/// palette's answer; the palette is a compile-time table, so the ramp is
+/// [`legend_ramp::IMMUTABLE`].
 fn radar_ramp(ctx: &egui::Context, pane: &PaneState, horizontal: bool) -> egui::TextureHandle {
     let product = pane.selected_product;
     let scale = get_legend_scale_ref(product);
@@ -1563,12 +1123,6 @@ fn radar_ramp(ctx: &egui::Context, pane: &PaneState, horizontal: bool) -> egui::
 }
 
 /// Format a legend label value. For HHC uses category names; for others, a short numeric string.
-///
-/// Values arrive in the unit `get_color_for_value` takes, which for several
-/// products is not the unit the user asked for: velocity's ramp is authored in
-/// mph and sampled in m/s, MEHS's in inches (`rustdar-radar`'s `palette.rs`).
-/// The colours stay where the palette put them and the *ticks* are converted
-/// here, so a preference change relabels the bar without recolouring it.
 fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreferences) -> String {
     match product {
         RadarProduct::HydrometeorClassification => match value as u16 {
@@ -1584,9 +1138,7 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
             100 => "HA".into(),
             110 => "LH".into(),
             120 => "GH".into(),
-            // `hc.lgd`'s own displayed code for melting snow. The palette
-            // carries a swatch for the class, so without this arm the bar
-            // would key it with the bare number `130`.
+            // `hc.lgd`'s own displayed code for melting snow.
             130 => "MS".into(),
             140 => "UK".into(),
             150 => "RF".into(),
@@ -1600,14 +1152,8 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
             let converted = prefs.speed.convert_from_ms(value);
             format!("{converted:.0}")
         }
-        // Both echo-tops products, because both are titled off
-        // `HeightUnit::kilo_suffix` and both are read out through
-        // `convert_kft_to_kilo` in `RadarProduct::format_value`. The
-        // interpolated one was missing from this arm alone: in metres its bar
-        // was labelled `60` under a title reading `km` while the readout under
-        // the pointer said `18.3 km` for the same pixel — the half-converted
-        // pane `a_mehs_tick_and_the_hover_readout_are_the_same_number` was
-        // written to rule out, on the one product that test did not reach.
+        // Both echo-tops products: both are titled off `HeightUnit::kilo_suffix`
+        // and read out through `convert_kft_to_kilo`.
         RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
             let converted = prefs.height.convert_kft_to_kilo(value);
             format!("{converted:.0}")
@@ -1622,12 +1168,8 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
         }
         // The ramp's stops are the NWS quarter-inch reporting steps; the ticks
         // are whatever unit the reader thinks in. Inches keep the generic short
-        // form the bar has always been labelled with (¼-in stops as .2 / .5 /
-        // .8), because widening every label by two characters to spell out a
-        // precision the palette's own stops already imply costs margin the
-        // labels do not have; cm and mm take the unit's own precision, which is
-        // what keeps `25.40` off a 20px bar and makes each tick the same number
-        // the hover readout gives for that value.
+        // form; cm and mm take the unit's own precision, which keeps `25.40`
+        // off a 20px bar.
         RadarProduct::MaxExpectedHailSize => {
             let converted = prefs.hail_size.convert_from_inches(value);
             match prefs.hail_size {
@@ -1655,35 +1197,14 @@ const PENDING_FONT_SIZE: f32 = 12.0;
 const PENDING_PADDING: egui::Vec2 = egui::vec2(8.0, 3.0);
 
 /// What a pane says while the image on screen is not yet the product and tilt it
-/// has selected.
-///
-/// It names what is **on screen**, which is the one piece of information nothing
-/// else on the pane carries: the color scale, the tilt picker, the hover readout
-/// and the status bar's data line have all already moved to the new selection, so
-/// the pixels are the only thing left unlabelled. "Loading Velocity" would repeat
-/// what the legend beside it already says and still leave the user unable to tell
-/// what they are looking at.
-///
-/// **One wording for both datasources.** The situation is identical whichever
-/// side a product is fetched from — a Level II render takes as long as it takes,
-/// a Level III one additionally waits for its object to land — and a notice that
-/// differed, or appeared for only one of them, would be a way to read the
-/// datasource off the screen. That is exactly the tell the uniform data line was
-/// introduced to remove.
+/// has selected — the one piece of information nothing else on the pane carries.
 fn pending_render_notice(product: RadarProduct, elevation: f32) -> String {
     format!("\u{27f3} showing {} {:.1}\u{b0}", product.name(), elevation)
 }
 
-/// Draw the notice across the top of the pane, over the imagery.
-///
-/// Deliberately non-blocking: the stale image stays fully visible and
-/// undimmed. Somebody watching weather must never lose the picture to a
-/// progress indicator — the picture is still real data, just not the field
-/// they last asked for, and one product's echoes are better than none.
-///
-/// Wrapped rather than clipped, because the longest product name is wider than a
-/// pane in a six-way split and a truncated notice about a mislabelled image would
-/// be its own small lie.
+/// Draw the notice across the top of the pane, over the imagery. Non-blocking:
+/// the stale image stays fully visible and undimmed. Wrapped rather than
+/// clipped — the longest product name is wider than a pane in a six-way split.
 pub(super) fn draw_pending_render_notice(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
@@ -1700,56 +1221,18 @@ pub(super) fn draw_pending_render_notice(
 }
 
 /// What a pane says when the classification on screen is standing on a melting
-/// layer nobody measured for the volume it is drawn from.
-///
-/// # It fires on the exception, never on the ordinary case
-///
-/// Only for the two unmeasured sources — see
-/// [`MeltingLayerSource::is_measured`]. When the RPG published its own layer
-/// for this volume, or this volume's own tilts detected one, the pane says
-/// **nothing**. That is the rule the section pane's module header records the
-/// cost of learning: a caveat shown on the ordinary case is not honesty, it is
-/// an alarm people learn to skip, and it takes the exceptional case down with
-/// it.
-///
-/// # And it is not styled as a break
-///
-/// Same plate, same size, same quiet white as the pending-render notice — no
-/// red, no alert glyph. A classification on a sounding's freezing level is a
-/// qualified answer, not a failed one; the thing that is broken here would be a
-/// classification that did not say. The wording is
-/// [`MeltingLayerSource::caption`]'s, which states the measured cost for the
-/// fleet-default case rather than hedging, because "may be less accurate" is
-/// the kind of sentence that gets skipped and "four times in five" is not.
-///
-/// # And it carries no icon
-///
-/// The pending notice leads with `⟳` because it is about a *transient* state —
-/// something is on its way. This one is not: it is a standing property of the
-/// picture, and every icon calm enough to say so (`ⓘ`, `ℹ`) is either absent
-/// from egui's proportional family or carried only by the monospace one, so
-/// the alternatives are a tofu box, a second font at the draw site, or a
-/// warning triangle. A warning triangle is the thing this notice must not be.
-/// **The missing icon is the decision, not an omission** — `ⓘ` was tried
-/// first and dropped for this reason, so adding one back means loading a font
-/// that has it, not picking a glyph that renders.
-/// The plate is the marker; the sentence is the message.
+/// layer nobody measured for the volume it is drawn from — only for the two
+/// unmeasured sources, see [`MeltingLayerSource::is_measured`]. Same plate and
+/// colour as the pending-render notice, and no icon: every calm enough glyph
+/// (`ⓘ`, `ℹ`) is missing from egui's proportional family.
 fn melting_layer_notice(source: MeltingLayerSource) -> String {
     source.caption().to_owned()
 }
 
-/// Draw the melting-layer qualification across the top of the pane.
-///
-/// # Only ever one plate
-///
-/// This shares the pending notice's position, and the two cannot collide:
+/// Draw the melting-layer qualification across the top of the pane. Shares the
+/// pending notice's position and cannot collide with it:
 /// [`PaneState::displayed_melting_layer_source`] is gated through
-/// `stale_image_on_screen`, so while there is a pending notice to draw this
-/// answers `None`. That is the arrangement chosen over stacking or offsetting —
-/// the two sentences are about the same pixels and the pending one is the more
-/// urgent ("these are not the pixels you asked for" precedes "and here is what
-/// they were classified against"). Once the render lands, the pending notice
-/// goes and this one takes the same spot, so nothing moves under the reader.
+/// `stale_image_on_screen`.
 pub(super) fn draw_melting_layer_notice(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
@@ -1759,18 +1242,8 @@ pub(super) fn draw_melting_layer_notice(
     draw_top_notice(painter, pane_rect, top_margin, melting_layer_notice(source));
 }
 
-/// The rounded plate every top-of-pane notice is drawn on.
-///
-/// One spelling, so a further notice cannot acquire a different size, colour or
-/// urgency by being written separately — which is how a plain qualification
-/// ends up looking like a fault.
-///
-/// Deliberately non-blocking: the imagery stays fully visible and undimmed.
-/// Somebody watching weather must never lose the picture to a caption.
-///
-/// Wrapped rather than clipped, because the longest of these sentences is wider
-/// than a pane in a six-way split and a truncated notice about a misleading
-/// image would be its own small lie.
+/// The rounded plate every top-of-pane notice is drawn on. Non-blocking: the
+/// imagery stays fully visible and undimmed. Wrapped rather than clipped.
 fn draw_top_notice(painter: &egui::Painter, pane_rect: egui::Rect, top_margin: f32, text: String) {
     let font = egui::FontId::proportional(PENDING_FONT_SIZE);
     let wrap_width = (pane_rect.width() - SCALE_MARGIN * 2.0 - PENDING_PADDING.x * 2.0).max(1.0);
@@ -1806,18 +1279,6 @@ fn draw_shadowed_text(
 
 /// Every colour-scale legend a pane shows: the radar product's own bar, and
 /// one more for each enabled overlay that carries a legend of its own.
-///
-/// The single entry point for the pane's legends, because there are two
-/// spellings of a legend bar behind it ([`render_color_scale`] and
-/// [`render_overlay_color_scales`], which `AUDIT.md` records as ~130
-/// duplicated lines) and a caller that reached for one of them would silently
-/// draw half the legends. A 3D pane is exactly such a caller — it draws its
-/// glass from the volume arm rather than from the dispatch loop — so the pair
-/// is named once here and called by both.
-///
-/// Painted through a `Painter`, never allocated as a widget: a legend that
-/// sensed the pointer would eat the drag that belongs to the map's pan or, on
-/// a 3D pane, to the orbit camera.
 pub(super) fn render_color_scales(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
@@ -1830,44 +1291,8 @@ pub(super) fn render_color_scales(
     render_overlay_color_scales(painter, pane_rect, horizontal, pane, overlays);
 }
 
-/// Render the color scale legend bar for the current pane's radar product.
-///
-/// `horizontal` is the panel-wide orientation resolved by
-/// `pane::ColorScaleOrientation` — deliberately *not* recomputed from
-/// `pane_rect` here, so that every pane in the grid draws its bars on the same
-/// edge and dragging a divider cannot flip them.
 /// The part of `pane_rect` the colour-scale legend may draw in: the pane, less
 /// whatever the phone shell's bottom bar covers.
-///
-/// # The bar was painted and then covered
-///
-/// Nothing was wrong with the legend on a phone. It was laid out correctly,
-/// submitted correctly, and then hidden: the map is full-bleed to the window's
-/// bottom edge by design (`ui_shell` — "the map fills everything under the top
-/// bar and all other chrome floats over it"), the legend is painted into the
-/// map's own `Background` layer during the pane loop, and the Compact width
-/// class then draws an opaque, full-bleed bottom bar on `Order::Middle` over
-/// it. The legend's block is the bottom `SCALE_MARGIN + SCALE_BAR_WIDTH` = 36
-/// points of the pane; the bar is about 52 points tall. So on a 432×936 phone
-/// window the ramp, the value labels, the unit title, the `folds ±N` line and
-/// the range-folded swatch were all behind it, and a velocity pane rendered a
-/// picture with no legend at all.
-///
-/// The map keeps its full bleed — that is the design rule, and the picture
-/// *should* run under the bar. Only the chrome moves.
-///
-/// # Why the whole rect and not just the bar
-///
-/// Every piece of the legend is positioned off this rect's bottom edge, and
-/// two of them (the unit title, the RF swatch) hang *below* the bar in the
-/// margin. Shortening the rect moves all of them together and leaves the
-/// `bar_length < 40.0` bail to catch a pane the chrome has eaten, which is
-/// what should happen. Trimming the bar alone would have left the title and the
-/// swatch exactly where they were, still under the phone bar.
-///
-/// A pane whose bottom sits above the chrome is returned unchanged, so this is
-/// a no-op on every width class that draws no bar, and on the upper panes of a
-/// phone-width grid.
 pub(super) fn clear_of_bottom_chrome(pane_rect: egui::Rect, floor: f32) -> egui::Rect {
     if !floor.is_finite() || floor >= pane_rect.bottom() {
         return pane_rect;
@@ -1891,11 +1316,9 @@ pub(super) fn render_color_scale(
         return;
     }
 
-    // Orientation follows the map panel's shape, not the platform (a grid can
-    // be any shape on any target): a portrait panel gets horizontal bars along
-    // the bottom, a landscape one vertical bars on the right, so the bar spans
-    // the shorter axis and its 20px thickness eats into the longer one.
-    // See `pane::ColorScaleOrientation`.
+    // Orientation follows the map panel's shape, not the platform: a portrait
+    // panel gets horizontal bars along the bottom, a landscape one vertical
+    // bars on the right. See `pane::ColorScaleOrientation`.
     let bar_length = if horizontal {
         pane_rect.width() - SCALE_MARGIN * 2.0
     } else {
@@ -1906,9 +1329,7 @@ pub(super) fn render_color_scale(
         return; // pane too small
     }
 
-    // Compute bar rect
     let bar_rect = if horizontal {
-        // Horizontal bar along the bottom, origin at bottom-left
         let left = pane_rect.left() + SCALE_MARGIN;
         let bottom = pane_rect.bottom() - SCALE_MARGIN;
         let top = bottom - SCALE_BAR_WIDTH;
@@ -1933,11 +1354,7 @@ pub(super) fn render_color_scale(
 
     if legend.is_gradient {
         // Gradient scales: one image over a ramp baked once per product.
-        //
-        // This was a per-pixel loop — `bar_length.ceil()` strips, each a
-        // `rect_filled` behind a binary search of the palette — which is ~1032
-        // of each per bar on a 1080-point pane, every frame, for a picture that
-        // is a pure function of the product. See `crate::legend_ramp`.
+        // See `crate::legend_ramp`.
         painter.image(
             radar_ramp(painter.ctx(), pane, horizontal).id(),
             bar_rect,
@@ -1945,17 +1362,9 @@ pub(super) fn render_color_scale(
             egui::Color32::WHITE,
         );
     } else {
-        // Discrete scales: equal-sized blocks, one per threshold.
-        //
-        // Left as blocks on purpose. The cost the bake exists to remove is the
-        // gradient's — a search per pixel of bar; a discrete bar reads
-        // `thresholds[i]` directly and issues one rect per stop, at most a few
-        // dozen. What it would *lose* is the reason: these blocks are hard
-        // edges at exact fractions of the bar, drawn as rects and antialiased
-        // by the tessellator, and a stretched `NEAREST` texture would put each
-        // boundary within a texel of where it is now rather than on it. A
-        // category bar whose edges moved is a visible change bought for
-        // nothing.
+        // Discrete scales: equal-sized blocks, one per threshold. Left as
+        // blocks on purpose: these are hard edges at exact fractions of the
+        // bar, and a stretched `NEAREST` texture would move each boundary.
         for i in 0..n {
             let (_, rgb) = legend.thresholds[i];
             let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
@@ -1984,32 +1393,6 @@ pub(super) fn render_color_scale(
     }
 
     // --- Fold markers: where the picture on the glass wraps ---
-    //
-    // Painted over the finished ramp, so the marker sits on the colour it is
-    // about rather than under it. The ramp itself is untouched by this — see
-    // [`fold_marker_positions`] for why a re-scaling velocity ramp was refused.
-    //
-    // Storm-relative velocity draws this same ramp and is deliberately never
-    // marked: its field is dealiased before the storm motion comes off it, so
-    // it runs past ±Vny legitimately. The gate is in
-    // [`PaneState::displayed_nyquist_ms`], which answers for base velocity
-    // alone, and this is one of the two places that would look like an
-    // oversight without it.
-    // Filtered here, above both halves of the annotation, so the caption and
-    // the markers answer from one decision about what a fold limit is.
-    //
-    // They did not, and the asymmetry shipped. `fold_marker_positions` has
-    // always refused a non-positive limit and correctly drawn nothing;
-    // `fold_title_line` had no such test and formatted whatever it was handed.
-    // Every TDWR declares `nyquist_velocity = 0` on every cut, so what a user
-    // saw on a TDWR velocity pane was the caption `folds ±0` over a bar with no
-    // markers on it — the two halves of one annotation disagreeing in public.
-    //
-    // `DeclaredNyquist::declare` now refuses that zero at the archive, which is
-    // the fix; this is the legend declining to caption a speed it will not
-    // mark, which holds whatever a future producer stamps into a frame's
-    // metadata. The legend is a leaf and cannot check provenance, so it checks
-    // the one thing it can: a picture does not fold at zero.
     let folds_at = pane
         .displayed_nyquist_ms()
         .filter(|ms| ms.is_finite() && *ms > 0.0);
@@ -2043,9 +1426,7 @@ pub(super) fn render_color_scale(
                 )
             };
             // The same dark backing `draw_shadowed_text` gives every label on
-            // this bar: at ±22 m/s the ramp under the marker is a mid red on
-            // one side and a mid green on the other, and a bare white line
-            // reads as a highlight on the second of them.
+            // this bar: a bare white line reads as a highlight over mid green.
             painter.rect_filled(
                 marker.expand(1.0),
                 0.0,
@@ -2055,7 +1436,6 @@ pub(super) fn render_color_scale(
         }
     }
 
-    // --- Labels: draw threshold values alongside the bar ---
     let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
     let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
 
@@ -2063,7 +1443,6 @@ pub(super) fn render_color_scale(
     let tick_text = memoized_ticks(painter.ctx(), pane, prefs);
     for ((i, &(val, _)), text) in legend.thresholds.iter().enumerate().zip(tick_text.iter()) {
         let pixel_pos = if legend.is_gradient {
-            // Gradient: value-proportional positioning
             let t = (val - min_val) / range;
             if horizontal {
                 bar_rect.left() + t * bar_rect.width()
@@ -2071,7 +1450,6 @@ pub(super) fn render_color_scale(
                 bar_rect.bottom() - t * bar_rect.height()
             }
         } else {
-            // Discrete: index-based positioning (bottom/left edge of each block)
             let t = i as f32 / n as f32;
             if horizontal {
                 bar_rect.left() + t * bar_rect.width()
@@ -2082,7 +1460,6 @@ pub(super) fn render_color_scale(
         label_positions.push((pixel_pos, text));
     }
 
-    // Filter out labels that are too close to the previous one
     let mut prev_pos: Option<f32> = None;
     let thinned: Vec<(f32, &str)> = label_positions
         .iter()
@@ -2100,7 +1477,6 @@ pub(super) fn render_color_scale(
 
     for (pixel_pos, text) in &thinned {
         if horizontal {
-            // Labels above the bar
             let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
             draw_shadowed_text(
                 painter,
@@ -2110,7 +1486,6 @@ pub(super) fn render_color_scale(
                 label_font.clone(),
             );
         } else {
-            // Labels to the left of the bar
             let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
             draw_shadowed_text(
                 painter,
@@ -2128,16 +1503,6 @@ pub(super) fn render_color_scale(
     let fold_line = legend_second_line(pane, prefs);
     if horizontal {
         // Under the bar's left end, reading left to right: `mph  folds ±50`.
-        //
-        // **Not beside the bar**, where it used to be. A bottom-edge bar starts
-        // `SCALE_MARGIN` in from the pane's edge, so a title right-anchored to
-        // its left end had 12 points to lay out in — and `mph` is 24 points
-        // wide, `dBZ` 22, `kg/m²` 30. The painter is clipped to the pane, so
-        // the half that did not fit was cut off at the pane's edge rather than
-        // overlapping anything: on a phone, which is where a bottom-edge bar
-        // is drawn, the colour scale has been labelled `ph` and `Bz`. The
-        // bottom margin below the bar is 16 points of clear glass the full
-        // width of the pane.
         let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
         draw_shadowed_text(
             painter,
@@ -2163,9 +1528,7 @@ pub(super) fn render_color_scale(
         }
     } else {
         // Two lines stacked above the bar, unit on top. `SCALE_TITLE_MARGIN`
-        // reserves 16 points there and the pane's own edge gives the second
-        // line the 16 above that, so the block ends flush with the pane top
-        // rather than running off it.
+        // reserves 16 points and the pane's edge gives the second line 16 more.
         let stacked = fold_line.as_ref().map_or(0.0, |_| FOLD_TITLE_LINE);
         let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0 - stacked);
         draw_shadowed_text(
@@ -2176,12 +1539,8 @@ pub(super) fn render_color_scale(
             title_font,
         );
         if let Some(line) = &fold_line {
-            // Hung off the pane's own edge rather than centred on the bar like
-            // the title above it, and by 2 points at `folds ±50` the two look
-            // the same. They stop looking the same at three digits — 63.5 m/s
-            // is `folds ±229` in km/h, 52 points wide over a 20-point bar
-            // standing 16 points from the edge — and a centred line would hand
-            // the last digit to the painter's clip rect.
+            // Hung off the pane's own edge rather than centred on the bar:
+            // `folds ±229` is 52 points over a 20-point bar 16 points in.
             draw_shadowed_text(
                 painter,
                 egui::pos2(pane_rect.right() - FOLD_TITLE_INSET, bar_rect.top() - 4.0),
@@ -2195,13 +1554,8 @@ pub(super) fn render_color_scale(
     // --- The range-folded key ---
     if range_folded_is_painted(product, pane) {
         // In both orientations the key stands past the end of the bar, in the
-        // pane's bottom-right corner — the one part of the legend's margin
-        // nothing else is drawn in — with its label reading outward from the
-        // swatch. Which way is outward is all the two cases disagree about,
-        // and the constraint is the neighbours: the value labels run down the
-        // inside of a vertical bar and along the top of a horizontal one, so a
-        // label on either of those sides prints through the ±80 tick that ends
-        // the ramp.
+        // pane's bottom-right corner, label reading outward from the swatch —
+        // a label on the bar's own side prints through the ±80 tick.
         let (swatch, label_pos, label_anchor) = if horizontal {
             let swatch = egui::Rect::from_min_size(
                 egui::pos2(
@@ -2247,43 +1601,6 @@ pub(super) fn render_color_scale(
 
 /// Which ends of the fold, in the ramp's own m/s domain, have a place on the
 /// bar — both, or neither.
-///
-/// # The ramp does not move
-///
-/// A velocity bar spans a fixed ±80.55 mph (±36.01 m/s) whatever the radar
-/// behind it declared, and rescaling it per sweep was refused on the record:
-/// the colour of 20 m/s has to mean the same thing across the frames of a loop,
-/// across two synced panes showing a TDWR and the WSR-88D it sits inside, and
-/// across the 2D, section and 3D renderers that all sample
-/// `get_color_for_value(product, value)` as a pure function of the pair. So the
-/// *marker* moves and the colours hold still.
-///
-/// # An off-scale Nyquist is marked nowhere, and it is reachable
-///
-/// The bar reaches 36.01 m/s. Nine of the ten volumes
-/// `rustdar_radar::nyquist` measured stay inside it — the fastest of those is
-/// KDMX's 35.35, which is the half-metre-a-second margin this note used to
-/// claim was the whole story. The tenth is not a rounding error: **KFFC
-/// declares past the bar on five of its fourteen cuts**, 37.1, 40.43, 40.43,
-/// 49.3 and 62.94 m/s, the last of them clearing the end by 27. One site in ten
-/// is not the ordinary case, but it is not a hypothetical either — select a
-/// high tilt on that volume and this is the branch you get.
-///
-/// A marker clamped to the end would say the picture folds at 36.01, the one
-/// speed it certainly does not fold at, and one drawn off the end would land in
-/// the pane's chrome. Nothing is drawn, and the `folds ±141` line beside the
-/// unit title still states the limit — the honest half of the annotation, and
-/// on these cuts the *whole* honest annotation, since a ramp lying entirely
-/// inside a radar's unambiguous velocity wraps nowhere and has nothing to mark.
-///
-/// # A non-positive Nyquist is marked nowhere either
-///
-/// Zero is what every TDWR declares, on every cut. It reaches here only if
-/// something upstream of `rustdar_radar::nyquist::DeclaredNyquist::declare`
-/// stamped it, and the answer is the same as for the off-scale case: no marker.
-/// The caption is gated on the same test at the one call site, because for a
-/// while it was not, and `folds ±0` over an unmarked bar is what that looked
-/// like.
 fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<[f32; 2]> {
     if !nyquist_ms.is_finite() || nyquist_ms <= 0.0 {
         return None;
@@ -2294,40 +1611,18 @@ fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<
     Some([-nyquist_ms, nyquist_ms])
 }
 
-/// Where this pane's picture folds, in the unit the reader chose — the line
-/// under the unit title on a right-edge bar, and the one after it on a
-/// bottom-edge one, which is the same place both times: the second thing the
-/// legend's caption says.
-///
-/// Converted through `rustdar-units` like every other user-facing number, so
-/// switching the speed preference relabels the annotation in the same frame it
-/// relabels the ticks — and moves neither the ramp nor the marker, which are
-/// positioned in the palette's own m/s domain.
+/// Where this pane's picture folds, in the unit the reader chose — the legend's
+/// second line. Converted through `rustdar-units`, which moves neither the ramp
+/// nor the marker: those are positioned in the palette's own m/s domain.
 fn fold_title_line(nyquist_ms: f64, prefs: &UserPreferences) -> String {
     let converted = prefs.speed.convert_from_ms(nyquist_ms as f32);
     format!("folds \u{b1}{converted:.0}")
 }
 
 /// What this pane's storm-relative picture was shifted by: the vector, then one
-/// short word for where it came from — `SRM 32 kt @ 240\u{b0} (NWS)`.
-///
-/// **This is the legend line that replaced an apology.** The pane used to draw
-/// a wrapped two-line plate over the radar on the two derived rungs, saying
-/// which fallback it had used and how badly that fallback could differ from the
-/// reference — a warning with no number in it and nothing for the reader to do.
-/// Every gate on screen is a velocity with this vector's projection already
-/// added, so the vector is the fact a reader actually needs, and it is drawn on
-/// **every** rung: the ordinary case, where the plate said nothing at all, is
-/// the case a reader most often wants to read it in.
-///
-/// The source is a tag and not a sentence — see
-/// [`rustdar_radar::srv::StormMotionSource::tag`] — sized to sit after the
-/// numbers rather than under them.
-///
-/// Converted through `rustdar-units` like every other user-facing number, so
-/// switching the speed preference relabels this in the same frame it relabels
-/// the ticks. The direction is a compass bearing and stays in degrees in every
-/// unit system, three digits wide as a bearing conventionally is.
+/// short word for where it came from — `SRM 32 kt @ 240\u{b0} (NWS)`. See
+/// [`rustdar_radar::srv::StormMotionSource::tag`]. The direction is a compass
+/// bearing and stays in degrees, three digits wide.
 fn srm_title_line(motion: rustdar_radar::srv::SrvMotion, prefs: &UserPreferences) -> String {
     let speed = prefs.speed.convert_from_knots(motion.speed_kt);
     format!(
@@ -2338,18 +1633,8 @@ fn srm_title_line(motion: rustdar_radar::srv::SrvMotion, prefs: &UserPreferences
     )
 }
 
-/// The legend's second line — the one under the unit title on a right-edge bar
-/// and after it on a bottom-edge one — or `None` for a pane whose product has
-/// nothing to say there.
-///
-/// Two products, one slot, and they **cannot** contend for it: base velocity is
-/// the only product [`PaneState::displayed_nyquist_ms`] answers for, and
-/// storm-relative velocity the only one
-/// [`PaneState::displayed_storm_motion`] answers for. That is the same
-/// mutual-exclusion-by-product argument the three top-of-pane notices used to
-/// rest on, and it is stronger here because a pane has exactly one selected
-/// product. Written as one function so the two can never be drawn stacked on
-/// each other by a caller that computed them separately.
+/// The legend's second line — under the unit title on a right-edge bar and
+/// after it on a bottom-edge one — or `None`.
 fn legend_second_line(pane: &PaneState, prefs: &UserPreferences) -> Option<String> {
     if let Some(nyquist_ms) = pane
         .displayed_nyquist_ms()
@@ -2364,24 +1649,9 @@ fn legend_second_line(pane: &PaneState, prefs: &UserPreferences) -> Option<Strin
 
 /// Whether the purple [`rustdar_radar::RANGE_FOLDED`] can appear in this pane's
 /// picture, and therefore needs a key beside it.
-///
-/// Velocity and spectrum width, and only in the plan view. Both moments are
-/// measured on the Doppler cut, whose unambiguous *range* is ~90 km on a TDWR
-/// against a WSR-88D's ~150, so a gate beyond it comes back marked
-/// `MomentValue::RangeFolded` — a reading with no range, which `render.rs`
-/// paints in a colour no product's scale can produce. Reflectivity comes off
-/// the surveillance cut, whose long PRT puts its unambiguous range past
-/// anything on screen.
-///
-/// The plan view is the gate because that is where the purple is. A 3D pane
-/// raymarches a voxel grid that has no range-folded state at all, and a key for
-/// a colour the picture cannot contain is a legend entry the reader will go
-/// looking for.
 fn range_folded_is_painted(product: RadarProduct, pane: &PaneState) -> bool {
-    // The other place base velocity and SRV part company: SRV is rasterized
-    // from `srv::compute_srv_grid`'s finished `f32` field, whose NaNs are
-    // skipped, so the folded-gate sentinel the moment loop claims a pixel with
-    // never reaches it and there is no purple on an SRV raster to key.
+    // SRV is rasterized from `srv::compute_srv_grid`'s finished `f32` field,
+    // whose NaNs are skipped, so there is no purple on an SRV raster to key.
     matches!(
         product,
         RadarProduct::Velocity | RadarProduct::SpectrumWidth
@@ -2446,12 +1716,7 @@ fn render_overlay_color_scales(
         }
 
         // Always gradient for overlay legends — one image over a ramp baked
-        // once per legend signature.
-        //
-        // This was the worse of the two per-pixel loops: `bar_length.ceil()`
-        // strips, each behind a **linear** scan of the threshold list rather
-        // than the radar bar's binary search, per stacked overlay bar per pane
-        // per frame. See `crate::legend_ramp`.
+        // once per legend signature. See `crate::legend_ramp`.
         let thresholds = &legend.items.thresholds;
         painter.image(
             legend_ramp::ramp(
@@ -2471,7 +1736,6 @@ fn render_overlay_color_scales(
             egui::Color32::WHITE,
         );
 
-        // Labels
         let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
         let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
 
@@ -2524,14 +1788,11 @@ fn render_overlay_color_scales(
             }
         }
 
-        // Title
         let unit = legend.items.unit_label;
         if horizontal {
             // Under its own bar, for the reason the radar bar's title is: 12
             // points is not enough to lay `kg/m²` out in, and the pane's clip
-            // rect turns the shortfall into a cut-off label rather than an
-            // overlap. Each stacked bar has the 25 points above the next one's
-            // value labels to itself.
+            // rect turns the shortfall into a cut-off label.
             let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
             draw_shadowed_text(painter, title_pos, egui::Align2::LEFT_TOP, unit, title_font);
         } else {
@@ -2591,10 +1852,6 @@ struct PerFrameOverlayCtx<'a> {
 }
 
 /// Per-frame rendering for point overlays (e.g. METAR station model plots).
-///
-/// Projects each point onto the screen, culls off-screen points, calls the
-/// handler's `draw_point()` via an `EguiPointPainter`, and handles click/hover
-/// detection using the handler-provided hit radius.
 fn render_per_frame_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -2623,14 +1880,9 @@ fn render_per_frame_overlay(
 
     let painter = ui.painter();
 
-    // Blocked-ness is a property of the *position*, not of the point being
-    // tested against it, so it is settled once here rather than inside the
-    // loop. It used to be evaluated per visible station: each call scans the
-    // excluded rects — up to 207 radar-site icons — and takes egui's memory
-    // lock through `layer_id_at`, so 200 stations meant 200 lock acquisitions
-    // and ~41,000 rect tests per pane per frame, every one of them returning
-    // the same answer. `&&` short-circuits left to right, which is why the
-    // cheap distance test in front of it did not save any of them.
+    // Blocked-ness is a property of the *position*, not of the point tested
+    // against it, so it is settled once here. Per-station it was ~41,000 rect
+    // tests and 200 egui memory-lock acquisitions per pane per frame.
     let blocked = |pos: egui::Pos2| is_pos_blocked(ui.ctx(), pos, pf.pane_rect, pf.excluded_rects);
     let hover_pos = ui.ctx().pointer_hover_pos().filter(|&p| !blocked(p));
     let click_pos = pf.overlay_click_pos.filter(|&p| !blocked(p));
@@ -2652,7 +1904,6 @@ fn render_per_frame_overlay(
             continue;
         }
 
-        // Draw the point
         let mut ep = EguiPointPainter {
             painter,
             center: screen,
@@ -2681,7 +1932,6 @@ fn render_per_frame_overlay(
         }
     }
 
-    // Show tooltip for closest hovered point
     if let Some((_, id)) = closest_hover
         && let Some(hp) = hover_pos
         && let Some(text) = pf.overlays.hover_text(pf.id, id, &hover_ctx)
@@ -2706,12 +1956,7 @@ fn render_per_frame_overlay(
 const TOOLTIP_OFFSET_Y: f32 = 60.0;
 
 /// Draw a floating tooltip above the finger during a long press, showing the
-/// radar value at the touched position.
-///
-/// Reached only from the touch pipeline. It used to live in `ui_mobile.rs`
-/// behind `cfg(target_os = "android")`, which is why it was unreachable on a
-/// touchscreen laptop and in a phone browser; the gate is now the runtime
-/// modality, so this is plain platform-independent drawing code.
+/// radar value at the touched position. Reached only from the touch pipeline.
 #[allow(clippy::too_many_arguments)]
 fn draw_long_press_tooltip(
     ui: &egui::Ui,
@@ -2725,9 +1970,7 @@ fn draw_long_press_tooltip(
 ) {
     // The same question the pointer readout asks, through the same two
     // functions: where is this point from the radar, and what did the render
-    // paint there. It used to be a second copy of the pixel arithmetic, against
-    // a rectangle rebuilt here from the extent — so a finger and a mouse over
-    // one spot could disagree, and only one of them was ever looked at.
+    // paint there.
     let map_pos = projector.unproject(egui::vec2(touch_pos.x, touch_pos.y));
     let (azimuth, ground_km) =
         rustdar_geo::site_bearing_range_km(lat, lon, map_pos.y(), map_pos.x());
@@ -2738,7 +1981,6 @@ fn draw_long_press_tooltip(
         Reading::NotResident => "No value held for this frame".to_string(),
     };
 
-    // Position tooltip above the finger
     let tooltip_pos = egui::pos2(touch_pos.x, touch_pos.y - TOOLTIP_OFFSET_Y);
 
     let painter = ui.painter();
@@ -2762,16 +2004,8 @@ mod tests {
         legend_ticks(product, prefs)
     }
 
-    /// The MEHS colour bar is labelled in the user's hail-size unit.
-    ///
-    /// Its stops are authored in inches (`palette.rs`'s `MEHS` table), which is
-    /// also the unit `get_color_for_value` is sampled in, so the
-    /// *colours* must not move — only the numbers written beside them. Same
-    /// arrangement velocity has had all along: an mph table sampled in m/s with
-    /// the ticks converted at the label.
-    ///
-    /// The inches row is today's labelling unchanged, quarter-inch stops and
-    /// all: nobody who has not opened the settings dialog sees a different bar.
+    /// The MEHS colour bar is labelled in the user's hail-size unit; its stops
+    /// are authored in inches, so the colours must not move.
     #[test]
     fn the_mehs_colour_bar_is_labelled_in_the_users_hail_size_unit() {
         let expected = [
@@ -2824,16 +2058,6 @@ mod tests {
     }
 
     /// A tick and the hover readout are the same number in the same unit.
-    ///
-    /// The failure this rules out is the half-converted one: a readout in
-    /// millimetres beside a bar still labelled in inches, where every number on
-    /// screen is individually right and the pane as a whole lies about the size
-    /// of the hail. Asserted by rebuilding the readout out of the tick, so the
-    /// two cannot drift apart in precision either.
-    ///
-    /// Inches are excluded on purpose: the ramp's ticks have always been the
-    /// generic short form (`1.2` for the 1.25 in stop) while the readout gives
-    /// hundredths, and this fix does not renumber the default bar.
     #[test]
     fn a_mehs_tick_and_the_hover_readout_are_the_same_number() {
         for unit in [HailSizeUnit::Centimeters, HailSizeUnit::Millimeters] {
@@ -2853,9 +2077,8 @@ mod tests {
         }
     }
 
-    /// Every other product's ticks are exactly what they were: the shared
-    /// `short_tick` helper the MEHS arm was factored out of still answers for
-    /// them, and no product picked up a hail-size conversion on the way past.
+    /// Every other product's ticks are unchanged, and no product picked up a
+    /// hail-size conversion.
     #[test]
     fn no_other_products_ticks_moved() {
         let prefs = UserPreferences {
@@ -2880,14 +2103,8 @@ mod tests {
         assert_eq!(short_tick(-1.5), "-1.5");
     }
 
-    /// **Both** echo-tops bars are labelled in the user's height unit.
-    ///
-    /// Their stops are authored in kft (`palette.rs`'s `ECHO_TOPS`, shared by
-    /// the pair) and both are titled off `HeightUnit::kilo_suffix` — so a bar
-    /// whose ticks are not converted is one labelled `60` under a title reading
-    /// `km`, with the readout under the pointer saying `18.3 km` for the same
-    /// pixel. `EchoTopsInterpolated` was in every list but the conversion's:
-    /// `unit_label`'s, `format_value`'s and `get_legend_scale`'s.
+    /// **Both** echo-tops bars are labelled in the user's height unit; their
+    /// stops are authored in kft and both are titled off `HeightUnit::kilo_suffix`.
     #[test]
     fn both_echo_tops_bars_are_labelled_in_the_users_height_unit() {
         use rustdar_units::HeightUnit;
@@ -2912,8 +2129,7 @@ mod tests {
                 "{product:?} in metres is labelled in kft: 60 kft is 18 km",
             );
             // And the number on the bar is the number the readout gives for the
-            // same stop, to the tick's own precision — the half-converted pane
-            // is the failure, not the rounding.
+            // same stop, to the tick's own precision.
             let top = get_legend_scale_ref(product)
                 .thresholds
                 .last()
@@ -2937,30 +2153,17 @@ mod tests {
     }
 
     /// A real Doppler declaration that sits **inside** the bar, m/s: KTLX's
-    /// 0.5° cut on 2026-08-11 at 10:09, the narrowest of the ten WSR-88D
-    /// volumes `rustdar_radar::nyquist` measured.
-    ///
-    /// A WSR-88D and not a TDWR, and that is the point rather than an
-    /// arbitrary pick: a TDWR declares `nyquist_velocity = 0` on every cut it
-    /// has, so no TDWR number ever reaches this annotation. A fixture labelled
-    /// as one would be describing a code path that does not exist.
+    /// 0.5° cut on 2026-08-11 at 10:09. A WSR-88D and not a TDWR — a TDWR
+    /// declares `nyquist_velocity = 0` on every cut.
     const INSIDE_THE_BAR_MS: f32 = 23.84;
 
-    /// A declaration past the end of the bar, m/s — wider than the 62.94 KFFC's
-    /// cut 12 declares, which is the fastest `rustdar_radar::nyquist` has
-    /// measured, and inside what Message 31's hundredths-of-a-metre field
-    /// carries. It is also the widest speed the velocity moment itself encodes,
-    /// ±63.5 m/s in half-metre steps, so a dealiased field can genuinely reach
-    /// it — and the gap between the two, 0.56 m/s, is how little headroom the
-    /// off-scale case has left.
+    /// A declaration past the end of the bar, m/s — wider than KFFC cut 12's
+    /// 62.94, the fastest measured, and the widest speed the velocity moment
+    /// itself encodes (±63.5 m/s in half-metre steps).
     const PAST_THE_BAR_MS: f32 = 63.5;
 
-    /// The fold annotation is the declared limit converted, and nothing else.
-    ///
-    /// Every user-facing number goes through `rustdar-units`, so the four
-    /// answers here are the four the hover readout and the ticks give for the
-    /// same speed — a bar annotated in m/s over ticks in mph is the
-    /// half-converted state the MEHS work ruled out for hail size.
+    /// The fold annotation is the declared limit converted, and nothing else —
+    /// every user-facing number goes through `rustdar-units`.
     #[test]
     fn the_fold_annotation_is_the_declared_limit_in_the_users_speed_unit() {
         // 23.84 m/s in each unit, rounded as the annotation rounds: 53.33 mph,
@@ -2985,12 +2188,8 @@ mod tests {
     }
 
     /// Both ends of a fold inside the ramp are marked; a declaration past its
-    /// reach is marked nowhere.
-    ///
-    /// The ramp spans ±36.01 m/s (±80.55 mph) for every radar, so KTLX's 23.84
-    /// lands at 0.17 and 0.83 of its length while 63.5 is nearly twice its
-    /// reach. The off-scale answer is *nothing*, not a marker parked at the
-    /// end: the end of the bar is the one speed that sweep does not fold at.
+    /// reach is marked nowhere. The off-scale answer is *nothing*, not a marker
+    /// parked at the end.
     #[test]
     fn a_fold_off_the_end_of_the_ramp_is_marked_nowhere() {
         let (min_val, max_val) = velocity_bounds();
@@ -3019,12 +2218,7 @@ mod tests {
             Some([-max_val, max_val]),
         );
         // A declaration of zero or a non-finite one describes no fold at all.
-        // Zero is the live case — every TDWR declares it — and the caption is
-        // now gated on the same test at the one call site in
-        // `render_color_scale`, which is what
-        // `a_pane_with_no_usable_fold_limit_captions_nothing` pins at app
-        // level. This half always refused it; that is why the bug was a
-        // caption over an unmarked bar rather than a mismarked one.
+        // Zero is the live case — every TDWR declares it.
         for absurd in [0.0, -22.0, f32::NAN, f32::INFINITY] {
             assert_eq!(
                 fold_marker_positions(absurd, min_val, max_val),
@@ -3036,10 +2230,6 @@ mod tests {
 
     /// A projection with no map in it: one screen point per degree, so a
     /// row's coordinates and the pixel it lands on are the same numbers.
-    ///
-    /// The site walk does not care which projection it is handed, and a real
-    /// one would need a live `egui::Ui`, a `walkers::Projector` and a tile
-    /// source to say something this says in a line.
     fn degrees_as_pixels(lat: f64, lon: f64) -> egui::Pos2 {
         egui::pos2(lon as f32, lat as f32)
     }
@@ -3050,19 +2240,7 @@ mod tests {
     }
 
     /// A [`VisibleSite`] keeps naming its own radar after the table grows
-    /// under it.
-    ///
-    /// This used to be a `usize` index back into a compiled-in
-    /// `[RadarSite; 207]`, which was safe only because that array could never
-    /// be any other length. The table is resolved at runtime and the array is
-    /// gone: every radar arrives from a volume or from the catalogue, so a
-    /// table grows within a session as well as between them, and position `n`
-    /// in one table is a different radar in the next.
-    ///
-    /// The revert this pins is a real one: a walk that resolved a row through
-    /// an index would panic on a table that had since shrunk, or — worse —
-    /// silently label a marker with whatever row happened to sit at that
-    /// offset.
+    /// under it — the table is resolved at runtime, so an index would not.
     #[test]
     fn a_visible_site_names_its_own_radar_after_the_table_grows() {
         let position = |lat_udeg, lon_udeg| rustdar_radar::site_position::SitePosition {
@@ -3072,13 +2250,10 @@ mod tests {
             tower_height_m: 20,
         };
         // Three radars in the empty South Pacific, and a smaller table holding
-        // only the first. Both are built here because the binary carries no
-        // radars at all — `build_table(empty)` is genuinely empty, and a walk
-        // over nothing cannot tell an index from a reference.
+        // only the first. The binary carries no radars at all.
         let learned = rustdar_radar::sites::SiteFix::Learned;
         // `ZZZA` rather than `ZZZZ`: arrivals are sorted by identifier, so the
-        // incumbent has to sort first for the smaller walk to be a prefix of
-        // the larger one, which is what the zip below compares.
+        // incumbent must sort first for the zip below to compare like with like.
         let incumbent = ("ZZZA", learned(position(-29_000_000, -139_000_000)));
         let smaller = rustdar_radar::sites::build_table([incumbent]);
         let bigger = rustdar_radar::sites::build_table([

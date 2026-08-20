@@ -1,43 +1,6 @@
 //! The seam between a 3D pane and whatever can actually draw one, plus every
 //! matrix that turns an [`OrbitCamera`] into the two numbers the raymarch reads.
 //!
-//! # Why the bridge is `Arc<dyn Any + Send + Sync>`
-//!
-//! This crate must gain no wgpu dependency — that is what keeps the whole UI
-//! headless-testable, and it is a hard constraint of the work package rather
-//! than a preference. So the value a 3D pane hands to egui cannot be typed here:
-//! it is whatever `egui_wgpu` wants inside an `epaint::PaintCallback`, and only
-//! the frontend can build one.
-//!
-//! `epaint::PaintCallback` has two **public** fields, `rect` and `callback:
-//! Arc<dyn Any + Send + Sync>`, so this crate can construct one directly. That
-//! is the route, and it is not the obvious one: `egui_wgpu::Callback`'s own
-//! field is private and its only constructor
-//! (`Callback::new_paint_callback(rect, cb)`) hands back a finished
-//! `PaintCallback`. A crate that cannot name `egui_wgpu` therefore cannot make
-//! the payload — it can only be given one, which is exactly what
-//! [`VolumePainter`] is for.
-//!
-//! # Why the painter is asked *during* the UI pass
-//!
-//! [`VolumePainter::paint`] is called from inside the pane loop, with the camera
-//! as it stands after this frame's drag has been applied. Building the payload
-//! before `Gui::ui` runs would be simpler and would put the orbit **one frame
-//! behind the pointer** — which does not read as a bug, it reads as input lag,
-//! and it gets "fixed" by tuning drag sensitivity instead of by fixing the
-//! order. The painter object is long-lived; the payload is not.
-//!
-//! # Why a wrong payload is the dangerous case
-//!
-//! `egui_wgpu`'s renderer downcasts the `Arc<dyn Any>` it is given. A payload of
-//! the wrong type is one `log::warn!` in `prepare` and a **silent `continue`**
-//! in `paint` — a pane that draws nothing, with no error on screen and no
-//! failing test. That is why the frontend owns a test that its own payload
-//! downcasts, and why [`StubVolumePainter`] is documented as exercising
-//! everything *except* that.
-//!
-//! # The camera math
-//!
 //! Box space is the unit cube `[0,1]³` over the voxel grid; world space is
 //! kilometres with `x` east, `y` north, `z` up and the origin at the box's
 //! centre. [`view_for`] builds
@@ -49,63 +12,7 @@
 //! **compositionally**, never by inverting a general 4×4. Each factor has a
 //! closed form: `box_from_world` is a scale and a translate, `world_from_view`
 //! *is* the camera basis (the inverse of a look-at is built, not computed), and
-//! `view_from_clip` is the analytic inverse of the perspective matrix. A general
-//! inverse would be forty lines of arithmetic whose failure mode is a
-//! plausible-looking picture.
-//!
-//! # What the standoff is measured against
-//!
-//! [`OrbitCamera::eye_distance`] is a *ratio*, not a distance — that is what
-//! makes the zoom rescale the picture smoothly with no reframe and no snap. The
-//! length it is a ratio **to** is [`framing_radius_km`], and choosing that length
-//! is the whole of how a 3D pane frames itself. It reads the box's north–south
-//! extent alone: not the east–west one, which the pane's *width* sets, and not
-//! the vertical one, which the zoom cannot shrink. The argument and the three
-//! measurements that forced each of those exclusions are on that function.
-//!
-//! # Vertical exaggeration, and where it is and is not applied
-//!
-//! At true proportions a wide-open box is 651 km across a WSR-88D's
-//! reflectivity volume by 18 km tall — **36:1** — and even a tight 40 km one is
-//! 2.2:1: either reads as a sheet of paper. So
-//! [`OrbitCamera::vertical_exaggeration`] stretches it, and it is a knob with a
-//! number on it rather than a silent constant.
-//!
-//! It is applied in exactly one place: [`exaggerated_box_km`], which every
-//! function here routes its box through. Scaling the box's `z` **extent** rather
-//! than the geometry inside it is what makes the stretch a pure change of the
-//! camera's world:
-//!
-//! * `box_from_world` divides `z` by `size_z · ex`, so a cell that sat at box
-//!   `z = 0.4` still sits at box `z = 0.4`. The volume texture is untouched and
-//!   the raymarch is unaware the knob exists.
-//! * The pivot and the far plane are measured against the stretched box, so the
-//!   camera keeps aiming at the same face and the frustum keeps containing the
-//!   box however far it is stretched.
-//! * **The standoff is not.** [`framing_radius_km`] reads the box's *true*
-//!   north–south extent and nothing else, so turning the knob leaves the eye
-//!   exactly where it was: the ground keeps its scale to the last digit and only
-//!   heights grow. That is what makes the knob a vertical exaggeration rather
-//!   than a zoom — see [`framing_radius_km`] for the measurement that moved it
-//!   off the stretched half-diagonal.
-//!
-//! **Nothing the pane reports about height goes through it.** The stretch is
-//! geometry; the readout reads `VoxelGrid::z_range_km_msl` and is in real kft
-//! MSL at every exaggeration. That separation is the whole reason the knob is
-//! defensible — an exaggerated view is a drawing convention, an exaggerated
-//! *number* would be a fabricated measurement.
-//!
-//! # The pivot, and why panning is scaled to depth
-//!
-//! [`OrbitCamera::pivot`] is the point the orbit turns about, and
-//! [`pan_for_drag`] is what a drag on the pane does to it. The scaling there is
-//! the whole of whether panning feels right: the pivot is moved by the world
-//! distance one screen point spans **at the pivot's own depth**, so the point of
-//! the box under the pointer stays under the pointer. Any fixed rate instead —
-//! a constant fraction of the box per point, say — attaches the box to the mouse
-//! rather than to the ground, and it goes wrong in opposite directions at the two
-//! ends of the zoom: sluggish when zoomed in, and flying off the pane when zoomed
-//! out.
+//! `view_from_clip` is the analytic inverse of the perspective matrix.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -113,37 +20,13 @@ use std::sync::Arc;
 use crate::pane::{OrbitCamera, VolumeTarget};
 
 /// Vertical field of view of the volume camera, degrees.
-///
-/// Narrower than a first-person 60–90°: the subject is a box being inspected
-/// from outside, and a wide lens on a 240 km box bends the storm's edges away
-/// from the viewer in a way that reads as a fisheye rather than as perspective.
 const FOV_Y_DEG: f32 = 40.0;
 
 /// Near plane, in multiples of the [`framing_radius_km`] the eye stands off in.
-///
-/// Both planes are **cosmetic here** and that is worth saying, because it looks
-/// as though they should matter. The shader only ever unprojects at `depth =
-/// 1.0` and uses the result for a *direction*; the far distance cancels in the
-/// normalisation and the near distance cancels out of the analytic inverse at
-/// that depth (`B/(A+1) = far` exactly). They are chosen to be sane rather than
-/// tuned, and a test pins that changing them does not move a ray.
-///
-/// In the framing radius rather than in half-diagonals so that it is provably
-/// nearer than the eye: the standoff is `eye_distance` of the same unit and
-/// [`crate::pane::MIN_EYE_DISTANCE`] is 0.05, so this is at worst two fifths of
-/// the way to the pivot. Against the stretched half-diagonal it would sit
-/// *beyond* the eye at the tight end of the zoom with the exaggeration up, where
-/// a 20 km box is 216 km tall.
 const NEAR_IN_FRAMING_RADII: f32 = 0.02;
 /// Far plane beyond the eye, in multiples of the **stretched box's**
 /// half-diagonal. See [`NEAR_IN_FRAMING_RADII`] for why the two planes are
 /// measured in different units.
-///
-/// This one keeps the box in the frustum, which the framing radius could not
-/// promise: the standoff no longer grows with the exaggeration, so at 12× a
-/// tightly zoomed box stands 216 km out of a 20 km footprint and two framing
-/// radii would end well inside it. Two half-diagonals of the box the camera
-/// actually looks at always clear it.
 const FAR_MARGIN_IN_HALF_DIAGONALS: f32 = 2.0;
 
 /// Shortest cross product the camera basis will accept before calling itself
@@ -158,63 +41,17 @@ pub type Mat4 = [[f32; 4]; 4];
 /// Web Mercator's `y` for a latitude in radians: `ln(tan(π/4 + φ/2))` —
 /// [`rustdar_geo::lat_rad_to_mercator_y`], whose one definition is now the one
 /// spelling workspace-wide, not just in this crate.
-///
-/// Public alongside [`mercator_y_of_lat`], for the same reason that one is: a
-/// caller holding radians would otherwise write the formula out again or route
-/// through degrees and back, and `to_degrees().to_radians()` is not the
-/// identity in `f64`. `overlay_cache`'s geographic hit test is that caller,
-/// and it has to reach the same Mercator `y` the renderer drew with or a click
-/// misses the shape under it — which both now do by calling the same function
-/// this delegates to.
 pub fn mercator_y(lat_rad: f64) -> f64 {
-    // Bit-identical to the body this delegation replaced, which spelled the
-    // constant term as libstd's quarter-π and the half as `lat_rad * 0.5`:
-    // dividing correctly rounded π by 4 is exact (a power-of-two scaling), so
-    // the pre-divided constant and the canonical's `PI / 4.0` are the same
-    // bits, and `x * 0.5` and `x / 2.0` are the same power-of-two scaling of
-    // the same `x` — so the sum, and the `tan().ln()` of it, cannot differ.
     rustdar_geo::lat_rad_to_mercator_y(lat_rad)
 }
 
 /// Web Mercator's `y` for a latitude in **degrees**.
-///
-/// Public because the renderer on the other side of this seam has to evaluate
-/// exactly this function to turn a [`MapPaneGeo`] into texture coordinates,
-/// and a second spelling of it there is precisely the drift this seam exists
-/// to prevent.
 pub fn mercator_y_of_lat(lat_deg: f64) -> f64 {
     rustdar_geo::lat_rad_to_mercator_y(lat_deg.to_radians())
 }
 
 /// How a map render maps geography onto egui's coordinate space — the affine a
 /// 3D pane needs in order to find its ground inside a copy of that render.
-///
-/// # What this is for
-///
-/// The 3D view's map floor is not a picture built for the floor. It is the
-/// pane's **own map render**, drawn into an off-screen strip below the frame,
-/// copied into an offscreen "mirror" texture and sampled by the raymarch. That
-/// makes the floor Web Mercator — whatever the
-/// 2D pane draws, in whatever projection the 2D pane draws it in — while the
-/// voxel box stays a tangent plane in kilometres east and north of the site,
-/// because beam geometry is kilometres and Mercator's scale factor varies
-/// ~6.6% across a 460 km box at mid-latitude, which would stretch storms.
-///
-/// So *something* has to carry the one conversion, and this is it: the pane's
-/// projection, reduced to the four numbers a linear reprojection needs. It is
-/// four numbers rather than a `walkers::Projector` because this seam's whole
-/// point is that the renderer gains no dependency on the map — and because the
-/// reduction is exact, not an approximation: Web Mercator's screen `x` is
-/// linear in longitude and its screen `y` is linear in Mercator `y`, so an
-/// affine in those two variables reproduces the projector everywhere on the
-/// pane, not merely near the anchor.
-///
-/// # Why an anchor rather than an origin
-///
-/// The affine is measured from the pane's own centre rather than from
-/// longitude 0 and the equator, so nothing downstream has to cancel a number
-/// near −93° against another one to land on a texture coordinate near 0.5. The
-/// quantities that reach `f32` stay small.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapPaneGeo {
     /// The pane's rect in **points**, in the frame's own coordinate space —
@@ -235,8 +72,6 @@ pub struct MapPaneGeo {
 
 impl MapPaneGeo {
     /// Where `(lat, lon)` lands on the frame, in points, by this affine.
-    ///
-    /// Exact rather than a local linearisation — see the type doc.
     pub fn project(&self, lat_deg: f64, lon_deg: f64) -> egui::Pos2 {
         let dx = (lon_deg - self.anchor_lon) * self.points_per_degree_lon;
         let dy = (mercator_y_of_lat(lat_deg) - mercator_y_of_lat(self.anchor_lat))
@@ -246,10 +81,6 @@ impl MapPaneGeo {
 }
 
 /// Everything the painter is told about one 3D pane on one frame.
-///
-/// Deliberately a record with no methods: it is the whole of the contract
-/// between a pane and a renderer, so anything it does not carry is something
-/// the renderer must not depend on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeFrameState {
     /// Which pane is asking. The renderer's offscreen targets are per-pane —
@@ -265,64 +96,19 @@ pub struct VolumeFrameState {
     pub size_px: [u32; 2],
     /// The scale [`Self::size_px`] was measured at, so the pane's size in
     /// *points* is recoverable.
-    ///
-    /// Carried because the two densities [`floor_magnification`] compares live
-    /// in different units — the pane's is pixels, the source map's affine is
-    /// points — and the adaptive mirror rung is exactly their ratio. Without
-    /// this the painter would have to guess a scale factor, and the guess would
-    /// be wrong on every display the developer does not own.
     pub pixels_per_point: f32,
     /// Whether this pane wants the map floor drawn under the volume.
-    ///
-    /// The positive form of `VolumePane::hide_floor`, resolved at the one
-    /// place the pane's state is read. The renderer may still draw no floor —
-    /// none may be in hand yet — but it must never draw one against this.
     pub floor: bool,
     /// The Mercator affine of the map this pane drew into its own off-screen
     /// floor strip, and the strip it drew it into.
-    ///
-    /// This is the whole of the floor's registration. `None` — no strip, or no
-    /// tile source to draw one from — means the renderer has nothing to
-    /// reproject through and must draw no floor, whatever [`Self::floor`] says.
-    ///
-    /// **This frame's**, exactly: the pane draws its map and reads the affine
-    /// back inside one arm of the pane loop, before the volume that stands on
-    /// it. The borrowed-source arrangement this replaced could not — it read
-    /// another pane's affine out of a map recorded in pane-index order, so a 3D
-    /// pane before its source saw the previous frame's, which trailed a pan by
-    /// one frame and needed a `request_repaint` to keep a *discontinuity* (a
-    /// site switch, a jump to live) from being the last thing drawn. Neither
-    /// the lag nor the mitigation survives a pane that is its own source.
     pub source: Option<MapPaneGeo>,
     /// How much of egui's coordinate space the pane mirror covers, in points —
     /// `Gui::mirror_size_points`.
-    ///
-    /// The floor samples the mirror by turning a position in points into a
-    /// texture coordinate, so it needs the points-extent of the texture, and
-    /// that is **not** the frame's: the mirror is the frame plus the strips
-    /// below it. Frame-relative was right while the two agreed and is a
-    /// vertical stretch of the whole floor now that they do not.
-    ///
-    /// In points rather than texels because it must not move with the adaptive
-    /// mirror rung — the rung scales `size_in_pixels` and `pixels_per_point`
-    /// together precisely so the quotient, which is this, stays put.
     pub mirror_size_points: [f32; 2],
     /// The user's Volume Alpha curve for this pane's product, or `None` for
     /// an untouched editor.
-    ///
-    /// `None` is a contract, not a shorthand: it obliges the renderer to
-    /// upload the grid's own LUT **bit-exactly**, so a user who never opens
-    /// the editor renders exactly what the palette says. `Some` obliges it to
-    /// replace the LUT's alpha channel with the curve — colours stay the
-    /// palette's — and to re-anchor the march's skip threshold at the curve's
-    /// own fade boundary rather than the palette's.
     pub alpha: Option<crate::volume_alpha::AlphaCurve>,
     /// How the pane draws its volume: the lit accumulation or an isosurface.
-    ///
-    /// A *drawing* property, which is why it rides the frame and not the
-    /// [`VolumeTarget`]: the target keys what is sampled, and toggling the
-    /// mode must not rebuild an 8 MiB grid — the same doctrine that keeps the
-    /// camera off the target.
     pub view_mode: crate::pane::VolumeViewMode,
     /// The isosurface threshold for this pane's product, in the product's own
     /// units ([`rustdar_radar::voxel::iso_shape`] says what the number
@@ -332,12 +118,6 @@ pub struct VolumeFrameState {
 }
 
 /// What the painter answered.
-///
-/// The empty arm carries its reason as a `String` rather than being a bare
-/// `None`, because every way this can be empty is a different thing for the
-/// user to do: wait for a volume, pick a different moment, use a different
-/// machine. A 3D pane that draws an empty box says nothing; one that says *why*
-/// the box is empty is the difference between a feature and a bug report.
 pub enum VolumePaint {
     /// Draw this. The payload is opaque here on purpose — see the module doc —
     /// but what it is a picture *of* is not, because the caption has to say so.
@@ -351,29 +131,12 @@ pub enum VolumePaint {
 
 /// What a [`VolumePaint::Callback`] is a picture of — the two facts a caption
 /// cannot get right from the pane's own state.
-///
-/// # Why the caption needs telling
-///
-/// A zoom retargets the pane's box, and the grid for the new box takes ~140 ms
-/// to build. Through that wait the pane draws the grid it already has, in the
-/// box the user just asked for; the box is therefore the requested one and the
-/// caption's "N km box" stays true, but the **resolution** is the old grid's
-/// and the coverage may not reach the box's edges. A caption that read both
-/// off the requested region alone would claim a sharpness the picture does not
-/// have, which is the one thing the stand-in is not allowed to do: the picture
-/// may lag, the caption may not lie.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Showing {
     /// Kilometres across one cell of the grid actually on screen, east–west
     /// and north–south, or `None` when the grid has no horizontal extent to
     /// divide (impossible for a built grid; answered rather than unwrapped
     /// because a caption is not a place to panic).
-    ///
-    /// **Two numbers because the box is the pane's viewport rectangle**, so the
-    /// grid's cells are rectangular too: the same cell count per axis over
-    /// unequal ground. One figure here would have had to pick an axis, and a
-    /// caption reporting the east–west cell of a 16:9 pane as *the* resolution
-    /// overstates the north–south one by 1.78×.
     pub cell_km: Option<(f32, f32)>,
     /// The grid on screen was built for a different box, and a build for the
     /// box the pane asked for has not landed yet.
@@ -394,95 +157,35 @@ impl Showing {
 }
 
 /// Something that can turn a 3D pane's state into a paint callback.
-///
-/// `Send + Sync` because the `Gui` holds one and egui's own callback payloads
-/// are required to be, and because the implementation on the other side of this
-/// trait owns GPU handles that a browser cannot share across threads — a bound
-/// that is trivially satisfiable today and would be a silent rewrite to add
-/// later.
 pub trait VolumePainter: Send + Sync {
     /// Produce this frame's payload for one pane, or say why there is none.
     fn paint(&self, frame: &VolumeFrameState) -> VolumePaint;
 
     /// The palette the pane's grid carries — 1024 bytes of straight RGBA, one
     /// entry per index — or `None` while no grid is in hand.
-    ///
-    /// This is the Volume Alpha editor's one window into the renderer: the
-    /// palette strip it draws, and the alpha channel it seeds an untouched
-    /// curve from, are the **grid's own table**, read through the same
-    /// pane-scoped lookup `paint` uses. Reading it anywhere else — a second
-    /// copy of the colour tables in the UI crate — would be a copy to keep in
-    /// step, and the day they disagreed the editor would show a curve over one
-    /// palette while the volume rendered through another.
-    ///
-    /// Defaulted to `None` so a painter that cannot answer (the test stub, a
-    /// future headless painter) is an editor that says "waiting for the
-    /// volume" rather than a build break.
     fn palette(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<Vec<u8>> {
         None
     }
 
     /// The full extent in kilometres, each axis, of the box the pane's grid was
     /// actually resampled over — or `None` while no grid is in hand.
-    ///
-    /// The pane's other window into the renderer, alongside
-    /// [`palette`](Self::palette), and it exists for the same reason: since the
-    /// box of a pane with no picked region follows the *volume's* reach
-    /// (`rustdar_radar::voxel::box_half_width_km`), the number is a fact about
-    /// data this crate never sees. The grid carries its own `x`/`y`/`z` ranges,
-    /// so this is a read of the picture rather than a second derivation beside
-    /// it — which is the whole point, because the two things scaled by this
-    /// number are the pan gesture and the caption's km-per-cell, and either
-    /// disagreeing with the picture is invisible until a user notices the drag
-    /// runs at the wrong speed.
-    ///
-    /// Defaulted to `None` so a painter that cannot answer falls back to
-    /// [`crate::pane::box_size_km`] over the pane's own viewport region, which
-    /// is what a pane with no grid uses anyway.
     fn box_size_km(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<[f32; 3]> {
         None
     }
 
     /// Cells along the grid's horizontal axes, for the caption's km-per-cell —
     /// or `None` while no grid is in hand.
-    ///
-    /// **Read off the grid rather than assumed**, which is now the only honest
-    /// way to get it: the shape is derived at runtime from the device's own
-    /// `max_texture_dimension_3d` against the tier's cell budget
-    /// (`rustdar_radar::voxel::shape_for_budget`), so there is no constant this
-    /// crate could name that is guaranteed to be what the grid on screen
-    /// actually has. The caption used to read `default_shape().nx` — a
-    /// compile-time triple — which would now be a confident division by the
-    /// wrong number on any device not reporting exactly the guarantee.
-    ///
-    /// One number rather than two, because the grid is square on its horizontal
-    /// axes by construction (`shape_for_budget` answers `nx == ny`) while the
-    /// *box* need not be — which is exactly why the caption prints two kilometre
-    /// figures out of this one cell count.
-    ///
-    /// Defaulted to `None` for a painter that cannot answer; the caption then
-    /// states the box and omits the resolution rather than guessing at it.
     fn grid_cells_across(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<usize> {
         None
     }
 }
 
 /// The two things the raymarch's uniform block needs from the camera.
-///
-/// Returned as plain arrays rather than as the frontend's `VolumeUniform`
-/// because this crate cannot name that type — and should not: the rest of that
-/// block is transfer-function state that has nothing to do with where the eye
-/// is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeView {
     /// Clip space to box space, column-major.
     pub box_from_clip: Mat4,
     /// The perspective eye, in box space.
-    ///
-    /// A *perspective* eye specifically: rays are cast from this point, which is
-    /// what lets the shader clamp the slab entry to zero and behave when the
-    /// camera is inside the box. An orthographic camera has no such point and
-    /// would need a different derivation throughout, not a different value here.
     pub eye_in_box: [f32; 3],
     /// Where the eye is in world kilometres, relative to the box centre. Not
     /// read by the shader; returned because it is the one intermediate a test
@@ -492,30 +195,7 @@ pub struct VolumeView {
 
 /// Build this frame's view, or `None` for a box or a viewport that cannot be
 /// looked at.
-///
-/// Refuses rather than clamps, for the reason [`OrbitCamera::nudge`] gives at
-/// length: every quantity here reaches a `1.0 / x`, and a clamp on the way in
-/// would launder a non-finite input into a matrix full of `NaN` that the GPU
-/// accepts, renders as an empty pane, and reports nowhere.
-///
-/// * `box_size_km` — the box's full extent along each axis. Every component
-///   must be finite and strictly positive; a zero axis divides by zero in
-///   `box_from_world` and a negative one mirrors the volume.
-/// * `aspect` — width over height of the target being rendered into, finite and
-///   strictly positive. A pane one frame wide during a divider drag is the
-///   realistic way this arrives as zero.
 pub fn view_for(camera: OrbitCamera, box_size_km: [f32; 3], aspect: f32) -> Option<VolumeView> {
-    // No validation here on purpose: every check lives in `build_view`, which
-    // this delegates to. A copy of the box check here would be unreachable —
-    // mutation testing found exactly that, by deleting it and seeing nothing
-    // fail — and an unreachable guard is one that can rot into disagreement with
-    // the reachable one.
-    //
-    // Two lengths, with two different jobs. The framing radius sets where the
-    // eye is and therefore the scale of the picture; the stretched box's
-    // half-diagonal only has to be big enough to keep the box inside the
-    // frustum. Deriving both from one number is what put the box's width and
-    // its fixed 18 km height into the scale — see `framing_radius_km`.
     let radius = framing_radius_km(box_size_km);
     let depth = half_diagonal(exaggerated_box_km(camera, box_size_km));
     let distance = camera.eye_distance() * radius;
@@ -530,20 +210,6 @@ pub fn view_for(camera: OrbitCamera, box_size_km: [f32; 3], aspect: f32) -> Opti
 
 /// The box as the camera sees it: the true extent with the vertical axis
 /// stretched by [`OrbitCamera::vertical_exaggeration`].
-///
-/// The single place the knob is applied. Everything that has to be in the
-/// camera's stretched world — the pivot, the far plane, `box_from_world`,
-/// `eye_in_box` — reads this rather than the true box, so there is exactly one
-/// line to be wrong and every consumer is wrong or right together.
-///
-/// [`framing_radius_km`] deliberately does not, and that is the one exception
-/// worth stating here: the standoff is a *scale*, and a vertical exaggeration
-/// that changed the scale would be a zoom. The eye does not move as the knob
-/// turns.
-///
-/// The horizontal axes are passed through untouched, which is the definition of
-/// a *vertical* exaggeration and worth stating: scaling all three would be a zoom,
-/// and a zoom is what `eye_distance` already is.
 pub fn exaggerated_box_km(camera: OrbitCamera, box_size_km: [f32; 3]) -> [f32; 3] {
     [
         box_size_km[0],
@@ -554,76 +220,6 @@ pub fn exaggerated_box_km(camera: OrbitCamera, box_size_km: [f32; 3]) -> [f32; 3
 
 /// The length [`OrbitCamera::eye_distance`] is a multiple of: half the diagonal
 /// of the **square of side `north`** the box stands on, `north / √2`.
-///
-/// One axis of the three, and each exclusion was forced by a measurement.
-///
-/// # Why not the east–west extent
-///
-/// The box is the ground its pane is showing, so its east extent is set by the
-/// pane's **width** and its north extent by the pane's **height**. A standoff
-/// that reads the east extent therefore moves the eye when the pane is widened,
-/// and the user's words for that are exact: *"a user doesn't expect to become
-/// more boxed in when they zoom, they just expect to be closer with the same
-/// area available to them."*
-///
-/// Measured on a real KDMX volume at 1600×900, going from the 460 km square this
-/// code used to build to the 818 × 460 km rectangle the viewport actually
-/// covers, the three-axis half-diagonal pushed the eye back **1.4397×**. A patch
-/// of ground came back **0.694×** its size at the default camera and **0.682×**
-/// at yaw 0 — converting a pane to 3D made the storm smaller, which is the
-/// complaint the rectangle existed to fix, reintroduced through the camera. The
-/// same expression at 1200×500 cost 1.834×.
-///
-/// The fix cannot be "use the extent that projects across the screen", because
-/// that extent depends on yaw: on a 16:9 box it swings **1.693×** over half a
-/// turn, so the eye would dolly in and out while the user merely orbited. The
-/// only standoff that is stable under both a resize and an orbit is one that
-/// does not read the east extent at all.
-///
-/// # Why the north–south extent, and why twice
-///
-/// The field of view is vertical ([`FOV_Y_DEG`]), so the pane's height is the
-/// projection's fixed dimension and the north extent is the box axis that height
-/// sets. Keying the standoff to it makes the pane's height span the same
-/// multiple of the box's north extent at every aspect ratio — and it is
-/// [`eye_distance_for_plan_scale`] that makes that multiple exactly **1.00000×**,
-/// so a plan pane converted to 3D shows the same ground at the same scale. The
-/// three-axis half-diagonal spanned **0.926×** at aspect 0.15 and **6.525×** at
-/// 7.1 (at the 2.5 standoff it shipped beside) — a factor of **7.04** set by
-/// nothing but the pane's shape, and still 2.50 over the 0.27 to 2.4 a two-column
-/// layout actually produces. A narrow pane's 3D view was silently zoomed in
-/// against its own plan pane and a wide one zoomed out; now neither is.
-///
-/// `north / √2` rather than `north` is the half-diagonal of the *square* box of
-/// that side, which is what the old expression returned when the box was square.
-/// That keeps every persisted `eye_distance` meaning what it meant and leaves
-/// [`crate::pane::MIN_EYE_DISTANCE`]'s "0.05 is inside the box" calibration
-/// standing: on the whole-scan square box at the default exaggeration the two
-/// agree to **0.17 %**, and to 0.34 % on a 460 km one.
-///
-/// # Why not the vertical extent, which is the zoom
-///
-/// The box's height is fixed — 0 to 18 km MSL — while its ground extent is what
-/// the zoom moves, from a 651 km whole-scan box down to the resampler's 20 km
-/// floor. Times the exaggeration knob the vertical term is ~54 km, which is
-/// nothing beside 651 km and everything beside 20 km, so a diagonal that
-/// includes it **stops tracking the zoom**: across that full range a 32.53×
-/// ground zoom came out as **15.12×** of picture. Reading `north` alone returns
-/// 32.53× of 32.53×.
-///
-/// Dropping it also settles the exaggeration knob, which the half-diagonal was
-/// there to serve and did not. The old promise was that the box fills the same
-/// fraction of the pane at 1× and at 12×; measured, the box's silhouette still
-/// grew 1.36× on a whole-scan box, and the **ground** shrank to 0.154× on a
-/// tightly zoomed one — the knob was a 6.5× zoom-out. It cannot be otherwise:
-/// the stretch changes the box's *shape*, and one distance cannot hold two
-/// changing dimensions still. So this holds the one a vertical exaggeration is
-/// defined to leave alone. The eye does not move at all as the knob turns, the
-/// ground keeps its scale exactly at every box size, and only heights grow —
-/// which is what [`exaggerated_box_km`] already says the knob means.
-///
-/// Takes the true box rather than the stretched one for that reason: there is
-/// nothing here for the exaggeration to multiply.
 fn framing_radius_km(box_size_km: [f32; 3]) -> f32 {
     half_diagonal([box_size_km[1], box_size_km[1], 0.0])
 }
@@ -631,56 +227,12 @@ fn framing_radius_km(box_size_km: [f32; 3]) -> f32 {
 /// The standoff at which a 3D pane draws the ground at exactly the scale its
 /// plan pane draws it at — [`OrbitCamera`]'s default, derived here rather than
 /// chosen.
-///
-/// Converting a pane to 3D is a change of *viewpoint*. It is not also a zoom,
-/// and the only standoff at which it is not is this one.
-///
-/// # The arithmetic
-///
 /// A plan pane `H` points tall shows `N` kilometres of north–south ground over
 /// that height, because the box is cut from the pane's own rectangle: `H / N`
 /// points to the kilometre.
-///
-/// The 3D pane is a perspective camera with a vertical field of view
-/// ([`FOV_Y_DEG`]), so at the pivot's own depth `d` its height spans
-/// `2 · d · tan(fov/2)` kilometres and a world offset perpendicular to the view
-/// direction lands `(H/2) / (d · tan(fov/2))` points to the kilometre. That is
-/// the scale the *ground* is drawn at: the camera's right vector is level at
-/// every pitch, so the across-pane direction is the one the tilt does not
-/// foreshorten. Setting the two equal,
-///
 /// ```text
 /// (H/2) / (d · tan(fov/2)) = H / N   ⇒   d = N / (2 · tan(fov/2))
 /// ```
-///
-/// and `eye_distance` is that `d` counted in [`framing_radius_km`], which is
-/// `N / √2`, so `N` cancels and what is left is a property of the lens alone:
-///
-/// ```text
-/// eye_distance = √2 / (2 · tan(fov/2)) = 1.94276 at 40°
-/// ```
-///
-/// It falls out of this that [`floor_magnification`] is exactly 1.0 for a fresh
-/// pane — one mirror texel per screen pixel, the density the adaptive rung is
-/// measured against — which is not a coincidence but the same equality read off
-/// the other side.
-///
-/// # Why a function rather than a `const`
-///
-/// `f32::tan` is not a `const fn` (Rust 1.97), so the division cannot be folded
-/// at compile time and the choice is between this and a literal. A literal would
-/// be a measurement of a field of view it no longer names: at 60° the correct
-/// standoff is 1.2247 and a pinned 1.94276 would stand **1.59× too far back**,
-/// silently, with nothing to fail. This runs once per camera constructed, which
-/// is once per pane opened.
-///
-/// # What it replaced
-///
-/// 2.5, chosen before the standoff had a unit that tracked the framing. Against
-/// the `N / √2` radius that makes the pane span `2.5 · √2 · tan(20°)` =
-/// **1.28683×** the box's north extent, so a 3D pane opened **1.287×** zoomed
-/// out from the plan pane it was made from — uniformly, at every aspect ratio
-/// and every zoom, which is what made it a constant and not a framing bug.
 pub fn eye_distance_for_plan_scale() -> f32 {
     std::f32::consts::SQRT_2 / (2.0 * (0.5 * FOV_Y_DEG.to_radians()).tan())
 }
@@ -695,58 +247,11 @@ fn half_diagonal(box_size_km: [f32; 3]) -> f32 {
 }
 
 /// Kilometres per degree of longitude at the equator.
-///
-/// On a sphere a degree of longitude at the equator and a degree of latitude
-/// anywhere are the same arc, so this is
-/// [`rustdar_geo::KM_PER_DEGREE_LAT`] rather than a figure of its
-/// own. It spelled `111.319_49` — the WGS-84 *equatorial* radius — which made
-/// it a third planet in a workspace that only ever wanted one; see that
-/// constant.
-///
-/// Only ever divided by, and only ever with `cos(latitude)` beside it, so it is
-/// a scale rather than a distance: [`floor_magnification`] wants the pane's
-/// points-per-kilometre and the pane's affine is expressed per *degree*.
 const KM_PER_DEGREE_LON_AT_EQUATOR: f64 = rustdar_geo::KM_PER_DEGREE_LAT;
 
 /// How much the 3D view magnifies the ground it samples out of the pane mirror,
 /// at the pivot's own depth. Dimensionless; 1.0 means one mirror texel per
 /// screen pixel and nothing is being stretched.
-///
-/// This is the number the adaptive mirror rung is chosen from, and it is a
-/// *ratio of two point densities* rather than of two pixel densities — which is
-/// what makes it independent of the window's `pixels_per_point`. The mirror is
-/// drawn at the frame's own scale times a rung, and the frame is presented at
-/// that same scale, so the device's DPI appears identically on both sides and
-/// cancels. What is left is exactly "how many rungs are missing".
-///
-/// # The two densities
-///
-/// The 3D side is the perspective one: the vertical field of view spans
-/// `2 · d · tan(fov/2)` kilometres across the pane's height at distance `d`, and
-/// `d` is the camera's eye distance in [`framing_radius_km`] — the same unit
-/// every other function here measures the camera in, which is what makes this
-/// number track the framing. It therefore falls as the reciprocal of the box's
-/// north–south extent and of nothing else: widening the pane leaves it alone,
-/// because widening the pane does not change how much a pixel is magnified, and
-/// so does turning the exaggeration knob, because that does not either.
-///
-/// The 2D side is the source pane's own affine, [`MapPaneGeo`], reduced from
-/// points per degree of longitude to points per kilometre at the site's
-/// latitude. Web Mercator is conformal, so that one scale is correct along both
-/// axes at that latitude, and the site is where the box is anchored.
-///
-/// # Why the pivot's depth and not the nearest ground
-///
-/// The floor is a plane seen in perspective, so its magnification varies from
-/// the bottom of the pane to the horizon without bound — there is no single
-/// right answer, and sizing for the worst pixel would ask for a mirror no target
-/// can allocate on any frame with a low camera. The pivot is what the user
-/// aimed at and what every other framing decision here is measured against, so
-/// it is the depth whose sharpness the rung is spent on.
-///
-/// Returns `None` for a pane with no height and for a source pane whose affine
-/// is degenerate, both of which are "there is nothing to size a mirror for"
-/// rather than "size it as large as possible".
 pub fn floor_magnification(
     camera: OrbitCamera,
     box_size_km: [f32; 3],
@@ -779,11 +284,6 @@ pub fn floor_magnification(
 }
 
 /// Where the camera is aimed, in world kilometres relative to the box's centre.
-///
-/// The pivot is stored as a fraction of the box's half-extent, so this is the one
-/// multiplication that turns it back into a place. Against the *stretched* box,
-/// so that a pivot on the top face stays on the top face as the exaggeration
-/// turns.
 fn pivot_km(camera: OrbitCamera, box_size_km: [f32; 3]) -> [f32; 3] {
     let stretched = exaggerated_box_km(camera, box_size_km);
     let pivot = camera.pivot();
@@ -796,28 +296,6 @@ fn pivot_km(camera: OrbitCamera, box_size_km: [f32; 3]) -> [f32; 3] {
 
 /// What a drag of `drag_points` screen points should add to
 /// [`OrbitCamera::pivot`], in the box-fraction units the pivot is stored in.
-///
-/// # The scaling is the feel
-///
-/// A drag of N points moves the pivot by the world distance N points span **at
-/// the pivot's depth** — so the piece of the box under the pointer stays under
-/// the pointer, and the box reads as an object being pushed around rather than as
-/// a picture being scrubbed. With a perspective camera that distance is
-/// `2 · distance · tan(fov/2)` across the viewport's height, which is why this
-/// needs the viewport as well as the camera.
-///
-/// # Signs
-///
-/// The content follows the pointer, so the *pivot* moves the other way: dragging
-/// right carries the box right, which means aiming further left. Both signs are
-/// convention rather than arithmetic — a sign error here pans perfectly well and
-/// merely feels inverted — so both are pinned by a test.
-///
-/// `None` for anything that would divide by zero or produce a non-finite offset:
-/// a pane with no height, a degenerate box, or a non-finite drag. Refused rather
-/// than clamped for the reason [`OrbitCamera::nudge`] gives — though `nudge`
-/// re-checks anyway, because this is not the only thing that could ever build a
-/// pan.
 pub fn pan_for_drag(
     camera: OrbitCamera,
     box_size_km: [f32; 3],
@@ -837,42 +315,26 @@ pub fn pan_for_drag(
     let stretched = exaggerated_box_km(camera, box_size_km);
     let distance = camera.eye_distance() * framing_radius_km(box_size_km);
 
-    // The camera basis, from the same eye direction `build_view` uses — so a pan
-    // is along the axes the user sees, at every yaw and pitch.
     let eye = orbit_eye_km(camera, distance);
     let forward = normalize([-eye[0], -eye[1], -eye[2]])?;
     let right = normalize(cross(forward, [0.0, 0.0, 1.0]))?;
     let up = cross(right, forward);
 
-    // World kilometres spanned by one screen point at the pivot's depth. The
-    // vertical field of view is the one that is fixed, so the height is what this
-    // is derived from and the horizontal follows from the same number — which is
-    // correct, because screen points are square.
     let km_per_point =
         2.0 * distance * (0.5 * FOV_Y_DEG.to_radians()).tan() / viewport_height_points;
 
-    // Screen y runs down, so a downward drag is a *negative* move along `up`;
-    // the content-follows-pointer inversion then makes it positive. The two
-    // negations are written out rather than cancelled so the reasoning survives.
     let along_right = -drag_points[0] * km_per_point;
     let along_up = drag_points[1] * km_per_point;
 
     let mut pan = [0.0f32; 3];
     for (axis, slot) in pan.iter_mut().enumerate() {
         let world = right[axis] * along_right + up[axis] * along_up;
-        // Back into fractions of the box's half-extent, which is what the pivot
-        // is stored in. The stretched box on every axis, matching `pivot_km`.
         *slot = world / (0.5 * stretched[axis]);
     }
     pan.iter().all(|p| p.is_finite()).then_some(pan)
 }
 
 /// [`view_for`] with the frustum's depth range supplied rather than derived.
-///
-/// Split out for exactly one reason: it is what lets a test build the same view
-/// twice at wildly different near and far planes and assert the rays are
-/// identical. Doing that by scaling the box instead would change the geometry as
-/// well as the frustum, which is a test that cannot see what it is named for.
 fn build_view(
     camera: OrbitCamera,
     box_size_km: [f32; 3],
@@ -887,21 +349,12 @@ fn build_view(
         return None;
     }
 
-    // Every length below is against the stretched box. See `exaggerated_box_km`:
-    // the grid's own coordinates are unchanged, so this is a change to the
-    // camera's world and not to the data in it.
     let stretched = exaggerated_box_km(camera, box_size_km);
     if !stretched.iter().all(|s| s.is_finite() && *s > 0.0) {
         return None;
     }
-    // Against the *true* box: the stretch is a change to what the camera looks
-    // at, not to how far away it stands. See `framing_radius_km`.
     let distance = camera.eye_distance() * framing_radius_km(box_size_km);
 
-    // The orbit is about the pivot, not about the origin — so the eye is the
-    // pivot plus the orbit offset, and the forward direction is still just the
-    // orbit offset reversed. That the two stay in step is what keeps the pivot
-    // exactly in the middle of the pane at every yaw and pitch.
     let orbit_offset = orbit_eye_km(camera, distance);
     let pivot = pivot_km(camera, box_size_km);
     let eye_km = [
@@ -929,13 +382,6 @@ fn build_view(
 
 /// The orbit's offset in world kilometres: where the eye sits **relative to the
 /// pivot**, which is the box's centre until the view is panned.
-///
-/// Yaw is a **compass bearing of the eye from the centre**: 0° puts the camera
-/// due north of the box looking south, 90° due east. That is what makes
-/// [`OrbitCamera`]'s default of 225° the south-west view its documentation
-/// claims, and it is the same sense as every other azimuth in this codebase
-/// (`rustdar_geo::site_bearing_range_km`, the sampler's `azimuth_deg`), which is worth
-/// more than the alternative convention's slightly tidier trigonometry.
 pub fn orbit_eye_km(camera: OrbitCamera, distance: f32) -> [f32; 3] {
     let yaw = camera.yaw_deg().to_radians();
     let pitch = camera.pitch_deg().to_radians();
@@ -966,13 +412,6 @@ fn box_from_world(box_size_km: [f32; 3]) -> Mat4 {
 }
 
 /// The camera-to-world matrix, built rather than inverted.
-///
-/// A look-at matrix is an orthonormal rotation followed by a translation, so its
-/// inverse is the basis itself with the eye in the translation column. Writing
-/// that down is exact and free; inverting the look-at would be neither.
-///
-/// The third column is `-forward` because a view space looks down its own `-z`,
-/// which is the convention [`inverse_perspective`] is written against.
 fn camera_basis(right: [f32; 3], up: [f32; 3], forward: [f32; 3], eye: [f32; 3]) -> Mat4 {
     [
         [right[0], right[1], right[2], 0.0],
@@ -984,15 +423,6 @@ fn camera_basis(right: [f32; 3], up: [f32; 3], forward: [f32; 3], eye: [f32; 3])
 
 /// The analytic inverse of wgpu's right-handed perspective, whose clip `z` runs
 /// `0..1`.
-///
-/// Derived rather than inverted. With `f = 1/tan(fovy/2)`, the forward matrix
-/// sends a view point to `(f/aspect · x, f · y, A·z + B, −z)` where
-/// `A = far/(near−far)` and `B = near·far/(near−far)`. Solving that back gives
-/// four non-zero entries, two of which simplify all the way:
-/// `A/B = 1/near` and `1/B = 1/far − 1/near`.
-///
-/// `None` for a degenerate frustum — a zero or inverted depth range, or a field
-/// of view at the limit where `tan` blows up.
 fn inverse_perspective(fov_y_deg: f32, aspect: f32, near: f32, far: f32) -> Option<Mat4> {
     if !(near.is_finite() && far.is_finite() && near > 0.0 && far > near) {
         return None;
@@ -1038,14 +468,6 @@ fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
 
 /// A painter that answers every frame with a payload of a type nothing can
 /// draw, for tests that need the paint *path* without a GPU.
-///
-/// **It cannot catch the failure it most looks like it should.** A payload of
-/// the wrong type is precisely what `egui_wgpu` swallows — one `log::warn!` in
-/// `prepare` and a silent `continue` in `paint` — so a suite built only on this
-/// stub proves the callback was pushed and proves nothing about whether it
-/// would ever draw. The test that closes that gap lives in `rustdar-volumetric`,
-/// where the real payload's type is nameable, and it is named in this crate's
-/// tests so the pairing is findable from either end.
 #[cfg(test)]
 pub(crate) struct StubVolumePainter {
     /// What every call answers with.
@@ -1102,16 +524,6 @@ impl VolumePainter for StubVolumePainter {
     }
 
     /// A painting stub has a grid, so it answers with one's cell count.
-    ///
-    /// Answered — where [`VolumePainter::box_size_km`] is left at its default —
-    /// because these are opposite questions for a stub. The box has a fallback
-    /// the pane derives from its own region, so declining is a *choice* the
-    /// caption handles; the cell count has none, so a stub that declined would
-    /// silently drop the resolution off every caption a harness test reads, and
-    /// the pane on screen would carry a line the tests never see.
-    ///
-    /// The desktop tier's own answer on a capable adapter, rather than a round
-    /// number, so a harness caption is the string a user would actually read.
     fn grid_cells_across(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<usize> {
         self.answer_empty.is_none().then(|| {
             rustdar_radar::voxel::shape_for_budget(rustdar_radar::voxel::DESKTOP_SHAPE, 2048).nx

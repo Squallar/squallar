@@ -1,7 +1,5 @@
 use crate::overlay_cache::OverlayTextureCache;
 use chrono::NaiveDateTime;
-// The pane caps are device-class policy and live on the floor since WO-RD;
-// this module's clamp and the width classes narrow inside them.
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use rustdar_radar::hover::HoverSource;
 use rustdar_radar::sites::RadarSite;
@@ -14,10 +12,6 @@ use walkers::MapMemory;
 #[path = "pane_content.rs"]
 mod content;
 
-// Re-exported so a pane's kind is named where a pane is named:
-// `rustdar_egui::pane::PaneKind`, alongside `LoopPhase` and `RenderTarget`. The
-// split into a second file is about how much there is to say about each half,
-// not about them being different things.
 pub use content::{
     BASE_HALF_WIDTH_KM, CrossSectionPane, DEFAULT_VERTICAL_EXAGGERATION, MAX_EYE_DISTANCE,
     MAX_VERTICAL_EXAGGERATION, MIN_EYE_DISTANCE, MIN_VERTICAL_EXAGGERATION, MapPane, MapRender,
@@ -28,10 +22,8 @@ pub use content::{
 
 const DEFAULT_PANE_ZOOM: f64 = 4.0;
 
-/// Identifies a pane in the multi-pane layout.
 pub type PaneId = usize;
 
-/// Holds the radar image texture and its associated metadata.
 #[derive(Clone)]
 pub struct RadarImageData {
     pub texture: egui::TextureHandle,
@@ -39,185 +31,51 @@ pub struct RadarImageData {
     pub lon: f64,
     /// The half-width this frame was projected at, km — what the renderer
     /// handed back. The range ring is drawn on it.
-    ///
-    /// It used to be "the only statement of where these pixels are", and the
-    /// draw derived the placement from it once per frame. [`Self::placed`] is
-    /// that statement now, derived from this at delivery; what is left here is
-    /// the *radius*, which the ring genuinely needs and which no rectangle can
-    /// give it back.
-    ///
-    /// The hover no longer reads it, and that sentence used to be here. A
-    /// readout divided the pointer's position by the rectangle the raster was
-    /// drawn into and so had to be told which frame that was; it asks the gates
-    /// where a point is now, and a gate knows its own range. `RadarHoverData`
-    /// in `ui_map_pane` records the same retraction in its own doc; this one
-    /// outlived it.
     pub max_range_km: f64,
-    /// Where these pixels sit on the ground, worked out **once**, by whoever
-    /// delivered the frame.
-    ///
-    /// Built from `(lat, lon, max_range_km)` through
-    /// [`rustdar_radar::types::ImageBounds::from_radar_site`] — still radar's
-    /// delivery-time constructor — and then carried. The draw used to rebuild
-    /// it on every frame of every animating pane; see
-    /// [`rustdar_geo::PlacedRaster`].
     pub placed: rustdar_geo::PlacedRaster,
-    /// The gates behind these pixels, and whatever is holding their numbers.
-    ///
-    /// A still pane's carries the render's own values. A loop frame's carries
-    /// the geometry and an `Arc` on the volume it was rendered from, because
-    /// 5.03 MiB of numbers per frame is 70 MiB across a browser's loop and the
-    /// volume is resident anyway — see [`rustdar_radar::hover::HoverSource`].
-    ///
-    /// It replaced a `side²` `f32` raster grid: 206.75 MiB for a surveillance
-    /// cut at the ceiling this display now reaches, held here, in the render
-    /// cache and in the suspend copy, so that a hover could read one number out
-    /// of it.
     pub hover: Arc<HoverSource>,
     /// Where the cut this frame was drawn from declared its velocity folds,
     /// m/s, or `None` for a frame no single cut is behind.
-    ///
-    /// Per frame, like `max_range_km`: a loop steps through volumes and the RDA
-    /// reselects PRFs between them, so the frame on the glass is the only thing
-    /// that can say where the picture on the glass wraps.
     pub nyquist_ms: Option<f64>,
     /// Where the melting layer this frame was classified against came from, or
     /// `None` for a frame that classified nothing.
-    ///
-    /// Per frame for a sharper version of `nyquist_ms`'s reason: the object is
-    /// paired to one volume, so a loop routinely animates one frame classified
-    /// against the RPG's own layer beside twenty classified on the fleet
-    /// default. The frame on the glass is the only thing that can say which
-    /// this one is.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
     /// Where the storm motion vector this frame was shifted by came from, or
     /// `None` for a frame that shifted nothing.
-    ///
-    /// Per frame for the melting layer's reason exactly: the `N0S` is paired
-    /// to one volume, so a loop routinely animates one frame shifted by the
-    /// RPG's own applied vector beside twenty shifted by a right-mover
-    /// prediction. The frame on the glass is the only thing that can say which
-    /// this one is.
     pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// Holds a rendered cross-section raster and the little that has to travel with
 /// it for the pane to draw honest axes over it.
-///
-/// The counterpart of [`RadarImageData`] for a section loop, and it carries the
-/// same amount of truth: what the picture is *of*, so the frame beneath the
-/// pointer and the frame on the glass cannot describe different volumes.
-///
-/// # What it deliberately does not carry
-///
-/// The `CrossSection` behind the raster is ~18 MB natively — an RGBA plane, an
-/// `f32` value plane and a status plane — and only the value and status planes
-/// serve the hover readout. Retaining them per frame would cost
-/// `MAX_LOOP_RENDER_BUDGET` × 18 MB (648 MB on desktop) to answer a question
-/// nobody can ask of a moving picture. So a section loop frame drops them, and
-/// the pane's hover readout goes quiet while a *section* loop runs.
-///
-/// A **plan-view** loop frame no longer goes quiet, and the difference is worth
-/// stating because the arithmetic above is the same. It stopped having to copy
-/// anything: a plan view's numbers are gates of a volume the loop's download
-/// cache is already holding for as long as the loop lives, so the frame keeps
-/// 5.8 KiB of geometry and an `Arc` and reads the numbers back out — see
-/// [`RadarImageData::hover`]. A section's are a resampled vertical plane cut
-/// from a tilt ladder, with no resident source to read back from, so this
-/// paragraph still describes it.
-///
-/// [`axes`](Self::axes) and [`tilt_elevations_deg`](Self::tilt_elevations_deg)
-/// are kept because they are *labels on this picture*: the height and distance
-/// scales, and the tilt ladder drawn over it. A few dozen floats, and without
-/// them a loop would animate the raster under the previous frame's axes.
 #[derive(Clone)]
 pub struct SectionImageData {
     pub texture: egui::TextureHandle,
-    /// The height/distance scales this raster was cut against.
     pub axes: rustdar_radar::xsect::SectionAxes,
-    /// Where the ladder's rungs are, in degrees of beam elevation.
     pub tilt_elevations_deg: Vec<f64>,
     /// When each of those rungs was flown, milliseconds since the Unix epoch,
     /// in the same order — `CrossSection::tilt_collected_ms`.
-    ///
-    /// Kept for the reason the two fields above it are: it is a *label on this
-    /// picture*, not a fact about the live volume. A loop frame's ladder was
-    /// flown minutes or hours before the one the pane would otherwise read, and
-    /// a caption that took its assembly span from the live cut would describe a
-    /// volume that is not on the glass.
     pub tilt_collected_ms: Vec<i64>,
     /// The fingerprint of the tilt ladder this frame was cut from, from
     /// [`rustdar_radar::sampler::ladder_fingerprint`].
-    ///
-    /// **The one thing that can change under a loop frame.** A frame's scan is
-    /// normally immutable once downloaded, which is what makes a loop frame's
-    /// picture permanent — but the newest frame is not: the live poll re-caches
-    /// its volume under the same `(site, timestamp)` key as more of it seals, so
-    /// a section cut from a two-rung ladder can sit at the head of a loop while
-    /// the real volume grows to fourteen.
-    ///
-    /// This is the *same* notion of section staleness the live pane already
-    /// uses — `SectionTarget::ladder` — reused rather than reinvented, and for
-    /// the identical reason: it moves when a rung's chosen sweep or the declared
-    /// pattern moves, and holds still for the seals that change neither.
     pub ladder: u64,
 }
 
 /// A finished loop frame's picture, in whichever shape its pane draws.
-///
-/// # Why the two shapes are one field
-///
-/// Everything about the loop machinery that is *not* the picture — the render
-/// set, the eviction, the readiness settle, the playhead's skip-to-the-next-
-/// textured-frame — asks only "does this frame have an image yet?". Keeping the
-/// two kinds in two `Option` fields would make that question ambiguous and give
-/// a frame a state where both are set, which is a frame depicting two volumes.
-/// One field has neither problem, and the arms are what force every consumer to
-/// say which shape it means.
-///
-/// That is the loop path's half of the axis [`RenderKey`]'s doc describes:
-/// a plan view and a section of the same product at the same site are the same
-/// `(site, product, elevation)` and completely different pictures. On the static
-/// path they would collide in an LRU; here they would collide in a **broadcast**
-/// — see [`LoopPlaybackState::view`].
-///
-/// [`RenderKey`]: https://docs.rs/rustdar-app
 #[derive(Clone)]
 pub enum LoopFrameImage {
-    /// A square plan-view raster, positioned by the site's coordinates.
     PlanView(RadarImageData),
     /// A `SECTION_WIDTH × SECTION_HEIGHT` vertical slice along the loop's line.
     Section(SectionImageData),
     /// A **resident voxel grid**, named rather than held.
-    ///
-    /// The odd one out, and deliberately so: the other two variants carry the
-    /// picture, and this one carries what the picture is raymarched *from*. A
-    /// 3D pane's image is a function of the camera, so a cached raster would
-    /// be invalidated by one orbit; the grid is not, and swapping which
-    /// resident grid the march samples is a `set_bind_group` and a 192-byte
-    /// uniform write. See `PaneKind::can_loop`.
-    ///
-    /// It is a name rather than an `Arc<VoxelGrid>` because the grids live in
-    /// the frontend's single `VolumeStore`, keyed by target and shared between
-    /// panes — two 3D panes orbiting one volume already share one build and
-    /// one upload, and a loop frame holding its own handle would defeat that
-    /// and put a `rustdar_radar` type in a pane.
     Volume(VolumeFrameGrid),
 }
 
 /// The resident grid one 3D loop frame marches, named by what built it.
-///
-/// `target` is the whole identity — site, volume time, product and region — and
-/// is what the painter is aimed at while this frame is the playhead's. `id` is
-/// the `VolumeStore` id its GPU upload is keyed by, carried so a consumer can
-/// tell two frames apart without comparing a `String` and a `NaiveDateTime`,
-/// and so a test can assert that the resident set is exactly the frame list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeFrameGrid {
     /// The store id of the resident grid. Unique per build; the GPU side keeps
     /// exactly the ids the store is still holding.
     pub id: u64,
-    /// Everything the grid was built from.
     pub target: VolumeTarget,
 }
 
@@ -232,7 +90,6 @@ impl LoopFrameImage {
         }
     }
 
-    /// The plan-view image, or `None` if this frame is a section.
     pub fn plan_view(&self) -> Option<&RadarImageData> {
         match self {
             Self::PlanView(image) => Some(image),
@@ -240,7 +97,6 @@ impl LoopFrameImage {
         }
     }
 
-    /// The section image, or `None` if this frame is a plan view.
     pub fn section(&self) -> Option<&SectionImageData> {
         match self {
             Self::Section(image) => Some(image),
@@ -248,7 +104,6 @@ impl LoopFrameImage {
         }
     }
 
-    /// The resident grid this frame marches, or `None` if it is a raster.
     pub fn volume(&self) -> Option<&VolumeFrameGrid> {
         match self {
             Self::Volume(grid) => Some(grid),
@@ -259,58 +114,18 @@ impl LoopFrameImage {
 
 /// A single rendered frame in a radar loop.
 pub struct LoopFrame {
-    /// UTC timestamp of this scan.
     pub timestamp: NaiveDateTime,
-    /// Rendered picture, `None` if not yet rendered or evicted.
-    ///
-    /// Named for what it is rather than for the texture inside it: a section
-    /// frame carries axes and a ladder fingerprint beside its handle, and the
-    /// consumers that ask whether a frame is drawn must not have to know which
-    /// kind they are looking at to ask.
     pub image: Option<LoopFrameImage>,
-    /// True while a background render is in progress for this frame.
     pub render_in_flight: bool,
     /// True once a render for this frame has been attempted and produced nothing
     /// (no matching sweep for the selected product/elevation, or the render itself
-    /// failed). Terminal for this frame's current scan data: the dispatcher stops
-    /// retrying it, and it no longer holds up loop readiness. Without this, an
-    /// unrenderable frame would either be re-spawned every frame forever or wedge
-    /// the loop in `Rendering` permanently.
+    /// failed). Terminal for this frame's current scan data.
     pub render_failed: bool,
 }
 
 /// Which entries of a listing of `total` scans a loop that may hold `held`
 /// frames keeps, oldest-first — or `None` when the listing fits and every scan
 /// becomes a frame.
-///
-/// # The `Option` is the answer, not a convenience
-///
-/// This is the *only* place the two outcomes are distinguished, and
-/// distinguishing them is the whole reason the function exists rather than the
-/// arithmetic sitting inline at the one call site. "Did this loop drop scans"
-/// is not recoverable afterwards from anything the loop holds: the sampling is
-/// even, so every surviving gap is a sampled gap and the frame list looks
-/// exactly like a listing at a slower cadence. `LoopPlaybackState::listing_sampled`
-/// is `is_none()` on this and is what the timeline caption reads.
-///
-/// The comparison the caption used to make instead was the frame list's own
-/// median gap against the listing's, and that cannot resolve this at all. Even
-/// sampling keeps the frame median at one listing step until two-step gaps are
-/// the *majority*, so it caught 2x decimation cleanly and nothing below about
-/// 1.5x: a browser loop of 20 scans held at 14 drops 30.0% of them and every
-/// gap the median can see is still one step. Two statistics over the same
-/// timestamps cannot answer a question about the timestamps that were thrown
-/// away.
-///
-/// # The spacing it produces
-///
-/// `i * (total - 1) / (held - 1)` puts the first sample on the oldest scan and
-/// the last on the newest, which is what keeps a loop covering the whole
-/// lookback the user asked for however hard it is decimated — the cap costs
-/// resolution, never span. Between those ends the integer division leaves gaps
-/// of alternating width, so a sampled loop's frames are *unevenly spaced by
-/// construction* and that unevenness says nothing about the radar. The caption
-/// names the sampling for exactly this reason; see `ui_timeline::loop_span_phrase`.
 pub fn listing_sample_indices(total: usize, held: usize) -> Option<Vec<usize>> {
     if total <= held {
         return None;
@@ -330,33 +145,6 @@ pub const ELEVATION_TOLERANCE: f32 = 0.01;
 /// Every input `render_radar_to_image` is given *except the scan itself*: the radar
 /// site whose coordinates set the projection, and the product/elevation selection
 /// that picks the sweep out of that scan.
-///
-/// This is the render target key. It is stored on `LoopPlaybackState::rendered_for`,
-/// stamped onto every dispatched render, and compared on arrival so a result
-/// produced for one target is never painted onto frames keyed to another.
-///
-/// It identifies an image only together with the scan, and it cannot check the scan
-/// itself: the key derives from the loop, not from what the loop was handed. That the
-/// scan is the right one is enforced upstream instead, at every point a scan can enter
-/// a loop — `LoopDownloadManager` keys its cache on `(site, timestamp)`; a polled scan
-/// is appended only to loops on its own site; a scan listing is refused unless it names
-/// the site the loop is on, and the site it was listed for travels with the queue so
-/// the downloads it produces are filed under it. Those four together are what make a
-/// frame's scan and its target name the same radar; the key cannot check any of them.
-///
-/// What the target does not pin even then is the *sweep*: `elevation` is the selection,
-/// and each scan snaps it to whatever sweep it carries. Anything handing one loop's
-/// finished image to another has to compare that separately; see
-/// [`LoopPlaybackState::frame_accepting_broadcast`].
-///
-/// `site` is the site the loop's *geometry* was captured for — the same lookup that
-/// produced `LoopPlaybackState::site_lat`/`site_lon`, which is what
-/// `render_radar_to_image` actually projects with. It is deliberately not the pane's
-/// live `site` field: the two can drift (a pane's site is re-synced from the active
-/// pane without rebuilding its loop), and it is the geometry the image depends on.
-///
-/// No `PartialEq` on purpose — `elevation` is an `f32` carried straight from a combo
-/// box, so `==` would be the wrong comparison. Use [`RenderTarget::matches`].
 #[derive(Clone, Debug)]
 pub struct RenderTarget {
     /// NEXRAD site code supplying the projection geometry (e.g. "KTLX").
@@ -379,17 +167,12 @@ impl RenderTarget {
     /// Site and product are exact; elevation is compared within
     /// `ELEVATION_TOLERANCE`, since the selection is an `f32` that round-trips
     /// through the UI and the scan's own sweep angles.
-    ///
-    /// Takes the parts loose so a caller that already holds them — notably
-    /// `retarget_renders`, which runs for every looping pane every frame — can ask
-    /// without allocating a `RenderTarget` just to throw it away.
     pub fn matches_parts(&self, site: &str, product: RadarProduct, elevation: f32) -> bool {
         self.site == site
             && self.product == product
             && (self.elevation - elevation).abs() <= ELEVATION_TOLERANCE
     }
 
-    /// Whether two targets name the same image.
     pub fn matches(&self, other: &RenderTarget) -> bool {
         self.matches_parts(&other.site, other.product, other.elevation)
     }
@@ -397,53 +180,14 @@ impl RenderTarget {
 
 /// What a **section** loop's frames were cut for, beyond what
 /// [`RenderTarget`] already says.
-///
-/// The two together are one key split across two fields, and they are written
-/// by one function ([`LoopPlaybackState::retarget_renders_for`]) precisely so
-/// they cannot disagree. The split exists because every pre-existing loop site
-/// reads the plan-view half and none of them should have to learn about this
-/// one.
-///
-/// # Both fields are things a picture depends on and a `RenderTarget` cannot say
-///
-/// * **The line.** A section is a slice along two geographic endpoints. Redraw
-///   the line and every frame in the loop is a picture of somewhere else — the
-///   exact counterpart of changing the product on a plan-view loop, which
-///   `retarget_renders` already discards every frame for.
-/// * **The storm motion vector.** A storm-relative section is not a slice of a
-///   measured moment: the derivation runs on the way out of the volume, so the
-///   picture *is* a function of the vector. This is the same field, for the same
-///   reason, as `render_dispatch::SectionInputKey::storm_motion` — which exists
-///   because leaving it out shipped the previous vector's field to the worker
-///   and redrew the section visibly wrong, with nothing saying so. A loop keyed
-///   on time alone would reintroduce that bug once per frame instead of once.
-///
-/// Bits rather than `f32`s, exactly as `SectionInputKey` stores them, so the
-/// comparison is reflexive: a NaN vector would never equal itself and every
-/// frame of the loop would be re-cut on every dispatch pass, for ever, with a
-/// hot CPU as the only symptom.
-///
-/// `PartialEq` is derived and compares a stored key against a stored key, never
-/// against a re-derived value. That is only safe because
-/// [`SectionLine::new`](crate::pane::SectionLine::new) refuses non-finite
-/// endpoints.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectionLoopKey {
-    /// The line every frame is cut along.
     pub line: SectionLine,
     /// The storm motion vector the frames were derived with, as raw bits, and
     /// `None` for every product that does not read one.
     pub storm_motion: Option<(u32, u32)>,
     /// Which derived rung the frames fell to when there was no override and no
     /// RPG vector — the reader's `Settings > Storm motion` choice.
-    ///
-    /// Here for the same reason the vector above it is, and it is *not* covered
-    /// by that field: the two derived rungs are reached with `storm_motion`
-    /// equal to `None` on both sides, so a preference change moves the whole
-    /// field while every other term of this key stands still. Without it,
-    /// switching between the mean wind and the right-mover would leave a
-    /// running section loop painting the previous quantity, frame after frame,
-    /// with nothing saying so.
     pub srv_fallback: rustdar_radar::srv::SrvFallback,
 }
 
@@ -451,10 +195,6 @@ impl SectionLoopKey {
     /// The key for `line` under the storm motion vector `motion` and derived
     /// rung `fallback`, in the same `(speed_kt, direction_from_deg)` form the
     /// extraction is handed.
-    ///
-    /// The `to_bits` conversion lives here rather than at the call sites for the
-    /// reason `SectionInputKey::of` gives: a second copy of it is a second
-    /// chance to compare `f32`s that are not reflexive.
     pub fn new(
         line: SectionLine,
         motion: Option<(f32, f32)>,
@@ -470,32 +210,6 @@ impl SectionLoopKey {
 
 /// The 3D counterpart of [`SectionLoopKey`]: what a resident voxel grid depends
 /// on that a [`RenderTarget`] cannot say.
-///
-/// * **The region.** A grid is resampled over a box of ground, and the region
-///   picker exists to spend a fixed cell count over less of it. Re-drag the box
-///   and every frame in the loop is a resample of somewhere else — the exact
-///   counterpart of redrawing a section's line, and the same reason
-///   [`VolumeTarget`] carries it.
-/// * **The storm motion vector.** A storm-relative grid is derived on the way
-///   out of the volume, so the grid *is* a function of the vector, and the
-///   vector is not in the target that keys it. Without it here, an override
-///   edit would leave fourteen grids painting the previous vector's field with
-///   nothing saying so — the same defect `SectionLoopKey::storm_motion` and
-///   `render_dispatch::SectionInputKey::storm_motion` exist for.
-///
-/// Bits rather than `f32`s, for [`SectionLoopKey`]'s reason: a NaN vector would
-/// never equal itself and every grid in the loop would be rebuilt on every
-/// dispatch pass for ever — 89 ms of resample apiece, with a hot CPU as the
-/// only symptom. The region is compared as itself, which is safe because
-/// [`VolumeRegion::new`] refuses a non-finite centre.
-///
-/// The **elevation** is deliberately absent, and that is a difference from
-/// every other loop kind. A grid is resampled from the whole ladder, so the
-/// pane's tilt selection changes nothing about it; keying on the tilt would
-/// throw away fourteen grids and pay ~2 s to rebuild them identically the first
-/// time a user nudged the elevation slider on a 3D pane. See
-/// [`LoopPlaybackState::retarget_renders_keyed`], which is where that exception
-/// is applied.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeLoopKey {
     /// The ground every frame is resampled over, or `None` for the default box
@@ -504,10 +218,8 @@ pub struct VolumeLoopKey {
     /// The storm motion vector the grids were derived with, as raw bits, and
     /// `None` for every product that does not read one.
     pub storm_motion: Option<(u32, u32)>,
-    /// Which derived rung the grids fell to, for the reason
-    /// [`SectionLoopKey::srv_fallback`] carries one: both derived rungs leave
-    /// `storm_motion` `None`, so nothing else in this key moves when the
-    /// reader changes the preference.
+    /// Which derived rung the grids fell to; both derived rungs leave
+    /// `storm_motion` `None`, so nothing else in this key moves.
     pub srv_fallback: rustdar_radar::srv::SrvFallback,
 }
 
@@ -529,43 +241,19 @@ impl VolumeLoopKey {
 }
 
 /// The view-specific half of a loop's render key.
-///
-/// One field on [`LoopPlaybackState`] rather than one per view, so that the
-/// invariant [`SectionLoopKey`]'s doc states — the halves of a key are written
-/// together and cannot disagree — holds across *three* kinds rather than being
-/// re-established for each. A loop that changed kind without changing product
-/// would otherwise keep a key describing the old kind's picture.
-///
-/// A plan-view loop has no view half at all, which is [`Option::None`] at the
-/// use site rather than a third variant: there is nothing to store, and a
-/// variant holding nothing would be a thing to forget to compare.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoopViewKey {
-    /// See [`SectionLoopKey`].
     Section(SectionLoopKey),
-    /// See [`VolumeLoopKey`].
     Volume(VolumeLoopKey),
 }
 
 /// The two sweep angles a sibling broadcast has to reconcile.
-///
-/// A [`RenderTarget`] carries the *selected* elevation; the renderer is given that
-/// selection snapped to a sweep the frame's own scan actually carries, and two scans
-/// can snap one selection to different sweeps. So an image arriving from another pane
-/// is described by a sweep the receiver has to compare against its own, which is a
-/// different question from "do we want the same product and elevation".
-///
-/// The two are a struct rather than a pair of `f32` parameters so they cannot be
-/// passed in the wrong order — they are the same type, adjacent, and both plausible.
 #[derive(Clone, Copy, Debug)]
 pub struct BroadcastSweep {
-    /// The sweep angle the incoming image depicts.
     pub rendered: f32,
     /// The sweep the receiving loop's *own* scan for this frame resolves the same
     /// selection to, or `None` if it has no scan for the frame yet (or that scan
-    /// carries no sweep for the product). `None` refuses the image: an unverifiable
-    /// hand-off is not better than the local render that will follow once the scan
-    /// is there.
+    /// carries no sweep for the product). `None` refuses the image.
     pub own: Option<f32>,
 }
 
@@ -581,201 +269,60 @@ impl BroadcastSweep {
 /// The state phases for a radar loop playback instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopPhase {
-    /// Loop mode is disabled (single-frame mode).
     Inactive,
-    /// Loop is enabled and waiting for the scan listing to complete.
     FetchingScanList,
     /// Scans listed and downloads/renders started, waiting to reach render budget.
     Rendering,
     /// Sufficient frames have rendered to allow playback, but playing is not started.
     Ready,
-    /// Loop is actively playing/animating forward through frames.
     Playing,
-    /// User paused the active loop (has enough rendered frames).
     Paused,
 }
 
-/// Per-pane loop playback state.
-///
-/// Always present on every pane. In single-frame mode (`phase == LoopPhase::Inactive`),
-/// `frames` holds at most one entry — the current static radar image. When the
-/// user enables loop mode, the phase transitions and multiple historical frames
-/// are fetched and rendered.
 pub struct LoopPlaybackState {
-    /// The current phase of the loop playback lifecycle.
     pub phase: LoopPhase,
-    /// Index of the currently displayed frame in `frames`.
     pub current_frame: usize,
-    /// Ordered list of frames (oldest-first).
     pub frames: Vec<LoopFrame>,
-    /// Lookback duration in seconds that was requested.
     pub lookback_secs: u64,
     /// Whether the listing this loop was built from had to be **sampled** to fit
     /// the frame cap — `Some(true)` when scans were dropped, `Some(false)` when
     /// every scan in the window became a frame, `None` before a listing has been
     /// accepted at all.
-    ///
-    /// # Recorded, because it cannot be recovered
-    ///
-    /// [`listing_sample_indices`] is where it is decided and its doc says why no
-    /// later inspection of `frames` can re-derive it: the sampling is even, so a
-    /// decimated loop's frame list is indistinguishable from a listing at a
-    /// slower cadence. This flag and [`Self::scan_step_secs`] are the loop's only
-    /// two witnesses to the listing it came from, and they answer different
-    /// halves — this one says *whether* scans were dropped, that one says what
-    /// the site's cadence was.
-    ///
-    /// # It survives live appends, and that is not an accident
-    ///
-    /// `append_polled_frame` adds the newest scan and evicts from the old end,
-    /// so it moves the window without changing what the loop does with it: a
-    /// loop showing every scan goes on showing every scan over a window one
-    /// scan newer, and a sampled loop stays sampled. A fidelity claim derived
-    /// from the frame list instead flips with the frame count — about sixty
-    /// appends were enough to make a loop missing 273 scans read as "every
-    /// scan" — which is why this is a recorded decision rather than a measured
-    /// one.
     pub listing_sampled: Option<bool>,
     /// The site's own scan cadence over this loop's window, in seconds: the median
     /// gap between consecutive scans in the listing the loop was built from,
     /// measured **before** any sampling. `None` until a listing has been accepted.
-    ///
-    /// # Why the pre-sampling figure is the one worth keeping
-    ///
-    /// `accept_scan_listing` does not truncate a listing that overruns the frame
-    /// cap — it *evenly samples* it. So a loop always covers the whole lookback the
-    /// user asked for, and what the cap actually costs is temporal resolution: at
-    /// the 1440-minute maximum lookback a WSR-88D in precip offers ~333 scans and a
-    /// desktop loop keeps 60 of them, four scans in five dropped. Nothing in
-    /// `frames` can reveal that on its own, because every surviving gap is a
-    /// sampled gap. This is the only witness to what was skipped, and it is what
-    /// lets the timeline caption say "every scan" or "sampled from ~4 min scans"
-    /// instead of quoting a frame spacing the user has no way to calibrate.
-    ///
-    /// The measured cadences it gets compared against, so the units are concrete: a
-    /// TDWR volume is 360 s on **both** VCP 80 and VCP 90, a WSR-88D precip volume
-    /// (VCP 212/215) is 259 s, and a WSR-88D clear-air volume (VCP 35) is 517 s.
-    ///
-    /// A median, not a mean: a site that changes VCP mid-window mixes two cadences,
-    /// and the mean of a 259 s run and a 517 s run describes neither of them.
+    /// Measured cadences: TDWR 360 s (VCP 80 and 90), WSR-88D precip (VCP
+    /// 212/215) 259 s, clear-air (VCP 35) 517 s. A median, not a mean: a site
+    /// that changes VCP mid-window mixes two cadences.
     pub scan_step_secs: Option<u32>,
-    /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<web_time::Instant>,
     /// When this loop entered [`LoopPhase::FetchingScanList`], or `None` for a
     /// loop that was never built ([`Self::new`]).
-    ///
-    /// # It exists to bound a memory exemption, not to time the network
-    ///
-    /// `App::evict_unneeded_loop_scans` skips a site whole while any loop on it
-    /// is still fetching, because such a loop names no frame yet and would
-    /// otherwise have its whole window swept one frame before the listing that
-    /// would have saved it. That exemption has to end even when the listing
-    /// never does. On wasm32 there is no timeout to end it: `rustdar_radar::tls`
-    /// accepts and ignores the one it is handed, because reqwest's wasm
-    /// `ClientBuilder` has no `timeout` and a browser `fetch()` has no default
-    /// of its own — a black-holed connection leaves the future pending for the
-    /// life of the tab. Natively `ARCHIVE_TIMEOUT` does end it, but at 300 s
-    /// **per request** and `list_scans_for_range` issues one listing per UTC day
-    /// the window touches, so the bound there is minutes rather than one
-    /// round-trip.
-    ///
-    /// # Why a stamp here rather than the pane's frame plan
-    ///
-    /// The plan would be the obvious witness — "a loop with no plan is still
-    /// listing" — and it is the wrong one: `begin_loop_for_pane` calls
-    /// `LoopDownloadManager::remove_pending`, which deletes the plan, so a
-    /// rebuilt loop has neither a plan nor a frame and the two states are
-    /// indistinguishable through it.
-    ///
-    /// Stamped by [`Self::new_for_loop`], which is the **only** writer of
-    /// `FetchingScanList` in the workspace — so this cannot go stale behind a
-    /// phase that re-entered fetching by some other route, because there is no
-    /// other route.
     pub listing_since: Option<web_time::Instant>,
     /// NEXRAD site code the loop's geometry belongs to, captured at loop creation
-    /// from the same lookup as `site_lat`/`site_lon`. Every frame in this loop is
-    /// rendered and positioned with those coordinates, so this — not the pane's
-    /// live `site` field — is the site half of the render target.
+    /// from the same lookup as `site_lat`/`site_lon` — not the pane's live `site`.
     pub site: String,
-    /// Radar site latitude, captured at loop creation for rendering.
     pub site_lat: f64,
-    /// Radar site longitude, captured at loop creation for rendering.
     pub site_lon: f64,
     /// The [`RenderTarget`] every frame's render state was produced for, or `None`
-    /// before the first dispatch. The user can change the pane's product or
-    /// elevation at any time, and both pieces of per-frame render state are
-    /// judgements about that selection — a `texture` shows that product, and a
-    /// `render_failed` flag means "this scan carries no sweep for that product".
-    /// When the selection moves, both are stale; see `retarget_renders`.
-    ///
-    /// The site rides along because it is a render input like any other, and every
-    /// path that hands one loop's image to another pane has to check it. A loop is
-    /// rebuilt from scratch when the pane changes site, so this half never moves
-    /// under a live loop — it exists so that results and sibling textures carrying
-    /// another site's geometry are rejected by construction rather than by luck.
-    ///
-    /// It does not make a frame's image fully determined on its own — the scan
-    /// supplies the rest, and the sweep it snaps the selection to is not in here.
-    /// See [`RenderTarget`].
+    /// before the first dispatch. When the pane's selection moves both the
+    /// texture and the `render_failed` flag are stale; see `retarget_renders`.
     pub rendered_for: Option<RenderTarget>,
     /// Which kind of picture this loop's frames are, fixed for the life of the
     /// state by the pane kind that started it.
-    ///
-    /// # This is the loop path's view axis, and it is a safety field
-    ///
-    /// [`RenderTarget`] is `(site, product, elevation)` with **no view term**,
-    /// and that was complete while a loop frame could only ever be a plan-view
-    /// tilt. It is not complete now: a section pane and a map pane on the same
-    /// site, product and elevation produce two `RenderTarget`s that
-    /// [`RenderTarget::matches`] says are the same — and the loop-frame
-    /// broadcast in `App::poll_loop_render_results` hands one pane's finished
-    /// texture to every sibling whose loop `is_rendered_for` the result's
-    /// target. Without this field a 2048² plan view is placed into a section
-    /// pane's frame list, and the pane animates a map where a vertical slice
-    /// should be, with every caption and axis around it describing the section.
-    ///
-    /// So the acceptance, donation and result-placement predicates all test it
-    /// — and each tests it against the *result's* view, not against the
-    /// receiving pane's kind, because a pane and a result can both be sections
-    /// and still disagree about which. That is the same lesson `RenderKey`
-    /// learnt on the static path, where the collision is a wrong-shaped buffer
-    /// handed to `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the main
-    /// thread rather than a wrong picture.
-    ///
-    /// [`RenderView::PlanView`] for a loop built before the field existed and
-    /// for [`LoopPlaybackState::new`], which is the inactive state.
     pub view: RenderView,
     /// The view-specific half of the render key, or `None` for a plan-view
     /// loop.
-    ///
-    /// See [`LoopViewKey`] for what is in it and why. Written only by
-    /// [`Self::retarget_renders_keyed`], alongside [`Self::rendered_for`], so
-    /// the two halves of the key cannot describe different pictures. Read
-    /// through [`Self::section_key`] and [`Self::volume_key`], which answer
-    /// `None` for a key of the other kind — so a caller that asks for its own
-    /// kind's key can never be handed another's.
     pub view_key: Option<LoopViewKey>,
 }
 
 /// Config-file content addressed to a build that is not this one, carried
 /// between load and save so the file survives a session under this build.
-///
-/// Populated by `load_ui_config` from the parts of a pane's config this
-/// build cannot name — overlay kinds from a newer build, whole fields it
-/// has never heard of — and drained by `ui_config_json`, which writes each
-/// piece back exactly where it came from. Never consulted in between: the
-/// pane cannot act on state it cannot name, and inventing behavior for it
-/// would be worse than carrying it. What this buys is the downgrade
-/// guarantee: run an older build once and your newer config comes through,
-/// not silently stripped by the first autosave.
 #[derive(Clone, Debug, Default)]
 pub struct PaneConfigBaggage {
     /// `draw_order` entries that are not strings at all, verbatim,
-    /// re-appended after the ids on save. (String entries — including names
-    /// from a newer build — are ordinary open [`LayerId`]s since M8b and
-    /// ride in [`PaneState::draw_order`] itself, in place; the same goes for
-    /// unknown keys in the enabled/config maps, so those baggage halves are
-    /// gone.)
+    /// re-appended after the ids on save.
     pub draw_order: Vec<serde_json::Value>,
     /// Whole pane-level fields this build does not know.
     pub fields: serde_json::Map<String, serde_json::Value>,
@@ -783,73 +330,24 @@ pub struct PaneConfigBaggage {
 
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
-///
-/// Every field below is flat, including for a pane that is not a map: what a
-/// pane is looking at (site, time, product, viewport, loop) is the same set of
-/// questions whether it draws a plan view, a vertical section or a volume. Only
-/// [`content`](Self::content) differs by kind, and it is the *only* field that
-/// does. See [`PaneContent`]'s module documentation for why — the short version
-/// is that ~53 all-panes loops keep working unchanged, one of which
-/// (`App::evict_unshown_scans`) is what stops a non-map pane's volume being
-/// freed out from under it.
 pub struct PaneState {
-    /// NEXRAD site code this pane is viewing (e.g. "KTLX").
     pub site: String,
-    /// Product/elevation metadata for this pane's site.
     pub scan_info: Option<ScanInfo>,
     /// When the data behind this pane's current radar image was collected (UTC).
-    ///
-    /// One field for every product, whatever it is derived from: the volume time
-    /// for a product read off the Level II scan, the
-    /// [`rustdar_radar::level3::ProductStamp`] time for one fetched from the
-    /// Level III bucket. The status bar draws it the same way either way — a
-    /// product whose age is reported under a different label, or only sometimes, is
-    /// a product the user can identify as coming from somewhere else.
-    ///
-    /// It is the time of *what is drawn*, not of the freshest data in hand, and
-    /// that is the point. `level3::latest_key` falls back to the previous UTC day,
-    /// so a site down since yesterday paints a field up to ~48 h old over a live
-    /// basemap; nothing else on screen says so, because the scan line beside it
-    /// describes the Level II volume.
-    ///
-    /// `None` before any render has reached the pane, and for a bucket key whose
-    /// tail does not parse — an *unknown* time, which the bar reports by drawing
-    /// nothing rather than by guessing.
     pub data_time: Option<NaiveDateTime>,
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
-    /// Whether this pane is viewing the latest (live) data.
     pub viewing_live: bool,
     /// Time navigation step size in seconds (0 = single scan mode).
     pub time_step_secs: i64,
     /// Whether this pane follows shared time (plan §3.7). Persisted; default
     /// **true** — every pane before the field existed behaved as linked.
-    ///
-    /// Off means frozen: the pane is left out of
-    /// [`Gui::time_sync_targets`](crate::Gui), so the loop fan-out skips it
-    /// and `propagate_layer_sync` leaves its `viewing_live`/`time_step_secs`
-    /// alone. It is deliberately *not* consulted by the site-wide scan
-    /// delivery (the `ScanInfoForSite` event): the volume a site holds is
-    /// shared state, and what this flag freezes is the pane's own time posture.
     pub time_link: bool,
-    /// Whether this pane's viewport belongs to the linked group (M11's
-    /// per-pane sync model — the successor to the retired `Gui`-global
-    /// `viewport_sync`). Persisted; default **true**.
-    ///
-    /// The linked group is the visible map panes with this on: a pan or zoom
-    /// on a linked pane moves the group, a change on an unlinked pane moves
-    /// only itself, and an unlinked pane is never written by the group's
-    /// convergence (`Gui::sync_viewports`).
-    pub viewport_link: bool,
-    /// Whether this pane's layer state belongs to the linked group (M11 —
-    /// the successor to the retired `Gui`-global `sync_layers`). Persisted;
+    /// Whether this pane's viewport belongs to the linked group. Persisted;
     /// default **true**.
-    ///
-    /// `propagate_layer_sync` converges site, scan, product, tilt, draw
-    /// order and overlay state from a linked **source** to linked
-    /// **targets** only: an unlinked pane's edits stay its own, and the
-    /// group's edits leave it alone. The time pair inside that pass keeps
-    /// its own gate ([`Self::time_link`]).
+    pub viewport_link: bool,
+    /// Whether this pane's layer state belongs to the linked group. Persisted;
+    /// default **true**.
     pub layer_link: bool,
     pub hover_value: Option<String>,
     /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
@@ -858,16 +356,10 @@ pub struct PaneState {
     pub map_memory: MapMemory,
     /// Per-overlay-type texture caches (background-rendered), keyed by
     /// [`LayerId`]. Only texture overlay kinds (SPC, NWS, discussions) have
-    /// cache entries; entries are created lazily by
-    /// [`Self::overlay_cache_mut`].
+    /// cache entries; entries are created lazily.
     pub overlay_textures: HashMap<LayerId, OverlayTextureCache>,
     /// Per-pane draw order (bottom to top). Controls the visual stacking of all
     /// map layers. Persisted across sessions.
-    ///
-    /// Open ids: an entry naming a layer this build has no handler for is
-    /// RETAINED in place and skipped at draw (M8b's deliberate refinement —
-    /// the old reconcile dropped it), so a newer build's layer keeps its
-    /// position through a session under this one.
     pub draw_order: Vec<LayerId>,
     /// Per-pane overlay enabled state (master visibility for each overlay kind).
     /// Propagated from a layer-linked active pane to the other layer-linked
@@ -890,17 +382,6 @@ pub struct PaneState {
     /// Generation counter for RadarSites texture invalidation.
     /// Bumped when site, loading_site, or theme changes.
     pub radar_sites_render_gen: u64,
-    /// What kind of pane this is, and the state that kind needs.
-    ///
-    /// The single source of [`Self::kind`] — there is deliberately no `kind`
-    /// field beside this one, because two fields can disagree and a mismatched
-    /// pair is a state every render frame would then have to have an opinion
-    /// about.
-    ///
-    /// **Nothing may read this through `Gui::panes[..]` or `Gui::active_pane()`
-    /// during the UI pass.** Six places `std::mem::take` a pane for the duration
-    /// of a draw, and a taken slot holds `PaneState::default()`, which is a
-    /// *map* pane whatever the real one is. Branch on the taken value instead.
     pub content: PaneContent,
 }
 
@@ -911,10 +392,6 @@ impl Default for LoopPlaybackState {
 }
 
 impl LoopPlaybackState {
-    /// Create a default single-frame (non-loop) state.
-    ///
-    /// The site fields are placeholders: the state is `Inactive` with no frames, so
-    /// nothing is ever rendered or accepted against them.
     pub fn new() -> Self {
         Self {
             phase: LoopPhase::Inactive,
@@ -934,20 +411,6 @@ impl LoopPlaybackState {
         }
     }
 
-    /// Create a new initialized loop state starting the fetch phase.
-    ///
-    /// Takes the whole [`RadarSite`] rather than a code and a pair of coordinates:
-    /// the code is what the render target is compared on and the coordinates are what
-    /// frames are actually projected with, so they have to describe the same site. As
-    /// separate parameters a caller could pass the pane's site code alongside another
-    /// site's coordinates, and every later comparison would be exact and wrong.
-    ///
-    /// `view` is the pane kind's [`PaneKind::render_view`], captured once here
-    /// rather than re-derived at each consumer. A pane cannot change kind under
-    /// a running loop — [`PaneState::set_content`] tears the loop down for a kind
-    /// that cannot animate, and rebuilds it for one that can — so this is fixed
-    /// for the life of the state, exactly like [`Self::site`]. See
-    /// [`Self::view`] for what it protects.
     pub fn new_for_loop(lookback_secs: u64, site: &RadarSite, view: RenderView) -> Self {
         Self {
             phase: LoopPhase::FetchingScanList,
@@ -969,17 +432,14 @@ impl LoopPlaybackState {
         }
     }
 
-    /// True if the loop is active (`new_for_loop` was called; single frame mode uses `Inactive`).
     pub fn is_active(&self) -> bool {
         !matches!(self.phase, LoopPhase::Inactive)
     }
 
-    /// True if actively playing back frames.
     pub fn is_playing(&self) -> bool {
         matches!(self.phase, LoopPhase::Playing)
     }
 
-    /// True if enough frames have rendered for playback to be enabled.
     pub fn is_render_ready(&self) -> bool {
         matches!(
             self.phase,
@@ -987,22 +447,12 @@ impl LoopPlaybackState {
         )
     }
 
-    /// True during the initial scan list fetch.
     pub fn is_fetching(&self) -> bool {
         matches!(self.phase, LoopPhase::FetchingScanList)
     }
 
     /// How long this loop has been waiting for its scan listing, or `None` if
     /// it is not waiting for one.
-    ///
-    /// The caller supplies `now` rather than reading the clock here, so one
-    /// sweep judges every pane against one instant — and so a test can drive
-    /// the bound without sleeping.
-    ///
-    /// `saturating_duration_since`, because `web_time::Instant` is the
-    /// browser's monotonic clock on wasm and a non-monotonic reading would
-    /// otherwise panic in a subtraction rather than answer "no time has
-    /// passed".
     pub fn listing_wait(&self, now: web_time::Instant) -> Option<std::time::Duration> {
         if !self.is_fetching() {
             return None;
@@ -1015,12 +465,10 @@ impl LoopPlaybackState {
         )
     }
 
-    /// True if playback was previously started (could be paused or playing).
     pub fn has_playback_started(&self) -> bool {
         matches!(self.phase, LoopPhase::Playing | LoopPhase::Paused)
     }
 
-    /// True if the frames' render state is keyed to exactly this target.
     pub fn is_rendered_for(&self, target: &RenderTarget) -> bool {
         self.rendered_for
             .as_ref()
@@ -1029,35 +477,6 @@ impl LoopPlaybackState {
 
     /// The index of the frame a finished render for `timestamp`, produced for
     /// `target`, must be written to — or `None` if the result has to be dropped.
-    ///
-    /// Two independent ways a result goes stale, and both must be checked:
-    ///
-    /// - The pane retargeted while the render ran, so the image depicts a site,
-    ///   product or elevation the frames are no longer keyed to. Checking "is the
-    ///   frame still marked in flight?" cannot catch this: `retarget_renders` clears
-    ///   the mark, but the very same dispatch pass re-spawns the frame for the new
-    ///   target and marks it again, so the older render's result arrives to a frame
-    ///   that *is* in flight. Comparing the target catches it, and a late result that
-    ///   still matches the current target is safe to apply: the target fixes every
-    ///   render input except the scan, and the scan for a given `(site, timestamp)`
-    ///   does not change under a live loop, so the pending render would produce the
-    ///   same image. The `(site, timestamp)` qualifier is load-bearing rather than
-    ///   pedantic: that is the cache's key, and it is what makes "the scan does not
-    ///   change" true. Under a timestamp-only key another site's scan could replace
-    ///   this one at any moment and the sentence above would be false.
-    /// - The frame is not expecting a result at all: the frame list was rebuilt, the
-    ///   graphics state was cleared, or a sibling pane already supplied the texture.
-    ///
-    /// Returns the *index* rather than a yes/no so the caller cannot look the frame up
-    /// a second time and land somewhere else. Timestamps are unique across a frame
-    /// list today, but only incidentally — a predicate answering "is some frame with
-    /// this timestamp in flight?" paired with a caller fetching "the frame with this
-    /// timestamp" is two lookups that are free to disagree, and the frame the
-    /// predicate cleared would then stay marked in flight forever.
-    /// - The result is a **plan view and this loop is not** (or the reverse).
-    ///   [`RenderTarget`] carries no view term, so a section loop and a map loop
-    ///   on one site, product and elevation produce targets that `matches` calls
-    ///   equal. See [`Self::view`].
     pub fn frame_awaiting_render_result(
         &self,
         timestamp: NaiveDateTime,
@@ -1071,13 +490,6 @@ impl LoopPlaybackState {
             .position(|f| f.timestamp == timestamp && f.render_in_flight)
     }
 
-    /// [`Self::frame_awaiting_render_result`] as a mutable borrow of the frame itself.
-    ///
-    /// This is what callers use. Handing back the frame rather than its index leaves
-    /// nothing for a caller to re-derive: the borrow of `self` is live for as long as
-    /// the frame is held, so "look the frame up again by timestamp" is not expressible
-    /// at the call site. The index form stays public so the choice can be asserted
-    /// directly in tests.
     pub fn frame_awaiting_render_result_mut(
         &mut self,
         timestamp: NaiveDateTime,
@@ -1089,31 +501,6 @@ impl LoopPlaybackState {
 
     /// The index of the frame that should receive a texture finished by *another*
     /// pane for `timestamp`/`target`, or `None` if this loop cannot use it.
-    ///
-    /// Two panes showing the same site at the same product and elevation render
-    /// byte-identical images, so one render can serve both. The site is what makes
-    /// that true, and it is not implied by the panes agreeing on product and
-    /// elevation: `propagate_layer_sync` converges `PaneState::site` across panes but
-    /// never rebuilds their loops, so two panes can agree on every visible control
-    /// while their loops still carry different geometry. Handing an image across that
-    /// gap positions it at coordinates it was not projected for.
-    ///
-    /// `sweep` closes the one input the target does not name. `target.elevation` is the
-    /// user's selection; what got rendered is that selection snapped to a sweep the
-    /// *donor's* scan carries, and the receiver's own scan for this frame may snap it
-    /// somewhere else. Accepting then is doubly wrong: the frame takes an image of the
-    /// wrong tilt, *and* the receiver's own in-flight render is dropped as redundant by
-    /// the caller — so nothing ever corrects it. The dispatcher's suppression test
-    /// (`render_already_queued`) already compares the snapped sweep, and suppression is
-    /// a promise of acceptance, so the two have to weigh the same thing.
-    ///
-    /// Only untextured frames qualify — a frame that already has an image is not
-    /// improved by an identical one, and overwriting it would churn texture handles.
-    ///
-    /// The [`view`](Self::view) test is first and is the one that is not about
-    /// tilts at all: the incoming image is a plan-view raster, and a section
-    /// loop whose target happens to match would otherwise animate a map inside a
-    /// vertical slice's axes.
     pub fn frame_accepting_broadcast(
         &self,
         timestamp: NaiveDateTime,
@@ -1132,8 +519,6 @@ impl LoopPlaybackState {
             .position(|f| f.timestamp == timestamp && f.image.is_none())
     }
 
-    /// [`Self::frame_accepting_broadcast`] as a mutable borrow of the frame itself,
-    /// for the same reason as [`Self::frame_awaiting_render_result_mut`].
     pub fn frame_accepting_broadcast_mut(
         &mut self,
         timestamp: NaiveDateTime,
@@ -1146,26 +531,6 @@ impl LoopPlaybackState {
 
     /// The index of a frame this loop can hand to a pane keyed to `target`, letting
     /// that pane skip a render it would otherwise dispatch.
-    ///
-    /// The mirror of [`Self::frame_accepting_broadcast`] — the dispatcher looks for a
-    /// donor *before* rendering, the response path pushes to receivers *after* — and
-    /// it must apply the same test, including the site. If the two disagree the
-    /// dispatcher suppresses a pane's own render on the promise of a broadcast the
-    /// response path then refuses, and the frame is served by neither.
-    ///
-    /// It takes no sweep argument, unlike acceptance, and that asymmetry is confined to
-    /// this direction: a donation is copied on the spot, so there is no promise for a
-    /// later test to break. The promise pair is the *other* one — `render_already_queued`
-    /// suppressing a render because a sibling's is queued, then that sibling's result
-    /// being offered to this loop — and both halves of it compare the sweep. Two loops
-    /// that pass this test are on one site and so share one `(site, timestamp)` cache
-    /// entry, which is what makes their scans, and therefore their snapped sweeps, the
-    /// same to begin with.
-    ///
-    /// The [`view`](Self::view) test is the same one acceptance applies, and for
-    /// the same reason — this is the *before* half of the pair, so if the two
-    /// disagreed the dispatcher would suppress a pane's own render on the
-    /// promise of a donation the placement path then refuses.
     pub fn frame_donatable_to(
         &self,
         timestamp: NaiveDateTime,
@@ -1181,18 +546,12 @@ impl LoopPlaybackState {
 
     /// Whether this loop's frames are cut for `target` **and** `key` — the
     /// section counterpart of [`Self::is_rendered_for`].
-    ///
-    /// Both halves, always, because they are one key: `rendered_for` carries the
-    /// site and product a section was cut under and `section_key` carries the
-    /// line and the storm motion vector, and a frame that agrees on one half and
-    /// not the other is a picture of a different slice.
     pub fn is_cut_for(&self, target: &RenderTarget, key: &SectionLoopKey) -> bool {
         self.is_rendered_for(target) && self.section_key() == Some(key)
     }
 
     /// The section half of this loop's key, or `None` — including for a loop
-    /// whose key is a *volume* key, which is the point of asking through here
-    /// rather than matching on [`Self::view_key`] at each site.
+    /// whose key is a *volume* key.
     pub fn section_key(&self) -> Option<&SectionLoopKey> {
         match &self.view_key {
             Some(LoopViewKey::Section(key)) => Some(key),
@@ -1200,8 +559,6 @@ impl LoopPlaybackState {
         }
     }
 
-    /// The volume half of this loop's key, or `None`. See
-    /// [`Self::section_key`].
     pub fn volume_key(&self) -> Option<&VolumeLoopKey> {
         match &self.view_key {
             Some(LoopViewKey::Volume(key)) => Some(key),
@@ -1211,14 +568,6 @@ impl LoopPlaybackState {
 
     /// The index of the frame awaiting a **section** result for
     /// `timestamp`/`target`/`key`, or `None` if this loop is not owed one.
-    ///
-    /// [`Self::frame_awaiting_render_result`] for sections, with the same
-    /// contract and the same view guard read the other way round. It exists as a
-    /// separate function rather than a parameter on that one because the two
-    /// take different keys — a plan-view result is identified by a snapped sweep
-    /// and a section result by a line and a motion vector — and a single
-    /// function taking both would have to accept `None` for whichever half did
-    /// not apply, which is a signature that lets a caller pass neither.
     pub fn frame_awaiting_section_result(
         &self,
         timestamp: NaiveDateTime,
@@ -1236,8 +585,6 @@ impl LoopPlaybackState {
             .position(|f| f.timestamp == timestamp && f.render_in_flight)
     }
 
-    /// [`Self::frame_awaiting_section_result`] as a mutable borrow of the frame,
-    /// for the reason [`Self::frame_awaiting_render_result_mut`] gives.
     pub fn frame_awaiting_section_result_mut(
         &mut self,
         timestamp: NaiveDateTime,
@@ -1250,18 +597,6 @@ impl LoopPlaybackState {
 
     /// The index of the frame that should receive a **section** raster finished
     /// by another pane, or `None` if this loop cannot use it.
-    ///
-    /// The section form of [`Self::frame_accepting_broadcast`]. It takes no
-    /// sweep, and the asymmetry is not an oversight: a plan view is one tilt out
-    /// of a volume, so two loops agreeing on the selection can still snap it to
-    /// different sweeps — a section is cut across *every* tilt, so there is no
-    /// snapping to disagree about. What replaces it is `ladder`, the fingerprint
-    /// of the ladder the incoming raster was cut from, which must match the
-    /// ladder this loop's own scan for the frame resolves to. Two loops sharing
-    /// one `(site, timestamp)` cache entry share one scan and so one ladder;
-    /// the test is here because the newest frame's scan can be re-cached as more
-    /// of the volume seals, and a raster cut from the two-rung version must not
-    /// be handed to a loop that is about to cut the fourteen-rung one.
     pub fn frame_accepting_section_broadcast(
         &self,
         timestamp: NaiveDateTime,
@@ -1282,7 +617,6 @@ impl LoopPlaybackState {
             .position(|f| f.timestamp == timestamp && f.image.is_none())
     }
 
-    /// [`Self::frame_accepting_section_broadcast`] as a mutable borrow.
     pub fn frame_accepting_section_broadcast_mut(
         &mut self,
         timestamp: NaiveDateTime,
@@ -1298,12 +632,6 @@ impl LoopPlaybackState {
 
     /// The index of a **section** frame this loop can hand to a pane keyed to
     /// `target`/`key`, letting that pane skip a cut it would otherwise dispatch.
-    ///
-    /// The mirror of [`Self::frame_accepting_section_broadcast`], applying the
-    /// same tests for the reason [`Self::frame_donatable_to`] gives — a donation
-    /// suppresses a render, so the two halves must weigh the same things. The
-    /// ladder comes off the candidate frame's own picture rather than from the
-    /// caller, because that is what a donation actually copies.
     pub fn section_frame_donatable_to(
         &self,
         timestamp: NaiveDateTime,
@@ -1329,34 +657,11 @@ impl LoopPlaybackState {
     /// Point the loop's frame renders at `product`/`elevation`, discarding every
     /// frame's render state if that differs from what the frames were last rendered
     /// for. Returns `true` if frames were invalidated.
-    ///
-    /// Both pieces of per-frame render state are only meaningful relative to a
-    /// selection: a `texture` depicts one product at one elevation, and a
-    /// `render_failed` flag records that the frame's scan carries no sweep for that
-    /// product. The user can change either at any time from the pane's combo boxes,
-    /// which write straight through to the pane. Without this, a frame retired under
-    /// a product that only some scans carry would stay blank forever after switching
-    /// to a product every scan has — and readiness counts retired frames as settled,
-    /// so playback would animate with permanent holes.
-    ///
-    /// In-flight renders are un-marked as well, since nothing is owed to a frame whose
-    /// target moved. That alone does *not* make their results stale — the same dispatch
-    /// pass re-spawns and re-marks the frame — so rejecting them is
-    /// `frame_awaiting_render_result`'s job, via the target stamped on the response.
-    ///
-    /// Only the product and elevation are parameters: the target's site is the loop's
-    /// own `site`, which is fixed for the life of a `LoopPlaybackState`. A pane that
-    /// changes site gets a whole new loop state rather than a retarget.
     pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
         self.retarget_renders_for(product, elevation, None)
     }
 
     /// [`Self::retarget_renders`] including the section half of the key.
-    ///
-    /// `section` is `None` for a plan-view loop and `Some` for a section loop.
-    /// Passing `None` on a section loop would therefore *also* count as a
-    /// change and discard every frame — which is the safe direction, and is what
-    /// a caller that has lost the line should get.
     pub fn retarget_renders_for(
         &mut self,
         product: RadarProduct,
@@ -1367,36 +672,6 @@ impl LoopPlaybackState {
     }
 
     /// [`Self::retarget_renders`] including whichever view half this loop has.
-    ///
-    /// **The only writer of either half**, which is what makes them one key
-    /// rather than two fields that can disagree: a caller cannot move the line
-    /// or the region without the frames keyed to the old one being discarded,
-    /// because there is no way to write [`Self::view_key`] that does not come
-    /// through here.
-    ///
-    /// # The tilt is part of the target only where it chooses the picture
-    ///
-    /// Asked of [`Self::view`] and the product together, through
-    /// [`RenderView::elevation_selects_picture`] — the one predicate that also
-    /// keys `render_dispatch`'s shared `RenderCache`. This is not a loop-kind
-    /// carve-out, and it is deliberately not restated here: a loop's re-renders
-    /// do **not** consult that cache, so every pair the two answered
-    /// differently cost a whole-volume recompute per *frame* rather than per
-    /// pane — up to `MAX_LOOP_RENDER_BUDGET` of them for one tilt click. Both
-    /// directions of that disagreement had already been paid for. See that
-    /// predicate for which pairs qualify and how the pipeline enforces each.
-    ///
-    /// On [`Self::view`] rather than on `key`, for the reason
-    /// [`RenderView::can_loop`] gives: the view is what a frame is a picture
-    /// of, and it is already the axis the loop dispatcher branches every other
-    /// decision on. `key` cannot answer it — `None` is both "a plan-view loop"
-    /// and "a section or volume loop that has lost its line or region", which
-    /// are opposite answers.
-    ///
-    /// The stored `rendered_for` still carries the pane's selection, so the
-    /// sibling broadcast and every result-acceptance test are unchanged; what
-    /// this drops is only the *comparison*, and only where the tilt cannot move
-    /// the picture.
     pub fn retarget_renders_keyed(
         &mut self,
         product: RadarProduct,
@@ -1435,40 +710,6 @@ impl LoopPlaybackState {
 
     /// Bring the frame list back inside `held`, by the same even sampling the
     /// listing was capped with. Returns whether anything was dropped.
-    ///
-    /// # Why an append needs this at all
-    ///
-    /// `accept_scan_listing` caps the listing once, and that was the only place
-    /// the cap was ever applied. Live appends then grow the list past it,
-    /// because the only eviction they run is the *lookback window* one — and a
-    /// loop whose listing had to be sampled is by definition one whose window
-    /// holds more scans than the cap, so that eviction is not binding. Measured
-    /// on the shipped desktop numbers: a 24 h loop sampled 333 scans down to 60,
-    /// and sixty live appends later held **120 frames against a stated cap of
-    /// 60**, with the transport's own caption printing both numbers side by
-    /// side.
-    ///
-    /// # Why re-sampling, rather than dropping the oldest
-    ///
-    /// Dropping from the old end is the cheaper answer and it breaks the one
-    /// invariant the cap is designed around: `accept_scan_listing` samples
-    /// instead of truncating precisely so that **the cap costs resolution and
-    /// never span**. Each append extends the newest end by one scan interval, so
-    /// evicting the oldest frame of a sampled loop would give back a whole
-    /// sampled step — around 26 min against 4 min gained on the 24 h shape — and
-    /// the window the user asked for would erode away in front of them.
-    ///
-    /// Re-sampling keeps the ends and drops one interior frame per append, so
-    /// the loop goes on covering its whole lookback at slightly coarser
-    /// resolution, which is exactly what the cap means everywhere else. It is
-    /// also why [`Self::listing_sampled`] is raised here: scans this loop was
-    /// holding have now been dropped, whether or not the original listing fitted.
-    ///
-    /// The playhead follows the frame it was on, or the nearest survivor, for
-    /// the reason `append_polled_frame`'s own eviction pulls it back inside the
-    /// list: `displayed_frame` resolves `current_frame` with `get()`, so an index
-    /// left past the end renders a blank pane, and a paused loop never advances
-    /// off it.
     pub fn cap_frames(&mut self, held: usize) -> bool {
         let Some(indices) = listing_sample_indices(self.frames.len(), held) else {
             return false;
@@ -1489,10 +730,6 @@ impl LoopPlaybackState {
 
     /// Drop textures outside the intended render set once more than `budget` frames
     /// are textured, capping loop memory.
-    ///
-    /// Deliberately shares `render_set_indices` with the dispatcher and the readiness
-    /// check: an eviction rule that disagreed with the dispatcher could drop the
-    /// texture of a frame that is about to be re-rendered, churning renders forever.
     pub fn evict_textures_outside_render_set(&mut self, budget: usize) {
         let textured = self.frames.iter().filter(|f| f.image.is_some()).count();
         if textured <= budget {
@@ -1508,11 +745,6 @@ impl LoopPlaybackState {
 
     /// Indices of the frames the renderer intends to have textured: up to `budget`
     /// frames, walking outward from the playhead (forward first, then backward).
-    ///
-    /// This is the "intended render set". The dispatcher spawns renders for exactly
-    /// these frames, and readiness waits for exactly these frames, so both must use
-    /// this function — if they disagree, readiness can fire over frames that were
-    /// never rendered. `budget` is clamped to the frame count.
     pub fn render_set_indices(&self, budget: usize) -> Vec<usize> {
         let num_frames = self.frames.len();
         let budget = num_frames.min(budget);
@@ -1539,18 +771,6 @@ impl LoopPlaybackState {
     }
 
     /// True when no frame in the intended render set is still waiting on a texture.
-    ///
-    /// This is deliberately *not* "nothing is in flight right now". The concurrent
-    /// render budget is shared with static pane renders, so a batch of loop frames
-    /// can be starved: only some spawn, those finish, and for an instant nothing is
-    /// in flight even though most of the set is still blank. Treating that as ready
-    /// makes playback animate mostly-empty frames. A frame is settled only if it has
-    /// a texture, or nothing is going to produce one for it (no render in flight, and
-    /// either it has been ruled out via `render_failed` or its scan has not
-    /// downloaded yet — the latter is gated separately by the download check).
-    ///
-    /// `scan_available` reports whether the frame's scan data has been downloaded;
-    /// that cache lives outside the pane, so the caller supplies it.
     pub fn render_set_settled(
         &self,
         budget: usize,
@@ -1569,7 +789,6 @@ impl PaneState {
         Self::with_site("KTLX".to_string())
     }
 
-    /// Create a new pane viewing the given site.
     pub fn with_site(site: String) -> Self {
         let mut map_memory = MapMemory::default();
         let _ = map_memory.set_zoom(DEFAULT_PANE_ZOOM);
@@ -1602,73 +821,22 @@ impl PaneState {
         }
     }
 
-    /// What kind of pane this is.
-    ///
-    /// Derived from [`Self::content`] rather than stored beside it. See the
-    /// warning on that field: during the UI pass this answers `Map` for a pane
-    /// that has been `mem::take`n, so read it from the value that was taken.
     pub fn kind(&self) -> PaneKind {
         self.content.kind()
     }
 
     /// What a render dispatched for this pane produces.
-    ///
-    /// The three-way answer, where [`Self::kind`] is the two-way one: a map
-    /// pane in the 3D render mode is still a `Map`, and asking its kind would
-    /// not say so. Every predicate that used to compare against a `Volume`
-    /// *kind* compares against [`RenderView::Volume`] here, which is the same
-    /// question asked of the thing that actually differs.
-    ///
-    /// Carries the same `mem::take` warning [`Self::kind`] does, and rather more
-    /// sharply: a taken pane's slot holds `PaneContent::default()`, which is a
-    /// plan-view map, so this answers `PlanView` for whatever the real pane was.
     pub fn render_view(&self) -> rustdar_radar::types::RenderView {
         self.content.render_view()
     }
 
     /// Whether this pane is drawing the plan view every pane used to be.
-    ///
-    /// The predicate the all-panes loops that are *only* about the flat map
-    /// filter on — render dispatch, the sibling texture broadcast, loop
-    /// synchronisation.
-    ///
-    /// **A map pane in the 3D render mode answers `false`**, which is the same
-    /// answer a 3D *pane* gave before the two collapsed. It is a question about
-    /// the picture, not about the kind: a raymarched pane has no plan-view
-    /// raster to dispatch, donate or synchronise.
     pub fn is_map(&self) -> bool {
         self.render_view() == rustdar_radar::types::RenderView::PlanView
     }
 
     /// Whether this pane paints map geography through a projector *somewhere*
     /// on screen this frame.
-    ///
-    /// The third question in the family, and the one the other two kept being
-    /// asked in place of. [`Self::kind`] asks what a pane *is*, [`Self::is_map`]
-    /// asks whether it draws the flat picture — and this asks whether the
-    /// `Surface::Ground` half of the map content pass runs for it at all.
-    /// Every consumer that says "a pane with no map has
-    /// nowhere to put a geo-positioned layer" means *this*, and while a 3D view
-    /// was a pane kind with no map of its own the three answers coincided.
-    ///
-    /// They stopped coinciding when the 3D view became a render mode standing on
-    /// its own map floor. A 3D pane runs `Map::show` on an off-screen strip and
-    /// dispatches exactly the ground layers a plan view does
-    /// (`Gui::draw_floor_strip`), so it wants the tile pyramids, the fetches and
-    /// the rasterizations a plan view wants. It answers `false` to `is_map`,
-    /// which is correct about the picture and was silently wrong about all of
-    /// those.
-    ///
-    /// **A hidden floor answers `false`**, and that is the same question
-    /// `Gui::is_floor_source` and `Gui::mirror_source_rects` already ask: a
-    /// floor the user switched off is not drawn, so nothing is fetched or
-    /// rasterized for it. A cross-section pane answers `false` outright — there
-    /// is no projector anywhere in its frame.
-    ///
-    /// Carries [`Self::kind`]'s `mem::take` warning in full: a taken pane's slot
-    /// is a plan-view map, so this answers `true` for whatever the real pane
-    /// was. Read it before the take, off the value that was taken, or from
-    /// outside the egui pass.
     pub fn draws_ground(&self) -> bool {
         match self.render_view() {
             rustdar_radar::types::RenderView::PlanView => true,
@@ -1682,64 +850,13 @@ impl PaneState {
     }
 
     /// Whether this pane takes part in the shared viewport — the group
-    /// [`Gui::sync_viewports`](crate::Gui) moves together, at **both** ends,
-    /// and the question the sync section asks before it offers a "Sync
-    /// viewport" row at all.
-    ///
-    /// Only the plan view does. A cross-section has no map viewport to share.
-    /// A 3D pane is left out **by decision**, not for want of a viewport: since
-    /// the box became the largest square inscribed in the pane's own reach,
-    /// scroll and pinch aim it, so there is something a link could drive. The
-    /// exclusion predates that and used to be true by accident; it is kept
-    /// because driving it is wrong at each end. As a *target* the pane would
-    /// resample its whole box every time a neighbour's wheel turned, and a plan
-    /// view zoomed to street level would drive the box straight through the
-    /// floor. As a *source* an orbit's zoom would drag every map pane in the
-    /// group along with it.
-    ///
-    /// [`Self::draws_ground`] is the wrong predicate here even though it reads
-    /// like the friendlier "has a map": it answers `true` for a 3D pane with a
-    /// visible floor, which is exactly the pane this excludes. The question is
-    /// not whether the pane paints geography — it does — but whether its
-    /// viewport is the flat pan-and-zoom the link moves. That is
-    /// [`Self::is_map`].
-    ///
-    /// [`Self::viewport_link`] itself is untouched by a conversion: kept, and
-    /// inert while this answers `false`, so going back to the plan view
-    /// restores the link the pane had. The same rule `selected_elevation`
-    /// follows across a conversion.
-    ///
-    /// Carries [`Self::kind`]'s `mem::take` warning: a taken pane's slot reads
-    /// as a plan view.
+    /// [`Gui::sync_viewports`](crate::Gui) moves together, at **both** ends.
     pub fn shares_viewport(&self) -> bool {
         self.is_map()
     }
 
     /// Whether this pane draws the map layers at all — the Layers panel's gate,
     /// and so the question "would a row here toggle anything?".
-    ///
-    /// A plan view draws every layer onto its own rect. **A 3D pane
-    /// draws them too**, onto two surfaces instead of one: the ground kinds go
-    /// into the off-screen floor strip the raymarcher mirrors onto the box's
-    /// bottom face (`Gui::draw_floor_strip`), and the one glass kind — the
-    /// colour scale — is painted on the pane's own rect by
-    /// `Gui::draw_volume_glass`. The handler-declared `Surface` is where that split is written
-    /// down, and both halves are gated on this pane's own
-    /// [`Self::is_overlay_enabled`]. That is the whole reason a 3D pane gets
-    /// rows: every layer it draws is one the user has to be able to switch off,
-    /// and while the panel showed it none, a layer set from before the
-    /// conversion was honoured and unreachable at the same time.
-    ///
-    /// A cross-section draws none of them — there is no projector anywhere in
-    /// its frame — and is the one kind with nothing to list.
-    ///
-    /// Not [`Self::draws_ground`], which answers `false` the moment the floor
-    /// is switched off. The rows must not go with the floor: the colour scale
-    /// is still on the glass, and the ground set has to stay editable so the
-    /// floor comes back the way it was left.
-    ///
-    /// Carries [`Self::kind`]'s `mem::take` warning: a taken pane's slot reads
-    /// as a plan view.
     pub fn draws_map_layers(&self) -> bool {
         self.render_view() != rustdar_radar::types::RenderView::CrossSection
     }
@@ -1750,24 +867,6 @@ impl PaneState {
     }
 
     /// Whether this pane can animate a sequence of past volumes.
-    ///
-    /// [`RenderView::can_loop`] is where the classification by view lives; this
-    /// adds the one thing a view cannot answer.
-    ///
-    /// # A section pane must be aimed before it can loop
-    ///
-    /// A cross-section is cut along a line, and until the user has drawn one
-    /// there is nothing for a frame to be a picture *of*. A loop enabled in that
-    /// state would fill with frames nothing can cut, and because their volumes
-    /// have downloaded perfectly well, `render_set_settled` would never call the
-    /// batch settled: the loop would sit in `Rendering` for the session, with
-    /// the transport showing `0/n` and no way to tell that the fix is to draw a
-    /// line. Refusing here — where the timeline's toggle and
-    /// `Gui::loop_sync_targets` both read it — is what keeps that state
-    /// unreachable, and the pane's own empty state already says what to do.
-    ///
-    /// `is_none_or` rather than a match on the kind: a map pane has no section
-    /// state and answers on its kind alone.
     pub fn can_loop(&self) -> bool {
         self.render_view().can_loop() && self.cross_section().is_none_or(|s| s.line.is_some())
     }
@@ -1780,7 +879,6 @@ impl PaneState {
         }
     }
 
-    /// [`Self::cross_section`], mutably.
     pub fn cross_section_mut(&mut self) -> Option<&mut CrossSectionPane> {
         match &mut self.content {
             PaneContent::CrossSection(section) => Some(section),
@@ -1789,10 +887,6 @@ impl PaneState {
     }
 
     /// This pane's map state, or `None` if it is a cross-section pane.
-    ///
-    /// Answers for **either** render mode, which is what separates it from
-    /// [`Self::volume`]: the config writer and the mode toggle need a plan-view
-    /// pane's 3D state, precisely because it is kept across the switch.
     pub fn map(&self) -> Option<&MapPane> {
         match &self.content {
             PaneContent::Map(map) => Some(map),
@@ -1800,7 +894,6 @@ impl PaneState {
         }
     }
 
-    /// [`Self::map`], mutably.
     pub fn map_mut(&mut self) -> Option<&mut MapPane> {
         match &mut self.content {
             PaneContent::Map(map) => Some(map),
@@ -1810,19 +903,12 @@ impl PaneState {
 
     /// This pane's 3D volume state, or `None` unless it is *currently drawing*
     /// the volume.
-    ///
-    /// Gated on the render mode, not merely on the pane being a map, so that
-    /// every caller that used to mean "is this a 3D pane, and if so its state"
-    /// keeps meaning exactly that. A plan-view pane's retained camera is
-    /// deliberately out of reach here — reachable through [`Self::map`], which
-    /// is the accessor that says it does not care what is being drawn.
     pub fn volume(&self) -> Option<&VolumePane> {
         self.map()
             .filter(|map| map.render == MapRender::Volume)
             .map(|map| &map.volume)
     }
 
-    /// [`Self::volume`], mutably.
     pub fn volume_mut(&mut self) -> Option<&mut VolumePane> {
         self.map_mut()
             .filter(|map| map.render == MapRender::Volume)
@@ -1832,20 +918,6 @@ impl PaneState {
     /// Draw this map pane's ground in `render` from now on, keeping everything
     /// about *what it is looking at* — and keeping the other mode's state, so
     /// that switching back returns the same picture.
-    ///
-    /// The render-mode counterpart of [`Self::set_kind`], and it tears the loop
-    /// down for the same reason: a loop's frames are pictures of one shape, and
-    /// the shape is the [`RenderView`](rustdar_radar::types::RenderView).
-    /// Flipping a looping plan-view pane into 3D would leave a list of
-    /// `IMAGE_SIZE` square rasters under a state that now wants voxel grids.
-    ///
-    /// Does nothing at all for the mode the pane is already in, on
-    /// [`Self::set_kind`]'s reasoning: re-selecting the current mode from a
-    /// menu must not throw away a camera the user spent a while aiming.
-    ///
-    /// Answers whether the pane was a map at all. A cross-section pane has no
-    /// render mode, and silently doing nothing would let a caller believe it
-    /// had switched one.
     pub fn set_map_render(&mut self, render: MapRender) -> bool {
         let Some(map) = self.map_mut() else {
             return false;
@@ -1861,49 +933,6 @@ impl PaneState {
     /// Convert this pane to `kind`, keeping everything about *what it is looking
     /// at*: its site, its scan, its product and elevation selection, its
     /// viewport and its layer toggles.
-    ///
-    /// That is a property of the representation rather than of this function —
-    /// only `content` is written, and every other field is flat — which is what
-    /// makes converting a pane feel like changing a view rather than like losing
-    /// one. A user who has panned to a storm and picked a tilt has said
-    /// something; asking for a section of it is not a reason to forget any of
-    /// it.
-    ///
-    /// Converting to the kind it already is does nothing at all, rather than
-    /// replacing the per-kind state with a fresh one: re-selecting the current
-    /// kind from a menu must not discard a drawn section line or a camera the
-    /// user has spent a while aiming.
-    ///
-    /// # The one exception: an animation loop is torn down
-    ///
-    /// A loop frame *is* a rendered plan-view tilt, so a pane with no plan view
-    /// has nothing to animate — and a loop left running on one is not merely idle,
-    /// it is actively harmful in five separate ways, every one of them silent:
-    ///
-    /// * `App::sync_loop_playback_start` holds **every** looping pane back until
-    ///   all of them are render-ready, and a converted pane can never become
-    ///   ready — nothing renders its frames and nothing marks them failed. With
-    ///   Sync Layers on, one converted pane would stop every map pane's loop from
-    ///   ever starting. A deadlock, in the other panes.
-    /// * Its queue goes on consuming the *shared* download budget, starving the
-    ///   live panes it sits beside.
-    /// * The status readout says "Rendering n/m" for ever, with no loop transport
-    ///   drawn on this pane to cancel it — the layers panel does not offer one to
-    ///   a non-map pane.
-    /// * `Gui::any_loop_active` stays true, so the event loop keeps waking at loop
-    ///   frame rate for an animation nobody can see.
-    /// * Its frame textures are held until the egui context dies.
-    ///
-    /// So the invariant is that **a non-map pane never has an active loop**, and
-    /// it is enforced here, at the transition, rather than by a filter at each of
-    /// those five consumers. `SwitchRadarSite` already resets `loop_state` for the
-    /// same reason, which is why a site switch happens to cure this.
-    ///
-    /// One half of the teardown is out of reach from here: the host's
-    /// `LoopDownloadManager` holds this pane's download queue by index, and a
-    /// `PaneState` cannot see it. `App::dispatch_loop_renders` drops it, which also
-    /// covers a pane that reached a non-map kind by some route that never called
-    /// this — a restored config, or a future auto-create.
     pub fn set_kind(&mut self, kind: PaneKind) {
         if self.kind() == kind {
             return;
@@ -1913,19 +942,6 @@ impl PaneState {
 
     /// Make this pane draw `view`, whichever combination of kind and render
     /// mode that takes.
-    ///
-    /// The one entry point the UI uses, because a `RenderView` is exactly what
-    /// the pane menu offers — plan view, 3D volume, cross-section — and the
-    /// caller should not have to know that two of those three are the same kind
-    /// of pane. [`Self::set_kind`] and [`Self::set_map_render`] are the halves,
-    /// and both are idempotent, so asking for the view a pane already shows
-    /// does nothing at all: neither its camera nor its drawn line is thrown
-    /// away by re-selecting the mode it is in.
-    ///
-    /// The order matters. `set_kind` runs first so that a cross-section pane
-    /// becoming a 3D view is a map pane *before* the mode is written; going the
-    /// other way, `set_map_render` simply finds no map pane and answers `false`,
-    /// which is correct — a section has no render mode.
     pub fn set_view(&mut self, view: rustdar_radar::types::RenderView) {
         use rustdar_radar::types::RenderView;
         match view {
@@ -1944,31 +960,6 @@ impl PaneState {
 
     /// Replace this pane's per-kind content wholesale, as the config loader does
     /// when it has both the kind and the state in hand.
-    ///
-    /// The one writer of `content` that enforces what a kind change implies, so
-    /// every route to a non-map pane — the menu, a restored config, a test
-    /// fixture — arrives with the same invariants. See [`Self::set_kind`].
-    /// # Why a *kind change* tears the loop down, not just a change to a kind
-    /// that cannot loop
-    ///
-    /// A loop's frames are pictures of one shape, and
-    /// [`LoopPlaybackState::view`] is the field that says which. Converting a
-    /// looping map pane into a section pane leaves a frame list full of
-    /// square plan-view rasters under a state that now claims to be
-    /// a section — every acceptance and donation predicate would refuse them,
-    /// which is the point of that field, so nothing would be *drawn* wrongly;
-    /// but the pane would animate a list of frames nothing can fill and hold
-    /// `MAX_LOOP_RENDER_BUDGET` textures alive to do it.
-    ///
-    /// So the rule is the wider one: any change to the **render view** resets
-    /// the loop, and a view that cannot loop at all resets it as well — the
-    /// second clause covers the path where a caller replaces one content with
-    /// another of the same view.
-    ///
-    /// The view rather than the kind, because a map pane has two of them: a
-    /// config that restores a pane straight into the 3D mode changes the shape
-    /// of a frame without changing the kind, and comparing kinds would leave the
-    /// old shape's frames in place.
     pub fn set_content(&mut self, content: PaneContent) {
         let previous = self.render_view();
         self.content = content;
@@ -1977,30 +968,18 @@ impl PaneState {
         }
     }
 
-    /// The currently active radar image (from loop frame or static render).
     pub fn active_image(&self) -> Option<&RadarImageData> {
         self.active_loop_image().and_then(LoopFrameImage::plan_view)
     }
 
     /// The playing frame's cross-section raster, or `None` when this pane is not
     /// animating a section.
-    ///
-    /// The section counterpart of [`Self::active_image`], and separate from it
-    /// for the reason [`LoopFrameImage`] exists: the two are different shapes
-    /// with different labels around them, and a caller that asked for "the
-    /// image" without saying which would draw a plan view into a section's axes.
     pub fn active_section_image(&self) -> Option<&SectionImageData> {
         self.active_loop_image().and_then(LoopFrameImage::section)
     }
 
     /// The playing frame's resident voxel grid, or `None` when this pane is not
     /// animating a 3D volume — including while its loop is still filling.
-    ///
-    /// `None` is what makes the 3D pane keep showing the *live* volume until
-    /// the loop is ready, exactly as a map pane goes on showing its static
-    /// render: the caller aims the painter at this target when there is one and
-    /// at the live stamp when there is not, and there is no third state in
-    /// which the pane is blank because a loop was switched on.
     pub fn active_volume_frame(&self) -> Option<&VolumeFrameGrid> {
         self.active_loop_image().and_then(LoopFrameImage::volume)
     }
@@ -2016,16 +995,6 @@ impl PaneState {
     }
 
     /// When the data behind the image *currently on screen* was collected.
-    ///
-    /// Under an active loop that is the playing frame's own volume time, not
-    /// [`data_time`](Self::data_time), which describes the static render the
-    /// animation replaced — captioning someone else's picture. The status bar used
-    /// to draw nothing at all while a loop ran for exactly that reason; answering
-    /// the question properly is better, and it is the same answer whichever
-    /// datasource the loop reads, since a frame *is* a volume.
-    ///
-    /// `None` when there is nothing to say: no render has landed, or the loop's
-    /// playhead is on a frame that no longer exists.
     pub fn data_time_on_screen(&self) -> Option<NaiveDateTime> {
         if self.loop_state.is_active() {
             return self
@@ -2040,37 +1009,6 @@ impl PaneState {
     /// What the radar image on screen depicts, **when that is not what this pane
     /// has selected** — the product and sweep the pixels really are, so a caller
     /// can say so.
-    ///
-    /// `None` means the pane is showing what it claims to be showing, or is
-    /// showing nothing at all. Both are honest states with nothing to report; the
-    /// case this exists for is the third one, where a product switch leaves the
-    /// previous product's image up while the color scale, the tilt picker and the
-    /// hover readout have all already moved to the new selection. The label
-    /// claiming something the pixels do not show is a correctness problem, not a
-    /// cosmetic one, and one that lasts as long as a render — longer for a
-    /// Level III product whose object has not landed yet.
-    ///
-    /// Read off [`crate::overlay_cache::RadarTextureMeta`], which travels *with*
-    /// the texture, so this cannot outlive or lag the image it describes: the two
-    /// are placed together by `apply_render_to_pane`, arrive together — a raster
-    /// still crossing to the GPU is held with its own description and neither
-    /// half goes on screen without the other ([`Self::place_radar_raster`]) —
-    /// and are dropped together whenever the radar cache is cleared. That is
-    /// also what keeps it from firing on a routine refresh — a new volume for
-    /// the site clears the dispatcher's `last_rendered` and re-renders, but the
-    /// image on screen still depicts the selected product, so there is nothing
-    /// to disown.
-    ///
-    /// The elevation is compared within [`ELEVATION_TOLERANCE`] against the
-    /// *snapped* selection from [`get_rendering_params`](Self::get_rendering_params)
-    /// — the same value the render was dispatched with — so a selection the scan
-    /// snaps onto the sweep already drawn is not a mismatch.
-    ///
-    /// `None` under an active loop, and not because the question does not arise
-    /// there: `LoopPlaybackState::retarget_renders` drops *every* frame texture
-    /// the instant the selection moves, so a looping pane never holds a frame
-    /// depicting the old product. There is no stale image to disown, and the
-    /// loop's own phase chrome covers the wait.
     pub fn stale_image_on_screen(&self) -> Option<(RadarProduct, f32)> {
         if self.loop_state.is_active() {
             return None;
@@ -2093,61 +1031,12 @@ impl PaneState {
         (!matches_selection).then_some((meta.product, meta.elevation))
     }
 
-    /// Where the picture **on the glass** folds, m/s — the Nyquist velocity the
-    /// cut behind those pixels declared, or `None` when nothing on screen can
-    /// carry that annotation.
-    ///
-    /// The velocity ramp is fixed at ±80.55 mph (±36.01 m/s) for every radar,
-    /// while a WSR-88D's Doppler cuts declare 23.84–62.94 m/s across the ten
-    /// volumes `rustdar_radar::nyquist` measured. So on KTLX's 0.5° cut at
-    /// 23.84 the outer third of the bar is colour that radar cannot measure —
-    /// past ±Vny the sign wraps and an inbound 25 m/s gate comes back painted
-    /// as outbound 19 — while on KFFC's cut 12 at 62.94 the whole bar is inside
-    /// the fold and nothing on it wraps at all. The legend says which of those
-    /// the reader is looking at, and the one thing it must get right is *which*
-    /// fold limit is on the glass this frame.
-    ///
-    /// A TDWR answers `None` here, always, and not by omission: it declares
-    /// `nyquist_velocity = 0` on every cut of every volume, which
-    /// `rustdar_radar::nyquist::DeclaredNyquist::declare` refuses as the
-    /// absence it is. Before that refusal existed the zero arrived intact and
-    /// this returned `Some(0.0)`, and every TDWR velocity pane was captioned
-    /// `folds ±0`.
-    ///
-    /// # The playing frame wins over the texture
-    ///
-    /// A loop steps through volumes and the RDA reselects PRFs between them, so
-    /// two frames of one animation can fold at different speeds. The radar
-    /// texture's metadata describes the *static* render the animation replaced
-    /// — somebody else's picture, exactly as [`Self::data_time`] is while a loop
-    /// runs, which is why [`Self::data_time_on_screen`] exists beside it.
-    ///
-    /// # Base velocity only
-    ///
-    /// Storm-relative velocity is deliberately excluded although it is a
-    /// velocity field: `rustdar_radar::srv` dealiases before subtracting the
-    /// storm motion, so its values legitimately run past ±Vny and a fold marker
-    /// would claim a wrap that is not in the picture. Every other product folds
-    /// nowhere — a fold limit is a property of the Doppler waveform, and
-    /// reflectivity is measured on the surveillance cut.
-    ///
-    /// # A ladder has many Nyquists
-    ///
-    /// Section and volume panes answer `None` by construction. Their picture is
-    /// assembled from a whole tilt ladder whose cuts each declare their own
-    /// limit — 25.65 m/s on KFFC's low Doppler cuts against 62.94 on its cut
-    /// 12, in one volume, which is the measurement `rustdar_radar::nyquist`
-    /// exists for — so a single number over all of them would be wrong for most
-    /// of them.
-    ///
-    /// # Only what the pixels are
-    ///
-    /// The static path is gated through [`Self::stale_image_on_screen`], so a
-    /// pane still showing the previous product — or the previous *sweep*, which
-    /// on a TDWR is a different PRF and a different fold limit — annotates
-    /// nothing until its own render lands. The alternative is a number that
-    /// describes the picture the user is waiting for rather than the one they
-    /// are looking at.
+    /// Where the picture **on the glass** folds, m/s — the Nyquist velocity
+    /// the cut behind those pixels declared, or `None` when nothing on screen
+    /// can carry that annotation. The ramp is fixed at ±36.01 m/s while a
+    /// WSR-88D's Doppler cuts declare 23.84–62.94 m/s (ten volumes measured in
+    /// `rustdar_radar::nyquist`), so past ±Vny the sign wraps. A TDWR always
+    /// answers `None`: it declares `nyquist_velocity = 0` on every cut.
     pub fn displayed_nyquist_ms(&self) -> Option<f64> {
         if self.selected_product != RadarProduct::Velocity || !self.is_map() {
             return None;
@@ -2170,26 +1059,6 @@ impl PaneState {
 
     /// Where the melting layer behind the classification **on screen** came
     /// from, or `None` when the picture is not a classification.
-    ///
-    /// [`displayed_nyquist_ms`](Self::displayed_nyquist_ms)'s sibling, sharing
-    /// every one of its gates and for the same reasons:
-    ///
-    /// * **One product.** A melting layer is a render input to the hybrid
-    ///   classification and to nothing else, so every other product answers
-    ///   `None` rather than reporting whatever the last classification stood
-    ///   on.
-    /// * **The playing frame wins over the texture.** A loop's frames are
-    ///   separate volumes with separately-paired objects, so the texture's
-    ///   metadata describes the static render the animation replaced.
-    /// * **Only what the pixels are.** Gated through
-    ///   [`stale_image_on_screen`](Self::stale_image_on_screen), so a pane
-    ///   still showing the previous product says nothing about a
-    ///   classification it is not displaying. This gate is also what keeps the
-    ///   pane from ever having two notices to draw at once: while the
-    ///   pending-render plate is up, this is `None` by construction.
-    ///
-    /// Map panes only. A section or a 3D pane is assembled from a whole tilt
-    /// ladder and its own classification is not what this describes.
     pub fn displayed_melting_layer_source(&self) -> Option<rustdar_radar::hca::MeltingLayerSource> {
         if self.selected_product != RadarProduct::HydrometeorClassification || !self.is_map() {
             return None;
@@ -2211,57 +1080,6 @@ impl PaneState {
 
     /// The storm motion vector behind the storm-relative field **on screen**,
     /// or `None` when the picture is not storm-relative.
-    ///
-    /// The whole vector, because the legend draws its speed and direction and
-    /// not only its provenance. This answered `Option<StormMotionSource>` while
-    /// the pane's only use for it was deciding whether to apologise.
-    ///
-    /// [`displayed_melting_layer_source`](Self::displayed_melting_layer_source)'s
-    /// sibling, sharing every one of its gates and for the same reasons:
-    ///
-    /// * **One product.** A storm motion vector is a render input to
-    ///   storm-relative velocity and to nothing else, so every other product
-    ///   answers `None` rather than reporting whatever the last SRV render
-    ///   shifted by.
-    /// * **The playing frame wins over the texture.** A loop's frames are
-    ///   separate volumes with separately-paired vectors, so the texture's
-    ///   metadata describes the static render the animation replaced.
-    /// * **Only what the pixels are.** Gated through
-    ///   [`stale_image_on_screen`](Self::stale_image_on_screen), so a pane
-    ///   still showing the previous product says nothing about a shift it is
-    ///   not displaying — a legend reading the previous volume's vector over
-    ///   this volume's pixels is the same lie the plate used to be able to
-    ///   tell, told in numbers.
-    ///
-    /// # Map panes only, and widening the gate is not the fix
-    ///
-    /// A 3D pane and a section pane draw storm-relative fields too, and both
-    /// call `render_color_scales` — so the legend slot the vector is drawn in
-    /// already exists on them. It stays empty there, and the missing piece is
-    /// the **data**, not this gate.
-    ///
-    /// A 3D pane does carry a Radar overlay texture: its floor. So dropping
-    /// `is_map()` would make this answer, with the *floor raster's* vector —
-    /// and the floor and the voxel grid are separately dispatched, separately
-    /// keyed (`VolumeLoopKey` against the dispatcher's plan-view render cache)
-    /// and separately invalidated, so they go out of step by a volume as a
-    /// matter of course. The legend would then describe the voxels with a
-    /// neighbouring volume's vector: precisely the confident lie the plate this
-    /// replaced was capable of, restated in numbers, which is worse than the
-    /// silence it would be curing.
-    ///
-    /// Nor is there an honest partial. A page can recover the vector for the
-    /// override and RPG rungs on its own, but the two derived rungs are fitted
-    /// from a VAD profile that exists only where the volume was decoded — so a
-    /// page-side reconstruction would draw the vector on some rungs and not
-    /// others, which is a worse legend than none.
-    ///
-    /// Closing it properly means `VoxelGrid` and `CrossSection` each carrying
-    /// the vector they were derived with, exactly as
-    /// `SweepRender::storm_motion` does — which needs `derive::prepare` to
-    /// report the motion it resolved, and a format bump on each of those two
-    /// wire encodings. That is real work and it is named rather than
-    /// half-done here.
     pub fn displayed_storm_motion(&self) -> Option<rustdar_radar::srv::SrvMotion> {
         if self.selected_product != RadarProduct::StormRelativeVelocity || !self.is_map() {
             return None;
@@ -2279,26 +1097,18 @@ impl PaneState {
             .storm_motion
     }
 
-    /// Whether this overlay is enabled for this pane.
-    ///
-    /// Falls back to `false` if the kind has no entry (uninitialised pane).
     pub fn is_overlay_enabled(&self, id: &LayerId) -> bool {
         self.enabled_overlays.get(id).copied().unwrap_or(false)
     }
 
-    /// Set the per-pane enabled state for a given overlay id.
     pub fn set_overlay_enabled(&mut self, id: LayerId, enabled: bool) {
         self.enabled_overlays.insert(id, enabled);
     }
 
     /// Overwrite the **handler-owned** halves of this pane's overlay maps
     /// with the registry's fresh serialize, KEEPING every entry whose id no
-    /// handler serves — the open-id doctrine's swap half: an unknown id's
-    /// saved state (a newer build's layer) must ride through every
-    /// registry-state overwrite verbatim, or the next autosave makes the
-    /// loss permanent. Every site that used to assign
-    /// `save_pane_configs()`/`save_enabled_map()` wholesale routes through
-    /// here; M10 deletes the swap itself.
+    /// handler serves: an unknown id's saved state (a newer build's layer)
+    /// must ride through verbatim, or the next autosave makes the loss permanent.
     pub fn adopt_handler_state(
         &mut self,
         registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
@@ -2311,119 +1121,27 @@ impl PaneState {
         self.enabled_overlays.extend(registry.save_enabled_map());
     }
 
-    /// Get the overlay texture cache for a given id (read-only).
     pub fn overlay_cache(&self, id: &LayerId) -> Option<&OverlayTextureCache> {
         self.overlay_textures.get(id)
     }
 
-    /// Get the overlay texture cache for a given id, inserting a default if absent.
     pub fn overlay_cache_mut(&mut self, id: &LayerId) -> &mut OverlayTextureCache {
         self.overlay_textures.entry(id.clone()).or_default()
     }
 
     /// Whether `kind`'s texture may be let go, judged against the enabled map
-    /// that decides it — **the single definition of that question**, and the
-    /// only place the rule is written.
-    ///
-    /// An associated function over the map rather than a method on the pane so
-    /// that both askers can reach it *literally* rather than each re-deriving
-    /// it. [`Self::release_disabled_overlay_textures`] holds
-    /// `&mut self.overlay_textures` while it asks, which rules out a `&self`
-    /// method — and an inline `kind == Radar || enabled.get(..)` there would be
-    /// a second copy of the rule that agrees with this one only by inspection.
-    /// The exclusion below has to hold at every point or it holds at none of
-    /// them: enforced when a layer is switched off but not when a late render
-    /// lands, it is a rule with a window in it, and the window is exactly the
-    /// frames in which the two spellings disagree.
-    ///
-    /// # The radar raster is not a layer texture, and this is where that is said
-    ///
-    /// The radar layer's cache is the only one this application does not
-    /// re-render on demand, and it is the only one carrying state nothing else
-    /// can rebuild:
-    ///
-    /// * **Nothing would put it back.** Every other texture cache is refilled by
-    ///   the viewport loop in `ui_map_pane`, which asks
-    ///   [`OverlayTextureCache::needs_rerender`] every frame and gets `true` from
-    ///   an empty cache outright. That loop `continue`s past `Radar` — the radar
-    ///   picture is dispatched by `App::dispatch_pane_renders` on a
-    ///   product/tilt/scan key, never on the cache being empty — so a cleared
-    ///   radar cache stays cleared until the next volume arrives. On a parked
-    ///   time or a site that has stopped scanning, that is *never*, and switching
-    ///   the layer back on shows empty map.
-    /// * **It is half of a two-step swap.** The cache holds a
-    ///   [`HeldOverlayTexture`](crate::overlay_cache::HeldOverlayTexture) whose
-    ///   pixels are still crossing PCIe, promoted by
-    ///   [`Self::promote_held_raster`] with the `data_time` that captions it.
-    ///   Only the dedicated paths end a hold — that promotion, and
-    ///   [`Self::release_held_raster`] for a context that died.
-    /// * **It carries facts no other copy has.**
-    ///   [`RadarTextureMeta`](crate::overlay_cache::RadarTextureMeta) is what
-    ///   `stale_image_on_screen`, the range ring, the hover readout and the
-    ///   storm-motion legend read, and it exists only here.
-    ///
-    /// So the radar raster is released by its own paths and by
-    /// `Gui::clear_graphics_state`, and a layer-stack toggle is not one of them.
-    /// The cost of the exclusion is one pane-sized texture per pane held across a
-    /// Radar-off period, which is the same texture the pane had before the click
-    /// and will draw again after it.
+    /// that decides it — the single definition of that question.
     pub fn overlay_texture_releasable(enabled: &HashMap<LayerId, bool>, id: &LayerId) -> bool {
         // The same fallback [`Self::is_overlay_enabled`] applies: an id with no
         // entry is not drawn, so its texture is releasable.
         *id != known::RADAR && !enabled.get(id).copied().unwrap_or(false)
     }
 
-    /// [`Self::overlay_texture_releasable`] against this pane's own map, for
-    /// callers that hold the whole pane.
     pub fn overlay_texture_is_releasable(&self, id: &LayerId) -> bool {
         Self::overlay_texture_releasable(&self.enabled_overlays, id)
     }
 
     /// Let go of the GPU texture of every overlay this pane no longer draws.
-    ///
-    /// Called wherever [`Self::enabled_overlays`] is written wholesale — the
-    /// toggle path (`Gui::write_pane_overlay`, which every eye, Show switch,
-    /// catalog tile and preset routes through), the fan-out that copies one
-    /// pane's map onto its linked siblings (`Gui::propagate_layer_sync`), and the
-    /// config restore (`Gui::load_ui_config`, which is *not* startup-only — on
-    /// web and Android the store can land mid-session, after frames have been
-    /// drawn). A reconciliation rather than a per-kind clear because two of those
-    /// three have a new map and no list of what changed.
-    ///
-    /// # What this recovers, and what it does not
-    ///
-    /// Only the kinds **switched off**. A pane with five layers still on keeps
-    /// five textures whether or not anything can see it, and that is untouched
-    /// here: releasing a hidden pane's live layers is a different rule, with a
-    /// different trigger and a re-render to pay on every re-split.
-    ///
-    /// # `render_in_flight` is deliberately left alone
-    ///
-    /// It is not a GPU resource, and the mark's whole lifecycle already belongs
-    /// to the dispatcher: `App::spawn_overlay_render` sets it, every path out of
-    /// that function that does not reach an `offload` undoes it with
-    /// `clear_overlay_render_marks`, and the `offload` arm's result clears it in
-    /// `poll_overlay_render_results` for every pane it names — kept or dropped.
-    /// There is no exit that strands one, so clearing it here would protect
-    /// against nothing.
-    ///
-    /// It would also cost. The dispatch gate is
-    /// `stale && !cache.render_in_flight`, so a mark cleared on the way off
-    /// **opens** it: switch a layer off and back on before its render lands and
-    /// the pane dispatches a second render of the same content, and both upload.
-    /// Left standing, the gate stays shut, the render already in flight arrives,
-    /// and the poller stores it because the layer is on again — which is the
-    /// picture the user asked for, at no extra cost.
-    ///
-    /// Idempotent: one pass over the kinds, clearing what is already clear for
-    /// all but the kinds just switched off. Cheap, but not free of callers — the
-    /// sync fan-out runs it on every linked pane on **every frame**, not only on
-    /// toggles, so what makes it affordable is that a cleared cache clears again
-    /// in two `Option` writes rather than that it runs rarely.
-    ///
-    /// Textures only — the handlers' *data* (alert polygons, GLM flashes, METAR
-    /// points) is untouched, because that costs a refetch to get back and this
-    /// costs a re-render.
     pub fn release_disabled_overlay_textures(&mut self) {
         // Two fields of one struct, borrowed disjointly, which is the whole
         // reason the predicate above is an associated function over the map.
@@ -2435,41 +1153,17 @@ impl PaneState {
         }
     }
 
-    /// Whether this pane is waiting on any raster's pixels to finish arriving.
-    ///
-    /// The frame loop's own term: the app runs on `ControlFlow::Wait`, so a pane
-    /// holding a picture is a pane that has to be given the frames to finish
-    /// arriving on and the frame to swap on. See `App::handle_redraw`.
-    ///
-    /// Over every overlay kind, not just the radar raster: any layer's texture
-    /// can be held now (see `OverlayTextureCache::held`), and a held alert
-    /// overlay that nothing wakes the loop for is a pane showing the previous
-    /// alert picture until some unrelated input happens by.
     pub fn is_holding_raster(&self) -> bool {
         self.overlay_textures
             .values()
             .any(OverlayTextureCache::is_holding)
     }
 
-    /// The id of the raster this pane is waiting on, if it is waiting on one.
     pub fn held_raster_id(&self) -> Option<egui::TextureId> {
         Some(self.overlay_cache(&known::RADAR)?.held_texture()?.id())
     }
 
     /// Let go of every raster that is still arriving, without showing any.
-    ///
-    /// For the one event that ends a hold the upload path will never end: a
-    /// renderer rebuilt after suspend, resume or surface loss holds nothing for
-    /// the dead context's ids and would answer "not delivered" about them
-    /// forever. `App::restore_cached_render` calls this on every pane before it
-    /// re-uploads, including the panes it goes on to skip — a pane with no
-    /// cached render is exactly a pane nothing else would come back for.
-    ///
-    /// Every kind's hold, not just the radar raster's, and for the same reason
-    /// [`Self::is_holding_raster`] asks about every kind: all of the held ids
-    /// belong to the context that died, so any one of them left standing keeps
-    /// `Gui::any_raster_held` true — and the event loop at refresh rate — for
-    /// the rest of the session, over a question whose answer cannot change.
     pub fn release_held_raster(&mut self) {
         for cache in self.overlay_textures.values_mut() {
             cache.release_hold();
@@ -2477,19 +1171,6 @@ impl PaneState {
     }
 
     /// Show the raster this pane is holding, if every texel of it has landed.
-    ///
-    /// The swap, and the only one. `delivered` is
-    /// `EguiRenderer::is_delivered`; returns whether anything moved, which the
-    /// caller has no use for beyond a test saying so.
-    ///
-    /// **The picture and everything describing it move together.** The bounds it
-    /// is placed on, the product and tilt `stale_image_on_screen` reads, the
-    /// fold limit, the melting-layer provenance and the data time all travel in
-    /// the held record and land in this one step. That is the whole reason the
-    /// hold is at this layer rather than in the renderer: the renderer could
-    /// keep the old *pixels* on screen, and would then be pairing them with the
-    /// new sweep's caption and the new sweep's ground — a wrong answer where the
-    /// banding was only a late one.
     pub fn promote_held_raster(&mut self, delivered: impl Fn(egui::TextureId) -> bool) -> bool {
         let cache = self.overlay_cache_mut(&known::RADAR);
         let Some(held) = cache.take_held_if_delivered(delivered) else {
@@ -2502,20 +1183,6 @@ impl PaneState {
 
     /// Show every non-radar overlay picture this pane is holding whose pixels
     /// have all landed.
-    ///
-    /// [`Self::promote_held_raster`]'s sibling for the layer textures — the
-    /// alert polygons, outlooks, county lines and the rest — which cross in
-    /// bands exactly as the radar raster does on any pane large enough (see
-    /// `OverlayTextureCache::held` for the sizes). The swap is the same one
-    /// step: the picture on screen stays whole until the question comes back
-    /// yes, then the held record goes up entire, bounds and hit map with it.
-    ///
-    /// Kept apart from the radar promotion rather than folded into it because
-    /// the radar swap writes one thing no layer texture has: the pane's
-    /// `data_time`, the caption dating the sweep on screen. A layer texture
-    /// has no pane-level caption — everything describing it travels inside its
-    /// own `OverlayTextureData` — so this sweep deliberately touches nothing
-    /// on the pane.
     pub fn promote_held_overlays(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {
         for (id, cache) in &mut self.overlay_textures {
             if *id == known::RADAR {
@@ -2528,25 +1195,6 @@ impl PaneState {
     }
 
     /// Put a freshly placed raster on this pane — now, or when it is whole.
-    ///
-    /// `already_whole` says the caller knows every texel of `data.texture` is
-    /// already on the GPU: it is the handle this pane was showing, re-described
-    /// rather than re-uploaded. Anything else has pixels still crossing.
-    ///
-    /// # A pane with no picture shows the new one arriving
-    ///
-    /// The hold exists to protect a *complete* picture from being replaced by a
-    /// partial one. Where there is no picture it protects nothing and costs the
-    /// whole upload in latency — a pane at start-up, or every pane after a
-    /// resume, would show empty map for as long as the bands take and then all
-    /// of it at once. A raster filling in top-down is a late answer; with no
-    /// predecessor there is no earlier answer to be had and no complete one
-    /// being spoiled. So it goes up straight away, and its caption with it,
-    /// which is correct because the caption describes exactly the pixels
-    /// arriving.
-    ///
-    /// That is the whole of the exception. From a pane's second raster onwards
-    /// its picture changes in one step and never in bands.
     pub fn place_radar_raster(
         &mut self,
         data: crate::overlay_cache::OverlayTextureData,
@@ -2562,26 +1210,6 @@ impl PaneState {
         }
     }
 
-    /// Get rendering params for this pane (product + closest elevation).
-    ///
-    /// Three cases, and the middle one is what keeps a Level III pane behaving like
-    /// a Level II one:
-    ///
-    /// * The product has tilts — the selection snaps to the nearest.
-    /// * The product is **listed with no tilts yet.** The selection stands as it is.
-    ///   Only Level III products reach this: `ScanInfo::from_scan` lists them the
-    ///   moment a volume loads and fills their angle in from the object's PDB when
-    ///   the fetch lands, so there is a window — reopened by every archive poll,
-    ///   which rebuilds `ScanInfo` from the volume alone — in which the product is
-    ///   selectable and has no angle. Answering `None` there made that window
-    ///   visible: `dispatch_pane_renders` took its no-params branch, no render was
-    ///   ever dispatched, and the pane went on showing the *previous* product's
-    ///   image, captioned as the new one, until the fetch happened to land. A
-    ///   Level II product switch holds the old image too — for as long as its render
-    ///   takes — so standing the selection up immediately makes the two paths
-    ///   indistinguishable rather than merely faster.
-    /// * The product is not listed at all — this pane's scan does not offer it, and
-    ///   there is nothing to render.
     pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
         let elevations = self
             .scan_info
@@ -2606,7 +1234,6 @@ impl Default for PaneState {
     }
 }
 
-/// Defines how panes are arranged in a grid layout.
 pub struct PaneLayout {
     /// Number of active panes (1-6 desktop, 1-4 mobile).
     pub pane_count: usize,
@@ -2626,12 +1253,6 @@ const DIVIDER_HALF_WIDTH: f32 = 4.0;
 /// (bottom-edge) orientation, having been vertical.
 const COLOR_SCALE_HORIZONTAL_ENTER: f32 = 1.35;
 /// Height/width ratio at which they *give it up* again.
-///
-/// The gap between this and [`COLOR_SCALE_HORIZONTAL_ENTER`] is the whole point:
-/// a single threshold — whatever its value — is a point the layout can be parked
-/// on or dragged across, and 1.2 sat 4% away from a 16:10 laptop's two-pane
-/// split and landed exactly on a 4:3 five-pane one. A ratio inside this band
-/// changes nothing at all; only leaving it flips the bars.
 const COLOR_SCALE_HORIZONTAL_EXIT: f32 = 1.05;
 /// Ratio used for the very first decision, when there is no previous
 /// orientation to keep. Sits in the middle of the band.
@@ -2639,29 +1260,6 @@ const COLOR_SCALE_SEED_RATIO: f32 = 1.2;
 
 /// The color scale bars' orientation for the whole map panel, remembered across
 /// frames so it has hysteresis instead of a bare threshold.
-///
-/// # Why the panel and not each pane
-///
-/// The orientation used to be decided per pane, from the pane's own rect. That
-/// is a defensible reading of "the bar should span the pane's shorter axis", but
-/// it has two failures a threshold cannot fix:
-///
-/// * **Mixed orientations on one screen.** A three-pane `[2, 1]` grid on a
-///   portrait phone gives two tall panes (h/w ≈ 2.0) and one wide one
-///   (h/w ≈ 1.0), so the same screen showed two bottom bars and one right-hand
-///   bar. No threshold helps: the panes genuinely disagree.
-/// * **Divider drags.** Dragging a divider changes pane rects continuously, so
-///   any per-pane threshold is something the user can scrub back and forth
-///   across, hopping the bars mid-drag.
-///
-/// Keying on the panel — the rect the whole grid is laid out in — fixes both
-/// outright. Every pane on a screen agrees by construction, and the panel rect
-/// does not move when a divider is dragged, so dragging cannot flip anything at
-/// all. What is left is window resizes and device rotation, which is what the
-/// hysteresis band above is for.
-///
-/// The single-pane case, which is the overwhelmingly common one on every
-/// platform, is unchanged: there the panel *is* the pane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ColorScaleOrientation {
     /// `None` until the first usable panel rect has been seen.
@@ -2669,11 +1267,6 @@ pub struct ColorScaleOrientation {
 }
 
 impl ColorScaleOrientation {
-    /// Resolve the orientation for this frame's `panel_rect`, remembering it.
-    ///
-    /// Returns `true` for horizontal bars along the bottom edge, `false` for
-    /// vertical bars along the right edge. Call once per frame, before the pane
-    /// loop, and pass the result to every pane.
     pub fn resolve(&mut self, panel_rect: egui::Rect) -> bool {
         let (w, h) = (panel_rect.width(), panel_rect.height());
         // A degenerate or not-yet-laid-out panel must not seed the memory with
@@ -2704,35 +1297,6 @@ impl Default for PaneLayout {
 impl PaneLayout {
     /// Create a layout for the given pane count, clamped to
     /// `1..=`[`MAX_PANES_DESKTOP`].
-    ///
-    /// # Why the clamp is here and not at the callers
-    ///
-    /// The table below covers exactly 1..=6, and its rows sum to the count in
-    /// every arm — that agreement between `grid` and `pane_count` is what the
-    /// rest of this type is built on. A count outside the table used to fall
-    /// through to a one-row, one-column grid while `pane_count` still stored
-    /// the raw number, and that pairing is worse than either half alone:
-    ///
-    /// * [`Self::pane_rect`] walks the grid looking for the row that holds
-    ///   `pane_idx` and hands back `total_rect` when it runs out of rows. With
-    ///   a one-cell grid, *every* index from 1 upward drew over the whole
-    ///   panel.
-    /// * `detect_active_pane_click` hit-tests those same rects in order, so
-    ///   every rect contained every pointer position: clicking anywhere made
-    ///   pane 1 active, clicking again made pane 0 active, and panes 2 and up
-    ///   could never be reached at all.
-    ///
-    /// Neither shows up as an error, a panic or a blank screen — the panes are
-    /// all drawn, just all in the same place.
-    ///
-    /// Every production caller clamps before it gets here today
-    /// (`load_ui_config` to `WidthClass::max_panes_absolute`,
-    /// the pane picker to the width class's own maximum), so this is currently
-    /// unreachable. It is clamped here anyway because "the caller clamped" is a
-    /// property of each call site rather than of this type, and the next writer
-    /// of `pane_count` — the pane a drawn cross-section auto-creates — is one
-    /// commit away. Making the trap unrepresentable costs one line; remembering
-    /// it at every future writer costs it forever.
     pub fn for_count(count: usize) -> Self {
         let count = count.clamp(1, MAX_PANES_DESKTOP);
         let grid = match count {
@@ -2761,12 +1325,10 @@ impl PaneLayout {
         }
     }
 
-    /// Get the grid configuration.
     pub fn grid(&self) -> &[usize] {
         &self.grid
     }
 
-    /// Compute the rect for the pane at the given index within the given total rect.
     pub fn pane_rect(&self, pane_idx: usize, total_rect: egui::Rect) -> egui::Rect {
         let mut row_y = total_rect.top();
         let mut idx = 0;
@@ -2796,7 +1358,6 @@ impl PaneLayout {
             return;
         }
 
-        // Horizontal dividers (between rows)
         let mut y = total_rect.top();
         for row_idx in 0..self.grid.len().saturating_sub(1) {
             y += total_rect.height() * self.row_ratios[row_idx];
@@ -2816,7 +1377,6 @@ impl PaneLayout {
             );
         }
 
-        // Vertical dividers (between columns in each row)
         let mut row_y = total_rect.top();
         for (row_idx, &cols) in self.grid.iter().enumerate() {
             let row_height = total_rect.height() * self.row_ratios[row_idx];

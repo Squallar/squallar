@@ -1,8 +1,8 @@
 use super::*;
 use rustdar_device_profile::constants::MAX_RENDER_CACHE_ENTRIES;
 
-/// A plan-view key at `elevation_tenths` tenths of a degree, built through the
-/// one construction site so these tests key exactly as production does.
+/// A plan-view key at `elevation_tenths` tenths of a degree, built through the one
+/// construction site so these tests key exactly as production does.
 fn key(site: &str, elevation_tenths: i32) -> RenderKey {
     render_cache_key(
         site,
@@ -12,12 +12,8 @@ fn key(site: &str, elevation_tenths: i32) -> RenderKey {
     )
 }
 
-/// A distinguishable entry — `max_range_km` doubles as the identity so a test
-/// can tell which render it got back.
-///
-/// Empty buffers, so it costs nothing: the tests that use it are about the
-/// *count* bound, and they are handed a byte budget that cannot bind so that
-/// each bound is exercised on its own.
+/// A distinguishable entry — `max_range_km` doubles as the identity so a test can tell
+/// which render it got back.
 fn output(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
@@ -29,13 +25,8 @@ fn output(range: f64) -> CachedRenderOutput {
     }
 }
 
-/// The gates behind a raster of `side` — a full ring of 720 radials at the gate
-/// count that side implies.
-///
-/// `side` is `2 · extent / sample · TEXELS_PER_SAMPLE` across the *diameter*
-/// (see `rustdar_radar::types::data_limited_side_px`), so a radius holds
-/// `side / 4` gates: 1840 at the 7362 px a surveillance cut asks for, against
-/// the 1832 such a cut really carries.
+/// The gates behind a raster of `side` — a full ring of 720 radials at the gate count that
+/// side implies.
 fn hover_field(side: usize) -> rustdar_radar::render::polar::PolarField {
     use rustdar_radar::render::polar::{PolarField, PolarGeometry, Wedge};
     const RADIALS: usize = 720;
@@ -52,14 +43,8 @@ fn hover_field(side: usize) -> rustdar_radar::render::polar::PolarField {
     )
 }
 
-/// An entry that costs what a real raster of `side` costs: the texture,
-/// `side² × 4`, and the gates behind it.
-///
-/// Those two used to be the same size, because the second was a `side²` `f32`
-/// grid of the first's values resampled up. It is the measurements now, so a
-/// long-range entry costs a little over half what it did and the same budget
-/// buys nearly twice as many of them — see
-/// [`a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries`].
+/// An entry that costs what a real raster of `side` costs: the texture, `side² × 4`, and
+/// the gates behind it.
 fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::new(
@@ -76,9 +61,7 @@ fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
     }
 }
 
-/// The bound the cache exists for. Before this it was a bare `HashMap` that only
-/// `reset_panes*` ever shrank, so cycling products grew it without limit at
-/// ~32 MiB per entry.
+/// The bound the cache exists for.
 #[test]
 fn inserting_past_capacity_evicts_instead_of_growing() {
     let mut cache = RenderCache::new(3, usize::MAX);
@@ -94,8 +77,7 @@ fn inserting_past_capacity_evicts_instead_of_growing() {
     assert!(cache.get(&key("KTLX", 0)).is_none());
 }
 
-/// Least *recently used*, not least recently inserted. A pane that keeps reading
-/// its entry must not lose it to one nobody has touched since it was written.
+/// Least *recently used*, not least recently inserted.
 #[test]
 fn a_read_protects_an_entry_from_eviction() {
     let mut cache = RenderCache::new(3, usize::MAX);
@@ -118,8 +100,8 @@ fn a_read_protects_an_entry_from_eviction() {
     assert_eq!(cache.entry_count(), 3);
 }
 
-/// Re-inserting an existing key replaces the value and refreshes its position,
-/// rather than queueing the key a second time and corrupting the eviction order.
+/// Re-inserting an existing key replaces the value and refreshes its position, rather than
+/// queueing the key a second time and corrupting the eviction order.
 #[test]
 fn reinserting_a_key_replaces_it_without_duplicating_it() {
     let mut cache = RenderCache::new(2, usize::MAX);
@@ -137,9 +119,7 @@ fn reinserting_a_key_replaces_it_without_duplicating_it() {
     assert!(cache.get(&key("KTLX", 0)).is_some());
 }
 
-/// `reset_panes_for_site` drops one site's entries. The recency queue has to lose
-/// them too, or it later evicts a key that is no longer in the map while the real
-/// oldest entry survives.
+/// `reset_panes_for_site` drops one site's entries.
 #[test]
 fn retain_drops_keys_from_the_recency_queue_as_well() {
     let mut cache = RenderCache::new(4, usize::MAX);
@@ -171,8 +151,8 @@ fn clear_empties_both_halves() {
     assert!(cache.recency_order().is_empty());
 }
 
-/// A zero capacity would evict every entry on the way in, silently disabling the
-/// cross-pane sharing the cache exists for.
+/// A zero capacity would evict every entry on the way in, silently disabling the cross-pane
+/// sharing the cache exists for.
 #[test]
 fn capacity_is_floored_at_one() {
     let mut cache = RenderCache::new(0, usize::MAX);
@@ -181,15 +161,8 @@ fn capacity_is_floored_at_one() {
     assert!(cache.get(&key("KTLX", 0)).is_some());
 }
 
-/// The cache the dispatcher actually builds must hold every pane that can be on
-/// screen at once, or the panes evict each other and every layout change
-/// re-renders.
-///
-/// Asserted by filling a real `RenderDispatcher` rather than by comparing
-/// `MAX_RENDER_CACHE_ENTRIES` against the pane limit. Those two constants can
-/// both be right while the dispatcher hands `RenderCache::new` something else
-/// entirely — a comparison of constants observes the *intent*, and this is the
-/// one place the intent is wired up.
+/// The cache the dispatcher actually builds must hold every pane that can be on screen at
+/// once, or the panes evict each other and every layout change re-renders.
 #[test]
 fn the_dispatchers_own_cache_holds_every_pane_on_screen() {
     let max_panes = if cfg!(target_os = "android") {
@@ -205,13 +178,8 @@ fn the_dispatchers_own_cache_holds_every_pane_on_screen() {
         sites.len()
     );
 
-    // A full screen of panes, each on its own site *and each a different
-    // view*, cycling so a mixed screen is what is measured. The view axis
-    // was the open question when it was added: a pane still wants exactly
-    // one entry whatever it shows, so `capacity >= pane_count` is still the
-    // whole invariant — what the axis removed is the *wrong* sharing
-    // between a plan view and a section of the same product, not headroom.
-    // Asserting it over mixed views is what says so.
+    // A full screen of panes, each on its own site *and each a different view*, cycling so
+    // a mixed screen is what is measured.
     let views = RenderView::all();
     let view_of = |i: usize| views[i % views.len()];
 
@@ -242,13 +210,8 @@ fn the_dispatchers_own_cache_holds_every_pane_on_screen() {
     }
 }
 
-/// The collision the view axis exists to stop: one site, one product, one
-/// elevation, two views.
-///
-/// Without the axis the second `cache_render` overwrites the first and the
-/// plan-view pane is handed the section's buffers — which is not a wrong
-/// picture but `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the
-/// main thread, live in release, aborting the whole app under wasm.
+/// The collision the view axis exists to stop: one site, one product, one elevation, two
+/// views.
 #[test]
 fn two_views_of_one_product_do_not_share_an_entry() {
     let mut d = RenderDispatcher::new();
@@ -289,9 +252,9 @@ fn two_views_of_one_product_do_not_share_an_entry() {
     );
 }
 
-/// A vertical view has no elevation, so every tilt selection maps to one
-/// entry — and that is only safe because the *view* is what keeps it apart
-/// from a real 0.0° plan render, which no `i32` sentinel could have done.
+/// A vertical view has no elevation, so every tilt selection maps to one entry — and that
+/// is only safe because the *view* is what keeps it apart from a real 0.0° plan render,
+/// which no `i32` sentinel could have done.
 #[test]
 fn a_vertical_view_ignores_the_elevation_and_still_misses_the_plan_view() {
     let mut d = RenderDispatcher::new();
@@ -325,18 +288,10 @@ fn a_vertical_view_ignores_the_elevation_and_still_misses_the_plan_view() {
     );
 }
 
-/// The whole-volume predicate honours both of its halves — pinned as a
-/// truth table over one concrete pair per quadrant, with the expected
-/// answers written out as literals. This test used to restate production's
-/// own `view.reads_whole_volume() || product.reads_whole_volume()` on the
-/// expectation side, which could never disagree with the function it was
-/// checking; a table of hard-coded booleans can.
+/// The whole-volume predicate honours both of its halves — pinned as a truth table over one
+/// concrete pair per quadrant, with the expected answers written out as literals.
 #[test]
 fn the_whole_volume_predicate_is_both_halves() {
-    // The quadrant representatives: a cross-section is vertical structure
-    // one sweep does not have (the view half), and interpolated echo tops
-    // integrates the whole reflectivity volume (the product half), while a
-    // reflectivity plan view is one sweep of one moment (neither half).
     let table = [
         // (view, product, needs the whole volume?)
         (RenderView::PlanView, RadarProduct::Reflectivity, false), // neither half
@@ -360,9 +315,9 @@ fn the_whole_volume_predicate_is_both_halves() {
         );
     }
 
-    // Non-vacuity: the view-only quadrant must really exist — a pair that
-    // needs the volume for the view's sake alone is the case the product
-    // half alone gets wrong, and every such pair must still answer true.
+    // Non-vacuity: the view-only quadrant must really exist — a pair that needs the volume
+    // for the view's sake alone is the case the product half alone gets wrong, and every
+    // such pair must still answer true.
     let mut saw_view_only = false;
     for &view in RenderView::all() {
         for &product in RadarProduct::all() {
@@ -383,11 +338,7 @@ fn the_whole_volume_predicate_is_both_halves() {
     );
 }
 
-/// The four products whose plan view is the same picture at every tilt. Named
-/// here rather than derived, because this list *is* what the derived predicate
-/// is being checked against: it is the set
-/// `render::render_radar_to_image_full` dispatches before it calls
-/// `find_sweep`, read off that function.
+/// The four products whose plan view is the same picture at every tilt.
 const TILT_INDEPENDENT: [RadarProduct; 4] = [
     RadarProduct::EchoTopsInterpolated,
     RadarProduct::ProbabilityOfSevereHail,
@@ -395,10 +346,6 @@ const TILT_INDEPENDENT: [RadarProduct; 4] = [
     RadarProduct::HydrometeorClassification,
 ];
 
-/// The predicate must name exactly the products the renderer dispatches
-/// before `find_sweep` — no more (a tilt-dependent product collapsed into one
-/// slot would hand a pane another tilt's picture) and no fewer (each one left
-/// out is a whole-volume recompute per tilt click).
 #[test]
 fn the_tilt_independent_set_is_the_renderers_own_pre_sweep_dispatch() {
     for &product in RadarProduct::all() {
@@ -410,9 +357,9 @@ fn the_tilt_independent_set_is_the_renderers_own_pre_sweep_dispatch() {
     }
 }
 
-/// What the fix is for: clicking to another tilt on one of those panes now
-/// finds the render already there instead of paying for the whole volume
-/// again to redraw the identical picture.
+/// What the fix is for: clicking to another tilt on one of those panes now finds the render
+/// already there instead of paying for the whole volume again to redraw the identical
+/// picture.
 #[test]
 fn a_tilt_change_on_a_volume_product_is_a_cache_hit() {
     for product in TILT_INDEPENDENT {
@@ -427,12 +374,8 @@ fn a_tilt_change_on_a_volume_product_is_a_cache_hit() {
     }
 }
 
-/// And the other half: a product whose pixels really do come from the sweep
-/// `find_sweep` picks must still miss, or a tilt click would show the tilt
-/// before it. NROT and SRV are the pair that makes this more than a
-/// restatement — both answer *true* to `reads_whole_volume`, because they fit
-/// their dealias seed from every velocity tilt, and both still rasterize one
-/// sweep.
+/// And the other half: a product whose pixels really do come from the sweep `find_sweep`
+/// picks must still miss, or a tilt click would show the tilt before it.
 #[test]
 fn a_tilt_change_on_a_sweep_product_is_still_a_miss() {
     for &product in RadarProduct::all() {
@@ -449,9 +392,8 @@ fn a_tilt_change_on_a_sweep_product_is_still_a_miss() {
     }
 }
 
-/// The collapse is per product, and the cache still tells the four apart from
-/// each other and from the other views — a shared absent elevation part is not a
-/// shared entry.
+/// The collapse is per product, and the cache still tells the four apart from each other
+/// and from the other views — a shared absent elevation part is not a shared entry.
 #[test]
 fn the_collapsed_products_still_key_apart_from_each_other() {
     let mut d = RenderDispatcher::new();
@@ -492,12 +434,7 @@ fn the_collapsed_products_still_key_apart_from_each_other() {
     );
 }
 
-/// A completed cut still invalidates what it should. `reset_panes_for_tilts`
-/// matches a plan view's entry by `elevation_key(angle)`, and the four
-/// collapsed products no longer carry one — but they are also the products it
-/// deliberately skips, because a volume still being assembled must not be read
-/// as a complete short one. `reset_panes_for_site` is what refreshes them, and
-/// it is elevation-blind, so the collapse cannot leave a stale entry behind.
+/// A completed cut still invalidates what it should.
 #[test]
 fn a_site_reset_still_clears_a_collapsed_entry() {
     let gui = rustdar_egui::Gui::new();
@@ -515,22 +452,12 @@ fn a_site_reset_still_clears_a_collapsed_entry() {
     }
 }
 
-/// The cache is bounded by bytes as well as by entries, because the count
-/// stopped being a statement about memory.
-///
-/// Eight entries of `4096² × 8` is 1 GiB, and that is what
-/// [`MAX_RENDER_CACHE_ENTRIES`] meant while a plan view was one of three sizes.
-/// Once the side became the device's own answer — a 7362 px surveillance cut on
-/// a machine that reports 32768 — the same eight entries are 3.3 GiB. Nothing
-/// in the cache was counting, so that regression would have been silent, which
-/// is why this is asserted against the resident total and not against a count.
-///
-/// The three sizes are the real ones: a browser loop frame, the base raster,
-/// and the widest sweep a WSR-88D flies at two texels per gate.
+/// The cache is bounded by bytes as well as by entries, because the count stopped being a
+/// statement about memory.
 #[test]
 fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
-    // A quarter of a base-size raster, so the arithmetic below is exact and the
-    // test is not sized to whatever the host class ships.
+    // A quarter of a base-size raster, so the arithmetic below is exact and the test is not
+    // sized to whatever the host class ships.
     const BUDGET: usize = 4 * 128 * 1024 * 1024;
 
     for (side, why) in [
@@ -547,18 +474,13 @@ fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
             "{why}: {} bytes resident against a {BUDGET} byte budget",
             cache.resident_bytes(),
         );
-        // And the bound is on bytes, so a smaller raster genuinely buys more
-        // entries — the thing a fixed count could not express.
+        // And the bound is on bytes, so a smaller raster genuinely buys more entries — the
+        // thing a fixed count could not express.
         let held = cache.entry_count();
         assert!(
             held >= 1,
             "{why}: the cache evicted everything, so nothing is ever shared",
         );
-        // An entry is the texture plus the gates, and the gates are the
-        // measurements rather than a resampling of them — so the arithmetic is
-        // read off the same two buffers the cache charges for rather than
-        // written down as `side² × 8`, which is what it was when the second
-        // buffer was a second raster.
         let entry = side * side * 4 + hover_field(side).resident_bytes();
         assert_eq!(
             held,
@@ -575,12 +497,6 @@ fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
 }
 
 /// An entry larger than the whole budget is kept anyway, alone.
-///
-/// The alternative is worse than holding it: a cache that dropped the render
-/// just handed to it would report a miss to the pane that asked, which would
-/// dispatch the same render again, for as long as the pane stayed open. The
-/// budget bounds what is *retained beside* an entry, and cannot be a reason to
-/// refuse one.
 #[test]
 fn a_single_raster_over_the_whole_budget_is_still_cached() {
     let mut cache = RenderCache::new(usize::MAX, 1);
@@ -594,21 +510,12 @@ fn a_single_raster_over_the_whole_budget_is_still_cached() {
     assert!(cache.get(&key("KTLX", 6)).is_some());
 }
 
-/// The byte total tracks every way an entry can arrive or leave, not just
-/// insertion.
-///
-/// A counter that only counted upward would drift above the truth and evict a
-/// cache that was already empty — silently turning off pane sharing, which is
-/// the failure this whole cache exists to prevent and the one nothing on screen
-/// would show.
+/// The byte total tracks every way an entry can arrive or leave, not just insertion.
 #[test]
 fn the_resident_total_survives_replacement_retention_and_clearing() {
     let mut cache = RenderCache::new(usize::MAX, usize::MAX);
-    // What one entry costs, off the same two buffers the cache charges for
-    // rather than written down. It was `512² × 8` while the second buffer was a
-    // second raster of the same side; the gates behind a raster are not that
-    // shape and never were, so a literal here would be pinning arithmetic the
-    // cache stopped doing.
+    // What one entry costs, off the same two buffers the cache charges for rather than
+    // written down.
     let one = 512 * 512 * 4 + hover_field(512).resident_bytes();
 
     cache.insert(key("KTLX", 5), output_of_side(1.0, 512));

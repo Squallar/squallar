@@ -11,13 +11,7 @@ fn a_full_size_buffer_converts() {
 }
 
 /// The reason the guard exists: on the worker thread the assert inside
-/// `from_rgba_premultiplied` would kill the thread silently, no response would be
-/// sent, and the frame would sit `render_in_flight` forever.
-///
-/// A *static* render's size — the long-range raster — is refused here too, and
-/// deliberately: a loop frame is `LOOP_IMAGE_SIZE` by policy, so a buffer of
-/// any other legal render size is a job dispatched at the wrong ceiling rather
-/// than a picture to squeeze in.
+/// `from_rgba_premultiplied` would kill the thread silently.
 #[test]
 fn a_malformed_buffer_is_rejected_rather_than_panicking() {
     let short = LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4 - 4;
@@ -37,12 +31,6 @@ fn a_malformed_buffer_is_rejected_rather_than_panicking() {
 
 /// Pixel values survive the conversion — a frame that converted to transparent
 /// black would render as nothing and look exactly like a frame that never rendered.
-///
-/// The pixel is written in the convention the function now takes: what arrives
-/// here has already been through `offload::execute`'s premultiply, at the alpha
-/// `palette.rs` gives nearly every data pixel. Feeding it a straight-alpha
-/// triple instead would pass for the wrong reason — the two constructors agree
-/// at α = 255 and nowhere else that matters.
 #[test]
 fn pixel_values_survive_the_conversion() {
     let mut rgba = vec![0u8; LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4];

@@ -1,30 +1,5 @@
 //! The floor is framed on the box, and the zoom gesture moves the eye and
 //! nothing else.
-//!
-//! The eleven tests this file used to hold were all about deriving a box from a
-//! viewport — containment on four sides, the quantum that stopped the pane
-//! rebuilding for ever, the ceiling and floor the derivation was clamped to.
-//! None of those things exists: a 3D pane's region is stored rather than
-//! measured, so there is no measurement to contain, no per-frame key to keep
-//! still and no derived extent to clamp. They are named in the change's test
-//! accounting rather than reconstructed here — a test for a concept that has
-//! been deleted cannot fail, and a suite full of tests that cannot fail is the
-//! defect this codebase keeps having to fix.
-//!
-//! What is pinned instead is the implication running the *other* way — that a
-//! strip framed on a stored box covers the whole of it, tightly, at every
-//! latitude and for every shape of pane — plus the arithmetic between a wheel
-//! notch and a standoff and the refusals that keep a bad frame's number out of
-//! the camera. The *gate* — which pane a gesture belongs to — is pinned through
-//! the real UI by `ui_map::volume_arm_tests`, because it is a question about
-//! layers and hover that no unit fixture can ask honestly.
-//!
-//! Since the selector came back there is a third subject here: the one writer
-//! of a stored region. [`RegionDrag`]'s arithmetic — Chebyshev, capped, refused
-//! below the resampler's floor, square on both axes — is pinned as a function,
-//! because every one of those is a decision that can be got wrong silently. The
-//! *gesture* around it is `ui_map::region_pick_tests`, for the reason the gate
-//! is over there.
 
 use super::{
     COVERAGE_MARGIN, COVERAGE_TARGET, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL,
@@ -33,18 +8,6 @@ use super::{
 };
 
 /// A frame whose timing is unusable leaves walkers exactly as it found it.
-///
-/// **This is what makes [`wheel_rate_correction`]'s finiteness test reachable**,
-/// and it is reachable: `f32::clamp` is two `if`s that a NaN fails both of, so a
-/// NaN `stable_dt` comes out of the clamp as a NaN rather than being bounded
-/// away. `stable_dt` is a wall-clock difference the platform hands egui, so that
-/// is an input and not a hypothetical — and the correction is multiplied into
-/// `smooth_scroll_delta`, which walkers puts into `MapMemory::zoom`, which is
-/// *stored*. One NaN frame would poison the pane's zoom until it was rebuilt.
-///
-/// 1.0 rather than a refusal because leaving walkers alone is the conservative
-/// answer: the frame zooms by whatever walkers would have done unaided, which is
-/// the behaviour that shipped before this module existed.
 #[test]
 fn a_frame_with_unusable_timing_leaves_walkers_alone() {
     let with = |stable_dt: f32, predicted_dt: f32| {
@@ -78,16 +41,6 @@ fn a_frame_with_unusable_timing_leaves_walkers_alone() {
 }
 
 /// Opening a second [`super::steady_wheel`] inside the first is refused.
-///
-/// The correction is a *multiplication* into a shared field, so nesting squares
-/// it: at the measured web frame time that is a 17× scroll rather than a 1×,
-/// and the map would leap seventeen zoom levels on one notch. Nothing nests
-/// today — the one call site is a leaf — so this exists to keep the guard from
-/// being the thing it is guarding against: an unreachable protection nobody
-/// ever proved fires. It fires.
-///
-/// Debug-only because `debug_assert` compiles out of a release build, and a
-/// `should_panic` test that cannot panic is a test that fails.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "nesting squares the correction")]
@@ -98,11 +51,6 @@ fn nesting_the_wheel_guard_is_refused() {
 
 /// An input frame carrying `scroll` points of wheel and nothing else, at
 /// egui's own default 60 Hz timing.
-///
-/// `zoom_factor_delta` is private and defaults to exactly 1.0, which is the
-/// "no pinch this frame" value [`zoom_step`] tests for — so a default frame
-/// with a scroll written into it drives the wheel branch, which is the one a
-/// desktop user reaches.
 fn scroll_frame(scroll: f32) -> egui::InputState {
     let mut input = egui::InputState::default();
     input.smooth_scroll_delta.y = scroll;
@@ -110,18 +58,6 @@ fn scroll_frame(scroll: f32) -> egui::InputState {
 }
 
 /// The whole of one wheel notch, in zoom levels, at a frame rate of `dt`.
-///
-/// **This is the measurement, not a fixture.** `scroll_frame` writes
-/// `smooth_scroll_delta` by hand and so cannot see the thing being tested:
-/// egui does not hand a frame the scroll that arrived during it, it hands the
-/// frame a *slice* of an accumulator it drains over about 100 ms
-/// (`input_state/wheel_state.rs::after_events`). So one notch is spread across
-/// however many frames fit in that window, and what a user feels is the
-/// **sum**, not any one frame's share. Only a real `egui::Context` run frame by
-/// frame produces that, which is what this does.
-///
-/// Runs until the accumulator is dry and stays dry, so the answer is the whole
-/// gesture rather than a prefix of it.
 fn notch_levels(dt: f64, notch_points: f32) -> f64 {
     // The shipped `predicted_dt`. `egui-winit` never writes the field — it is
     // not mentioned anywhere in the crate — so it holds `RawInput::default()`'s
@@ -174,10 +110,6 @@ fn notch_levels(dt: f64, notch_points: f32) -> f64 {
 
 /// The frame rates this app is measured at: a 240 Hz desktop, a hitched web
 /// frame, and everything between.
-///
-/// The last row is not hypothetical — it is the measured p50 frame duration of
-/// the shipped web build in Chromium with the NWS alerts overlay on, where the
-/// overlay raster runs inline on the main thread.
 const FRAME_RATES: &[(&str, f64)] = &[
     ("240Hz", 1.0 / 240.0),
     ("120Hz", 1.0 / 120.0),
@@ -188,35 +120,10 @@ const FRAME_RATES: &[(&str, f64)] = &[
 ];
 
 /// How far apart two frame rates' answers are allowed to land, as a fraction.
-///
-/// Set by what the `f32` accumulator inside egui's own smoothing leaves behind
-/// — 4.4e-8 at the worst of the rates above — with a decimal order of margin.
-/// The defect this bounds was a factor of **four**, so this is four hundred
-/// thousand times tighter than the thing it is watching for.
 const RATE_TOLERANCE: f64 = 1e-6;
 
 /// **The reported bug, as a gate**: one wheel notch is the same zoom whatever
 /// the frame rate.
-///
-/// > scrolling behavior has gotten choppy. When I'm zoomed out wide, a zoom
-/// > moves a lot more than a close zoom, which is a tiny jump. I think it has
-/// > to do with the processing done during zoom.
-///
-/// The user's diagnosis was right, and this is the arithmetic of it. Before the
-/// fix this table read 0.50 / 0.50 / 1.00 / 2.00 / 2.00 / 2.00 — a 4× spread
-/// driven by nothing but how long the frame took, saturating at both ends of
-/// walkers' `clamp(predicted_dt * 0.5, predicted_dt * 2.0)`. Zoomed out wide is
-/// when the app is slowest, so that is where a notch was worth a *quadrupling*
-/// of scale; zoomed in the frames are quick and the same notch was a 1.41×.
-///
-/// One level per notch is the mapping every map application has, and
-/// [`super::POINTS_PER_ZOOM_LEVEL`] is what holds it.
-///
-/// The tolerance is [`RATE_TOLERANCE`], which is what is left of the coupling
-/// rather than a margin for it: at 240 Hz the notch is spread over about
-/// twenty-five frames and egui's accumulator is `f32`, so the sum lands 4.4e-8
-/// off. That is the arithmetic of the filter, not the frame time — a returning
-/// bug moves this by factors, not by ulps.
 #[test]
 fn a_notch_is_the_same_zoom_at_every_frame_rate() {
     for &(name, dt) in FRAME_RATES {
@@ -230,10 +137,6 @@ fn a_notch_is_the_same_zoom_at_every_frame_rate() {
 }
 
 /// The gesture is linear in how far the wheel turned, at any frame rate.
-///
-/// The fix could have been a clamp — pin the step and cap it — and that would
-/// pass the table above while quietly making a fast flick worth the same as a
-/// slow one. Two notches are two levels, and a half notch is half a level.
 #[test]
 fn the_zoom_follows_how_far_the_wheel_turned() {
     for &(name, dt) in FRAME_RATES {
@@ -249,18 +152,6 @@ fn the_zoom_follows_how_far_the_wheel_turned() {
 
 /// One wheel notch over the **plan view**, in zoom levels, at a frame rate of
 /// `dt` — driven through the real UI and the real `walkers::Map`.
-///
-/// The two tests above measure [`zoom_step`], which is the 3D pane's arm. The
-/// plan view does not go through it: it reaches `walkers::Map::zoom_delta`,
-/// which holds its own copy of the frame-time multiplier and cannot be
-/// configured out of it. So the plan view is measured where it actually lives —
-/// through `render_panes`, through walkers, off `MapMemory::zoom` — and
-/// [`super::steady_wheel`] is what has to make this flat.
-///
-/// Runs until the zoom stops moving, for the same reason [`notch_levels`] does:
-/// a notch is spread over about 100 ms of frames, so a fixed frame count reads
-/// a different fraction of the gesture at every rate and would report the
-/// coupling as fixed when it was not.
 fn plan_view_notch_levels(dt: f64) -> f64 {
     use crate::input_harness::InputHarness;
 
@@ -304,32 +195,6 @@ fn plan_view_notch_levels(dt: f64) -> f64 {
 /// instrumentation 3673d316) are drawn, and it is the arm that reaches
 /// walkers' multiplier rather than this
 /// module's.
-///
-/// Fixing [`zoom_step`] alone would have left this one at the 4× spread *and*
-/// broken the agreement between the two panes that
-/// `a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view` pins — a
-/// half fix that reads as a whole one, because the 3D pane is the one with the
-/// unit tests. Hence [`super::steady_wheel`], and hence this.
-///
-/// # The 1.3% this does not remove, and why it is left
-///
-/// Measured after the fix: 0.9867 at 240 Hz, 0.9983 at 120, 1.0000 at 60 and
-/// 30, 0.9990 at 10 and below. A **1.3% spread**, against the 4× it replaced.
-///
-/// What is left is a *second* frame-rate coupling in walkers, and a much
-/// smaller one: `handle_gestures` only zooms at all when
-/// `(zoom_delta - 1.0).abs() > 0.001`, so a frame carrying less than 0.24
-/// points of wheel is dropped on the floor rather than accumulated. The faster
-/// the frame rate the more of the notch arrives in slices that small — at
-/// 240 Hz the exponential tail spends about 1.6 of its 120 points under the
-/// bar, which is the 1.3%.
-///
-/// Left because removing it means carrying the sub-threshold remainder across
-/// frames — real state, in the input path, to recover a part in eighty of a
-/// gesture nobody can feel. The defect this test exists for was a factor of
-/// four in the same quantity. The bound below is set where the measurement
-/// actually is so that a *regression* moves it, rather than at a round number
-/// that would let one hide.
 #[test]
 fn a_notch_moves_the_plan_view_the_same_distance_at_every_frame_rate() {
     let measured: Vec<(&str, f64)> = FRAME_RATES
@@ -360,12 +225,6 @@ fn a_notch_moves_the_plan_view_the_same_distance_at_every_frame_rate() {
 /// **The property the user asked for, in the one place it is arithmetic**: a
 /// zoom level in is a halving of the eye's standoff, so the ground the pane
 /// looks at halves while the box under it does not move at all.
-///
-/// One Web Mercator zoom level is a factor of two of ground per point by the
-/// projection's definition, and a perspective camera sees `2 · d · tan(fov/2)`
-/// of ground at its pivot plane — linear in `d`. So the conversion is `2^step`
-/// exactly, and this is what says the exponent has not been dropped, doubled or
-/// inverted.
 #[test]
 fn one_zoom_level_is_one_halving_of_the_standoff() {
     assert_eq!(dolly_for_step(1.0), 2.0, "a level in halves the standoff");
@@ -374,12 +233,6 @@ fn one_zoom_level_is_one_halving_of_the_standoff() {
 }
 
 /// A frame with no gesture leaves the eye exactly where it is.
-///
-/// The neutral value is 1.0 and not 0.0 because this is a *divisor*, and the
-/// two are one character apart at the call site. A 0.0 would divide the
-/// standoff by zero and put an infinity in the camera, whose staleness key
-/// would then never equal itself — a permanently rebuilding pane whose only
-/// symptom is a fan.
 #[test]
 fn no_gesture_leaves_the_eye_where_it_is() {
     assert_eq!(dolly_for_step(0.0), 1.0);
@@ -387,11 +240,6 @@ fn no_gesture_leaves_the_eye_where_it_is() {
 
 /// Zooming out undoes zooming in, exactly, at every magnitude a gesture
 /// produces.
-///
-/// `2^s · 2^-s = 1` is arithmetic, but it is arithmetic in `f64` that is then
-/// rounded to `f32` twice, and the thing being pinned is that a user who
-/// scrolls one notch each way finds the pane where they left it rather than
-/// drifting a little further out every round trip.
 #[test]
 fn zooming_out_undoes_zooming_in() {
     for step in [0.05_f64, 0.25, 0.5, 1.0, 3.0, 7.0] {
@@ -405,12 +253,6 @@ fn zooming_out_undoes_zooming_in() {
 
 /// A gesture frame that produced a `NaN` or an infinity does not reach the
 /// camera.
-///
-/// [`crate::pane::OrbitCamera::nudge`] would refuse such a factor itself — but
-/// it refuses the **whole delta**, which throws away the same frame's orbit and
-/// pan. Answering the identity here keeps those two verbs working through a
-/// frame whose scroll arrived unusable, which is what a user dragging and
-/// scrolling at once actually does.
 #[test]
 fn a_non_finite_gesture_does_not_reach_the_camera() {
     for step in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -419,13 +261,6 @@ fn a_non_finite_gesture_does_not_reach_the_camera() {
 }
 
 /// A finite step whose exponential is not finite is refused too.
-///
-/// The one arithmetic step between [`zoom_step`]'s own finiteness check and the
-/// camera's: `2^129` is past `f32::MAX` and `2^-150` is under `f32::MIN_POSITIVE`
-/// even as a subnormal, so a finite input can still produce an infinity or a
-/// zero. Neither may be divided into a standoff, and testing the *output* rather
-/// than bounding the input is what keeps this true if the exponent's base ever
-/// changes.
 #[test]
 fn a_step_that_overflows_the_factor_is_refused() {
     assert_eq!(dolly_for_step(1000.0), 1.0, "an overflow to infinity");
@@ -433,11 +268,6 @@ fn a_step_that_overflows_the_factor_is_refused() {
 }
 
 /// Scrolling up brings the eye in and scrolling down takes it out.
-///
-/// Convention rather than arithmetic — a sign error here dollies perfectly well
-/// and merely feels backwards, which is the kind of defect that survives review
-/// — and it is walkers' own convention, so that a wheel means the same thing
-/// over a 3D pane as over the plan view beside it.
 #[test]
 fn scrolling_up_brings_the_eye_in() {
     assert!(
@@ -457,11 +287,6 @@ fn scrolling_up_brings_the_eye_in() {
 
 /// The range the gesture can actually reach, measured off the camera's own
 /// constants rather than restated.
-///
-/// The module doc claims 160× and 7.32 zoom levels as the bound the box's
-/// bounds were replaced by. Both are read back here, so a change to either
-/// constant fails this instead of leaving the prose describing a range that no
-/// longer exists.
 #[test]
 fn the_gesture_runs_from_inside_the_box_to_well_outside_it() {
     let span = f64::from(crate::pane::MAX_EYE_DISTANCE / crate::pane::MIN_EYE_DISTANCE);
@@ -483,18 +308,6 @@ fn half(east_km: f64, north_km: f64) -> rustdar_radar::voxel::HalfExtentKm {
 
 /// **The property the floor exists for**: the strip covers the whole box, on
 /// every axis, for every shape of box and pane the application can produce.
-///
-/// `floor_colour` clips the floor to the mirror's `0..1` and answers
-/// *transparent* outside it — off the mirror is ground the strip is not showing
-/// and has no colour to report, and clamping would smear the strip's border
-/// across the rest of the box as if it were map. So a strip that falls short on
-/// any side is a volume standing on nothing along that side, which is the exact
-/// symptom the stored region was going to reintroduce and this closes.
-///
-/// Swept rather than sampled once: the binding axis changes with the pane's
-/// aspect and the box's, and a framing that solved for the wrong one would pass
-/// on a square fixture. The latitudes matter for the same reason — Mercator's
-/// north lane is the one the single-logarithm solve is only approximate on.
 #[test]
 fn the_framed_strip_covers_the_whole_box() {
     for (w, h) in [
@@ -529,49 +342,9 @@ fn the_framed_strip_covers_the_whole_box() {
 
 /// How far a delivered margin may sit from the band's ends before it counts as
 /// outside it, as a fraction of the end.
-///
-/// The solve computes its target and its step in one arithmetic; a test measures
-/// what came back by building a **fresh** projector and running the geodesy
-/// again. The two agree to a few parts in 1e8 rather than exactly, and the band
-/// this file asserts is 1e-3 wide, so an exact `contains` would be asserting
-/// that a round trip through Mercator and a haversine is lossless. Measured
-/// worst deviation over the 865 280-framing sweep: 2.2e-8 below
-/// [`COVERAGE_MARGIN`] would be needed to trip the floor, and 8.5e-11 above
-/// [`COVERAGE_TARGET`] was the largest excess seen at the ceiling.
-///
-/// One part in a million, which is four orders clear of both and still six
-/// orders inside the defect it exists to catch — a solve that settles for zero
-/// margin delivers 3.3e-8, not 9.99e-4.
 const BAND_ROUND_TRIP: f64 = 1e-6;
 
 /// **The margin is delivered, not merely aimed at.**
-///
-/// [`COVERAGE_MARGIN`] promises "0.1% of a 920 km box is 920 m … the price of
-/// never being short", and for as long as the solve aimed and settled at the
-/// same number that promise was not kept. The east–west lane is *exact* — one
-/// logarithm lands the strip on the target to rounding — so a solve aimed at the
-/// box plus the margin and settling for the box plus nothing came back covering
-/// the box and nothing more. Measured over this sweep with the old bar: the
-/// worst delivered margin was **3.28e-8**, 2.09% of framings delivered under a
-/// tenth of the margin, and 438 of them delivered under `f32::EPSILON`. The
-/// mirror registers through walkers' **f32** `Projector::project`, so those last
-/// ones had spent the margin past the precision of the projection it protects.
-///
-/// The old coverage tests could not see it: they assert `covered >= box`, which
-/// zero margin satisfies exactly. This asserts the *band* —
-/// [`COVERAGE_MARGIN`] at the floor, [`COVERAGE_TARGET`] at the ceiling — which
-/// is a claim with a number in it that a solve can come in under.
-///
-/// The sweep is the shipped one at fixture scale: ten strip sizes on each axis,
-/// every whole degree of latitude both sides of the equator, and eight boxes
-/// including the 470 km cap a maximal drag commits and the two rectangles that
-/// straddle it. A solve that ran out of zoom is excluded — a strip physically
-/// too small to show the box has no margin to deliver, and
-/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]
-/// is what covers that exit.
-///
-/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]:
-///     a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows
 #[test]
 fn the_framing_delivers_the_margin_it_promises() {
     let mut framings = 0usize;
@@ -643,23 +416,11 @@ fn the_framing_delivers_the_margin_it_promises() {
 }
 
 /// The strip sizes and boxes the framing properties are swept over.
-///
-/// Awkward on purpose. The shapes that stress the solve hardest are the
-/// lopsided ones — a 536 × 8 strip at 58°N, a 1256 × 56 at 65°N — so a list of
-/// round sizes measures the solve as easier than it is.
 const FRAMING_SWEEP_SIDES: [f32; 10] = [
     8.0, 24.0, 56.0, 96.0, 200.0, 392.0, 536.0, 680.0, 1016.0, 1256.0,
 ];
 
 /// The boxes [`FRAMING_SWEEP_SIDES`] is swept against.
-///
-/// The whole ring, the **470 km cap a maximal drag commits**, 300 km, the 10 km
-/// floor, the 664 × 10 km rectangle the corner bound allows and its transpose,
-/// an ordinary 120 × 75, and the 235 × 470 rectangle that binds on the axis the
-/// square one does not — with its transpose, which is the shape that spent the
-/// margin hardest: a 96 × 56 strip at 64.5°N framed on 470 × 235 is the framing
-/// that delivered **3.28e-8** while the solve aimed and settled at the same
-/// number.
 const FRAMING_SWEEP_BOXES: [rustdar_radar::voxel::HalfExtentKm; 9] = [
     rustdar_radar::voxel::HalfExtentKm {
         east_km: 460.125,
@@ -700,20 +461,6 @@ const FRAMING_SWEEP_BOXES: [rustdar_radar::voxel::HalfExtentKm; 9] = [
 ];
 
 /// The framing is **tight**, not merely sufficient.
-///
-/// The mirror is a fixed number of pixels, so every kilometre of ground outside
-/// the box is floor resolution spent on ground `floor_hit` will clip away. A
-/// solve that zoomed out "to be safe" would pass the coverage test above and
-/// cost the floor detail on every 3D pane in the application.
-///
-/// The binding axis is asserted to land inside [`COVERAGE_TARGET`], the ceiling
-/// of the band the solve settles in — the margin is what the solve converges
-/// *through*, so landing a fraction of it wide is the intended outcome rather
-/// than slack. The other axis is free, because a square box in a 16:9 strip must
-/// overhang east–west and there is no framing that avoids it.
-///
-/// 0.2% of the 470 km cap a maximal drag commits is 940 m of mirror outside the
-/// box on each side, which is where the ceiling was set and why.
 #[test]
 fn the_framing_spends_no_more_of_the_mirror_than_the_box_needs() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(700.0, 450.0));
@@ -733,39 +480,6 @@ fn the_framing_spends_no_more_of_the_mirror_than_the_box_needs() {
 
 /// **The early-out fires.** [`MAX_FRAMING_PASSES`] is a budget the solve stops
 /// short of, and this counts the passes it really ran.
-///
-/// Two settle tests ago the loop compared a shortfall measured against the box
-/// *plus* [`COVERAGE_MARGIN`] to `1.0` — a value the margin's own doc says the
-/// solve approaches from above and never reaches. This doc used to conclude from
-/// that the condition was unsatisfiable and every framing ran the whole budget.
-/// **It is not what happened**, and the difference is the point of the test.
-/// The margin's "never reaches" is true of the real numbers and false of `f64`:
-/// restoring that loop whole and running it over the sweep
-/// [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`] performs
-/// today, it **settled on 6,347 of 76,500 framings, 8.30%**, at passes two,
-/// three and four. [`MAX_FRAMING_PASSES`] carries the full reading, and says
-/// which of the several "old bars" this one is.
-///
-/// So the constant did not describe a ceiling nothing could come in under. It
-/// described one that a twelfth of framings came in under and the rest did not,
-/// for a reason no reading of either the loop or the prose would reveal — which
-/// is why the count has to come out of the shipped loop rather than out of an
-/// argument about it.
-///
-/// The predecessor of this test could not have caught it, and the shape of the
-/// mistake is worth keeping in view: it re-ran the solve's arithmetic in the
-/// test body and counted *that* loop's passes. Its copy used the settle
-/// condition the prose describes and the real loop used a different one, so both
-/// were green while disagreeing. So this drives [`super::solve_viewport`] — the
-/// shipped loop — and reads the count out of it.
-///
-/// The pass counts below are measured, and the fixtures are chosen to show what
-/// decides them. It is not latitude alone: which lane *binds* is the box's shape
-/// against the strip's, and the east lane is exact in one step where the north
-/// lane has to iterate. So a whole-ring box in a **tall** strip settles in two at
-/// 64.8°N — that is the shape the old constant's "two passes to spare" was
-/// measured on — and the same box in a **wide** strip at the same latitude takes
-/// four.
 #[test]
 fn the_solve_stops_as_soon_as_the_strip_covers_the_box() {
     let ring = half(460.125, 460.125);
@@ -816,26 +530,6 @@ fn the_solve_stops_as_soon_as_the_strip_covers_the_box() {
 
 /// The pass table on [`MAX_FRAMING_PASSES`], re-measured — every row of it,
 /// including the last one, which is the budget entire.
-///
-/// The budget is a claim about every strip, latitude and box this application
-/// can produce, and the last one to be measured on a single fixture was measured
-/// on the easy one. So this sweeps [`FRAMING_SWEEP_SIDES`] on each axis and
-/// [`FRAMING_SWEEP_BOXES`] at every whole degree from the equator to 84°.
-///
-/// Two things are held. Every solve settles inside its band's row, and each row
-/// is *reached* — a table whose numbers are all overstatements is a table nobody
-/// can use to choose the budget, and until the 470 km cap and the 80°+ rows
-/// joined it the table peaked at seven, so a [`MAX_FRAMING_PASSES`] of 7 would
-/// have passed every test there was.
-///
-/// A solve that runs out of zoom rather than out of passes is excluded: the
-/// clamp at [`MIN_ZOOM_LEVEL`] is the strip being physically unable to show the
-/// box, which
-/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]
-/// covers and this is not about.
-///
-/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]:
-///     a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows
 #[test]
 fn the_framing_budget_covers_every_latitude_a_region_can_sit_at() {
     let mut reached = std::collections::BTreeMap::<usize, usize>::new();
@@ -882,10 +576,6 @@ fn the_framing_budget_covers_every_latitude_a_region_can_sit_at() {
 }
 
 /// The row of [`MAX_FRAMING_PASSES`]' table that `lat` falls in.
-///
-/// Free rather than nested so that
-/// [`a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`] reads the
-/// same table this one does.
 fn documented_passes(lat: f64) -> usize {
     match lat.abs() as i64 {
         0..=29 => 3,
@@ -899,19 +589,6 @@ fn documented_passes(lat: f64) -> usize {
 
 /// **The budget's last pass is one a maximal drag really needs**, and the box
 /// that needs it is the exact one the selector commits at its cap.
-///
-/// [`MAX_FRAMING_PASSES`] is 8 and the sweep above only ever showed 7 until the
-/// 470 km square joined it, which is a constant asserting nothing: seven would
-/// have been green everywhere. This drives the cap in a square strip at the
-/// latitudes where the north lane's convergence has slowed to a crawl, and holds
-/// **both** ends of the claim at once.
-///
-/// A budget of 7 fails the second assertion rather than the first: the solve
-/// would still answer `(memory, 7)`, because running out of passes and settling
-/// on the last one are the same count — but it would answer with the strip it
-/// had not finished converging, short of the margin. A budget of 9 fails the
-/// first. So the pair pins 8 from above and below, which one of them alone
-/// cannot do.
 #[test]
 fn the_budgets_last_pass_is_one_a_maximal_drag_really_needs() {
     let cap = half(
@@ -948,36 +625,6 @@ fn the_budgets_last_pass_is_one_a_maximal_drag_really_needs() {
 
 /// **What running out of passes really answers.** It is not "biased outward",
 /// and the comment that said so is the reason this is measured.
-///
-/// The claim was that the loop's last act is a step, so an exhausted answer is
-/// one whole measured shortfall wider than the last thing measured short. The
-/// step is real; the conclusion does not follow, because the north lane's ground
-/// is **sub**linear in the zoom it is bought with — a step sized by the linear
-/// model gains less than it asks for, and near the pole it gains almost nothing.
-/// Measured before [`ground_half_extent`]'s longitude clamp landed, the worst
-/// exhausted answer covered **13.9%** of its box: a 460 km square at 83.5°N in a
-/// 536 × 96 strip, where the east lane was folding back on itself and shrinking
-/// as the strip widened, so the solve had nothing to converge to. That was the
-/// fold, and it is fixed.
-///
-/// What is left is the pole, and it is bounded on both sides:
-///
-/// * Exhaustion needs a centre at **81.5°** or higher *and* a box whose poleward
-///   edge reaches within **2.53°** of the pole — 87.47°N at the nearest measured.
-///   Mercator's `y` runs to infinity there, so the ground the last pass is
-///   buying costs an unbounded number of zoom levels.
-/// * No box a **drag** can commit is left short at all. The selector caps at
-///   [`MAX_HALF_WIDTH_KM`](rustdar_radar::voxel::MAX_HALF_WIDTH_KM), and every
-///   exhausted framing of a box inside that cap still covered its box — worst
-///   measured 1.00068, which is margin rather than shortfall.
-/// * Past the cap — the rectangles the corner bound allows, up to 664 km on an
-///   axis — an exhausted answer covers at worst **95.9%** of its box.
-///
-/// That last one is a real 4% of transparent floor and it is answered rather
-/// than refused, for the same reason the clamp exit is: the alternative is the
-/// caller's own map memory, centred on the site rather than on the box, and
-/// `the_floor_is_framed_on_a_dragged_region_rather_than_on_the_site` is what
-/// that costs.
 #[test]
 fn a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole() {
     let mut exhausted = 0usize;
@@ -1063,43 +710,6 @@ fn a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole() {
 }
 
 /// **A strip wider than the world measures the world, not the fold.**
-///
-/// walkers' `unproject` is the plain inverse Mercator and does not wrap, so a
-/// point a whole world left of the centre reads back as `centre − 360°`
-/// literally — and the geodesy between two longitudes exactly 360° apart is the
-/// distance from a point to itself. Measured before the clamp landed, at
-/// [`MIN_ZOOM_LEVEL`] about 35.33°N:
-///
-/// | strip width | worlds across | east half-extent |
-/// |---|---|---|
-/// | 128 pt | 0.50 | 7 835 km |
-/// | 256 pt | 1.00 | 12 158 km |
-/// | 300 pt | 1.17 | 11 529 km |
-/// | 512 pt | 2.00 | **2.47e-12 km** |
-/// | 513 pt | 2.00 | 63.8 km |
-/// | 1400 pt | 5.47 | 8 271 km |
-///
-/// Two failures in one. The near-zero is **one guard from `None`**, and `None`
-/// here is [`viewport_for_region`] refusing, which drops the caller onto the
-/// pane's own map memory centred on the *site* — the fallback the stored region
-/// exists to keep away from and the one that put a 470 km box on a fraction of
-/// a kilometre of floor. And the non-monotonicity broke the framing solve
-/// outright: [`super::solve_viewport`] steps by a logarithm of the shortfall on
-/// the assumption that a wider strip shows more ground, and out there a wider
-/// strip showed less — so a solve whose north lane had already converged could
-/// never settle. That is what left the worst exhausted framing covering 13.9%
-/// of its box, and
-/// [`a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`] is what
-/// bounds the exit now that this is fixed.
-///
-/// So this asserts the property the solve needs rather than the six numbers
-/// above: **monotone in width, and saturating at the half-circumference.** Half
-/// a turn is the whole of the axis, and a strip showing two worlds is showing
-/// the same ground as a strip showing one.
-///
-/// The north lane is checked alongside to show it needs no such clamp: latitude
-/// comes back through `atan(sinh(y))`, which is bounded into ±90° for every
-/// pixel there is, so a latitude offset cannot reach half a turn to begin with.
 #[test]
 fn a_strip_wider_than_the_world_measures_the_world_rather_than_the_fold() {
     let centre = walkers::lat_lon(35.33, -97.28);
@@ -1159,10 +769,6 @@ fn a_strip_wider_than_the_world_measures_the_world_rather_than_the_fold() {
 
 /// A box or a pane that cannot be framed is refused, so the caller falls back to
 /// the pane's own map memory rather than to a viewport built from a `NaN`.
-///
-/// The extent is checked for being **positive** as well as finite: a zero-width
-/// box divides to an infinity in the solve, and an infinite zoom step reaches
-/// `set_zoom` as a `NaN` that walkers accepts as a number.
 #[test]
 fn an_unframable_box_or_pane_is_refused() {
     let centre = walkers::lat_lon(35.33, -97.28);
@@ -1190,19 +796,6 @@ fn an_unframable_box_or_pane_is_refused() {
 /// Where `walkers::MapMemory::set_zoom` answers `Err(InvalidZoom)`, pinned so
 /// that [`MIN_ZOOM_LEVEL`] and [`MAX_ZOOM_LEVEL`] cannot drift from the crate
 /// they restate.
-///
-/// walkers keeps the bounds inside a `pub(crate)` type — `Zoom::try_from` is
-/// `if !(0. ..=26.).contains(&value) { Err(InvalidZoom) }` at
-/// `walkers-0.56.0/src/zoom.rs:14` — so a consumer has no constant to import and
-/// no way to read them but to try. A version bump that moved either end would
-/// leave this module clamping to the wrong place, and the symptom would be the
-/// silent refusal the clamp exists to remove, back again with a clamp in front
-/// of it.
-///
-/// The `NaN` row is the one that is easy to get wrong: `contains` is false for
-/// a `NaN`, so walkers refuses one — and `f64::clamp` **propagates** a `NaN`
-/// rather than bounding it, so clamping is not a defence against one. That is
-/// why the solve's finiteness test runs before the clamp.
 #[test]
 fn a_zoom_walkers_refuses_is_one_this_module_clamps_away() {
     let accepts = |zoom: f64| walkers::MapMemory::default().set_zoom(zoom).is_ok();
@@ -1237,20 +830,6 @@ fn a_zoom_walkers_refuses_is_one_this_module_clamps_away() {
 /// **The refusal that used to be silent.** A strip too small to reach the box
 /// inside walkers' zoom range is framed as wide as walkers allows, centred on
 /// the box, rather than abandoned to the caller's fallback.
-///
-/// The solve starts at `MapMemory::default()`'s zoom 16 and buys ground by
-/// zooming out, so it has 16 levels — a factor of 65 536 — before walkers
-/// refuses the step. A pane whose shorter side is a handful of points needs more
-/// than that to reach a continental box, and that gap is what the stored region
-/// made reachable: the box used to *be* the viewport, so the two could not
-/// disagree by a factor of 65 536; a picked region is a fact about the ground
-/// that outlives any pane size, including a pane a divider drag or a canvas
-/// resize has left a few points across.
-///
-/// **The trip is asserted as well as the answer.** A fixture that quietly
-/// stopped driving `set_zoom` out of range would leave this passing while
-/// testing nothing, so the first step is computed here and checked to be a zoom
-/// walkers really does refuse.
 #[test]
 fn a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(8.0, 6.0));
@@ -1305,12 +884,6 @@ fn a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows() {
 
 /// A framed strip is centred on the box, not on wherever the pane's map was
 /// left.
-///
-/// The centre is the other half of "the two clips are the same rectangle": a
-/// strip zoomed out far enough to cover a 920 km box but centred 400 km away
-/// still leaves a side of the box transparent. It is asserted through the
-/// projector rather than off `MapMemory`, because what the shader ends up
-/// sampling is the projection.
 #[test]
 fn a_framed_strip_is_centred_on_the_box() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(700.0, 450.0));
@@ -1341,24 +914,9 @@ fn ktlx() -> rustdar_geo::GeoPoint {
 
 /// Kilometres a fixture's stated offset may be out by, at the ~100 km distances
 /// used below.
-///
-/// The offsets are built with the **flat** approximation
-/// ([`OFFSET_TOLERANCE_KM`]'s companion, `corners_for`'s own arithmetic) while
-/// the drag measures with [`rustdar_geo::site_bearing_range_km`], the
-/// real geodesy. The two disagree by a fraction of a percent, so an exact
-/// assertion would be an assertion about which approximation the fixture used
-/// rather than about the drag. 1.5 km on a 100 km offset is 1.5% — an order of
-/// magnitude looser than the disagreement and two orders tighter than every
-/// error these tests exist to catch, all of which are 30% or a factor of two.
 const OFFSET_TOLERANCE_KM: f64 = 1.5;
 
 /// A point `east_km` east and `north_km` north of `from`.
-///
-/// The flat approximation, deliberately independent of the geodesy the drag
-/// measures with: the exact inverse exists
-/// (`rustdar_geo::great_circle_destination`), but a fixture built on it would
-/// share its arithmetic with the code under test. See [`OFFSET_TOLERANCE_KM`]
-/// for what the independence costs and why it costs nothing that matters.
 fn offset(from: rustdar_geo::GeoPoint, east_km: f64, north_km: f64) -> rustdar_geo::GeoPoint {
     let per_deg = rustdar_geo::KM_PER_DEGREE_LAT;
     rustdar_geo::GeoPoint {
@@ -1369,11 +927,6 @@ fn offset(from: rustdar_geo::GeoPoint, east_km: f64, north_km: f64) -> rustdar_g
 
 /// **The half-width is Chebyshev, not Euclidean**: the square's *edge* follows
 /// the pointer, so a straight drag grows the box at the rate the pointer moves.
-///
-/// The alternative reads as the box tracking something behind the cursor — a
-/// pointer 100 km east would give a 70.7 km half-width, and the edge the user is
-/// watching would lag their finger by 30%. Both axes are swept, and a diagonal,
-/// because a max() written as a min() passes any fixture that only pulls one way.
 #[test]
 fn the_squares_edge_follows_the_pointer_rather_than_its_corner() {
     for (east_km, north_km, want) in [
@@ -1398,13 +951,6 @@ fn the_squares_edge_follows_the_pointer_rather_than_its_corner() {
 }
 
 /// A drag below the resampler's own minimum **commits nothing**.
-///
-/// The bar is [`rustdar_radar::voxel::MIN_HALF_WIDTH_KM`] rather than a pixel
-/// count because `build_voxels` *clamps* rather than refuses: a 4 km box would
-/// be resampled as a 10 km one, so committing it would put the pane over ground
-/// the user did not draw and make its own resolution readout a description of
-/// the wrong picture. Refusing means every region that commits is honoured
-/// exactly.
 #[test]
 fn a_drag_under_the_resamplers_minimum_commits_nothing() {
     let min = rustdar_radar::voxel::MIN_HALF_WIDTH_KM;
@@ -1433,11 +979,6 @@ fn a_drag_under_the_resamplers_minimum_commits_nothing() {
 }
 
 /// The preview **stops** at the widest box the resampler will build.
-///
-/// `VolumeRegion::new` clamps on commit, so an uncapped drag would paint an
-/// ever-bigger square past the stop and release the same box every time — what
-/// is drawn has to be what is resampled. Asserted as the pair: the drag's own
-/// half-width stops, and the region it commits agrees with it.
 #[test]
 fn a_long_drag_stops_at_the_widest_box_the_resampler_will_build() {
     let max = rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
@@ -1461,13 +1002,6 @@ fn a_long_drag_stops_at_the_widest_box_the_resampler_will_build() {
 
 /// **Every committed region is square**, and that is a decision rather than an
 /// accident of the fixture.
-///
-/// `VolumeRegion` carries an axis each and says at length why. The *drag*
-/// produces equal axes because the alternative — keying the box on the pane's
-/// aspect — puts the divider back on the list of things that change the region,
-/// which is the whole defect the stored region exists to remove. A pull that is
-/// long on one axis and short on the other is the case that would expose a
-/// per-axis measurement, so that is what is pulled.
 #[test]
 fn a_committed_region_is_square_whatever_shape_the_pull_was() {
     for (east_km, north_km) in [(120.0, 20.0), (20.0, 120.0), (200.0, 199.0), (60.0, 60.0)] {
@@ -1484,11 +1018,6 @@ fn a_committed_region_is_square_whatever_shape_the_pull_was() {
 }
 
 /// A corner the projector could not place leaves the drag **exactly** as it was.
-///
-/// This runs every frame of a drag, so a single laundered NaN would stick for
-/// the rest of it — the box would freeze, or worse commit somewhere nobody
-/// pointed. Refused rather than clamped, because `f64::clamp` propagates NaN
-/// and there is no nearest sensible patch of ground.
 #[test]
 fn a_corner_off_earth_leaves_the_drag_where_it_was() {
     let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
@@ -1518,10 +1047,6 @@ fn a_corner_off_earth_leaves_the_drag_where_it_was() {
 }
 
 /// A press the projector could not place starts **no drag at all**.
-///
-/// Reachable for a pane a divider has collapsed to nothing. `None` leaves the
-/// mode armed and costs the user nothing, where a laundered centre would commit
-/// a box somewhere they never pointed.
 #[test]
 fn a_press_off_earth_starts_no_drag() {
     for bad in [
@@ -1547,11 +1072,6 @@ fn a_press_off_earth_starts_no_drag() {
 }
 
 /// The drawn box is square **in kilometres**, not in degrees.
-///
-/// A degree-square box at 35°N is 22% wider than it is tall, and it would not be
-/// the box that gets resampled — the outline would promise ground the grid never
-/// covers. Swept over latitude because the error is `1/cos(lat)` and vanishes at
-/// the equator, where a degree-square fixture would pass.
 #[test]
 fn the_drawn_box_is_square_in_kilometres_rather_than_degrees() {
     for lat in [0.0, 25.0, 35.33, 49.0, 64.8] {
@@ -1574,10 +1094,6 @@ fn the_drawn_box_is_square_in_kilometres_rather_than_degrees() {
 }
 
 /// A polar centre draws nothing rather than an infinity.
-///
-/// `cos(lat)` is zero at the pole and every longitude is the same place, so the
-/// east half-width has no degree measure. No NEXRAD site is within 20° of one;
-/// the refusal is here because the alternative reaches a painter.
 #[test]
 fn a_polar_box_has_no_corners() {
     for lat in [90.0, -90.0] {

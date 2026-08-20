@@ -1,15 +1,9 @@
 //! The crate's charter, held as tests: an empty dependency ceiling and the
 //! three-method fence on the trait itself.
 //!
-//! The ceiling test reads `cargo metadata --no-deps --format-version 1` from
-//! the workspace root. `packages[].dependencies` there are *declared*
-//! dependencies — feature-independent and resolution-independent — so no
-//! feature selection (default, `--all-features`, CI's llvm-cov arm) can mask
-//! or fake what it asserts. Dep-name mechanics, recorded at M0 and relied on
-//! here: a workspace-internal dep appears with `"req": "*"` and a `path`;
-//! `kind` is `null` for normal deps (normalised to "normal" below); one name
-//! may legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`.
+//! The ceiling test reads `cargo metadata --no-deps --format-version 1`, whose
+//! `packages[].dependencies` are *declared* dependencies, so no feature
+//! selection can mask it. Entries are judged per `(kind, name)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -39,8 +33,7 @@ fn metadata() -> serde_json::Value {
 }
 
 /// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency.
+/// normal dependency; target-gated entries are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -65,12 +58,8 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 }
 
 /// The floor stays a floor: the *only* dependency this crate may declare, of
-/// any kind, is the dev-only serde_json that this file itself needs to parse
-/// `cargo metadata`. The ceiling is empty on purpose — a three-method blob
-/// contract over `std` is the crate's whole identity.
-///
-/// The floor assertion at the bottom is what keeps this test falsifiable — a
-/// broken parse or a renamed package cannot pass as an empty set.
+/// any kind, is the dev-only serde_json this file needs. The floor assertion
+/// at the bottom keeps the test falsifiable.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata();
@@ -93,8 +82,7 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares its one dev dependency,
-    // so a broken parse or a renamed package cannot pass as an empty set.
+    // Falsifiability floor: the crate really declares its one dev dependency.
     assert!(
         deps.iter().any(|(k, n)| k == "dev" && n == "serde_json"),
         "rustdar-kv no longer declares serde_json (dev) — either the crate \
@@ -103,13 +91,9 @@ fn the_dependency_ceiling_holds() {
 }
 
 /// The fence on the trait itself: `KvStore` declares exactly `load`, `store`
-/// and `store_now`, and nothing more.
-///
-/// A textual scrape rather than a trait-object probe, because the failure this
-/// exists to catch is a *new* method — which no compiled assertion against the
-/// current three could see. The scanner walks `src/lib.rs` from the trait's
-/// opening line to its column-zero closing brace and collects every `fn`
-/// declared inside.
+/// and `store_now`. A textual scrape rather than a trait-object probe, because
+/// the failure it catches is a *new* method, invisible to a compiled
+/// assertion about the current three.
 #[test]
 fn the_contract_is_three_methods_and_nothing_more() {
     let src = include_str!("../src/lib.rs");
@@ -132,9 +116,7 @@ fn the_contract_is_three_methods_and_nothing_more() {
         })
         .collect();
 
-    // Pin the scanner before trusting it: each of the three literal spellings
-    // must have been found, or the scrape is reading the wrong text and every
-    // later assertion is vacuous.
+    // Pin the scanner before trusting it, or every later assertion is vacuous.
     for expected in ["load", "store", "store_now"] {
         assert!(
             methods.contains(&expected),

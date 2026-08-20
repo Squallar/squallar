@@ -4,14 +4,9 @@ use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock
 use rustdar_radar::level3::{Level3Product, ProductStamp};
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 
-/// A radar whose Level III objects the pane below is showing.
 pub(super) const SITE: &str = "KMPX";
-/// The product carried through — any Level III product will do, and
-/// storm-relative velocity no longer is one.
 const PRODUCT: RadarProduct = RadarProduct::EchoTops;
 
-/// The smallest Level III object `nearest_tilt` will consider: it reads
-/// the elevation off the PDB and nothing else.
 pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
     Level3Product {
         message: Level3Message {
@@ -53,15 +48,10 @@ pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
             symbology: None,
         },
         stamp: ProductStamp::from_key(key),
-        // No render in these tests, so nothing decodes them.
         bytes: std::sync::Arc::new(Vec::new()),
     }
 }
 
-/// A finished render, as `poll_render_results` builds one. The pixels are
-/// blank but full size, and already converted: the premultiply moved into the
-/// job and the `ColorImage` is built in `deliver`, so what reaches a pane is a
-/// `ColorImage`.
 fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     let side = rustdar_radar::types::IMAGE_SIZE;
     CachedPaneRender {
@@ -79,9 +69,6 @@ fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     }
 }
 
-/// The volume the fixture pane has loaded, deliberately **not** the time in
-/// the Level III key below: a pane stamped with the wrong one of the two is
-/// then a wrong value rather than a coincidence.
 fn volume_time() -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
         .unwrap()
@@ -89,8 +76,6 @@ fn volume_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// The time `MPX_EET_2026_07_26_01_55_52` carries — seven minutes after the
-/// volume, which is what a bucket object that lagged a volume looks like.
 fn object_time() -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
         .unwrap()
@@ -98,9 +83,6 @@ fn object_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// An `App` with one pane on [`SITE`], far enough along that
-/// `apply_render_to_pane` will not bail out of it: the pane needs scan info
-/// for the site coordinates and the dispatcher needs a slot for the pane.
 pub(super) fn app_showing_site() -> crate::app::App {
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)
@@ -125,14 +107,6 @@ pub(super) fn app_showing_site() -> crate::app::App {
     app
 }
 
-/// Placing an image also dates it, with the time of the data *behind that
-/// image*.
-///
-/// `latest_key` falls back to the previous UTC day, so a site that went down
-/// yesterday serves an object most of a day old while the Level II scan line
-/// beside it looks current. The data line is the only thing that says so, and
-/// nothing between the render arriving and the pane being drawn would notice
-/// this call going missing — the pane would simply keep the time it last had.
 #[test]
 fn a_placed_render_dates_the_pane_it_lands_on() {
     let ctx = egui::Context::default();
@@ -156,8 +130,6 @@ fn a_placed_render_dates_the_pane_it_lands_on() {
         "a Level III pane must report its own object's time, not the volume's",
     );
 
-    // …and the image really did land, so the assertion above is about a
-    // frame the user would be looking at rather than an early return.
     let pane = app.gui.pane_mut(0).unwrap();
     assert!(
         pane.overlay_cache_mut(&rustdar_source::id::known::RADAR)
@@ -167,14 +139,6 @@ fn a_placed_render_dates_the_pane_it_lands_on() {
     );
 }
 
-/// Switching datasource replaces the time rather than leaving the old one.
-///
-/// The assignment is unconditional for this reason: leaving the Level III
-/// object's time in place would caption a field derived from the volume with
-/// the age of one it has nothing to do with. And the replacement is the
-/// volume's own time, not nothing — a product whose age line disappears is a
-/// product the user can identify as coming from somewhere else, which is the
-/// asymmetry this line no longer has.
 #[test]
 fn switching_datasource_redates_the_pane_rather_than_undating_it() {
     let ctx = egui::Context::default();
@@ -204,9 +168,6 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
         &finished(RadarProduct::Reflectivity, 0.5),
         &mut PlanViewUploads::default(),
     );
-    // The date travels with the pixels. Until they land the pane is still
-    // showing the bucket object, and saying otherwise would caption a Level III
-    // field with the volume's age.
     assert_eq!(
         app.gui.pane(0).unwrap().data_time,
         Some(object_time()),
@@ -222,20 +183,6 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
     );
 }
 
-/// Placing an image also records **what it depicts**, so a pane can tell when
-/// its pixels are not the selection its labels describe.
-///
-/// Written into the texture's own `RadarTextureMeta`, which is what makes
-/// `PaneState::stale_image_on_screen` impossible to leave behind: the pair is
-/// placed together and dropped together. Nothing between the render arriving
-/// and the pane being drawn would notice this assignment going missing — the
-/// pane would simply never report a mismatch, and would go on captioning one
-/// product's image with another's name, which is the defect.
-///
-/// Both datasources, in both directions, from the one call: the product on the
-/// render is the only thing that differs, so a Level II and a Level III image
-/// cannot be described differently. This is also the contract
-/// `InputHarness::place_radar_image` imitates.
 #[test]
 fn a_placed_render_describes_what_it_depicts() {
     let ctx = egui::Context::default();
@@ -245,7 +192,6 @@ fn a_placed_render_describes_what_it_depicts() {
         "one product from each datasource",
     );
 
-    // A Level III image under a Level II selection.
     app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
     app.apply_render_to_pane(
         &ctx,
@@ -260,7 +206,6 @@ fn a_placed_render_describes_what_it_depicts() {
              say the label is ahead of the pixels",
     );
 
-    // The matching render lands: nothing to report.
     app.gui.pane_mut(0).unwrap().selected_product = PRODUCT;
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
@@ -268,10 +213,6 @@ fn a_placed_render_describes_what_it_depicts() {
         "the image is the selection now",
     );
 
-    // And the other way round — a Level II image under a Level III selection,
-    // through the same call. This one has a predecessor, so it is held: the
-    // description on screen goes on describing the picture on screen, which is
-    // still the Level III one and still matches the selection.
     app.apply_render_to_pane(
         &ctx,
         0,
@@ -292,26 +233,9 @@ fn a_placed_render_describes_what_it_depicts() {
     );
 }
 
-/// A long-range render lands on a pane at its own size, and the overlay entry
-/// says so.
-///
-/// `apply_render_to_pane` used to name `IMAGE_SIZE` three times: once to
-/// convert the buffer and twice to describe the texture. The conversion has
-/// moved to the render thread, and the two descriptions now come off the
-/// picture itself — which is the property worth pinning, because a texture
-/// uploaded at 4096 and described as 2048 would be placed on a quarter of the
-/// ground its gates were painted onto, with the hover reading the wrong pixel
-/// and nothing anywhere to notice.
 #[test]
 fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
     let side = rustdar_device_profile::constants::LONG_RANGE_IMAGE_SIZE;
-    // The same limit the device gate is read from, told to egui the way
-    // `egui_winit::State::new` tells it: `Context::load_texture` asserts the
-    // image against `max_texture_side`, and a bare `Context` defaults it to
-    // the 2048 WebGL2 floor. The two are one number in the shipped app —
-    // `AppState::raster_side_ceiling_px` and this both come off
-    // `device.limits().max_texture_dimension_2d` — so a fixture that let them
-    // disagree would be modelling a state the host cannot reach.
     let ctx = egui::Context::default();
     ctx.begin_pass(egui::RawInput {
         max_texture_side: Some(side),
@@ -324,17 +248,10 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
             [side, side],
             &vec![0u8; side * side * 4],
         )),
-        // The extent that put it there: a 417 km TDWR long-range cut.
         max_range_km: 417.0,
         hover: std::sync::Arc::new(rustdar_radar::hover::HoverSource::empty()),
         product: PRODUCT,
         elevation: 0.5,
-        // KTLX's 0.5° Doppler cut's own declaration, so the assertion below
-        // reads a number the fixture states rather than a default that would
-        // pass against a placement that dropped it. A WSR-88D's and not the
-        // TDWR's whose range the extent above came from: a TDWR declares
-        // `nyquist_velocity = 0` on every cut, which `DeclaredNyquist::declare`
-        // refuses, so it arrives here with nothing to stamp.
         nyquist_ms: Some(23.84),
         melting_layer_source: None,
         storm_motion: None,
@@ -364,8 +281,6 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
          without it a velocity pane can say nothing about where its own \
          picture wraps",
     );
-    // And the pane kept a copy at the same size, so a resume re-uploads the
-    // picture rather than a differently shaped one.
     assert_eq!(
         app.render.pane_render[0]
             .cached_render
@@ -375,15 +290,6 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
     );
 }
 
-/// A suspend and resume puts the picture back exactly as it was, fold limit
-/// included.
-///
-/// The restore path rebuilds the overlay entry from the pane's kept copy and
-/// from nothing else — the volume behind the pixels may have been evicted by
-/// then, and on a device that was backgrounded for an hour it certainly has
-/// been. A field that reached the texture on the render path but not on this
-/// one gives a pane that answers a question before suspend and stops answering
-/// it after, with the same picture on the glass either way.
 #[test]
 fn a_resume_puts_back_the_fold_limit_it_took_down() {
     let ctx = egui::Context::default();
@@ -396,8 +302,6 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
     };
     app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
-    // What a surface loss does: the overlay entry goes, the pane's kept copy
-    // stays. `restore_cached_render` is what runs on the way back.
     {
         let pane = app.gui.pane_mut(0).unwrap();
         let cache = pane.overlay_cache_mut(&rustdar_source::id::known::RADAR);
@@ -417,16 +321,6 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
     );
 }
 
-/// …and the legend at the far end of that wire says so again.
-///
-/// The other half of the resume claim, asserted where the user would read it:
-/// `PaneState::displayed_nyquist_ms` is what the velocity bar's `folds ±N` line
-/// and its ±Vny markers are drawn from, so a restore that put the metadata back
-/// without the pane answering would give a picture that came back identical
-/// with an annotation that did not. Reopening is 1:1 or it is not a reopen.
-///
-/// Velocity rather than this module's usual product, because it is the only one
-/// that folds — the annotation is deliberately silent on every other bar.
 #[test]
 fn a_resumed_velocity_pane_annotates_the_fold_again() {
     let ctx = egui::Context::default();

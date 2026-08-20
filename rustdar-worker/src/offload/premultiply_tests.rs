@@ -1,36 +1,15 @@
-//! The premultiply moved to the producer, and **no pixel moved with it**.
-//!
-//! `execute` now hands back rasters in egui's premultiplied convention, and
-//! every consumer reads them with `ColorImage::from_rgba_premultiplied` instead
-//! of `from_rgba_unmultiplied`. That is a change to *where* per-pixel arithmetic
-//! runs — off the browser's main thread, and off the frame thread entirely for
-//! the static cross-section — and it must be a change to nothing else.
-//!
-//! The claim is bit-identity, not a tolerance, and it rests on one structural
-//! fact: `Color32::from_rgba_premultiplied(r, g, b, a)` is `Self([r, g, b, a])`,
-//! a constructor that computes nothing. So a byte written by
-//! `Color32::from_rgba_unmultiplied` and read back through it is the same
-//! `Color32` the old consumer computed — not an approximation of it. The tests
-//! below stop that from being an argument: the first walks every
-//! (channel, alpha) pair that can exist, and the next two run a real
-//! rasterization through both paths and compare the finished `ColorImage`s.
+//! The premultiply moved to the producer, and **no pixel moved with it**. The
+//! claim is bit-identity, not a tolerance.
 
 use super::*;
 use egui::ColorImage;
 use rustdar_radar::jobs::{RadarPlanJob, SectionJob, VoxelJob};
 
-/// Every pixel that can exist reaches the same `Color32` by the new route as by
-/// the old one.
-///
-/// **Exhaustive, and in a sense worth stating precisely.**
-/// `Color32::from_rgba_unmultiplied` is a three-arm match on the alpha — a
-/// `TRANSPARENT` short-circuit at 0, an alpha-only `from_rgb` at 255, and in
-/// between a lookup of `(channel, alpha)` in a 64 KiB table `ecolor` builds
-/// once. All three arms treat the three colour channels independently given the
-/// alpha, so the 65,536 (channel, alpha) pairs this walks cover every one of the
-/// 2³² pixels that can be written — and the second family below, whose three
-/// channels hold three *different* values under the same alpha, is what stops
-/// that independence from being an assumption.
+/// Every pixel that can exist reaches the same `Color32` by the new route as
+/// by the old one. `Color32::from_rgba_unmultiplied` is a three-arm match on
+/// the alpha (a `TRANSPARENT` short-circuit at 0, an alpha-only `from_rgb` at
+/// 255, and a 64 KiB table between), and all three arms treat the colour
+/// channels independently given the alpha.
 #[test]
 fn every_pixel_that_can_exist_reaches_the_same_color32() {
     let mut straight: Vec<u8> = Vec::with_capacity(2 * 65_536 * 4);
@@ -44,8 +23,8 @@ fn every_pixel_that_can_exist_reaches_the_same_color32() {
     for alpha in 0..=u8::MAX {
         for value in 0..=u8::MAX {
             // Three different channels under one alpha: the case that fails if
-            // the conversion is not per-channel, or if a channel is dropped or
-            // transposed on the way back into the buffer.
+            // the conversion is not per-channel, or if a channel is
+            // transposed.
             straight.extend_from_slice(&[value, 255 - value, value.wrapping_mul(7), alpha]);
         }
     }
@@ -64,19 +43,14 @@ fn every_pixel_that_can_exist_reaches_the_same_color32() {
     );
 }
 
-/// The identity holds through a **real plan-view rasterization**, not only over
-/// a synthetic sweep of bytes.
-///
-/// The comparison is against the rasterizer's own output read the old way — the
-/// exact expression `plan_view_image` and `loop_frame_image` carried before this
-/// change — so what is pinned is the two paths, end to end, on pixels the
-/// palette actually produces. Those are alpha 0 and alpha 180 and nothing else
-/// (`palette.rs`'s `TRANSPARENCY`), which is one fast arm and one table arm.
+/// The identity holds through a **real plan-view rasterization**. The palette
+/// produces alpha 0 and alpha 180 and nothing else (`palette.rs`'s
+/// `TRANSPARENCY`), which is one fast arm and one table arm.
 #[test]
 fn a_real_plan_view_render_lands_on_the_same_picture() {
     let request = tests::a_job();
-    // The ceiling off the request's envelope, exactly as the row's `run`
-    // reads it, so the two rasterizations cannot come out at two sizes.
+    // The ceiling off the request's envelope, exactly as the row's `run` reads
+    // it, so the two rasterizations cannot come out at two sizes.
     let side_ceiling_px = request.geometry.side_ceiling_px as usize;
     let plan = request
         .job
@@ -102,9 +76,7 @@ fn a_real_plan_view_render_lands_on_the_same_picture() {
     );
 }
 
-/// The same claim for the **cross-section** raster, which is the one that also
-/// changed thread: `app_render::upload_section_raster` converted on the frame
-/// thread on both targets and now converts on neither.
+/// The same claim for the **cross-section** raster, which also changed thread.
 #[test]
 fn a_real_section_cut_lands_on_the_same_picture() {
     use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH};
@@ -142,12 +114,6 @@ fn a_real_section_cut_lands_on_the_same_picture() {
 
 /// A voxel grid carries no raster, and the output stage must leave it exactly
 /// as the builder answered.
-///
-/// Named rather than left to inference because the output stage runs on what
-/// each output type declares (`JobOut::straight_rasters_mut`), and the grid's
-/// empty answer is the declaration that has to *decline*. The method is
-/// required with no default, so the next output kind that carries pixels has
-/// to state its posture rather than inherit a silent decline.
 #[test]
 fn a_voxel_grid_passes_through_the_output_stage_untouched() {
     let voxel_job = tests::a_voxel_job();

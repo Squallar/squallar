@@ -26,9 +26,7 @@ fn preset() -> super::super::PresetConfig {
     }
 }
 
-/// A saved preset comes back whole, and a config from before the field has
-/// none — the built-ins are compiled in, not persisted, so "none" is still a
-/// populated catalog.
+/// A saved preset comes back whole; the built-ins are compiled in, not persisted.
 #[test]
 fn user_presets_round_trip_and_an_older_config_has_none() {
     let store = MemoryKvStore::default();
@@ -49,9 +47,8 @@ fn user_presets_round_trip_and_an_older_config_has_none() {
     assert!(parsed.presets.is_empty());
 }
 
-/// A preset naming a product this build does not know falls back to the
-/// default product rather than failing the whole file — the same forward
-/// tolerance the pane configs carry, through the same deserializer.
+/// A preset naming a product this build does not know falls back to the default
+/// product rather than failing the whole file.
 #[test]
 fn an_unknown_preset_product_costs_the_product_not_the_file() {
     let store = MemoryKvStore::default();

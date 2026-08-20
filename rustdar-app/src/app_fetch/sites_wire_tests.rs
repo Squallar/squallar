@@ -1,25 +1,12 @@
 //! The sites overlay dispatch is a **described job**, end to end.
-//!
-//! `spawn_overlay_render`'s `RadarSites` arm used to close over its inputs and
-//! hand the closure to `offload`, whose wasm arm runs it inline on the
-//! browser's one thread. These pin the replacement: the dispatch builds a
-//! `JobRequest::Overlay` and hands it to the funnel, so a browser with a
-//! worker attached posts it across the port instead of paying the raster on
-//! the frame — and a job that is never answered still un-wedges the pane.
-//!
-//! Reverting the dispatch to the closure fails the first test by shape (the
-//! port records nothing) and the second by silence (no failure response can
-//! exist for a job that was never described).
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_source::id::known;
 use std::sync::{Arc, Mutex};
 
-/// A sink that records what the funnel hands it and takes every job, standing
-/// where `rustdar-web`'s `Port` stands. It records the request itself — the
-/// funnel hands it over by value — and the wire round trip is asserted on the
-/// recording, so the codec is on this path exactly as it is on the browser's.
+/// A sink that records what the funnel hands it and takes every job, standing where
+/// `rustdar-web`'s `Port` stands.
 struct RecordingPort {
     taken: Arc<Mutex<Vec<(u64, rustdar_worker::offload::JobRequest)>>>,
 }
@@ -62,12 +49,9 @@ fn in_flight(app: &mut crate::app::App) -> bool {
         .render_in_flight
 }
 
-/// The dispatch posts a described overlay job to the installed sink — it does
-/// not run a closure around it — and what it posts survives its own wire
-/// round trip, names this pane's site as current, and marks the pane in
-/// flight. Then the failure path closes the loop: the worker dies, the funnel
-/// fails the job, and the empty response clears the mark, so the layer can be
-/// asked for again.
+/// The dispatch posts a described overlay job to the installed sink — it does not run a
+/// closure around it — and what it posts survives its own wire round trip, names this
+/// pane's site as current, and marks the pane in flight.
 #[test]
 fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
     let taken = Arc::new(Mutex::new(Vec::new()));
@@ -88,8 +72,8 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
              rasterization this slice removed",
         );
         let (_, request) = &posted[0];
-        // The envelope destructure is irrefutable since WO-M7.2; the typed
-        // downcast below is what proves the dispatch posted this kind.
+        // The envelope destructure is irrefutable since WO-M7.2; the typed downcast below
+        // is what proves the dispatch posted this kind.
         let rustdar_worker::offload::JobRequest { geometry, job } = request;
         assert_eq!(
             (geometry.width, geometry.height),
@@ -109,8 +93,8 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
             sites.sites.iter().any(|s| s.name == "KTLX" && s.is_current),
             "the pane's own site is not marked current in the described input",
         );
-        // The browser's sink serialises exactly this value on its way out; the
-        // round trip here keeps the codec on the recorded path.
+        // The browser's sink serialises exactly this value on its way out; the round trip
+        // here keeps the codec on the recorded path.
         assert_eq!(
             rustdar_worker::offload::JobRequest::from_bytes(&request.to_bytes()).as_ref(),
             Some(request),
@@ -123,14 +107,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
          pane in flight",
     );
 
-    // The worker dies with the job outstanding. `abandon_worker` fails it,
-    // and the failure must reach the channel as a response with no image —
-    // the un-wedge message. What the poller does with exactly that shape
-    // (clear the mark, place nothing) is pinned by
-    // `overlay_disable_race_tests::a_failed_render_clears_the_in_flight_mark_and_touches_nothing`;
-    // this half pins that a dead worker *produces* it, because a `deliver`
-    // that returned early on `None` would leave this channel empty and that
-    // test's fixture unreachable from production.
+    // The worker dies with the job outstanding.
     rustdar_worker::offload::abandon_worker("test: the worker died");
     let resp = app.channels.overlay_render_receiver.try_recv().expect(
         "a job the worker never answered sent nothing on the overlay channel: \

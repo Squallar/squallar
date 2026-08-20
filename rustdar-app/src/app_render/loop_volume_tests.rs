@@ -1,25 +1,5 @@
-//! The 3D loop's host half: what becomes resident, what bounds it, and what a
-//! region change lets go of before it rebuilds.
-//!
-//! # What these are written against
-//!
-//! A 3D loop frame is not a picture. The other two loop kinds cache a raster
-//! per frame and can drop and re-render one at will; a raymarch is a function
-//! of the camera, so what this loop caches is the **input** — one live
-//! `Rg16Float` 3D texture per frame, and the march swaps which one it samples.
-//! That makes three things true at once that are not true of the other kinds,
-//! and each of the tests below is one of them:
-//!
-//!  * the frame list **is** the resident set, because re-entering a window
-//!    costs ~140 ms against a 200 ms playback interval;
-//!  * the store is bounded by **bytes** rather than by a shed, because a set
-//!    holder is exempt from every shed there is;
-//!  * a change of key **releases before it builds**, because the seamless-swap
-//!    rule that keeps the old grid through a rebuild is a peak of two full sets
-//!    — 1025 MiB against a 576 MiB budget on desktop.
-//!
-//! The pane-level identity rules live in `rustdar_egui::pane`; the store's own
-//! rules live in `volume::bridge::tests`. These are the dispatcher's.
+//! The 3D loop's host half: what becomes resident, what bounds it, and what a region change
+//! lets go of before it rebuilds.
 
 use super::*;
 use crate::app::tests::{empty_scan, headless};
@@ -52,15 +32,8 @@ fn site() -> RadarSite {
         .clone()
 }
 
-/// An app with one 3D pane running a volume loop over `minutes`, every one of
-/// whose scans is already downloaded.
-///
-/// The scans are `empty_scan`s, which carry no moment — so every build is
-/// *refused*, and a refusal is an entry in the store exactly as a grid is. That
-/// is deliberate and is what keeps these tests about the dispatcher: a real
-/// resample is 89 ms apiece and `build_voxels` is `rustdar_radar`'s to test.
-/// Everything below asserts about which targets the store is holding for this
-/// pane, which a refusal answers as well as a grid does.
+/// An app with one 3D pane running a volume loop over `minutes`, every one of whose scans
+/// is already downloaded.
 fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
     let mut app = headless(TestBridge::desktop());
     app.render.ensure_pane_count(1);
@@ -106,9 +79,8 @@ fn frame_target(minute: u32, region: Option<VolumeRegion>) -> VolumeTarget {
     }
 }
 
-/// A picked box, distinct from the default one about the site — 20 km rather
-/// than the full surveillance range, which is the resolution trade the region
-/// picker exists to make.
+/// A picked box, distinct from the default one about the site — 20 km rather than the full
+/// surveillance range, which is the resolution trade the region picker exists to make.
 fn region() -> VolumeRegion {
     VolumeRegion::new(
         GeoPoint {
@@ -122,10 +94,6 @@ fn region() -> VolumeRegion {
 
 /// Run dispatch until every frame has been offered a build, which at
 /// `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` per pass takes one pass per frame.
-///
-/// The `+ 2` is slack for the pass that finds everything already resident; a
-/// loop that needed more than that would be one whose pacing does not converge,
-/// and the assertions at the call sites would catch it as a short set.
 fn dispatch_until_settled(app: &mut crate::app::App, frames: usize) {
     for _ in 0..frames + 2 {
         app.dispatch_loop_renders();
@@ -148,24 +116,10 @@ fn resident_times(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
     times
 }
 
-/// The volume times every test here loops over. Named so `resident_times` can
-/// enumerate the same set the loop was built from rather than guessing.
+/// The volume times every test here loops over.
 const MINUTES: [u32; 4] = [0, 5, 10, 15];
 
-/// **The resident set equals the frame list.** For this loop kind they are one
 /// thing, and nothing else in the codebase makes them so.
-///
-/// A plan-view loop holds `MAX_LOOP_FRAMES` and textures
-/// `test_loop_allocation().plan_view_frames` of them, dropping and re-rendering as the playhead
-/// walks. Re-entering a resident 3D window costs ~140 ms (89 ms resample +
-/// 51 ms upload) against the 200 ms interval at `DEFAULT_LOOP_SPEED_FPS`, so
-/// that treadmill does not close here — which is why `loop_frame_budget` and
-/// `loop_frames_held` both answer `LoopAllocation::volume_frames` for a volume
-/// loop.
-///
-/// Reverting any of that shows up here: a render set smaller than the frame
-/// list leaves the far frames unbuilt, and a `retain_set` that did not state
-/// the whole list would let the store shed them as the later ones landed.
 #[test]
 fn the_resident_set_is_the_whole_frame_list() {
     let mut app = app_with_volume_loop(&MINUTES);
@@ -179,8 +133,8 @@ fn the_resident_set_is_the_whole_frame_list() {
          nothing to sample",
     );
 
-    // And the frames name them, which is what makes the playhead able to march
-    // one: a store entry nothing points at is memory, not a loop.
+    // And the frames name them, which is what makes the playhead able to march one: a store
+    // entry nothing points at is memory, not a loop.
     let frames = &app.gui.pane(0).expect("pane 0").loop_state.frames;
     for (idx, frame) in frames.iter().enumerate() {
         assert!(
@@ -191,20 +145,8 @@ fn the_resident_set_is_the_whole_frame_list() {
     }
 }
 
-/// **Release before build.** A region change invalidates the whole set, and the
-/// store's seamless-swap rule would otherwise keep every old grid while the new
-/// ones were built.
-///
-/// That rule is right for one grid — it is what stops a live 3D pane flashing
-/// "Building…" every sealed sweep — and wrong for fourteen: 14 × 36.598 MiB
-/// twice over is 1025 MiB against a 576 MiB budget. So a set holder releases
-/// first and accepts the first-build message for the fraction of a second that
-/// costs.
-///
-/// The observable is the store's contents *at the moment the new key's first
-/// build is dispatched*: no target keyed to the old region may still be there.
-/// Dispatch is run one pass at a time so the assertion lands inside the
-/// transition rather than after it has resolved itself.
+/// store's seamless-swap rule would otherwise keep every old grid while the new ones were
+/// built.
 #[test]
 fn a_region_change_releases_the_old_set_before_building_the_new_one() {
     let mut app = app_with_volume_loop(&MINUTES);
@@ -222,10 +164,7 @@ fn a_region_change_releases_the_old_set_before_building_the_new_one() {
         );
     }
 
-    // The pane's box changes. In production that is the user zooming the pane:
-    // the render arm re-measures the viewport and publishes what it measured on
-    // `VolumePane::region`, which is what the loop planner reads. Written
-    // directly here because this test has no egui pass to measure one in.
+    // The pane's box changes.
     app.gui
         .pane_mut(0)
         .expect("pane 0")
@@ -271,16 +210,6 @@ fn a_region_change_releases_the_old_set_before_building_the_new_one() {
 }
 
 /// The pacing is a cap on the *extraction*, not on the naming.
-///
-/// `extract_volume_parts` runs on the frame thread — the job wire carries a
-/// `RenderInput`, not a `Scan` — so at most `MAX_LOOP_VOLUME_BUILDS_PER_FRAME`
-/// of them may be paid per pass. But a pass over a settled loop must be free to
-/// name every frame it finds already resident, or a fourteen-frame loop would
-/// take fourteen frames to notice grids it already had, every time the playhead
-/// moved.
-///
-/// `App::volume_extractions` counts the walks, and it is a `#[cfg(test)]`
-/// counter on the App rather than a timing measurement, so this cannot be flaky.
 #[test]
 fn the_pacing_caps_the_extraction_and_not_the_naming() {
     let mut app = app_with_volume_loop(&MINUTES);
@@ -311,11 +240,6 @@ fn the_pacing_caps_the_extraction_and_not_the_naming() {
 }
 
 /// A 3D loop's grids do not outlive the loop.
-///
-/// The teardown `PaneState::set_kind` starts is pane-local; the store is keyed
-/// by pane index and a `PaneState` cannot reach it. Without the host-side half,
-/// 512 MiB stays allocated for a pane that has gone back to showing one live
-/// volume — the 3D counterpart of the download queue that outlived its loop.
 #[test]
 fn switching_the_loop_off_gives_the_resident_set_back() {
     let mut app = app_with_volume_loop(&MINUTES);
@@ -341,21 +265,11 @@ fn switching_the_loop_off_gives_the_resident_set_back() {
 }
 
 /// Switching the loop off leaves the pane able to ask for a live volume again.
-///
-/// The quiet half of the teardown above, and the one with no visible symptom
-/// until a user tries it: while a 3D loop runs the pane paints the playhead's
-/// frame and stops emitting `PrepareVolume`, so `VolumePane::rendered_for`
-/// freezes at whatever it named when the loop started. Release the set without
-/// clearing it and that key names a grid the store no longer holds — the
-/// level-triggered ask never fires again, and the pane reads "Building the REF
-/// volume…" for the rest of the session.
 #[test]
 fn switching_the_loop_off_lets_the_pane_ask_for_a_live_volume_again() {
     let mut app = app_with_volume_loop(&MINUTES);
     dispatch_until_settled(&mut app, MINUTES.len());
-    // The key the live pane was left holding when the loop took over. Planted
-    // rather than driven through a GUI pass, because what is under test is the
-    // teardown's obligation to clear it, not how it came to be set.
+    // The key the live pane was left holding when the loop took over.
     app.gui
         .pane_mut(0)
         .expect("pane 0")
@@ -379,8 +293,8 @@ fn switching_the_loop_off_lets_the_pane_ask_for_a_live_volume_again() {
          for the rest of the session",
     );
 
-    // And a live 3D pane — one that never held a set — keeps its key, which is
-    // what stops this clearing becoming a rebuild every frame.
+    // And a live 3D pane — one that never held a set — keeps its key, which is what stops
+    // this clearing becoming a rebuild every frame.
     let mut live = headless(TestBridge::desktop());
     live.render.ensure_pane_count(1);
     let pane = live.gui.pane_mut(0).expect("pane 0");
@@ -400,14 +314,8 @@ fn switching_the_loop_off_lets_the_pane_ask_for_a_live_volume_again() {
     );
 }
 
-/// The refusal path is terminal, and it is what stops a loop over volumes with
-/// nothing to resample sitting in `Rendering` for the session.
-///
-/// Every scan in these fixtures is empty, so every build is refused — which is
-/// why the tests above can assert about store contents without a real resample.
-/// This is the assertion that makes that legitimate rather than accidental: a
-/// refusal must retire the frame, exactly as an unrenderable sweep does on the
-/// plan-view path.
+/// The refusal path is terminal, and it is what stops a loop over volumes with nothing to
+/// resample sitting in `Rendering` for the session.
 #[test]
 fn a_volume_with_nothing_to_resample_retires_its_frame() {
     let mut app = app_with_volume_loop(&MINUTES);
@@ -438,14 +346,8 @@ fn a_volume_with_nothing_to_resample_retires_its_frame() {
     }
 }
 
-/// A 3D loop is capped at its **resident** frame count when the scan listing
-/// lands, not at `MAX_LOOP_FRAMES`.
-///
-/// Sixty frames sampled down to fourteen is what makes the frame list and the
-/// resident set the same thing on desktop. Without this the list would be sixty
-/// long, the render set a fourteen-wide window inside it, and the loop would be
-/// back on the treadmill it cannot afford — 89 ms of resample per playback
-/// step, at a 200 ms interval.
+/// A 3D loop is capped at its **resident** frame count when the scan listing lands, not at
+/// `MAX_LOOP_FRAMES`.
 #[test]
 fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::Volume);
@@ -453,9 +355,9 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     let listing: Vec<_> = (0..MAX_LOOP_FRAMES + 20)
         .map(|i| {
             (
-                // Minutes apart, which past an hour has to roll into the hour
-                // rather than saturate — `ts` above takes a minute-of-hour and
-                // this listing is longer than one.
+                // Minutes apart, which past an hour has to roll into the hour rather than
+                // saturate — `ts` above takes a minute-of-hour and this listing is longer
+                // than one.
                 ts(0) + chrono::Duration::minutes(i64::try_from(i).expect("a small index")),
                 rustdar_radar::archive::Identifier::new(format!("v{i}")),
             )
@@ -481,8 +383,8 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
          than its resident set can be",
     );
 
-    // The plan-view loop is unchanged, which is what makes the assertion above
-    // about the view rather than about the cap having moved for everyone.
+    // The plan-view loop is unchanged, which is what makes the assertion above about the
+    // view rather than about the cap having moved for everyone.
     let mut plan = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
     accept_scan_listing(
@@ -495,18 +397,13 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES);
 }
 
-/// The playing frame is what the pane paints, and it is a *grid* rather than a
-/// raster — so `active_image` and `active_section_image` must both refuse it.
-///
-/// The loop path's view axis, applied to the third kind: a consumer that asked
-/// for "the image" and was handed a volume frame would draw a plan view into a
-/// 3D pane's box, which is the collision `LoopPlaybackState::view` exists to
-/// stop.
+/// The playing frame is what the pane paints, and it is a *grid* rather than a raster — so
+/// `active_image` and `active_section_image` must both refuse it.
 #[test]
 fn the_playing_frame_is_a_grid_and_no_raster_consumer_takes_it() {
     let mut app = app_with_volume_loop(&MINUTES);
-    // A resident grid named on the playhead's frame, planted directly: what is
-    // under test is which accessor answers, not how the frame was filled.
+    // A resident grid named on the playhead's frame, planted directly: what is under test
+    // is which accessor answers, not how the frame was filled.
     let pane = app.gui.pane_mut(0).expect("pane 0");
     pane.loop_state.phase = LoopPhase::Playing;
     pane.loop_state.current_frame = 1;
@@ -543,17 +440,6 @@ fn the_playing_frame_is_a_grid_and_no_raster_consumer_takes_it() {
 }
 
 /// A volume that really resamples, dated at `minute`.
-///
-/// Every other fixture in this file is an `empty_scan`, so every build is
-/// *refused* — and a refused frame is never named: `LoopFrameImage` stays
-/// `None` and `render_failed` goes up instead. That is a state in which the
-/// resident-set statement cannot go wrong, and it is why the defect
-/// [`the_resident_set_survives_its_own_frames_landing`] pins survived a suite
-/// that already claimed to cover it. A grid is the other half, and only a scan
-/// carrying a moment over real elevation cuts produces one.
-///
-/// Two sweeps of eight radials, which is the smallest shape
-/// `rustdar_radar::voxel::build_voxels` returns a grid for.
 fn resamplable_scan(minute: u32) -> nexrad_model::data::Scan {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -638,8 +524,8 @@ fn resamplable_scan(minute: u32) -> nexrad_model::data::Scan {
     )
 }
 
-/// [`app_with_volume_loop`], over volumes that resample into real grids rather
-/// than into refusals.
+/// [`app_with_volume_loop`], over volumes that resample into real grids rather than into
+/// refusals.
 fn app_with_built_volume_loop(minutes: &[u32]) -> crate::app::App {
     let mut app = app_with_volume_loop(minutes);
     app.loop_mgr = LoopDownloadManager::new();
@@ -655,11 +541,6 @@ fn app_with_built_volume_loop(minutes: &[u32]) -> crate::app::App {
 
 /// One dispatch pass, with the worker's replies taken delivery of exactly as
 /// `App::poll_voxel_results` does.
-///
-/// The builds are real and run on the real job wire — `offload` spawns a thread
-/// natively — so the pass waits for precisely the replies it dispatched and no
-/// more. How many that is, is read off the store rather than guessed: a
-/// `Building` entry is opened at dispatch and by nothing else.
 fn pass(app: &mut crate::app::App) {
     app.dispatch_loop_renders();
     let in_flight = MINUTES
@@ -692,25 +573,9 @@ fn pass(app: &mut crate::app::App) {
     }
 }
 
-/// **A frame landing must not take it out of its own loop's resident set.**
-///
-/// The dispatcher plans the set, hands it to `make_volume_frames_resident`, and
-/// that pass states the whole thing through `VolumeStore::retain_set` — which
-/// detaches the holder from *everything it did not name*. So the planned list
-/// has to be the whole frame list, every pass, whatever state the frames are
-/// in. Skipping a frame because it is already resident and already named drops
-/// it out of the statement, and the next pass hands its grid back: the set is
-/// eaten one frame at a time, from the front, as it is built.
-///
-/// What the user sees is the report this test was written from — a loop that
-/// "sort of" plays and then shows the newest volume for every frame. The last
-/// grid built is the only survivor (nothing is stated once every frame is
-/// named, so the last statement stands), and `lookup_for_pane`'s same-scope
-/// fallback quietly paints it under every other frame's caption.
-///
-/// This cannot be written against the refusal fixtures the rest of this file
-/// uses: a refusal never names a frame, so the skip is never taken and the set
-/// is always stated whole.
+/// The dispatcher plans the set, hands it to `make_volume_frames_resident`, and that pass
+/// states the whole thing through `VolumeStore::retain_set` — which detaches the holder
+/// from *everything it did not name*.
 #[test]
 fn the_resident_set_survives_its_own_frames_landing() {
     let mut app = app_with_built_volume_loop(&MINUTES);
@@ -756,21 +621,8 @@ fn the_resident_set_survives_its_own_frames_landing() {
     );
 }
 
-/// **A slow radar shortens a 3D loop's frame list and leaves its span alone.**
-///
-/// The 3D loop is the one kind whose frame list *is* its resident set, so the
-/// span budget reaches its list rather than only its render set. What it must
-/// not reach is the *span*: `accept_scan_listing` samples a listing that
-/// overruns the cap instead of truncating it, so the loop still covers the
-/// whole lookback the user asked for and what a lower count costs is temporal
-/// resolution. That is exactly what the timeline caption reports — "spans 9h
-/// 45m over 9 frames, sampled from ~15 min scans" — so the oldest and the
-/// newest scan surviving is what keeps that sentence true.
-///
-/// A fifteen-minute cadence rather than a real one: the measured radars are
-/// 259 s, 360 s and 517 s, and on this build's arm none of them is slow enough
-/// to bind before the pool's own share of grids does. The property is about the
-/// ordering of the two bounds, not about any one site.
+/// The 3D loop is the one kind whose frame list *is* its resident set, so the span budget
+/// reaches its list rather than only its render set.
 #[test]
 fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     let budgets = test_budgets();
@@ -827,9 +679,9 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
          caption would claim every scan over a list that dropped 31 of them",
     );
 
-    // And the plan-view loop beside it is untouched: a raster frame's history
-    // costs no texture until it is in the render set, so holding fewer would
-    // throw away resolution the span budget never paid for.
+    // And the plan-view loop beside it is untouched: a raster frame's history costs no
+    // texture until it is in the render set, so holding fewer would throw away resolution
+    // the span budget never paid for.
     let mut plan = LoopPlaybackState::new_for_loop(10 * 3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
     accept_scan_listing(test_loop_allocation(), &budgets, &mut plan, SITE, listing);

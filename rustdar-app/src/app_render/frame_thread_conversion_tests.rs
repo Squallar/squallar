@@ -1,20 +1,5 @@
 //! The unmultiply stays off the frame thread — and the opaque overlay path
 //! stays deleted.
-//!
-//! Read off the source, for the reason `frame_build_order_tests` gives: what is
-//! being asserted is *where a statement is written*, and no runtime observation
-//! distinguishes a conversion that ran on the frame thread from one that ran on
-//! the rasterizer's — both produce the same pixels, which is the whole point.
-//!
-//! Every overlay raster is a **described job** now. Nothing converts on
-//! arrival: `offload::execute` premultiplies inside the job (the model grid's
-//! straight-alpha palette included), so what every consumer holds is already
-//! egui's own bytes and reading them through `from_rgba_premultiplied`
-//! computes nothing. The assertions below look for a *missing* unmultiply in
-//! `app_render`, exactly one compute-nothing read in the one shared overlay
-//! deliver — and, since S5d, for the **absence of the opaque path itself**:
-//! no `offload(name, closure)` funnel, no closure arm in the overlay
-//! dispatch, and an `Opaque` job variant that does not exist on wasm at all.
 
 const APP_RENDER: &str = include_str!("../app_render.rs");
 const APP_FETCH: &str = include_str!("../app_fetch.rs");
@@ -32,11 +17,6 @@ fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 }
 
 /// [`body_of`] for a **free** function, whose closing brace is at column 0.
-///
-/// A separate helper and not a parameter, because the two terminators are not
-/// interchangeable: `"\n    }"` matches the first four-space brace inside a free
-/// function — `execute`'s `match` closes on one — and would cut the body off
-/// before the line this module reads.
 fn free_body_of<'a>(source: &'a str, signature: &str) -> &'a str {
     let (_, rest) = source
         .split_once(signature)
@@ -49,34 +29,11 @@ fn free_body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 /// The per-pixel unmultiply, by the only name it is ever called by.
 const UNMULTIPLY: &str = "from_rgba_unmultiplied";
 
-/// The deleted overlay converter, by the name it had: the function that read
-/// `RasterizeOutput::alpha` on the frame side and picked an egui constructor
-/// from it. It died with the opaque closure arm — the convention is resolved
-/// inside the job now — and its name coming back anywhere in `app_fetch` is
-/// the page-side conversion coming back with it.
+/// The deleted overlay converter, by the name it had.
 const OVERLAY_CONVERT: &str = "overlay_color_image";
 
 /// Every function `setup_egui_frame` reaches that used to walk a full-size
 /// buffer, and no longer may.
-///
-/// `apply_render_to_pane` is the radar half — 4.19 M pixels at 2048², 6.66 ms
-/// measured, paid once per pane on the same site rather than once per volume.
-/// `poll_overlay_render_results` is the overlay half and the larger one: an
-/// overlay texture is planned against the viewport, so on a desktop it is
-/// 18.7 M pixels and ~47 ms, drained unbounded over every enabled overlay kind.
-///
-/// `TRANSPARENCY = 180` in `palette.rs` is what makes the figure what it is:
-/// every data pixel takes the slow arm of `Color32::from_rgba_unmultiplied`,
-/// neither the `a == 0` nor the `a == 255` fast path, at 31.8× the instructions
-/// of the premultiplied constructor.
-///
-/// `upload_section_raster` joined the list when the premultiply moved into
-/// `offload::execute`. It was the known exception this module used to name: a
-/// section pane **retains** its `CrossSection`, so converting before the send
-/// once meant carrying a `ColorImage` beside the cut for the life of the
-/// session. Premultiplying the cut's own raster inside the job is what made the
-/// exception unnecessary rather than merely paid for — there is one buffer, in
-/// one convention, and the upload and the resume re-upload both read it.
 #[test]
 fn no_poller_unmultiplies_on_the_frame_thread() {
     for signature in [
@@ -108,20 +65,6 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
 
 /// The overlay dispatch converts nothing and closes over nothing: every arm
 /// is a described job handed to the one shared deliver.
-///
-/// * No arm may convert. `offload::execute` converts inside the job at the
-///   rasterizer's own declaration — the model grid's straight alpha included
-///   — the reply contract (`RasterizeOutput::straight_rasters_mut`) is
-///   premultiplied-always, and the per-kind
-///   `..._is_byte_identical_direct_and_via_the_wire` parity tests in
-///   `offload::tests` pin the bytes. The deliver therefore reads the buffer
-///   through `from_rgba_premultiplied`, which computes nothing — the same
-///   read-a-converted-raster shape `upload_section_raster` is *required* to
-///   have below — and exactly one such read may exist, in the one shared
-///   deliver rather than once per dispatch.
-/// * Both dispatch sites — the handler-kind arm (all six handler-backed
-///   kinds, the model grid among them) and the sites arm — must hand their
-///   reply to that one `overlay_job_deliver`, or a drifting copy grows.
 #[test]
 fn every_overlay_dispatch_is_described_and_converts_nothing() {
     let body = body_of(APP_FETCH, "pub(super) fn spawn_overlay_render(");
@@ -156,8 +99,6 @@ fn every_overlay_dispatch_is_described_and_converts_nothing() {
          is an arm that has stopped going through it.",
     );
 
-    // The shared deliver itself: exactly one compute-nothing read, and no
-    // conversion of any other shape.
     let deliver = body_of(APP_FETCH, "fn overlay_job_deliver(");
     assert_eq!(
         deliver.matches("from_rgba_premultiplied").count(),
@@ -177,29 +118,11 @@ fn every_overlay_dispatch_is_described_and_converts_nothing() {
     );
 }
 
-/// **The opaque overlay path stays deleted** — S5d's guard, stated as
-/// properties of the source so it cannot come back silently.
-///
-/// Three doors are pinned shut, each beside a presence control on the same
-/// haystack so an absence cannot pass vacuously on a moved or renamed file
-/// (a scrape that greps an empty string finds nothing and means nothing):
-///
-/// 1. The dispatch: `spawn_overlay_render` names no `Job::Opaque`, no bare
-///    `offload(` funnel and no `prepare_rasterize` — the trait method is
-///    deleted, so this is a tripwire for it being re-grown.
-/// 2. The funnel: `offload.rs` has no `pub fn offload(` — the function whose
-///    wasm arm ran any closure inline on the browser's one thread. The only
-///    inline execution left there is `run_here`, the lost-worker fallback
-///    every described job shares.
-/// 3. The type: `Job::Opaque` is declared under
-///    `#[cfg(not(target_arch = "wasm32"))]`, so on wasm the variant does not
-///    exist and a dispatch that routed an overlay through a closure would
-///    not compile — the compile-level half of the guarantee, witnessed here
-///    so the cfg cannot be quietly dropped.
+/// **The opaque overlay path stays deleted**, stated as properties of the
+/// source so it cannot come back silently.
 #[test]
 fn the_opaque_overlay_path_stays_deleted() {
     let body = body_of(APP_FETCH, "pub(super) fn spawn_overlay_render(");
-    // Presence control: the scrape is reading the real dispatch.
     assert!(
         body.contains("offload_job("),
         "control: `spawn_overlay_render` no longer calls `offload_job`, so \
@@ -215,7 +138,6 @@ fn the_opaque_overlay_path_stays_deleted() {
         );
     }
 
-    // Presence control for the funnel scrape.
     assert!(
         OFFLOAD.contains("pub fn offload_job("),
         "control: offload.rs no longer declares `offload_job`, so the \
@@ -240,19 +162,6 @@ fn the_opaque_overlay_path_stays_deleted() {
 
 /// The radar rasters are converted by **the job**, at the one place every
 /// rasterizing row funnels through.
-///
-/// The counterpart of the assertions above: they say the conversion is not on
-/// the frame thread, and this says where it went instead. `execute`'s output
-/// stage — the `straight_rasters_mut` walk over what the row's own output
-/// type declares (required, no default, since WO-M7c) — rather than any
-/// per-kind arm, because an arm-by-arm conversion is one a new kind can be
-/// added without, and the two consumers that would then read a
-/// straight-alpha buffer through `from_rgba_premultiplied` would draw it
-/// too bright with nothing to catch them.
-///
-/// Read off the source for the module's reason: what is being asserted is that
-/// the statement is written *inside the job*, and a job that ran on this thread
-/// produces pixels indistinguishable from one that ran in a worker.
 #[test]
 fn the_job_converts_its_own_rasters() {
     let body = free_body_of(OFFLOAD, "pub fn execute(");
@@ -275,15 +184,6 @@ fn the_job_converts_its_own_rasters() {
 }
 
 /// The section raster is no longer the known exception.
-///
-/// It was, and the note that stood here explained why: a section pane
-/// **retains** its `CrossSection` — the hover reads it and
-/// `restore_section_textures` re-uploads from it after a suspend — so
-/// converting before the send would have meant carrying a `ColorImage` beside
-/// the cut for the life of the session, to save 8 MiB of frame thread once per
-/// cut. That trade was never taken. Premultiplying the cut's *own* raster
-/// inside the job removed the choice: there is one buffer, the pane retains it,
-/// and both uploads read it through a constructor that computes nothing.
 #[test]
 fn the_section_upload_reads_a_converted_raster() {
     let body = body_of(APP_RENDER, "fn upload_section_raster(");

@@ -1,16 +1,12 @@
 //! The crate's charter, held as tests: a dependency ceiling and the graph
 //! position it exists to hold.
 //!
-//! Both read `cargo metadata --no-deps --format-version 1` from the workspace
-//! root. `packages[].dependencies` there are *declared* dependencies —
-//! feature-independent and resolution-independent — so no feature selection
-//! (default, `--all-features`, CI's llvm-cov arm) can mask or fake what these
-//! assert. Dep-name mechanics, recorded at M0 and relied on here: a
+//! Both read `cargo metadata --no-deps --format-version 1`, whose
+//! `packages[].dependencies` are *declared* deps — feature- and
+//! resolution-independent, so no feature selection can mask them. A
 //! workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
 //! `null` for normal deps (normalised to "normal" below); one name may
-//! legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`. Assertions key on dependency *names*, never on feature
-//! emptiness — a later feature on either crate must not disturb them.
+//! appear once per kind, so entries are judged per `(kind, name)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -24,7 +20,6 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The declared-dependency metadata of every workspace member, as parsed JSON.
 fn metadata() -> serde_json::Value {
     let out = Command::new(env!("CARGO"))
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -40,8 +35,7 @@ fn metadata() -> serde_json::Value {
 }
 
 /// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency.
+/// normal dependency; target-gated entries carry their kind and are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -65,9 +59,7 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
         .collect()
 }
 
-/// The exact declared set, both kinds — an equality, not a ceiling, so a
-/// dropped dependency is as loud as a new one and the census below never
-/// rots silently.
+/// The exact declared set, both kinds — an equality, not a ceiling.
 #[test]
 fn the_dependency_ceiling_holds() {
     let expected: BTreeSet<(String, String)> = [
@@ -99,12 +91,8 @@ fn the_dependency_ceiling_holds() {
     );
 }
 
-/// The direction pin: the engine sits ABOVE the vocabulary and pipeline
-/// crates and BELOW the app side. rustdar-app and rustdar-web each stand
-/// on rustdar-worker (the presence half that keeps the absence half
-/// falsifiable), and neither rustdar-radar nor rustdar-overlays may ever
-/// declare it back — codec rows live beside their pipelines and are composed
-/// HERE, never the other way round.
+/// The engine sits above the vocabulary and pipeline crates and below the
+/// app side; neither rustdar-radar nor rustdar-overlays may declare it back.
 #[test]
 fn the_engine_sits_above_the_vocabulary() {
     let meta = metadata();

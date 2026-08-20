@@ -1,112 +1,22 @@
 //! Grabbing a committed cross-section line — by an end to re-aim it, by its
 //! body to slide or sweep it — and re-cutting only on the drop.
-//!
-//! # The shape of the interaction, and why each part of it is the way it is
-//!
-//! A committed section's ground track already draws its two endpoints as
-//! labelled caps. This module makes the whole track **grabbable**: press a cap
-//! and drag to move that end; press the line between them and drag to slide
-//! the whole line rigidly (GR2Analyst's Position motion, as a direct gesture);
-//! hold shift at the press to sweep it about its midpoint instead. In every
-//! case the track previews live while the drag is in flight and the section is
-//! re-cut **only when the drag is dropped**. Before this, adjusting a line
-//! meant re-arming the draw mode from the menu and drawing the whole line
-//! again, which turns "nudge B a few kilometres east" into a four-step trip
-//! through a drawer — and made walking a cut through a storm impractical
-//! outright.
-//!
-//! The body's motions are **rigid on the sphere**: translation carries the
-//! midpoint and rebuilds the ends about it, rotation pivots on the midpoint;
-//! length is preserved by construction in both ([`rebuilt`] is the one
-//! constructor). The fine-step spelling of the same two motions — and the only
-//! sweep a touch screen with no modifier keys gets — lives on the section
-//! pane itself ([`pan_step_km`], [`SWEEP_STEP_DEG`]), beside a readout of the
-//! line's bearing and length so a sweep is aimed rather than blind.
-//!
-//! Every decision here is one of the map's existing rules, applied:
-//!
-//! * **No arming.** The armed modal drags exist because a drag on a *bare map*
-//!   already means pan, so a rare gesture needs a mode to disambiguate it. A
-//!   handle is different: it is a visible target a few points across, pressed
-//!   deliberately, so proximity is the disambiguation — the same way a pane
-//!   divider takes precedence over the map under it. The radius
-//!   ([`ENDPOINT_GRAB_RADIUS_PT`]) is the whole contract with panning: inside
-//!   it a press is an edit, outside it the map pans exactly as before. While
-//!   either armed mode **is** on, the handles go inert — one drag on one map
-//!   pane cannot be two gestures, and the armed mode was asked for last.
-//! * **The preview is geographic, and it moves only when the pointer does.**
-//!   The drag suppresses panning but not zooming (walkers reads the wheel
-//!   itself), so a mid-drag zoom is ordinary. The grabbed end is re-anchored
-//!   from the pointer **only on frames the pointer moved**
-//!   ([`SectionEditDrag::pointer_moved`]): on a zoom-only frame the pointer
-//!   sits still over new ground, and re-unprojecting it would silently slide
-//!   the endpoint to wherever that pixel names now — the exact failure
-//!   [`SectionLine`](crate::pane::SectionLine) stores geography to prevent.
-//! * **The re-cut happens on the drop, and through the existing dispatch.** A
-//!   cut is a multi-MB extraction walking the merged volume's gate bytes; per
-//!   frame it would be the most expensive thing in the app by an order of
-//!   magnitude. So the drag never touches the pane's stored line. The drop
-//!   records a [`pending edit`](crate::ui::Gui) applied after the pane loop,
-//!   which writes the line and nothing else — the section staleness key
-//!   carries the line, so the ordinary poll notices and re-cuts, and there is
-//!   no second render path to drift from the first.
-//! * **A drop that says nothing new commits nothing.** A press-and-release on
-//!   a handle is how a user checks it is grabbable; committing the unchanged
-//!   line would burn a re-cut on it. And a drag that shrinks the line under
-//!   [`MIN_SECTION_EDIT_KM`] is discarded whole rather than committed — the
-//!   same refusal the modal draw makes of a too-short gesture, made in ground
-//!   kilometres here because an edit has no gesture length to measure: the
-//!   pointer may travel a long way bringing B almost onto A.
 
 use crate::pane::{PaneId, SectionLine};
 use rustdar_geo::GeoPoint;
 
 /// How close to an endpoint a press must land to grab it, in points.
-///
-/// The balance the radius strikes is stated in the module doc: generous enough
-/// to grab — the visible cap is ~6 points and a finger is ~25, so 14 forgives
-/// half a finger of aim — and small enough not to steal pans, since two
-/// 14-point discs are a vanishing fraction of a pane. In **points**, not
-/// pixels, so it is the same physical target on a hidpi desktop and a phone.
 pub(crate) const ENDPOINT_GRAB_RADIUS_PT: f32 = 14.0;
 
 /// The shortest line an edit may commit, in kilometres of ground.
-///
-/// The arithmetic bar is `SectionLine::new`'s refusal of coincident endpoints;
-/// this is the usability bar above it. A section a couple of kilometres long is
-/// two or three raster columns stretched across the pane — a picture of
-/// nothing — and the likeliest way to produce one is overshooting while
-/// dragging B toward A. Measured in ground km rather than gesture points
-/// because the gesture can be long while the *line* ends up short.
-///
-/// Refused **whole**, not clamped: the drop keeps the line the drag started
-/// from, exactly as a too-small modal drag keeps the mode armed. A clamped
-/// commit would cut a line the user did not put there.
 pub(crate) const MIN_SECTION_EDIT_KM: f64 = 2.0;
 
 /// How close to the line's **body** a press must land to grab it, in points.
-///
-/// Deliberately tighter than [`ENDPOINT_GRAB_RADIUS_PT`]: the body is a track
-/// that can run the whole width of a pane, so its capture zone is a long thin
-/// band rather than two small discs — at 14 points either side it would turn
-/// most pans across a sectioned storm into line drags. 8 points is four times
-/// the stroke's width, enough to press the line a user can see.
 pub(crate) const BODY_GRAB_RADIUS_PT: f32 = 8.0;
 
 /// Degrees one sweep step turns the line about its midpoint.
-///
-/// Small enough that stepping around a storm feature reads as motion rather
-/// than as jumps — a 5° turn moves a 100 km line's ends ~4.4 km — and large
-/// enough that a full quarter-turn is 18 clicks, not 90.
 pub(crate) const SWEEP_STEP_DEG: f64 = 5.0;
 
 /// Kilometres one pan step slides the line, as a function of its length.
-///
-/// A fraction of the line rather than a constant, clamped to a sane band: a
-/// 20 km line stepped 10 km at a time skips half its own width of storm, and a
-/// 300 km line stepped 1 km at a time takes three hundred clicks to cross what
-/// it shows. 5% reads as "walk the section through the storm" at every length
-/// the app can cut; the clamps keep the ends of the range honest.
 pub(crate) fn pan_step_km(length_km: f64) -> f64 {
     (length_km * 0.05).clamp(1.0, 10.0)
 }
@@ -125,18 +35,6 @@ pub(crate) enum SectionGrab {
 }
 
 /// Where one line's grabbable geometry was drawn last frame, in screen points.
-///
-/// Recorded from inside `Map::show` — the only place a projector exists — and
-/// read **before** it, by `render_panes`' pan-suppression decision: a press
-/// that is going to become a grab is indistinguishable from one that is going
-/// to become a pan until the pointer moves, and by then the map has already
-/// slid. One frame stale by construction, which for a press is harmless — a
-/// pointer about to press is not also flinging the viewport.
-///
-/// Carries the whole track polyline rather than reduced hit shapes, so the
-/// suppression decision and the authoritative in-show hit test are **the same
-/// call to [`grab_at`]** on the same geometry — two spellings of one hit test
-/// is how a press comes to pan the map and start a drag at once.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SectionGrabZone {
     /// The map pane the line is drawn on.
@@ -159,11 +57,6 @@ impl SectionGrabZone {
 }
 
 /// An endpoint drag in flight.
-///
-/// Held on the `Gui`, like [`RegionDrag`](crate::ui_region::RegionDrag) and for
-/// the same reason: it is a property of the *gesture*, advanced only from
-/// inside the owning map pane's `Map::show`, and it must not survive the modes
-/// that conflict with it (both armed-drag setters clear it).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SectionEditDrag {
     /// The map pane the drag is happening on. A drag belongs to one pane for
@@ -196,9 +89,6 @@ pub(crate) struct SectionEditDrag {
 
 impl SectionEditDrag {
     /// Start a drag on `grab` of `original`.
-    ///
-    /// `sweep` is only consulted for a [`SectionGrab::Body`] drag — an
-    /// endpoint drag means the same thing with or without a modifier down.
     pub(crate) fn begin(
         map_pane: PaneId,
         section_pane: PaneId,
@@ -233,19 +123,6 @@ impl SectionEditDrag {
     }
 
     /// Fold a moved pointer in.
-    ///
-    /// An endpoint grab moves that end to `ground` and leaves the other
-    /// exactly where it is. A body grab recomputes from the **original** line
-    /// and the whole press→pointer motion — translation, or rotation about
-    /// the original midpoint under [`sweep`](Self::begin) — rather than
-    /// accumulating frame deltas, so floating error cannot walk the line and
-    /// a pointer that returns to the press returns the line to its start.
-    ///
-    /// A motion the constructors refuse — off Earth, coincident ends, a
-    /// rotation press too close to the midpoint to have a bearing — leaves
-    /// the **preview** as it was rather than the drag dead: the pointer will
-    /// move again next frame, and a refusal that stuck would read as the line
-    /// freezing mid-drag.
     pub(crate) fn drag_to(&mut self, pointer: egui::Pos2, ground: GeoPoint) {
         self.last_pointer = pointer;
         let next = match self.grab {
@@ -279,12 +156,6 @@ impl SectionEditDrag {
 
     /// The line this drop commits, or `None` for a drop that must leave the
     /// pane's line alone.
-    ///
-    /// `None` twice over: an unchanged preview (a press-and-release, the way a
-    /// user checks a handle is grabbable) would burn a multi-MB re-cut to
-    /// produce the same picture; and a line under [`MIN_SECTION_EDIT_KM`] is
-    /// refused whole rather than clamped, keeping the line the drag started
-    /// from.
     pub(crate) fn commit(self) -> Option<SectionLine> {
         (self.preview != self.original && length_km(self.preview) >= MIN_SECTION_EDIT_KM)
             .then_some(self.preview)
@@ -294,9 +165,6 @@ impl SectionEditDrag {
 /// `line` with the `grab` end moved to `ground`, or `None` for a line that
 /// cannot be cut — and `None` for a body grab, which has no single end to
 /// move ([`SectionEditDrag::drag_to`] routes it before asking).
-///
-/// Through [`SectionLine::new`], which is the one gate on finite, distinct
-/// endpoints — this must not become a second spelling of that judgement.
 pub(crate) fn with_endpoint(
     line: SectionLine,
     grab: SectionGrab,
@@ -331,11 +199,6 @@ pub(crate) fn midpoint(line: SectionLine) -> GeoPoint {
 
 /// The line's bearing, degrees clockwise from north: the direction A→B as it
 /// passes through the midpoint.
-///
-/// **At the midpoint**, not at A: a great circle's bearing changes along its
-/// run, and the midpoint is the point the pan and sweep operations are defined
-/// around — measuring the bearing anywhere else would make "rotate by 0°"
-/// move the line.
 pub(crate) fn bearing_deg(line: SectionLine) -> f64 {
     let mid = midpoint(line);
     let (bearing, _) =
@@ -345,11 +208,6 @@ pub(crate) fn bearing_deg(line: SectionLine) -> f64 {
 
 /// The point `distance_km` from `from` along `bearing_deg`, on the sphere the
 /// rest of the crate's geodesy walks ([`rustdar_geo::EARTH_RADIUS_KM`]).
-///
-/// The longitude is wrapped into `[-180, 180]` because
-/// [`GeoPoint::is_on_earth`] — and therefore `SectionLine::new` — refuses
-/// anything outside it, and a translation across the antimeridian is a place a
-/// section can legitimately go.
 fn destination(from: GeoPoint, bearing_deg: f64, distance_km: f64) -> GeoPoint {
     let (lat, lon_raw) =
         rustdar_geo::great_circle_destination(from.lat, from.lon, bearing_deg, distance_km);
@@ -365,9 +223,6 @@ fn destination(from: GeoPoint, bearing_deg: f64, distance_km: f64) -> GeoPoint {
 /// The line rebuilt about `mid` with the given bearing and half-length — the
 /// one constructor pan and sweep both go through, so "length and bearing are
 /// preserved" is true by construction rather than by two matching derivations.
-///
-/// Through [`SectionLine::new`], which is still the only gate on a line that
-/// can be cut.
 fn rebuilt(mid: GeoPoint, bearing: f64, half_km: f64) -> Option<SectionLine> {
     let a = destination(mid, bearing + 180.0, half_km);
     let b = destination(mid, bearing, half_km);
@@ -376,12 +231,6 @@ fn rebuilt(mid: GeoPoint, bearing: f64, half_km: f64) -> Option<SectionLine> {
 
 /// `line` translated by the ground motion `from` → `to`: the midpoint is
 /// carried along that displacement, the bearing and length are kept.
-///
-/// Defined through the midpoint rather than by offsetting each endpoint's
-/// coordinates, because a lat/lon offset is not a rigid motion on a sphere —
-/// sliding a 200 km line 100 km south by subtracting degrees changes its
-/// length by the ratio of the two latitudes' `cos`, and the section would
-/// quietly grow as it walked toward the equator.
 pub(crate) fn translated(line: SectionLine, from: GeoPoint, to: GeoPoint) -> Option<SectionLine> {
     let (motion_bearing, motion_km) =
         rustdar_geo::site_bearing_range_km(from.lat, from.lon, to.lat, to.lon);
@@ -421,13 +270,6 @@ pub(crate) fn panned(line: SectionLine, step_km: f64) -> Option<SectionLine> {
 
 /// Which part of the line a press at `pos` grabs, given the endpoints and the
 /// drawn track's polyline — or `None` for a press that should pan the map.
-///
-/// **Endpoints before body**, unconditionally: the track passes through its
-/// own end caps, so every press on a handle is also within the body band, and
-/// resolving by distance instead of by kind would make the grab near a cap
-/// flicker between "move this end" and "move everything" with sub-point
-/// pointer noise. The **nearer** endpoint wins when both are in radius (a
-/// short line puts them within a finger of each other).
 pub(crate) fn grab_at(
     pos: egui::Pos2,
     a_px: egui::Pos2,
@@ -569,12 +411,6 @@ mod tests {
     /// Pan and sweep are rigid motions: translation keeps length and bearing
     /// and carries the midpoint; rotation keeps midpoint and length and turns
     /// the bearing by exactly the delta.
-    ///
-    /// Tolerances are metres-and-microdegrees against motions of tens of
-    /// kilometres and tens of degrees: what these close is not floating error
-    /// but the shape of the arithmetic — a translation done by offsetting
-    /// lat/lon (which stretches with latitude), or a rotation pivoted on an
-    /// endpoint instead of the midpoint.
     #[test]
     fn pan_and_sweep_are_rigid_motions_of_the_line() {
         let line = line();

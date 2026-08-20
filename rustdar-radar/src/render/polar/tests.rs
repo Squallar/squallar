@@ -1,10 +1,4 @@
 //! The inverse rule on its own, on geometry written down by hand.
-//!
-//! What these cannot check is that the rule matches the rasterizer, because
-//! nothing here goes through a rasterizer. That is
-//! [`super::super::tests::the_polar_field_answers_what_the_value_grid_holds`]'s
-//! job, and it is the one that would catch the two drifting apart; these pin
-//! the edges that a whole-sweep comparison averages over.
 
 use super::*;
 
@@ -151,9 +145,6 @@ fn a_field_with_no_gates_answers_nothing_rather_than_dividing_by_zero() {
     assert!(empty.geometry().is_empty());
     assert_eq!(read(&empty, 0.0, 10.0), None);
 
-    // A zero gate depth is the other way in: `data_limited_side_px` already
-    // treats a non-positive spacing as saying nothing about sampling, and a
-    // field built on one would divide by it.
     let f = PolarField::from_parts(
         PolarGeometry::from_parts(
             vec![Wedge {
@@ -172,9 +163,6 @@ fn a_field_with_no_gates_answers_nothing_rather_than_dividing_by_zero() {
 
 #[test]
 fn stripping_the_values_keeps_every_gate_findable() {
-    // What a loop frame holds: the geometry, and no numbers. `pick` still
-    // resolves — that is the half a loop frame reads its own volume with —
-    // and `at` declines, because this field has nothing to say.
     let mut f = ring(8, 45.0, 4);
     let at = f.geometry().pick(90.0, 2.5).expect("inside the picture");
     assert_eq!(f.at(at), Some(2002.0));
@@ -193,8 +181,6 @@ fn stripping_the_values_keeps_every_gate_findable() {
 
 #[test]
 fn the_geometry_is_a_thousandth_of_the_values_it_indexes() {
-    // The whole reason the two are separate types. A full ring of a
-    // surveillance cut: 720 radials of 1832 gates.
     let f = ring(720, 0.5, 1832);
     let values = f.resident_bytes() - f.geometry().resident_bytes();
     assert_eq!(values, 720 * 1832 * 4, "radials × gates × f32");
@@ -212,9 +198,6 @@ fn the_geometry_is_a_thousandth_of_the_values_it_indexes() {
 
 #[test]
 fn a_field_survives_the_round_trip_the_browsers_worker_port_makes() {
-    // The page↔worker port transfers buffers, so a field's byte form is the
-    // only shape it crosses in. Every field has to come back the same picture,
-    // including a loop frame's — geometry with no numbers behind it.
     for mut f in [ring(37, 9.7, 23), ring(1, 180.0, 1), PolarField::default()] {
         let back = PolarField::from_bytes(&f.to_bytes()).expect("this build wrote it");
         assert_eq!(back.geometry().wedges(), f.geometry().wedges());
@@ -266,32 +249,6 @@ fn a_message_this_build_did_not_write_is_declined_rather_than_indexed_into() {
 
 /// A field assembled by hand, for
 /// [`the_polar_wire_layout_is_the_one_this_protocol_ships`].
-///
-/// Every number here is a literal and exactly representable, so the encoding is
-/// the same bytes on every target: nothing in this fixture is computed, so
-/// nothing in it can move with a libm. [`ring`] cannot serve — its azimuths
-/// come out of a division and its values out of an arithmetic walk, and while
-/// both happen to be exact today, a fixture whose numbers are *derived* is one
-/// whose digest is a claim about the derivation as well as about the layout.
-///
-/// Written as a struct literal with no `..`, and reaching past
-/// [`PolarGeometry::from_parts`] to the private fields, for two reasons that
-/// are both about what the pin can see:
-///
-///   * **`from_parts` sets `reach_gates` equal to `gates`.** Those are two
-///     separate `u32`s side by side in the header, and a fixture where they
-///     hold the same number cannot tell a swap of the two apart from no change
-///     at all — the pin would pass for the wrong reason, which is the failure
-///     mode a digest is easiest to build wrong into. Here `gates` is 4 and
-///     `reach_gates` is 2.
-///   * **A new field on either struct makes this fail to compile**, so a field
-///     that joins the type and is then written by `to_bytes` cannot reach the
-///     wire without someone having already been stopped once.
-///
-/// All four header counts are distinct (3, 4, 2, 12) and all three header
-/// `f64`s are distinct (0.125, 0.25, 0.5), so any reorder within either width
-/// class moves the bytes. The six wedge `f32`s are likewise pairwise distinct,
-/// so a swap of a wedge's azimuth and half-width is visible too.
 fn layout_fixture() -> PolarField {
     PolarField {
         geometry: PolarGeometry {
@@ -337,56 +294,6 @@ fn layout_fixture() -> PolarField {
 }
 
 /// The bytes this protocol ships are **these** bytes.
-///
-/// # What was blind, exactly
-///
-/// This encoding has no version of its own. What a page and a worker from
-/// opposite sides of a deploy actually compare is `rustdar_web`'s
-/// `build_token` — `GITHUB_SHA` in CI, the `rustdar_worker::wire_identity`
-/// framing-rows digest locally — and the guards standing over that boundary
-/// are all blind here:
-///
-///   * `the_worker_protocol_is_versionless_and_the_token_names_the_build`
-///     pins that the deleted hand-kept version stays deleted and that
-///     `build_token` reads both of its halves; it says nothing about any
-///     payload's bytes.
-///   * `the_worker_reply_shape_is_the_one_this_build_ships`
-///     scrapes the reply's **field names**. These bytes travel inside one of
-///     those fields (`polar`), so the field set is identical either side of a
-///     change here and that guard cannot see one.
-///   * The local token digests the *framing rows* — the request and reply
-///     layouts `rustdar_worker`'s own tests pin — and deliberately not the
-///     nested payloads inside the reply's fields, so a change here moves no
-///     token either.
-///
-/// Measured, not argued: this header once grew an `f64` (the elevation) and
-/// restated its two ranges as slant rather than ground, and **no guard
-/// fired** — the hand-kept protocol number of that era was bumped by hand. A
-/// buffer-valued field was where the author was entirely on their own; this
-/// is the instrument that ends that.
-///
-/// # What this fails for
-///
-/// The encoder's own output, over a fixture nothing computes, compared with the
-/// bytes recorded when the protocol version was last set. Any change to what
-/// `to_bytes` writes — a field added, removed, reordered, retyped, or written
-/// at a different width or endianness — moves the length or the digest, and the
-/// only way past it is to write the new numbers down. That is where the bump
-/// obligation is met.
-///
-/// # What it still cannot do
-///
-/// It cannot make a **local** page/worker pair differing only in these bytes
-/// refuse each other: the local token deliberately folds the framing rows
-/// and not the nested payloads — `rustdar_worker::wire_identity` records
-/// that accepted residual, and deployed pairs always differ by `GITHUB_SHA`
-/// and refuse at the handshake. What it can do is fail for the person who
-/// changes the layout, and say in the message what they owe. That is the
-/// direction that was missing.
-///
-/// A digest is opaque about *what* moved, deliberately: the two assertions are
-/// one tuple so the failure reads as one fact, and what to do about it does not
-/// depend on which field it was.
 #[test]
 fn the_polar_wire_layout_is_the_one_this_protocol_ships() {
     let bytes = layout_fixture().to_bytes();

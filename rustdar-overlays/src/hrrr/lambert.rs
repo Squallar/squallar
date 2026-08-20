@@ -1,21 +1,10 @@
 //! Lambert Conformal Conic projection, in pure Rust.
 //!
-//! `grib` can do this for GRIB2 template 3.30, but only behind `gridpoints-proj`,
-//! which links PROJ (`proj-sys`, `libsqlite3-sys`, `link-cplusplus` — none of
-//! which cross-compile to wasm32 or iOS). With `default-features = false`,
-//! `Template3_30::latlons()` falls into grib's catch-all and returns
-//! `GribError::NotSupported`. HRRR is *entirely* template 3.30, so that kills
-//! every HRRR fetch.
-//!
 //! Reproduces what grib handed PROJ:
 //!
 //! ```text
 //! +a=<a> +b=<b> +proj=lcc +lat_0=<LaD> +lon_0=<LoV> +lat_1=<Latin1> +lat_2=<Latin2>
 //! ```
-//!
-//! and the same sequence: forward-project the grid's first point (La1/Lo1), step
-//! by Dx/Dy in metres, inverse-project each step. That is why both directions are
-//! implemented, not just the inverse.
 //!
 //! Math is Snyder, *Map Projections — A Working Manual* (USGS PP 1395) ch. 15.
 //! The ellipsoidal formulation is used throughout and reduces exactly to the
@@ -29,10 +18,6 @@
 use grib::{GridPointIndex, def::grib2::template::Template3_30};
 
 /// Below this parallel separation the tangent limit `n = sin(lat_1)` is used.
-///
-/// GRIB2 stores Latin1/Latin2 as integer microdegrees, so the smallest non-zero
-/// separation representable is 1e-6° = 1.745e-8 rad — an order of magnitude
-/// above this, so a genuinely secant grid is never mistaken for a tangent one.
 const TANGENT_EPSILON_RAD: f64 = 1e-9;
 
 /// ~6 micrometres on the ground.
@@ -44,11 +29,6 @@ const MAX_LATITUDE_ITERATIONS: usize = 32;
 
 /// Constructed from the same six parameters PROJ's `+proj=lcc` takes, so it can
 /// be checked against PROJ directly.
-///
-/// `PartialEq` is field-for-field over the *derived* constants, which is what
-/// the wire round-trip compares: [`LambertGrid::from_parts`] restores stored
-/// bits rather than re-running this constructor, so two equal parts are two
-/// equal projections with no libm in between.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LambertConformalConic {
     /// Semi-major axis, metres.
@@ -285,16 +265,6 @@ fn normalize_longitude_degrees(lon: f64) -> f64 {
 
 /// A template 3.30 grid reduced to the constants any point's lat/lon can be
 /// rebuilt from — 104 bytes standing in for two 15 MB `Vec<f64>`.
-///
-/// (104, not the 88 this said before: the six `f64` of the projection, four more
-/// here, two `usize`, and three `bool` padded to the 8-byte alignment. The
-/// figure predated `alternating` and `wraps_longitude`.)
-///
-/// HRRR CONUS is 1,905,141 points, so materialising the coordinates costs
-/// 30.5 MB per cached parameter and 61 MB at the peak of a parse (the pair
-/// vector and the split arrays are alive together). Nothing downstream reads
-/// them in bulk: the rasterizer walks the grid in index order and the tooltip
-/// wants one point, both of which this answers arithmetically.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LambertGrid {
     projection: LambertConformalConic,
@@ -318,39 +288,23 @@ pub struct LambertGrid {
 /// A [`LambertGrid`]'s stored constants as one plain struct of public fields —
 /// its wire form, produced by [`LambertGrid::to_parts`] and consumed by
 /// [`LambertGrid::from_parts`].
-///
-/// It exists because the grid's fields are private and the codec that carries
-/// a model-grid overlay job (`rustdar_worker::offload`) lives in another
-/// crate. The fields are the *stored* values — derived constants and the
-/// measured `wraps_longitude` included — precisely so the far side restores
-/// bits instead of re-deriving anything: a re-derivation would put libm's last
-/// ulp between two builds of one grid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LambertGridParts {
-    /// Semi-major axis, metres.
     pub a: f64,
-    /// First eccentricity; exactly 0 for a sphere.
     pub e: f64,
-    /// Cone constant.
     pub n: f64,
     /// Scale factor (Snyder eq. 15-2).
     pub big_f: f64,
-    /// Polar radius to the latitude of origin.
     pub rho0: f64,
-    /// Central meridian, radians.
     pub lon0: f64,
-    /// Projection-plane metres of grid point (0, 0).
     pub x0: f64,
     pub y0: f64,
-    /// Signed step per index.
     pub dx: f64,
     pub dy: f64,
     pub ni: usize,
     pub nj: usize,
-    /// Scanning-mode bits that decide the flat index order.
     pub i_consecutive: bool,
     pub alternating: bool,
-    /// Measured at construction; carried, never recomputed.
     pub wraps_longitude: bool,
 }
 
@@ -418,34 +372,19 @@ impl LambertGrid {
     /// Whether two *adjacent* grid points can differ by more than half a turn
     /// in longitude.
     ///
-    /// Two unrelated discontinuities show up as the same jump, and both break
-    /// any caller that treats a cell as covering the ground between itself and
-    /// its neighbour:
-    ///
     ///  * [`normalize_longitude_degrees`] folds at ±180, so a grid straddling
     ///    the anti-meridian has neighbours a whole turn apart;
     ///  * [`LambertConformalConic::inverse`] takes `atan2`, whose own cut at
     ///    ±pi is the *cone's* seam. Crossing it moves longitude by `360 / n`
     ///    degrees — 578 for HRRR — which normalises to a 218° jump.
-    ///
-    /// Either way a Mercator rasterizer puts the two neighbours most of a
-    /// texture apart and stretches the cell between them across the image.
     fn detect_longitude_wrap(&self) -> bool {
         if self.ni == 0 || self.nj == 0 {
             return false;
         }
         // The boundary alone is enough, for a different reason per cut.
-        //
         // The band cut is a *crossing* test on a meridian, which this projection
         // draws as a straight ray from the apex: a ray cannot cross the grid
         // without crossing an edge between two adjacent boundary points.
-        //
-        // The sector cut is a *membership* test on a wedge (`|theta| > n*pi`,
-        // angular width `2(1-n)pi`), not on its boundary rays. It reduces to the
-        // boundary because the wedge is symmetric about the plane's y-axis with
-        // its apex on it, and a template 3.30 grid is axis-aligned in that same
-        // plane — so the wedge's horizontal slices nest in y, and any column bad
-        // at some row is bad at j = 0 or j = nj-1. Both are walked.
         for j in [0, self.nj - 1] {
             for i in 1..self.ni {
                 if self.step_is_discontinuous((i - 1, j), (i, j)) {
@@ -503,27 +442,12 @@ impl LambertGrid {
 
     /// See [`Self::detect_longitude_wrap`]. Free to call; measured at
     /// construction.
-    ///
-    /// Deliberately not "does the grid's `min_lon..max_lon` contain the seam":
-    /// for a grid that wraps, those two are the extreme *normalised*
-    /// longitudes, so the discontinuity falls in the unpopulated gap between
-    /// `max_lon` and `min_lon + 360` — outside the interval — and the test
-    /// silently answers `false`. That is the same "interval predicate applied
-    /// to something that is not an interval" mistake one level up, and it hides
-    /// exactly the `LoV = 0` case, where the cone seam and the anti-meridian
-    /// coincide.
     pub fn wraps_longitude(&self) -> bool {
         self.wraps_longitude
     }
 
     /// This grid's stored constants, whole, for the one boundary that can only
     /// carry numbers: `rustdar_worker::offload`'s described-overlay codec.
-    ///
-    /// Every field is the **stored** value — the derived projection constants
-    /// included — so [`Self::from_parts`] restores bits rather than re-running
-    /// [`LambertConformalConic::new`] or [`Self::detect_longitude_wrap`]. That
-    /// is what makes the round trip exact: nothing on the decode side consults
-    /// libm, whose last ulp is the one thing two platforms do not share.
     pub fn to_parts(&self) -> LambertGridParts {
         LambertGridParts {
             a: self.projection.a,
@@ -549,8 +473,7 @@ impl LambertGrid {
     /// produces — a non-finite number anywhere, a non-positive semi-major
     /// axis, an eccentricity outside `[0, 1)`, or a zero cone constant, each
     /// of which would make the projection arithmetic answer NaN for every
-    /// point rather than fail. The parts arrive off a message port, so this is
-    /// a refusal at the boundary, not an assertion about a caller.
+    /// point rather than fail.
     pub fn from_parts(parts: LambertGridParts) -> Option<Self> {
         let finite = [
             parts.a,
@@ -624,9 +547,6 @@ impl LambertGrid {
     ///
     /// Forward-projecting and dividing by the step is exact for this grid — the
     /// axes are the projection's own — so this replaces a scan over every point.
-    /// "Nearest" is therefore in the projection plane rather than in degrees;
-    /// on a 3 km grid the two can differ only for a query already sitting on a
-    /// cell boundary.
     pub fn nearest(&self, lat: f64, lon: f64) -> Option<usize> {
         let (x, y) = self.projection.forward(lat, lon);
         let fi = ((x - self.x0) / self.dx).round();
@@ -657,9 +577,6 @@ impl LambertGrid {
     /// of a longitude range spanning it is therefore two disjoint arcs, and
     /// anything that treats it as one interval is describing a different region
     /// of the plane than the one it was asked about.
-    ///
-    /// Detected by consistency rather than by comparing meridians: stepping from
-    /// one end must land on the other end's own angle.
     pub fn crosses_seam(&self, min_lon: f64, max_lon: f64) -> bool {
         let p = &self.projection;
         let span = p.n * (max_lon - min_lon).to_radians();
@@ -677,12 +594,6 @@ impl LambertGrid {
     /// `cos φ` once more, i.e. the same number in radians) also bounds the step
     /// in Mercator `y`. That is what lets a caller state a margin in *cells*
     /// rather than as a fraction of whatever box it happens to be rendering.
-    ///
-    /// Upper bound only where the scale factor `k >= 1`, which a tangent cone
-    /// guarantees. A secant cone has `k < 1` between its parallels and this
-    /// underestimates by `1/k` — ~3.5% for a 30/60 pair at 45°, inside
-    /// `CELL_REACH`'s 0.75-against-0.55 headroom, but not by an unlimited
-    /// margin. HRRR is tangent; revisit if a secant model is ever added.
     pub fn cell_span_degrees(&self, lat: f64) -> f64 {
         // Not the pole: `cos` there is zero and the bound is unbounded, which is
         // true but useless. 89.9° already gives ~570x the equatorial cell.
@@ -698,10 +609,7 @@ impl LambertGrid {
     /// projection plane: `rho` depends only on latitude and `theta` only on
     /// longitude. So `x = rho·sin θ` and `y = rho0 − rho·cos θ` are extremal
     /// either at a corner of the sector or where `sin`/`cos` turns — a quadrant
-    /// boundary of `theta` — and that candidate set is finite. Sampling the
-    /// box's edges instead would be an approximation whose error is a function
-    /// of the arc, and this is used to *skip* work, so an underestimate paints
-    /// the wrong picture.
+    /// boundary of `theta` — and that candidate set is finite.
     ///
     /// Callers must still widen the result: a grid point just outside the box
     /// can influence a pixel inside it.
@@ -721,9 +629,7 @@ impl LambertGrid {
         // The theta interval, unwrapped: `theta` folds `lon - lon0` into
         // -pi..=pi, so stepping from one end is the only way to get a single
         // interval rather than two arcs — and it is only a single interval at
-        // all if the box stays off the seam. Rather than bound two arcs,
-        // decline; such a box spans half the planet, so there was little to
-        // exclude anyway.
+        // all if the box stays off the seam.
         if self.crosses_seam(min_lon, max_lon) {
             return None;
         }
@@ -762,10 +668,6 @@ impl LambertGrid {
     }
 
     /// The `(i, j)` grib's [`GridPointIndex::ij`] yields at position `index`.
-    ///
-    /// Reproduces `GridPointIndexIterator` in closed form;
-    /// `the_flat_index_mapping_reproduces_gribs_scan_order` pins it against the
-    /// iterator itself rather than against this reasoning.
     fn ij_at(&self, index: usize) -> Option<(usize, usize)> {
         let (major_len, minor_len) = self.scan_lengths();
         if minor_len == 0 {
@@ -814,11 +716,6 @@ impl LambertGrid {
 /// Points come back in scanning-mode order — the same order as the decoded data
 /// values — because the iteration is driven by grib's own
 /// [`GridPointIndex::ij`], which is not gated behind `gridpoints-proj`.
-///
-/// The fetch path no longer calls this; it keeps a [`LambertGrid`] and computes
-/// points on demand. It survives as the reference the lazy form is checked
-/// against, and as the eager form for any caller that genuinely wants all
-/// 30 MB.
 pub fn latlons(grid: &Template3_30) -> Result<Vec<(f64, f64)>, String> {
     let geometry = LambertGrid::from_template(grid)?;
     let indices = grid
@@ -837,9 +734,6 @@ pub fn latlons(grid: &Template3_30) -> Result<Vec<(f64, f64)>, String> {
 /// assertions fail by a hair — see
 /// [`tests::the_nomads_filter_reencodes_lo1_by_one_microdegree`]. Both are
 /// correct; the projection anchors on whatever `Lo1` the file states.
-///
-/// Lives outside `mod tests` so the rasterizer's tests can raster a grid with
-/// the real HRRR geometry rather than a toy one.
 #[cfg(test)]
 pub(crate) fn hrrr_conus_grid() -> Template3_30 {
     use grib::def::grib2::template::param_set;

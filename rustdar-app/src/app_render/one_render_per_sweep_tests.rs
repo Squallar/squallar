@@ -1,32 +1,4 @@
 //! One sweep is one *render*, however many panes are looking at it.
-//!
-//! The sibling of `radar_texture_sharing_tests`, one step earlier in the same
-//! path. That module removed the duplicate **upload**: several panes holding one
-//! `Arc<ColorImage>` used to turn it into one `TextureId` each. This one removes
-//! the duplicate **render** that produced the buffer in the first place —
-//! `dispatch_pane_renders` walks the panes in a single pass, and the render
-//! cache it consults is only written when a result comes *back*, so on the frame
-//! a volume lands it missed for every pane at once and each pane started its own
-//! job.
-//!
-//! The observable is the **job posted on the wire**, counted through the same
-//! `JobSink` a browser has and read back with the same `from_bytes` a worker
-//! uses. A timing would not do: on a 32-core desktop the duplicates run in
-//! parallel and the wall-clock latency barely moves, while the CPU and the
-//! resident memory they cost move a great deal — and on wasm, where
-//! `MAX_CONCURRENT_RENDERS` is 1, they do not run in parallel at all. The count
-//! is the property; the cost of one render is not this module's business.
-//!
-//! **Two regression tests and two invariant guards, and it is worth knowing
-//! which is which.** Only `one_sweep_on_several_panes_is_one_render` and
-//! `a_render_that_answers_with_nothing_releases_its_siblings` fail if the
-//! suppression is taken back out — the first counting two jobs where it wants
-//! one, the second at its own precondition. The other two hold in both arms:
-//! `the_panes_that_asked_for_nothing_are_served_anyway` pins the broadcast this
-//! change leans on rather than the change, and
-//! `panes_wanting_different_pictures_each_get_one` pins the key against being
-//! coarsened later. Both are guards worth keeping and neither is evidence that
-//! the suppression works.
 
 use rustdar_radar::types::RadarProduct;
 use rustdar_source::id::known;
@@ -39,18 +11,12 @@ const TILT: f32 = 0.5;
 const OTHER_TILT: f32 = 1.5;
 
 /// A worker port that keeps what it was handed instead of running it.
-///
-/// Installing one is also what makes these tests deterministic: with a port in
-/// place `offload_job` posts and returns, so no render thread is spawned, no
-/// rasterizer runs, and the count of jobs is taken at the moment of dispatch
-/// rather than raced against workers finishing.
 struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl JobSink for Recorder {
-    /// Serialises here, as the browser's own sink does, so what these tests
-    /// read back has been through `to_bytes`/`from_bytes` exactly as a job
-    /// crossing a real worker boundary has. The funnel stopped doing it on
-    /// every sink's behalf; a recorder standing in for the browser still must.
+    /// Serialises here, as the browser's own sink does, so what these tests read back has
+    /// been through `to_bytes`/`from_bytes` exactly as a job crossing a real worker
+    /// boundary has.
     fn send(&self, _id: u64, request: JobRequest) -> Result<(), JobRequest> {
         self.0.lock().unwrap().push(request.to_bytes());
         Ok(())
@@ -58,12 +24,6 @@ impl JobSink for Recorder {
 }
 
 /// Install a recorder, and the guard that retires it however the test ends.
-///
-/// The guard is not decoration. `WORKER` is a thread-local the harness's
-/// threads are reused across, so a failed assertion that unwound past a plain
-/// retirement call would leave this port installed for the *next* test on that
-/// thread — which would then post its renders into a recorder nobody reads and
-/// fail for reasons of its own. See `offload::InstalledTestWorker`.
 fn recorder() -> (
     Arc<Mutex<Vec<Vec<u8>>>>,
     rustdar_worker::offload::InstalledTestWorker,
@@ -105,8 +65,8 @@ fn volume_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// A two-cut volume carrying reflectivity and velocity, so an extraction
-/// reaches a sweep at either tilt and a real `JobRequest::Radar` is built.
+/// A two-cut volume carrying reflectivity and velocity, so an extraction reaches a sweep at
+/// either tilt and a real `JobRequest::Radar` is built.
 fn sample_scan() -> Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -184,8 +144,8 @@ fn sample_scan() -> Arc<nexrad_model::data::Scan> {
     ))
 }
 
-/// Aim pane `idx` at `site` showing `product` at `elevation`, far enough along
-/// that the dispatcher will act on it, and put the volume where it will look.
+/// Aim pane `idx` at `site` showing `product` at `elevation`, far enough along that the
+/// dispatcher will act on it, and put the volume where it will look.
 fn point_at(
     app: &mut crate::app::App,
     idx: usize,
@@ -241,13 +201,6 @@ fn app_on_one_sweep(n: usize, product: RadarProduct) -> crate::app::App {
     app_with(n, |app, idx| point_at(app, idx, SITE, product, TILT))
 }
 
-/// **The finding.** A volume landing on a split is one render, not one per pane.
-///
-/// Run at every pane count a desktop split reaches, and over both a per-tilt
-/// product and one whose payload is the whole velocity ladder — the second
-/// because the extraction this suppresses is far larger there, and because a
-/// dedupe that keyed on the tilt rather than on the render cache's own key
-/// would behave differently for the two.
 #[test]
 fn one_sweep_on_several_panes_is_one_render() {
     for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
@@ -281,15 +234,6 @@ fn one_sweep_on_several_panes_is_one_render() {
 }
 
 /// And the panes that asked for nothing still get a picture.
-///
-/// **An invariant guard, not a regression test.** It holds with the
-/// suppression and without it — with it because the broadcast serves the panes
-/// that skipped, without it because each pane's own render serves it — so it
-/// pins no behaviour this change introduced. It is kept because it pins the
-/// half the change *leans* on: the broadcast in `poll_render_results` is the
-/// entire reason a suppressed pane is not simply a blank one, and if that half
-/// ever narrowed, the saving would silently become three blank panes of a
-/// four-pane split until something unrelated re-dispatched them.
 #[test]
 fn the_panes_that_asked_for_nothing_are_served_anyway() {
     const PANES: usize = 4;
@@ -341,20 +285,8 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
     }
 }
 
-/// The suppression is per picture, not per site: two panes wanting two
-/// different pictures of one volume still get two renders.
-///
-/// Both axes the key discriminates on, because a dedupe that collapsed either
-/// would leave a pane showing another product's or another tilt's field with
-/// nothing saying so.
-///
-/// **An invariant guard, not a regression test.** Two panes on different
-/// pictures got two renders before this change as well — the old path gave
-/// every pane its own — so it passes in both arms. What it is here for is the
-/// direction this mechanism could still be got wrong in: a key coarsened even
-/// slightly, on the raw elevation rather than the cache's slot, say, would
-/// suppress a render nothing was going to serve, and the symptom is a pane
-/// quietly showing another product's or another tilt's field.
+/// The suppression is per picture, not per site: two panes wanting two different pictures
+/// of one volume still get two renders.
 #[test]
 fn panes_wanting_different_pictures_each_get_one() {
     for (label, aim) in [
@@ -393,18 +325,8 @@ fn panes_wanting_different_pictures_each_get_one() {
     }
 }
 
-/// A render that answers releases the panes it was holding back — including
-/// when it answers with nothing.
-///
-/// This is the pairing the private field exists for. `render_finished` clears
-/// the flag and the key together; a path that cleared only the flag would leave
-/// every sibling deferring for ever to a render that had already answered, and
-/// the symptom would be panes that stay blank until the next volume.
-///
-/// A render that drew nothing is the case to test it on, because it is the one
-/// that leaves no cache entry behind: the siblings cannot be rescued by the
-/// cache hit at the top of the dispatch, so if the key were not cleared there
-/// would be nothing left to save them.
+/// A render that answers releases the panes it was holding back — including when it answers
+/// with nothing.
 #[test]
 fn a_render_that_answers_with_nothing_releases_its_siblings() {
     let (recorded, _worker) = recorder();
@@ -438,8 +360,8 @@ fn a_render_that_answers_with_nothing_releases_its_siblings() {
          set, so every pane wanting this picture will defer for ever to a \
          render that finished",
     );
-    // And the pane list agrees: with the key gone, the volume is asked for
-    // again rather than waited on.
+    // And the pane list agrees: with the key gone, the volume is asked for again rather
+    // than waited on.
     app.dispatch_pane_renders(&ctx);
     assert_eq!(
         posted(&recorded).len(),

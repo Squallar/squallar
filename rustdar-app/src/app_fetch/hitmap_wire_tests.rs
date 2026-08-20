@@ -1,20 +1,6 @@
-//! The two hit-map overlay dispatches — storm reports and GLM lightning —
-//! are **described jobs**, end to end, with the half of a hit map that cannot
-//! cross a message port captured at the dispatch and zipped at delivery.
-//!
-//! `spawn_overlay_render` used to route these kinds to `offload`'s opaque
-//! closure arm precisely because their `HitMap` owned an
-//! `Arc<dyn OverlayItem>` id map. The split — portable `HitCells` on the
-//! reply, id_map captured page-side — is what let them leave it, and these
-//! pin the replacement: the dispatch describes the kind's own input, captures
-//! `hit_items` beside it, and the shared deliver zips the reply's cells with
-//! exactly that capture — refusing, as a whole failed render, any reply whose
-//! cells do not fit the dispatch's own grid and items, because a hit map
-//! zipped across a mismatch is a hover that names the wrong report.
-//!
-//! The order-stability half of the zip contract — cells record row positions,
-//! so the id_map must be the same enumeration — is pinned with a shuffled-map
-//! negative control in `offload::tests`, beside the byte-parity gates.
+//! The two hit-map overlay dispatches — storm reports and GLM lightning — are **described
+//! jobs**, end to end, with the half of a hit map that cannot cross a message port captured
+//! at the dispatch and zipped at delivery.
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
@@ -23,8 +9,8 @@ use rustdar_overlays::render::rasterize::HitCells;
 use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
-/// A sink that records what the funnel hands it and takes every job — each
-/// test file owns its double; see `sites_wire_tests`.
+/// A sink that records what the funnel hands it and takes every job — each test file owns
+/// its double; see `sites_wire_tests`.
 struct RecordingPort {
     taken: Arc<Mutex<Vec<(u64, rustdar_worker::offload::JobRequest)>>>,
 }
@@ -40,9 +26,9 @@ impl rustdar_worker::offload::JobSink for RecordingPort {
     }
 }
 
-/// A sink that refuses every job, so the funnel runs it here — which drives
-/// the **whole** described path, dispatch through `execute` through the
-/// shared deliver, on this thread, and lands the response on the channel.
+/// A sink that refuses every job, so the funnel runs it here — which drives the **whole**
+/// described path, dispatch through `execute` through the shared deliver, on this thread,
+/// and lands the response on the channel.
 struct RefusingPort;
 
 impl rustdar_worker::offload::JobSink for RefusingPort {
@@ -58,11 +44,6 @@ impl rustdar_worker::offload::JobSink for RefusingPort {
 /// The id_map argument's shape, named once for the deliver-level cases below.
 type IdMap = Option<Vec<Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>>;
 
-/// The codec-row label whose input type `job` carries — the naming half the
-/// deleted `OverlayJobInput` match used to provide, restated over
-/// `downcast_ref` so a dispatch that described another kind's input is still
-/// caught by name. All seven texture inputs are listed; an input no row
-/// claims panics.
 fn described_label(job: &rustdar_source::job::DescribedJob) -> &'static str {
     use rustdar_overlays::render::rasterize as rz;
     if job.downcast_ref::<rz::ReportsInput>().is_some() {
@@ -103,10 +84,6 @@ fn a_render_request() -> super::OverlayRenderRequest {
     }
 }
 
-/// Give `app`'s registry the smallest data `kind`'s handler will describe:
-/// two rows at well-separated in-box positions, so both markers draw and the
-/// delivered hit map has two distinct identities to answer with. Through
-/// `apply_fetch_result` — the same door a live fetch uses.
 fn seed(app: &mut crate::app::App, id: &LayerId) {
     use rustdar_overlays::render::handlers::reports::StormReportsFetchResult;
     let data: rustdar_overlays::render::overlay_state::FetchPayload = match id {
@@ -136,9 +113,9 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
             use rustdar_overlays::glm::{
                 GlmDataLevel, GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, RecordDrops,
             };
-            // Real clock reads, because the dispatch captures its own
-            // `Utc::now()` into the context: seconds-old flashes sit far
-            // inside the handler's 300 s default window on any run.
+            // Real clock reads, because the dispatch captures its own `Utc::now()` into the
+            // context: seconds-old flashes sit far inside the handler's 300 s default
+            // window on any run.
             let now = chrono::Utc::now().naive_utc();
             let flash = |age_secs: i64, lat: f64, lon: f64| GlmFlash {
                 lat,
@@ -172,8 +149,6 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
         kind: id.clone(),
         data,
     });
-    // Keep the pane's stored per-layer config in step with the handler —
-    // `polygon_wire_tests::seed` says why.
     let configs = app.gui.overlays.save_pane_configs();
     if let Some(pane) = app.gui.pane_mut(0) {
         pane.overlay_configs = configs;
@@ -188,10 +163,6 @@ fn in_flight(app: &mut crate::app::App, id: &LayerId) -> bool {
         .render_in_flight
 }
 
-/// Each hit-map kind's dispatch posts **one described job** carrying **its
-/// own input variant**, what it posts survives its own wire round trip, and
-/// the pane is marked in flight — the walk `polygon_wire_tests` makes, on the
-/// two kinds that used to be the documented reason this path could not exist.
 #[test]
 fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
     let taken = Arc::new(Mutex::new(Vec::new()));
@@ -214,8 +185,6 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
              an inline gesture-end rasterization",
         );
         let (_, request) = &posted[before];
-        // The envelope destructure is irrefutable since WO-M7.2; the typed
-        // downcast below is what proves the dispatch posted this kind.
         let rustdar_worker::offload::JobRequest { geometry, job } = request;
         assert_eq!(
             (geometry.width, geometry.height),
@@ -247,11 +216,6 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
     }
 }
 
-/// The whole described path, end to end, for a hit-map kind: dispatch,
-/// `execute`, the shared deliver's zip — and a response whose hit map
-/// resolves probes to **the items this dispatch captured**, with both seeded
-/// rows reachable. Driven by a refusing sink, so the funnel runs the job
-/// through the same `execute` a worker would call.
 #[test]
 fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
     let _guard = rustdar_worker::offload::install_test_worker(Box::new(RefusingPort));
@@ -319,11 +283,6 @@ fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
     }
 }
 
-/// The deliver's mismatch guards, each against the shape the reply would
-/// have if the two ends stopped being one build — and each answered as a
-/// **whole failed render**, never as a picture with a wrong or missing hit
-/// map, with the positive control first so every refusal below is the
-/// mutation's doing.
 #[test]
 fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
@@ -335,8 +294,8 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
         .expect("items");
     let (width, height) = (64u32, 48u32);
     let rgba = vec![0u8; (width * height * 4) as usize];
-    // 64/4 × 48/4, with one occupied cell naming item 1: the shape `execute`
-    // really answers for this plan.
+    // 64/4 × 48/4, with one occupied cell naming item 1: the shape `execute` really answers
+    // for this plan.
     let cells = |idx: u32, id: u32| {
         let mut occupied = std::collections::HashMap::new();
         occupied.insert(idx, vec![id]);
@@ -372,8 +331,8 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             .expect("every deliver answers, failure included")
     };
 
-    // The positive control: a reply of this dispatch's own shape zips, and
-    // the zipped map answers the item the cells name — at cell 33 = (1, 2).
+    // The positive control: a reply of this dispatch's own shape zips, and the zipped map
+    // answers the item the cells name — at cell 33 = (1, 2).
     let ok = deliver(
         Some(items.clone()),
         rustdar_overlays::render::rasterize::RasterizeOutput {
@@ -394,9 +353,9 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
         "the zipped map must answer the item the cells name",
     );
 
-    // Every mismatch: a grid that is not this dispatch's, an id past the
-    // captured items, cells without items, items without cells, and a
-    // buffer of the wrong length beside well-formed cells.
+    // Every mismatch: a grid that is not this dispatch's, an id past the captured items,
+    // cells without items, items without cells, and a buffer of the wrong length beside
+    // well-formed cells.
     let mismatches: Vec<(
         &str,
         IdMap,
@@ -412,7 +371,6 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                     height: 12,
                     cells: std::collections::HashMap::from([(33u32, vec![1u32])]),
                 }),
-                // The reply contract: pixels arrive premultiplied.
                 alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
@@ -422,7 +380,6 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: Some(cells(33, 2)),
-                // The reply contract: pixels arrive premultiplied.
                 alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
@@ -432,7 +389,6 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: Some(cells(33, 0)),
-                // The reply contract: pixels arrive premultiplied.
                 alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
@@ -442,7 +398,6 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: rgba.clone(),
                 hit_cells: None,
-                // The reply contract: pixels arrive premultiplied.
                 alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
@@ -452,7 +407,6 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             rustdar_overlays::render::rasterize::RasterizeOutput {
                 rgba: vec![0u8; 16],
                 hit_cells: Some(cells(33, 1)),
-                // The reply contract: pixels arrive premultiplied.
                 alpha: rustdar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
         ),
@@ -471,10 +425,9 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     }
 }
 
-/// The failure path closes the loop for the hit-map kinds the way it does
-/// for the polygon kinds: the worker dies with the job outstanding, and the
-/// image-less response — the only thing that clears the named panes'
-/// in-flight marks — reaches the channel.
+/// The failure path closes the loop for the hit-map kinds the way it does for the polygon
+/// kinds: the worker dies with the job outstanding, and the image-less response — the only
+/// thing that clears the named panes' in-flight marks — reaches the channel.
 #[test]
 fn a_dead_worker_unwedges_a_reports_pane() {
     let taken = Arc::new(Mutex::new(Vec::new()));

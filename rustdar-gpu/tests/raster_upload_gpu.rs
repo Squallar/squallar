@@ -1,33 +1,5 @@
 //! A banded upload puts the same bytes in the same places a single
 //! `write_texture` would have.
-//!
-//! `texture_upload`'s own tests are arithmetic over [`BandPlan`], which is where
-//! the interesting decisions are. Two things they cannot reach, and both of them
-//! fail silently:
-//!
-//! * **The stride.** `copy_buffer_to_texture` is held to
-//!   `COPY_BYTES_PER_ROW_ALIGNMENT` where `write_texture` repacks internally, so
-//!   the DMA route pads every row and the fallback does not. Get that wrong and
-//!   the picture shears progressively across each band — no panic, no validation
-//!   message, just a raster that looks like a torn page. A 7362 px surveillance
-//!   cut is 29448 bytes a row against a 29696-byte stride, so this is the
-//!   shipped shape rather than an edge case.
-//! * **The origin.** Each band lands at `y = rows already moved`, and an
-//!   off-by-one there stacks bands on top of each other or leaves gaps.
-//!
-//! So the raster here is deliberately **odd**: 3000 px is 12000 bytes a row
-//! against a 12032-byte stride, and 36 MB is more than one frame's budget on
-//! *either* route — five [`UPLOAD_BAND_BYTES`] bands, the last of them short.
-//! That is the smallest shape that exercises row padding, several bands, a
-//! short final band and more than one frame on both routes at once. Every texel
-//! is a function of its own coordinates, so a band landing at the wrong row or
-//! a row read at the wrong stride produces different bytes rather than the same
-//! byte.
-//!
-//! `#[ignore]`d, both of them: they need a real adapter, and CI has none.
-//!
-//! [`BandPlan`]: rustdar_gpu::egui_renderer::texture_upload
-//! [`UPLOAD_BAND_BYTES`]: rustdar_gpu::egui_renderer::texture_upload::UPLOAD_BAND_BYTES
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -39,9 +11,6 @@ use rustdar_gpu::staging_ring::STAGING_RING_FEATURE;
 const SIDE: usize = 3000;
 
 /// A device, with the staging ring feature or deliberately without it.
-///
-/// `None` when there is no adapter at all, which is the arm CI takes and the
-/// reason both tests are `#[ignore]`d rather than skipped silently.
 fn device(with_ring: bool) -> Option<(wgpu::Device, wgpu::Queue, bool)> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -75,8 +44,7 @@ fn texel(x: usize, y: usize) -> [u8; 4] {
         (x % 251) as u8,
         (y % 241) as u8,
         ((x * 7 + y * 13) % 239) as u8,
-        // Alpha stays opaque: `ColorImage::from_rgba_premultiplied` keeps the
-        // bytes as given, and a varying alpha would only test epaint.
+        // Alpha stays opaque: a varying alpha would only test epaint.
         255,
     ]
 }
@@ -134,11 +102,6 @@ fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture
 }
 
 /// Drive frames until the upload says it is done, and say how many it took.
-///
-/// The first frame carries the delta; the rest carry nothing, which is exactly
-/// what `end_pass_and_upload` does on a frame egui produced no new texture on.
-/// The bound is the liveness claim: a raster that never finished would hang the
-/// suite rather than fail it, so it fails it.
 fn run_to_completion(
     uploads: &mut TextureUploads,
     device: &wgpu::Device,
@@ -150,10 +113,8 @@ fn run_to_completion(
     let mut frames = 0;
     let mut pending = uploads.apply(device, queue, renderer, set);
     while pending {
-        // The half of `is_delivered` a pane's hold depends on, and the half
-        // nothing else would notice going wrong: while a band is still to move,
-        // the answer has to be *no*. A version that said yes early would read
-        // green everywhere and swap a pane onto a half-filled picture.
+        // While a band is still to move, `is_delivered` has to answer *no*, or
+        // a pane swaps onto a half-filled picture.
         if let Some(id) = watch {
             assert!(
                 !uploads.is_delivered(id),
@@ -176,11 +137,6 @@ fn run_to_completion(
 }
 
 /// Both routes put every texel exactly where a single `write_texture` would.
-///
-/// Parameterised over the ring rather than written twice, because the property
-/// is that the two routes **agree**: the DMA path pads each row to the copy
-/// alignment and the fallback does not, and the whole risk is that only one of
-/// them is right.
 fn every_texel_lands(with_ring: bool) {
     let Some((device, queue, has_ring)) = device(with_ring) else {
         eprintln!("no adapter; nothing to check");
@@ -198,14 +154,11 @@ fn every_texel_lands(with_ring: bool) {
         egui_wgpu::RendererOptions::default(),
     );
     // A real pass, not a bare `Context`: egui's font atlas is a 0x0 delta until
-    // one has been run, and `Renderer::update_texture` refuses to create a
-    // texture of that size. Production has always had a pass here — this is
-    // `end_pass_and_upload`'s own input, which is the point.
+    // one has been run, and `update_texture` refuses that size.
     let ctx = egui::Context::default();
-    // The adapter's limit, the way `EguiRenderer::new` hands it to
-    // `egui_winit::State`. egui's own default is the WebGL2 floor of 2048 and
-    // it *panics* on a larger `load_texture`, so a bare `RawInput` here would
-    // refuse the shape this test exists to check.
+    // The adapter's limit, as `EguiRenderer::new` hands it to
+    // `egui_winit::State`: egui's own default is the WebGL2 floor of 2048 and
+    // it *panics* on a larger `load_texture`.
     ctx.begin_pass(egui::RawInput {
         max_texture_side: Some(device.limits().max_texture_dimension_2d as usize),
         ..Default::default()
@@ -215,9 +168,8 @@ fn every_texel_lands(with_ring: bool) {
 
     let mut uploads = TextureUploads::new(&device);
     assert_eq!(uploads.has_ring(), with_ring);
-    // Before anything is filed the answer is no, which is what a pane asks on
-    // the frame it stages a hold — the delta is still in egui's
-    // `TextureManager` and `end_pass` has not handed it over yet.
+    // Before anything is filed the answer is no: the delta is still in egui's
+    // `TextureManager`.
     assert!(
         !uploads.is_delivered(handle.id()),
         "an id this module has never been shown reported delivered",
@@ -236,8 +188,7 @@ fn every_texel_lands(with_ring: bool) {
          the pane holding it would hold forever",
     );
 
-    // More than one, or the band budget is not doing anything and this test is
-    // checking a single `write_texture` under another name.
+    // More than one, or the band budget is doing nothing.
     assert!(
         frames > 1,
         "a {SIDE}px raster finished in one frame, so the {} bytes it carries did \

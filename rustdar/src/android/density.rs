@@ -6,9 +6,8 @@ use super::with_activity;
 pub(super) fn get_display_density() -> f32 {
     use jni::{jni_sig, jni_str};
 
-    // getResources is a Context method, so this worked on the Application too --
-    // but the Activity's Resources are the ones that track the current
-    // configuration, which is what a density reading wants.
+    // getResources is a Context method, so this worked on the Application too,
+    // but the Activity's Resources track the current configuration.
     with_activity(|env, activity| -> jni::errors::Result<f32> {
         // activity.getResources().getDisplayMetrics().density
         let resources = env

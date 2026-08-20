@@ -2,8 +2,6 @@
 //! `rustdar-app`, which must never name a per-OS type.
 
 use rustdar_app::platform::{PlatformBridge, RedrawWaker};
-// Only the android bridge drains channels since WO-RL-4 took the desktop
-// bridge's location channels into the facade.
 #[cfg(target_os = "android")]
 use rustdar_app::platform::drain_latest;
 
@@ -14,13 +12,9 @@ type InsetsQuerier = fn() -> (f32, f32, f32, f32);
 
 /// This machine's IANA timezone name, or `None` if it cannot be determined.
 ///
-/// Shared by all three native bridges, which answer this identically —
-/// `iana-time-zone` already covers Linux, macOS, Windows, Android and iOS, so
-/// there is nothing per-OS left for the bridges to decide.
-///
 /// A failure here is ordinary: a container with no `/etc/localtime`, or a `TZ`
 /// naming a POSIX offset rather than a zone. The caller falls back to its
-/// compiled-in default site, which is what it did before this existed.
+/// compiled-in default site.
 fn system_timezone() -> Option<String> {
     match iana_time_zone::get_timezone() {
         Ok(zone) => Some(zone),
@@ -31,27 +25,16 @@ fn system_timezone() -> Option<String> {
     }
 }
 
-// ── Desktop implementation ──────────────────────────────────────────────
+// ── Desktop implementation ──
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    /// Handed to the theme/back producers this bridge starts. The location
-    /// producers left with the location half (WO-RL-4): the facade's
-    /// `OsBackend` owns the OS provider AND the serial reader now, and gets
-    /// the app's wake through `LocationFacade::set_wake`.
+    /// Handed to the theme/back producers this bridge starts.
     redraw_waker: RedrawWaker,
 }
-
-// ── The OS location service left this file at WO-RL-4 ───────────────────
-//
-// The `OsLocation` wiring (provider + permission atomic + fix channel) and
-// the serial reader beside it live in `rustdar_location::os_location` as
-// `OsBackend` — the arm `create_location()` below hands the app inside its
-// `LocationFacade`. Every `target_os` left in this file says which *bridge*
-// exists, and not one of them says anything about location at all.
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Default for DesktopPlatform {
@@ -140,10 +123,8 @@ impl PlatformBridge for DesktopPlatform {
         false
     }
 
-    /// Handed over before any window exists, which is what [`RedrawWaker`]'s
-    /// slot is for. (The location facade takes the same wake through its own
-    /// `set_wake`, which is also what brings the OS provider up since
-    /// WO-RL-4.)
+    /// Handed over before any window exists, which is what [`RedrawWaker`]'s slot
+    /// is for.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
         self.redraw_waker = waker;
     }
@@ -155,32 +136,25 @@ impl PlatformBridge for DesktopPlatform {
     }
 }
 
-// ── Android implementation ──────────────────────────────────────────────
+// ── Android implementation ──
 
 #[cfg(target_os = "android")]
 pub struct AndroidPlatform {
-    /// Injected by `android::entry`: the read is a JNI call, and the bridge
-    /// stays `deny(unsafe_code)`-clean and host-testable by the injection rule
-    /// in `src/android/mod.rs`.
+    /// Injected by `android::entry`: the read is a JNI call, and the bridge stays
+    /// `deny(unsafe_code)`-clean by the injection rule in `src/android/mod.rs`.
     theme_detector: Option<fn() -> bool>,
     /// Theme changes from the poll thread `set_theme_detector` starts.
     theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
-    /// Injected by `android::entry`: the flag it reads is set by the JNI
-    /// callback `BackHandler.java` invokes on the UI thread (`android::back`).
+    /// Injected by `android::entry`: the flag it reads is set by the JNI callback
+    /// `BackHandler.java` invokes on the UI thread (`android::back`).
     back_press_taker: Option<fn() -> bool>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
-    // The location hooks and their fix receiver left at WO-RL-4: the JNI arm
-    // lives in `rustdar_location::android` (initialised once by the entry's
-    // `rustdar_location::android::init`), and the app polls it through its
-    // `LocationFacade`. The inversion rule in `src/android/mod.rs` still
-    // governs insets, theme and back — location's consumer is no longer this
-    // bridge at all.
     /// Handed to the theme poller below, so a light/dark switch noticed on that
-    /// thread gets a frame to be applied on. See [`RedrawWaker`].
+    /// thread gets a frame to be applied on.
     redraw_waker: RedrawWaker,
 }
 
@@ -243,11 +217,8 @@ impl PlatformBridge for AndroidPlatform {
         match self.theme_detector {
             Some(detect) => detect(),
             None => {
-                // Loud because the failure is invisible: a missing detector
-                // just looks like a working app to anyone not in dark mode, and
-                // there is no fallback -- NativeActivity never emits
-                // `WindowEvent::ThemeChanged`, so the poll channel is the only
-                // theme input here.
+                // Loud because the failure is invisible: NativeActivity never emits
+                // `WindowEvent::ThemeChanged`, so the poll is the only theme input.
                 log::warn!(
                     "no theme detector installed; assuming light. \
                      android_main must call set_theme_detector before run_app"
@@ -285,9 +256,8 @@ impl PlatformBridge for AndroidPlatform {
         true
     }
 
-    /// Taken before the theme poller is started, which is the only ordering
-    /// this bridge depends on: `android_main` calls `App::new` (which delivers
-    /// this) and only then `set_theme_detector` (which spawns the thread).
+    /// Taken before the theme poller is started, which is the only ordering this
+    /// bridge depends on.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
         self.redraw_waker = waker;
     }
@@ -304,9 +274,8 @@ impl PlatformBridge for AndroidPlatform {
     /// switch is only visible by re-reading `Configuration.uiMode` on a timer.
     fn set_theme_detector(&mut self, detector: fn() -> bool) {
         if self.theme_receiver.is_some() {
-            // Refuse rather than half-apply: assigning would leave the
-            // synchronous path on the new detector while the running thread
-            // keeps calling the old one.
+            // Refuse rather than half-apply: assigning would leave the synchronous path on
+            // the new detector while the running thread keeps calling the old one.
             log::warn!("theme detector already installed; ignoring the second one");
             return;
         }
@@ -319,8 +288,8 @@ impl PlatformBridge for AndroidPlatform {
             self.redraw_waker.clone(),
         ) {
             Ok(receiver) => self.theme_receiver = Some(receiver),
-            // Not fatal: `detect_dark_theme` still answers synchronously, so
-            // the app opens in the right theme, it just stops tracking changes.
+            // Not fatal: `detect_dark_theme` still answers synchronously; it just stops
+            // tracking changes.
             Err(e) => {
                 log::error!("could not start theme polling, theme will not track changes: {e}")
             }
@@ -334,24 +303,13 @@ impl PlatformBridge for AndroidPlatform {
     }
 }
 
-// ── iOS implementation ──────────────────────────────────────────────────
+// ── iOS implementation ──
 //
 // Compass and theme are still the next unit of work and are `None` here.
-// Location is the facade's business since WO-RL-4: `create_location()` below
-// hands iOS the same `OsBackend` the desktop gets, whose arm table selects
-// `apple` — CoreLocation is the same API on both. (The provider used to be
-// brought up from this bridge's `set_redraw_waker`; the note about
-// constructing CoreLocation before `UIApplicationMain` has run lives on
-// `OsBackend::set_wake`'s path now and is unchanged in substance: the main
-// thread is still the main thread, and the callbacks CoreLocation schedules
-// are delivered once UIKit starts spinning the loop.)
 //
 // There is no insets querier and must not be one: egui-winit already fills
 // `RawInput::safe_area_insets` on iOS. Android's side channel works around a
 // platform gap iOS does not have.
-//
-// Nothing will be injected here the way Android injects. That split exists
-// because Android's entry point is in another crate; iOS's is in this one.
 
 #[cfg(target_os = "ios")]
 pub struct IosPlatform {
@@ -379,8 +337,7 @@ impl IosPlatform {
         }
     }
 
-    /// UIKit points `HOME` at the app's sandbox container, so this needs no
-    /// `NSHomeDirectory` call and therefore no ObjC.
+    /// UIKit points `HOME` at the app's sandbox container, so this needs no ObjC.
     fn sandbox_subdir(rel: &str) -> Option<std::path::PathBuf> {
         std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rel))
     }
@@ -461,12 +418,9 @@ pub fn create_platform() -> DesktopPlatform {
     DesktopPlatform::new()
 }
 
-/// Create the platform-appropriate location facade (WO-RL-4): the arm is
-/// per-OS and feature-fenced inside rustdar-location, and this crate — which
-/// turns the fences on per target — is the one place that knows which arm to
-/// build. Desktop and iOS share `OsBackend` (its arm table selects the
-/// provider); Android's JNI arm requires `rustdar_location::android::init`
-/// first, which `android_main` has already run by the time it builds an app.
+/// Create the platform-appropriate location facade: the arm is per-OS and
+/// feature-fenced inside rustdar-location. Android's JNI arm requires
+/// `rustdar_location::android::init` first.
 #[cfg(not(target_os = "android"))]
 pub fn create_location() -> rustdar_location::LocationFacade {
     rustdar_location::LocationFacade::new(Box::new(rustdar_location::os_location::OsBackend::new()))
@@ -490,6 +444,3 @@ pub fn create_platform() -> IosPlatform {
     IosPlatform::new()
 }
 
-// The two provider-contract tests that lived here moved to
-// `rustdar_location::os_location::backend` with the wiring they test
-// (WO-RL-4).

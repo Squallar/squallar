@@ -1,24 +1,11 @@
 //! The model grid's windowed wire carry paints **the same bytes** as the
-//! whole grid — the rasterize-level half of the S5d parity story, whose
-//! wire-level half (through the codec, `execute_bytes` and the premultiply
-//! seam) is `rustdar_worker::offload::tests`.
-//!
-//! The claim under test is the one the transport decision stands on: the
-//! values outside [`projection_window`] are **dead to the raster**, so a
-//! dispatch that ships only the window's values — a few hundred KB at a
-//! storm-watching zoom against the 7.62 MB whole — has not changed the
-//! picture. "Dead" is asserted from both sides: the window form is
-//! byte-identical to the whole, a value moved *outside* the window moves
-//! nothing, and a value moved *inside* it moves the picture — so the equality
-//! is not a fixture too small or a viewport that misses the grid.
+//! whole grid.
 
 use super::lambert_fixture::lambert_grid;
 use super::*;
 use std::sync::Arc;
 
-/// A viewport over the grid's interior, sized so its projection window is a
-/// **proper** subset of the grid — asserted, not assumed: S5c's alignment pin
-/// passed vacuously on a fixture too small to express the property.
+/// A viewport over the grid's interior, sized so its projection window is a proper subset.
 fn fixture() -> (HrrrGridData, GeoBounds) {
     let grid = lambert_grid(97, 61, 0b0100_0000);
     let at = |i: usize, j: usize| grid.coords.at(j * grid.ni + i).expect("in range");
@@ -160,9 +147,7 @@ fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
 }
 
 /// The extent of the carried window is load-bearing: cut one ring tighter
-/// than [`projection_window`] says and the picture changes. This is the red
-/// light for an encoder that recomputed the window with different padding —
-/// the exact drift the carried-window design exists to prevent.
+/// than [`projection_window`] says and the picture changes.
 #[test]
 fn a_window_one_ring_too_tight_changes_the_picture() {
     let (grid, bounds) = fixture();

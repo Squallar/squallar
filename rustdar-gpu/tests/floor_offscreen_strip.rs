@@ -1,65 +1,6 @@
 //! Can a pane's map be drawn *only* into the mirror, and never onto the glass?
-//!
-//! This is the load-bearing question under "3D is a render mode of a map pane
-//! rather than a pane kind of its own". Today a 3D pane borrows another pane's
-//! render for its floor (`VolumePane::source_pane`), and the mirror pass copies
-//! that pane's rect. If the 3D view *is* the pane, the pane's rect is occupied
-//! by the volume, so the pane no longer emits map primitives for the mirror to
-//! copy — and the floor has nowhere to come from.
-//!
-//! The answer is that the map is drawn into an **off-screen strip**: a rect in
-//! egui's own coordinate space that lies *below* the frame. Two passes then see
-//! the same tessellated geometry differently, because they are handed different
-//! attachments:
-//!
-//! * the **screen** pass, whose attachment is the frame, scissors the strip to
-//!   zero height and skips it (`egui_wgpu::Renderer::render`, renderer.rs:515,
-//!   skips a zero-size scissor while still advancing the mesh iterators — the
-//!   same property the existing mirror filter is built on);
-//! * the **mirror** pass, whose attachment is the frame *plus* the strip, has
-//!   texels down there and draws it.
-//!
-//! No second `walkers::Map`, no synthetic projector, no per-layer floor
-//! compositor, and no hand-written rasteriser — the thing that was deleted once
-//! already and must not come back. The pane draws its map exactly once, with
-//! exactly the primitives, tile requests and layer ordering it draws today; only
-//! *where* it lands moves.
-//!
-//! # What each assertion is protecting
-//!
-//! The design has four premises, and three of them are the kind that are
-//! obviously true right up until egui changes its mind:
-//!
-//! 1. **egui does not cull geometry outside the screen rect.** It does not, but
-//!    an `egui::Area` *does* spend its first frame invisible working out its own
-//!    size, which would blank the floor for a frame every time a pane entered 3D
-//!    mode. A bare `Ui` on its own layer with the rect given up front has no
-//!    sizing pass, and [`the_strip_is_tessellated_on_its_very_first_frame`] is
-//!    what pins the difference — it asserts on frame **0**, deliberately.
-//! 2. **The screen pass drops it and the mirror pass keeps it**, purely from the
-//!    attachment size. See [`scissor`].
-//! 3. **Growing the mirror does not move the frame's own geometry**, so every
-//!    existing floor stays registered where it is. This is the same statement
-//!    the adaptive rung rests on (`egui_renderer::mirror`'s module doc): egui's
-//!    vertex shader divides by `size_in_pixels / pixels_per_point`, so a taller
-//!    attachment at the same scale simply has more texels underneath.
-//! 4. **A hidden map cannot swallow input.** The pointer is in frame
-//!    coordinates and the strip is not in the frame, so this is structural
-//!    rather than a suppression flag someone has to remember to set.
-//!
-//! # Why the scissor arithmetic is restated rather than called
-//!
-//! `egui_wgpu::ScissorRect` is private. So [`scissor`] restates it, on the
-//! precedent `tests/floor_alignment.rs` sets for `volume.wgsl`'s three lines of
-//! mapping: the restatement is honest because the *decision* it feeds — drawn or
-//! skipped — is asserted in both directions against real tessellator output.
 
 /// `egui_wgpu::ScissorRect::new`, restated. See the module doc.
-///
-/// Returns the scissor's width and height in texels. `egui_wgpu` skips the
-/// primitive when **either** is zero (`renderer.rs:515`), which is the whole
-/// mechanism: the same clip rect is a real scissor against one attachment and
-/// nothing at all against a smaller one.
 fn scissor(clip: egui::Rect, pixels_per_point: f32, size_in_pixels: [u32; 2]) -> (u32, u32) {
     let width = size_in_pixels[0] as f32;
     let height = size_in_pixels[1] as f32;
@@ -90,9 +31,6 @@ fn raw_input() -> egui::RawInput {
 
 /// The rect a pane's map is drawn into when the pane itself is showing a
 /// volume: the pane's own rect, moved a whole frame down.
-///
-/// A uniform translation rather than a packing, so two 3D panes can never
-/// collide and the mirror is bounded at twice the frame however many there are.
 fn strip_for(pane_rect: egui::Rect) -> egui::Rect {
     pane_rect.translate(egui::vec2(0.0, FRAME.y))
 }

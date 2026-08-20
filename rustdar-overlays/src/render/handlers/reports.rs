@@ -18,18 +18,12 @@ use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
-// `pub`, not `pub(crate)`, for `alert::NwsAlertFetchResult`'s reason: the
-// described-job dispatch tests in `rustdar-app` and the hit-map zip tests in `rustdar-worker` seed a
-// live registry through `apply_fetch_result`, and the payload type has to be
-// nameable where the test constructs it.
+// `pub`, not `pub(crate)`: the described-job dispatch tests in `rustdar-app`
+// and the hit-map zip tests in `rustdar-worker` construct this payload type.
 pub struct StormReportsFetchResult(pub Result<StormReportRound, crate::fetch_policy::FetchError>);
 /// [`Assembled`]: three CSVs, one per report kind, fetched independently and
 /// refused as a round only when **all three** failed. One failing arrives here
 /// as `Ok` with a whole kind of report absent from the map.
-///
-/// Observed: the tornado CSV answering 503 took every tornado report in the
-/// country off the map, byte-for-byte indistinguishable from a quiet day on
-/// every user-visible surface.
 ///
 /// [`Assembled`]: crate::fetch_policy::Assembled
 impl crate::fetch_policy::FetchRound for StormReportsFetchResult {
@@ -40,7 +34,7 @@ impl crate::fetch_policy::FetchRound for StormReportsFetchResult {
 pub(crate) struct StormReportItem {
     pub report: StormReport,
     /// The reports feed carries no IDs, so position in the fetch is the only
-    /// identity available. It is what `matches()` and the hit map both key on.
+    /// identity available — what `matches()` and the hit map both key on.
     pub index: usize,
 }
 
@@ -56,24 +50,14 @@ impl OverlayItem for StormReportItem {
             StormReportKind::Hail => "Hail",
             StormReportKind::Wind => "Wind",
         };
-        // The feed gives HHMM with no date, so local conversion has to assume
-        // today's date.
+        // The feed gives HHMM with no date, so local conversion assumes today.
         //
-        // Four ASCII digits, which is what "the feed gives HHMM" means, tested
-        // as such rather than as a byte count. `time` is a field of the SPC
-        // reports CSV and nothing between the fetch and here checks its
-        // charset, so `len() == 4` admitted two different wrong values: "1é2"
-        // is four bytes and `&time[..2]` split `é` down the middle — a panic in
-        // `popup_content`, on the render thread, taking the app rather than the
-        // overlay — and "éé" is four bytes that split *legally* into a clock
-        // reading "é:é". The digit test rejects both, and anything it rejects
-        // is shown below exactly as the feed sent it, which is the only place
-        // the user can see that it was unreadable.
+        // Four ASCII *digits*, not four bytes: `time` is a CSV field whose
+        // charset nothing checks, and `len() == 4` admitted "1é2" (where
+        // `&time[..2]` split `é` down the middle — a panic on the render thread,
+        // taking the app) and "éé" (four bytes that split *legally* into a clock
+        // reading "é:é"). Anything rejected is shown below as the feed sent it.
         let is_hhmm = report.time.len() == 4 && report.time.bytes().all(|b| b.is_ascii_digit());
-        // `split_at_checked` even so. The digit test above already makes the
-        // split legal, and it costs nothing to have the total form guard it
-        // anyway rather than leave the next edit to this line one condition
-        // away from the panic it replaced.
         let split = is_hhmm.then(|| report.time.split_at_checked(2)).flatten();
         let formatted_time = if let Some((hh, mm)) = split {
             let hhmm = format!("{hh}:{mm}");
@@ -105,12 +89,8 @@ impl OverlayItem for StormReportItem {
             let mag_text = match report.kind {
                 StormReportKind::Tornado => format!("F/EF Scale: {mag}"),
                 // Hundredths of an inch on the wire (`StormReport::magnitude`).
-                // The precision comes from the unit rather than being fixed at
-                // hundredths, so a report reads `1.75"`, `4.4cm` or `44mm` and
-                // not `44.45mm` — a hundredth of a millimetre nobody estimated.
-                // Same rule as the MEHS readout (`RadarProduct::format_value`),
-                // so the two hail sizes a pane can show agree about how precise
-                // a hail size is.
+                // The precision comes from the unit, the same rule as the MEHS
+                // readout (`RadarProduct::format_value`).
                 StormReportKind::Hail => {
                     let inches = (mag / 100.0) as f32;
                     let converted = prefs.hail_size.convert_from_inches(inches);
@@ -165,19 +145,11 @@ impl StormReportsHandler {
         }
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder
-    /// `prepare_job` answers from, kept a private helper so a second dispatch
-    /// path could not quietly capture different state.
-    ///
-    /// The rows are [`rasterize::ReportPaint`], not whole [`StormReport`]s:
-    /// the kind and the coordinates are everything the raster reads, and the
-    /// described job serialises this struct onto a message port — the time,
+    /// What the rasterizer reads, captured once. The rows are
+    /// [`rasterize::ReportPaint`], not whole [`StormReport`]s: the time,
     /// magnitude and comments are popup content the raster never draws.
-    ///
-    /// **Row `i` is `state.data[i]`'s report**, which is the same indexing
-    /// [`Self::hit_items`] answers — one iteration order, stated in both
-    /// places, because a hit-map id is a position in this list and the item
-    /// it resolves to is the same position in that one.
+    /// **Row `i` is `state.data[i]`'s report**, the indexing
+    /// [`Self::hit_items`] answers.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::ReportsInput> {
         if self.state.data.is_empty() {
             return None;
@@ -233,7 +205,6 @@ impl OverlayHandler for StormReportsHandler {
         self.enabled = enabled;
     }
 
-    /// E.g. `"27 reports"` — today's filtered report count.
     fn status_line(&self) -> Option<String> {
         if !self.enabled {
             return None;
@@ -289,14 +260,10 @@ impl OverlayHandler for StormReportsHandler {
         match fetch.0 {
             Ok(round) => {
                 log::info!("Received {} storm reports", round.reports.len());
-                // The coverage report travels with the data it describes.
-                // `fetch_storm_reports` refuses the round only when **all
-                // three** CSVs failed, so one or two failing arrives here as
-                // `Ok` — a good answer with a whole kind of report absent from
-                // it, which is the coverage axis and not the health one. It
-                // used to go through `set_data`, which declares an answer
-                // whole, so every tornado report in the country could be off
-                // the map under a green `Updated 0s ago`.
+                // The coverage report travels with the data it describes:
+                // `fetch_storm_reports` refuses the round only when **all three**
+                // CSVs failed, so one or two failing arrives here as `Ok` with a
+                // whole kind of report absent — coverage, not health.
                 let coverage = round.completeness();
                 let items = round
                     .reports
@@ -308,16 +275,9 @@ impl OverlayHandler for StormReportsHandler {
             }
             Err(e) => {
                 log::error!("Storm reports fetch failed: {e}");
-                // **Undocumented behaviour, named rather than changed.**
-                // `spc::reports::fetch` errors only when all three CSVs failed,
-                // and this branch does not clear `state.data` — so a total
-                // outage leaves the previous poll's reports on the map instead
-                // of emptying it. Probably the better answer for a product that
-                // only accumulates through the day, but it does mean the map
-                // can be showing an hour-old report set that looks current.
-                // What makes that safe is the health note
-                // `OverlayRegistry::controls` now prepends for every layer;
-                // before it, this layer said nothing at all.
+                // **Undocumented behaviour, named rather than changed.** This
+                // branch does not clear `state.data`, so a total outage leaves
+                // the previous poll's reports on the map, which can look current.
                 self.state.record_failure(&e);
             }
         }
@@ -345,9 +305,8 @@ impl OverlayHandler for StormReportsHandler {
             .find(|row| row.label == "overlay/reports")
     }
 
-    /// Index-aligned with [`Self::paint_input`]'s rows: both iterate
-    /// `state.data` in order, so `hit_items()[i]` **is** the item whose
-    /// report travelled at row `i` — the invariant
+    /// Index-aligned with [`Self::paint_input`]'s rows: `hit_items()[i]` **is**
+    /// the item whose report travelled at row `i` — the invariant
     /// [`rasterize::HitMap::from_cells`] zips on.
     fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
         if self.state.data.is_empty() {
@@ -397,11 +356,8 @@ impl OverlayHandler for StormReportsHandler {
             enabled: self.enabled,
         }];
 
-        // Ungated on enabled (the every-option rule, M9.1): a hidden
-        // layer's options stay visible and editable - edits take effect
-        // when the eye shows it again - Refresh still fetches (nothing
-        // on the fetch path reads enabled), and the status lines keep
-        // reporting.
+        // Ungated on enabled: a hidden layer's options stay visible and
+        // editable, Refresh still fetches, and the status lines keep reporting.
         items.push(ControlItem::ButtonRow {
             buttons: vec![ControlButton {
                 id: "refresh",
@@ -465,14 +421,8 @@ mod tests {
     use rustdar_units::HailSizeUnit;
 
     /// A hail report's size reads in the user's hail-size unit, at the precision
-    /// that unit carries.
-    ///
-    /// This popup is the app's *other* hail size, beside the MEHS product's
-    /// readout, and it already converted; what it did not do was drop the two
-    /// decimals it needs for inches, so a millimetre reading claimed a hundredth
-    /// of a millimetre out of a size somebody estimated by eye against a golf
-    /// ball. The inches row is unchanged — `{:.2}` and the inch mark are what
-    /// this line has always printed for the default.
+    /// that unit carries: this popup converted but did not drop the two decimals
+    /// it needs for inches, so a millimetre reading claimed a hundredth of a mm.
     #[test]
     fn a_hail_reports_size_reads_in_the_users_hail_size_unit() {
         let item = StormReportItem {
@@ -513,16 +463,10 @@ mod tests {
 
     /// A report whose time field is multi-byte still opens its popup.
     ///
-    /// `time` is `parts[0]` of the SPC storm-reports CSV, trimmed and kept
-    /// verbatim — nothing between the fetch and here checks its charset. The
-    /// gate was `time.len() == 4`, in bytes, so `"1é2"` cleared it and
-    /// `&time[..2]` then split `é` down the middle. This is the worst-placed
-    /// of the family: `popup_content` runs on the render thread, so one row of
-    /// a public CSV took the whole app down, not one overlay.
-    ///
-    /// Both clocks are exercised because the local branch re-derives the same
-    /// two halves, and it was the branch a user with the default timezone
-    /// would land on.
+    /// The gate was `time.len() == 4`, in bytes, so `"1é2"` cleared it and
+    /// `&time[..2]` then split `é` down the middle — and `popup_content` runs on
+    /// the render thread, so one row of a public CSV took the whole app down.
+    /// Both clocks are exercised because the local branch re-derives the halves.
     #[test]
     fn a_report_whose_time_is_multibyte_still_opens_its_popup() {
         for time in ["1é2", "éé", "é", "🌀", "12é4", "20:5"] {
@@ -548,10 +492,6 @@ mod tests {
                     timezone,
                     ..UserPreferences::default()
                 };
-                // The assertion is that this returns at all. An unreadable
-                // time is shown as it stands rather than repaired: the popup
-                // is the only place the user can see the feed said something
-                // this build could not read.
                 let content = item.popup_content(&prefs);
                 assert!(
                     content.sections.iter().any(|section| matches!(
@@ -566,7 +506,7 @@ mod tests {
 
     /// The fix must not have stopped an ordinary HHMM being split into a clock.
     ///
-    /// Without this, the guard could reject every time and the test above would
+    /// Without this the guard could reject every time and the test above would
     /// still pass, leaving every report reading `2015 UTC` instead of `20:15`.
     #[test]
     fn an_ordinary_hhmm_still_reads_as_a_clock() {
@@ -615,8 +555,7 @@ mod round_tests {
     }
 
     /// Serve the three `today_*.csv` from loopback, so the round under test is
-    /// driven over a real socket rather than around it. The origin comes from
-    /// `DataSources::spc_base`, which the fetch never spells.
+    /// driven over a real socket. The origin comes from `DataSources::spc_base`.
     fn spc_serving(responses: Vec<(&'static str, String)>) -> rustdar_source::origins::DataSources {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -649,8 +588,6 @@ mod round_tests {
     const WIND: &str = "Time,Speed,Location,County,State,Lat,Lon,Comments\n\
          2020,60,MOORE,CLEVELAND,OK,35.34,-97.48,trees down\n";
 
-    /// Fetch over the socket and push the result through the production ingest
-    /// path, returning the row and the options note a user would see.
     fn round(responses: Vec<(&'static str, String)>) -> (Option<String>, Option<String>) {
         rustdar_source::tls::init();
         let client = reqwest::Client::builder()
@@ -686,13 +623,9 @@ mod round_tests {
     }
 
     /// **A CSV that would not load takes a whole kind of report off the map.**
-    ///
-    /// `fetch_storm_reports` refuses the round only when all three failed,
-    /// which is right — hail and wind reports are worth drawing without the
-    /// tornado CSV. What was wrong is that it then said nothing. Measured over
-    /// this socket against the shipped code: health `Ok`, `is_incomplete()`
-    /// false, no mark, a fresh clock, and the round byte-for-byte
-    /// indistinguishable from a whole one on every surface a user can see.
+    /// `fetch_storm_reports` refuses the round only when all three failed, which
+    /// is right; what was wrong is that it then said nothing — health `Ok`,
+    /// `is_incomplete()` false, no mark, a fresh clock.
     #[test]
     fn a_report_csv_that_would_not_load_marks_the_layer_and_names_the_kind() {
         let (line, note) = round(vec![
@@ -727,8 +660,7 @@ mod round_tests {
 
     /// A 404 is the SPC rebuilding `today_*.csv` for a kind with nothing in it
     /// yet, which is a **normal answer**. Marking the layer for it would put a
-    /// fault on the row on every quiet day, which is the failure mode in the
-    /// other direction and would teach a user to ignore the mark.
+    /// fault on the row on every quiet day.
     #[test]
     fn a_kind_with_nothing_reported_yet_is_not_a_fault() {
         let (line, note) = round(vec![
@@ -744,7 +676,6 @@ mod round_tests {
         assert_eq!(note, None, "a quiet day must not raise a note: {note:?}");
     }
 
-    /// The control: three CSVs answering carries no mark at all.
     #[test]
     fn a_whole_round_carries_no_mark() {
         let (line, note) = round(vec![
@@ -758,9 +689,8 @@ mod round_tests {
         assert_eq!(note, None);
     }
 
-    /// All three failing is still a failed round, on the health axis. The two
-    /// axes must not have swapped places: this one is stale, not incomplete —
-    /// the previous poll's reports stay on the map deliberately.
+    /// All three failing is still a failed round, on the health axis: this one
+    /// is stale, not incomplete.
     #[test]
     fn every_csv_failing_is_still_a_failed_round() {
         let (line, _) = round(vec![

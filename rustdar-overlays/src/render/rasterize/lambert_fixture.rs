@@ -3,9 +3,6 @@ use crate::hrrr::{GridCoords, ModelParameter, lambert::LambertGrid, summarize_va
 
 /// An `ni` x `nj` grid on HRRR's own Lambert projection and 3 km step.
 /// `scanning_mode` is HRRR's `0b0100_0000` unless a test wants another.
-///
-/// Values vary along both axes, so the painted output depends on *which*
-/// points were projected, not merely how many.
 pub(crate) fn lambert_grid(ni: usize, nj: usize, scanning_mode: u8) -> HrrrGridData {
     lambert_grid_stepped(ni, nj, scanning_mode, 3_000_000, 262_500_000)
 }
@@ -68,10 +65,6 @@ pub(crate) fn lambert_grid_stepped(
     }
 }
 
-/// The same grid with its coordinates materialised — which is both what the
-/// rasterizer did before the grid went lazy and the one `GridCoords` arm
-/// [`projection_window`] declines to narrow. So rasterizing this is the
-/// project-every-point reference, on bit-identical coordinates.
 pub(crate) fn materialised(grid: &HrrrGridData) -> HrrrGridData {
     let n = grid.ni * grid.nj;
     let (mut lats, mut lons) = (Vec::with_capacity(n), Vec::with_capacity(n));
@@ -87,11 +80,6 @@ pub(crate) fn materialised(grid: &HrrrGridData) -> HrrrGridData {
 }
 
 /// A box `cells` grid cells across, centred on grid point `(i, j)`.
-///
-/// Sized in *cells*, not in a fraction of the grid: the rasterizer's reach
-/// is 0.55 of a cell, so that is the unit the window has to be correct in,
-/// and a sweep stated as a fraction of the grid never reaches the regime
-/// where one cell covers the whole texture.
 pub(crate) fn box_of_cells(
     grid: &HrrrGridData,
     i: usize,
@@ -116,9 +104,7 @@ pub(crate) fn box_of_cells(
     }
 }
 
-/// Sub-cell offsets a viewport centre can land on, in cells. The aligned
-/// case is first and is the weakest; the rest are what actually exercise the
-/// margin.
+/// Sub-cell offsets a viewport centre can land on, in cells.
 pub(crate) const CELL_OFFSETS: &[(f64, f64)] = &[
     (0.0, 0.0),
     (0.5, 0.0),

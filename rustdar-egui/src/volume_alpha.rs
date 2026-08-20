@@ -1,42 +1,5 @@
 //! The Volume Alpha curve: a per-product opacity profile the user draws over
 //! the palette, GR2Analyst-style.
-//!
-//! # What this is
-//!
-//! The 3D raymarch colours a sample by fetching the grid's 256-entry palette
-//! LUT, and the entry's **alpha** is what decides how much of the storm that
-//! density hides. GR2Analyst's "Volume Alpha" window lets the user redraw that
-//! alpha as a freehand curve over the palette strip — strip the low dBZ haze
-//! off a supercell, or thin the mid-range until the hail core shows through.
-//! This module is that curve: the value model, the freehand-stroke editing
-//! rule, and the per-product store the UI and the config both read.
-//!
-//! # Where it applies, and where it deliberately does not
-//!
-//! The curve is applied at exactly one seam: the frontend's LUT upload, where
-//! the grid's own table is about to go to the GPU. Colour channels stay the
-//! palette's; only the alpha channel is replaced. Nothing upstream changes —
-//! not the wire, not the worker, not `rustdar-radar`'s tables — and nothing
-//! reaches the GPU-test instruments, which upload `VoxelGrid::lut()` directly
-//! and never see a `VolumeFrameState`.
-//!
-//! **An untouched editor is bit-exact.** "No curve stored" is a real state
-//! ([`AlphaCurves::get`] answers `None`), and the frontend uploads the grid's
-//! own LUT bytes unmodified in that state. The default curve the editor
-//! *shows* is seeded from the palette's own alpha, so drawing over one region
-//! and leaving the rest alone keeps the rest at the palette's values — which
-//! is the "per region of the value axis" behaviour the feature exists for.
-//!
-//! # Index 0 is no-data and cannot be made visible
-//!
-//! Palette entry 0 is the no-data index: `build_voxels` forces it transparent
-//! so unmeasured air draws nothing, and the raymarch's skip threshold sits
-//! above it. A curve that painted alpha onto entry 0 would resurrect
-//! unmeasured air as a visible shell around every storm — a fabricated
-//! picture. So [`AlphaCurve::from_alphas`] clamps entry 0 to zero at the only
-//! constructor, [`apply_stroke`] re-clamps after every edit, and the frontend
-//! forces it a third time at the upload. The editor says so in its UI text
-//! rather than silently eating the user's stroke.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,14 +10,6 @@ use rustdar_radar::types::RadarProduct;
 pub const CURVE_LEN: usize = 256;
 
 /// A user-drawn alpha curve over the 256-index value axis.
-///
-/// Cheap to clone and to compare: the alphas live behind an `Arc`, and
-/// equality takes the pointer fast path before it compares bytes — the
-/// frontend compares last frame's curve against this frame's on every frame,
-/// and re-uploads the LUT only when they differ.
-///
-/// Entry 0 is always 0. See the module doc: index 0 is no-data by design, and
-/// the constructor is where that is enforced.
 #[derive(Clone, Debug)]
 pub struct AlphaCurve(Arc<[u8; CURVE_LEN]>);
 
@@ -78,13 +33,6 @@ impl AlphaCurve {
     /// A grid table's alpha channel as a curve — what an untouched editor
     /// shows, and what a first stroke starts from. `None` unless `lut` is the
     /// exact 1024 bytes a `VoxelGrid::lut()` hands over.
-    ///
-    /// Those bytes are the plan-view palette's alpha **times the product's 3D
-    /// transparency profile**, not the palette's alpha. The distinction is not
-    /// pedantry: for ρHV at 0.99 the palette says 180 and the grid table says
-    /// 0, because uniform precipitation is exactly what that profile exists to
-    /// see through. Anything in this module that says "the palette's alpha"
-    /// means these bytes.
     pub fn from_palette(lut: &[u8]) -> Option<Self> {
         if lut.len() != CURVE_LEN * 4 {
             return None;
@@ -107,12 +55,6 @@ impl AlphaCurve {
     /// threshold is anchored at `(band + 0.5) / 255`, and the two producers of
     /// `band` must agree about what it counts or the march skips visible data
     /// on one path and pays for invisible shells on the other.
-    ///
-    /// All-transparent answers `u8::MAX`, which puts the threshold above every
-    /// representable index: the march skips everything and the pane is
-    /// honestly empty — the picture a fully-zeroed curve asks for.
-    ///
-    /// [`VoxelGrid::fade_band`]: rustdar_radar::voxel::VoxelGrid::fade_band
     pub fn fade_band(&self) -> u8 {
         match self.0.iter().position(|alpha| *alpha != 0) {
             // Entry 0 is clamped transparent, so the first visible entry is at
@@ -126,21 +68,6 @@ impl AlphaCurve {
 }
 
 /// One freehand stroke segment: rewrite the curve between two pointer samples.
-///
-/// `from` and `to` are `(index, alpha)` in curve units — index `0..=255`
-/// (fractional, straight off the pointer's x), alpha `0..=1`. Every integer
-/// index the segment crosses gets the segment's linearly interpolated alpha;
-/// **every index outside the crossed range is untouched**, which is the whole
-/// "redraw one region, keep the rest" contract. Order does not matter: a
-/// right-to-left drag is the same stroke.
-///
-/// The pointer path arrives as one segment per frame, so a whole drag is a
-/// chain of these calls — freehand, monotone in x within each segment, later
-/// segments overwriting earlier ones where the pointer doubles back.
-///
-/// Non-finite input writes nothing: the pointer cannot produce it, so
-/// anything non-finite here is a bug upstream, and a NaN must not be laundered
-/// into a `u8` by `as` saturation.
 pub fn apply_stroke(alphas: &mut [u8; CURVE_LEN], from: (f32, f32), to: (f32, f32)) {
     if ![from.0, from.1, to.0, to.1].iter().all(|v| v.is_finite()) {
         return;
@@ -173,13 +100,6 @@ pub fn apply_stroke(alphas: &mut [u8; CURVE_LEN], from: (f32, f32), to: (f32, f3
 
 /// Every product's user-drawn curve — the session state the editor edits, the
 /// frame reads, and the config persists.
-///
-/// Keyed by product from day one: only reflectivity renders in 3D today, but
-/// the products WP is next and a curve drawn for one moment must never apply
-/// to another. Absence is the meaningful default — a product with no entry
-/// renders through its grid table's own alpha, bit-exactly — the palette's
-/// alpha through the product's 3D transparency profile; see
-/// [`AlphaCurve::from_palette`].
 #[derive(Default)]
 pub struct AlphaCurves {
     curves: HashMap<RadarProduct, AlphaCurve>,

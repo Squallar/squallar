@@ -1,60 +1,23 @@
 //! What only a real GPU can say about the volume raymarch.
 //!
-//! Everything here is `#[ignore]`d and every test carries its own invocation.
-//! The attribute is about *this machine*, not about CI: a checkout on a box
-//! with no working Vulkan loader must still give a green `cargo test`, so the
-//! whole file is opt-in and nobody has to own a GPU to contribute.
-//!
-//! **CI opts in.** The `gpu` job in `test.yaml` installs `mesa-vulkan-drivers`,
-//! points the Vulkan loader at Mesa's lavapipe and runs this file with
-//! `-- --ignored`, so every test below is executed on every PR against a
-//! software rasteriser. Nothing here is any longer protected by hand alone.
-//!
-//! That the tests pass on llvmpipe is not incidental — it is checked, and it is
-//! the reason the job can exist on a runner with no graphics hardware. The
-//! adapter is named once per process on stderr, which is what `--nocapture` in
-//! that job is for: an adapter that quietly turned out to be a real GPU would
-//! leave the job green having tested something else entirely.
-//!
-//! Run the lot with:
+//! Everything here is `#[ignore]`d so a checkout on a box with no working
+//! Vulkan loader still gives a green `cargo test`; CI's `gpu` job opts back in
+//! on Mesa's lavapipe. The adapter is named once per process on stderr, which
+//! is what `--nocapture` is for — an adapter that turned out to be a real GPU
+//! would leave the job green having tested something else.
 //!
 //! ```text
 //! cargo test -p rustdar-gpu --test volume_gpu -- --ignored --nocapture
 //! ```
 //!
-//! **These tests hold a process-wide lock and therefore run one at a time**,
-//! whatever `--test-threads` says. Four of them creating four devices on one
-//! adapter and each blocking in `poll(wait_indefinitely)` deadlocked
-//! reproducibly on this box; serialising them is a fix rather than a
-//! workaround, and it costs nothing because the whole file runs in about a
-//! second.
-//!
-//! Serialised rather than sharing one device, because
-//! `the_pipelines_build_on_a_real_device` pushes an error scope, and error
-//! scopes are a per-device stack — a concurrent test's error would land inside
-//! it and be reported against the wrong thing.
-//!
-//! Four things are checked, and each is here because no host test can reach it:
-//!
-//! 1. **The pipelines build.** `create_render_pipeline` returns no `Result`, so
-//!    a shader a driver refuses surfaces asynchronously — which is why the
-//!    error scope, not the absence of a panic, is what is asserted.
-//! 2. **The march composites what the palette says.** A uniform grid must paint
-//!    its palette entry's own colour back out, which is the end-to-end check
-//!    that the decode/accumulate/encode round trip is a round trip.
-//! 3. **Opacity is per kilometre, not per box diagonal.** Spike 0a's first bug,
-//!    as a property rather than a source scan.
-//! 4. **The blit matches egui exactly, on both surface colour spaces.** Spike
-//!    0a's second bug. This is the measurement the counter-intuitive sRGB rule
-//!    rests on, and it is the only thing that can distinguish the rule from the
-//!    colour-theoretically correct version that measured 60/255 away from it.
+//! **These tests hold a process-wide lock and run one at a time**, whatever
+//! `--test-threads` says: four devices on one adapter each blocking in
+//! `poll(wait_indefinitely)` deadlocked reproducibly. Serialised rather than
+//! sharing one device because error scopes are a per-device stack.
 //!
 //! The adapter, the readback and the planted fixtures live in `gpu_harness`,
-//! shared with `volume_shader_mutants.rs` — the battery that proves the tests
-//! below can fail at all, by substituting one expression at a time into
-//! `volume.wgsl` and requiring a probe over these same fixtures to notice.
-//! Sharing is the point: a battery on its own fixtures would prove that some
-//! other rendering can detect a broken shader.
+//! shared with `volume_shader_mutants.rs` — the battery that proves these tests
+//! can fail at all, over these same fixtures.
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
@@ -75,10 +38,6 @@ use gpu_harness::{
 
 /// Open a pass that clears to opaque black, which is what `EguiRenderer::draw`
 /// does.
-///
-/// A macro rather than a function because `RenderPassDescriptor`'s
-/// `color_attachments` borrows a slice, and a function returning the descriptor
-/// would be returning a reference to its own temporary.
 macro_rules! clearing_pass {
     ($encoder:expr, $view:expr) => {
         $encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -101,16 +60,6 @@ macro_rules! clearing_pass {
 }
 
 /// Both pipelines build, on both surface colour spaces, with no device error.
-///
-/// The assertion is on the error scope rather than on the absence of a panic:
-/// `create_render_pipeline` returns no `Result`, and its errors arrive through
-/// the uncaptured sink, which in a plain test binary would be a panic on some
-/// other thread or nothing at all.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_pipelines_build_on_a_real_device -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_pipelines_build_on_a_real_device() {
@@ -141,18 +90,6 @@ fn the_pipelines_build_on_a_real_device() {
 }
 
 /// An offscreen is reused at the same size and rebuilt at a new one.
-///
-/// `ensure_offscreen` needs a device, so no host test can reach it — and its
-/// two failure modes are both quiet. Always rebuilding churns a pane-sized
-/// texture at the frame rate, which looks like a driver problem rather than an
-/// application one. Never rebuilding blits a stale texture at the wrong scale
-/// after a resize, which looks like a camera bug.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     an_offscreen_is_reused_at_one_size_and_rebuilt_at_another \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_offscreen_is_reused_at_one_size_and_rebuilt_at_another() {
@@ -189,21 +126,6 @@ fn an_offscreen_is_reused_at_one_size_and_rebuilt_at_another() {
 }
 
 /// A grid of one palette index paints that entry's own colour back out.
-///
-/// The end-to-end check on the colour round trip: the shader decodes the
-/// table's gamma-encoded entry to linear, accumulates, un-premultiplies,
-/// re-encodes and re-premultiplies. For a constant colour every one of those
-/// steps has to cancel exactly, so anything but the original bytes back is a
-/// broken conversion — and a broken conversion is a volume that is merely a bit
-/// dark, which nobody would report as a bug.
-///
-/// Also checks the empty-cell skip in the same shape: an all-zero grid must
-/// come back fully transparent rather than fully black.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     a_uniform_grid_paints_its_palette_colour -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_uniform_grid_paints_its_palette_colour() {
@@ -270,26 +192,6 @@ fn a_uniform_grid_paints_its_palette_colour() {
 
 /// The isosurface mode paints one opaque, lit surface at the threshold, and
 /// it reads the DATA, not the table's alpha.
-///
-/// The discriminating fixture: the filled grid's palette entry has **zero
-/// alpha**. The lit volume renders it as nothing at all — every absorbed
-/// contribution is scaled by the entry's alpha — while the isosurface must
-/// still paint an opaque, lit version of the entry's colour, because its
-/// threshold reads the interpolated index and its surface is opaque by
-/// construction. That is the "threshold reads the data, not the curve"
-/// doctrine, run on the GPU: a Volume Alpha curve (which rewrites exactly
-/// this alpha channel) can strip the lit volume to nothing and the
-/// isosurface must not move.
-///
-/// Lighting is asserted as a bound, not a value: the surface colour is the
-/// entry's times the half-Lambert wrap, which lives in
-/// `[ambient, 1] = [0.35, 1]` of the decoded colour.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone() {
@@ -383,29 +285,6 @@ fn grey_span(pixels: &[[u8; 4]], size: [u32; 2]) -> (u8, u8) {
 /// The isosurface sits where the value crosses the threshold, not where the
 /// sample comb happened to notice — which is what `refine_iso_hit`'s bisection
 /// is for, and what the one shipped isosurface test could not see.
-///
-/// That test fills the box uniformly, so its only crossing is the box's own
-/// entry face and `refine_iso_hit` is handed a degenerate interval: replacing
-/// its whole body with `return t_hi_in` passed 149/149 host, 11/11 GPU and
-/// 10/10 silhouette tests.
-///
-/// The fixture here is a graded field — four slabs whose index rises along the
-/// ray — read through a grey ramp table under ambient-only light, so a pixel's
-/// grey level *is* the index the surface was found at. Two things then follow,
-/// and each is a different half of the bug:
-///
-/// * the level equals the threshold, because that is where the field crosses
-///   it; and
-/// * every pixel agrees, because the sample comb is **jittered per pixel**
-///   (`interleaved_gradient_noise`), so an unrefined hit lands wherever that
-///   pixel's stratum fell and the surface comes back as speckle spanning a
-///   whole slab of index.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed() {
@@ -449,23 +328,6 @@ fn an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed() {
 /// A diverging isosurface is the level set of the **deviation** from its
 /// centre, so it draws both lobes — which is what `iso_field`'s fold is for,
 /// and what nothing measured.
-///
-/// Deleting that fold (`return index`) turned every diverging surface into a
-/// sequential one and passed the whole suite: the only isosurface test filled
-/// its box uniformly and set `iso_centre` to the sequential sentinel, so the
-/// fold was never taken.
-///
-/// Both fixtures start at the centre index at the box's near face and ramp
-/// *away* from it, one downward and one upward. Under the fold each finds its
-/// own lobe, at its own index, on its own side. Without it both collapse to
-/// "the first index over the threshold", which on either ramp is the very
-/// first sample — the centre value itself.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     a_diverging_isosurface_draws_both_lobes_of_its_own_field \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_diverging_isosurface_draws_both_lobes_of_its_own_field() {
@@ -513,38 +375,6 @@ fn a_diverging_isosurface_draws_both_lobes_of_its_own_field() {
 
 /// The isosurface excludes unmeasured air — the one contract
 /// `COVERAGE_FLOOR` exists for, and the one nothing measured.
-///
-/// `iso_hit_test`'s coverage term had no test at all: deleting it outright, or
-/// dropping `COVERAGE_FLOOR` from 0.5 to 0.0, passed the entire suite — 13/13
-/// here, 10/10 silhouette, 151/151 lib. The reason is that every isosurface
-/// fixture in this file is *fully covered* ([`slab_ramp`] fills every cell), so
-/// no iso test contained a single no-data cell and the term was never reached.
-///
-/// What the term prevents is stated in the shader and is worst for exactly the
-/// products that most need an isosurface. `field_at` of an all-air fetch is
-/// index 0 by the floored divisor, and `iso_field` folds that against the
-/// diverging centre, so:
-///
-/// * for a velocity-like product whose centre sits mid-ramp, air reads as a
-///   deviation of the whole half-ramp — a strong inbound crossing at the very
-///   first sample, which shrink-wraps the surface onto the *coverage cone* and
-///   hides the couplet inside it; and
-/// * for ρHV, whose centre sits at the **top** of its ramp, index 0 is the
-///   single most extreme value the field can produce — the largest possible
-///   hit, from the absence of data.
-///
-/// Both directions are rendered here. Each fixture puts two slabs of no-data
-/// air between the eye and the data, so a march without the coverage term takes
-/// its hit in the air at index 0 and the grey ramp reads back 0, while the
-/// honest surface reads back the index where the deviation actually reaches the
-/// threshold. The two are ~90 and ~190 grey levels apart, so neither mutation
-/// can survive as a tolerance argument.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     an_isosurface_excludes_unmeasured_air \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_isosurface_excludes_unmeasured_air() {
@@ -586,7 +416,6 @@ fn an_isosurface_excludes_unmeasured_air() {
             &device, &queue, &pipelines, cells, &indices, &lut, &uniform, size,
         );
         // `grey_span` asserts opacity, which is the first half of the claim:
-        // an air test that rejected too much would paint nothing at all.
         let (lo, hi) = grey_span(&pixels, size);
         let level = i32::from(lo) + (i32::from(hi) - i32::from(lo)) / 2;
         println!(
@@ -614,34 +443,6 @@ fn an_isosurface_excludes_unmeasured_air() {
 
 /// The isosurface keeps features narrower than the smoothing kernel — at the
 /// rung the region boxes actually ship.
-///
-/// This is the measurement behind `volume::bridge`'s isosurface exemption, and
-/// the reason the exemption is a line of code rather than a comment.
-/// `cloud_reconstruction_lod_for` returns the full `CLOUD_RECONSTRUCTION_LOD`
-/// for every cell size at or under 0.65 km, which is **both** shipped region
-/// rungs (a 60 km box is 0.23 km/cell, a 160 km one 0.625). At that level a
-/// lone measured voxel is an eighth of its coarse texel — coverage 32/255 =
-/// 0.125 — and a one-cell sheet is half of one, coverage 128/255 = 0.502. The
-/// shader's `COVERAGE_FLOOR` cut of 0.5 deletes the first outright and all but
-/// deletes the second.
-///
-/// Both fixtures are shapes a forecaster looks for: the lone voxel is a narrow
-/// hail core or an updraft tip, the one-cell sheet a bright band or a TDS
-/// shell. Losing them from the 3D surface while the 2D pane and the lit volume
-/// both still show them is the "3D erased a core the 2D pane shows" failure the
-/// occupancy mip and the LOD taper were both added to close.
-///
-/// So the isosurface marches the raw field, and this test pins both halves:
-/// the shipped configuration keeps the features, and the smoothed level is
-/// measured erasing them rather than left as an assertion in a comment. If the
-/// second assertion ever fails, the erasure has stopped being real and
-/// `volume::bridge`'s reasoning needs rewriting rather than relaxing.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
@@ -740,24 +541,6 @@ fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
 }
 
 /// Opacity is per kilometre travelled, not per box diagonal.
-///
-/// Spike 0a's first bug, as the property it actually breaks. On a
-/// 240 x 240 x 20 km box a vertical ray crosses 20 km and a horizontal one 240,
-/// so at 0.01 per km their alphas must be `1 - exp(-0.2)` and `1 - exp(-2.4)`.
-/// The 96-step discretisation drops out exactly — `(exp(-s*L/96))^96` is
-/// `exp(-s*L)` — so these are analytic values, not tolerances hiding a fudge.
-///
-/// With `dt * length(box_size_km)` instead, both rays would get the box's
-/// 340 km diagonal and both would read `1 - exp(-3.4) = 0.967`. The vertical
-/// one is the tell: 0.18 against 0.97 is not a subtle difference, which is
-/// precisely why it is worth having a test that can see it — on screen the
-/// whole volume simply looks denser.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     opacity_accumulates_per_kilometre_not_per_box_diagonal \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
@@ -812,54 +595,6 @@ fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
 }
 
 /// The blit composites exactly what egui would, on both surface colour spaces.
-///
-/// The measurement the whole colour design rests on. egui is driven for real —
-/// a `rect_filled` of a known `Color32`, tessellated and rendered by
-/// `egui_wgpu::Renderer` itself — and the blit is given the same premultiplied
-/// gamma bytes in its offscreen. Both composite over the same cleared target
-/// with the same blend state, so any difference in the two fragment shaders'
-/// conventions shows up as a per-channel delta.
-///
-/// **Zero is the bar**, not "close". The colour-theoretically correct sRGB blit
-/// — un-premultiply, decode, re-premultiply — measured 60/255 away here, which
-/// is why decoding the premultiplied value directly is what shipped.
-///
-/// Dithering is switched off on egui's side. It is *on* in production
-/// (`EguiRenderer::new` takes `RendererOptions`' default), and it adds
-/// sub-eight-bit noise to egui's own geometry — the blit does not dither and
-/// does not need to, because it is sampling an eight-bit texture rather than
-/// quantising a float. Leaving it on here would compare the blit against noise.
-///
-/// The comparison is on the rectangle's interior: `rect_filled` is feathered by
-/// about a pixel at its edges and the viewport is not, so the boundary is two
-/// different things by design.
-///
-/// The map floor stands under the volume — drawn only when the flag says,
-/// the right way up, and behind the volume's own opacity.
-///
-/// Four renders through one down-looking camera, each closing a mutation:
-///
-/// 1. A mirror bound but `map_floor` off: nothing paints. Removing the shader's
-///    `flags.w` gate fails here — and this is the instrument contract, since
-///    every mask harness renders with a floor-capable pipeline now.
-/// 2. Flag on over an empty grid: the whole footprint is the floor, opaque.
-///    Deleting the after-march composite fails here.
-/// 3. The floor's orientation: a red-north/blue-south mirror renders red at
-///    the top of the image. The floor is no longer *indexed* by the box, so
-///    this is the reprojection's own contract now: it is `floor_uv.w` being
-///    negative — v running down the mirror while Mercator y runs north — that
-///    keeps the map the right way up, and losing that sign renders it blue.
-///    See [`equatorial_floor_lanes`] for why the lanes make this a clean
-///    north-at-row-0 correspondence.
-/// 4. A saturating slab over the west half occludes the floor there and
-///    leaves it visible to the east: the floor is behind the volume, not
-///    over it.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_map_floor_stands_under_the_volume_and_only_when_asked \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
@@ -971,27 +706,6 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
 
 /// The floor and the volume agree, to the pixel, about where the weather
 /// stands.
-///
-/// The orientation case above is qualitative — red north, blue south. This is
-/// the quantitative seam: one voxel column and one mirror patch are planted at
-/// the **same box footprint cell**, each is rendered alone through the same
-/// down-looking camera, and their screen centroids must coincide within a
-/// pixel bound. Any offset, flip or scale disagreement between the volume's
-/// texture mapping and the floor's reprojection through `floor_uv`/`floor_geo`
-/// moves one centroid and not the other: flipping the sign of `floor_uv.w`
-/// alone moves the floor patch 36 px here.
-///
-/// The lanes are [`equatorial_floor_lanes`], so the mirror stands exactly over
-/// the box's footprint and the patch can be planted in mirror rows rather than
-/// in latitudes. What that buys is a *registration* instrument that is not also
-/// a projection instrument — the projection's own arithmetic is pinned on the
-/// host, per texel, in `tests/floor_alignment.rs`.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_floor_and_the_volume_put_the_same_weather_in_the_same_place \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
@@ -1115,28 +829,6 @@ fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
 }
 
 /// From under the box, the floor does not wall the volume off.
-///
-/// The composite draws the floor **in front** of the whole volume for an eye
-/// under the bottom plane — geometrically it is in front — but the user asked
-/// for the ground to become transparent from below, and the shader fades its
-/// coverage out over `FLOOR_BELOW_FADE` of eye depth. Two renders through an
-/// up-looking camera, one closing each half:
-///
-/// 1. A saturating slab in the box, floor on, eye well under the fade band:
-///    the slab's colour reaches the pixel — deleting the fade (coverage 1
-///    from below) walls it off with ground.
-/// 2. An empty grid, floor on, same eye: the pixel is fully transparent —
-///    compositing any residual ground from below fails here.
-///
-/// The eye-above cases are pinned by
-/// [`the_map_floor_stands_under_the_volume_and_only_when_asked`], which this
-/// change must leave bit-identical: above the plane the fade is exactly 1.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_floor_is_transparent_from_below \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_is_transparent_from_below() {
@@ -1216,14 +908,6 @@ fn the_floor_is_transparent_from_below() {
 }
 
 /// egui's own sRGB transfer functions, in Rust.
-///
-/// Line for line `volume.wgsl`'s `linear_from_gamma_rgb` and
-/// `gamma_from_linear_rgb`, which are themselves character for character
-/// egui's. Restated rather than approximated with a 2.2 power, because the
-/// expected values in [`the_floor_decodes_the_mirror_only_when_the_flag_says_to`]
-/// are the exact composition of the two and an approximation there would
-/// measure the approximation. (That test, like everything in this file, is
-/// `#[ignore]`d behind a real adapter.)
 fn linear_from_gamma(gamma: f64) -> f64 {
     if gamma < 0.04045 {
         gamma / 12.92
@@ -1243,32 +927,6 @@ fn gamma_from_linear(linear: f64) -> f64 {
 
 /// The mirror's encoding is a fact the shader has to be *told*, and
 /// `floor_geo.w` is what tells it.
-///
-/// Nothing else in this file can see this. `egui_wgpu` picks its fragment entry
-/// point once, from the **swapchain's** format, and that one pipeline is what
-/// draws the mirror — so whether the mirror holds gamma-encoded or linear texels
-/// depends on a format the volume code never sees, and a wrong guess yields a
-/// floor that is merely a bit too bright or too dark. No validation error, no
-/// crash, nothing to notice in a screenshot: exactly the class of defect that
-/// ships. Two renders of one mid-grey mirror, differing only in the flag:
-///
-/// 1. The flag set to what the mirror actually is — [`MIRROR_FORMAT`] is not
-///    sRGB, so its texels *are* gamma-encoded. The shader decodes them to
-///    linear, the march composites in linear, and the fragment re-encodes on
-///    the way out. Decode then encode is the identity, so the planted byte
-///    comes back unchanged.
-/// 2. The flag cleared — the lie. The gamma value is taken for linear and
-///    encoded a second time, and 128 comes back as 188.
-///
-/// Both colours of the red/blue fixtures above are fixed points of both
-/// transfer functions, which is precisely why every other floor test here is
-/// blind to this and why mid grey is the fixture.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_floor_decodes_the_mirror_only_when_the_flag_says_to \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_decodes_the_mirror_only_when_the_flag_says_to() {
@@ -1369,27 +1027,6 @@ fn the_floor_decodes_the_mirror_only_when_the_flag_says_to() {
 
 /// A box footprint that runs off the mirror composites nothing there, rather
 /// than smearing the mirror's border texel across the ground.
-///
-/// The mirror covers the **frame**, not the box, so a 3D pane aimed away from
-/// what its source map is showing — or simply reaching past its edge —
-/// reprojects part of its footprint outside 0..1. `floor_colour` returns
-/// transparent for that, and the alternative is not hypothetical: the floor
-/// sampler's address mode is `ClampToEdge`, so deleting the guard does not
-/// produce garbage, it produces the border texel repeated over however much of
-/// the box overran — which reads as real map. That is why the guard is a
-/// `return` and not a clamp, and it is the one thing about the mirror's finite
-/// extent no host test can observe.
-///
-/// One render of a wall-to-wall opaque mirror with `floor_uv.x` pushed a
-/// quarter of a mirror east, so `u` runs 0.25..1.25 across the box and the
-/// eastern quarter of the footprint is off the picture. The west must be
-/// ground and the east must be nothing.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it() {
@@ -1427,9 +1064,6 @@ fn the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it() {
         &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
     );
     // Both samples on the middle row, where v is comfortably inside the mirror:
-    // hit.x = 0.25 (u = 0.5, well on) and hit.x = 0.875 (u = 1.125, well off),
-    // far enough either side of the 0.75 seam that no sampling wobble reaches
-    // them.
     let row = size[1] / 2;
     let west = pixels[(row * size[0] + size[0] / 4) as usize];
     let east = pixels[(row * size[0] + 7 * size[0] / 8) as usize];
@@ -1449,19 +1083,6 @@ fn the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it() {
 
 /// Where a ray from the standard down-looking fixture camera meets the floor
 /// plane, as a box coordinate.
-///
-/// [`box_from_clip_down`] is not orthographic: it unprojects the far plane onto
-/// `z = -1` while [`eye_outside`] sits at `z = 3`, so the ray reaches `z = 0`
-/// three quarters of the way along and the footprint the image spans is the
-/// middle 0.125..0.875 of the box, not the whole of it. Every "far corner"
-/// probe in this file is therefore at 0.872, not at 1.0, and a test that
-/// predicted a value at the box's true corner would be predicting for a pixel
-/// that does not exist.
-///
-/// Restating the *camera* here is not the restatement trap: what is under test
-/// below is the reprojection from box kilometres into the mirror, and this says
-/// only which box position the probe pixel is asking about. Get it wrong and
-/// the test fails loudly rather than passing vacuously.
 fn floor_hit_of_pixel(col: u32, row: u32, size: [u32; 2]) -> (f64, f64) {
     let ndc_x = 2.0 * (f64::from(col) + 0.5) / f64::from(size[0]) - 1.0;
     let ndc_y = 1.0 - 2.0 * (f64::from(row) + 0.5) / f64::from(size[1]);
@@ -1472,47 +1093,6 @@ fn floor_hit_of_pixel(col: u32, row: u32, size: [u32; 2]) -> (f64, f64) {
 
 /// `cos φ` is taken at **the pixel's own latitude**, not at the site's, and
 /// this is the one instrument in the tree that can tell the two apart.
-///
-/// # Why this test exists at all
-///
-/// The whole reason `floor_colour` reprojects per pixel — rather than mapping
-/// the box onto the mirror with a scale and a translate — is that the box's
-/// footprint is a *trapezoid* in longitude: a kilometre east is more degrees of
-/// longitude the further north you are. Taking `cos φ` at the site collapses
-/// that trapezoid into a rectangle, which is exactly zero error at the box
-/// centre and up to 7.6 km of east-west drift at the corners of the shipped
-/// 460 km box, growing with latitude. A forecaster registering a hook echo
-/// against a town gets it 8 km off, and this repo has already shipped a
-/// misregistration of precisely this class once.
-///
-/// Nothing else could see it. `tests/floor_alignment.rs` scores a **CPU
-/// restatement** of this function, so mutating the WGSL leaves it green; every
-/// other GPU floor fixture here sits on the equator through
-/// [`equatorial_floor_lanes`], whose own doc admits the trapezoid is
-/// "deliberately absent"; and `tests/volume_real_mask.rs` drives a real
-/// latitude but writes a PPM and asserts nothing. Changing line 544 of
-/// `volume.wgsl` to `cos(radians(site_lat_deg))` passed all three suites.
-///
-/// # The fixture
-///
-/// A 45 °N site with the box's **west and south edges on the site** — 100 km
-/// east by 400 km north — so the probe pixel is 3.1 ° of latitude away from the
-/// site and `cos φ` has moved a long way. The mirror is a red ramp that is
-/// exactly linear in `u` over the half of it the footprint uses, so the byte
-/// read back *is* a measurement of `u`, to within the ramp's own 8-bit
-/// quantisation.
-///
-/// Two assertions, and the second is what makes the first mean anything:
-///
-///  1. the read-back matches the `cos`-at-pixel prediction to within 3;
-///  2. the two predictions are more than 8 apart, so the probe is demonstrably
-///     capable of telling them apart rather than agreeing with both.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_floor_takes_cos_at_the_pixels_latitude_not_the_sites \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
@@ -1544,11 +1124,6 @@ fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
     // below. Linear filtering between texels that lie on a line reproduces the
     // line, so the sample at any `u` in that half is `(u - 0.5) * 510` to
     // within the 8-bit rounding of the texels either side.
-    //
-    // 510 rather than 255: the footprint only ever uses the upper half of the
-    // mirror's `u`, so a ramp over that half alone has twice the sensitivity —
-    // which is what puts the two hypotheses more than 8 levels apart instead of
-    // 6. The lower half is never sampled; see the `u` bound asserted below.
     const MIRROR_W: u32 = 256;
     const MIRROR_H: u32 = 64;
     let ramp = |u: f64| ((u - 0.5) * 510.0).clamp(0.0, 255.0);
@@ -1569,8 +1144,6 @@ fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
 
     // `v` per unit of Mercator y: one whole mirror over the 40..50 °N span,
     // negative because `v` runs down the picture while Mercator y runs north.
-    // Derived from `mercator_y` rather than tabulated, for the same reason
-    // `equatorial_floor_lanes` derives its own.
     let v_per_mercator_y = -1.0 / (mercator_y(50.0) - mercator_y(40.0));
 
     let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
@@ -1647,39 +1220,6 @@ fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
 
 /// A **translucent** mirror composites at its own alpha, in both of the two
 /// encodings egui can have written it in.
-///
-/// # What this is the only coverage of
-///
-/// Every other mirror fixture in this file is fully opaque, and a fully opaque
-/// colour is the same four bytes premultiplied or straight — so deleting
-/// `floor_colour`'s `sample.rgb / sample.a` changes nothing anywhere else, and
-/// two doc comments here say as much. The one test translucent floor content
-/// ever had died with `volume_floor.rs`. What regresses without this: SPC
-/// outlook fills, warning and watch polygons, the range ring and the palette's
-/// faded low end all composite far too bright on the floor while looking right
-/// on the 2D pane beside it.
-///
-/// # Why both encodings, and why the arithmetic is not symmetric
-///
-/// egui premultiplies in **gamma** space and only then encodes
-/// (`egui-wgpu-0.35.0/src/egui.wgsl`): the gamma entry point writes
-/// `gamma(C) * A`, the linear one writes `linear_from_gamma_rgb(gamma(C) * A)`,
-/// alpha untouched in both. So the un-premultiply has to be taken in gamma
-/// space in *both* arms — dividing the linear texel by `A` and calling the
-/// result straight linear returns 0.428 where 1.0 is correct at `C = 1`,
-/// `A = 0.5`, which is what shipped. The arms are therefore fixtures that
-/// differ only in which of those two bytes is planted and what `floor_geo.w`
-/// says; both must recover the same white.
-///
-/// Straight white at half alpha is the maximally discriminating fixture:
-/// deleting the division reads back 64 in the gamma arm and 88 in the linear
-/// one, against 128 for both when it is right.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     a_translucent_mirror_composites_at_its_own_alpha \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_translucent_mirror_composites_at_its_own_alpha() {
@@ -1762,22 +1302,6 @@ fn a_translucent_mirror_composites_at_its_own_alpha() {
 /// The smoothed reconstruction really reaches the coarse level: a lone voxel
 /// paints a **wider** footprint through the cloud rung than through the raw
 /// field.
-///
-/// Two mutations this can see, and one it deliberately cannot:
-///
-/// * Deleting the mip-1 upload in `upload_volume` leaves level 1 zeroed
-///   (WebGPU zero-initialises textures), the LOD-1 render paints nothing,
-///   and the width assertion fails on an empty mask.
-/// * Writing the wrong bytes into the level — a stride or dimension error —
-///   moves or smears the footprint, which the width ratio bounds.
-/// * It cannot see the *default* leaking soft: that contract belongs to the
-///   silhouette harness's index-1 sphere, which this test leaves untouched.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_smoothed_reconstruction_spreads_a_lone_voxel \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
@@ -1838,47 +1362,6 @@ fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
 
 /// A grid uploaded **without** its coarse level marches the raw field at the
 /// cloud rung — the same image, pixel for pixel, as asking for level 0.
-///
-/// `volume::bridge::coarse_level_for` leaves the level out on every arm but
-/// one, so [`CoarseLevel::Omitted`] is what the shipped desktop default
-/// uploads: at the 460 km box the taper has already taken the reconstruction
-/// LOD to zero, and every other platform ceiling puts `GradientShading::Off`
-/// on the adapter. Nothing else in these suites renders through that arm —
-/// `raymarch_once` uploads at [`CoarseLevel::Built`] — which is what leaves
-/// two mutations of the omission alive that no host test can reach:
-///
-/// * **The descriptor allocating a level the write does not fill.** Level 1
-///   would exist and be zeroed (WebGPU zero-initialises), so a march at the
-///   cloud rung samples all-air through it and this fixture paints *nothing*:
-///   0 px of 4096. The saving would also not be a saving — the 4 MiB is still
-///   resident.
-/// * **The write not being gated with it.** A mip-1 `write_texture` against a
-///   one-level texture is a validation error raised inside
-///   `egui_wgpu::CallbackTrait::prepare`, which has no `Result` to carry it
-///   anywhere and no user-visible symptom on a driver that tolerates it. The
-///   error scope below is what makes it a failing assertion rather than a line
-///   in a log.
-///
-/// The equality is exact rather than tolerant because the clamp is exact:
-/// WebGPU clamps the sample level to the levels that exist, and with one level
-/// that is level 0 itself, not something very near it. `field_at`'s LOD is the
-/// only thing varying between the two renders — the step is held at the cloud
-/// rung's own for both — so a difference of any size is the texture, not the
-/// march.
-///
-/// # The control is not optional
-///
-/// A shader that had stopped reading `reconstruction_lod` at all would satisfy
-/// the equality for entirely the wrong reason. So the same fixture is rendered
-/// a third time at the same rung with the level *built*, and required to
-/// differ: that is the level being sampled, which is what makes the first
-/// comparison a statement about the omission rather than about a dead uniform.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
@@ -1946,8 +1429,6 @@ fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
          below is between two empty images",
     );
     // The first pixel that differs rather than `assert_eq!` on the images:
-    // equal is equal either way, and the two 4096-texel vectors an inequality
-    // prints are a hundred kilobytes that say less than this line does.
     let parted = raw
         .iter()
         .zip(&clamped)
@@ -1978,50 +1459,6 @@ fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
 /// The coverage-premultiplied reconstruction never paints a palette band the
 /// data does not occupy — the boundary-honesty contract behind the KLOT NROT
 /// green arcs, now discharged by the texture rather than by a nearest march.
-///
-/// The fixture is the defect's shape in miniature: a small block whose only
-/// data index is 147 (blue), over a LUT whose entries 1..=120 are opaque
-/// green — the stand-in for NROT's anticyclonic band, which really does sit
-/// under its cyclonic data on the one index ramp. A plain `R8Unorm` tent
-/// interpolates *indices*, so every sample in the one-cell shell between the
-/// block and empty air reads some index in (0, 147) and paints the green the
-/// field never contained; measured on KLOT 2026-08-10, a volume with 0-2
-/// honest green voxels rendered broad green arcs exactly this way.
-///
-/// With `R = coverage x index`, `G = coverage` and `index = R_bar / G_bar`,
-/// air contributes 0 to both sums and drops out of the mean, so every sample
-/// in that shell reconstructs to 147 exactly. The block may only ever paint
-/// its own blue — **at the same LOD 0 trilinear filter the old path painted
-/// green at**, which is the difference between this and the nearest march it
-/// replaces.
-///
-/// # The control, and why it is not optional
-///
-/// A green-free render proves nothing on its own: a camera that missed the
-/// boundary, or a march that never sampled the shell, would produce the same
-/// zero. So the same fixture is rendered a second time with every air cell
-/// replaced by [`CONTROL_AIR`] — a real index, so coverage is 1 everywhere and
-/// the tent blends it against 147 straight through the green run. That render
-/// **must** be green. It is the old defect reproduced through this very shader
-/// with coverage removed as the only variable, so it pins that the geometry,
-/// the camera and the march do reach the interpolation shell.
-///
-/// [`CONTROL_AIR`]'s own LUT entry is **transparent**, and that is the whole
-/// design of the control rather than an accident of it. With an opaque entry
-/// the outer air layer saturates on the first sample at this fixture's
-/// extinction and the render is uniformly green without the march ever
-/// reaching the data block — deleting the block from the control fixture
-/// changed nothing, so the control was inert, green by construction, and
-/// asserting on it pinned nothing. Transparent air makes the *only* possible
-/// green the interpolation shell between index 1 and index 147, which is the
-/// property the control claims. The opaque green run therefore starts at entry
-/// 2.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
@@ -2031,9 +1468,6 @@ fn coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
     const DATA: u8 = 147;
     /// The air replacement in the control: a real index below the green
     /// band, so coverage is 1 everywhere and the tent has a band to sweep.
-    ///
-    /// Its own LUT entry is transparent — see the doc comment. An opaque one
-    /// saturates the outer layer and the control never reaches the data.
     const CONTROL_AIR: u8 = 1;
 
     let (device, queue) = device();
@@ -2053,8 +1487,6 @@ fn coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
         indices
     };
     // The band under the data: opaque green, like NROT's anticyclonic run.
-    // It starts at 2, not at 1: entry `CONTROL_AIR` stays transparent so the
-    // control's air layer cannot saturate before the march reaches the shell.
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
     for entry in usize::from(CONTROL_AIR) + 1..=120usize {
         lut[entry * 4..entry * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
@@ -2280,30 +1712,6 @@ fn blitted(
 }
 
 /// **`release_pane` gives real GPU memory back, and only the pane's own.**
-///
-/// Here rather than in a host test because there is nothing to release without
-/// a device: the two maps `release_pane` empties hold a pane-sized colour
-/// attachment and an uploaded 3D texture apiece, and a test that could not
-/// allocate one would be asserting over two empty `HashMap`s — green whatever
-/// the function did. Both halves are driven and both are measured in bytes,
-/// through `VolumeResources::resident_bytes`.
-///
-/// The two halves fail differently and neither implies the other:
-///
-///  * the **offscreen** is keyed by pane, so releasing the wrong index frees a
-///    live pane's attachment and it is reallocated on the next frame — a
-///    pane-sized texture churned at the frame rate;
-///  * the **uploads** are keyed by the store's ids, and this is the *only*
-///    thing that frees a grid texture when the pane that went away was the last
-///    3D pane: no `prepare` runs again, so the 36 MiB stays for the session.
-///    The two uploads below are deliberately different shapes, so an inverted
-///    retain — which frees exactly as many bytes — is caught by *which* one
-///    survives rather than by how many did.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     release_pane_frees_that_panes_offscreen -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of() {
@@ -2400,30 +1808,6 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
 }
 
 /// `upload_volume_at` paints the same frame whichever route its plane took.
-///
-/// The exact texels the two routes write are compared in
-/// `volume::raymarch::staging::tests::the_two_routes_write_the_same_plane`,
-/// which owns its textures and can read them back. What *this* checks is the
-/// production wiring around them, which that test cannot see:
-///
-///  * that `upload_volume_at` reaches the ring at all on a device that has one
-///    — a `write_plane` that always answered `false` would leave every
-///    measurement in this campaign describing code nobody runs;
-///  * that the `write_texture` fallback still produces a correct volume, on
-///    the very same device, so the arm every WebGL2 browser takes is not
-///    covered only by adapters that cannot reach it;
-///  * and that the two are indistinguishable in the rendered frame, which is
-///    the only place a user could tell.
-///
-/// The fixture is a slab ramp read through a grey ramp table with ambient light
-/// only, so a pixel's grey level *is* the palette index the surface was found
-/// at: a plane that landed one slab out paints a visibly different grey rather
-/// than a subtly different one.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     both_upload_routes_paint_the_same_frame -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn both_upload_routes_paint_the_same_frame() {
@@ -2508,28 +1892,6 @@ fn both_upload_routes_paint_the_same_frame() {
 
 /// The `grid_from_box` affine really crops, and the bounds flag really stops
 /// the sampler smearing the grid's rim across ground the radar never reported.
-///
-/// # Why this needs a GPU at all
-///
-/// The affine's *arithmetic* is pinned host-side (`volume::bridge`'s
-/// `the_drawn_box_is_the_one_asked_for_and_the_crop_finds_it_in_the_grid`), and
-/// that the shader carries the two expressions is pinned by a source scan
-/// (`volume::uniform`'s `a_fresh_uniform_draws_the_grid_in_its_own_box`).
-/// Neither can see whether the numbers reach the fetch. Deleting the
-/// transform's use inside `field_at` — sampling `p` where the uniform said
-/// `t` — leaves both green, leaves the picture a plausible-looking storm, and
-/// makes a zoomed pane draw its whole held grid stretched across the box it was
-/// asked for instead of the part of it that box actually contains.
-///
-/// Both halves are measured against the **identity** render rather than against
-/// absolute figures, so nothing here is pinned to a shape, a camera or a
-/// palette that another test also owns.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
@@ -2550,14 +1912,6 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 
     // Looking down the vertical, so the painted count is the horizontal
     // footprint the crop is about and the vertical axis stays out of it.
-    //
-    // The eye is a hundred box-heights back rather than `eye_outside`'s three,
-    // which makes the projection all but orthographic: at three, rays converge
-    // hard enough that the whole frame maps into the middle half of the box at
-    // its top face, and every fixture below would saturate at 16384 px whatever
-    // the affine did. Nearly parallel rays make the painted count a plain
-    // measure of the footprint, so the ratios asserted are the areas they read
-    // as.
     let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
     uniform.box_from_clip = box_from_clip_down(2);
     uniform.eye_in_box = [0.5, 0.5, 100.0];
@@ -2574,10 +1928,6 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
     };
 
     // --- Zooming in: the drawn box is the middle half of the grid ---------
-    //
-    // Data in cells 4..12 on both horizontal axes — exactly the half the
-    // affine below selects — so at the identity it covers a quarter of the
-    // footprint and through the crop it covers all of it.
     let mut middle = vec![0u8; n];
     for z in 0..cells[2] {
         for y in 4..12 {
@@ -2608,10 +1958,6 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
     );
 
     // --- Zooming out: the drawn box reaches past the grid ------------------
-    //
-    // Every cell filled, so what lies outside the grid is the only thing that
-    // can differ: clamped, the rim texels paint the whole box; answered as
-    // air, only the middle quarter paints.
     let full = vec![255u8; n];
     let identity = painted(&full, &uniform);
 
@@ -2647,95 +1993,6 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 
 /// **What this crate charges for a resident grid is never under what the
 /// device reserved for it.**
-///
-/// The contract `volume::raymarch::grid_bytes_with_mips` states and, until the
-/// mip tail was counted, did not hold: an eviction figure that under-counts
-/// lets the store believe it is inside a budget it has already left. This is
-/// the only test in the workspace that can check it, because the only honest
-/// source for "what did the device reserve" is the device.
-///
-/// # How the real figure is read
-///
-/// `wgpu::Device::generate_allocator_report` returns one `AllocationReport` per
-/// live allocation, and `name` is the **texture label** — `wgpu-hal`'s Vulkan
-/// backend passes `TextureDescriptor::label` straight into the allocator — so
-/// `rustdar.volume.grid` picks the grid texture out and `size` is the
-/// `VkMemoryRequirements::size` the driver asked for. Nothing is inferred and
-/// nothing is scaled.
-///
-/// The report is `None` outside Vulkan and DX12 (wgpu 29.0.4), which is a skip
-/// rather than a failure: on those backends there is nothing to compare
-/// against, and the arithmetic is pinned by
-/// `volume::raymarch::tests::a_second_mip_level_is_charged_as_the_whole_pyramid`
-/// on every target regardless.
-///
-/// Both coarse arms and every shipped shape rung, plus one rung with a
-/// deliberately unaligned depth — `shape_for_budget` cannot produce one any
-/// more (`voxel::VERTICAL_AXIS_MULTIPLE`), and that is exactly why the charge
-/// has to stay right for one, or the constraint and the accounting could drift
-/// apart with nothing to notice.
-///
-/// # The margin is asserted, not just printed
-///
-/// `charged >= actual` is the contract, and on its own it let a claim rot in
-/// the doc it was written into: `volume::raymarch::grid_bytes_at` said the tile
-/// arithmetic reproduced the driver "exactly" on six shapes and came 512 B under
-/// on a seventh, while every rung this test drives was in fact 512 B under. The
-/// margin was never checked, so nothing noticed.
-///
-/// So the surplus is asserted too. **It is not one number**, and asserting that
-/// it was is what took this test red on CI: it was pinned at
-/// `TEXTURE_ALLOCATION_SLACK_BYTES - 512` — one page of slack less the constant
-/// an NVIDIA driver adds to every `D3` image — which is a property of *that
-/// vendor's layout* dressed up as a property of the charge. lavapipe runs
-/// 606,208 B over on the same rung and is not wrong to.
-///
-/// # Two layouts exist in the wild, so the layout is measured first
-///
-/// [`MipLayout`] is read off the device before any rung is charged, by naming a
-/// third mip level on a descriptor that already named two and seeing whether
-/// the reservation moves. Both readings below are from this campaign, same
-/// shape, `mip_level_count` swept 1 to 5:
-///
-/// | backend | 1 level | 2 | 3 | 4 | 5 |
-/// |---|---:|---:|---:|---:|---:|
-/// | RTX 3090, Vulkan 610.57.04 | 33,555,168 | 38,351,584 | 38,351,584 | 38,351,584 | 38,351,584 |
-/// | lavapipe, Mesa 26.1.6 | 33,554,480 | 37,748,776 | 38,273,064 | 38,338,600 | 38,346,792 |
-///
-/// So the charge's central assumption — a second level buys the whole pyramid,
-/// and past one the count stops mattering — is **NVIDIA's layout and not
-/// lavapipe's**. It is still the right thing to charge, because it is the
-/// larger of the two and this figure may only ever err upwards; what is wrong
-/// is asserting the *difference* as though it were fixed.
-///
-/// The surplus is therefore still pinned exactly, once per layout, which is
-/// what keeps this a measurement rather than a tolerance:
-///
-/// * [`MipLayout::WholePyramid`] — the model's arithmetic **is** the device's,
-///   so all that is left over is [`GRID_CHARGE_SURPLUS_BYTES`]. Uniform across
-///   shape, byte count and arm: twelve readings on the rungs below and twelve
-///   more on six further shapes swept down to 1×1×1, all 3,584.
-/// * [`MipLayout::NamedLevelsOnly`] — the device reserves the **payload of the
-///   levels the descriptor named**, exactly: no tiles, no per-image constant,
-///   nothing below them. That is asserted instead, and it pins the surplus just
-///   as tightly, at whatever the shape makes it: 4,096 B on a one-level
-///   descriptor and 81,920 B to 606,208 B on a two-level one.
-///
-/// What this arm deliberately does *not* do is bound `charged` against a
-/// tolerance. On a backend that does not tile, nothing about the device can
-/// bound the tile model — a 34-layer depth laid out as 48 is 41% of mip 0 that
-/// lavapipe simply does not reserve, and a bound loose enough to admit it would
-/// admit anything. The guard on the charge growing lives where it can run
-/// without an adapter: `volume::raymarch::tests::a_second_mip_level_is_charged_
-/// as_the_whole_pyramid` bounds it at 11/10 of the packed two levels and
-/// `a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip` pins the
-/// shipped shapes to the byte, on every target.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_charged_grid_bytes_are_never_under_what_the_device_reserved \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
@@ -2852,57 +2109,26 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
 /// [`MipLayout::WholePyramid`] backend: the 4,096 B page
 /// `volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES` adds, less the 512 B the
 /// driver adds to every `D3` image and the tile model does not name.
-///
-/// Constant across shape, byte count and mip level count — swept from 1×1×1 to
-/// 256×256×128 on an RTX 3090 — because neither term varies with any of them.
-///
-/// **Only on that layout.** Both halves are that vendor's: lavapipe adds no
-/// per-image constant, so its one-level descriptors run the full 4,096 B over,
-/// and its two-level ones run the uncounted pyramid over on top. See
-/// [`MipLayout`].
 const GRID_CHARGE_SURPLUS_BYTES: u64 = 4096 - 512;
 
 /// How a backend lays a mip-mapped `D3` image out — **two layouts exist in the
 /// wild**, and `volume::raymarch::grid_bytes_at` charges for the larger.
-///
-/// Which one a device uses is not knowable from the descriptor, so it is read
-/// off the device by [`probe_mip_layout`] rather than assumed. That is the
-/// difference between this test measuring the charge and it re-asserting one
-/// vendor's memory layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MipLayout {
     /// Naming a second level reserves the **whole pyramid** down to 1×1×1,
     /// whether or not anything ever writes to it — so past one level the count
     /// stops mattering. Measured on an NVIDIA RTX 3090, Vulkan, driver
     /// 610.57.04: identical reservations at `mip_level_count` 2 through 9.
-    ///
-    /// This is what the charge models, and it is the right one to model because
-    /// it is the larger.
     WholePyramid,
     /// Naming a second level reserves **those levels and nothing below them**,
     /// so every further level named costs its own bytes. Measured on Mesa's
     /// lavapipe (Mesa 26.1.6, LLVM 22.1.8) — which is the backend CI's `gpu`
     /// job runs on, so this arm is the one every PR exercises.
-    ///
-    /// The charge over-states here, by 1.6% to 2.3% of a shipped grid. Safe,
-    /// and measured rather than inferred: see the frame-count finding on
-    /// `constants::VOLUME_LOOP_TEXTURE_BUDGET_BYTES`.
     NamedLevelsOnly,
 }
 
 /// Read [`MipLayout`] off the device, by naming one more level than a
 /// descriptor already names and seeing whether the reservation moves.
-///
-/// The discriminator is a *threshold* rather than an equality because the same
-/// image measured twice on one device differs by up to 736 B according to
-/// whether the allocator gave it a fresh block or sub-allocated it. Level 2 of
-/// the probe shape is 65,536 B, so half of it is forty-four times that noise
-/// and there is nothing to tune. Measured: the two backends read so far come
-/// out at 0 B and 65,536 B of growth, one at each end.
-///
-/// The shape is a shipped rung (`constants::WASM_VOLUME_GRID_CELLS`) so that
-/// the probe cannot be measuring something the rungs below never do; 4 MiB,
-/// created twice and freed, once per process.
 fn probe_mip_layout(device: &wgpu::Device, queue: &wgpu::Queue) -> MipLayout {
     use rustdar_volumetric::VOLUME_TEXTURE_FORMAT;
 
@@ -2966,17 +2192,6 @@ fn probe_mip_layout(device: &wgpu::Device, queue: &wgpu::Queue) -> MipLayout {
 
 /// The payload of the mip levels a grid's descriptor names, packed: no tiles
 /// and no per-image constant.
-///
-/// The floor under any device's reservation — it has to store those texels —
-/// and, on a [`MipLayout::NamedLevelsOnly`] backend, measured to be the whole
-/// of it.
-///
-/// Deliberately its own arithmetic rather than a call into
-/// `volume::raymarch`: a figure the code under test computed would move with it,
-/// and there would be nothing left to compare. Only the *level count* is read
-/// from the crate ([`GRID_MIP_LEVELS`], through the same guard `grid_mip_levels`
-/// applies) — that is the descriptor's own field and asserting a stale copy of
-/// it would be asserting the wrong descriptor.
 fn named_level_payload(cells: [u32; 3], coarse: CoarseLevel) -> u64 {
     let levels = if coarse == CoarseLevel::Built && cells.iter().copied().max().unwrap_or(0) >= 2 {
         GRID_MIP_LEVELS
@@ -2995,53 +2210,6 @@ fn named_level_payload(cells: [u32; 3], coarse: CoarseLevel) -> u64 {
 }
 
 /// **Every pixel of a frame composites the floor on the same arm.**
-///
-/// The composite after the march has two arms — the floor under the
-/// accumulation for an eye above the bottom plane, over it (faded) for an eye
-/// below — and the design is that which arm runs is a property of the *frame*.
-/// It was not. The discriminant was `floor_t > span.x`: the ray's own crossing
-/// against the ray's own box entry, two quantities that vary per pixel and, at
-/// a grazing eye, land within a ULP of each other. Swept over 175 cameras, 68
-/// were not uniform, and one mixed visibly — `eye.z = -0.0703`,
-/// `floor_fade = 0.121`, 193 pixels behind and 1172 in front, in one frame.
-///
-/// # Why this is exact rather than a tolerance
-///
-/// Widening a tolerance is precisely what this must not do, so the test never
-/// compares a mixed frame against a threshold. It builds the shipped shader and
-/// two mutants of it — one whose arm is forced on, one whose arm is forced off
-/// — and requires the shipped frame to be **byte-identical** to one of the two.
-/// A frame that took one arm in some pixels and the other arm elsewhere matches
-/// neither, whatever the difference between them is worth in 8-bit levels. The
-/// forcing goes through [`VolumePipelines::from_shader_source`], the same seam
-/// `tests/volume_shader_mutants.rs` uses, so both arms are the shipped arms
-/// rather than a restatement.
-///
-/// # The sweep
-///
-/// A solid volume standing on an opaque floor — the two arms are algebraically
-/// identical over an empty box, so a fixture without a volume in it could not
-/// tell them apart at all — and the eye walked through the bottom plane in
-/// 0.002 steps, which puts forty cameras inside the 0.08 fade band and several
-/// on the crossing itself.
-///
-/// # What this half cannot do, and what stands under it instead
-///
-/// It is a behavioural check and it can only report what its own adapter does.
-/// The pre-fix shader was rebuilt through the same seam and run over this whole
-/// sweep on an RTX 3090 (Vulkan 610.57.04): **it was uniform on every one of
-/// the 78 cameras.** That driver evidently emits the same bits for `a / b` and
-/// `a * (1.0 / b)` at these inputs, so the ULP the old discriminant turned on
-/// never opened here. A defect that is invisible on the adapter in front of you
-/// is exactly the one a behavioural test cannot be the whole answer to, so the
-/// driver-independent half is
-/// `volume_shader::the_floor_composites_arm_is_a_property_of_the_frame`, which
-/// pins the arm's expression rather than its consequences and runs everywhere.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_gpu \
-///     the_floor_composites_on_one_arm_per_frame -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_floor_composites_on_one_arm_per_frame() {

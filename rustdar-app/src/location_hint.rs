@@ -1,29 +1,8 @@
 //! A coarse guess at where the user is, costing no permission prompt.
-//!
-//! The problem this solves is the first paint. Opening every user on one
-//! hardcoded site means most of them are looking at weather a thousand miles
-//! away, and the fix that would be exact — the Geolocation API — cannot run
-//! without a modal permission prompt that most people decline and that nobody
-//! wants before they have seen the app do anything.
-//!
-//! The IANA timezone is the useful middle. Every platform already knows it, it
-//! needs no permission and no network, it is available synchronously before the
-//! first frame, and it leaves the machine not at all. What it buys is a region,
-//! not a position: `America/Chicago` is one zone from the Gulf coast to the
-//! Canadian border. That is imprecise and it is still enormously better than
-//! defaulting a viewer in Minnesota to Oklahoma.
-//!
-//! So the hint is a *starting* site, never an override. Precedence is settled in
-//! the caller: a stored configuration always wins, this fills in only when there
-//! is nothing stored, and a real [`Fix`](rustdar_location::Fix) — which arrives
-//! only if the user has already granted location — supersedes it.
 
 use rustdar_location::coordinate_for_timezone;
 
 /// The radar site to open on for a device reporting IANA timezone `zone`.
-///
-/// `None` when the zone is unmapped, which leaves the caller on its compiled-in
-/// default rather than on a site derived from a guess.
 pub fn site_for_timezone(zone: &str) -> Option<&'static str> {
     let (lat, lon) = coordinate_for_timezone(zone)?;
     rustdar_radar::sites::nearest_wsr88d_site(lat, lon).map(|(site, _)| site.name)
@@ -33,36 +12,12 @@ pub fn site_for_timezone(zone: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// The radars these tests resolve against — [`crate::test_sites`], which
-    /// is the crate's one fixture network.
-    ///
-    /// # What the compiled-in table used to do here, and what replaced it
-    ///
-    /// Every assertion in this module used to run against the whole network,
-    /// because the whole network was a `const` in `rustdar-radar`. That let
-    /// four tests check the *anchors* rather than the mechanism: that every
-    /// zone resolves to something, that none is more than 400 km from a radar,
-    /// that the territories reach their own island's radar, and that no anchor
-    /// silently lands on the old hardcoded `KTLX`.
-    ///
-    /// A binary that carries no radars cannot check any of that hermetically,
-    /// and a fixture pretending to is worse than not checking: with fifteen
-    /// radars in the table, "every anchor is within 400 km of one" is false for
-    /// most of them and true for no interesting reason. So that work moved to
-    /// [`the_live_anchor_survey`], which fetches the real network and checks
-    /// all four properties at once, and what stays here is the mechanism: an
-    /// anchor resolves to the nearest **operational WSR-88D**, and anchors far
-    /// apart resolve to different radars.
+    /// The radars these tests resolve against — [`crate::test_sites`], which is the crate's
+    /// one fixture network.
     use crate::test_sites::install as install_radars;
 
-    /// The whole point of the feature, stated as a test: viewers in different
-    /// parts of the country get different radars, each the nearest to them.
-    ///
-    /// The expected identifiers are the fixture's, and each one is the nearest
-    /// fixture radar to that zone's anchor by a wide margin — so a wrong
-    /// anchor, a transposed coordinate or a broken nearest-search all still
-    /// fail here. What it no longer proves is that the anchor is right for the
-    /// *real* network; that is [`the_live_anchor_survey`].
+    /// The whole point of the feature, stated as a test: viewers in different parts of the
+    /// country get different radars, each the nearest to them.
     #[test]
     fn distinct_regions_get_distinct_sites() {
         install_radars();
@@ -72,12 +27,8 @@ mod tests {
         assert_eq!(site_for_timezone("America/Chicago"), Some("KLOT"));
     }
 
-    /// The territories are the case a CONUS-shaped assumption breaks: each
-    /// must resolve to its own island's radar, not to the mainland.
-    ///
-    /// They are the one group a small fixture still tests honestly, because
-    /// the property is that an island is nearer to itself than to a continent
-    /// — and that holds whether the fixture has eleven radars or two hundred.
+    /// The territories are the case a CONUS-shaped assumption breaks: each must resolve to
+    /// its own island's radar, not to the mainland.
     #[test]
     fn territories_resolve_to_their_own_radars() {
         install_radars();
@@ -86,16 +37,6 @@ mod tests {
     }
 
     /// An anchor resolves past a TDWR and past the ROC test bed.
-    ///
-    /// The two filters `nearest_wsr88d_site` applies, reached through the
-    /// route that actually uses them. Oklahoma City is the case that
-    /// exercises both at once: the literal nearest radar is the TDWR `TOKC`,
-    /// which has no Level II data, and the nearest WSR-88D is `KCRI`, which
-    /// scans to whatever the ROC is testing that day.
-    ///
-    /// There is no anchor at Oklahoma City — that is
-    /// `no_covered_zone_silently_resolves_to_the_old_default`'s business — so
-    /// this asks the coordinate directly.
     #[test]
     fn an_anchor_skips_the_tdwr_and_the_test_bed() {
         install_radars();
@@ -104,14 +45,7 @@ mod tests {
         assert_eq!(site.name, "KTLX");
     }
 
-    /// Nothing may resolve to the old hardcoded default by accident. KTLX is a
-    /// legitimate answer only for a zone anchored near Oklahoma, and no anchor
-    /// is.
-    ///
-    /// Weaker than it was — with eleven radars in the table, plenty of anchors
-    /// are nearest to `KTLX` simply because nothing else is close. So it is
-    /// asked of the four anchors the fixture genuinely covers, and asked of
-    /// the whole set by [`the_live_anchor_survey`].
+    /// Nothing may resolve to the old hardcoded default by accident.
     #[test]
     fn no_covered_zone_silently_resolves_to_the_old_default() {
         install_radars();
@@ -131,14 +65,6 @@ mod tests {
     }
 
     /// With no radars at all there is no hint, and no guess in place of one.
-    ///
-    /// The state a fresh install launches in, and the reason
-    /// `App::poll_site_catalogue` runs the hint again when the first catalogue
-    /// lands: `site_for_timezone` cannot answer here, and inventing an answer
-    /// would open the app on a radar it has no position for.
-    ///
-    /// Asserted against a table this test builds rather than the process one,
-    /// which a sibling has certainly populated by now.
     #[test]
     fn a_process_with_no_radars_offers_no_hint() {
         let empty = rustdar_radar::sites::build_table(std::iter::empty());
@@ -158,8 +84,8 @@ mod tests {
         assert_eq!(coordinate_for_timezone("Antarctica/Davis"), None);
     }
 
-    /// Empty and malformed input reach here from a browser that returns
-    /// something unexpected, and must be ordinary misses rather than panics.
+    /// Empty and malformed input reach here from a browser that returns something
+    /// unexpected, and must be ordinary misses rather than panics.
     #[test]
     fn junk_input_is_an_ordinary_miss() {
         install_radars();

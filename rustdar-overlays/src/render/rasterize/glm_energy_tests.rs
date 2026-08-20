@@ -107,7 +107,6 @@ fn unknown_energy_renders_larger_than_the_weakest_strike() {
     );
 }
 
-// ── Antimeridian ─────────────────────────────────────────────────────────
 
 /// Draw one flash at `lon` into a viewport spanning `min_lon..max_lon`, and
 /// return the painted-pixel count. Zero means the flash never reached the

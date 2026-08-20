@@ -1,27 +1,8 @@
-//! The typed Gui↔App seam (WO-E2): [`FrameInputs`] for snapshot-shaped facts
+//! The typed Gui↔App seam: [`FrameInputs`] for snapshot-shaped facts
 //! the App owns and re-states every frame, [`GuiEvent`] for event-shaped
 //! pushes applied at the call site's existing control-flow position. The
 //! out-direction, `GuiAction`, already had this shape and lives in
 //! [`crate::actions`]. The re-verbed `GuiAction` lands here at E5.
-//!
-//! The appliers — `Gui::apply` and `Gui::apply_frame_inputs` — live on
-//! `impl Gui` in the `ui` module, beside the state they write; this module
-//! holds the vocabulary both sides of the seam can name.
-//!
-//! # What deliberately did not become part of the seam
-//!
-//! Five `Gui` setters are not App-pushes and stay setters:
-//!
-//! * `set_live_chunks`, `set_chunk_notifications`, `set_notifier_endpoint` —
-//!   written by the settings UI and the config load, both inside this crate;
-//!   the frontend never calls them in production.
-//! * `set_section_draw_armed`, `set_region_pick_armed` — Gui-internal
-//!   interaction toggles whose mutual-exclusion bodies are the reason they
-//!   are setters at all; every caller is inside this crate (`pub(crate)`
-//!   since E2 Land 2).
-//!
-//! `Gui::set_initial_site` is also untouched: it is the config-load path,
-//! called once at startup, and dissolves at E6.
 
 use crate::actions::RadarConfig;
 use crate::ui::CurrentVolumeStamp;
@@ -30,10 +11,6 @@ use rustdar_radar::types::ScanInfo;
 
 /// One frame's facts, composed by the App from state it already owns, applied
 /// by `Gui::apply_frame_inputs` once per frame immediately before `Gui::ui`.
-///
-/// `chunk_status`/`current_volumes` are typed fields DELIBERATELY: E8
-/// replaces them with `sources: &[SourceLiveness]` when the radar root fields
-/// dissolve (adversary m7).
 pub struct FrameInputs<'a> {
     /// Safe-area insets in logical pixels (top, bottom, left, right).
     pub safe_area_insets: (f32, f32, f32, f32),
@@ -70,8 +47,6 @@ pub struct FrameInputs<'a> {
 /// at E5/E8.
 pub enum GuiEvent {
     /// A complete volume's scan info, for all panes viewing the site.
-    /// Replaces: ends the wait (spinner down, archive backoff reset) and
-    /// spends the one-shot zoom latch if any pane took it.
     ScanInfoForSite { site: String, info: ScanInfo },
     /// MERGE semantics, NOT replace — former `apply_chunk_scan_info` doc
     /// (partial volumes union products/elevations; no spinner/backoff touch).

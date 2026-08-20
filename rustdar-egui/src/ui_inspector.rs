@@ -1,31 +1,5 @@
-//! The inspector: one panel, three bodies — a layer's options, the active
-//! pane's properties, or the app's settings.
-//!
-//! One body set for every shell. On Expanded it floats at the map's top-right,
-//! mirroring the stack on the left; on Medium the same panel is a right
-//! slide-over; on Compact it is the phone sheet's Inspector page, in the slot
-//! `ui_sheet.rs` hands over. Closed by default at every width — the top
-//! bar's ⚙ toggle where the bar carries one, the bottom bar's Pane and App
-//! items on the phone, a stack row click and the menu's Settings… entry are
-//! the ways in, and `dismiss_top_layer` is the keyboard's way out.
-//!
-//! The crumb row names what the body is about — `Pane 2 › NWS Alerts`,
-//! `Pane 2 › Properties`, `App › Settings` — and the body arm is dispatched on
-//! [`InspectorSelection`]. Each arm writes its own literal into the probe's
-//! `mode`, the `PaneContentProbe` pattern: a mis-wired arm cannot fake having
-//! run.
-//!
-//! # One body per selection, one id scope per body
-//!
-//! The three bodies allocate very different widget counts, and they share one
-//! `Ui`. Each body renders inside its own explicit-id scope, so switching the
-//! selection cannot re-key the widgets of the body being switched *to* — the
-//! same reasoning as the kind scope inside the Pane-properties body, written
-//! out on [`render_pane_props_body`](super::Gui::render_pane_props_body).
-//!
-//! The panel is sized from the map explicitly per frame, not via
-//! `Area::default_size` — the same §5.9 fix as the stack; see `ui_stack.rs`'s
-//! module note for the mechanism.
+//! The inspector: one panel, three bodies — a layer's options, the active pane's
+//! properties, or the app's settings.
 
 use crate::actions::GuiAction;
 use rustdar_source::id::{LayerId, known};
@@ -33,37 +7,31 @@ use rustdar_source::id::{LayerId, known};
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState, map};
 
-/// Width of the inspector, in both its floating and slide-over forms — one
-/// value for the same one-id reason as [`super::ui_stack::STACK_WIDTH`].
+/// Width of the inspector, in both its floating and slide-over forms — one value
+/// for the same one-id reason as [`super::ui_stack::STACK_WIDTH`].
 pub(super) const INSPECTOR_WIDTH: f32 = 300.0;
 
 /// The inspector's inset from the map's top-right corner.
 pub(super) const INSPECTOR_INSET: f32 = 8.0;
 
-/// What the inspector leaves clear above the map's bottom edge — the same
-/// band the stack leaves (plan §1.4: same vertical insets).
+/// What the inspector leaves clear above the map's bottom edge — the same band the
+/// stack leaves (plan §1.4: same vertical insets).
 pub(super) const INSPECTOR_BOTTOM_CLEARANCE: f32 = 88.0;
 
 /// What the crumb row and its separator cost above the scroll body.
 const HEADER_ALLOWANCE: f32 = 40.0;
 
-/// The collapse button's glyph: the panel slides out to the right. `›`
-/// rather than the demo's `⟩`, which egui's bundled fonts do not carry (see
-/// `ui_glyphs.rs`) — and the crumb's own separator, which is the direction
-/// the panel leaves in.
+/// The collapse button's glyph: the panel slides out to the right.
 const COLLAPSE_LABEL: &str = "\u{203a}";
 
-/// The deselect button's glyph — back to App › Settings. `×`, not the
-/// uncarried `✕`, on the same grounds as the collapse.
+/// The deselect button's glyph — back to App › Settings.
 const DESELECT_LABEL: &str = "\u{d7}";
 
-/// Width of combo boxes inside the inspector — the layers panel's old value,
-/// kept with the `layers_` salts so the combos' stored state moved intact.
+/// Width of combo boxes inside the inspector — the layers panel's old value, kept
+/// with the `layers_` salts so the combos' stored state moved intact.
 const COMBO_BOX_WIDTH: f32 = 150.0;
 
-/// Id prefix for the product/tilt combos. Deliberately the prefix the layers
-/// panel always used: the widget state egui keyed on `layers_product_sel`
-/// belongs to the control, not to which panel is hosting it.
+/// Id prefix for the product/tilt combos.
 const LAYER_CONTROL_ID_PREFIX: &str = "layers_";
 
 /// What the inspector drew last frame, as it was drawn.
@@ -74,8 +42,8 @@ pub(crate) struct InspectorProbe {
     pub rect: egui::Rect,
     /// The crumb row's text, e.g. `Pane 2 › Properties`.
     pub crumb: String,
-    /// The `×` deselect button — [`egui::Rect::NOTHING`] on the App ›
-    /// Settings body, which has nothing to deselect.
+    /// The `×` deselect button — [`egui::Rect::NOTHING`] on the App › Settings
+    /// body, which has nothing to deselect.
     pub deselect: egui::Rect,
     /// The `›` collapse button.
     pub collapse: egui::Rect,
@@ -86,16 +54,15 @@ pub(crate) struct InspectorProbe {
     pub mode: Option<InspectorSelection>,
     /// The pane-props body's site search field.
     pub site_search: egui::Rect,
-    /// The site rows the pane-props body drew, filtered as drawn: the site
-    /// code, where the row landed, and whether it was highlighted as the
-    /// pane's current site.
+    /// The site rows the pane-props body drew, filtered as drawn: the site code,
+    /// where the row landed, and whether it was highlighted as the pane's current
+    /// site.
     pub site_rows: Vec<(String, egui::Rect, bool)>,
     /// The site list's count caption, verbatim.
     pub site_caption: String,
-    /// The sync section's rows as drawn — the three link checkboxes with the
-    /// state they were handed and the two action rows with `false`
-    /// (`pills::sync_section_ui`'s outcome, verbatim). Empty on a
-    /// single-pane layout, which has no group to sync with.
+    /// The sync section's rows as drawn — the three link checkboxes with the state
+    /// they were handed and the two action rows with `false`
+    /// (`pills::sync_section_ui`'s outcome, verbatim).
     pub sync_rows: Vec<(String, egui::Rect, bool)>,
 }
 
@@ -118,11 +85,8 @@ impl Default for InspectorProbe {
 }
 
 impl super::Gui {
-    /// The inspector, in the slot its host chose — the map's top-right
-    /// corner from the shell, the sheet's body from the phone shell.
-    ///
-    /// `pane` is the active pane, `mem::take`n by the caller for the whole
-    /// stack+inspector pass — nothing in here reads `self.panes[..]`.
+    /// The inspector, in the slot its host chose — the map's top-right corner from
+    /// the shell, the sheet's body from the phone shell.
     pub(super) fn render_inspector(
         &mut self,
         ctx: &egui::Context,
@@ -138,8 +102,6 @@ impl super::Gui {
             ..InspectorProbe::default()
         };
 
-        // Same swap as the stack's, for the same id reason — see
-        // `SurfaceSlot`.
         let frame = if slot.sheet {
             egui::Frame::NONE
         } else {
@@ -174,19 +136,10 @@ impl super::Gui {
                         .id_salt("inspector_scroll")
                         .max_height(max_body_height)
                         .min_scrolled_height(max_body_height);
-                    // A selection change starts its body at the top: the
-                    // offset is the panel's memory, and a deep settings
-                    // scroll carried into a fresh layer's options would open
-                    // them somewhere in the middle.
                     if std::mem::take(&mut self.insp_scroll_reset) {
                         body = body.vertical_scroll_offset(0.0);
                     }
                     let scroll = body.show(ui, |ui| {
-                        // One explicit id scope per body — see the module
-                        // note. `UiBuilder::id` rather than `id_salt` for
-                        // the reason the status bar's `status_error` scope
-                        // records: the explicit form takes the parent's
-                        // auto-id counter out of the children entirely.
                         let scope = egui::UiBuilder::new()
                             .id(ui.id().with(match self.inspector_sel {
                                 InspectorSelection::AppSettings => "body_settings",
@@ -243,13 +196,7 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The crumb row: where the body's subject is named, and where it is
-    /// changed. The crumb draws in every host — it is the selection, not a
-    /// header — but the › collapse hides in the sheet host, where the
-    /// sheet's own × and the back-chain already close the page and a second
-    /// close control would be a back button by another name (§1.13; M7's
-    /// sheet-header polish). The crumb's ×-deselect stays everywhere: it
-    /// changes the selection, not the navigation.
+    /// The crumb row: where the body's subject is named, and where it is changed.
     fn render_inspector_crumb(
         &mut self,
         ui: &mut egui::Ui,
@@ -267,15 +214,10 @@ impl super::Gui {
                         probe.collapse = collapse.rect;
                     }
                     if collapse.clicked() {
-                        // A collapse is not a deselection: the selection
-                        // stays, so reopening returns to it. Escape resets —
-                        // see `dismiss_top_layer`.
                         self.insp_open = false;
                     }
                 }
 
-                // Nothing to deselect on App › Settings — it is what
-                // deselecting returns to.
                 if self.inspector_sel != InspectorSelection::AppSettings {
                     let deselect = ui
                         .button(DESELECT_LABEL)
@@ -309,10 +251,6 @@ impl super::Gui {
                             "Properties".to_owned()
                         }
                         InspectorSelection::Layer(kind) => {
-                            // The `Pane N` segment opens Pane properties.
-                            // The pills are the primary route to the pane's
-                            // properties now; this stays as the in-crumb way
-                            // to the body that shows them all at once.
                             let seg = ui
                                 .selectable_label(
                                     false,
@@ -342,12 +280,7 @@ impl super::Gui {
         });
     }
 
-    /// The layer body: the handler's own controls, through the one host they
-    /// have. Visibility is the stack row's 👁 eye alone — the "Show <layer>"
-    /// master toggle this body used to open with duplicated the eye in the
-    /// same context and is gone (the second user test's de-dup), and the
-    /// separator under it — the stray line at the body's bottom whenever a
-    /// layer had no further controls — went with it.
+    /// The layer body: the handler's own controls, through the one host they have.
     fn render_layer_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -355,12 +288,6 @@ impl super::Gui {
         kind: &LayerId,
         actions: &mut Vec<GuiAction>,
     ) {
-        // The Radar handler owns nothing but the master toggle, so its body
-        // would be empty. What it says instead: which picture the layer is —
-        // the stack row's own status line — and where the product and tilt
-        // controls live, because they are pane properties (the pills and the
-        // Pane-properties body own them; a copy here was the duplication the
-        // second user test called out).
         if *kind == known::RADAR {
             if let Some(status) = super::shell::radar_row_status(pane) {
                 ui.label(status);
@@ -384,21 +311,8 @@ impl super::Gui {
         self.render_overlay_controls_one(ui, pane, kind, actions);
     }
 
-    /// The Pane-properties body: what the pane is, what it shows, and how it
-    /// runs with its siblings.
-    ///
-    /// # The kind-specific block goes in one child scope
-    ///
-    /// The block at the bottom depends on what the pane *is* — a volume pane
-    /// draws the 3D knobs, a section pane its A–B readout, a map pane nothing
-    /// — so it sits inside a single `scope_builder` with an explicit
-    /// [`egui::UiBuilder::id`]. `Ui::new_child` folds the parent's
-    /// `next_auto_id_salt` into every child's registered id, so whatever this
-    /// body ever grows below the block would come back under new ids the
-    /// moment a pane was converted; the explicit id takes this scope's
-    /// children out of that entirely. Defence, not a fix for a live
-    /// difference — the block is currently last — on the same terms the old
-    /// layers panel recorded at length.
+    /// The Pane-properties body: what the pane is, what it shows, and how it runs
+    /// with its siblings.
     fn render_pane_props_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -409,15 +323,6 @@ impl super::Gui {
         super::render_pane_identity(ui, pane);
         ui.add_space(4.0);
 
-        // The kind segmented control — the same three targets the ☰ menu and
-        // the armed drags reach, in one row. The shared picker body
-        // (`ui_pills::kind_list_ui`) and the shared chooser
-        // (`Gui::pick_pane_kind`) are the kind pill popover's own, so the
-        // two routes offer and mean the same things by construction. Through
-        // `request_pane_view` inside the chooser, **not** `set_view`: this
-        // runs inside the shell's take window, where a direct write lands on
-        // the placeholder in the vector and is silently discarded (see
-        // `pending_pane_view`).
         let current = pane.render_view();
         let picked = ui
             .horizontal(|ui| super::pills::kind_list_ui(ui, current).picked)
@@ -439,16 +344,6 @@ impl super::Gui {
 
         self.render_radar_controls(ui, pane, COMBO_BOX_WIDTH, LAYER_CONTROL_ID_PREFIX);
 
-        // --- Sync ---
-        //
-        // The per-pane sync section (M11): this pane's three links and the
-        // two action rows, rendered by the same `sync_section_ui` the Sync
-        // pill's popover renders — one implementation, so the two routes are
-        // one wording and one behaviour by construction. Written on the
-        // taken pane, where every write in this body lands; the action rows
-        // go through `apply_sync_outcome`, which never reads the taken
-        // pane's placeholder slot. Only offered when there is more than one
-        // pane to hold together.
         if self.pane_layout.pane_count > 1 {
             ui.add_space(6.0);
             ui.separator();
@@ -458,13 +353,8 @@ impl super::Gui {
                 probe.sync_rows = outcome.rows.clone();
             }
             self.apply_sync_outcome(&outcome, pane, self.active_pane);
-            // `layer_relinked` needs no hand here: this body runs inside the
-            // shell/sheet panel pass, which calls `propagate_layer_sync`
-            // itself as soon as the pane is back in its slot.
         }
 
-        // The kind-specific block, last, in its one scope — see the method
-        // note.
         let kind_scope = egui::UiBuilder::new().id(ui.id().with("pane_kind_controls"));
         ui.scope_builder(kind_scope, |ui| match pane.render_view() {
             rustdar_radar::types::RenderView::PlanView => {}
@@ -472,10 +362,6 @@ impl super::Gui {
                 self.render_section_controls(ui, pane);
             }
             rustdar_radar::types::RenderView::Volume => {
-                // Why this pane drew nothing last frame, if it did — see
-                // `Gui::volume_empty_states`. The active pane's, because this
-                // whole body is the active pane's properties; `pane` itself is
-                // the value taken out of that slot and cannot be asked.
                 let drawing_nothing = self.volume_empty_states.get(&self.active_pane).cloned();
                 map::render_volume_controls(
                     ui,
@@ -488,17 +374,10 @@ impl super::Gui {
         });
     }
 
-    /// The radar-site search: a filter box over the full compiled-in table
-    /// and a scrolling list of what survives it, the pane's current site
-    /// highlighted (plan §1.4 — the first *list* route to a site; the map's
-    /// clickable icons were the only picker before this).
-    ///
-    /// The list itself is the shared [`super::pills::site_list_ui`] — the
-    /// site pill popover renders the same function over the same
-    /// `site_query`, so the two routes are one inventory by construction. A
-    /// row click emits the same [`GuiAction::SwitchRadarSite`] the map icon
-    /// emits, with the same in-flight marker on the pane, so the routes
-    /// cannot mean different things either.
+    /// The radar-site search: a filter box over the full compiled-in table and a
+    /// scrolling list of what survives it, the pane's current site highlighted
+    /// (plan §1.4 — the first *list* route to a site; the map's clickable icons
+    /// were the only picker before this).
     fn render_site_search(
         &mut self,
         ui: &mut egui::Ui,
@@ -506,11 +385,6 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
         #[cfg(test)] probe: &mut InspectorProbe,
     ) {
-        // One explicit-id child scope for the whole block: the row count
-        // below follows the filter, so without it every widget drawn after
-        // this block would re-key each time the query changed — the same
-        // device, for the same reason, as the kind scope at the body's
-        // bottom.
         let scope = egui::UiBuilder::new().id(ui.id().with("site_search"));
         ui.scope_builder(scope, |ui| {
             let search = ui.add(

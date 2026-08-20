@@ -1,45 +1,21 @@
 //! How long the page waits before starting another rasterization worker.
 //!
-//! The one piece of [`crate::worker_port`]'s respawn that is not a browser
-//! type, and it is here rather than there for exactly that reason:
-//! `worker_port` is `#[cfg(target_arch = "wasm32")]`, so nothing in it runs
-//! under `cargo test` on a host, and a ladder that only a browser can walk is a
-//! ladder nobody checks. This module compiles everywhere and is driven by the
-//! tests at the bottom.
+//! Kept out of [`crate::worker_port`], which is wasm32-gated, so the ladder is
+//! driven by the tests at the bottom on a host.
 
 /// What each successive respawn waits, in milliseconds.
 ///
-/// # The shape, and why the last rung repeats
+/// The first rung is short enough to be invisible and the last long enough to be
+/// free, and the last **repeats forever** rather than giving up: never retrying
+/// costs a second of frame time per volume for the rest of the session, while a
+/// retry a minute costs one `Worker` construction and a failed handshake.
 ///
-/// A worker is lost for two kinds of reason and the ladder has to serve both.
-/// One is transient — a page that lost its worker to memory pressure, a
-/// service-worker update caught mid-flight, a `FATAL` from an instantiation
-/// that raced the module's own fetch — and a second attempt a second later
-/// simply works. The other is not: a browser that cannot start this worker at
-/// all will not start it on the hundredth try either, and a page that keeps
-/// asking spends the user's battery to learn nothing.
-///
-/// So the first rung is short enough to be invisible and the last is long
-/// enough to be free, and the last **repeats forever** rather than giving up.
-/// Giving up is the state this whole file exists to remove: it is what the page
-/// did before, and it converted one worker error into every later scan, scrub
-/// and loop frame running on the browser's one thread. A retry a minute costs a
-/// `Worker` construction and a handshake that fails; never retrying costs a
-/// second of frame time per volume, for the rest of the session.
-///
-/// The numbers are a policy, not a measurement — nothing here has a browser to
-/// measure — and they are chosen against those two costs rather than against a
-/// figure. What is measured is what the fallback costs when the ladder is at
-/// its top: 1021.9 ms in Firefox and 911.4 ms in Chrome for a 16.9 MB volume
-/// decode, quoted from `rustdar_radar::jobs::DecodeJob`, which
-/// is where the audit recorded it.
+/// The numbers are a policy, not a measurement. What is measured is the
+/// fallback cost at the top of the ladder: 1021.9 ms in Firefox and 911.4 ms in
+/// Chrome for a 16.9 MB volume decode.
 pub const RESPAWN_BACKOFF_MS: [u32; 4] = [1_000, 4_000, 16_000, 60_000];
 
 /// Which rung of [`RESPAWN_BACKOFF_MS`] the next respawn takes.
-///
-/// A type rather than a bare counter so that "advance" and "reset" are the only
-/// two things that can happen to it, and so the saturation at the top rung is
-/// written once instead of at each caller.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Backoff {
     rung: usize,
@@ -48,20 +24,16 @@ pub struct Backoff {
 impl Backoff {
     /// A ladder at the bottom rung.
     ///
-    /// `const` because the page holds one in a `thread_local!` and a
-    /// non-const initializer there is a lazy check on every access.
-    /// [`Default`] is derived and agrees with it by construction — the struct
-    /// is one `usize` and `Default` zeroes it — which is why the two can
-    /// coexist without a second statement of the same state.
+    /// `const` because the page holds one in a `thread_local!` and a non-const
+    /// initializer there is a lazy check on every access.
     pub const fn new() -> Self {
         Self { rung: 0 }
     }
 
     /// How long to wait before the next attempt, and step the ladder.
     ///
-    /// Saturating: past the last rung every answer is the last rung's, which is
-    /// what makes this a *ceiling* on the retry rate rather than a countdown to
-    /// giving up. See [`RESPAWN_BACKOFF_MS`].
+    /// Saturating: past the last rung every answer is the last rung's, which makes
+    /// this a *ceiling* on the retry rate rather than a countdown to giving up.
     pub fn next_delay_ms(&mut self) -> u32 {
         let last = RESPAWN_BACKOFF_MS.len() - 1;
         let delay = RESPAWN_BACKOFF_MS[self.rung.min(last)];
@@ -72,10 +44,8 @@ impl Backoff {
     /// Start again from the bottom, because a worker answered the handshake.
     ///
     /// **The reset belongs to `HELLO` and to nothing weaker.** A `Worker` that
-    /// constructs is not a worker that works: the module has still to fetch,
-    /// instantiate and prove it is this same build. Resetting on the
-    /// construction would make a browser that fails at instantiation retry
-    /// every second forever, which is the runaway this ladder exists to bound.
+    /// constructs is not a worker that works: resetting on the construction would
+    /// make a browser that fails at instantiation retry every second forever.
     pub fn reset(&mut self) {
         self.rung = 0;
     }
@@ -85,8 +55,6 @@ impl Backoff {
 mod tests {
     use super::*;
 
-    /// The ladder is walked once and then held, rather than continuing off the
-    /// end of the table or wrapping back to the bottom.
     #[test]
     fn the_ladder_is_walked_once_and_then_held() {
         let mut backoff = Backoff::default();
@@ -109,9 +77,7 @@ mod tests {
         }
     }
 
-    /// A handshake that lands puts the next loss back at the bottom of the
-    /// ladder — so a worker that dies once an hour is recovered in a second
-    /// each time, rather than in a minute because of an hour-old failure.
+    /// A handshake that lands puts the next loss back at the bottom of the ladder.
     #[test]
     fn a_handshake_puts_the_next_loss_back_at_the_bottom() {
         let mut backoff = Backoff::default();
@@ -138,13 +104,7 @@ mod tests {
         );
     }
 
-    /// The ladder rises, which is the whole of what makes it a backoff. Written
-    /// as a property of the table rather than of the four numbers, so a rung
-    /// edited to sit below its predecessor fails here.
     /// The `const` constructor and the derived `Default` are the same ladder.
-    /// They are two statements of one state — the page needs the first for a
-    /// `thread_local!` and the tests reach for the second — and a divergence
-    /// would mean a browser retrying on a rung no test ever walks.
     #[test]
     fn the_const_ladder_and_the_derived_one_are_the_same_ladder() {
         assert_eq!(Backoff::new(), Backoff::default());

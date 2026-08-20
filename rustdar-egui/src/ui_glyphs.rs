@@ -1,44 +1,8 @@
 //! The one inventory of every icon glyph the chrome may draw, and the tests
 //! that keep it honest against the fonts egui actually bundles.
-//!
-//! # Why this exists
-//!
-//! egui 0.35's default fonts are Ubuntu-Light plus a *subset* NotoEmoji and
-//! the emoji-icon-font, and the subset is far smaller than the names suggest:
-//! `▲`, `✕`, `⚡`, `🔗`, `🕐` and dozens of other plausible icon chars have no
-//! glyph in the proportional family and render as a tofu box. The first
-//! hands-on session found them one button at a time. This module turns that
-//! into a closed class:
-//!
-//! * [`ICON_GLYPHS`] lists every icon char the chrome is allowed to use, and
-//!   a test holds each entry against the real font tables
-//!   (`epaint::text::Fonts::has_glyph` over `FontDefinitions::default()`) —
-//!   an entry the fonts do not carry fails the build, so tofu cannot ship.
-//! * A second test scans the crate's UI sources (and the sibling crates'
-//!   display strings — the overlay handlers' and the frontend's) and
-//!   requires every non-ASCII char in every string literal to be on the
-//!   allowlist — [`ICON_GLYPHS`] plus [`TEXT_GLYPHS`] — so a new icon or a
-//!   fancy typographic char cannot be introduced without registering it
-//!   here, where the font check will judge it.
-//!
-//! # The prose rules (user decision, M8)
-//!
-//! UI text is ASCII prose: no em/en dashes (`-` instead), no arrows (write
-//! "to"), no middle dots (` - ` is the one separator), no `…` (write `...`),
-//! no curly quotes. The degree sign and the other unit chars in
-//! [`TEXT_GLYPHS`] are the deliberate exceptions — they are units, not
-//! typography, and the font check verifies each. egui's own truncation
-//! (`TextWrapMode::Truncate`) appends its ellipsis internally from a glyph
-//! its fonts carry; the ban is on *our* string literals, which is what the
-//! scan reads.
 
 /// Every icon char the chrome may use, with where it is used — the single
-/// source of truth the coverage test walks. All of these are verified against
-/// the **proportional** family, which is what every text style in the stock
-/// theme resolves to.
-///
-/// An entry here is a *permission*, checked against the fonts; the source
-/// scan is what makes the permission the only route on screen.
+/// source of truth the coverage test walks, verified against the proportional family.
 pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
     ('\u{2630}', "app menu (top bar, bottom bar)"),
     ('\u{2699}', "inspector / App (top bar, bottom bar)"),
@@ -89,17 +53,14 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
 ];
 
 /// Icon chars carried only by the **monospace** family (Hack), verified
-/// against it. Usable only where the draw site names the monospace font
-/// explicitly — today that is the section pane's painted ℹ detail toggle.
+/// against it. Usable only where the draw site names the monospace font.
 pub(crate) const MONO_ICON_GLYPHS: &[(char, &str)] = &[(
     '\u{2139}',
     "section-pane detail toggle (painted, monospace)",
 )];
 
 /// Non-icon, non-ASCII chars UI text may carry: units and symbols with no
-/// ASCII spelling worth the loss. Verified against the proportional family
-/// like the icons. A char with both roles is registered once: `×` lives in
-/// [`ICON_GLYPHS`], where its text use is documented beside its icon one.
+/// ASCII spelling worth the loss. Verified against the proportional family.
 pub(crate) const TEXT_GLYPHS: &[(char, &str)] = &[
     ('\u{b0}', "degrees"),
     ('\u{b2}', "squared (km²)"),
@@ -114,16 +75,11 @@ pub(crate) const TEXT_GLYPHS: &[(char, &str)] = &[
 mod tests {
     use super::*;
 
-    /// A `Fonts` over egui's stock `FontDefinitions` — exactly what the app
-    /// renders with, since nothing in rustdar installs custom fonts.
     fn stock_fonts() -> egui::text::Fonts {
         egui::text::Fonts::new(Default::default(), egui::FontDefinitions::default())
     }
 
-    /// Every registered glyph exists in the family it is registered for. This
-    /// is the test that makes the inventory mean something: an icon char the
-    /// bundled fonts do not carry fails here by name, instead of shipping as
-    /// a tofu box for the user to find.
+    /// Every registered glyph exists in the family it is registered for.
     #[test]
     fn every_registered_glyph_exists_in_eguis_bundled_fonts() {
         let mut fonts = stock_fonts();
@@ -146,10 +102,7 @@ mod tests {
         }
     }
 
-    /// The inventory is a set — across all three tables: a duplicated entry
-    /// would make one row dead weight and a removal look safe when it is
-    /// not. A char with both an icon and a text role (`×`) gets one entry
-    /// documenting both, not one per table.
+    /// The inventory is a set across all three tables.
     #[test]
     fn the_glyph_inventory_has_no_duplicate_entries() {
         let mut seen = std::collections::BTreeSet::new();
@@ -161,8 +114,6 @@ mod tests {
             assert!(seen.insert(c), "U+{:04X} is registered twice", c as u32);
         }
     }
-
-    // --- the source scan -------------------------------------------------
 
     /// String-literal contents of one Rust source, comments stripped and
     /// `\u{..}` escapes decoded, with the trailing `#[cfg(test)] mod` block
@@ -198,7 +149,6 @@ mod tests {
                     }
                 }
                 'r' if matches!(bytes.get(i + 1), Some('"' | '#')) => {
-                    // Raw string: r"..." or r#"..."# etc.
                     let mut hashes = 0;
                     let mut j = i + 1;
                     while bytes.get(j) == Some(&'#') {
@@ -231,10 +181,6 @@ mod tests {
                     }
                 }
                 '\'' => {
-                    // A char literal ('x', '\n', '\u{..}') or a lifetime.
-                    // Char literals are scanned like strings — a `'…'` pushed
-                    // into a `String` is display text the string pass never
-                    // sees — and a '"' inside one must not open a string.
                     if bytes.get(i + 1) == Some(&'\\') {
                         if bytes.get(i + 2) == Some(&'u') && bytes.get(i + 3) == Some(&'{') {
                             let mut cp = 0u32;
@@ -247,8 +193,6 @@ mod tests {
                                 out.push(c.to_string());
                             }
                         }
-                        // Skip to the close whatever the escape was; the
-                        // non-`\u` escapes all resolve to ASCII.
                         let mut j = i + 2;
                         while j < bytes.len() && bytes[j] != '\'' {
                             j += 1;
@@ -278,9 +222,6 @@ mod tests {
                                 }
                                 i = j + 1;
                             } else {
-                                // Every other escape resolves to ASCII (or a
-                                // line continuation); the scan only cares
-                                // about non-ASCII, so the spelling is enough.
                                 i += 2;
                             }
                         } else {
@@ -298,12 +239,6 @@ mod tests {
     }
 
     /// Where the file's `#[cfg(test)] mod { .. }` tail begins, if it has one.
-    /// The UI sources keep their inline test modules last, so cutting there
-    /// drops assertion messages — which are prose for developers, not UI
-    /// text — from the scan. Only a mod with an inline `{` body cuts: a
-    /// bodiless `#[cfg(test)] mod tests;` merely names a sibling file, which
-    /// the walk already skips by name, and cutting at the declaration would
-    /// unscan everything after it — most of `glm/mod.rs`, once.
     fn find_test_mod(src: &str) -> Option<usize> {
         let mut from = 0;
         while let Some(rel) = src[from..].find("#[cfg(test)]") {
@@ -321,13 +256,8 @@ mod tests {
     }
 
     /// The UI sources under scan: this crate's `src/` and the sibling crates
-    /// whose strings reach the screen — the overlay crate's display strings
-    /// (status lines, control labels, popup text and the fetch errors the
-    /// toast presents), the app crate's (rustdar-app), and the volumetric
-    /// crate's, whose `VolumePaint::Empty` prose is the 3D pane's on-screen
-    /// empty state (that file rode out of the app crate at WO-RV and had
-    /// silently escaped this scan — re-covered at WO-RA). Test files carry
-    /// developer prose and are skipped by name.
+    /// whose strings reach the screen. Test files carry developer prose and
+    /// are skipped by name.
     fn scanned_sources() -> Vec<std::path::PathBuf> {
         let mut roots = vec![
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
@@ -359,11 +289,6 @@ mod tests {
     }
 
     /// Every non-ASCII char in every UI string literal is a registered glyph.
-    ///
-    /// This is the closed class: the banned typography (em/en dashes, arrows,
-    /// middle dots, `…`, curly quotes) fails because it is not registered,
-    /// and a *new* icon fails until it is added to [`ICON_GLYPHS`] — where
-    /// the font-table test decides whether it may exist at all.
     #[test]
     fn ui_string_literals_use_only_registered_glyphs() {
         let allowed: std::collections::BTreeSet<char> = ICON_GLYPHS
@@ -396,11 +321,8 @@ mod tests {
         );
     }
 
-    /// The scanner itself: literals are found — char literals included, in
-    /// both spellings — comments and `\u{..}` escapes are handled, a bodiless
-    /// test-mod *declaration* does not end the scan, and the inline
-    /// test-module tail is cut. A broken scanner passes the scan vacuously,
-    /// so it gets its own pin.
+    /// The scanner itself: literals are found, comments and `\u{..}` escapes
+    /// handled, and the inline test-module tail cut.
     #[test]
     fn the_literal_scanner_reads_what_rust_would() {
         let src = r##"

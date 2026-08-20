@@ -3,13 +3,6 @@ use super::*;
 use crate::platform_double::TestBridge;
 
 /// The cell budget a device that says nothing about itself resolves.
-///
-/// It is `constants::VOLUME_GRID_CELLS`, and it is written as the resolver's
-/// answer rather than as the constant because that is what the production call
-/// site now passes: a machine that earns a promotion carries a *different*
-/// budget into the same request. The tests below are about the axis limit
-/// rather than about the budget, so they pin the unpromoted one deliberately —
-/// `budget::tests` is where the promoted rows are checked.
 const SHIPPED_CELLS: [u32; 3] = rustdar_device_profile::constants::VOLUME_GRID_CELLS;
 
 fn at(minute: u32) -> chrono::NaiveDateTime {
@@ -91,11 +84,6 @@ fn send_auto_poll_archive(app: &App, timestamp: chrono::NaiveDateTime) {
 
 /// The bug this closes: pressing Refresh while the real-time feed was ahead
 /// reverted the display to the previous archive volume.
-///
-/// The archive publishes a volume only once every cut is finished, so what a
-/// Refresh returns while a feed is running is by construction the volume
-/// *before* the one being assembled — several minutes older than what is on
-/// screen.
 #[test]
 fn an_archive_volume_older_than_the_feed_does_not_replace_it() {
     let mut app = app_showing(at(10));
@@ -122,10 +110,7 @@ fn an_archive_volume_older_than_the_feed_does_not_replace_it() {
     );
 }
 
-/// The wait still has to end. A Refresh raises `fetching`, and
-/// `check_auto_polls` refuses to poll while it is set, so a skipped apply
-/// that left it up would wedge the archive poll behind a spinner that
-/// nothing takes down.
+/// The wait still has to end.
 #[test]
 fn a_skipped_archive_volume_still_ends_the_wait_it_belonged_to() {
     let mut app = app_showing(at(10));
@@ -177,16 +162,10 @@ fn without_a_feed_the_archive_is_applied_unconditionally() {
     );
 }
 
-/// **The overlay dies with the setting.** With live chunks toggled off,
-/// `drive_chunk_feeds` returns before `retain_live`, so the feed map kept
-/// its last assembler for the session — and no consumer of the merged
-/// current volume gates on the setting, so the frozen partial overlay
-/// went on standing over a base the archive polls keep rolling forward.
+/// **The overlay dies with the setting.**
 #[test]
 fn turning_live_chunks_off_stops_the_overlay_from_standing() {
     let mut app = app_showing(at(10));
-    // No sockets from a unit test: the notification driver runs ahead of
-    // the enabled gate and would otherwise open real connections.
     app.gui.set_chunk_notifications(false);
     app.chunk_feeds.ensure("KTLX");
     app.chunk_feeds
@@ -206,23 +185,11 @@ fn turning_live_chunks_off_stops_the_overlay_from_standing() {
     );
 }
 
-/// The 3D texture limit these fixtures name when they ask what would be
-/// requested. A modern desktop's, so the shape under test is the one the rule
-/// derives rather than the floor it degrades to.
+/// The 3D texture limit these fixtures name when they ask what would be requested.
 const DEVICE_AXIS: u32 = 2048;
 
 /// The device's own limit reaches the request, and the shape it produces is the
 /// one that device can hold.
-///
-/// **This is the seam the Android overrun was made of.** The shape a request
-/// carries and the budget every allocation is sized against have to come from
-/// one decision; when they did not, an Android build budgeted 192×192×96 and
-/// asked `build_voxels` for 256×256×128 — 2.4× the budget, on the class with
-/// the least memory to absorb it. The shape is a runtime answer now, derived
-/// from a limit only the device can report, so that seam is longer than it was
-/// and this is the far end of it: what `voxel_request_for` puts on the wire is
-/// what `constants::volume_grid_shape` says for *that* device, and a device
-/// that reports less is asked for less rather than for the same shape.
 #[test]
 fn the_requested_shape_is_the_one_this_device_can_hold() {
     use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
@@ -258,9 +225,6 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
             );
         }
     }
-    // And at the guarantee — which is what a frame before the renderer exists
-    // passes — the shape that shipped, rather than a guess at what might be
-    // there.
     assert_eq!(
         voxel_request_for(
             &target,
@@ -276,11 +240,6 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
 
 /// A picked region decides the ground that is resampled; without one, the
 /// default box about the site does.
-///
-/// Both halves, because the two failure modes are opposite and both silent.
-/// A region ignored resamples the default box, which looks exactly like a
-/// region that was never committed. A default applied when a region was
-/// picked is the same thing seen from the other side.
 #[test]
 fn a_picked_region_decides_the_ground_that_is_resampled() {
     use rustdar_egui::pane::{VolumeRegion, VolumeStamp, VolumeTarget};
@@ -333,11 +292,6 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
 }
 
 /// The vertical extent is not part of the region pick.
-///
-/// It is a separate axis by design — the region changes what is sampled over
-/// the ground, the exaggeration changes only how it is drawn — and a region
-/// drag that also re-cut the column would silently change what heights the
-/// pane reports.
 #[test]
 fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
     use rustdar_egui::pane::{VolumeRegion, VolumeStamp, VolumeTarget};
@@ -374,22 +328,10 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
 
 /// The pane and the resampler agree about the box a pane has before its first
 /// grid lands.
-///
-/// They have to: the pane does its own camera arithmetic against the box it
-/// believes it has — the pan scale and the pivot are both fractions of it —
-/// and a disagreement would show up as a pan that drifts against the picture,
-/// which is the kind of thing that gets "fixed" by tuning a sensitivity.
-///
-/// Only the *stand-in* box can be checked from here, and that is the whole
-/// change: once a grid exists the pane reads the box off it
-/// (`VolumePainter::box_size_km`), and the width the resampler chose came from
-/// a volume neither side of this assertion holds.
 #[test]
 fn the_pane_and_the_resampler_agree_about_the_stand_in_box() {
     let base = rustdar_egui::pane::BASE_HALF_WIDTH_KM;
     assert_eq!(base, rustdar_radar::voxel::box_half_width_km(f64::NAN));
-    // `None` is the unmeasured case, which is the one this test is about: the
-    // box a pane gets when neither a viewport nor a grid has sized one for it.
     assert_eq!(
         rustdar_egui::pane::box_size_km(None),
         [
@@ -402,26 +344,6 @@ fn the_pane_and_the_resampler_agree_about_the_stand_in_box() {
 }
 
 /// **The 3D build reads `base_scans` and never `scan_data`.**
-///
-/// The completeness decision, stated as the behaviour a user gets: what
-/// reaches the resampler must be a volume whose every flown cut sealed —
-/// an archive decode or a whole closed chunk volume — and never whatever
-/// partial snapshot the map panes happen to be drawing mid-volume. Reading
-/// `scan_data` instead works, and silently: mid-volume it is the live
-/// snapshot, so the grid would be built from however many cuts had sealed
-/// by that frame, a plausible short volume with nothing to notice. (The
-/// archive-only half of the old rule is gone on purpose — see
-/// `base_scans` — but the partial-volume half is the one that was always
-/// load-bearing, and it is what this pins.)
-///
-/// An empty scan cannot be resampled, so the store's answer here is a
-/// `Refused` entry rather than a grid. That is the right discriminator
-/// anyway: what is under test is whether the build was *reached*, and the
-/// arm that finds no base volume deliberately stores nothing at all so
-/// that the pane goes on asking.
-/// A one-sweep volume whose single radial carries reflectivity and a real
-/// collection stamp at `minute` — the smallest scan whose current-volume
-/// stamp resolves, so a build can actually be dispatched against it.
 fn stamped_scan(minute: u32) -> nexrad_model::data::Scan {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -507,9 +429,6 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
         region: None,
     };
 
-    // The volume the map panes are drawing, and nothing else. `scan_data`
-    // is deliberately never consulted by the stamp or the extraction, so
-    // no build can be reached from it.
     let mut live_only = headless(TestBridge::desktop());
     live_only.scan_data.insert(
         "KTLX".to_string(),
@@ -521,9 +440,6 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
         "a volume only the map panes hold was handed to the resampler",
     );
 
-    // The same volume, arrived as the site's base. The build is reached:
-    // a `Building` entry opens at dispatch, which is all a headless test
-    // can — and need — observe.
     let mut based = headless(TestBridge::desktop());
     based.base_scans.insert(
         "KTLX".to_string(),
@@ -537,16 +453,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
     );
 }
 
-/// **A budget-refused frame pays nothing for the refusal.** The voxel
-/// path used to run `extract_current_volume` — the full merged-volume
-/// walk and copy, multi-ms on the frame thread — and *then* ask
-/// `spawn_voxel_build`, which refuses on a full budget with nothing
-/// marked. `PrepareVolume` is level-triggered, so the pane re-asked and
-/// the extraction repeated every frame until a slot freed — on wasm,
-/// where the budget is 1, any in-flight render made a pending 3D rebuild
-/// a per-frame multi-ms stall. The section path's shape is the model:
-/// the budget gate runs before the extraction closure, so the walk is
-/// paid exactly when a slot is actually taken.
+/// **A budget-refused frame pays nothing for the refusal.**
 #[test]
 fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
     use rustdar_device_profile::constants::MAX_CONCURRENT_RENDERS;
@@ -566,8 +473,6 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
 
-    // Every slot is taken. Several frames of the level-triggered ask
-    // arrive, as they do while a render is in flight.
     app.render
         .renders_in_flight
         .store(MAX_CONCURRENT_RENDERS, Ordering::Relaxed);
@@ -585,7 +490,6 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         "the ask must stay pending: nothing dispatched and nothing marked",
     );
 
-    // A slot frees: exactly one extraction, and the build dispatches.
     app.render.renders_in_flight.store(0, Ordering::Relaxed);
     app.handle_prepare_volume(0, target.clone());
     assert_eq!(
@@ -598,8 +502,6 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         "the freed slot dispatches the build",
     );
 
-    // And the next frame attaches to the `Building` entry rather than
-    // extracting again — the dedupe gate stays ahead of the walk.
     app.handle_prepare_volume(0, target.clone());
     assert_eq!(
         app.volume_extractions.get(),
@@ -609,13 +511,6 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
 }
 
 /// A pane is handed the volume it named, or none.
-///
-/// A target names one volume — the published stamp. Matching on the site
-/// alone would hand a pane that asked for the 18:10 data the 18:15 build
-/// the moment the next sweep sealed — and `mark_volume_rendered` would
-/// then record that it had built the one it asked for, so the
-/// substitution is invisible from every direction. Refusing instead is
-/// self-healing: the pane re-asks next frame with the current stamp.
 #[test]
 fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
     let target = rustdar_egui::pane::VolumeTarget {
@@ -642,18 +537,10 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
 
 /// **Every archive path offers its volume to the 3D pane**, including the
 /// two that decline to display it.
-///
-/// Recording inside the display branch instead of above it leaves a 3D pane
-/// on a live-fed site waiting for ever: a site with a feed running takes the
-/// `feed_is_ahead` arm on every poll, so the complete volume the app already
-/// holds would simply never be offered. Each arm is entered through the same
-/// door a user does, and each asserts its own precondition so that a test
-/// which stopped reaching its arm fails rather than passes vacuously.
 #[test]
 fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     let collected = |app: &App| app.base_scans.get("KTLX").map(|(_, _, at)| *at);
 
-    // 1. The arm that displays it.
     let mut shown = app_showing(at(10));
     send_archive(&shown, at(15));
     shown.poll_data_channels();
@@ -663,7 +550,6 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     );
     assert_eq!(collected(&shown), Some(at(15)));
 
-    // 2. The arm that keeps the real-time volume on screen instead.
     let mut behind = app_showing(at(10));
     behind.chunk_feeds.ensure("KTLX");
     send_archive(&behind, at(5));
@@ -679,7 +565,6 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
              pane on it would never be offered a volume at all",
     );
 
-    // 3. The arm that caches silently for a pane that is not viewing live.
     let mut historic = app_showing(at(10));
     historic.gui.pane_mut(0).unwrap().viewing_live = false;
     send_auto_poll_archive(&historic, at(15));
@@ -692,31 +577,16 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
 }
 
 /// **A Refresh in the pre-publication window must not walk the base back.**
-/// The feed's whole closed volumes roll `base_scans` forward at volume
-/// end, up to ~7 minutes before the archive publishes the same volume —
-/// so in that window a manual Refresh returns the volume *before* the one
-/// already based, and the drain's unconditional insert put the older
-/// ladder back under every whole-volume consumer.
-///
-/// The guard is scoped to the feed-ahead window on purpose, and the third
-/// phase is the boundary: with no feed ahead, the base still follows the
-/// display backwards, because a historic navigation re-bases the substrate
-/// on the volume shown — a section pane stamps its target with the pane's
-/// own time while cutting from `base_scans`, so a base pinned newer than
-/// the display would cut newer data under the navigated caption.
 #[test]
 fn a_refresh_in_the_pre_publication_window_does_not_walk_the_base_back() {
     let based = |app: &App| app.base_scans.get("KTLX").map(|(_, _, at)| *at);
     let mut app = app_showing(at(10));
     app.chunk_feeds.ensure("KTLX");
-    // The feed's whole closed volume is already the merge base.
     app.base_scans.insert(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
 
-    // A manual Refresh in the window: the archive answers the previous
-    // volume.
     send_archive(&app, at(5));
     app.poll_data_channels();
     assert_eq!(
@@ -726,14 +596,10 @@ fn a_refresh_in_the_pre_publication_window_does_not_walk_the_base_back() {
              merge base one volume, under every whole-volume consumer",
     );
 
-    // The counterweight: a genuinely newer archive volume still advances
-    // it.
     send_archive(&app, at(15));
     app.poll_data_channels();
     assert_eq!(based(&app), Some(at(15)), "a newer volume was refused");
 
-    // And with the feed no longer ahead, the base follows the display —
-    // backwards included.
     app.chunk_feeds
         .force_retire_at("KTLX", std::time::Duration::from_secs(1));
     assert!(
@@ -751,11 +617,6 @@ fn a_refresh_in_the_pre_publication_window_does_not_walk_the_base_back() {
 }
 
 /// And the recorded volume reaches the pane that has to name it.
-///
-/// The decoded `Scan` stays in the frontend; `rustdar-egui` is told only
-/// the *stamp*, and a 3D pane asks for a volume by it. So a recording that
-/// is never published is a pane that never asks — the same silent wait as
-/// never recording, one layer further out.
 #[test]
 fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
     let mut app = app_showing(at(10));
@@ -768,8 +629,6 @@ fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
 
     send_archive_scan(&app, at(5), stamped_scan(5));
     app.poll_data_channels();
-    // The stamps cross to the UI on the frame's compose, which no renderer
-    // exists here to run.
     app.push_frame_inputs();
 
     let stamp = app
@@ -787,8 +646,6 @@ fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
         "a pure base volume names itself as the base",
     );
 }
-
-// ── Manual navigation outranks the feed guard (M10) ──────────────────
 
 /// A pane on `site` at `shown`, beside [`app_showing`]'s pane 0 — the state
 /// a second linked-off or unlinked pane is in while its sibling navigates.
@@ -827,10 +684,7 @@ fn shown_stamp(app: &App) -> chrono::NaiveDateTime {
         .timestamp
 }
 
-/// The M10 "time controls are inert" root cause, pinned at its site: the
-/// feed guard read a manual navigation's answer as a stale "latest" and
-/// threw it away. Two panes on one site, the second still live so the feed
-/// never retires — Back's archive volume must still land.
+/// The "time controls are inert" root cause, pinned at its site.
 #[test]
 fn a_manual_navigation_outranks_the_feed_guard() {
     let mut app = app_showing(at(10));
@@ -868,10 +722,8 @@ fn a_manual_navigation_outranks_the_feed_guard() {
     );
 }
 
-/// The single-pane race arm of the same break: the response drains on the
-/// very frame the click was processed, before `drive_chunk_feeds` has had
-/// a frame to retire the now-parked site's feed. "No live pane on the
-/// site" must already disarm the guard.
+/// The single-pane race arm of the same break: the response drains on the very frame
+/// the click was processed.
 #[test]
 fn a_navigation_response_on_a_parked_site_applies_even_mid_retire() {
     let mut app = app_showing(at(10));
@@ -919,10 +771,8 @@ fn an_auto_poll_result_stays_behind_the_guard_even_mid_navigation() {
     );
 }
 
-/// Live on a chunk-fed site is a reattachment, not a fetch: the panes
-/// already hold the feed's current volume, and the archive fallback would
-/// return the volume *before* it — a walk backwards for the one click that
-/// means "newest". No fetch generation may be spent on it.
+/// Live on a chunk-fed site is a reattachment, not a fetch: the panes already hold the
+/// feed's current volume.
 #[test]
 fn jump_to_live_on_a_serving_feed_reattaches_without_a_fetch() {
     let mut app = app_showing(at(10));
@@ -956,9 +806,8 @@ fn jump_to_live_on_a_serving_feed_reattaches_without_a_fetch() {
     );
 }
 
-/// With the site parked and its feed retired, Live still takes the archive
-/// route: cached volume if one was kept, else a real fetch — the
-/// pre-feed behaviour, unchanged.
+/// With the site parked and its feed retired, Live still takes the archive route:
+/// cached volume if one was kept, else a real fetch.
 #[test]
 fn jump_to_live_with_the_feed_retired_still_fetches() {
     let mut app = app_showing(at(10));
@@ -983,11 +832,8 @@ fn jump_to_live_with_the_feed_retired_still_fetches() {
     );
 }
 
-// ── The transport payloads, applied (M10) ────────────────────────────
-
-/// `NavigateTime`'s payload, acted on: the step is relative to the pane's
-/// own scan time, the pane parks out of live, and a fetch generation is
-/// spent on the target moment.
+/// `NavigateTime`'s payload, acted on: the step is relative to the pane's own scan
+/// time, the pane parks out of live.
 #[test]
 fn navigate_time_steps_relative_to_the_panes_scan_and_parks_it() {
     let mut app = app_showing(at(30));
@@ -1005,8 +851,6 @@ fn navigate_time_steps_relative_to_the_panes_scan_and_parks_it() {
     assert!(app.gui.fetching());
     assert!(app.manual_nav_pending);
     assert_eq!(app.render.fetch_generation_for("KTLX"), generation + 1);
-    // The UI config's timestamp is the fetch target in local time — the
-    // pane's scan time stepped back, not "now minus step".
     let expected = chrono::TimeZone::from_utc_datetime(&chrono::Local, &at(20)).naive_local();
     assert_eq!(
         app.gui.get_radar_config().timestamp,
@@ -1015,9 +859,8 @@ fn navigate_time_steps_relative_to_the_panes_scan_and_parks_it() {
     );
 }
 
-/// `NavigateOneScan` spends a generation on the adjacent-scan lookup and
-/// marks the navigation pending; a pane with no scan yet is a silent no-op
-/// rather than a fetch for a site with no reference moment.
+/// `NavigateOneScan` spends a generation on the adjacent-scan lookup and marks the
+/// navigation pending.
 #[test]
 fn navigate_one_scan_spends_a_generation_and_marks_pending() {
     let mut app = app_showing(at(30));
@@ -1050,9 +893,8 @@ fn navigate_one_scan_spends_a_generation_and_marks_pending() {
     );
 }
 
-/// The loop transport's per-frame payloads, acted on: toggle drives the
-/// phase state machine, step wraps at both ends, seek clamps to the frame
-/// list. These are the frontend halves of the timeline's row-2 emissions.
+/// The loop transport's per-frame payloads, acted on: toggle drives the phase state
+/// machine, step wraps at both ends.
 #[test]
 fn the_loop_transport_payloads_drive_the_playback_state() {
     use rustdar_egui::actions::GuiAction;
@@ -1119,13 +961,6 @@ fn the_loop_transport_payloads_drive_the_playback_state() {
 
 /// A volume whose flight runs from `first` to `last` — two sweeps, dated
 /// minutes apart, as a real VCP-212 volume's are.
-///
-/// The span is the point. `ScanInfo::from_scan` dates a volume by its **first**
-/// radial and the base holder is keyed by that, while `current::resolve`
-/// reports the **newest** data time; on any real volume those are five minutes
-/// apart. Every existing fixture here is a single radial, where the two
-/// coincide — and a target keyed on one while the source decision tests the
-/// other passes perfectly well until they are told apart.
 fn spanning_scan(first: u32, last: u32) -> nexrad_model::data::Scan {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -1221,18 +1056,6 @@ fn volume_target(collected: chrono::NaiveDateTime) -> rustdar_egui::pane::Volume
 }
 
 /// **A 3D pane navigated off live is served the volume it names.**
-///
-/// The host half of "changing time in the time bar does not change the 3D
-/// viewer". A navigated pane stamps its target with `ScanInfo::timestamp` —
-/// the volume's *start*, the same field a cross-section pane's target carries
-/// and the same key the base holder is stored under. `prepare_volume` knew
-/// only two sources: the live merged volume, matched by *newest data time*,
-/// and a 3D loop's downloaded scans. A navigated target is neither, so it fell
-/// through to `Waiting`: no build, no entry, no picture, for the rest of the
-/// session.
-///
-/// The two coincide on a one-radial fixture, which is why nothing caught this.
-/// [`spanning_scan`] tells them apart the way a real volume does.
 #[test]
 fn a_navigated_3d_pane_is_served_the_volume_it_names() {
     let mut app = headless(TestBridge::desktop());
@@ -1241,7 +1064,6 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
         (
             Arc::new(spanning_scan(10, 14)),
             Default::default(),
-            // The key the scan drain records: `scan_info.timestamp`.
             at(10),
         ),
     );
@@ -1265,9 +1087,6 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
          and no build was reached — so a scrubbed 3D pane waits for ever",
     );
 
-    // The live target is still served, and from the merge rather than from
-    // this arm — so the assertion above is about a new source and not about
-    // the gate having been dropped.
     let live = volume_target(newest);
     app.handle_prepare_volume(1, live.clone());
     assert!(
@@ -1275,8 +1094,6 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
         "the live target stopped being served",
     );
 
-    // And a time the app holds no volume for is still left alone, with no
-    // entry, so the level-triggered caller goes on asking.
     let unheld = volume_target(at(30));
     app.handle_prepare_volume(2, unheld.clone());
     assert!(
@@ -1288,17 +1105,6 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
 
 /// **The request carries the budget this device resolved, not the one this
 /// binary compiled.**
-///
-/// The far end of the promotion, and the half that is easy to leave behind: a
-/// resolver can promote every field it likes and the picture will not change by
-/// one voxel while the wire still says `constants::VOLUME_GRID_CELLS`. That
-/// constant is one answer for every machine that compiled the same binary, and
-/// a browser on an RTX 3090 and a browser on a phone compile the same binary —
-/// which is the whole complaint.
-///
-/// Two claims, because either alone would pass while the seam was broken: the
-/// function *uses* the argument, and the production call site *passes the
-/// resolved budget* rather than re-reading the constant beside it.
 #[test]
 fn the_requested_shape_is_the_budget_this_device_resolved() {
     use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
@@ -1315,8 +1121,6 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
         region: None,
     };
 
-    // A browser at the WebGL2 guarantee against one reporting what a measured
-    // desktop machine reports: the pair a `cfg` cascade cannot tell apart.
     let web = |two_d: u32, three_d: u32| {
         rustdar_device_profile::budget::resolve(&rustdar_device_profile::budget::DeviceProfile {
             limits: rustdar_device_profile::budget::BudgetLimits::WASM,
@@ -1345,9 +1149,6 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
          same grid as one at the spec floor",
     );
 
-    // And the call site passes the resolved figure. A `voxel_request_for` that
-    // took the budget and a caller that handed it `constants::VOLUME_GRID_CELLS`
-    // would satisfy every assertion above and change nothing on any machine.
     let call = include_str!("../app.rs")
         .split_once("let request = voxel_request_for(")
         .map(|(_, rest)| rest.split_once(");").expect("a call site").0)
@@ -1360,14 +1161,6 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
 }
 
 /// **The budgets are re-resolved before anything downstream reads them.**
-///
-/// `install_volume_bridge` is the one place an adapter first exists, and three
-/// things in it spend `self.budgets`: the quality ceiling `quality::select` is
-/// capped by, the pool `LoopPoolLimits::from_budgets` brackets, and the
-/// offscreen budget the painter fits every pane against. A re-resolve placed
-/// after any of them would leave that one on the pre-adapter answer — a
-/// silently half-promoted machine, which reads green everywhere and draws a
-/// phone's picture on a workstation.
 #[test]
 fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
     let body = include_str!("../app.rs")
@@ -1395,18 +1188,6 @@ fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
 }
 
 /// **A lost surface steps the whole budget set down, not just the loop pool.**
-///
-/// The behavioural backstop, and on the browser it is the *only* signal there
-/// is: WebGL2 answers memory exhaustion by destroying the rendering context
-/// rather than by failing a call, so a lost surface is the one piece of memory
-/// evidence any target here produces.
-///
-/// The order is the ladder's, and the first rung is lighting — the cheapest
-/// large saving (0.766 ms dense against 0.263 for the flat march on the
-/// measured 3090) and the one a user is least likely to be able to name. What
-/// this asserts is that the rung is taken, that the pool halves beside it, and
-/// that both are written to the config store *at the moment of the decision*
-/// rather than left to the 3 s autosave a crashing session may not survive.
 #[test]
 fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
     use rustdar_device_profile::quality::GradientShading;
@@ -1416,10 +1197,6 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
     let store = platform.store();
     let mut app = headless(platform);
 
-    // A headless app has no adapter, so its pool is at the bracket floor and
-    // has nothing to halve. Put it where a discrete GPU would have: the halving
-    // and the rung are two independent halves of one event, and a test that saw
-    // only the rung would pass with the pool half deleted.
     app.loop_pool = crate::loop_pool::LoopPool::for_promotion(
         rustdar_device_profile::budget::Promotion::Ceiling,
         None,
@@ -1460,11 +1237,6 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
 
 /// **What was learned by crashing is in force from the first paint of the next
 /// session.**
-///
-/// The 1:1 reopen rule, on the one value it matters most for. Without this a
-/// second launch re-probes, comes up at a quality this machine has already been
-/// unable to serve, and falls out of it in front of the user — which is worse
-/// than never having promoted it at all.
 #[test]
 fn a_backed_off_machine_reopens_where_it_left_off() {
     use rustdar_device_profile::quality::GradientShading;
@@ -1477,7 +1249,6 @@ fn a_backed_off_machine_reopens_where_it_left_off() {
     let settled = app.budgets;
     assert_eq!(settled.steps_back, 2);
 
-    // A second launch over the same store, and nothing else carried across.
     let reopened = headless(TestBridge::desktop().with_store(store));
     assert_eq!(
         reopened.budgets.steps_back, 2,
@@ -1492,13 +1263,6 @@ fn a_backed_off_machine_reopens_where_it_left_off() {
 }
 
 /// **A machine that keeps failing stops writing, rather than counting for ever.**
-///
-/// The memo is a *position on a ladder*, not a tally of failures: once every
-/// rung this function owns is at its stop there is nothing left for another
-/// step to mean, and a number that went on rising would be a config entry
-/// growing without bound over a session that is already in trouble. What is
-/// below the last rung is not a smaller budget — it is `volume::degrade`
-/// retiring the 3D view, which latches after two such losses.
 #[test]
 fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
     use rustdar_kv::KvStore;
@@ -1520,8 +1284,6 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
         store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
         Some(settled.to_string().as_str()),
     );
-    // And the floor is the configuration this build already shipped, reached
-    // rather than crossed.
     let shipped = rustdar_device_profile::budget::BudgetLimits::for_target();
     assert_eq!(app.budgets.grid_cells, shipped.grid_cells.floor);
     assert_eq!(app.budgets.offscreen_bytes, shipped.offscreen_bytes.floor);

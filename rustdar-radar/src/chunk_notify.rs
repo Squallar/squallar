@@ -1,44 +1,4 @@
 //! Push notification of new real-time chunks, over a WebSocket.
-//!
-//! The chunk feed's latency is bound by its poll interval, not by the bucket —
-//! measured at a median 4 s against a 5 s interval. `nexrad-aws-notifier` bridges
-//! the NEXRAD SNS topic to a per-station WebSocket, so a chunk can be fetched the
-//! moment it exists instead of on the next tick.
-//!
-//! # A notification names the object, so it drives the fetch outright
-//!
-//! The message carries `path` — the complete bucket key. That is the whole
-//! difference between an early wake-up and a shortcut: the volume's
-//! `YYYYMMDD-HHMMSS` start time is part of the object name and cannot be derived
-//! from the numeric fields, so without it a listing would still be needed to
-//! learn the key. With it, [`crate::chunks::ChunkPoller::fetch_notified`]
-//! goes straight to a `GET`.
-//!
-//! What that retires, per site: the ~11-request cold-start discovery search, the
-//! directory listing every round, and the rollover probe — the notification's own
-//! volume start time says which volume a chunk belongs to.
-//!
-//! # Degradation is the absence of a feature, not a second path
-//!
-//! The periodic poll never stops. It simply finds nothing new while
-//! notifications are doing the work, so it backs off to its quiet interval and
-//! sits there as a gap-filler for a dropped socket or a missed message.
-//!
-//! So there is no fallback to get right: if the service is unreachable, the
-//! endpoint is wrong, the socket drops, or the network blocks it, no
-//! notifications arrive and the timer carries the site exactly as it does with
-//! the feature switched off.
-//!
-//! A message this build cannot fully read degrades one step rather than to
-//! nothing: an unparseable `path` still yields the station, which brings that
-//! site's next round forward.
-//!
-//! # No async
-//!
-//! `ewebsock` hands back a `WsReceiver` with a non-blocking `try_recv`, and its
-//! reader lives on its own thread natively and on the browser's event loop on
-//! web. So this drains once a frame like every other channel the app crate
-//! owns, with no executor and no `MaybeSend` gymnastics.
 
 use std::collections::HashMap;
 
@@ -46,30 +6,14 @@ use crate::chunks::{ChunkId, VolumeIndex};
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 
 /// Backoff after a failed or dropped connection, doubling to a ceiling.
-///
-/// A ceiling, never a limit: retries continue for as long as the setting is on
-/// and the site is live. A service that is down for an hour is exactly the case
-/// this has to survive, and giving up would leave the site silently on the
-/// slower path with nothing to say so.
 const RECONNECT_BASE: std::time::Duration = std::time::Duration::from_secs(5);
 const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long a socket may sit in [`LinkState::Connecting`] before it is torn down
 /// and retried.
-///
-/// `ewebsock` reports failures by event, so an ordinary refusal already lands as
-/// `Error` or `Closed`. This covers the case with no event at all: a handshake
-/// black-holed by a proxy, or a browser that neither opens nor rejects. Without
-/// it such a socket sits in `subs` forever and the reconnect loop skips it,
-/// because "already subscribed" and "still trying" are the same state there.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A chunk the service says now exists.
-///
-/// Carries the full [`ChunkId`] when the message named the object, which is what
-/// lets a notification drive a direct `GET` — no listing, no discovery, no
-/// rollover probe. Falls back to the loose fields when it did not, so an older
-/// or changed service still buys the early wake-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkAvailable {
     /// The message named the object, so the key is known exactly.
@@ -88,14 +32,6 @@ impl ChunkAvailable {
 }
 
 /// One notification message, as the service sends it.
-///
-/// `volume` and `chunk` arrive as strings rather than numbers. `path` is the
-/// complete bucket key — `{site}/{volume}/{name}` — which is the whole reason
-/// this can skip listing: the volume's `YYYYMMDD-HHMMSS` start time is part of
-/// the object name and is not derivable from the numeric fields.
-///
-/// Everything except `station` is optional so a service that changes shape
-/// degrades to a wake-up rather than going silent.
 #[derive(serde::Deserialize)]
 struct Notification {
     station: String,
@@ -117,9 +53,7 @@ impl Notification {
         if let Some(id) = self.path.as_deref().and_then(ChunkId::from_key) {
             return Some(ChunkAvailable::Identified(id));
         }
-        // `path` absent but the pieces present: rebuild it. Kept because the two
-        // fields are redundant in the protocol and either could be the one that
-        // survives a future change.
+        // `path` absent but the pieces present: rebuild it.
         if let (Some(volume), Some(name)) = (self.volume.as_deref(), self.name.as_deref())
             && let Some(volume) = volume.parse().ok().and_then(VolumeIndex::new)
             && let Some(id) = ChunkId::parse(&self.station, volume, name)
@@ -131,12 +65,6 @@ impl Notification {
 }
 
 /// Which of the service's two streams a subscription is on.
-///
-/// Both matter, for different reasons. Chunks are the low-latency live path.
-/// Archive volumes are what the 60-second auto-poll is looking for — the
-/// fallback when chunks are off or retired, the source for panes parked on
-/// historic data, and what feeds loop frames — so pushing those too takes the
-/// fallback from "up to a minute late" to "as soon as it is published".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feed {
     Chunk,
@@ -144,8 +72,8 @@ pub enum Feed {
 }
 
 impl Feed {
-    /// `pub` rather than `pub(crate)` since WO-RF1: the app crate's
-    /// notification driver narrows from this set when the live feed is off.
+    /// `pub` rather than `pub(crate)`: the app crate's notification driver
+    /// narrows from this set when the live feed is off.
     pub const ALL: [Feed; 2] = [Feed::Chunk, Feed::Archive];
 
     fn route(self) -> &'static str {
@@ -163,18 +91,10 @@ pub enum Notified {
     /// to wake its site.
     Chunk(ChunkAvailable),
     /// A completed archive volume exists for this site.
-    ///
-    /// Carries only the site on purpose. The archive path already knows how to
-    /// find the newest volume, including the previous-day fallback and the
-    /// `_MDM` sidecars, and reusing that is worth far more than saving one
-    /// listing on an event that fires about once every five minutes.
     Archive { site: String },
 }
 
 /// Parse one message according to which stream it arrived on.
-///
-/// The two share a `station` field and nothing else that matters, so the stream
-/// decides the shape rather than the payload being sniffed.
 fn parse_message(feed: Feed, text: &str) -> Option<Notified> {
     match feed {
         Feed::Chunk => serde_json::from_str::<Notification>(text)
@@ -225,17 +145,6 @@ impl ChunkNotifier {
 
     /// Open a subscription to every `feed` for every site in `sites`, drop the
     /// rest, and retry anything that is due.
-    ///
-    /// Called every frame, which is what makes reconnection unconditional: there
-    /// is no separate retry task to stall, and a socket that dropped is simply a
-    /// key that is missing again on the next pass.
-    ///
-    /// `feeds` is narrowed rather than the whole call being skipped when the live
-    /// chunk feed is off — see [`Feed::Archive`], which is worth pushing exactly
-    /// when chunks are not.
-    ///
-    /// `wake` is called from the socket's own thread on every event, so the frame
-    /// loop does not sleep through a notification.
     pub fn sync_sites(
         &mut self,
         sites: &[String],
@@ -248,10 +157,6 @@ impl ChunkNotifier {
         self.subs.retain(|(site, feed), _| wanted(site, feed));
         self.backoff.retain(|(site, feed), _| wanted(site, feed));
 
-        // A handshake that never resolves would otherwise be indistinguishable
-        // from a healthy subscription: the loop below skips every key already in
-        // `subs`, so without this "connecting" is a state a socket can never
-        // leave and the site never reconnects.
         let stuck: Vec<(String, Feed)> = self
             .subs
             .iter()
@@ -289,39 +194,12 @@ impl ChunkNotifier {
 
     /// Whether a handshake is in flight, so the frame loop must keep coming
     /// until it resolves or times out.
-    ///
-    /// Reconnection runs from [`Self::sync_sites`], which only runs on a frame,
-    /// so without a term of its own it would inherit whatever unrelated work
-    /// happened to be keeping frames coming: turn auto-poll off with the socket
-    /// down and it would never be retried.
-    ///
-    /// This half is an *unconditional* re-arm and stays one, because it is
-    /// bounded: [`CONNECT_TIMEOUT`] is 30 s, after which `sync_sites` tears the
-    /// socket down and the wait becomes a backoff, which is scheduled rather
-    /// than spun on ([`Self::next_retry_delay`]). Thirty seconds of frames is
-    /// worth pinning down eventually — nothing about a handshake needs the
-    /// display's refresh rate — but it ends on its own, which is the property
-    /// the backoff half did not have.
     pub fn handshake_pending(&self) -> bool {
         self.subs.values().any(|s| s.state == LinkState::Connecting)
     }
 
     /// How long until some subscription's backoff is up, or `None` when none is
     /// waiting one out.
-    ///
-    /// This used to be half of a boolean the frame loop re-armed on
-    /// unconditionally, and that was the app's last permanent spinner. The
-    /// backoff doubles from 5 s to a 300 s ceiling and *never gives up* — by
-    /// design, since a service that is down for an hour is the case it exists
-    /// to survive — so for anyone who cannot reach the notifier at all
-    /// (offline, a restrictive network, the service down) `backoff` is
-    /// non-empty for the entire session. Re-arming a redraw on that is the
-    /// same defect the auto-poll re-arm had, for a whole class of users: five
-    /// minutes of drawing at the display's refresh rate to make one connection
-    /// attempt.
-    ///
-    /// The retry itself is unchanged. `sync_sites` still decides what is due;
-    /// this only says when to bring it a frame.
     pub fn next_retry_delay(&self) -> Option<std::time::Duration> {
         let now = web_time::Instant::now();
         self.backoff
@@ -339,9 +217,7 @@ impl ChunkNotifier {
         wake: impl Fn() + Send + Sync + 'static,
     ) {
         // The provider `tungstenite` will reach for at handshake time is the
-        // process default, and this is the call that installs it. Cheap and
-        // idempotent; called here so a session that somehow reaches a socket
-        // before any S3 request still has one.
+        // process default, and this is the call that installs it.
         crate::tls::init();
 
         let url = format!(
@@ -380,10 +256,6 @@ impl ChunkNotifier {
     }
 
     /// Take everything the sockets have said since the last frame.
-    ///
-    /// Unparseable messages are dropped rather than treated as failures: the
-    /// service may grow fields or event kinds this build has never heard of, and
-    /// the worst case for ignoring one is the five-second timer firing instead.
     pub fn drain(&mut self) -> Vec<Notified> {
         let mut out = Vec::new();
         let mut dropped: Vec<((String, Feed), u32)> = Vec::new();
@@ -458,10 +330,6 @@ impl ChunkNotifier {
 
     /// Age a socket's handshake, so [`CONNECT_TIMEOUT`] can be exercised without
     /// the test sleeping for it.
-    ///
-    /// Also compiled under the `test-support` feature: the app crate's re-arm
-    /// suite drives a handshake past its timeout, and a `#[cfg(test)]` in this
-    /// crate is invisible to a dependent's tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn backdate_handshake(&mut self, site: &str, feed: Feed, by: std::time::Duration) {
         if let Some(sub) = self.subs.get_mut(&(site.to_string(), feed)) {
@@ -606,10 +474,6 @@ mod tests {
     }
 
     /// Sites nothing watches lose their socket, and their backoff with it.
-    ///
-    /// The endpoint is unreachable on purpose: what is under test is the
-    /// bookkeeping either way, and every site must end up accounted for — either
-    /// subscribed or waiting out a retry, never silently dropped.
     #[test]
     fn subscriptions_follow_the_live_sites() {
         let mut n = ChunkNotifier::new();
@@ -647,12 +511,6 @@ mod tests {
     }
 
     /// A handshake that never resolves must not become a permanent state.
-    ///
-    /// `sync_sites` skips every key already in `subs`, so a socket that neither
-    /// opens nor fails — a black-holed handshake, a gateway that accepts the
-    /// connection and says nothing — would otherwise occupy its slot forever and
-    /// the site would never reconnect. Kills a mutation that drops the
-    /// `CONNECT_TIMEOUT` sweep.
     #[test]
     fn a_handshake_that_never_resolves_is_torn_down_and_retried() {
         let mut n = ChunkNotifier::new();
@@ -678,14 +536,6 @@ mod tests {
     /// on a frame, so if neither reported anything while a socket was down,
     /// the retry would depend on unrelated work happening to keep the loop
     /// awake.
-    ///
-    /// They were one boolean, re-armed on unconditionally. The halves behave
-    /// nothing alike: a handshake resolves or times out inside
-    /// [`CONNECT_TIMEOUT`], while a backoff doubles to a five-minute ceiling
-    /// and never gives up — so on a machine that cannot reach the notifier at
-    /// all, that boolean was true for the entire session and the app drew at
-    /// the display's refresh rate for as long as it ran. Hence a *duration*
-    /// for the backoff, which the loop sleeps through.
     #[test]
     fn a_pending_reconnect_is_visible_to_the_frame_loop() {
         let mut n = ChunkNotifier::new();

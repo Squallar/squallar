@@ -2,22 +2,14 @@
 
 use super::with_activity;
 
-/// Query the system window insets (status bar, navigation bar) in physical pixels.
-/// Returns (top, bottom, left, right) inset values.
+/// Query the system window insets (status bar, navigation bar) in physical
+/// pixels, as (top, bottom, left, right).
 ///
-/// # Called from the winit thread, not the UI thread
-///
-/// `View`/`ViewRootImpl` are main-thread-only by contract. `getWindowInsets`
-/// happens not to `checkThread()`, so this does not throw — but what it returns
-/// is whatever `ViewRootImpl` last computed, not a fresh measurement. Before
-/// the first layout that is the null this function already guards for, which is
-/// exactly why [`android_main`] defers the query to a callback fired on the
-/// first `resumed()` rather than calling it at startup.
-///
-/// The practical consequence is a stale read after a configuration change until
-/// the next layout, not a wrong-object read. Prior to the [`JAVA`] fix this
-/// returned `(0,0,0,0)` unconditionally, so any real value is new behaviour
-/// that has not been observed on a device.
+/// Called from the winit thread, not the UI thread. `View`/`ViewRootImpl` are
+/// main-thread-only by contract; `getWindowInsets` happens not to
+/// `checkThread()`, so this does not throw, but it returns whatever
+/// `ViewRootImpl` last computed. Hence [`android_main`] defers the query to a
+/// callback fired on the first `resumed()`.
 pub fn get_system_insets() -> (f32, f32, f32, f32) {
     with_activity(system_insets_with).unwrap_or((0.0, 0.0, 0.0, 0.0))
 }
@@ -31,12 +23,9 @@ fn system_insets_with(
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
-    // `activity` is the real Activity -- see [`JAVA`]. This used to take
-    // whatever `ndk_context` held and guard with `is_instance_of(_, Activity)`,
-    // which on android-activity 0.6 is the Application and so failed every
-    // single time: the insets returned here were unconditionally (0,0,0,0), on
-    // every API level, and the map laid its excluded_rects out against a
-    // full-bleed rect that ignored cutouts and the navigation bar.
+    // `activity` is the real Activity — see [`JAVA`]. This used to take whatever
+    // `ndk_context` held, which on android-activity 0.6 is the Application, so
+    // the insets returned here were unconditionally (0,0,0,0).
     //
     // Activity.getWindow().getDecorView().getRootWindowInsets()
     let window = match env.call_method(
@@ -76,10 +65,9 @@ fn system_insets_with(
         Err(_) => return (0.0, 0.0, 0.0, 0.0),
     };
 
-    // On API 30+, use getInsets(WindowInsets.Type.systemBars())
-    // On older APIs, use getSystemWindowInset*()
+    // API 30+ uses getInsets(WindowInsets.Type.systemBars()), older APIs the
+    // deprecated getSystemWindowInset*().
     let (top, bottom, left, right) = if android_api_level(env) >= 30 {
-        // WindowInsets.Type.systemBars() returns a bitmask
         let type_class = match env.find_class(jni_str!("android/view/WindowInsets$Type")) {
             Ok(c) => c,
             Err(_) => return get_legacy_insets(env, &insets_obj),
@@ -132,7 +120,6 @@ fn system_insets_with(
     (top, bottom, left, right)
 }
 
-/// Fallback for Android < API 30: use deprecated getSystemWindowInset*() methods.
 fn get_legacy_insets(
     env: &mut jni::Env<'_>,
     insets_obj: &jni::objects::JObject<'_>,
@@ -178,11 +165,9 @@ fn get_legacy_insets(
     (top as f32, bottom as f32, left as f32, right as f32)
 }
 
-/// Get the Android API level.
-///
-/// Takes the caller's `Env` rather than attaching its own: jni 0.22 attachments
-/// push a JNI stack frame, and nesting one inside `system_insets_with` would put
-/// the local references it is holding out of the top frame.
+/// Get the Android API level. Takes the caller's `Env` rather than attaching
+/// its own: jni 0.22 attachments push a JNI stack frame, and nesting one here
+/// would put the local references it holds out of the top frame.
 fn android_api_level(env: &mut jni::Env<'_>) -> i32 {
     use jni::{jni_sig, jni_str};
 

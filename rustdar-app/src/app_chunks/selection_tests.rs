@@ -4,13 +4,10 @@ use crate::platform_double::TestBridge;
 use rustdar_radar::chunks::CutSelection;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 
-/// Re-point the pane an existing app already has, so a per-product sweep
-/// does not stand a `wgpu` instance up once per variant.
 pub(super) fn show(app: &mut App, product: RadarProduct, selected: f32, available: &[f32]) {
     show_on(app, 0, product, selected, available);
 }
 
-/// [`show`] against a chosen pane, for the multi-pane cases.
 pub(super) fn show_on(
     app: &mut App,
     idx: usize,
@@ -45,18 +42,6 @@ pub(super) fn show_on(
     });
 }
 
-/// **Every pane shape takes the whole feed.** The narrowing this module
-/// used to pin — tilt lists for single-sweep panes, `All` forced by
-/// whole-volume products, section/3D pane kinds and active loops — is
-/// superseded by the current merged volume: the substrate's premise is
-/// that a live site always holds a full, current copy of its data, and a
-/// feed that skips cuts breaks it twice over (the overlay misses rungs,
-/// and no closed volume is ever whole, so the base never rolls forward).
-///
-/// The sweep runs the very configurations that used to narrow — most
-/// pointedly the single-tilt Reflectivity pane, the case the traffic
-/// saving existed for — so reintroducing any narrowing arm fails here on
-/// the exact shape it would narrow.
 #[test]
 fn every_pane_shape_takes_the_whole_feed() {
     let mut app = headless(TestBridge::desktop());
@@ -80,7 +65,5 @@ fn every_pane_shape_takes_the_whole_feed() {
         assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All, "{kind:?}");
     }
 
-    // A site with no pane at all still answers `All`: the answer is a
-    // property of the substrate now, not of what is on screen.
     assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
 }

@@ -225,27 +225,20 @@ pub(crate) fn decode_generic_radial_packet(
 
     let block_end = checked_end(data, o, block_length)?;
 
-    // --- XDR Product Description ---
-    // Skip: name, description (variable-length strings)
     o = skip_xdr_string(data, o)?;
     o = skip_xdr_string(data, o)?;
 
-    // Skip: code(i32), type(i32), prod_time(u32)
     o = skip_xdr_bytes(data, o, 12)?;
 
-    // Skip: radar_name (variable-length string)
     o = skip_xdr_string(data, o)?;
 
-    // Skip: lat(f32), lon(f32), height(f32), vol_time(u32), el_time(u32),
-    //        el_angle(f32), vol_num(i32), op_mode(i32), vcp_num(i32),
-    //        el_num(i32), compression(i32), uncompressed_size(i32)
-    //        = 12 × 4 = 48 bytes
+    // Skip 12 × 4 bytes: lat, lon, height, vol_time, el_time, el_angle, vol_num,
+    // op_mode, vcp_num, el_num, compression, uncompressed_size.
     o = skip_xdr_bytes(data, o, 48)?;
 
-    // Skip product-level parameters
+    // Skip product-level parameters.
     o = skip_xdr_param_list(data, o)?;
 
-    // --- Components ---
     let num_components = read_i32(data, o)?;
     o += 4;
     o += 4; // skip "pointer" field (always present, value is meaningless)
@@ -284,9 +277,6 @@ pub(crate) fn decode_generic_radial_packet(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// XDR helper functions
-// ---------------------------------------------------------------------------
 
 fn read_xdr_f32(data: &[u8], offset: usize) -> Result<f32> {
     let bits = read_u32(data, offset)?;
@@ -304,16 +294,11 @@ fn skip_xdr_bytes(data: &[u8], offset: usize, n: usize) -> Result<usize> {
     Ok(offset + n)
 }
 
-/// The on-wire extent of an XDR counted string: its 4-byte length prefix
-/// plus `len` content bytes padded up to a 4-byte boundary. `None` when a
-/// declared length is too large for that extent to exist.
-///
-/// The rounding is done at `u32` width — the width the length is declared
-/// at on the wire — so the same lengths are refused on every target. Done
-/// in `usize` it is only refused on 64-bit: on wasm32 `len.div_ceil(4) * 4`
-/// wraps a length near `u32::MAX` down to a padded size of 0, and the
-/// caller's bounds check then waves the string through as if it were
-/// empty. Same hazard, and the same remedy, as `checked_end`.
+/// The on-wire extent of an XDR counted string: its 4-byte length prefix plus
+/// `len` content bytes padded up to a 4-byte boundary. `None` when a declared
+/// length is too large for that extent to exist. The rounding is done at `u32`
+/// width, the width the length is declared at, so the same lengths are refused
+/// on every target: in `usize` a length near `u32::MAX` wraps to 0 on wasm32.
 fn xdr_string_extent(len: u32) -> Option<usize> {
     let padded = len.checked_next_multiple_of(4)?;
     Some(padded.checked_add(4)? as usize)
@@ -343,8 +328,7 @@ fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
 
 fn read_xdr_string(data: &[u8], offset: usize) -> Result<(String, usize)> {
     let (len, end) = xdr_string_bounds(data, offset)?;
-    // `len` is at most the padded extent, so the content ends at or before
-    // `end`, which `xdr_string_bounds` proved is within `data`.
+    // `len` is at most the padded extent, proven within `data`.
     let s = std::str::from_utf8(&data[offset + 4..offset + 4 + len])
         .unwrap_or("")
         .to_owned();
@@ -393,21 +377,17 @@ fn decode_xdr_radial_component(
     mut o: usize,
     block_end: usize,
 ) -> Result<(RadialPacket, usize)> {
-    // Description string
     o = skip_xdr_string(data, o)?;
 
-    // gate_width and first_gate, both f32 metres
     let gate_width = read_xdr_f32(data, o)?;
     o += 4;
     let first_gate = read_xdr_f32(data, o)?;
     o += 4;
 
-    // Radial-level parameters
     o = skip_xdr_param_list(data, o)?;
 
-    // Real products carry 360–720 radials per sweep; 3600 allows 0.1°
-    // spacing with room to spare. A negative count would sign-extend through
-    // `as usize` into a capacity-overflow panic in `Vec::with_capacity`.
+    // Real products carry 360–720 radials per sweep. A negative count would
+    // sign-extend into a capacity-overflow panic in `Vec::with_capacity`.
     const MAX_RADIALS: i32 = 3600;
     let num_radials_raw = read_i32(data, o)?;
     o += 4;
@@ -489,17 +469,11 @@ fn decode_xdr_radial_component(
         1.0
     };
 
-    // Metres to range bins: the inverse of `RadialPacket::gate_range_km`,
-    // which carries the ICD citation for the half bin.
-    //
-    // `first_gate` is the range of the **centre** of the first bin (the
-    // generic radial component's own definition — ICD 2620001AD Figure E-3,
-    // "Range to the center of the first bin"; the RPG's
-    // `buildDPR_Packet28.c` writes `first_range = 125.0` for a 250 m bin,
-    // half a bin), while `first_range_bin` is a bin *index* whose centre
-    // sits at `(index + 0.5) · gate_width`. Converting one to the other
-    // therefore drops the half bin; rounding the raw ratio instead put every
-    // gate of a half-bin product one bin too far out.
+    // Metres to range bins: the inverse of `RadialPacket::gate_range_km`.
+    // `first_gate` is the range of the **centre** of the first bin (ICD
+    // 2620001AD Figure E-3; the RPG's `buildDPR_Packet28.c` writes 125.0 for a
+    // 250 m bin), while `first_range_bin` is a bin index whose centre sits at
+    // `(index + 0.5) · gate_width` — so converting drops the half bin.
     let first_range_bin = if gate_width > 0.0 {
         (((first_gate / gate_width) - 0.5).max(0.0)).round() as i16
     } else {
@@ -540,9 +514,8 @@ mod tests {
         push_i32(d, 0);
     }
 
-    /// The packet-28 header and XDR product description leading up to the
-    /// radial component body: empty strings, zeroed scalars, one component
-    /// of code 1 (radial). Bytes appended afterwards land exactly where
+    /// The packet-28 header and XDR product description leading up to the radial
+    /// component body. Bytes appended afterwards land exactly where
     /// `decode_xdr_radial_component` starts reading.
     fn xdr_radial_component_prelude() -> Vec<u8> {
         let mut d = Vec::new();
@@ -576,11 +549,9 @@ mod tests {
         d
     }
 
-    /// The generic radial component declares `first_gate` as the range of
-    /// the **centre** of bin 0, while `first_range_bin` is a bin index whose
-    /// centre sits at `(index + 0.5) · gate_width`. The RPG's DPR
-    /// (`buildDPR_Packet28.c`) writes 125 m for a 250 m bin — half a bin —
-    /// which has to decode as index 0, not the 1 a raw `round` gives.
+    /// The generic radial component declares `first_gate` as the range of the
+    /// **centre** of bin 0, while `first_range_bin` is a bin index. The RPG's DPR
+    /// writes 125 m for a 250 m bin, which has to decode as index 0.
     #[test]
     fn a_half_bin_first_gate_decodes_as_bin_zero() {
         for (gate_width, first_gate, want) in [
@@ -640,9 +611,8 @@ mod tests {
         assert!(matches!(r, Err(Error::InvalidSymbologyBlock(_))), "{r:?}");
     }
 
-    /// For `arr_len = -1`, the old `arr_len * 4` wrapped in release so
-    /// `data_end` landed 4 bytes *before* the slice start and
-    /// `data[o..data_end]` panicked in both build modes.
+    /// For `arr_len = -1`, `arr_len * 4` wraps in release so `data_end` lands
+    /// 4 bytes *before* the slice start and the slicing panics.
     #[test]
     fn a_negative_xdr_data_array_length_is_an_error_not_a_slice_panic() {
         let mut d = xdr_radial_component_prelude();
@@ -669,16 +639,10 @@ mod tests {
         assert!(decode_generic_radial_packet(&d, 0).is_err());
     }
 
-    /// An XDR string's padded extent is rounded at `u32` width, so this
-    /// bites on a 64-bit host even though the defect only ever fired on
-    /// wasm32. Rounding in `usize` instead — what this code used to do —
-    /// makes the hostile lengths harmless on 64-bit and catastrophic on
-    /// 32-bit, which is precisely the shape CI cannot see.
-    ///
-    /// Two separate overflows live in this range. `u32::MAX - 3` is already
-    /// a multiple of 4, so the rounding leaves it alone and the `+ 4` for
-    /// the length prefix is what carries; the three above it overflow in
-    /// the rounding itself. Both must be refused.
+    /// An XDR string's padded extent is rounded at `u32` width, so this bites on a
+    /// 64-bit host even though the defect only ever fired on wasm32. Two separate
+    /// overflows live in this range: `u32::MAX - 3` is already a multiple of 4, so
+    /// the `+ 4` for the length prefix is what carries.
     #[test]
     fn a_hostile_xdr_string_length_has_no_extent() {
         for len in [u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3] {
@@ -690,8 +654,7 @@ mod tests {
         }
     }
 
-    /// The refusal must not cost the lengths a real product uses: the
-    /// prefix plus the content rounded up to the next 4-byte boundary.
+    /// The refusal must not cost the lengths a real product uses.
     #[test]
     fn an_ordinary_xdr_string_length_keeps_its_padded_extent() {
         for (len, want) in [
@@ -701,18 +664,15 @@ mod tests {
             (4, 8),
             (5, 12),
             (64, 68),
-            // The largest length that still has an extent: rounds to
-            // itself, and the prefix is the last 4 bytes that fit.
+            // The largest length that still has an extent.
             (u32::MAX - 7, (u32::MAX - 7) as usize + 4),
         ] {
             assert_eq!(xdr_string_extent(len), Some(want), "declared length {len}");
         }
     }
 
-    /// End to end: a hostile length prefix on the radial attribute string
-    /// must come back as an error. On wasm32 the padded extent wrapped to
-    /// 0 and the bounds check waved it through, leaving the decoder to
-    /// read the following fields from the middle of the string.
+    /// End to end: a hostile length prefix on the radial attribute string must
+    /// come back as an error rather than a read from the middle of the string.
     #[test]
     fn a_hostile_xdr_string_length_is_an_error_not_a_misframed_read() {
         let mut d = xdr_radial_component_prelude();
@@ -727,22 +687,13 @@ mod tests {
         assert!(decode_generic_radial_packet(&finish(d), 0).is_err());
     }
 
-    /// The same length on a *skipped* string, reached through the radial
-    /// parameter list rather than the attribute read. `skip_xdr_string`
-    /// carried its own copy of the arithmetic.
-    ///
-    /// Caveat, so nobody mistakes this for the guard: it passed against the
-    /// unfixed code in release. A wrapped extent makes the skip land 4 bytes
-    /// in and mis-frame everything after, and this buffer errors only
-    /// because it then runs out of bytes — a longer one would have decoded
-    /// the garbage instead. `a_hostile_xdr_string_length_has_no_extent` is
-    /// what actually holds the line; this covers the second call site.
+    /// The same length on a *skipped* string, reached through the radial parameter
+    /// list rather than the attribute read. Caveat: it passed against the unfixed
+    /// code in release, erroring only because the buffer ran out of bytes.
     #[test]
     fn a_hostile_xdr_string_length_is_an_error_when_skipped() {
         let mut d = xdr_radial_component_prelude();
-        // Rewrite the radial parameter count from 0 to 1 so the list is
-        // walked; the prelude's last eight bytes are that count and its
-        // pointer.
+        // Rewrite the radial parameter count from 0 to 1 so the list is walked.
         let n = d.len();
         d[n - 8..n - 4].copy_from_slice(&1i32.to_be_bytes());
         d.extend_from_slice(&u32::MAX.to_be_bytes()); // parameter id length
@@ -750,8 +701,7 @@ mod tests {
         assert!(decode_generic_radial_packet(&finish(d), 0).is_err());
     }
 
-    /// The guardrails must not reject a well-formed packet: one radial,
-    /// two gates, decoded end to end.
+    /// The guardrails must not reject a well-formed packet.
     #[test]
     fn a_well_formed_generic_radial_packet_still_decodes() {
         let mut d = xdr_radial_component_prelude();

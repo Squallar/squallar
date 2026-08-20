@@ -2,8 +2,8 @@ use super::*;
 use crate::types::GateReport;
 use nexrad_model::data::{MomentData, Radial, RadialStatus};
 
-/// Levels at the profile's 0.3 km layer centres, `count` of them, so
-/// `WindProfile::from_levels` maps level `l` onto layer `l` exactly.
+/// Levels at the profile's 0.3 km layer centres, so `WindProfile::from_levels`
+/// maps level `l` onto layer `l` exactly.
 fn profile_at_centres(uv: impl Fn(usize) -> (f64, f64), count: usize) -> WindProfile {
     let levels: Vec<(f64, f64, f64)> = (0..count)
         .map(|l| {
@@ -56,26 +56,19 @@ fn bunkers_on_a_curved_hodograph_deviates_right_of_the_shear() {
     assert!(u < 0.0, "the deviation outweighs the mean here");
 }
 
-/// Without a shear direction the deviation is dropped, not invented:
-/// the estimate falls back to pure advection by the mean wind. A
-/// profile that is mostly holes is refused outright.
 #[test]
 fn bunkers_falls_back_to_the_mean_wind_without_shear_direction() {
-    // Uniform wind: shear is exactly zero, motion is the mean itself —
-    // the quiet-day case, which must keep painting.
     let uniform = profile_at_centres(|_| (15.0, 5.0), 20);
     assert_eq!(bunkers_right_mover_uv(&uniform), Some((15.0, 5.0)));
 
-    // Only three levels fit near the surface: `from_levels` clamp-fills
-    // three layers past the last one, leaving 6 of 20 — under the floor
-    // — and the 5.5–6 km band empty twice over.
+    // Only three levels fit near the surface: `from_levels` clamp-fills three
+    // layers past the last one, leaving 6 of 20 — under the floor.
     let hollow = profile_at_centres(|l| (2.0 * l as f64, 0.0), 3);
     assert_eq!(bunkers_right_mover_uv(&hollow), None);
 }
 
-/// The correction is `+speed·cos(direction − azimuth)` in m/s at the
-/// radial centre — [`crate::srm`]'s pinned conventions, on this module's
-/// own grid type.
+/// The correction is `+speed·cos(direction − azimuth)` in m/s at the radial
+/// centre — [`crate::srm`]'s pinned conventions.
 #[test]
 fn the_storm_motion_term_is_added_along_the_radial() {
     let mut grid = VelocityGrid {
@@ -93,23 +86,16 @@ fn the_storm_motion_term_is_added_along_the_radial() {
     };
     apply_storm_motion(&mut grid, &motion);
     let full = 30.0 * KT_TO_MS;
-    // Azimuth 90 points at the direction the storm comes from: full +.
     assert!((grid.values[0][0] - (10.0 + full)).abs() < 1e-9, "az 090");
-    // The reciprocal takes the full −; orthogonals keep base velocity.
     assert!((grid.values[2][0] - (10.0 - full)).abs() < 1e-9, "az 270");
     assert!((grid.values[1][0] - 10.0).abs() < 1e-9, "az 180");
     assert!((grid.values[3][0] - 10.0).abs() < 1e-9, "az 000");
 }
 
-/// A zero vector reproduces base velocity exactly, and NaN gates stay
-/// NaN under any vector.
 #[test]
 fn a_zero_vector_is_identity_and_no_data_stays_empty() {
     let mut grid = VelocityGrid {
         values: vec![vec![-12.5, f64::NAN, 33.0]],
-        // The empty gate here is a gate the fixture never reported, which is
-        // the arm that has always been meant by a bare `NaN` in a hand-built
-        // grid — not a below-threshold measurement.
         status: vec![vec![
             GateReport::Value,
             GateReport::NotReported,
@@ -143,11 +129,6 @@ fn a_zero_vector_is_identity_and_no_data_stays_empty() {
     assert!((grid.values[0][0] - (-12.5 + 45.0 * KT_TO_MS)).abs() < 1e-9);
 }
 
-/// **The port check, offline**: the same velocity product and the same
-/// vector through this module's m/s arithmetic and through
-/// [`crate::srm::derive`]'s knots arithmetic land on the same derived
-/// levels. This is Protocol B's exact comparison on a synthetic message,
-/// so the live run can only fail for a live-data reason.
 #[test]
 fn the_msus_arithmetic_matches_the_level3_derivation_gate_for_gate() {
     use nexrad_level3::model::{
@@ -164,7 +145,6 @@ fn the_msus_arithmetic_matches_the_level3_derivation_gate_for_gate() {
         .map(|i| RadialRun {
             start_angle: i as f32 * 0.5,
             angle_delta: 0.5,
-            // Every level 2..=255 appears repeatedly across the sweep.
             gate_values: (0..40)
                 .map(|j| (2 + (i * 7 + j * 11) % 254) as u16)
                 .collect(),
@@ -271,9 +251,9 @@ fn the_msus_arithmetic_matches_the_level3_derivation_gate_for_gate() {
     );
 }
 
-/// A Level III velocity packet as this module's grid: m/s through the
-/// PDB's scale/offset, radial-centre azimuths, gate centres at
-/// `(first_range_bin + j + 0.5) · 0.25 km`. Protocol B's "ours" side.
+/// A Level III velocity packet as this module's grid: m/s through the PDB's
+/// scale/offset, radial-centre azimuths, gate centres at
+/// `(first_range_bin + j + 0.5) · 0.25 km`.
 fn grid_from_packet(
     packet: &nexrad_level3::model::RadialPacket,
     pdb: &nexrad_level3::model::ProductDescriptionBlock,
@@ -300,8 +280,7 @@ fn grid_from_packet(
             .collect(),
         // Levels 0 and 1 are below-threshold and range-folded across the whole
         // Level III family — the same convention `twin::compare::ValueCodec`
-        // decodes by — so this side of the comparison can say which of the two
-        // each empty gate is rather than flattening both to `NaN`.
+        // decodes by.
         status: packet
             .radials
             .iter()
@@ -359,10 +338,6 @@ fn radial(azimuth: f32, elevation: f32, gates: Vec<u8>) -> Radial {
     )
 }
 
-/// `dealiased_grid` runs the Coverage profile: an isolated velocity
-/// pocket the propagation passes never reach survives, where NROT's
-/// posture censors it. This is the behavioural difference the profile
-/// parameter exists for, observed through this module's public entry.
 #[test]
 fn the_display_dealias_keeps_isolated_pockets_the_nrot_posture_drops() {
     let n = 72;
@@ -391,8 +366,6 @@ fn the_display_dealias_keeps_isolated_pockets_the_nrot_posture_drops() {
         grid.values[30][37],
     );
 
-    // The same sweep through NROT's preprocessing censors it — the two
-    // profiles really are different postures over one dealiaser.
     let raw = crate::velocity::grid(&radials).expect("velocity present");
     let mut strict = raw.values.clone();
     crate::nrot::dealias(
@@ -408,9 +381,6 @@ fn the_display_dealias_keeps_isolated_pockets_the_nrot_posture_drops() {
     );
 }
 
-/// The full per-tilt derivation end to end on a clean sweep: dealias is
-/// a no-op on continuous data, so the output is base velocity plus the
-/// correction — and the geometry comes through for the renderer.
 #[test]
 fn compute_srv_derives_a_full_sweep() {
     let n = 72;
@@ -445,8 +415,6 @@ fn compute_srv_derives_a_full_sweep() {
     );
 }
 
-/// The override is dominant and a derived rung is only a default — and a
-/// non-override sample can never pose as one.
 #[test]
 fn the_user_override_dominates_a_derived_rung() {
     let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
@@ -457,8 +425,6 @@ fn the_user_override_dominates_a_derived_rung() {
     assert_eq!(picked.direction_deg, 210.0);
     assert_eq!(picked.source, StormMotionSource::UserOverride);
 
-    // …under either preference, because the override outranks the choice
-    // rather than being one of its arms.
     let picked = storm_motion(Some(&p), Some(over), None, SrvFallback::BunkersRightMover)
         .expect("still the override");
     assert_eq!(picked.source, StormMotionSource::UserOverride);
@@ -467,7 +433,6 @@ fn the_user_override_dominates_a_derived_rung() {
         .expect("the mean wind from the profile");
     assert_eq!(default.source, StormMotionSource::MeanWind);
 
-    // Mislabelled sample: claims Bunkers, arrives in the override slot.
     let poser = SrvMotion {
         speed_kt: 1.0,
         direction_deg: 2.0,
@@ -487,18 +452,12 @@ fn the_user_override_dominates_a_derived_rung() {
     assert!(SrvMotion::user_override(30.0, f32::INFINITY).is_none());
 }
 
-/// **The derived default is the mean wind, and the right-mover is a choice.**
-///
-/// The chain used to fall to the Bunkers right-mover, and the pane apologised
-/// on the glass for it. Measured against the vector the RPG actually publishes
-/// the right-mover is not a stand-in for it at all — it is a supercell motion
-/// *prediction*, 7.5 m/s off the mean wind in whatever direction the shear
-/// happens to point, which in weak flow is most of the vector. The mean wind
-/// sits an order of magnitude closer. So the rung moved, and Bunkers stayed
-/// reachable: it is what a chaser wants and it is pinned against MetPy.
+/// The derived default is the mean wind, and the right-mover is a choice: the
+/// right-mover is a supercell motion *prediction*, 7.5 m/s off the mean wind
+/// in whatever direction the shear points, and measured against the vector the
+/// RPG publishes the mean wind sits an order of magnitude closer.
 #[test]
 fn the_derived_default_is_the_mean_wind_and_bunkers_is_a_choice() {
-    // Real shear, so the two rungs are genuinely different vectors.
     let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
 
     let default =
@@ -513,21 +472,16 @@ fn the_derived_default_is_the_mean_wind_and_bunkers_is_a_choice() {
         .expect("the right-mover is still reachable");
     assert_eq!(asked.source, StormMotionSource::BunkersRightMover);
 
-    // Same profile, genuinely different fields — the deviation is 7.5 m/s
-    // perpendicular to the shear, which on this profile is due south.
     assert_ne!(default.speed_kt, asked.speed_kt);
     assert_ne!(default.direction_deg, asked.direction_deg);
 
-    // The mean wind rung really is the plain mean, unchanged by the reorder:
-    // the same numbers `bunkers_right_mover_uv` starts from.
     let (u, v) = mean_wind_uv(&p).expect("a full profile has a mean wind");
     assert!((u - 29.0).abs() < 1e-9, "u = {u}");
     assert!(v.abs() < 1e-9, "v = {v}");
 
-    // And the chain reaches volumes the right-mover refuses outright. Twelve
-    // fitted layers is the mean's floor; with only the lowest twelve present
-    // the 5.5–6 km shear band is empty, so Bunkers has no direction to deviate
-    // in — and before the reorder that was `None`, meaning no SRV at all.
+    // Twelve fitted layers is the mean's floor; with only the lowest twelve
+    // present the 5.5–6 km shear band is empty, so Bunkers has no direction to
+    // deviate in.
     let hollow = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 12);
     assert_eq!(
         bunkers_right_mover(&hollow),
@@ -538,25 +492,17 @@ fn the_derived_default_is_the_mean_wind_and_bunkers_is_a_choice() {
         .expect("the mean wind still renders where the right-mover cannot");
     assert_eq!(picked.source, StormMotionSource::MeanWind);
 
-    // Asking for Bunkers on such a volume is a refusal, not a silent swap to
-    // the other rung: the reader asked for a quantity this volume cannot
-    // support, and answering with a different one under no label is the
-    // failure the whole source enum exists to prevent.
     assert_eq!(
         storm_motion(Some(&hollow), None, None, SrvFallback::BunkersRightMover),
         None,
     );
 }
 
-/// The whole chain, in order: an override beats the RPG, the RPG beats every
-/// derived rung, and a vector that only *claims* the RPG's provenance cannot
-/// take its rung.
 #[test]
 fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
     let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
     let rpg = SrvMotion::rpg_scit_average(31.0, 246.0).expect("finite");
 
-    // Rung 2 beats rung 3.
     for fallback in [SrvFallback::MeanWind, SrvFallback::BunkersRightMover] {
         let picked = storm_motion(Some(&p), None, Some(rpg), fallback).expect("the RPG's vector");
         assert_eq!(
@@ -568,21 +514,16 @@ fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
         assert_eq!(picked.direction_deg, 246.0);
     }
 
-    // Rung 1 beats rung 2.
     let over = SrvMotion::user_override(45.0, 210.0).expect("finite");
     let picked =
         storm_motion(Some(&p), Some(over), Some(rpg), SrvFallback::MeanWind).expect("the override");
     assert_eq!(picked.source, StormMotionSource::UserOverride);
     assert_eq!(picked.speed_kt, 45.0);
 
-    // With no profile at all the RPG's vector still renders: the lower rungs
-    // are what need a wind fit, not this one.
     let picked =
         storm_motion(None, None, Some(rpg), SrvFallback::MeanWind).expect("no profile needed");
     assert_eq!(picked.source, StormMotionSource::RpgScitAverage);
 
-    // A derived vector posted into the RPG slot must not inherit the
-    // reference's label — it falls through to the rung it really is.
     let poser = SrvMotion {
         speed_kt: 1.0,
         direction_deg: 2.0,
@@ -597,13 +538,8 @@ fn the_rpg_vector_outranks_bunkers_and_yields_to_an_override() {
     assert!(SrvMotion::rpg_scit_average(30.0, f32::INFINITY).is_none());
 }
 
-/// A legitimately zero vector is the RPG's answer, not a missing one.
-///
 /// Clear-air and cell-free volumes publish exactly 0.0 kt from 0.0°: SCIT
-/// tracked nothing, so the average over it is empty and the RPG paints an
-/// unshifted field. Falling back to Bunkers there would substitute a
-/// double-digit vector exactly where the reference applied none — the one
-/// place the two are guaranteed to disagree.
+/// tracked nothing, so the RPG paints an unshifted field.
 #[test]
 fn a_zero_rpg_vector_is_a_reading_and_not_a_gap() {
     let p = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
@@ -614,8 +550,6 @@ fn a_zero_rpg_vector_is_a_reading_and_not_a_gap() {
     assert_eq!(picked.speed_kt, 0.0);
     assert_eq!(picked.direction_deg, 0.0);
 
-    // And it really is a no-op on the field, which is the point of keeping it:
-    // the pane matches the RPG's unshifted one gate for gate.
     let mut grid = VelocityGrid {
         values: vec![vec![12.0; 4]; 4],
         status: vec![vec![GateReport::Value; 4]; 4],
@@ -629,27 +563,19 @@ fn a_zero_rpg_vector_is_a_reading_and_not_a_gap() {
     assert_eq!(grid.values, before, "a zero vector shifts nothing");
 }
 
-/// Under the shear floor the deviation is dropped, so what comes back is the
-/// mean wind — and it says so. It used to report itself as a right-mover
-/// while being the one thing a right-mover is not.
 #[test]
 fn a_mean_wind_fallback_does_not_claim_to_be_a_right_mover() {
-    // Uniform wind: shear is exactly zero, so the deviation cannot be
-    // oriented and the estimate is pure advection.
     let uniform = profile_at_centres(|_| (15.0, 5.0), 20);
     let m = bunkers_right_mover(&uniform).expect("the mean wind still renders");
     assert_eq!(m.source, StormMotionSource::MeanWind);
-    // The arithmetic is untouched: still exactly the mean.
     assert_eq!(bunkers_right_mover_uv(&uniform), Some((15.0, 5.0)));
     let want_kt = (15.0f64.powi(2) + 5.0f64.powi(2)).sqrt() / KT_TO_MS;
     assert!((m.speed_kt as f64 - want_kt).abs() < 1e-3, "{}", m.speed_kt);
 
-    // Real shear still earns the right-mover label.
     let sheared = profile_at_centres(|l| (10.0 + 2.0 * l as f64, 0.0), 20);
     let m = bunkers_right_mover(&sheared).expect("a full profile supports Bunkers");
     assert_eq!(m.source, StormMotionSource::BunkersRightMover);
 
-    // And the chain propagates the honest label rather than flattening it.
     let picked = storm_motion(Some(&uniform), None, None, SrvFallback::BunkersRightMover)
         .expect("still a vector");
     assert_eq!(picked.source, StormMotionSource::MeanWind);
@@ -658,11 +584,6 @@ fn a_mean_wind_fallback_does_not_claim_to_be_a_right_mover() {
 /// The declaration order is the fallback order, so `<` reads as "nearer the
 /// top of the chain" — the convention `MeltingLayerSource` uses, and the
 /// reason `Ord` is derived at all.
-///
-/// **The mean wind moved above the right-mover**, which is the whole of the
-/// reorder as far as this ordering is concerned: it is the derived rung the
-/// chain reaches by default, and the right-mover is the one below it that only
-/// a reader's choice reaches.
 #[test]
 fn the_storm_motion_chain_orders_itself_best_first() {
     use StormMotionSource::*;
@@ -675,15 +596,10 @@ fn the_storm_motion_chain_orders_itself_best_first() {
         assert!(!other.is_rpg(), "{other:?}");
     }
 
-    // The preference selects between exactly the derived rungs, and its
-    // default is the one the measurement chose.
     assert_eq!(SrvFallback::default(), SrvFallback::MeanWind);
     assert_eq!(SrvFallback::MeanWind.source(), MeanWind);
     assert_eq!(SrvFallback::BunkersRightMover.source(), BunkersRightMover);
 
-    // Every rung has a distinct label *and* a distinct tag, or the glass
-    // cannot distinguish them. The tag is what the legend draws beside the
-    // vector, so it is the one that has to survive being short.
     for naming in [StormMotionSource::label, StormMotionSource::tag] {
         let named = [UserOverride, RpgScitAverage, MeanWind, BunkersRightMover].map(naming);
         for (i, a) in named.iter().enumerate() {
@@ -694,14 +610,6 @@ fn the_storm_motion_chain_orders_itself_best_first() {
     }
 }
 
-/// **Nothing on the glass says "RPG", "SCIT" or "cell average".**
-///
-/// Those are this codebase's words for the NWS product generator and its cell
-/// tracker. The pane used to put them in a paragraph over the radar — "showing
-/// the Bunkers right-mover, which can differ from the RPG's cell average by a
-/// large and unpredictable angle" — which a reader cannot weigh, cannot act on
-/// and did not ask for. The vocabulary is pinned here rather than left to
-/// review, because it came back once already.
 #[test]
 fn no_rung_names_itself_in_this_codebases_private_vocabulary() {
     use StormMotionSource::*;
@@ -715,8 +623,6 @@ fn no_rung_names_itself_in_this_codebases_private_vocabulary() {
                 );
             }
         }
-        // And a tag is a tag: short enough to sit after the numbers rather
-        // than wrap under them.
         assert!(
             rung.tag().len() <= 12 && !rung.tag().contains('.'),
             "{rung:?}'s tag {:?} is a sentence, not a label",

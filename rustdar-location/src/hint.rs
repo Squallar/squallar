@@ -1,11 +1,6 @@
 //! The timezone → coordinate anchor table: the dependency-free half of the
-//! app's coarse "where is the user" hint.
-//!
-//! What a timezone buys is a region, not a position — see the app-side
-//! `location_hint` module for the feature's argument (starting site only,
-//! never an override). Only the table and its lookup live HERE: this crate
-//! resolves no radar site, because the domain vocabulary must not depend on
-//! any radar catalogue.
+//! app's coarse "where is the user" hint. Only the table and its lookup live
+//! here; this crate resolves no radar site.
 
 /// A representative coordinate for an IANA timezone, and how coarse it is.
 pub struct ZoneAnchor {
@@ -18,28 +13,14 @@ pub struct ZoneAnchor {
 
 /// Representative coordinates for the timezones that overlap NEXRAD coverage.
 ///
-/// Each anchor is the population centre of its zone rather than its geometric
-/// centre: the goal is to be right for the most people, not to be equidistant
-/// from the zone's corners. For `America/Chicago` that means Chicago itself,
-/// which is wrong for Texas — but Texas is `America/Chicago` too and there is no
-/// single point that serves both. Zones with their own entry (the Indiana and
-/// North Dakota families, `America/Detroit`, `America/Menominee`) are exactly
-/// the places where that split matters enough that IANA already made it.
+/// Each anchor is the population centre of its zone, not its geometric centre.
+/// For `America/Chicago` that means Chicago itself, which is wrong for Texas —
+/// but Texas is `America/Chicago` too and no single point serves both. Non-US
+/// zones near the border are included because NEXRAD reaches across it.
 ///
-/// Non-US zones near the border are included because NEXRAD reaches across it
-/// and those users are otherwise sent to Oklahoma.
-///
-/// A zone earns an anchor only if it lands within reach of a radar. Mexico City,
-/// Edmonton, Adak and Tokyo were all tried and removed: their nearest WSR-88D is
-/// 700–1300 km away, far enough that the "hint" would be a different flavour of
-/// wrong answer rather than a better one. They fall through to `None` and the
-/// caller's default, which is the honest result for a place NEXRAD does not
-/// cover. `the_live_anchor_survey` holds the line, and holds it against the
-/// real catalogue rather than a fixture — which is why it is `#[ignore]`d.
-/// `every_anchor_is_a_real_coordinate` is what runs on every row.
-///
-/// Public for the app crate's `#[ignore]` live survey, which audits every
-/// anchor against the real radar network.
+/// A zone earns an anchor only if it lands within reach of a radar: Mexico City,
+/// Edmonton, Adak and Tokyo were tried and removed, their nearest WSR-88D being
+/// 700–1300 km away. `the_live_anchor_survey` holds that line.
 pub static ZONE_ANCHORS: &[ZoneAnchor] = &[
     // Eastern
     ZoneAnchor {
@@ -195,8 +176,7 @@ pub static ZONE_ANCHORS: &[ZoneAnchor] = &[
         lat: 32.5149,
         lon: -117.0382,
     },
-    // Alaska, Hawaii and the territories, each of which has its own radars and
-    // would otherwise be sent thousands of miles to the mainland.
+    // Alaska, Hawaii and the territories, each of which has its own radars.
     ZoneAnchor {
         zone: "America/Anchorage",
         lat: 61.2181,
@@ -257,8 +237,8 @@ pub static ZONE_ANCHORS: &[ZoneAnchor] = &[
         lat: 18.3419,
         lon: -64.9307,
     },
-    // Overseas WSR-88D sites. Small populations, but the alternative for them is
-    // a radar on the other side of the planet.
+    // Overseas WSR-88D sites, whose alternative is a radar on the other side of
+    // the planet.
     ZoneAnchor {
         zone: "Atlantic/Azores",
         lat: 38.7333,
@@ -272,12 +252,9 @@ pub static ZONE_ANCHORS: &[ZoneAnchor] = &[
 ];
 
 /// A representative coordinate for `zone`, or `None` if it is not one we map.
-///
-/// Unknown zones are deliberately not approximated. Guessing a coordinate from
-/// a zone's UTC offset alone recovers a longitude and nothing about latitude,
-/// which across `America/Chicago`'s span is the difference between Texas and
-/// Manitoba — a confident wrong answer where `None` lets the caller keep a
-/// default it can explain.
+/// Unknown zones are deliberately not approximated: a coordinate guessed from a
+/// UTC offset recovers a longitude and nothing about latitude, which across
+/// `America/Chicago`'s span is the difference between Texas and Manitoba.
 pub fn coordinate_for_timezone(zone: &str) -> Option<(f64, f64)> {
     ZONE_ANCHORS
         .iter()
@@ -289,9 +266,7 @@ pub fn coordinate_for_timezone(zone: &str) -> Option<(f64, f64)> {
 mod tests {
     use super::*;
 
-    /// A duplicated zone name means the second entry is unreachable, which is
-    /// invisible at runtime and exactly the kind of edit a table this shape
-    /// invites.
+    /// A duplicated zone name makes the second entry unreachable, invisibly.
     #[test]
     fn zone_names_are_unique() {
         let mut names: Vec<&str> = ZONE_ANCHORS.iter().map(|a| a.zone).collect();
@@ -301,12 +276,8 @@ mod tests {
         assert_eq!(before, names.len(), "a zone is listed twice");
     }
 
-    /// Every anchor's coordinates are on the planet and finite.
-    ///
-    /// What is left of `anchors_sit_within_plausible_radar_range` that can be
-    /// checked without the network: a transposed sign or a dropped digit shows
-    /// up here, and whether the result is *near a radar* is the live survey's
-    /// question.
+    /// A transposed sign or a dropped digit shows up here; whether the result is
+    /// *near a radar* is the live survey's question.
     #[test]
     fn every_anchor_is_a_real_coordinate() {
         for anchor in ZONE_ANCHORS {
@@ -325,12 +296,8 @@ mod tests {
         }
     }
 
-    /// The zones that were tried and rejected as out of coverage. Re-adding one
-    /// without noticing would quietly hand those users a radar most of a
-    /// continent away.
-    ///
-    /// Table-independent: these zones are not anchored at all, so the lookup
-    /// misses before any radar is consulted.
+    /// The zones tried and rejected as out of coverage. Re-adding one would
+    /// quietly hand those users a radar most of a continent away.
     #[test]
     fn zones_outside_nexrad_coverage_stay_unanchored() {
         for zone in [

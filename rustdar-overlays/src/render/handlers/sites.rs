@@ -39,9 +39,7 @@ impl OverlayHandler for RadarSitesHandler {
     }
 
     /// `is_dark` rides into the described job (`SitesInput`) and picks the
-    /// label plate colour (`text_bg`), so a cached raster is a raster in one
-    /// theme — exactly the class this declaration exists for, and the one the
-    /// audit's "four theme-dependent handlers" left out.
+    /// label plate colour (`text_bg`), so a cached raster is a raster in one theme.
     fn theme_sensitive(&self) -> bool {
         true
     }
@@ -62,11 +60,6 @@ impl OverlayHandler for RadarSitesHandler {
         true
     }
 
-    /// The sites row is registered like every other texture kind's, while
-    /// `prepare_job` stays the default `None`: the described input needs
-    /// `pane.site`/`loading_site`, which this handler cannot see until
-    /// per-pane handler state exists (M10), so the frontend dispatch builds
-    /// the `SitesInput` itself and frames it with this row.
     fn job_codec(&self) -> Option<&'static JobCodec> {
         crate::render::jobs::JOB_CODECS
             .iter()

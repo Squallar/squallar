@@ -13,14 +13,8 @@ mod h5;
 #[cfg(test)]
 mod tests;
 
-/// Which GOES orbital slot to fetch GLM data from.
-///
 /// Variants name the *slot*, not the spacecraft: NOAA rotates satellites through
 /// the East/West positions (GOES-19 replaced GOES-16 as GOES-East in April 2025).
-///
-/// Not `Serialize`/`Deserialize`: nothing persists this type. `ui.json` stores
-/// only the satellite *selection*, as lowercase strings owned by
-/// `render::handlers::glm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmSatellite {
     /// GOES-East (currently GOES-19), covering roughly -25°W to -105°W.
@@ -30,12 +24,10 @@ pub enum GlmSatellite {
 }
 
 impl GlmSatellite {
-    /// S3 bucket for the satellite currently operating this slot, resolved
-    /// from the origin table rather than hardcoded here: the two derived
-    /// validations (the Android network-security-config test, the web
-    /// service-worker never-cache test) read [`DataSources`], so a bucket
-    /// named anywhere else is invisible to both — which is how `noaa-goes16`
-    /// outlived GOES-16's rotation out of the East slot.
+    /// S3 bucket for the satellite currently operating this slot, resolved from
+    /// the origin table rather than hardcoded: the Android network-security and
+    /// web service-worker validations read [`DataSources`], so a bucket named
+    /// anywhere else is invisible to both.
     pub fn bucket(self, sources: &DataSources) -> &str {
         match self {
             GlmSatellite::GoesEast => &sources.goes_east_bucket,
@@ -43,7 +35,6 @@ impl GlmSatellite {
         }
     }
 
-    /// Display name.
     pub fn display_name(self) -> &'static str {
         match self {
             GlmSatellite::GoesEast => "GOES-19 (East)",
@@ -52,9 +43,6 @@ impl GlmSatellite {
     }
 }
 
-/// GLM detection hierarchy level.
-///
-/// Not serialized: the UI persists three independent `show_*` booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmDataLevel {
     /// Individual pixel detections (~2ms resolution, highest density).
@@ -75,137 +63,68 @@ impl GlmDataLevel {
     }
 }
 
-/// A single GLM lightning observation (event, group, or flash).
 #[derive(Debug, Clone)]
 pub struct GlmFlash {
     pub lat: f64,
     pub lon: f64,
-    /// Radiant energy in joules, when the product reports one.
-    ///
     /// `None` means unknown; do not substitute 0.0. Every GLM energy variable
-    /// carries `add_offset = 2.8515e-16`, so zero is out of band, and
-    /// `rasterize` sizes bolts by `energy.log10()` — 0.0 draws "unknown" as
-    /// "weakest".
-    ///
-    /// The *column* is required and an absent one fails the level; only a
-    /// per-record `_FillValue` reaches here as `None`.
+    /// carries `add_offset = 2.8515e-16`, so zero is out of band, and `rasterize`
+    /// sizes bolts by `energy.log10()`.
     pub energy: Option<f32>,
-    /// Area in km², when the product reports one.
-    ///
-    /// Stored as an `_Unsigned` packed `short` with `scale_factor = 152601.9`
-    /// and `units = "m2"`; `fetch` unpacks and converts to km².
-    ///
-    /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product has only
-    /// `group_area` and `flash_area`. Also `None` for a per-record `_FillValue`.
+    /// Stored as an `_Unsigned` packed `short` with `scale_factor = 152601.9` and
+    /// `units = "m2"`. `None` at [`GlmDataLevel::Event`]: the L2 LCFA product has
+    /// only `group_area` and `flash_area`.
     pub area: Option<f32>,
-    /// UTC timestamp.
     pub time: chrono::NaiveDateTime,
-    /// Which satellite observed this.
     pub satellite: GlmSatellite,
-    /// Detection hierarchy level.
     pub level: GlmDataLevel,
 }
 
-/// A satellite whose S3 listing came back with no objects whatsoever.
-///
-/// Distinct from "no flashes": the files themselves are absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadFeed {
     pub satellite: GlmSatellite,
-    /// Owned, not `&'static`: the bucket is resolved from [`DataSources`],
-    /// which a test can point at a mock.
     pub bucket: String,
-    /// The S3 prefixes that were queried and returned nothing.
     pub prefixes: Vec<String>,
 }
 
 /// A satellite whose listing answered with objects, none of which is a granule
 /// covering the requested window.
 ///
-/// The fourth listing shape, and the one that had nowhere to go. [`DeadFeed`] is
-/// "the prefix is empty"; this is "the prefix is full and none of it is ours" —
-/// a `.nc` suffix that stopped matching, an `_s` timestamp that stopped parsing,
-/// or publishing that stopped for longer than the window. All three end the poll
-/// with `Ok`, a fresh clock, and this feed contributing nothing.
-///
-/// # Why this is never a quiet sky
-///
-/// GLM publishes a granule every 20 s whether or not anything flashed — an empty
-/// granule is still a granule, which is why [`fetch::GlmCache`] stores a
-/// granule's own start time rather than deriving it from its records. So a quiet
-/// sky is *keys present, granules parsed, zero flashes*, and it stays silent.
-/// Zero **keys** is a different claim: it says nothing covering the window was
-/// published, so the layer is empty for want of data rather than for want of
-/// lightning, and the two are not interchangeable to anyone reading the map.
-///
-/// Measured over 24 hour-prefixes on both live buckets, spanning two years, four
-/// seasons, all times of day and a 3.4x range of flash activity: 4313 granules,
-/// inter-granule gap 20.0 s in 4285 of 4289 cases and 40.0 s in the other four,
-/// **never above 40.0 s**. [`GLM_MIN_TIME_WINDOW_SECS`] is 60 s, so on a healthy
-/// feed the window always covers at least one granule and this condition cannot
-/// arise. That margin is what makes the report actionable rather than noise.
+/// [`DeadFeed`] is "the prefix is empty"; this is "the prefix is full and none of
+/// it is ours". Never a quiet sky: GLM publishes a granule every 20 s whether or
+/// not anything flashed. Measured over 24 hour-prefixes on both live buckets:
+/// 4313 granules, inter-granule gap 20.0 s in 4285 of 4289 cases and 40.0 s in
+/// the other four, **never above 40.0 s**, against a 60 s minimum window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowGap {
     pub satellite: GlmSatellite,
-    /// Objects the queried prefixes did hold, none of them an in-window granule.
-    /// Carried so the report can say the listing itself was healthy.
     pub objects_seen: usize,
 }
 
 /// Records a granule delivered that the parser refused to place, against the
 /// number it looked at.
 ///
-/// # Its own denominator
-///
-/// `considered` is **records**, and it is carried rather than inferred because
-/// every other count in a GLM round is granules or satellite feeds. Pooling a
-/// record count into `parts_resolved` would divide records by granules and read
-/// as a coverage figure. See [`DataCompleteness`](crate::fetch_policy::DataCompleteness).
-///
-/// # Why this is reported at all, at a measured rate of zero
-///
-/// Measured over 105 granules from 7 cases across both satellites, two years and
-/// a 3.4x activity range: **0 drops in 1584507 records**, and 0 in 76003 on a
-/// held-out eighth case.
-///
-/// What that zero is worth differs by counter, and the difference is not a
-/// detail. `off_globe` is backed by a control that re-runs its predicate against
-/// an impossible band and fires on all 1584507 records, so the loop demonstrably
-/// runs. `fill_values` is **not** so backed: `_FillValue` reaches the corpus 3
-/// times in 1584507 and 0 times in the holdout, because real GLM LCFA data
-/// essentially never marks a value missing. That branch is pinned by a synthetic
-/// fixture instead - see
-/// `fetch::tests::a_dropped_record_reaches_the_caller_and_says_which_kind` - and
-/// its zero here is an observation about the corpus rather than a demonstration.
-///
-/// It is reported because of what a non-zero means. The drops are not a property
-/// of the weather - they are a disagreement between the product and this reader,
-/// and when one appears it applies to every granule at once. `normalize_longitude`
-/// is the worked example: GOES-West stores longitude unwrapped past the
-/// antimeridian, the range check below rejected it, and that quietly deleted 60
-/// of 3228 events per granule until somebody read the code. Nothing on screen
-/// moved. At a zero baseline this costs nothing on healthy data and turns the
-/// next such mismatch into a number the user can see.
+/// `considered` is **records**, carried rather than inferred because every other
+/// count in a GLM round is granules or feeds. Measured over 105 granules across
+/// both satellites: **0 drops in 1584507 records**, and 0 in 76003 on a holdout.
+/// Reported because a non-zero is a disagreement between the product and this
+/// reader — `normalize_longitude` deleted 60 of 3228 events per granule with
+/// nothing on screen moving.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RecordDrops {
-    /// Records the drop predicates were applied to - every entry in the level
-    /// dimensions of the granules this poll parsed.
     pub considered: usize,
-    /// Dropped for a `_FillValue` in latitude, longitude or time: the product
-    /// declined to place the record, so there is nothing to draw.
+    /// Dropped for a `_FillValue` in latitude, longitude or time.
     pub fill_values: usize,
-    /// Dropped for a coordinate that is not on the globe after unwrapping. A
-    /// product change or an unpacking mismatch, never a weather condition.
+    /// Dropped for a coordinate not on the globe after unwrapping: a product
+    /// change or an unpacking mismatch, never a weather condition.
     pub off_globe: usize,
 }
 
 impl RecordDrops {
-    /// Records looked at and thrown away.
     pub fn dropped(&self) -> usize {
         self.fill_values + self.off_globe
     }
 
-    /// Fold another level's or granule's tally in.
     pub(crate) fn absorb(&mut self, other: RecordDrops) {
         self.considered += other.considered;
         self.fill_values += other.fill_values;
@@ -216,136 +135,96 @@ impl RecordDrops {
 /// Shortest lightning aggregation window the UI allows, in seconds.
 ///
 /// Must stay above the S3 publish latency of the hour's first granule (27–30 s
-/// after the boundary, measured live). A shorter window queries a single hour
-/// prefix, which is empty until then, and [`fetch`]'s zero-object check would
-/// read that as a dead feed once an hour. Do not lower below ~45 s.
+/// after the boundary, measured live): a shorter window queries a single hour
+/// prefix, and the zero-object check would read that as a dead feed hourly.
 pub const GLM_MIN_TIME_WINDOW_SECS: f64 = 60.0;
 
-/// Longest lightning aggregation window the UI allows, in seconds (30 minutes).
 pub const GLM_MAX_TIME_WINDOW_SECS: f64 = 1800.0;
 
 /// Below this many files in the window, "everything failed" is not a claim
 /// worth making.
 ///
 /// Two, not three: measured against live granules `in_window` is exactly
-/// `floor(window / 20) - 1`, so the 60 s slider minimum holds exactly 2 files
-/// and a floor of 3 would put `is_total` permanently out of reach there.
+/// `floor(window / 20) - 1`, so the 60 s slider minimum holds exactly 2 files.
 const MIN_FILES_FOR_TOTAL_VERDICT: usize = 2;
 
-/// Files that were expected to contribute to the current window but did not.
-///
-/// Unlike [`DeadFeed`], the S3 listing is healthy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchFailures {
     /// Every file the listing placed inside the current time window.
     ///
     /// Deliberately *not* "files downloaded this poll": successful parses are
-    /// cached and drop out of later polls while failures are never cached and
-    /// are retried forever, so a per-poll denominator makes every persistent
-    /// failure eventually read as total.
+    /// cached and drop out of later polls while failures are retried forever, so
+    /// a per-poll denominator makes every persistent failure read as total.
     pub in_window: usize,
-    /// How many of those are currently failing.
     pub failed: usize,
-    /// One representative error, so the report can say *why*.
     pub sample_error: String,
 }
 
 impl FetchFailures {
-    /// Nothing in the window is usable, over enough files for that to mean
-    /// something systematic rather than one bad granule.
+    /// Nothing in the window is usable, over enough files to mean something
+    /// systematic rather than one bad granule.
     pub fn is_total(&self) -> bool {
         self.in_window >= MIN_FILES_FOR_TOTAL_VERDICT && self.failed == self.in_window
     }
 }
 
-/// A hierarchy level that would not parse, inside files that otherwise did.
-///
-/// The third failure shape: [`DeadFeed`] is "files absent", [`FetchFailures`]
-/// is "files present and unusable", this is "files usable, one *layer* is not".
-/// Counting it as a failed file would make `is_total()` announce "all N files
-/// failed to parse" while the other layers are still drawing.
+/// A hierarchy level that would not parse, inside files that otherwise did:
+/// [`DeadFeed`] is "files absent", [`FetchFailures`] is "files present and
+/// unusable", this is "files usable, one *layer* is not".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelFailure {
     pub satellite: GlmSatellite,
     pub level: GlmDataLevel,
-    /// Representative error for this level, for the log.
     pub sample_error: String,
 }
 
-/// What one GLM fetch produced.
 pub struct GlmFetchOutcome {
     pub flashes: Vec<GlmFlash>,
     /// Enabled satellites whose listing answered with objects but placed no
-    /// granule in the window. See [`WindowGap`] for why this is never a quiet
-    /// sky, and why it needs a report of its own rather than sharing
-    /// `dead_feeds`: the two have opposite listings and opposite causes.
+    /// granule in the window. See [`WindowGap`].
     pub window_gaps: Vec<WindowGap>,
-    /// Records the granules this poll parsed handed over and the parser refused
-    /// to place. See [`RecordDrops`].
     pub record_drops: RecordDrops,
     /// Enabled satellites whose listing returned zero objects this poll.
     ///
-    /// Reported rather than logged here so the handler can edge-trigger the
-    /// message against the previous poll instead of repeating it every 20 s.
+    /// Reported rather than logged so the handler can edge-trigger the message
+    /// against the previous poll instead of repeating it every 20 s.
     pub dead_feeds: Vec<DeadFeed>,
     /// Satellites this fetch actually asked about.
     ///
     /// Required to interpret `dead_feeds`: absence from `dead_feeds` only means
-    /// alive if the satellite was queried. Without this, deselecting a dead
-    /// satellite reads as the feed recovering.
+    /// alive if the satellite was queried.
     pub queried: Vec<GlmSatellite>,
-    /// Files that downloaded but would not parse — suspect the product.
     pub parse_failures: Option<FetchFailures>,
     /// Files that could not be downloaded at all (connection errors, non-2xx)
     /// — suspect the network. Never merged with `parse_failures`.
     pub transport_failures: Option<FetchFailures>,
-    /// Hierarchy levels that failed to parse in files that otherwise parsed.
-    ///
-    /// Deduplicated per (satellite, level): a schema change hits every granule
-    /// in the window identically.
+    /// Hierarchy levels that failed to parse in files that otherwise parsed,
+    /// deduplicated per (satellite, level).
     pub level_failures: Vec<LevelFailure>,
-    /// (satellite, level) pairs this poll actually learned something about.
-    ///
-    /// Required to interpret `level_failures` as `queried` is for `dead_feeds`.
-    /// A poll that downloaded no new granules evaluates nothing, and must not
-    /// read as a recovery.
+    /// (satellite, level) pairs this poll learned something about — required to
+    /// interpret `level_failures` as `queried` is for `dead_feeds`.
     pub evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
     /// Satellites whose S3 listing never answered this poll — the complement of
-    /// `queried`, and the thing this outcome had no way to express.
+    /// `queried`.
     ///
-    /// A round that lists one satellite and fails the other returns `Ok`,
-    /// deliberately, because the survivor's flashes are real. It then went
-    /// through `set_data`, stamped a fresh clock and reported health `Ok`, with
-    /// nothing anywhere saying half the sky had stopped arriving: GOES-East
-    /// dies, its flashes drain out of the cache window over the next half hour,
-    /// and most of CONUS quietly loses its lightning under an `Updated 0s ago`
-    /// line. Carried here so the handler can file it as
-    /// [`DataCompleteness`](crate::fetch_policy::DataCompleteness) beside the
-    /// data that did arrive.
+    /// A round that lists one satellite and fails the other returns `Ok`, because
+    /// the survivor's flashes are real — but then stamped a fresh clock with
+    /// nothing saying half the sky had stopped arriving.
     pub listing_failures: Vec<(GlmSatellite, crate::fetch_policy::FetchError)>,
 }
 
-/// Type-erased fetch result for GLM lightning data.
-///
 /// The error is a [`FetchError`](crate::fetch_policy::FetchError) rather than a
-/// `String` so the round's verdict survives the trip to the handler. It used to
-/// be a `String`, and the handler had nothing left to classify it by, so it
-/// recorded every GLM failure as `Transient` — which at a 20 s interval is 180
-/// attempts an hour against a bucket that may have been renamed a year ago.
+/// `String` so the round's verdict survives the trip to the handler; as a
+/// `String` every GLM failure recorded as `Transient`, which at a 20 s interval
+/// is 180 attempts an hour.
 pub struct GlmFetchResult(pub Result<GlmFetchOutcome, crate::fetch_policy::FetchError>);
 
 /// [`Assembled`]: two satellite listings and a request per granule, and
-/// [`GlmFetchOutcome`] above carries five separate lists of what did not come
-/// back.
+/// [`GlmFetchOutcome`] carries five separate lists of what did not come back.
 ///
-/// Declared here, next to those lists, because this is the layer that proves a
-/// declaration made anywhere else does not hold. The first fix wired
-/// `listing_failures` alone; `dead_feeds`, `transport_failures`,
-/// `parse_failures` and `level_failures` stayed silent through that review and
-/// a green suite, and were caught only by driving the round over a socket with
-/// both listings answering 200 and every granule answering 503 — **0 flashes,
-/// `is_complete()` true, no mark.** What this line buys is that the handler for
-/// this round has no `set_data` to go back to.
+/// Declared next to those lists because this is the layer that proves a
+/// declaration made anywhere else does not hold: wiring `listing_failures` alone
+/// left the other four silent through a green suite.
 ///
 /// [`Assembled`]: crate::fetch_policy::Assembled
 impl crate::fetch_policy::FetchRound for GlmFetchResult {

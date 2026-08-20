@@ -1,113 +1,26 @@
 //! Proof that the GPU tests in this directory can actually fail.
 //!
-//! Every code review of the volume work has turned up a test that could not
-//! fail, and every time a human found it by hand-editing the shader. The worst
-//! of them: `volume.wgsl` reprojects the map floor using a cosine taken at the
-//! pixel's own latitude, and swapping that for a cosine at the site's latitude
-//! — the exact misregistration this repository already shipped once, worth
-//! about 7.6 km of drift at the corners of a 460 km box — passed *every* test
-//! in the tree. Three independent reasons, all fixture blindness: the
-//! registration instrument is a CPU restatement that never runs the WGSL; every
-//! GPU floor fixture is planted on the equator, where that error is
-//! mathematically zero; and the one test that drives the shader at a real
-//! latitude writes a PPM and asserts nothing. `cargo-mutants` cannot reach any
-//! of it, because to Rust `volume.wgsl` is a string.
-//!
-//! This file is that string's mutation battery. wgpu compiles the shader at
-//! *runtime* from a `&str`, so a mutant needs no rebuild: substitute text in
-//! memory, build the real pipelines from the mutated source through
+//! `cargo-mutants` cannot reach `volume.wgsl`, because to Rust it is a string.
+//! wgpu compiles the shader at runtime from a `&str`, so a mutant needs no
+//! rebuild: substitute text in memory, build the real pipelines through
 //! [`VolumePipelines::from_shader_source`], run a probe, and require the
-//! probe's reading to move by more than that probe's own tolerance. A mutant
-//! whose reading does not move is a shader property nothing in this repository
-//! can see.
+//! probe's reading to move by more than its own tolerance. A mutant whose
+//! reading does not move is a shader property nothing here can see.
 //!
 //! ```text
 //! cargo test -p rustdar-gpu --test volume_shader_mutants -- --ignored --nocapture
 //! ```
 //!
-//! **An unmatched pattern is a hard failure.** A battery whose patterns have
-//! stopped matching is a vacuously green test, which is the precise failure
-//! class it exists to prevent — so every substitution asserts that its pattern
-//! was found, that it was found exactly the declared number of times, and that
-//! the resulting source differs from the original. None of those is a skip and
-//! none is a warning. That check does not need a GPU and is therefore **not**
-//! `#[ignore]`d: `every_mutant_still_matches_the_shader_it_mutates` runs in the
-//! ordinary `cargo test`, so an edit to `volume.wgsl` that moves an anchor goes
-//! red on a machine with no Vulkan loader at all. Loud breakage on a legitimate
-//! shader edit is the design; re-anchor the pattern and, if the expression it
-//! named is gone, delete the mutant deliberately rather than by attrition.
+//! **An unmatched pattern is a hard failure**, not a skip or a warning: every
+//! substitution asserts its pattern was found exactly the declared number of
+//! times and that the source changed. That check needs no GPU and is *not*
+//! `#[ignore]`d, so an edit to `volume.wgsl` that moves an anchor goes red on a
+//! machine with no Vulkan loader. Re-anchor the pattern, or delete the mutant
+//! deliberately. Patterns are anchored on distinctive expressions, never on line
+//! numbers or whitespace runs.
 //!
-//! Patterns are anchored on distinctive expressions, never on line numbers or
-//! on whitespace runs, because this file moves under active development.
-//!
-//! Adding a mutant is one row of [`MUTANTS`]: a name, a class, the pattern, the
-//! replacement, how many times the pattern occurs, and which probe should
-//! notice. Adding a probe is one `fn` and one `static`.
-//!
-//! # What only this file sees
-//!
-//! Every row was also run the slow way, by patching `volume.wgsl` on disk and
-//! running every suite that can observe it — `--lib`, `volume_shader`,
-//! `volume_gpu`, `volume_silhouette`; nothing else in the workspace reads the
-//! shader. **Eleven of the thirty-four mutations left that whole set green.**
-//! They are therefore shader properties this repository has no other instrument
-//! for, and the probes below are the only thing standing on them.
-//!
-//! Coverage-premultiplied reconstruction — four of the ten, and the newest code
-//! in the file:
-//!
-//!   * the coverage weight on the LIT VOLUME's optical depth. The isosurface's
-//!     half of the feature is measured; the lit volume's is not, and it is the
-//!     half that turns a silhouette's alpha from a step into a ramp.
-//!   * `COVERAGE_FLOOR`'s *value*. That the surface excludes air is asserted;
-//!     that it stops at the tent's **half** level set — the decision boundary
-//!     the constant's doc is entirely about — is not, because no test moves the
-//!     number and watches the silhouette follow.
-//!   * the coverage weight on `iso_shading_field`, which is what stops a
-//!     product whose diverging centre sits above its data lighting the surface
-//!     from inside.
-//!   * `shading_field` being the premultiplied channel rather than the
-//!     reconstructed index. Identical everywhere except the echo edge — which
-//!     is the entire surface being shaded.
-//!
-//! Shading, three more, and the reason for the first two is one fixture: the
-//! only `gradient_shading` test renders a *uniform* grid, whose gradient is
-//! zero and whose shading is therefore the 1.0 early exit.
-//!
-//!   * the sign of the normal — the difference between a lit cloud and one lit
-//!     from inside;
-//!   * the displayed-kilometre metric the gradient is divided by, invisible
-//!     unless an anisotropic box meets a gradient with more than one non-zero
-//!     component, because a normal is invariant under isotropic rescaling; and
-//!   * which kilometre `cell_km`'s **north** lane measures. Every box that
-//!     reaches a shading test is square in x and y, so writing the east extent
-//!     into both horizontal entries renders a bit-identical picture. Only a
-//!     horizontally rectangular box carrying a gradient in x *and* y parts
-//!     them, and until [`probe_wide_lit_gradient`] there was none — the one
-//!     rectangular box in the repository, `volume_gpu`'s 100 × 400 km
-//!     cos-at-pixel fixture, is a floor test with `gradient_shading` off.
-//!
-//! The opacity ramp, two: every shipped fixture leaves `edge_soft_width` at the
-//! hard default, where the ramp is a step and neither its shape nor the foot it
-//! rises from can matter.
-//!
-//! The map floor, two:
-//!
-//!   * the off-edge guard, because every floor fixture looks straight down,
-//!     where each ray's plane crossing is inside the footprint by construction
-//!     — and clamping instead of missing smears the boundary texel of the map
-//!     across the whole ground beyond it;
-//!   * a 1.65% scale error in the footprint — the shape of the misregistration
-//!     above — because nothing measures the floor's position to better than the
-//!     3 px the shipped seam test allows.
-//!
-//! Those ten are covered now, and they are equally the specification for the
-//! shipped tests that should eventually carry them.
-//!
-//! Two further candidate mutations are deliberately **absent**, each because it
-//! is genuinely equivalent rather than merely unobserved. Both are written out
-//! at the point in [`MUTANTS`] where they would have gone, because a mutation
-//! that provably cannot be seen is a fact about the shader worth keeping.
+//! Adding a mutant is one row of [`MUTANTS`]: name, class, pattern,
+//! replacement, occurrence count, and which probe should notice.
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
@@ -135,23 +48,17 @@ const SURFACE: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 /// One text substitution in `volume.wgsl`, and the probe that must notice it.
 struct Mutant {
-    /// What the mutation does, in the shader's own vocabulary. Printed in the
-    /// battery's table and in every failure.
+    /// What the mutation does, in the shader's own vocabulary.
     name: &'static str,
-    /// Which of the classes in the module doc this belongs to. Only for the
-    /// printed table, so a reader can see at a glance which parts of the shader
-    /// are covered.
+    /// Which class this belongs to; only for the printed table.
     class: &'static str,
     /// The distinctive expression to replace. Never a bare token and never
-    /// whitespace-anchored: it has to survive a reflow and break loudly on a
-    /// rewrite.
+    /// whitespace-anchored: it has to survive a reflow.
     pattern: &'static str,
-    /// What to put in its place. Must be valid WGSL of the same type, or the
-    /// pipeline build below fails its error scope and the battery says so.
+    /// What to put in its place. Must be valid WGSL of the same type.
     replacement: &'static str,
     /// How many times `pattern` occurs. Declared rather than derived, so an
-    /// edit that duplicates or removes one occurrence is a failure rather than
-    /// a quietly narrower mutation.
+    /// edit that changes the count fails rather than narrowing the mutation.
     occurrences: usize,
     /// The measurement that must move.
     probe: &'static Probe,
@@ -185,23 +92,16 @@ fn mutate(source: &str, mutant: &Mutant) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// A rendering reduced to a handful of numbers.
-///
-/// The reduction is what makes a mutant's effect assertable: `Vec<f64>` rather
-/// than an image, so "the probe moved" is one `max` over a difference and the
-/// failure message can print both readings in full.
 type ProbeFn = fn(&wgpu::Device, &wgpu::Queue, &VolumePipelines) -> Vec<f64>;
 
 struct Probe {
-    /// Named after what it looks at, because the failure message is "nothing
-    /// in the repository can see X" and the reader needs to know what X was
-    /// measured with.
+    /// Named after what it looks at: the failure message is "nothing in the
+    /// repository can see X".
     name: &'static str,
     /// The largest per-element difference two readings may have and still count
-    /// as the same picture. The renders are deterministic — the same shader
-    /// gives bit-identical bytes — so this is not sampling noise: it is the
-    /// bar for "materially different", set at a few 8-bit levels or a fraction
-    /// of a pixel, so that a mutation whose whole effect is a rounding is
-    /// correctly reported as invisible rather than counted as caught.
+    /// as the same picture. Renders are deterministic, so this is not sampling
+    /// noise but the bar for "materially different" — a few 8-bit levels, so a
+    /// mutation whose whole effect is a rounding reports as invisible.
     tolerance: f64,
     run: ProbeFn,
 }
@@ -237,11 +137,6 @@ fn channel_mean(pixels: &[[u8; 4]], channel: usize) -> f64 {
 }
 
 /// The centroid of the pixels `keep` accepts, in fractions of the image.
-///
-/// Fractions rather than pixels so that one probe's tolerance is one number:
-/// a reading that mixes pixel coordinates with 0-1 channels would need two.
-/// `(-1, -1)` for an empty selection, which is outside every real centroid and
-/// therefore itself a detectable reading.
 fn centroid_fraction(
     pixels: &[[u8; 4]],
     size: [u32; 2],
@@ -266,10 +161,6 @@ fn centroid_fraction(
 
 /// The lowest and highest grey level in the middle half of the image, and how
 /// much of that region came back opaque.
-///
-/// Deliberately assertion-free, unlike `volume_gpu`'s `grey_span`: a mutant may
-/// legitimately leave the surface translucent or absent, and that has to arrive
-/// as a moved reading rather than as a panic from inside the instrument.
 fn grey_statistics(pixels: &[[u8; 4]], size: [u32; 2]) -> Vec<f64> {
     let (mut lo, mut hi) = (u8::MAX, u8::MIN);
     let (mut opaque, mut total) = (0usize, 0usize);
@@ -296,13 +187,6 @@ fn grey_statistics(pixels: &[[u8; 4]], size: [u32; 2]) -> Vec<f64> {
 const CUBE_KM: [f32; 3] = [10.0, 10.0, 10.0];
 
 /// A half-transparent uniform volume, read at the centre pixel.
-///
-/// Extinction is chosen to land alpha near 0.5, which is the whole point:
-/// at alpha 1 the premultiply is the identity and every un-premultiply /
-/// re-premultiply rule agrees, so a saturated fixture cannot see that half of
-/// the colour pipeline at all. (That is exactly why the shipped
-/// `a_uniform_grid_paints_its_palette_colour`, which saturates, does not — and
-/// it is `#[ignore]`d behind an adapter, as is everything here.)
 fn probe_translucent_volume(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -326,11 +210,6 @@ fn probe_translucent_volume(
 }
 
 /// A volume sitting halfway up the opacity ramp.
-///
-/// Every shipped fixture leaves `edge_soft_width` at its hard default, where
-/// the ramp reaches 1 within a millionth of an index step and is therefore
-/// indistinguishable from no ramp at all. This one gives the ramp a real width
-/// and plants the field in the middle of it.
 fn probe_opacity_ramp(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -358,20 +237,6 @@ fn probe_opacity_ramp(
 
 /// A field graded **diagonally**, on an anisotropic box, under gradient
 /// shading.
-///
-/// Two things this fixture has to get right, and neither is optional:
-///
-/// * A *uniform* grid has no gradient at all, so `shading` takes its 1.0 early
-///   exit and every lighting mutation is invisible — which is exactly what the
-///   `gradient_shading = true` arm of the shipped
-///   `a_uniform_grid_paints_its_palette_colour` measures (`#[ignore]`d, like
-///   every adapter-bound test named in this file). So the index ramps.
-/// * It ramps along **x and z together**, over a 240 x 240 x 20 km box. A
-///   gradient with one non-zero component, or an isotropic cell, cannot see the
-///   displayed-kilometre metric at all: `normal = -gradient / |gradient|`
-///   is invariant under any isotropic rescaling, so dividing by `cell_km` or
-///   not gives the identical normal. The pancake box and the diagonal ramp are
-///   what put the 12:1 aspect ratio into the direction.
 fn probe_lit_gradient(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -379,10 +244,8 @@ fn probe_lit_gradient(
 ) -> Vec<f64> {
     let size = [64u32, 64];
     let cells = [16u32, 16, 16];
-    // A block with air all round it, so the render carries both an interior —
-    // where coverage is 1 and the premultiplied channel equals the index — and
-    // an echo edge, where they part company and only the premultiplied one has
-    // a gradient pointing out of the data.
+    // Air all round, so the render carries both an interior (coverage 1, the
+    // premultiplied channel equal to the index) and an echo edge.
     let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
     for z in 3..13u32 {
         for y in 3..13u32 {
@@ -411,10 +274,6 @@ fn probe_lit_gradient(
 
 /// An eye **inside** the box, looking down through an empty lower half at a
 /// solid upper one.
-///
-/// The slab entry's clamp to zero is the only thing keeping the march from
-/// starting behind the viewer. Every other fixture here puts the eye outside
-/// the box, where the entry is positive and the clamp is dead code.
 fn probe_eye_inside_the_box(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -450,10 +309,6 @@ fn probe_eye_inside_the_box(
 }
 
 /// Where the sequential isosurface landed, and how much it wobbles.
-///
-/// The grey ramp table under ambient-only light makes a pixel's grey level the
-/// palette index the surface was found at, and the per-pixel jitter makes the
-/// *spread* the tell for an unrefined hit.
 fn probe_isosurface_level(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -473,13 +328,6 @@ fn probe_isosurface_level(
 
 /// Where the *diverging* isosurface landed: the level set of the deviation
 /// from the centre index, which is a different surface from the index's own.
-///
-/// The near slab is **unmeasured air**. That is what puts `iso_hit_test`'s
-/// coverage term on the picture: an air sample reconstructs to index 0, which
-/// is as far from a diverging centre as any real inbound value, so without the
-/// coverage floor the very first sample crosses and the surface shrink-wraps
-/// the coverage cone — the stated reason the term is there, which no shipped
-/// fixture reaches because every one of them fills its box.
 fn probe_diverging_isosurface(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -527,8 +375,7 @@ fn probe_floor_orientation(
     uniform.gradient_shading = false;
     uniform.map_floor = true;
     // The footprint over the whole mirror, north edge on row 0, established
-    // through the reprojection rather than assumed of it — the same fixture
-    // `volume_gpu.rs` drives, which is the point of sharing the harness.
+    // through the reprojection rather than assumed of it.
     let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
     uniform.floor_uv = floor_uv;
     uniform.floor_geo = floor_geo;
@@ -545,13 +392,6 @@ fn probe_floor_orientation(
 }
 
 /// Where one planted floor patch lands on screen, to a fraction of a pixel.
-///
-/// This is the registration seam as a *number*. The camera is 200 box-heights
-/// up through the same far plane, which is orthographic to well under a pixel,
-/// so the patch's centroid is a direct read of the shader's floor texture
-/// mapping — and a mutation that scales the footprint by a percent or two
-/// moves it by a couple of pixels, which is the shape of the misregistration
-/// this repository shipped.
 fn probe_floor_registration(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -583,8 +423,7 @@ fn probe_floor_registration(
     uniform.gradient_shading = false;
     uniform.map_floor = true;
     // The footprint over the whole mirror, north edge on row 0, established
-    // through the reprojection rather than assumed of it — the same fixture
-    // `volume_gpu.rs` drives, which is the point of sharing the harness.
+    // through the reprojection rather than assumed of it.
     let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
     uniform.floor_uv = floor_uv;
     uniform.floor_geo = floor_geo;
@@ -599,35 +438,11 @@ fn probe_floor_registration(
 
 /// The box every fixture below that is **not square** is drawn on: 2° of
 /// longitude east–west against 1° of latitude north–south, 222.4 × 111.2 km.
-///
-/// 2:1 because that is the shape a 3D pane's own viewport has — a 16:9 pane is
-/// 1.78:1 — and because every floor fixture in *this* file was square, which
-/// makes `floor_colour`'s two reprojection lines interchangeable: on a square
-/// box, writing `box_size_km.x` into the north line, or exchanging the two
-/// lines outright, renders a bit-identical picture.
-///
-/// The repository is not entirely square, and the exception is worth naming
-/// because it is what these two floor rows are measured against:
-/// `volume_gpu`'s `the_floor_takes_cos_at_the_pixels_latitude_not_the_sites`
-/// — `#[ignore]`d, so this only holds for someone running `-- --ignored` —
-/// stands on a 100 × 400 km box, and it catches both of them when they are
-/// patched into `volume.wgsl` on disk. So they are rows that prove *that* test
-/// can fail, not holes it leaves. The shading row below is the hole.
 const WIDE_EAST_DEGREES: f64 = 2.0;
 /// The north–south span of the wide box. See [`WIDE_EAST_DEGREES`].
 const WIDE_NORTH_DEGREES: f64 = 1.0;
 
 /// Where one planted floor patch lands on a **rectangular** box.
-///
-/// [`probe_floor_registration`] with two changes and no others: the box is
-/// [`WIDE_EAST_DEGREES`] × [`WIDE_NORTH_DEGREES`] rather than square, and the
-/// lanes are the ones written for it, so the footprint still covers exactly
-/// the whole mirror and the patch's screen centroid is still a direct read of
-/// the shader's floor mapping.
-///
-/// The patch sits at cell (26, 8) of 32 — east of centre and well south of
-/// it, off both the diagonal and the anti-diagonal — so a mapping that
-/// exchanges the two axes moves it whichever way it exchanges them.
 fn probe_wide_floor_registration(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -677,29 +492,6 @@ fn probe_wide_floor_registration(
 
 /// A field graded across **both horizontal axes** of a box whose two
 /// horizontal axes are 6:1, under gradient shading.
-///
-/// [`probe_lit_gradient`] puts the 12:1 aspect between a horizontal axis and
-/// the vertical, which is what sees `cell_km`'s z lane. Nothing sees its **y**
-/// lane, because every box in this repository has `box_size_km.x ==
-/// box_size_km.y`: writing `box_size_km.x` into both horizontal entries of
-/// `cell_km` renders a bit-identical picture on all of them.
-///
-/// So: 240 × 24 × 20 km, with the index ramping along x and y together. The
-/// honest metric divides the two equal raw differences by 15 km and 1.5 km,
-/// which puts the normal 5.7° off the y axis; a squared metric divides both by
-/// 15 km and puts it at 45°. Against the default light that is 0.590 of
-/// half-Lambert against 0.669, and the mutation moves the worst element of the
-/// reading by 0.043 — eleven 8-bit levels — against this probe's bar of 0.012.
-///
-/// **The column is full from bottom to top**, and that is not tidiness. The
-/// first fixture written here was `probe_lit_gradient`'s block with air above
-/// and below it, and the mutation moved the centre pixel by 0.004 — invisible.
-/// A down-looking ray meets that block's *top face* first, where coverage runs
-/// from 0 to 1 across one 1.25 km cell: the z component of the gradient is
-/// twelve times either horizontal one, the normal is very nearly +z, and which
-/// kilometre the two horizontal lanes were divided by cannot matter. A field
-/// with no variation along the ray is what puts the whole normal in the plane
-/// the mutation acts on.
 fn probe_wide_lit_gradient(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -725,11 +517,9 @@ fn probe_wide_lit_gradient(
     // near samples' shading rather than a blend with the background.
     uniform.extinction_per_km = 0.5;
     uniform.gradient_shading = true;
-    // Ambient is a floor added to every shading, so it compresses exactly the
-    // difference this probe exists to measure: at the shipped 0.35 the whole
-    // half-Lambert term arrives scaled by 0.65. Turned down rather than off,
-    // because 0 would put the away-facing half of a real surface at black and
-    // stop the reading being a shading at all.
+    // Ambient compresses exactly the difference this probe measures: at the
+    // shipped 0.35 the half-Lambert term arrives scaled by 0.65. Turned down
+    // rather than off, since 0 would put an away-facing surface at black.
     uniform.ambient = 0.05;
     let lut = opaque_white_lut();
     let pixels = raymarch_once(
@@ -743,17 +533,6 @@ fn probe_wide_lit_gradient(
 
 /// A shallow ray that leaves the box through its side and only meets the
 /// bottom plane far outside the footprint.
-///
-/// The off-edge guard's only job. Looking straight down, every ray that hits
-/// the box hits the floor inside the footprint too, so no shipped fixture can
-/// distinguish "reject the hit" from "clamp to the edge texel" — and clamping
-/// smears the boundary texel of the map across the whole ground beyond it.
-///
-/// Here the eye is beside the box at mid height and the rays fan downward, so
-/// their plane crossings land at box x around -1: outside the unit square,
-/// rejected, nothing painted. The fixture proves itself: if no ray reached the
-/// plane at all, the clamping mutant would paint nothing either and the battery
-/// would report it as invisible.
 fn probe_grazing_ray_past_the_footprint(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -785,9 +564,6 @@ fn probe_grazing_ray_past_the_footprint(
 }
 
 /// An empty box seen from under its bottom plane, with the floor on.
-///
-/// The ground must have faded to nothing by this depth: a residual is the wall
-/// the user reported.
 fn probe_floor_from_below(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -829,13 +605,6 @@ fn probe_floor_from_below(
 /// A solid volume standing on an opaque floor, seen from an eye above the
 /// bottom plane — which is the only fixture where the composite's two arms give
 /// different pictures.
-///
-/// Every other floor probe here draws an *empty* box, and over an empty box the
-/// two arms are algebraically identical: `0 + 1 * cover * ground` and
-/// `ground * cover + 0 * (1 - cover)` are the same colour. So a mutation of the
-/// arm itself is invisible to all of them, which is exactly the hole this
-/// closes. Behind the volume the ground is absorbed and the pixel is white; in
-/// front of it the ground covers the volume and the pixel is red.
 fn probe_floor_arm_over_a_solid_volume(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -849,10 +618,8 @@ fn probe_floor_arm_over_a_solid_volume(
     let floor = planted_mirror(device, queue, pipelines, [8, 8], &rgba);
 
     let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
-    // Down the z axis from the box's own middle: above the bottom plane, but
-    // not above the box, so a mutation that moves the plane to the top face has
-    // somewhere to be wrong. An eye outside the near face would be above both
-    // and could not tell them apart.
+    // Down the z axis from the box's own middle: above the bottom plane but not
+    // above the box, so a plane moved to the top face has somewhere to be wrong.
     uniform.box_from_clip = box_from_clip_down(2);
     uniform.eye_in_box = [0.5, 0.5, 0.5];
     uniform.extinction_per_km = 1000.0;
@@ -876,9 +643,6 @@ fn probe_floor_arm_over_a_solid_volume(
 }
 
 /// How wide one voxel paints, at the raw field and at the cloud rung.
-///
-/// The reconstruction knob is the difference between the two numbers; the
-/// march's step length is most of the first.
 fn probe_lone_voxel_footprint(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -908,15 +672,6 @@ fn probe_lone_voxel_footprint(
 }
 
 /// A two-cell slab in a 64-cube, seen edge-on from above.
-///
-/// The march's step *ceiling* is nearly invisible on every other fixture, and
-/// correctly so: when a span outruns the ceiling the `dt` floor stretches the
-/// steps to cover it rather than truncating the volume, and for a constant
-/// field the discretisation then telescopes out of the alpha exactly. What a
-/// collapsed ceiling actually destroys is **resolution** — a feature thinner
-/// than the stretched step is missed by whatever fraction of the jittered comb
-/// steps over it. So the fixture is a thin feature on a fine grid: 64 cells
-/// along the ray at one cell per step, against a slab two cells thick.
 fn probe_thin_slab_resolution(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -946,27 +701,6 @@ fn probe_thin_slab_resolution(
 
 /// How far an isosurface reaches into the reconstruction tent, and how the
 /// surface it finds is lit there.
-///
-/// A solid block in air, rendered as an isosurface under ordinary ambient
-/// light. Two things live on this picture and nowhere else:
-///
-/// * `COVERAGE_FLOOR` is where the surface stops. It is the *half level set* of
-///   the trilinear coverage field on purpose — the decision boundary that gives
-///   a smooth surface the reach of an honest nearest march — and moving it
-///   shrinks or inflates the block by a fraction of a cell on every face, which
-///   only a silhouette area can read.
-/// * The isosurface's shading normal is the gradient of `iso_field x coverage`.
-///   Inside the data coverage is 1 and the weight is invisible; at the boundary
-///   — which is the entire surface — it is what makes the gradient point out of
-///   the data at all. Read as colour, which means the light cannot be ambient
-///   only: every other isosurface fixture here sets `ambient = 1` to turn grey
-///   into an index readout, and that collapses the wrap term to exactly 1. It
-///   also means the product must be **diverging**, with its centre above the
-///   data — the ρHV shape the shader names. On a sequential ramp `iso_field`
-///   falls outward on its own and an unweighted gradient happens to point the
-///   right way; with the centre above the block, `iso_field` of air is the
-///   largest value the function takes, so dropping the weight turns the normal
-///   round and lights the surface from inside.
 fn probe_isosurface_reach(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -987,9 +721,6 @@ fn probe_isosurface_reach(
     uniform.eye_in_box = eye_outside(2);
     // Not `iso_uniform`: its ambient of 1 is what makes a grey level readable
     // as an index, and it is also what would hide every lighting term here.
-    // Diverging, centre above the block: |60 - 200| clears the threshold, and
-    // so — by more — does |0 - 200|, which is the air the coverage weight has
-    // to exclude from the normal.
     uniform.iso_centre = 200.0 / 255.0;
     uniform.iso_threshold = 100.0 / 255.0;
     let lut = opaque_white_lut();
@@ -1004,19 +735,6 @@ fn probe_isosurface_reach(
 }
 
 /// The KLOT NROT green-arc fixture, and the echo edge it lives on.
-///
-/// A block whose only data index is blue, in air, over a table whose low band
-/// is opaque green — the stand-in for NROT's anticyclonic run, which really
-/// does sit under its cyclonic data on the one index ramp. The whole claim of
-/// the coverage-premultiplied reconstruction is that a fetch beside empty air
-/// returns a coverage-weighted mean of the **covered** texels alone, so the
-/// block may only ever paint its own blue: any green is a band the data never
-/// occupied.
-///
-/// The reading carries the edge as well as the census, because that is where
-/// every coverage term lives — inside the data coverage is exactly 1 and the
-/// premultiplied channel, the divisor and the optical-depth weight are all
-/// identities.
 fn probe_coverage_boundary(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1071,12 +789,6 @@ fn probe_coverage_boundary(
 }
 
 /// A planted slab under a **real perspective camera**, as a silhouette.
-///
-/// Every other fixture in this directory drives an orthographic-by-hand
-/// `box_from_clip` whose `w` row is the identity, so the perspective divide in
-/// `unproject` is the identity too and cannot be seen. This one goes through
-/// the application's own `view_for`, which is the only way a divide, a depth
-/// row or a matrix convention can show up.
 fn probe_perspective_silhouette(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1217,9 +929,6 @@ static PERSPECTIVE_SILHOUETTE: Probe = Probe {
 // ---------------------------------------------------------------------------
 
 /// Every mutation, and the probe that must see it.
-///
-/// One row per shader property. The classes are the ones the campaign has
-/// actually watched regress in silence.
 static MUTANTS: &[Mutant] = &[
     // --- reconstruction and sampling -------------------------------------
     Mutant {
@@ -1546,8 +1255,6 @@ static MUTANTS: &[Mutant] = &[
         occurrences: 1,
         // An eye outside the near face, where an unsigned direction sends the
         // slab's far bound behind the camera and the box is missed outright.
-        // Not FLOOR_ARM: its eye is inside the box, and from there the
-        // unsigned solve still enters and the picture barely moves.
         probe: &TRANSLUCENT_VOLUME,
     },
     Mutant {
@@ -1575,16 +1282,6 @@ static MUTANTS: &[Mutant] = &[
 
 /// Every pattern in [`MUTANTS`] still names something in the shader, exactly as
 /// often as declared, and every replacement really changes the source.
-///
-/// **Not `#[ignore]`d**, and that is the point: this is the check that stops
-/// the battery going vacuously green, and it needs no adapter. A `volume.wgsl`
-/// edit that moves an anchor fails here in the ordinary `cargo test`, on any
-/// machine, before anybody looks at a GPU job.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_shader_mutants \
-///     every_mutant_still_matches_the_shader_it_mutates -- --exact
-/// ```
 #[test]
 fn every_mutant_still_matches_the_shader_it_mutates() {
     let mut broken = Vec::new();
@@ -1605,11 +1302,6 @@ fn every_mutant_still_matches_the_shader_it_mutates() {
 
 /// The rectangular fixtures' box and lanes are two views of the same two
 /// spans, and at one degree they are the square fixtures exactly.
-///
-/// `equatorial_box_km` stays a `const fn` with its own literals, so this is
-/// what stops the two drifting — and it is the tie the rest of the battery
-/// stands on, since a wide box whose lanes described a different one would
-/// move every probe here for a reason that is not the mutation. Needs no GPU.
 #[test]
 fn the_wide_lanes_are_the_square_ones_at_one_degree() {
     assert_eq!(equatorial_box_km_of(1.0, 1.0), equatorial_box_km());
@@ -1644,10 +1336,6 @@ fn every_mutant_has_its_own_name() {
 }
 
 /// The substitution machinery refuses a mutation that changes nothing.
-///
-/// The guard rail under everything else here: without it a pattern equal to its
-/// replacement would render an identical picture, the probe would not move, and
-/// the battery would report a live shader property as dead.
 #[test]
 fn a_substitution_that_changes_nothing_is_refused() {
     let no_op = Mutant {
@@ -1676,10 +1364,6 @@ fn a_substitution_that_changes_nothing_is_refused() {
 
 /// Build the real pipelines from `wgsl`, failing loudly if the driver refuses
 /// it.
-///
-/// `create_render_pipeline` returns no `Result`, so a mutation that produces
-/// invalid WGSL would otherwise arrive as an unrelated garbage rendering — the
-/// error scope turns it into a message naming the mutant.
 fn pipelines_from(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1699,19 +1383,6 @@ fn pipelines_from(
 }
 
 /// Every mutation of `volume.wgsl` changes what a probe measures.
-///
-/// The whole battery in one test, because the expensive part is the device and
-/// the baselines, and because the useful output is the *table*: every row's
-/// divergence is printed whether it passed or not, and a run that fails names
-/// every dead mutant at once rather than the first.
-///
-/// A surviving mutant is not a bug in this file. It is a shader property no
-/// probe here can observe — a live, untested expression — and the fix is a new
-/// probe, not a deleted row.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_shader_mutants -- --ignored --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn every_mutant_moves_the_probe_that_should_see_it() {

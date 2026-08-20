@@ -23,10 +23,6 @@ fn a_rung_divides_both_axes_by_its_linear_divisor() {
 }
 
 /// The measured table's own sizes are reachable, which is the point of it.
-///
-/// 1440 x 900 at `Half` is 720 x 450 — the two rows the extrapolation to a
-/// phone rests on. If the divisors ever stopped producing them the numbers
-/// in the module doc would describe something the code cannot select.
 #[test]
 fn the_measured_rows_are_reachable_from_the_ladder() {
     let native = VolumeQuality::BEST.fit([2560, 1440], UNLIMITED);
@@ -47,11 +43,6 @@ fn the_measured_rows_are_reachable_from_the_ladder() {
 }
 
 /// A pane no rung can round away to nothing.
-///
-/// `wgpu` refuses a zero-extent texture, and it refuses it inside the
-/// callback where `create_texture` returns no `Result` — so a plain integer
-/// divide here is a panic on a one-pixel pane, which a user reaches by
-/// dragging a splitter.
 #[test]
 fn a_tiny_pane_never_rounds_to_a_zero_sized_texture() {
     for pane in [[1, 1], [1, 900], [3, 2], [7, 5]] {
@@ -113,9 +104,6 @@ fn a_pane_over_budget_at_every_rung_is_shrunk_proportionally() {
 }
 
 /// Whatever the pane, whatever the rung, the result fits the budget.
-///
-/// The property, rather than the three cases above: this is what makes the
-/// budget constant a bound rather than a suggestion.
 #[test]
 fn no_pane_and_no_rung_can_exceed_the_budget() {
     let budget = 4 * 1024 * 1024;
@@ -200,13 +188,6 @@ fn every_device_class_selects_the_quality_its_row_documents() {
 
 /// Lighting degrades before resolution: no class keeps the cloud rung
 /// after giving up pixels.
-///
-/// This is the ladder's stated order made assertable. The cloud rung is
-/// the expensive knob (~2.9x per covered pixel), so a class that had to
-/// coarsen its offscreen has by definition already run out of the budget
-/// the cloud look costs — a `Half`+`On` row would be paying the premium
-/// look into a downscaled target, which is the old `Integrated` row this
-/// ordering retired. The floor stays jagged-unlit by the same rule.
 #[test]
 fn no_class_that_gave_up_resolution_keeps_the_cloud_rung() {
     for class in [
@@ -229,15 +210,6 @@ fn no_class_that_gave_up_resolution_keeps_the_cloud_rung() {
 }
 
 /// All three platform ceilings, checked from whichever target compiles this.
-///
-/// The earlier version of this test built a **local literal** Half/Off and
-/// asserted against that, while its doc claimed to be reaching "the arm no
-/// test binary on any CI row would otherwise reach". It reached nothing:
-/// changing the wasm arm to [`VolumeQuality::BEST`] failed zero host tests,
-/// which is a browser promoted to the full-size shaded march on the target
-/// with the least headroom and the least coverage. Naming the three
-/// constants outside the cascade is what makes this checkable at all —
-/// the same fix, one level up, as `constants::WASM_VOLUME_GRID_CELLS`.
 #[test]
 fn all_three_platform_ceilings_are_the_ones_documented() {
     let handheld = VolumeQuality {
@@ -250,11 +222,6 @@ fn all_three_platform_ceilings_are_the_ones_documented() {
 }
 
 /// Both handheld ceilings really cap, and the desktop one really does not.
-///
-/// The property rather than the values: a "ceiling" equal to the best the
-/// build offers is not a ceiling. An Android tablet with a fast GPU reports
-/// `DiscreteGpu`, so this is the case that decides whether a phone-class
-/// target can select the desktop's march.
 #[test]
 fn the_handheld_ceilings_cap_a_discrete_adapter_and_the_desktop_one_does_not() {
     for (target, ceiling) in [
@@ -289,11 +256,6 @@ fn the_handheld_ceilings_cap_a_discrete_adapter_and_the_desktop_one_does_not() {
 }
 
 /// Every device class is held to every ceiling, on both rungs.
-///
-/// The general property behind the three rows above: whatever a class would
-/// pick unconstrained, the result is never finer than the ceiling on either
-/// axis. `Ord` on both enums runs finest-to-coarsest, so "no better than"
-/// is `>=`.
 #[test]
 fn no_device_class_escapes_any_platform_ceiling() {
     for (target, ceiling) in [
@@ -328,10 +290,6 @@ fn no_device_class_escapes_any_platform_ceiling() {
 }
 
 /// A ceiling never *raises* a device that had already chosen less.
-///
-/// The mistake this catches is writing `capped_by` as an assignment rather
-/// than a `max`: a software rasteriser under the desktop ceiling would then
-/// be promoted to the full-size shaded march.
 #[test]
 fn a_ceiling_never_raises_a_device_that_chose_less() {
     assert_eq!(
@@ -347,10 +305,6 @@ fn a_ceiling_never_raises_a_device_that_chose_less() {
 }
 
 /// The two rungs cap independently of each other.
-///
-/// Folding them into one ordered "quality level" is the tempting
-/// simplification, and it is wrong: shading is the 2.4x knob and resolution
-/// is the 3.4x one, and a device can want one without the other.
 #[test]
 fn the_two_rungs_are_capped_independently() {
     let shaded_but_small = VolumeQuality {
@@ -376,10 +330,6 @@ fn the_shading_rung_reports_itself_as_a_flag() {
 }
 
 /// The ladder is ordered finest-first and `next_coarser` walks it.
-///
-/// `fit` depends on both: it walks with `next_coarser` and the budget tests
-/// index `LADDER`. A `LADDER` in the other order would leave the tests
-/// asserting the same things about the wrong rungs.
 #[test]
 fn the_ladder_runs_finest_to_coarsest_and_next_coarser_walks_it() {
     assert_eq!(
@@ -407,17 +357,6 @@ fn the_ladder_runs_finest_to_coarsest_and_next_coarser_walks_it() {
 }
 
 /// What a `cfg` cascade's arm is defined as, read out of the source.
-///
-/// The one thing about a `cfg`-selected constant that no host test can
-/// evaluate is its **selection**: on this target the other two arms are
-/// dead text the compiler never looks at. Naming the arms outside the
-/// cascade pins their *values*, and that is all it pins — pointing the
-/// wasm32 arm at `DESKTOP_PLATFORM_CEILING` leaves the whole workspace
-/// green with the wasm `--all-targets` check at 0, which was measured
-/// rather than assumed. Reading the text is the only instrument left.
-///
-/// Asserts the definition is unique so a decoy elsewhere in the file — a
-/// doc example, a string in an assertion message — cannot be what is found.
 fn cascade_arm(source: &str, cfg: &str, name: &str) -> String {
     let definition = format!("#[cfg({cfg})]\npub const {name}");
     let occurrences = source.matches(&definition).count();
@@ -449,12 +388,6 @@ const CASCADE_ARMS: [(&str, &str); 3] = [
 ];
 
 /// Each ceiling arm selects **its own** class's constant.
-///
-/// This is the half `all_three_platform_ceilings_are_the_ones_documented`
-/// cannot reach. That test pins what `WASM_PLATFORM_CEILING` *is*; this one
-/// pins that the wasm32 arm is the one that picks it. Both mutations were
-/// run: changing a ceiling's value dies on the first test, pointing an arm
-/// at another class's constant dies only on this one.
 #[test]
 fn each_ceiling_arm_selects_its_own_classs_constant() {
     let source = include_str!("../quality.rs");
@@ -472,20 +405,6 @@ fn each_ceiling_arm_selects_its_own_classs_constant() {
 }
 
 /// The compiled cascade selects one of the three named ceilings.
-///
-/// This is the one thing about `PLATFORM_CEILING` that no other target can
-/// check on this one's behalf, so it is all this test claims. The values
-/// themselves are pinned unconditionally by
-/// `all_three_platform_ceilings_are_the_ones_documented`.
-///
-/// Replaces a test that asserted
-/// `LADDER.contains(PLATFORM_CEILING.resolution)` and
-/// `select(Discrete, PLATFORM_CEILING) == PLATFORM_CEILING`. Both were
-/// vacuous: `LADDER` holds every variant of a three-variant enum, so
-/// `contains` is unconditionally true, and `select(Discrete, X) == X` for
-/// **every** `X`, because Discrete's unconstrained quality is the minimum
-/// on both ladders. Neither could distinguish a correct ceiling from any
-/// other value, which is precisely what the test was named for.
 #[test]
 fn the_compiled_cascade_selects_one_of_the_named_ceilings() {
     assert!(
@@ -502,12 +421,6 @@ fn the_compiled_cascade_selects_one_of_the_named_ceilings() {
 }
 
 /// `select(Discrete, ceiling)` returns the ceiling for *every* ceiling.
-///
-/// Stated as its own property rather than left implicit under a test that
-/// looked like it was checking something else. It holds because
-/// `DeviceClass::Discrete`'s unconstrained quality is the minimum on both
-/// ladders, and that is the fact worth pinning: change Discrete's row and
-/// the fastest hardware silently stops reaching the ceiling it was given.
 #[test]
 fn a_discrete_adapter_reaches_whatever_ceiling_it_is_given() {
     assert_eq!(

@@ -1,52 +1,5 @@
 //! The six radar codec rows — the radar half of the job boundary, beside the
 //! pipeline the rows run (WO-M7.1).
-//!
-//! Each row is a [`JobSpec`] whose `In` is its own typed input struct —
-//! [`RadarPlanJob`] and its five siblings, the shapes of the frontend's
-//! `JobRequest` variants minus the envelope — monomorphized into a
-//! [`JobCodec`] in [`JOB_CODECS`]. The codec bodies moved here **verbatim**
-//! (post-WO-M6.3 text) from `rustdar_worker::offload`, which keeps
-//! byte-identical duplicates until WO-M7.2 flips the frontend onto this
-//! table and deletes them — until that flip nothing routes through this
-//! module, and the frontend's framing digests over the duplicate bodies are
-//! the byte gate the flip must pass.
-//!
-//! **The code byte and the envelope stay with the caller.** A row's payload
-//! is the kind's own bytes and nothing else: since WO-M7b's dense flip the
-//! frontend frames every row as its composed-registry index plus one and the
-//! one canonical envelope, so no row here writes or reads a wire byte of
-//! either. The row order in [`JOB_CODECS`] — radar, level3, level3/vild,
-//! section, voxels, decode — is load-bearing for exactly that framing: the
-//! wire code IS the composed-registry index plus one.
-//!
-//! **The side ceiling is envelope, not input.** The frontend's `execute`
-//! reads `side_ceiling_px` once off the request so its rasterizing arms
-//! cannot come to disagree about how large a picture a job was allowed to
-//! make; here the same property is structural — no input struct carries the
-//! field, `run` reads it only from the [`JobGeometry`], and the caller's
-//! canonical envelope is what carries it across the wire. Every decode here
-//! passes the envelope through unchanged.
-//!
-//! **Every row states both directions.** The three frame rows' replies ride
-//! [`RenderedFrame::write_head`]/[`from_parts`](RenderedFrame::from_parts)
-//! — the wire form WO-M7c gave the frame when the reply direction joined
-//! the codec table, split at WO-M7d into a scalar head plus the two
-//! nominated tails `[polar, image]` — and the section, voxel and decode
-//! rows' outputs already had wire forms of their own ([`CrossSection`],
-//! [`VoxelGrid`] and [`DecodedScan`] `to_bytes`/`from_bytes`), which their
-//! [`JobOutCodec`] halves delegate to unchanged (all head, no tails).
-//!
-//! **The refusal contract**, shared by every `decode` here: `None` for a
-//! flag, product code or enum byte outside this build's values, a payload
-//! whose two product statements disagree (`agree_on_product`), a voxel
-//! shape the budget cannot afford, or a buffer shorter than its layout
-//! claims. The variable-length tails ride last — `RenderInput::from_bytes`
-//! refuses trailing bytes, and the archive rows' tails are the buffer's own
-//! remainder — so no length prefix can lie about them.
-//!
-//! **No clock.** Nothing here may read one — a worker that did would render
-//! a picture the direct call would not; WO-M7.2 lands the grep ratchet that
-//! pins this for every jobs module.
 
 use std::sync::Arc;
 
@@ -61,11 +14,6 @@ use crate::voxel::{HalfExtentKm, VoxelGrid, VoxelRequest, VoxelShape};
 use crate::xsect::{CrossSection, SectionRequest};
 
 /// The six radar rows, in dispatch order: **radar, level3, level3/vild,
-/// section, voxels, decode**. The order is load-bearing — the dense wire
-/// code (WO-M7b) IS the row's index into the composed registry, plus one —
-/// and the labels are the shipped kind strings the frontend's `kind()`
-/// prints, byte for byte (`radar`'s per-product `"radar/nrot"`/`"radar/srv"`
-/// refinements are a `kind()` nicety over the same row, not row labels).
 pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<RadarPlanJob>(),
     JobCodec::of::<Level3Job>(),
@@ -76,28 +24,10 @@ pub static JOB_CODECS: &[JobCodec] = &[
 ];
 
 /// The frame rows' shared reply half: the wire form lives on the type
-/// ([`RenderedFrame::write_head`]/[`from_parts`](RenderedFrame::from_parts)),
-/// and the three rows delegate to it through one macro so a Level III frame
-/// and a Level II one cannot come to encode themselves differently — the
-/// same argument `From<SweepRender>` makes for the direct path.
-///
-/// The frame nominates `[polar, image]` as its two tails (WO-M7d): the
-/// image `Vec` MOVES into the tails — zero worker-side copy of the 16 MiB
-/// widest-still buffer — and the polar block rides whole beside it, so
-/// neither is concatenated into the head (the concatenation this replaces
-/// was a 21.04 MiB memcpy per widest 2048² still frame, plus the encode
-/// sink's whole-reply double-buffer on top). The tail ORDER is load-bearing
-/// both ends and is pinned by the frame-reply digest rows
-/// (`rustdar_worker::wire_identity::WIRE_FRAME_REPLY_ROWS`): a symmetric
-/// swap here and in `from_parts` keeps every round-trip green, and the
-/// digest is what goes red.
 macro_rules! frame_reply_codec {
     ($spec:ty) => {
         impl JobOutCodec for $spec {
             fn encode_out(v: RenderedFrame, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>) {
-                // The head is the scalar block alone: 29 bytes with every
-                // optional present (8 range + 9 nyquist + 2 melting +
-                // 10 storm), 11 with none — reserved exactly, once.
                 head.reserve_exact(29);
                 v.write_head(head);
                 tails.push(v.polar.to_bytes());
@@ -116,11 +46,6 @@ frame_reply_codec!(Level3Job);
 frame_reply_codec!(Level3PairJob);
 
 /// Rasterize a Level II frame.
-///
-/// The shape of the frontend's `JobRequest::Radar` arm minus its
-/// `side_ceiling_px`: the ceiling is envelope, not input — `run` reads it
-/// from the [`JobGeometry`] and the caller's canonical envelope carries it
-/// (see the module doc).
 #[derive(Debug, PartialEq)]
 pub struct RadarPlanJob {
     /// Boxed because a `RenderInput` owns its gate bytes and is the largest
@@ -128,19 +53,6 @@ pub struct RadarPlanJob {
     pub input: Box<RenderInput>,
     /// Whether the caller wants the numbers behind the gates, or only the
     /// geometry of where they are.
-    ///
-    /// Static pane renders want both — the numbers are what a hover reads.
-    /// A **loop frame** wants only the geometry: 5.03 MiB of values for the
-    /// widest sweep, across a loop of up to 36 frames, is not affordable and
-    /// does not have to be paid, because the volume the frame was rendered
-    /// from is resident for as long as the loop lives and the wedges are
-    /// what turn a point back into a gate of it. See
-    /// [`crate::hover::SweepGates`].
-    ///
-    /// It used to mean the `side²` `f32` raster grid, which no longer
-    /// leaves `rustdar-radar` on any path — see [`RenderedFrame::polar`].
-    /// The geometry is kept on both settings; only the values are dropped,
-    /// and the texture is unaffected either way.
     pub values_wanted: bool,
 }
 
@@ -152,9 +64,6 @@ impl JobSpec for RadarPlanJob {
     const LABEL: &'static str = "radar";
     const COST: JobCost = JobCost::Raster;
 
-    // `values_wanted` is input, not envelope — it stays. The ceiling does
-    // not: the caller's canonical envelope carries it (WO-M7b), so the row
-    // writes no envelope bytes and the decode passes the geometry through.
     fn encode(input: &RadarPlanJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.push(u8::from(input.values_wanted));
         out.extend_from_slice(&input.input.to_bytes());
@@ -176,18 +85,6 @@ impl JobSpec for RadarPlanJob {
         crate::render::render_from_sized(&input.input, geo.side_ceiling_px as usize).map(|render| {
             let mut frame = RenderedFrame::from(render);
             if !input.values_wanted {
-                // A loop frame keeps its geometry and drops its numbers. 5.03
-                // MiB apiece across a loop of up to 36 frames is not affordable
-                // and does not have to be paid: the volume the frame was
-                // rendered from is resident for as long as the loop lives, and
-                // 5.8 KiB of wedges is what turns a point back into a gate of
-                // it. See `crate::hover::SweepGates`.
-                //
-                // A *Level II* loop frame is the one render that reaches this
-                // arm. The Level III loop has no `values_wanted` to reach it by
-                // and strips at the consumer instead; `app_fetch`'s `deliver`
-                // is the site, and stripping an already-stripped field there is
-                // what makes the one call safe for both.
                 frame.polar.strip_values();
             }
             frame
@@ -196,12 +93,6 @@ impl JobSpec for RadarPlanJob {
 }
 
 /// Rasterize a Level III radial product.
-///
-/// The product's *bytes*, not its decoded form: a `Level3Message` holds
-/// run-length radial packets with no serde derives anywhere in the graph,
-/// and re-decoding is both cheap against the render and a use of the one
-/// decoder rather than a second description of the format. The decode moves
-/// off the main thread with the render as a result.
 #[derive(Debug, PartialEq)]
 pub struct Level3Job {
     pub bytes: Arc<Vec<u8>>,
@@ -218,9 +109,6 @@ impl JobSpec for Level3Job {
     const LABEL: &'static str = "level3";
     const COST: JobCost = JobCost::Raster;
 
-    // No envelope bytes: the ceiling `run` spends rides the caller's
-    // canonical envelope (WO-M7b), and the decode passes the geometry
-    // through.
     fn encode(input: &Level3Job, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&input.product.wire_code().to_le_bytes());
         out.extend_from_slice(&input.radar_lat.to_le_bytes());
@@ -257,12 +145,6 @@ impl JobSpec for Level3Job {
 /// Rasterize a Level III product **derived from two objects of the same
 /// volume**: VIL density, Digital VIL over Enhanced Echo Tops
 /// ([`crate::vild`]).
-///
-/// A second row rather than a `Vec<Arc<Vec<u8>>>` on the one above: the
-/// two objects are not interchangeable — the first is the numerator and the
-/// second the denominator — and a positional pair says so where a list
-/// would leave it to a comment. The bytes travel for the same reason
-/// [`Level3Job`]'s do.
 #[derive(Debug, PartialEq)]
 pub struct Level3PairJob {
     pub dvl: Arc<Vec<u8>>,
@@ -279,9 +161,6 @@ impl JobSpec for Level3PairJob {
     const LABEL: &'static str = "level3/vild";
     const COST: JobCost = JobCost::Raster;
 
-    // No envelope bytes (WO-M7b, as on the two rows above). The first
-    // object is length-prefixed and the second takes the rest, so neither
-    // length can lie about the other.
     fn encode(input: &Level3PairJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&input.radar_lat.to_le_bytes());
         out.extend_from_slice(&input.radar_lon.to_le_bytes());
@@ -315,22 +194,12 @@ impl JobSpec for Level3PairJob {
                 geo.side_ceiling_px as usize,
             )
             .map(RenderedFrame::from),
-            // One of the two did not decode, which `decode_level3` has already
-            // logged: nothing to draw, the same answer a missing sweep gets.
             _ => None,
         }
     }
 }
 
 /// Draw a vertical cross-section through a volume.
-///
-/// The geometry rides here rather than on the [`RenderInput`]: a section's
-/// endpoints are not a render parameter *of reflectivity*, and a
-/// `RenderInput` carrying them would make every plan-view payload's bytes
-/// depend on where somebody last drew a line.
-///
-/// The `input` is a [`RenderInput::extract_volume`] payload — every tilt
-/// carrying the moment, and the cut table that keys them.
 #[derive(Debug, PartialEq)]
 pub struct SectionJob {
     pub input: Box<RenderInput>,
@@ -347,9 +216,6 @@ impl JobSpec for SectionJob {
 
     fn encode(input: &SectionJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         encode_section_request(out, &input.request);
-        // The `RenderInput` goes **last**, because `RenderInput::from_bytes`
-        // refuses trailing bytes: it has to be handed exactly the remainder,
-        // so nothing may follow it.
         out.extend_from_slice(&input.input.to_bytes());
     }
 
@@ -366,24 +232,6 @@ impl JobSpec for SectionJob {
         ))
     }
 
-    // The `Scan` is rebuilt from the payload and dropped again here, which
-    // is the same shape the `radar` row has: one renderer, run wherever the
-    // job landed, rather than a worker-side reimplementation that could
-    // come to disagree with the main thread's.
-    // The storm motion override rides the `RenderInput` — the lane the
-    // plan-view SRV render already uses — and is threaded here into the
-    // derivation seam both vertical renderers share. The RPG's own vector
-    // rides the same payload, one field over, and is threaded through
-    // beside it: the two are rungs of one chain and the derivation is what
-    // arbitrates between them, so a caller that passed only the override
-    // would silently demote every vertical SRV cut to a derived rung while
-    // the map beside it used the RPG's.
-    //
-    // So does the declared Nyquist table, and it has to be lifted back out
-    // separately: `to_scan` rebuilds model types, and the model type is
-    // precisely what dropped the number. Pairing the two here is what
-    // keeps this thread's velocity fold guard on the same limits the
-    // thread that extracted the payload used.
     fn run(input: &SectionJob, _geo: &JobGeometry) -> Option<CrossSection> {
         let (scan, declared) = (input.input.to_scan(), input.input.declared_nyquist());
         crate::xsect::render_section(
@@ -397,19 +245,10 @@ impl JobSpec for SectionJob {
 }
 
 impl JobOutCodec for SectionJob {
-    // Delegating to the type's own wire form keeps one description of the
-    // layout; the `to_bytes` Vec is copied into `head`. WO-M7d — the order
-    // the note here once forecast as "WO-M7c may flatten it" — flattened
-    // the overlay adapter and split the frame reply into head+tails, and
-    // deliberately left this delegation and its one copy as they were: the
-    // copy ledger that drove that order measured the frame rows, not
-    // these.
     fn encode_out(v: CrossSection, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         head.extend_from_slice(&v.to_bytes());
     }
 
-    // All head, no tails: a tail count this row did not write is refused
-    // per the `JobOutCodec` convention.
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<CrossSection> {
         if !tails.is_empty() {
             return None;
@@ -419,7 +258,6 @@ impl JobOutCodec for SectionJob {
 }
 
 /// The reply half of the job boundary's erasure seam: a described section
-/// render answers this type through the codec rows in this module.
 impl rustdar_source::job::JobOut for CrossSection {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -429,8 +267,6 @@ impl rustdar_source::job::JobOut for CrossSection {
         self
     }
 
-    /// The cut raster is the one straight-alpha buffer here; the two axis
-    /// tables beside it are numbers, not pixels.
     fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
         vec![self.image_mut()]
     }
@@ -453,9 +289,6 @@ impl JobSpec for VoxelJob {
 
     fn encode(input: &VoxelJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         encode_voxel_request(out, &input.request);
-        // The `RenderInput` goes **last**, because `RenderInput::from_bytes`
-        // refuses trailing bytes: it has to be handed exactly the remainder,
-        // so nothing may follow it.
         out.extend_from_slice(&input.input.to_bytes());
     }
 
@@ -485,12 +318,10 @@ impl JobSpec for VoxelJob {
 }
 
 impl JobOutCodec for VoxelJob {
-    // Delegation kept whole at WO-M7d, `SectionJob`'s reasoning.
     fn encode_out(v: VoxelGrid, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         head.extend_from_slice(&v.to_bytes());
     }
 
-    // All head, no tails: a foreign tail count refuses.
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<VoxelGrid> {
         if !tails.is_empty() {
             return None;
@@ -500,7 +331,6 @@ impl JobOutCodec for VoxelJob {
 }
 
 /// The reply half of the job boundary's erasure seam: a described voxel
-/// build answers this type through the codec rows in this module.
 impl rustdar_source::job::JobOut for VoxelGrid {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -510,40 +340,12 @@ impl rustdar_source::job::JobOut for VoxelGrid {
         self
     }
 
-    /// A grid carries palette indices for the raymarcher, never pixels —
-    /// there is nothing here to premultiply, stated rather than defaulted.
     fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
         Vec::new()
     }
 }
 
 /// **Decode a downloaded Level II archive volume.**
-///
-/// The one row here that does not rasterize anything, and the one whose
-/// input is not already a decoded volume — it is what *produces* the
-/// volume every other row is built from.
-///
-/// It is a job for the reason the renders are: on the web the work has to
-/// happen somewhere that is not the one thread the browser has.
-/// [`crate::scan`]'s own doc predicted this — the walk is paid "on
-/// cold start, on every timeline scrub, on every 'next scan', and once per
-/// frame of a loop download … and on the web it is paid on the browser's
-/// main thread" — and the frame-thread audit put a number on it: **1021.9
-/// ms in Firefox 153 and 911.4 ms in Chrome 151** for a 16.9 MB, 21-sweep
-/// volume, against 42–66 ms on a native thread pool. Nothing else this
-/// application does blocks a frame for a second.
-///
-/// # The bytes, not a `File`
-///
-/// `nexrad_data::volume::File` owns a `Vec<u8>` and nothing else, so the
-/// archive bytes *are* the job's input and no wrapper has to cross. They
-/// arrive here straight off the download, which is the split this row
-/// exists to make: the network half belongs to whoever has the fetch stack
-/// and stays on the async task, and the CPU half comes here.
-///
-/// `Arc` so that the dispatch site — which may hold the bytes for a retry —
-/// does not have to hand over its only copy, and so a clone costs a
-/// refcount rather than 16 MB.
 #[derive(Debug, PartialEq)]
 pub struct DecodeJob {
     pub archive: Arc<Vec<u8>>,
@@ -558,9 +360,6 @@ impl JobSpec for DecodeJob {
     const COST: JobCost = JobCost::VolumeDecode;
 
     fn encode(input: &DecodeJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
-        // The archive takes the rest: an archive volume has no framing this
-        // needs to know about, and a length prefix would be a second
-        // statement of a length the buffer already has.
         out.extend_from_slice(&input.archive);
     }
 
@@ -573,20 +372,10 @@ impl JobSpec for DecodeJob {
         ))
     }
 
-    // The one row that produces a volume rather than consuming one. It is
-    // also the one row whose input is bigger than a pointer: `File::new`
-    // takes the archive by value, so the bytes are cloned out of the `Arc`
-    // here. That is one 16 MB memcpy against a decode of ~1000 ms in a
-    // browser, and it happens wherever the job ran rather than on the
-    // thread that asked for it.
     fn run(input: &DecodeJob, _geo: &JobGeometry) -> Option<DecodedScan> {
         match crate::scan::decode_bytes(input.archive.as_ref().clone()) {
             Ok(volume) => Some(volume),
             Err(e) => {
-                // "Nothing to draw", which is what every other row's
-                // failure already means, and what the caller's `deliver`
-                // already handles: the fetch reports it and the pane keeps
-                // whatever it had.
                 log::error!("could not decode a Level II volume: {e}");
                 None
             }
@@ -595,12 +384,10 @@ impl JobSpec for DecodeJob {
 }
 
 impl JobOutCodec for DecodeJob {
-    // Delegation kept whole at WO-M7d, `SectionJob`'s reasoning.
     fn encode_out(v: DecodedScan, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         head.extend_from_slice(&v.to_bytes());
     }
 
-    // All head, no tails: a foreign tail count refuses.
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<DecodedScan> {
         if !tails.is_empty() {
             return None;
@@ -610,7 +397,6 @@ impl JobOutCodec for DecodeJob {
 }
 
 /// The reply half of the job boundary's erasure seam: a described archive
-/// decode answers this type through the codec rows in this module.
 impl rustdar_source::job::JobOut for DecodedScan {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -620,8 +406,6 @@ impl rustdar_source::job::JobOut for DecodedScan {
         self
     }
 
-    /// A decoded volume carries gate codes, not pixels — there is nothing
-    /// here to premultiply, stated rather than defaulted.
     fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
         Vec::new()
     }
@@ -630,28 +414,11 @@ impl rustdar_source::job::JobOut for DecodedScan {
 /// The product is on the wire twice — once in the request's own geometry and
 /// once inside the [`RenderInput`] — and two statements of one fact can
 /// disagree.
-///
-/// They must not be allowed to. A section of a moment the payload does not
-/// carry does not fail: `VolumeSampler` builds no rung for it, every sample
-/// comes back `NoCoverage`, and the raster is a full-size, correctly-shaped
-/// picture of clear air. That is indistinguishable from a genuinely empty
-/// section, so it is refused here rather than drawn.
-///
-/// The alternative — carrying the product only in the payload and filling the
-/// request's field from it at decode — was rejected because it makes the
-/// request not round-trip: a caller who built an inconsistent pair would
-/// get a *different* request back rather than a refusal, which moves the
-/// disagreement from the wire into the type.
 fn agree_on_product(wanted: RadarProduct, input: &RenderInput) -> Option<()> {
     (wanted == input.product()).then_some(())
 }
 
 /// A wire boolean, refusing anything that is not 0 or 1.
-///
-/// The two ends of a message port can be different builds, and a byte outside
-/// the pair is a payload this one cannot read rather than a `true` to guess at
-/// — the same refusal `values_wanted` has always made, now spelt once for the
-/// several flags that make it.
 fn flag(byte: u8) -> Option<bool> {
     match byte {
         0 => Some(false),
@@ -694,14 +461,6 @@ fn encode_voxel_request(out: &mut Vec<u8>, request: &VoxelRequest) {
     out.extend_from_slice(&request.product.wire_code().to_le_bytes());
     out.extend_from_slice(&request.centre.0.to_le_bytes());
     out.extend_from_slice(&request.centre.1.to_le_bytes());
-    // Tagged rather than sent as a sentinel width, the same shape the storm
-    // motion override above is sent in: `None` means "as wide as the volume
-    // reaches", which is a decision `build_voxels` makes on the worker side
-    // with the volume in hand, and no f64 can stand for it without also being
-    // a width somebody could legitimately ask for.
-    // East then north, and both always written when the tag says `Some`: the
-    // two axes are independent, so a wire that carried one and squared it on
-    // the far side would silently resample ground the pane is not framing.
     match request.half_extent_km {
         None => out.push(0),
         Some(half) => {

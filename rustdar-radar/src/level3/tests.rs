@@ -1,37 +1,6 @@
 use super::*;
 use crate::types::RadarProduct;
 
-/// AWIPS product ID and Level III message code per product, transcribed
-/// from NWS 2620001 (ICD for the RPG to Class 1 User).
-///
-/// Keyed by `RadarProduct`, not by AWIPS ID, so it can *contradict*
-/// [`RadarProduct::level3_products`]: keyed by ID it could only ever agree,
-/// because `DVL` decodes as 134 no matter which product asked for it.
-///
-/// | product | AWIPS | message code | field |
-/// |---|---|---|---|
-/// | Specific Differential Phase | `N0K` | 163 | Specific Differential Phase |
-/// | Echo Tops | `EET` | 135 | Enhanced Echo Tops |
-/// | Vertically Integrated Liquid | `DVL` | 134 | Digital Vertically Integrated Liquid |
-/// | VIL Density | `DVL`, `EET` | 134, 135 | the two above, divided |
-/// | Precipitation Rate | `DPR` | 176 | Digital Instantaneous Precipitation Rate |
-///
-/// Hydrometeor Classification's row (`HHC` 177) left with the fetch —
-/// the product composites locally from Level II now ([`crate::hhc`]).
-///
-/// The AWIPS IDs are listed **in request order**, so the table pins which
-/// tilt each one is, not merely that the set is right. Storm-relative
-/// velocity's five-entry row (`N0S` 56 vector-only, `N0G`/`N1G` 154,
-/// `N2U`/`N3U` 99) left with the fetch — the product derives from
-/// Level II now ([`crate::srv`]).
-///
-/// VIL density is the one **derived** row: its two IDs are not two tilts of
-/// one field but the numerator and the denominator of
-/// `1000 · DVL / ((EET + 0.5) · 304.8)` ([`crate::vild`]), in that order —
-/// so the order pins which is which, and swapping them would divide
-/// kilofeet by kilograms. It is therefore also the one row whose IDs
-/// legitimately appear elsewhere in the table; see
-/// [`DERIVED_FROM_OTHER_ROWS`].
 const ICD: &[(RadarProduct, &[(&str, i16)])] = &[
     (RadarProduct::SpecificDifferentialPhase, &[("N0K", 163)]),
     (RadarProduct::EchoTops, &[("EET", 135)]),
@@ -40,23 +9,6 @@ const ICD: &[(RadarProduct, &[(&str, i16)])] = &[
     (RadarProduct::PrecipitationRate, &[("DPR", 176)]),
 ];
 
-/// The products whose row is a **computation over other products' objects**
-/// rather than the tilts of a field of their own.
-///
-/// This exists so the duplicate-ID check below stays as strict as it was
-/// for everything else. Its point was never "no ID may appear twice" for
-/// its own sake — it was that two products must not each claim to *be* the
-/// same field, because `DVL` under Echo Tops decodes cleanly and paints a
-/// 62 kg/m² VIL core labelled "Echo Tops: 62.0 kft". A derived product
-/// reusing its inputs' objects is a different thing, and admitting it by
-/// name — rather than by relaxing the check for everyone — keeps the
-/// original bug catchable.
-///
-/// The obligation an entry takes on: its row must name **more than one** ID
-/// (a single-ID row that reuses another product's ID is exactly the
-/// copy-paste bug), and every ID it names must belong to some
-/// non-derived row, so a derived product cannot invent an input nothing
-/// fetches.
 const DERIVED_FROM_OTHER_ROWS: &[RadarProduct] = &[RadarProduct::VilDensity];
 
 fn icd_row(product: &RadarProduct) -> Option<&'static [(&'static str, i16)]> {
@@ -67,13 +19,6 @@ fn is_derived(product: &RadarProduct) -> bool {
     DERIVED_FROM_OTHER_ROWS.contains(product)
 }
 
-/// Every Level III product must request the AWIPS IDs the ICD gives for the
-/// field rustdar renders it as, in the order it gives them.
-///
-/// Swapping two IDs neither crashes nor fails to decode: `DVL` under Echo
-/// Tops decodes cleanly in kg/m² and the Echo Tops palette then paints a
-/// 62 kg/m² VIL core labelled "Echo Tops: 62.0 kft". Shape-only checks
-/// (`every_level3_product_has_at_least_one_awips_code`) miss that.
 #[test]
 fn each_level3_product_requests_the_awips_id_the_icd_gives_it() {
     for product in RadarProduct::all() {
@@ -104,8 +49,6 @@ fn each_level3_product_requests_the_awips_id_the_icd_gives_it() {
     }
 }
 
-/// The table must cover every Level III product and nothing else, or the
-/// test above passes by skipping a product the table forgot.
 #[test]
 fn the_icd_table_covers_exactly_the_level3_products() {
     let level3: Vec<_> = RadarProduct::all()
@@ -119,10 +62,6 @@ fn the_icd_table_covers_exactly_the_level3_products() {
         ICD.len(),
         level3.len(),
     );
-    // A duplicated ID would let two products agree with the table while
-    // pointing at the same field — so among the rows that *are* a field,
-    // every ID is still unique. The derived rows are checked separately,
-    // and more strictly, below.
     let primary: Vec<&str> = ICD
         .iter()
         .filter(|(p, _)| !is_derived(p))
@@ -135,11 +74,6 @@ fn the_icd_table_covers_exactly_the_level3_products() {
         );
     }
 
-    // A derived row reuses its inputs' objects rather than naming a field
-    // of its own. It owes two things: more than one input (a single-ID row
-    // reusing another product's ID is the copy-paste bug the check above
-    // exists for), and every input has to be an object some non-derived row
-    // fetches, so nothing can invent an input.
     for product in DERIVED_FROM_OTHER_ROWS {
         let row = icd_row(product)
             .unwrap_or_else(|| panic!("{} is derived but has no row", product.name()));
@@ -175,27 +109,17 @@ fn at(h: u32, m: u32, s: u32) -> NaiveDateTime {
         .unwrap()
 }
 
-/// A fetched product must say how old it is: nothing downstream could
-/// otherwise tell a product two minutes old from one the previous-day
-/// fallback dug out of yesterday. Expected ages are subtracted by hand, not
-/// recomputed with `key_time`.
 #[test]
 fn a_product_stamp_reports_its_age_from_its_key() {
     let stamp = ProductStamp::from_key("TLX_N0S_2026_07_25_17_30_24");
-    // 17:45:24 - 17:30:24
     assert_eq!(stamp.age(at(17, 45, 24)).map(|a| a.num_minutes()), Some(15));
-    // 17:30:24 - 17:30:24
     assert_eq!(stamp.age(at(17, 30, 24)).map(|a| a.num_seconds()), Some(0));
-    // Ahead of `now` reads negative rather than clamping to zero.
     assert_eq!(stamp.age(at(17, 29, 24)).map(|a| a.num_minutes()), Some(-1));
 }
 
-/// The previous-day fallback is the case this exists for: yesterday's key
-/// must read as old, not as fresh.
 #[test]
 fn a_stamp_from_the_previous_day_is_stale() {
     let now = at(0, 5, 0);
-    // 00:05:00 today minus 23:58:48 yesterday = 6 minutes 12 seconds.
     let overnight = ProductStamp::from_key("TLX_N0S_2026_07_24_23_58_48");
     assert_eq!(overnight.age(now).map(|a| a.num_minutes()), Some(6));
     assert!(
@@ -203,8 +127,6 @@ fn a_stamp_from_the_previous_day_is_stale() {
         "the ordinary 00Z rollover is not staleness",
     );
 
-    // A site down since the previous morning: the fallback still finds a
-    // key, and it is nearly a day and a half old.
     let dead = ProductStamp::from_key("TLX_N0S_2026_07_24_11_00_00");
     assert_eq!(dead.age(now).map(|a| a.num_hours()), Some(13));
     assert!(dead.is_stale(now, Duration::minutes(30)));
@@ -212,59 +134,37 @@ fn a_stamp_from_the_previous_day_is_stale() {
     assert!(!dead.is_stale(now, Duration::hours(14)));
 }
 
-/// An unreadable key has an *unknown* age, which is not the same as stale:
-/// `age` is `None` and `is_stale` is false.
 #[test]
 fn a_stamp_with_no_readable_time_reports_neither_age_nor_staleness() {
     let stamp = ProductStamp::from_key("garbage");
     assert_eq!(stamp.time, None);
     assert_eq!(stamp.age(at(12, 0, 0)), None);
     assert!(!stamp.is_stale(at(12, 0, 0), Duration::zero()));
-    // The key survives, so the UI can still say *what* it drew.
     assert_eq!(stamp.key, "garbage");
 }
 
-/// The rule is "drop the leading letter", not "strip a leading K": every
-/// non-CONUS site breaks under the latter.
 #[test]
 fn a_site_code_loses_its_leading_letter_not_a_literal_k() {
     assert_eq!(site_code("KTLX"), "TLX");
     assert_eq!(site_code("KFWS"), "FWS");
-    // Alaska, Hawaii, Puerto Rico, Guam — all `P*`/`T*`, none start with K.
     assert_eq!(site_code("PAHG"), "AHG");
     assert_eq!(site_code("PHKI"), "HKI");
     assert_eq!(site_code("TJUA"), "JUA");
     assert_eq!(site_code("PGUA"), "GUA");
 }
 
-/// Applying it twice must not eat a second character.
 #[test]
 fn shortening_a_site_code_is_idempotent() {
     assert_eq!(site_code(site_code("KTLX")), "TLX");
     assert_eq!(site_code("TLX"), "TLX");
 }
 
-/// Callers uppercase at the point of use, not on the way in, so a lowercase
-/// identifier still has to lose its leading letter here.
-///
-/// Guards the fix as much as the bug: an ASCII test written as "uppercase or
-/// digit" would leave `"ktlx"` four characters long, and `fetch_latest_product`
-/// would then build the prefix `KTLX_N0S_…` — four letters where the bucket
-/// keys on three — and find nothing, for every site, silently.
 #[test]
 fn a_lowercase_identifier_still_loses_its_leading_letter() {
     assert_eq!(site_code("ktlx"), "tlx");
     assert_eq!(site_code("pHkI"), "HkI");
 }
 
-/// Four *bytes* is not four characters, and this function is handed persisted
-/// text.
-///
-/// Each identifier below is exactly four bytes with a multi-byte leading
-/// character, so `&id[1..]` lands inside a UTF-8 sequence. Before the ASCII
-/// test this was not a wrong answer, it was
-/// `byte index 1 is not a char boundary` and a dead process — reachable by
-/// typing one of them into the `site` field of `ui.json`.
 #[test]
 fn a_four_byte_identifier_with_a_multibyte_head_is_not_sliced() {
     for id in ["éab", "Ω12", "日a", "🌀"] {
@@ -274,13 +174,6 @@ fn a_four_byte_identifier_with_a_multibyte_head_is_not_sliced() {
     }
 }
 
-/// The other half of "four bytes is not four characters": an identifier whose
-/// byte 1 *is* a boundary never panicked, and was silently wrong instead.
-///
-/// `"aéb"` is four bytes, so the old length test accepted it, and `&id[1..]`
-/// happened to be legal — it returned `"éb"`, a two-character "site code"
-/// interpolated straight into an S3 key. Passing it through unchanged is what
-/// makes the failure legible: it comes back as `NoProduct` naming `"aéb"`.
 #[test]
 fn a_four_byte_identifier_that_slices_legally_is_still_not_a_site() {
     assert_eq!("aéb".len(), 4);
@@ -291,11 +184,6 @@ fn a_four_byte_identifier_that_slices_legally_is_still_not_a_site() {
     assert_eq!(site_code("aéb"), "aéb");
 }
 
-/// Nothing shorter than an identifier may be indexed, including nothing at all.
-///
-/// `String::new()` is what the config falls back to for a site it refuses, so
-/// the empty case is not hypothetical — it is the value the rejection path
-/// produces, and it reaches here through `PaneState::with_site`.
 #[test]
 fn an_identifier_shorter_than_a_site_code_is_returned_whole() {
     for id in ["", "K", "KT", "KTL", "é", "🌀🌀"] {
@@ -303,8 +191,6 @@ fn an_identifier_shorter_than_a_site_code_is_returned_whole() {
     }
 }
 
-/// The newest key is chosen by *value*, not position. The fixture is
-/// shuffled: a `newest` returning `keys.last()` fails here.
 #[test]
 fn the_newest_key_is_the_maximum_not_merely_the_last_returned() {
     let keys = vec![
@@ -315,8 +201,6 @@ fn the_newest_key_is_the_maximum_not_merely_the_last_returned() {
     assert_eq!(newest(keys).as_deref(), Some("TLX_N0S_2026_07_25_17_30_24"),);
 }
 
-/// Zero padding is what makes binary order equal chronological order.
-/// An hour of `9` rather than `09` would sort after `17`.
 #[test]
 fn zero_padded_hours_keep_binary_order_equal_to_time_order() {
     let mut keys = [
@@ -333,8 +217,6 @@ fn an_empty_listing_has_no_newest_key() {
     assert_eq!(newest(Vec::new()), None);
 }
 
-/// The timestamp comes off the tail of the key, so a product code with
-/// digits or a site code of another length cannot shift it.
 #[test]
 fn a_key_timestamp_is_read_from_the_last_six_fields() {
     assert_eq!(
@@ -359,20 +241,15 @@ fn a_key_timestamp_is_read_from_the_last_six_fields() {
     assert_eq!(key_time("garbage"), None);
 }
 
-/// The prefix must pin the day, or the listing returns the whole archive
-/// for that site/product and "newest" becomes "newest ever recorded".
 #[test]
 fn the_day_prefix_constrains_the_listing_to_one_utc_day() {
     let d = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
     let prefix = DataSources::level3_day_prefix("TLX", "N0S", &d);
     assert_eq!(prefix, "TLX_N0S_2026_07_25");
-    // A key from a different day must not match the prefix.
     assert!(!"TLX_N0S_2026_07_24_23_58_48".starts_with(&prefix));
     assert!("TLX_N0S_2026_07_25_17_30_24".starts_with(&prefix));
 }
 
-/// Catches a product added to `RadarProduct::is_level3` without a code,
-/// which would silently render an always-empty layer.
 #[test]
 fn every_level3_product_has_at_least_one_awips_code() {
     for product in RadarProduct::all() {
@@ -404,11 +281,6 @@ fn every_level3_product_has_at_least_one_awips_code() {
     }
 }
 
-/// Storm-relative velocity fetches nothing from Level III at all: it is
-/// derived from the Level II volume ([`crate::srv`]). Asserted directly,
-/// because putting the five-object fetch back — or just "N1S", dead
-/// since 2020 (NWS SCN 22-96) — is the obvious regression when someone
-/// notices the tilts are computed rather than fetched.
 #[test]
 fn storm_relative_velocity_requests_no_level3_product() {
     assert!(!RadarProduct::StormRelativeVelocity.is_level3());
@@ -456,9 +328,6 @@ fn pdb_for_volume(date: u16, time: u32, elevation_number: u16) -> ProductDescrip
     }
 }
 
-/// The volume stamp conversion: day 1 is 1970-01-01, so MJD 20661 at 7108 s
-/// is 2026-07-26 01:58:28 — checked against a calendar, not against the
-/// function.
 #[test]
 fn the_volume_stamp_reads_day_one_as_the_epoch() {
     let t = volume_scan_started(&pdb_for_volume(20661, 7108, 0)).expect("a valid stamp");
@@ -468,16 +337,11 @@ fn the_volume_stamp_reads_day_one_as_the_epoch() {
         Some("1970-01-01 00:00:00".to_string()),
         "day 1 is the epoch itself",
     );
-    // Day 0 cannot precede the epoch: it is None, not 1969-12-31.
     assert!(volume_scan_started(&pdb_for_volume(0, 0, 0)).is_none());
 }
 
-/// The volume test is a tolerance, not a search: a minute either way is the
-/// same volume, more is not — and a PDB with no readable stamp names no
-/// volume at all rather than passing on a plausible default.
 #[test]
 fn a_pdb_names_the_volume_it_started_within_a_minute_of() {
-    // MJD 20661 @ 7108 s = 2026-07-26 01:58:28.
     let started = volume_scan_started(&pdb_for_volume(20661, 7108, 0)).expect("valid");
     let pdb = pdb_for_volume(20661, 7108, 0);
 
@@ -489,8 +353,6 @@ fn a_pdb_names_the_volume_it_started_within_a_minute_of() {
         "past the tolerance is another volume",
     );
     assert!(!names_volume(&pdb, started - Duration::seconds(61)));
-    // A four-minute volume spacing is comfortably outside it, which is what
-    // makes the tolerance safe against pairing the neighbour.
     assert!(!names_volume(&pdb, started + Duration::minutes(4)));
 
     assert!(
@@ -513,10 +375,6 @@ fn want_at(h: u32, m: u32, s: u32) -> NaiveDateTime {
         .unwrap()
 }
 
-/// The rule the whole pairing rests on: candidates are ranked by distance
-/// from the *volume start*, never by recency. The fixture puts the newest
-/// key furthest away, so a selection that took `keys.max()` — which is what
-/// the display path's `latest_key` does — would rank it first.
 #[test]
 fn candidates_are_ranked_by_distance_from_the_volume_not_by_recency() {
     let keys = vec![
@@ -539,8 +397,6 @@ fn candidates_are_ranked_by_distance_from_the_volume_not_by_recency() {
     );
 }
 
-/// Keys outside the window are not candidates at all, and an unparseable
-/// key cannot be ranked so it is dropped rather than sorted to the front.
 #[test]
 fn the_pairing_window_and_unreadable_keys_bound_the_candidate_set() {
     let inside = key_at("EET", (17, 49, 0)); // 19 min out
@@ -558,9 +414,6 @@ fn the_pairing_window_and_unreadable_keys_bound_the_candidate_set() {
     assert!(!ranked.contains(&outside));
 }
 
-/// A busy product-day serves hundreds of objects; the candidate list is
-/// capped so a pairing opens a bounded number of objects, and the cap keeps
-/// the *nearest* ones.
 #[test]
 fn the_candidate_list_is_capped_at_the_nearest_objects() {
     // One key every 10 s for 5 minutes either side of the volume: 60 keys,
@@ -583,8 +436,6 @@ fn the_candidate_list_is_capped_at_the_nearest_objects() {
     }
 }
 
-/// Equidistant candidates resolve the same way every call: the tie breaks on
-/// the key, so a listing assembled in another order pairs identically.
 #[test]
 fn equidistant_candidates_break_their_tie_deterministically() {
     let before = key_at("EET", (17, 29, 0));
@@ -601,8 +452,6 @@ fn equidistant_candidates_break_their_tie_deterministically() {
     );
 }
 
-/// Midnight: a volume just after 00Z is paired against objects that can
-/// still be under yesterday's prefix, so both days are listed.
 #[test]
 fn the_pairing_days_cover_the_previous_utc_day() {
     let just_after_midnight = NaiveDate::from_ymd_opt(2026, 7, 25)
@@ -616,7 +465,6 @@ fn the_pairing_days_cover_the_previous_utc_day() {
             NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
         ],
     );
-    // And an in-window key from yesterday really does rank.
     let overnight = "TLX_EET_2026_07_24_23_59_10".to_string();
     assert_eq!(
         candidates_near(vec![overnight.clone()], just_after_midnight),
@@ -624,9 +472,6 @@ fn the_pairing_days_cover_the_previous_utc_day() {
     );
 }
 
-/// The per-product pick, which is what keeps a QPE loop from animating
-/// partial accumulations. Asserted for every product so a new Level III
-/// product cannot arrive without a decision.
 #[test]
 fn only_the_qpe_product_takes_the_volumes_last_object() {
     use crate::types::RadarProduct;
@@ -657,16 +502,6 @@ fn only_the_qpe_product_takes_the_volumes_last_object() {
     }
 }
 
-/// VIL density is a Level III product with **two** inputs, in numerator
-/// then denominator order, and no Level II moment behind it.
-///
-/// Asserted directly because every part of it is a plausible regression:
-/// the product used to be `compute_vil / compute_eet` off the Level II
-/// volume and listed on the reflectivity moment, and it was retired for
-/// measured muteness at the thresholds it is read for (see
-/// [`crate::vil`]'s validation section). A `moment_slot` here again would
-/// put the local quotient back on screen; a one-ID row would render a
-/// kg/m² field through the g/m³ palette.
 #[test]
 fn vil_density_requests_the_two_products_it_divides() {
     assert!(RadarProduct::VilDensity.is_level3());
@@ -686,8 +521,6 @@ fn vil_density_requests_the_two_products_it_divides() {
     );
     assert!(is_derived(&RadarProduct::VilDensity));
 
-    // Its inputs are the objects the two single-field products fetch, so
-    // nothing new is downloaded on its account.
     assert_eq!(
         RadarProduct::VerticallyIntegratedLiquid.level3_products(),
         Some(&["DVL"][..]),
@@ -695,12 +528,6 @@ fn vil_density_requests_the_two_products_it_divides() {
     assert_eq!(RadarProduct::EchoTops.level3_products(), Some(&["EET"][..]));
 }
 
-/// One poll fetches one object per **code**, not one per (product, code).
-///
-/// The three products that read `DVL` and `EET` between them name those two
-/// codes four times over, and before this the fetch loop walked the table
-/// product by product and asked the bucket for each of the four — two extra
-/// ~100 KB GETs per site per poll, for bytes already in hand.
 #[test]
 fn one_poll_asks_for_each_object_once() {
     assert_eq!(
@@ -713,8 +540,6 @@ fn one_poll_asks_for_each_object_once() {
         "VIL, echo tops and VIL density need two objects between them, not four",
     );
 
-    // The whole roster, which is what a real poll asks for: one entry per
-    // distinct code, and every code some product names is in it.
     let codes = RadarProduct::level3_codes_for(RadarProduct::all());
     assert_eq!(codes, ["DPR", "DVL", "EET", "N0K"]);
     for product in RadarProduct::all() {
@@ -732,11 +557,6 @@ fn one_poll_asks_for_each_object_once() {
     );
 }
 
-/// `level3_readers` is the exact inverse of `level3_products`.
-///
-/// It is what a landed object is dispatched by — which panes to redraw, which
-/// entries the product picker gains — so a code whose readers it under-reports
-/// is a product that silently never notices its data arriving.
 #[test]
 fn every_code_reports_exactly_the_products_that_read_it() {
     assert_eq!(
@@ -761,8 +581,6 @@ fn every_code_reports_exactly_the_products_that_read_it() {
         "a code nothing names has no readers — SRM's old tilts are gone",
     );
 
-    // Round-trip: every product is a reader of every code it names, and of
-    // nothing else.
     for product in RadarProduct::all() {
         for code in RadarProduct::level3_codes_for(RadarProduct::all()) {
             let names_it = product
@@ -778,17 +596,6 @@ fn every_code_reports_exactly_the_products_that_read_it() {
     }
 }
 
-/// Products sharing an AWIPS code must agree on which object of a volume to
-/// take.
-///
-/// One object is cached per `(code, site)` and handed to every product that
-/// reads it, so a `Latest` reader and a `Nearest` reader of one code would
-/// take turns replacing the entry with the other's choice — and each would
-/// draw the other's object roughly half the time, with nothing in the image
-/// to say so. Today `DPR` (the only `Latest`) is named by one product and the
-/// shared codes `DVL`/`EET` are `Nearest` throughout; this fails the moment
-/// that stops being true, which is the point at which the loop's per-code
-/// cache needs a pick in its key.
 #[test]
 fn every_shared_level3_code_agrees_on_its_volume_pick() {
     for code in RadarProduct::level3_codes_for(RadarProduct::all()) {
@@ -814,17 +621,7 @@ fn every_shared_level3_code_agrees_on_its_volume_pick() {
 }
 
 // ── Live checks ───────────────────────────────────────────────────────
-//
-// Run with:
-//   cargo test -p rustdar-radar --lib -- --ignored --nocapture level3
 
-/// Every product rustdar asks for genuinely fetches and decodes, against
-/// the live bucket and the production mapping.
-///
-/// The decoded message code is checked against [`ICD`] keyed by **product**,
-/// which is what makes a wrong product→ID mapping fail: swap `EET` and
-/// `DVL` in `level3_products` and this downloads Digital VIL for Echo Tops
-/// and sees 134 where the ICD says 135.
 #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
 #[tokio::test]
 async fn live_every_requested_product_fetches_and_decodes() {
@@ -849,8 +646,6 @@ async fn live_every_requested_product_fetches_and_decodes() {
                 fetched.stamp.key,
                 fetched.age(now).map(|a| a.num_minutes()),
             );
-            // The timestamp must survive the fetch, not just the key
-            // parser: it is what marks a product from yesterday's fallback.
             assert!(
                 fetched.stamp.time.is_some(),
                 "{code} arrived as {} with no readable timestamp",
@@ -873,9 +668,6 @@ async fn live_every_requested_product_fetches_and_decodes() {
     }
 }
 
-/// Proves the shortening is the one the *bucket* wants, not just that the
-/// string transform works: "KTLX" straight through lists nothing, which is
-/// indistinguishable from "site is down" without this.
 #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
 #[tokio::test]
 async fn live_a_four_letter_icao_site_resolves_to_bucket_keys() {
@@ -887,24 +679,18 @@ async fn live_a_four_letter_icao_site_resolves_to_bucket_keys() {
         .expect("listing must succeed");
     assert!(three.is_some(), "TLX must have N0S objects today");
 
-    // The un-shortened form must find nothing.
     let four = latest_key(&sources, "KTLX", "N0S", &today)
         .await
         .expect("listing must succeed");
     assert_eq!(four, None, "the bucket does not key on 4-letter codes");
 }
 
-/// The three dropped SRM tilts really are gone, asserted against the live
-/// bucket rather than rustdar's own table. Starts failing if NWS restores
-/// them.
 #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
 #[tokio::test]
 async fn live_the_dropped_srm_tilts_have_no_current_data() {
     let sources = DataSources::production();
     let today = chrono::Utc::now().naive_utc().date();
 
-    // Control: the tilt that survives must be present, so an outage or a
-    // wrong prefix cannot make the assertion below pass vacuously.
     let n0s = latest_key(&sources, "TLX", "N0S", &today)
         .await
         .expect("listing must succeed");
@@ -951,11 +737,8 @@ async fn live_a_loops_frames_each_pair_with_their_own_volume() {
     crate::tls::init();
     let sources = DataSources::production();
     let now = chrono::Utc::now().naive_utc();
-    // Long enough for several volumes at any VCP, short enough to stay inside
-    // one product-day listing most of the time.
     let start = now - Duration::hours(1);
 
-    // Echo tops: one AWIPS code, published once per volume.
     let product = RadarProduct::EchoTops;
     let code = product.level3_products().expect("EET")[0];
     let pick = product
@@ -966,8 +749,6 @@ async fn live_a_loops_frames_each_pair_with_their_own_volume() {
         let Ok(volumes) = crate::scan::list_scans_for_range(site, start, now).await else {
             continue;
         };
-        // The frontend caps a loop's frames; five is enough to make
-        // distinctness mean something without a long test.
         let frames: Vec<NaiveDateTime> = volumes
             .iter()
             .rev()
@@ -980,7 +761,6 @@ async fn live_a_loops_frames_each_pair_with_their_own_volume() {
             continue;
         }
 
-        // One listing for the whole loop, exactly as the loop does it.
         let days: Vec<NaiveDate> = {
             let mut days = Vec::new();
             for f in &frames {
@@ -1031,16 +811,12 @@ async fn live_a_loops_frames_each_pair_with_their_own_volume() {
             paired.push((*frame, object));
         }
 
-        // A gap or two is ordinary; every frame resolving to nothing is not.
         assert!(
             paired.len() >= 3,
             "{site}: only {} of {} frames paired — the loop would be mostly gaps",
             paired.len(),
             frames.len(),
         );
-        // The assertion the pairing exists for. Taking the newest key would
-        // give one object repeated, which every check above still passes for
-        // the one frame nearest it.
         for (i, (_, a)) in paired.iter().enumerate() {
             for (_, b) in &paired[..i] {
                 assert_ne!(
@@ -1065,9 +841,6 @@ async fn live_a_loops_frames_each_pair_with_their_own_volume() {
     panic!("no site served an hour of volumes with EET objects");
 }
 
-/// Pins "last key wins" against the live bucket: keys returned in another
-/// order, or a selection taking the first key, would yield something hours
-/// old rather than minutes.
 #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
 #[tokio::test]
 async fn live_the_selected_key_is_the_freshest_one() {

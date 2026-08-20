@@ -1,15 +1,12 @@
 //! The Nyquist velocity each sweep **declares**, and the pairing that carries
 //! it to the one consumer that needs it.
 //!
-//! # Why this module exists at all
-//!
 //! Doppler velocity wraps at the Nyquist velocity, and
 //! [`crate::sampler::VolumeSampler`] refuses to interpolate a pair of readings
 //! that straddle that wrap. The number is a property of the sweep's PRF: it
 //! differs from cut to cut inside one volume — KFFC's 2026-08-12 02:05 volume
 //! declares 25.65 m/s on each of its low Doppler cuts and climbs to 62.94 on
 //! cut 12 — so the guard needs it per sweep, not per volume.
-//!
 //! **The archive states it.** Message 31's Radial Data Block carries
 //! `nyquist_velocity`, in hundredths of a metre per second, on every radial;
 //! `nexrad-decode` decodes it. What loses it is the model boundary:
@@ -17,54 +14,6 @@
 //! drops it on the floor, and nothing downstream of a `Scan` can get it back.
 //! [`crate::scan`] therefore walks the archive's records itself and reads the
 //! number where it is still in hand, on the same pass that builds the `Scan`.
-//!
-//! Before this module the sampler *estimated* the limit instead, off the
-//! largest speed a sweep observed (`estimate_fold_limit`).
-//! That estimate is exact for a sweep that folded and an **under**estimate for
-//! one that did not, and the sampler uses the number as a classification
-//! boundary, so an underestimate widens the fold hypothesis and manufactures
-//! false positives. The declared number has neither failure mode. The estimate
-//! stays as the fallback, because it is still the only answer available where
-//! the declaration is not:
-//!
-//! * **every TDWR volume.** See below — the field is on the wire and it is
-//!   zero, which [`DeclaredNyquist::declare`] refuses, so a TDWR reaches the
-//!   sampler with an empty table and estimates every cut exactly as it did
-//!   before this module existed;
-//! * a volume decoded entirely from **Message 1** (`digital_radar_data_legacy`)
-//!   — the legacy message has no Nyquist field of any kind, so there is nothing
-//!   to read, and this is an absence rather than an error;
-//! * a `Scan` that reached the sampler by some route that never carried a
-//!   table — every test fixture, and any future caller that holds only model
-//!   types.
-//!
-//! # Who this actually helps, measured
-//!
-//! **The WSR-88D, and not the TDWR.** Twenty-two TDWR volumes from ten sites
-//! over three days declare `nyquist_velocity = 0` on every cut; ten WSR-88D
-//! volumes read the same way declare 8.27–62.94 m/s and never zero. So the
-//! improvement this module exists for lands on the radar that states its
-//! waveform, and the radar whose short PRT makes folding routine — the one the
-//! case for declared-over-estimated was argued on — is precisely the one still
-//! being estimated for. That is worth knowing before anybody reasons about
-//! TDWR velocity from the presence of this code.
-//!
-//! Two shapes in the WSR-88D numbers matter to a reader:
-//!
-//! * a split cut's **surveillance** half declares 8.27–9.68 m/s. That is the
-//!   long PRT, it is real, and it sits barely above
-//!   [`crate::sampler::FOLD_LIMIT_FLOOR_MS`]'s 8.0 — but those cuts carry no
-//!   velocity moment, so no velocity rung is ever served one;
-//! * the **Doppler** cuts declare 23.84–62.94 m/s, and the spread is within one
-//!   volume as much as across sites: KFFC's low Doppler cuts declare 25.65 and
-//!   its cut 12 declares 62.94.
-//!
-//! # What is *not* in here
-//!
-//! No tolerance, no reconciliation between the declared and the estimated
-//! number, and no warning when they disagree. The declared value simply wins
-//! where it exists. Comparing the two would be a measurement, and this is the
-//! plumbing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,15 +22,6 @@ use nexrad_model::data::Scan;
 /// Elevation number → declared Nyquist velocity, metres per second.
 ///
 /// Keyed by the RDA's own `elevation_number` — the 1-based index of the cut in
-/// the VCP — because that is the key the sampler already resolves a rung by,
-/// and because it survives every hop this value takes: the chunk feed, the
-/// merged current volume and the worker's wire payload all carry it, while a
-/// sweep's position in a `Vec` does not.
-///
-/// Empty is the honest "no volume said" and the only failure mode: every
-/// reader falls back to `estimate_fold_limit` for a cut this
-/// has no entry for, so a partial table degrades cut by cut rather than
-/// wholesale.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeclaredNyquist {
     by_elevation: BTreeMap<u8, f64>,
@@ -91,8 +31,6 @@ pub struct DeclaredNyquist {
 }
 
 impl DeclaredNyquist {
-    /// A table that declares nothing. `const` so it can back the `static` that
-    /// [`Volume`]'s `From<&Scan>` hands out.
     pub const fn empty() -> Self {
         Self {
             by_elevation: BTreeMap::new(),
@@ -102,78 +40,6 @@ impl DeclaredNyquist {
 
     /// Record `elevation_number`'s declared Nyquist velocity in m/s, **first
     /// writer wins**.
-    ///
-    /// First-wins rather than last-wins because within one sweep the number is
-    /// constant by construction — every radial of a cut is collected at the
-    /// same PRF — so the first radial to arrive is as good a statement as the
-    /// last, and first-wins makes the table independent of how many radials a
-    /// caller happens to walk.
-    ///
-    /// # A number that is not a fold limit is not stored
-    ///
-    /// [`Self::is_a_fold_limit`] is the whole admission test, and both halves
-    /// of it refuse rather than clamp.
-    ///
-    /// A non-finite value would reach the guard as a comparison that is false
-    /// in both directions, which is a silently disabled guard rather than an
-    /// absent one.
-    ///
-    /// **Zero and below are refused on the same footing**, and that half is not
-    /// hypothetical. `Vny = λ·PRF/4`, so a fold limit of zero says the cut was
-    /// flown at no PRF at all, which cannot be true of a cut that produced the
-    /// radial the field was read from: it is the wire's way of spelling *not
-    /// populated*. **Every TDWR spells it that way.** Across 22 Level II
-    /// volumes from 10 TDWR sites (TATL, TDFW, THOU, TMCO, TMIA, TMSY, TORD,
-    /// TPHX, TPIT, TTPA) over three days, every cut of every volume declares
-    /// `nyquist_velocity = 0` — not a low number, zero — in a Radial Data Block
-    /// that is otherwise sound: the same 20-byte legacy block decodes
-    /// `unambiguous_range` correctly at 4604, 1259, 905 and 1088, and its two
-    /// channel noise levels are zero beside it. Ten WSR-88D volumes read on the
-    /// same pass declare 8.27–62.94 m/s and never zero.
-    ///
-    /// Refused rather than recorded in [`Self::contradicted`], because the two
-    /// say different things about an archive. A contradiction is two cuts
-    /// colliding under one elevation number — a keying problem the *value*
-    /// survives, which is why it is reported and the number still stands. Zero
-    /// is the absence of a value, and there is nothing for a reader to stand
-    /// on.
-    ///
-    /// And refused here rather than left for each consumer to floor, because
-    /// **no consumer wants "the archive said zero" told apart from "the archive
-    /// said nothing"**: all three answer the same way, estimate. Two of them
-    /// already erased the distinction — [`crate::sampler::VolumeSampler`] and
-    /// `crate::nrot::fold_limit_ms` both drop a limit under
-    /// [`crate::sampler::FOLD_LIMIT_FLOOR_MS`], so a zero has never reached a
-    /// dealias pass or a straddle test. The third had no floor: the velocity
-    /// legend's caption reads its number straight off the render, and every
-    /// TDWR velocity pane in the shipping app was captioned **`folds ±0`** over
-    /// a bar with no fold markers on it, because the markers *did* refuse a
-    /// non-positive limit and the caption did not. One refusal here clears the
-    /// wire, the legend and every future consumer at once.
-    ///
-    /// # When first-wins is the wrong rule, and how you would know
-    ///
-    /// The key is the RDA's `elevation_number`, and the constancy above holds
-    /// *within a cut*. A VCP that gave two cuts the same number would put two
-    /// waveforms under one key, and the first would pin every later revisit to
-    /// its own PRF — a fold limit that is wrong but entirely plausible, which
-    /// no reader can tell from a right one. Nothing downstream can catch it
-    /// either: [`crate::sampler::VolumeSampler`] and
-    /// [`crate::nrot::dealias_with_knobs`] both take the number as given.
-    ///
-    /// Today's TDWR VCPs do not do this — VCP 80's seven revisits of the
-    /// 0.2637° tilt carry elevation numbers 1, 2, 6, 10, 14, 18 and 22, and VCP
-    /// 90's sixteen cuts are a strict 1..16 — so this is a shape the archive
-    /// has not been observed to take rather than one it cannot. **A
-    /// contradiction is therefore reported and recorded, and nothing else**:
-    /// there is no data behind a rule for choosing between two declarations
-    /// (newest? the wider one? per-radial keying?), and inventing one would
-    /// substitute a guess for the absence of a case.
-    ///
-    /// Once per elevation number, not once per statement. The archive walk
-    /// calls this for every radial of every cut, so a contradicted revisit
-    /// would otherwise log its 360 radials identically and bury the one line
-    /// that says which cut and which two numbers.
     pub fn declare(&mut self, elevation_number: u8, metres_per_second: f64) {
         if !Self::is_a_fold_limit(metres_per_second) {
             return;
@@ -183,9 +49,6 @@ impl DeclaredNyquist {
                 .insert(elevation_number, metres_per_second);
             return;
         };
-        // Bit-equality, and it is the right test rather than a tolerance: the
-        // number is a `u16` of hundredths times 0.01, so one PRF always
-        // produces one `f64` and two PRFs never produce the same one.
         if held == metres_per_second || !self.contradicted.insert(elevation_number) {
             return;
         }
@@ -198,23 +61,12 @@ impl DeclaredNyquist {
 
     /// Whether a number is a speed a sweep could actually fold at: finite, and
     /// above zero.
-    ///
-    /// The one admission test, shared by [`Self::declare`] and [`Self::set`],
-    /// so the table's invariant — *every value in it is a fold limit* — cannot
-    /// depend on which of the two doors a value came in through. Written out
-    /// once for the same reason [`Self::declare_from_message`] is the crate's
-    /// only reader of the wire field: a second copy of the rule is a second
-    /// chance for one of them to drift, and the drift would be silent.
     fn is_a_fold_limit(metres_per_second: f64) -> bool {
         metres_per_second.is_finite() && metres_per_second > 0.0
     }
 
     /// The cuts a second, different declaration arrived for — empty on every
     /// volume this archive has been observed to produce. See [`Self::declare`].
-    ///
-    /// Public because the warning alone is a statement nothing can act on or
-    /// test against, and because this is the honest answer to "how much do you
-    /// trust this cut's number". It reports; it decides nothing.
     pub fn contradicted(&self) -> impl Iterator<Item = u8> + '_ {
         self.contradicted.iter().copied()
     }
@@ -241,41 +93,14 @@ impl DeclaredNyquist {
     }
 
     /// Overlay `newer` onto this table: every cut `newer` names takes its
-    /// value, and cuts it does not name keep theirs.
-    ///
-    /// The merge [`crate::current::resolve`] needs, and in its direction. A
-    /// merged volume serves each cut from the *newest* sweep that sealed it —
-    /// the in-flight overlay's where it has one, the complete base's
-    /// otherwise — so the declared number has to follow the same precedence or
-    /// a rung would be guarded by the PRF of the sweep it did not take. Two
-    /// volumes flying the same VCP normally declare the same numbers, so this
-    /// is usually a no-op; it stops being one across a VCP change or an
-    /// adaptive-PRF reselect, which is exactly when it matters.
     pub fn overlay(&mut self, newer: &Self) {
         for (elevation_number, ms) in newer.iter() {
             self.set(elevation_number, ms);
         }
-        // A union, not a replacement: whichever of the two volumes put two
-        // waveforms under one key, the merged table serves a value that came
-        // from one of them. Note that a *disagreement between* the two — the
-        // ordinary VCP change this merge exists for — is not one of these; only
-        // `declare` records anything here.
         self.contradicted.extend(newer.contradicted.iter().copied());
     }
 
     /// Encode for a message port.
-    ///
-    /// This table rides beside the `Scan` on every path that carries one —
-    /// [`crate::scan::DecodedScan`] says why the pair is inseparable — so when
-    /// the volume itself became something a worker could hand back, this had to
-    /// become writable too.
-    ///
-    /// **Both halves travel.** [`Self::contradicted`] is not a convenience the
-    /// far side could recompute: nothing but [`Self::declare`] ever records
-    /// one, and a decoder rebuilding the table by replaying `declare` over the
-    /// pairs would replay each key exactly once and therefore always answer
-    /// "nothing contradicted". A cut whose two waveforms disagreed would arrive
-    /// looking trustworthy, which is the one thing this set exists to prevent.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + self.by_elevation.len() * 9 + self.contradicted.len());
         out.extend_from_slice(&(self.by_elevation.len() as u32).to_le_bytes());
@@ -291,16 +116,6 @@ impl DeclaredNyquist {
     /// The inverse of [`to_bytes`](Self::to_bytes), reading from the shared
     /// cursor so this table can sit inside a larger payload without either side
     /// having to say where it ended.
-    ///
-    /// `None` for a payload this build cannot read. The two ends of a message
-    /// port can be different builds, so a short or malformed table is a clean
-    /// refusal rather than a half-filled one.
-    ///
-    /// The pairs are written straight into the map rather than replayed through
-    /// [`Self::declare`], which would apply [`Self::is_a_fold_limit`] a second
-    /// time and silently drop entries the *sender's* admission test had already
-    /// passed. Re-filtering here would let a decoded table differ from the one
-    /// encoded, on a path whose whole job is to move it unchanged.
     pub(crate) fn read(r: &mut crate::wire::Reader) -> Option<Self> {
         let pairs = r.u32()?;
         let declared = r.bounded(pairs, 9)?;
@@ -319,12 +134,6 @@ impl DeclaredNyquist {
 
     /// [`Self::declare`]'s last-wins twin: replace whatever this table held
     /// for `elevation_number`.
-    ///
-    /// `pub(crate)` because the only caller that legitimately overwrites is
-    /// [`crate::current::resolve`]'s merge, where a later sweep is by
-    /// construction the newer statement of its cut. Everywhere else the
-    /// first-wins rule is what keeps a table from depending on how far a walk
-    /// happened to get, so this is not part of the public surface.
     pub(crate) fn set(&mut self, elevation_number: u8, metres_per_second: f64) {
         if Self::is_a_fold_limit(metres_per_second) {
             self.by_elevation
@@ -334,24 +143,6 @@ impl DeclaredNyquist {
 
     /// Record what one decoded Message 31 radial declares, if it declares
     /// anything.
-    ///
-    /// **The one place this crate reads the field, and the one place it states
-    /// the unit.** Three walks over Level II bytes reach a Message 31 —
-    /// [`crate::scan`]'s archive decode, [`crate::chunks`]'s real-time chunk
-    /// decode, and [`Self::from_archive`]. Two of them spelled the read out for
-    /// themselves before this; the archive decode is the walk this change adds,
-    /// and it would have been a third copy. "Read `nyquist_velocity_raw`,
-    /// multiply by 0.01, first writer wins" written out three times is three
-    /// chances for one of them to drift, and the drift would be silent: the
-    /// guard would simply be a little wrong on whichever path diverged. They
-    /// all call this instead.
-    ///
-    /// A radial with no Radial Data Block leaves its cut unnamed rather than
-    /// declaring a zero — an absence the guard estimates for, not a fold limit
-    /// of nothing. So does a radial whose block is *present* and whose field
-    /// reads zero, which is every TDWR radial there is: [`Self::declare`] makes
-    /// those two the same answer, because the archive means the same thing by
-    /// them.
     pub(crate) fn declare_from_message(
         &mut self,
         radar: &nexrad_decode::messages::digital_radar_data::Message<'_>,
@@ -359,10 +150,6 @@ impl DeclaredNyquist {
         let Some(block) = radar.radial_data_block() else {
             return;
         };
-        // The raw word is hundredths of a metre per second. Taken raw rather
-        // than through `nyquist_velocity()` so this crate's one statement of
-        // the unit is the `* 0.01` here, in a module whose whole subject is the
-        // number.
         self.declare(
             radar.header().elevation_number(),
             f64::from(block.nyquist_velocity_raw()) * 0.01,
@@ -371,31 +158,6 @@ impl DeclaredNyquist {
 
     /// Read every cut's declared Nyquist velocity out of a raw Level II
     /// archive file, on a walk of its own.
-    ///
-    /// **Not what the archive path uses.** [`crate::scan`] folds this read into
-    /// the same walk that builds the `Scan`, because a separate pass here costs
-    /// a second bzip2 decompress and a second Message 31 parse of the whole
-    /// volume — measured at 98% of `volume::File::scan()`'s own cost, so
-    /// running both very nearly doubled every archive decode.
-    ///
-    /// It stays because its *traversal* is independent: the live test in
-    /// [`crate::scan`] pins the folded table against this one, and a table built
-    /// by a walk that does nothing else is what makes that a real check on the
-    /// single-pass restructure rather than a tautology. Note the limit of that
-    /// check — the reading itself is shared through
-    /// [`Self::declare_from_message`], so a wrong field or a wrong unit would be
-    /// wrong identically on both sides and this would still agree. Use it for
-    /// the traversal check, and for a caller who wants the numbers without
-    /// paying for a `Scan`.
-    ///
-    /// Every failure is an absence, never an error: an unreadable record, a
-    /// record that will not decompress, a Message 1 volume (no Nyquist field
-    /// exists in the legacy message), a Message 31 radial with no Radial Data
-    /// Block and a block declaring zero all leave their cut unnamed, and the
-    /// guard estimates for it. A TDWR is the last of those on every radial, so
-    /// this returns an empty table for one and that is the correct answer.
-    /// Returning a `Result` here would make a volume that renders perfectly
-    /// well fail on a field only one product's interpolation reads.
     pub fn from_archive(file: &nexrad_data::volume::File) -> Self {
         use nexrad_decode::messages::MessageContents;
         let mut out = Self::empty();
@@ -439,21 +201,6 @@ impl FromIterator<(u8, f64)> for DeclaredNyquist {
 static NOTHING_DECLARED: DeclaredNyquist = DeclaredNyquist::empty();
 
 /// A borrowed volume: a `Scan`, and the per-sweep numbers the model type drops.
-///
-/// # Why a pair rather than a parameter
-///
-/// [`crate::sampler::VolumeSampler::new`], [`crate::xsect::render_section`] and
-/// [`crate::voxel::build_voxels_with_motion`] all take "the volume", and all
-/// three now need one thing about it that a `Scan` cannot hold. Adding a
-/// parameter to each would mean every caller that *has* no table — every
-/// fixture, every test, every path where the volume never came from an archive
-/// — writing an empty one out loud at the call site, and it would put the
-/// declared table's absence in three signatures instead of one type.
-///
-/// So they take `impl Into<Volume>` instead. `&Scan` converts, yielding a
-/// volume that declares nothing; a caller that *does* hold a table passes
-/// [`Volume::new`]. The conversion is what keeps "no declared table" from
-/// being a special case anybody has to spell.
 #[derive(Clone, Copy)]
 pub struct Volume<'a> {
     scan: &'a Scan,

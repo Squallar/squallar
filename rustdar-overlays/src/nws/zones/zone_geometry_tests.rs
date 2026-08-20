@@ -1,10 +1,6 @@
 //! Why a zone's boundary goes missing, pinned against the geometry the NWS
 //! actually serves.
 //!
-//! [`ZoneFailure`] could say *how many* boundaries did not arrive and *what
-//! kind* of failure each was, and the answer to "so why does this happen"
-//! turned out to be that two of the four kinds were us.
-//!
 //! Measured over every one of the **11,651 published NWS zones**, fetched once
 //! from `api.weather.gov` at 43 req/s, plus two full live alert rounds of 1,791
 //! and 1,806 zones at production concurrency:
@@ -21,11 +17,7 @@
 //! as zero-area out-and-backs.
 //!
 //! The three fixtures below are the three shapes of that, copied verbatim from
-//! live responses. Nothing here is synthesised; a degenerate polygon anyone can
-//! construct proves nothing about whether this fires on real data, which was
-//! the whole question.
-//!
-//! [`ZoneFailure`]: super::ZoneFailure
+//! live responses. Nothing here is synthesised.
 
 use super::parse_zone_polygons;
 use crate::render::geo::simplify_ring;
@@ -43,8 +35,6 @@ fn fixture(key: &str) -> serde_json::Value {
         .clone()
 }
 
-/// The whole bare Feature the zones API returns is what `parse_zone_polygons`
-/// reads, and each fixture entry already holds its `geometry` under that name.
 fn boundary_of(key: &str) -> Option<Vec<GeoPolygon>> {
     parse_zone_polygons(&fixture(key), key)
 }
@@ -81,8 +71,6 @@ fn every_ring(key: &str) -> Vec<GeoPolygonRing> {
 /// the Outer Banks, the Florida Keys, Maryland's western shore, Kauai. Every
 /// one of them fell down `parse_geometry`'s `_ =>` arm and came back
 /// `NoBoundary`, which reads in the panel as though the zone had no shape.
-///
-/// Both live rounds sampled produced 28 failures and this was all 28 of them.
 #[test]
 fn a_zone_served_as_a_geometry_collection_still_has_a_boundary() {
     let polygons = boundary_of("collection").expect(
@@ -112,9 +100,7 @@ fn a_zone_served_as_a_geometry_collection_still_has_a_boundary() {
 /// as "the NWS sent us nothing" for a boundary the NWS sent in full.
 ///
 /// Six of the 11,651 zones do this, all of them Yap outer-island atolls, and
-/// they are not decorative: NWS issues High Surf Advisories against those zones
-/// on most days. A zone this size is also exactly the size a tornado warning
-/// lives at.
+/// they are not decorative: NWS issues High Surf Advisories against those zones on most days.
 #[test]
 fn an_atoll_smaller_than_the_simplification_tolerance_still_has_a_boundary() {
     let polygons = boundary_of("atoll").expect(
@@ -155,12 +141,6 @@ fn a_part_the_tolerance_cannot_resolve_is_kept_as_a_ring_with_area() {
     );
 }
 
-/// The invariant the three cases above are instances of, stated once.
-///
-/// Simplification is a fidelity operation with a tolerance. It is not a filter,
-/// and it does not get to decide that a shape is too small to exist — that
-/// decision needs the zoom, which this code does not have and the rasterizer
-/// does.
 #[test]
 fn simplification_never_turns_a_ring_into_something_that_is_not_a_ring() {
     for key in ["collection", "atoll", "islet"] {
@@ -186,11 +166,6 @@ fn simplification_never_turns_a_ring_into_something_that_is_not_a_ring() {
     }
 }
 
-/// **The counterweight.** Every test above is satisfied by not simplifying at
-/// all, and that would put 8 million vertices through the projector on every
-/// frame. A ring the tolerance *can* resolve must still be reduced by it, and
-/// reduced by the same amount as before — the tolerance only gives way where it
-/// would otherwise destroy the ring.
 #[test]
 fn a_ring_the_tolerance_can_resolve_is_still_simplified_as_hard_as_ever() {
     let rings = every_ring("collection");
@@ -208,13 +183,6 @@ fn a_ring_the_tolerance_can_resolve_is_still_simplified_as_hard_as_ever() {
     );
 }
 
-/// A cache entry written by a *different* simplification is not the answer to
-/// this question, and reading it as one is how a fix fails to arrive.
-///
-/// The disk cache stores simplified rings for a year. Every entry on every
-/// machine that has ever run this was written by the simplifier that deleted
-/// small islands, so without a schema stamp the fix would reach a zone the
-/// first time anyone looked at it after August 2027.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_cache_entry_from_before_the_schema_existed_is_refused() {
