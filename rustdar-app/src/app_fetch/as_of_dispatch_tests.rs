@@ -37,7 +37,11 @@ fn a_live_pane_tells_every_layer_the_picture_depicts_now() {
     let clock = ts(30);
 
     let layers = declared(&gui);
-    assert_eq!(layers.len(), 12, "the walk below must cover every layer");
+    assert_eq!(
+        layers.len(),
+        12 + cfg!(feature = "fake-source") as usize,
+        "the walk below must cover every layer",
+    );
     for (id, _) in &layers {
         assert_eq!(
             as_of_for_layer(&gui, 0, id, clock),

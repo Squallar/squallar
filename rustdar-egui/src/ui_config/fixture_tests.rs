@@ -426,8 +426,9 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
     // The registered ids the file omitted joined at their weight positions.
     assert_eq!(
         order.len(),
-        13,
-        "all twelve registered layers plus the unknown id: {order:?}",
+        13 + cfg!(feature = "fake-source") as usize,
+        "all twelve registered layers plus the unknown id — thirteen \
+         registered where the fake source is on: {order:?}",
     );
 
     // Direction 2 (save): written back in place, as a slot.

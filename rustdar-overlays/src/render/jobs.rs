@@ -22,6 +22,13 @@ use crate::render::rasterize::{
 
 /// The seven overlay rows, in dispatch order: **sites, alerts, outlooks,
 /// discussions, reports, glm, model**. The order is load-bearing.
+///
+/// **Two `#[cfg]`'d definitions rather than one list with a `#[cfg]`'d
+/// element**, because `#[cfg]` on an array element is not stable. The fake row
+/// is APPENDED, never inserted: `rustdar_worker::job_registry::job_codecs`
+/// numbers rows by position across the composed chain, so a row inserted
+/// anywhere else would renumber the shipped wire codes.
+#[cfg(not(feature = "fake-source"))]
 pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<SitesJob>(),
     JobCodec::of::<AlertsJob>(),
@@ -31,6 +38,91 @@ pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<GlmJob>(),
     JobCodec::of::<ModelJob>(),
 ];
+
+/// The same seven, plus the fake source's own row. See the note above for why
+/// this is a second definition and why the extra row goes last.
+#[cfg(feature = "fake-source")]
+pub static JOB_CODECS: &[JobCodec] = &[
+    JobCodec::of::<SitesJob>(),
+    JobCodec::of::<AlertsJob>(),
+    JobCodec::of::<OutlooksJob>(),
+    JobCodec::of::<DiscussionsJob>(),
+    JobCodec::of::<ReportsJob>(),
+    JobCodec::of::<GlmJob>(),
+    JobCodec::of::<ModelJob>(),
+    JobCodec::of::<FakeJob>(),
+];
+
+/// The fake row's label, named once so the handler and the registry cannot
+/// disagree about it.
+#[cfg(feature = "fake-source")]
+pub const FAKE_LABEL: &str = "overlay/fake";
+
+/// The fake source's row.
+///
+/// Deliberately **unpinned in the framing digest**: no row of
+/// `rustdar_worker::wire_identity::WIRE_FRAMING_ROWS` names it, so the local
+/// page/worker build token is byte-identical whether this feature is on or off.
+/// A token that moved with a test-only feature would make a feature-enabled
+/// page refuse a feature-enabled worker for no reason.
+#[cfg(feature = "fake-source")]
+pub struct FakeJob;
+
+#[cfg(feature = "fake-source")]
+impl JobSpec for FakeJob {
+    type In = crate::render::handlers::fake::FakeInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = FAKE_LABEL;
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(input: &Self::In, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        out.push(match input.tint {
+            crate::render::handlers::fake::FakeTint::Warm => 0,
+            crate::render::handlers::fake::FakeTint::Cool => 1,
+        });
+        out.extend_from_slice(&input.level.to_le_bytes());
+        out.extend_from_slice(&input.device_scale.to_le_bytes());
+    }
+
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(Self::In, JobGeometry)> {
+        let tint = match r.u8()? {
+            0 => crate::render::handlers::fake::FakeTint::Warm,
+            1 => crate::render::handlers::fake::FakeTint::Cool,
+            // The refusal contract: an enum byte outside this build's values.
+            _ => return None,
+        };
+        let level = r.f32()?;
+        let device_scale = r.f32()?;
+        Some((
+            crate::render::handlers::fake::FakeInput {
+                tint,
+                level,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(input: &Self::In, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(crate::render::handlers::fake::rasterize_fake(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+#[cfg(feature = "fake-source")]
+impl JobOutCodec for FakeJob {
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
+    }
+
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
+    }
+}
 
 /// The radar-site markers row.
 pub struct SitesJob;
@@ -1149,19 +1241,40 @@ mod tests {
             .naive_utc()
     }
 
+    /// The labels of the rows this build registers, spelled out per feature
+    /// arm. **Two `#[cfg]`'d definitions**, matching the two definitions of
+    /// `JOB_CODECS` itself — which is what makes this pin catch a row that
+    /// drifted between them.
+    #[cfg(not(feature = "fake-source"))]
+    const EXPECTED_LABELS: [&str; 7] = [
+        "overlay/sites",
+        "overlay/alerts",
+        "overlay/outlooks",
+        "overlay/discussions",
+        "overlay/reports",
+        "overlay/glm",
+        "overlay/model",
+    ];
+
+    #[cfg(feature = "fake-source")]
+    const EXPECTED_LABELS: [&str; 8] = [
+        "overlay/sites",
+        "overlay/alerts",
+        "overlay/outlooks",
+        "overlay/discussions",
+        "overlay/reports",
+        "overlay/glm",
+        "overlay/model",
+        // Appended, never inserted: the composed registry numbers rows by
+        // position and an insert would renumber every shipped wire code.
+        "overlay/fake",
+    ];
+
     #[test]
     fn the_registry_is_the_seven_rows_in_dispatch_order() {
         assert_eq!(
             JOB_CODECS.iter().map(|row| row.label).collect::<Vec<_>>(),
-            [
-                "overlay/sites",
-                "overlay/alerts",
-                "overlay/outlooks",
-                "overlay/discussions",
-                "overlay/reports",
-                "overlay/glm",
-                "overlay/model",
-            ],
+            EXPECTED_LABELS,
             "the labels are the shipped kind strings and the order is \
              load-bearing: WO-M7b's dense code flip assigns codes by index",
         );
