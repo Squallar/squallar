@@ -4,6 +4,7 @@ use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use rustdar_radar::hover::HoverSource;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -359,6 +360,39 @@ impl LayerSlot {
             enabled,
             config: serde_json::Value::Null,
         }
+    }
+}
+
+/// **One pane's layer stack, in the shape [`PaneRef`] borrows from.**
+///
+/// The sibling-config table is built once here and shared by every
+/// [`Self::layer`] call, so asking twelve handlers about one pane costs one
+/// allocation rather than twelve.
+pub struct PaneView<'a> {
+    pane_idx: usize,
+    slots: Vec<(&'a LayerId, &'a serde_json::Value)>,
+    loading_site: Option<&'a str>,
+    pane: &'a PaneState,
+}
+
+impl<'a> PaneView<'a> {
+    /// What this pane looks like to `id`'s handler. A layer this pane has no
+    /// slot for gets a `null` config and no state — the same answer an absent
+    /// map entry has always given.
+    pub fn layer(&'a self, id: &LayerId) -> PaneRef<'a> {
+        let slot = self.pane.slot(id);
+        PaneRef {
+            pane_idx: self.pane_idx,
+            config: slot.map_or(&serde_json::Value::Null, |slot| &slot.config),
+            state: None,
+            slots: &self.slots,
+            loading_site: self.loading_site,
+        }
+    }
+
+    /// Which pane this is.
+    pub fn pane_idx(&self) -> usize {
+        self.pane_idx
     }
 }
 
@@ -1197,6 +1231,22 @@ impl PaneState {
             .radar_meta
             .as_ref()?
             .storm_motion
+    }
+
+    /// **This pane, as handlers see it.** Build once per pane per frame and
+    /// ask it for each layer in turn: the sibling table is materialised here
+    /// rather than per layer, which is the whole reason the type exists.
+    pub fn view(&self, pane_idx: usize) -> PaneView<'_> {
+        PaneView {
+            pane_idx,
+            slots: self
+                .layers
+                .iter()
+                .map(|slot| (&slot.id, &slot.config))
+                .collect(),
+            loading_site: self.loading_site.as_deref(),
+            pane: self,
+        }
     }
 
     /// This pane's slot for `id`, or `None` for a layer it has no slot for.

@@ -64,19 +64,6 @@ pub enum ControlValue {
     Action,
 }
 
-/// Lets a handler adapt its controls to one pane, e.g. offering only the
-/// products that pane has data for.
-pub struct PaneControlContext<'a> {
-    pub pane_idx: usize,
-    /// Present only if the handler defined `create_pane_state()`.
-    pub pane_state: Option<&'a dyn std::any::Any>,
-}
-
-pub struct PaneControlContextMut<'a> {
-    pub pane_idx: usize,
-    pub pane_state: Option<&'a mut dyn std::any::Any>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlEffect {
     #[default]

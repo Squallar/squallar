@@ -11,6 +11,7 @@ use rustdar_radar::voxel::VoxelGrid;
 use rustdar_radar::voxel::{VoxelRequest, VoxelShape};
 use rustdar_radar::xsect::CrossSection;
 use rustdar_radar::xsect::SectionRequest;
+use rustdar_source::handler::PaneRef;
 use rustdar_source::job::{DescribedJob, DescribedOut, JobGeometry};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -2382,7 +2383,7 @@ fn the_hit_map_zip_answers_the_direct_calls_hits_on_a_probe_grid() {
         (a_seeded_glm_registry(), known::LIGHTNING),
     ] {
         let job = registry
-            .prepare_job(&kind, &ctx)
+            .prepare_job(&kind, &ctx, &PaneRef::bare(0))
             .expect("the seeded registry describes a job");
         let items = registry
             .hit_items(&kind)
@@ -2465,7 +2466,7 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
     let registry = a_seeded_reports_registry();
     let ctx = a_zip_ctx();
     let job = registry
-        .prepare_job(&known::STORM_REPORTS, &ctx)
+        .prepare_job(&known::STORM_REPORTS, &ctx, &PaneRef::bare(0))
         .expect("the seeded registry describes a reports job");
     assert!(
         job.downcast_ref::<rustdar_overlays::render::rasterize::ReportsInput>()

@@ -1,12 +1,10 @@
 //! The radar layer as a source — its registration, its toggle and its saved
 //! state, and nothing else.
 
+use rustdar_source::handler::{PaneMut, PaneRef};
 use std::sync::Arc;
 
-use rustdar_source::controls::{
-    ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
-};
+use rustdar_source::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
 use rustdar_source::handler::{FetchPayload, OverlayItem, RenderMode, SourceHandler, Surface};
 use rustdar_source::id::{LayerId, known};
 
@@ -76,7 +74,7 @@ impl SourceHandler for RadarSource {
     fn apply_fetch_result(&mut self, _result: FetchPayload) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {}
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
             label: "Radar".to_string(),
@@ -84,11 +82,7 @@ impl SourceHandler for RadarSource {
         }]
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         if update.id == "enabled"
             && let ControlValue::Bool(val) = update.value
         {

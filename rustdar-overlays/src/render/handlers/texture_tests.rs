@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 
+use crate::render::overlay_state::PaneRef;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::DescribedJob;
 
@@ -373,9 +374,11 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         }
         let id = handler.id();
         let name = id.as_str();
-        let input = handler.prepare_job(&ctx).unwrap_or_else(|| {
-            panic!("{name} was seeded with data it should draw and answered None")
-        });
+        let input = handler
+            .prepare_job(&ctx, &PaneRef::bare(0))
+            .unwrap_or_else(|| {
+                panic!("{name} was seeded with data it should draw and answered None")
+            });
         let (named, out) = run_described(&input, &BOUNDS, W, H);
         assert_eq!(
             named, id,
@@ -497,7 +500,7 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
         }
         let id = handler.id();
         let input = handler
-            .prepare_job(&ctx)
+            .prepare_job(&ctx, &PaneRef::bare(0))
             .expect("seeded above, and the walk next door asserts this");
         let (_, out) = run_described(&input, &BOUNDS, W, H);
         let translucent: HashSet<u8> = drawn(&out.rgba)
@@ -539,7 +542,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
             // The one exempt kind: there is no `prepare_job` for its `has_data`
             // to agree *with*, and its dispatch cannot decline.
             assert!(
-                handler.prepare_job(&ctx).is_none(),
+                handler.prepare_job(&ctx, &PaneRef::bare(0)).is_none(),
                 "{name} grew a `prepare_job`; it now has this invariant \
                  to keep, so seed it in `seed` and drop it from this exemption",
             );
@@ -549,7 +552,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         let agree = |h: &dyn OverlayHandler, state: &str| {
             assert_eq!(
                 h.has_data(),
-                h.prepare_job(&ctx).is_some(),
+                h.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
                 "{name} disagrees with its own rasterizer while {state}. \
                  `ui_map_pane` gates both the render dispatch and the settle \
                  repaint on `has_data`, so `true` here with `None` there is a \
@@ -598,7 +601,7 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     let mut handler = super::outlook::SpcOutlookHandler::new();
     assert!(seed(&mut handler), "the outlook handler takes a fetch");
     assert!(
-        handler.has_data() && handler.prepare_job(&ctx).is_some(),
+        handler.has_data() && handler.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
         "fixture: Day 1 Categorical is both ticked and fetched",
     );
 
@@ -616,7 +619,7 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     );
 
     assert!(
-        handler.prepare_job(&ctx).is_none(),
+        handler.prepare_job(&ctx, &PaneRef::bare(0)).is_none(),
         "fixture: there is nothing on Day 5 to rasterize",
     );
     assert!(
@@ -649,7 +652,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         let agree = |h: &dyn OverlayHandler, state: &str| {
             if !handler_backed {
                 assert!(
-                    h.prepare_job(&ctx).is_none(),
+                    h.prepare_job(&ctx, &PaneRef::bare(0)).is_none(),
                     "{name} grew a `prepare_job` while {state}. The \
                      described set is stated twice — here and in \
                      `spawn_overlay_render`'s match — so add the layer to the \
@@ -661,13 +664,15 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
             if has_hit_map(&id) {
                 assert_eq!(
                     h.hit_items().is_some(),
-                    h.prepare_job(&ctx).is_some(),
+                    h.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
                     "{name}'s `hit_items` disagrees with its `prepare_job` \
                      while {state}. The dispatch captures the two together, \
                      and rows without items is a layer whose every hover \
                      resolves to nothing.",
                 );
-                if let (Some(items), Some(_)) = (h.hit_items(), h.prepare_job(&ctx)) {
+                if let (Some(items), Some(_)) =
+                    (h.hit_items(), h.prepare_job(&ctx, &PaneRef::bare(0)))
+                {
                     assert_eq!(
                         items.len(),
                         h.item_count(),
@@ -691,7 +696,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
             continue;
         }
         assert!(
-            handler.prepare_job(&ctx).is_some(),
+            handler.prepare_job(&ctx, &PaneRef::bare(0)).is_some(),
             "{name} is a seeded texture layer with no described job — the \
              closure path it would have ridden is deleted, so this layer \
              cannot render at all",
@@ -729,7 +734,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
             continue;
         }
         let job = handler
-            .prepare_job(&ctx)
+            .prepare_job(&ctx, &PaneRef::bare(0))
             .expect("seeded, and the agreement walk pins this");
         let items = handler.hit_items().expect("seeded");
         if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {

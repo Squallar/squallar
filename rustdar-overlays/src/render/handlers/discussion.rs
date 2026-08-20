@@ -1,9 +1,9 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::sync::Arc;
 
 use crate::fetch_policy::{FetchError, FetchRetry, Whole};
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
@@ -282,7 +282,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         self.paint_input(ctx).map(DescribedJob::new)
     }
 
@@ -292,7 +292,7 @@ impl OverlayHandler for SpcDiscussionHandler {
             .find(|row| row.label == "overlay/discussions")
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         log::info!("Fetching SPC Mesoscale Discussions");
         // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes this fail in the browser. See `spc::fetch`.
@@ -313,7 +313,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
             "Mesoscale Disc.".to_string()
@@ -353,11 +353,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {

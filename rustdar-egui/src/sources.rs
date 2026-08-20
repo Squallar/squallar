@@ -23,8 +23,8 @@ pub fn default_draw_order() -> Vec<LayerId> {
 
 #[cfg(test)]
 mod controls_parity_tests {
-    use rustdar_overlays::render::controls::{ControlItem, PaneControlContext};
-    use rustdar_overlays::render::overlay_state::OverlayRegistry;
+    use rustdar_overlays::render::controls::ControlItem;
+    use rustdar_overlays::render::overlay_state::{OverlayRegistry, PaneRef};
     use rustdar_source::id::LayerId;
 
     use super::all;
@@ -68,10 +68,7 @@ mod controls_parity_tests {
             "the registry carries all twelve handlers - the walk below \
              must cover every one"
         );
-        let ctx = PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let ctx = PaneRef::bare(0);
         for kind in kinds {
             registry.set_enabled(&kind, true);
             let shown: Vec<String> = registry.controls(&kind, &ctx).iter().map(shape).collect();

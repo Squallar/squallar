@@ -158,7 +158,7 @@ impl super::Gui {
         }
 
         let statuses: Vec<(LayerId, Option<String>)> = if stack_slide > 0.0 {
-            self.stack_row_statuses(&pane)
+            self.stack_row_statuses(self.active_pane, &pane)
         } else {
             Vec::new()
         };
@@ -222,16 +222,21 @@ impl super::Gui {
     /// The stack rows' status lines, one per layer in the pane's own order —
     /// empty for a pane that draws no map layers, which has no rows to carry
     /// them.
-    pub(super) fn stack_row_statuses(&self, pane: &PaneState) -> Vec<(LayerId, Option<String>)> {
+    pub(super) fn stack_row_statuses(
+        &self,
+        pane_idx: usize,
+        pane: &PaneState,
+    ) -> Vec<(LayerId, Option<String>)> {
         if !pane.draws_map_layers() {
             return Vec::new();
         }
+        let view = pane.view(pane_idx);
         pane.draw_order()
             .map(|kind| {
                 let line = if *kind == known::RADAR {
                     radar_row_status(pane)
                 } else {
-                    self.overlays.status_line(kind)
+                    self.overlays.status_line(kind, &view.layer(kind))
                 };
                 (kind.clone(), line)
             })

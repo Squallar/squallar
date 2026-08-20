@@ -11,16 +11,14 @@ use rustdar_units::UserPreferences;
 #[cfg(test)]
 use crate::fetch_policy::{Assembled, Whole};
 use crate::fetch_policy::{FetchError, FetchHealth, FetchRetry};
-use crate::render::controls::{
-    ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
-};
+use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::types::OverlayLabel;
 
 pub use rustdar_source::handler::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayItem, OverlayLegend, OverlayState,
-    PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext, RenderMode, Signed,
-    SourceHandler as OverlayHandler, Surface, TaskFuture,
+    PaneMut, PaneRef, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
+    RenderMode, Signed, SourceHandler as OverlayHandler, Surface, TaskFuture,
 };
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
@@ -223,9 +221,9 @@ impl OverlayRegistry {
 
     /// [`OverlayHandler::status_line`] for `kind`, marked when the layer is not
     /// updating; `None` for a kind with no handler.
-    pub fn status_line(&self, id: &LayerId) -> Option<String> {
+    pub fn status_line(&self, id: &LayerId, pane: &PaneRef<'_>) -> Option<String> {
         let handler = self.handler(id)?;
-        let line = handler.status_line();
+        let line = handler.status_line(pane);
         if !handler.is_enabled() {
             return line;
         }
@@ -259,8 +257,8 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.hover_value_at(lat, lon))
     }
 
-    pub fn legend(&self, id: &LayerId) -> Option<Signed<OverlayLegend>> {
-        self.handler(id).and_then(|h| h.legend())
+    pub fn legend(&self, id: &LayerId, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
+        self.handler(id).and_then(|h| h.legend(pane))
     }
 
     /// [`OverlayHandler::theme_sensitive`] for `id`.
@@ -296,8 +294,13 @@ impl OverlayRegistry {
         }
     }
 
-    pub fn prepare_job(&self, id: &LayerId, ctx: &RasterizeContext) -> Option<DescribedJob> {
-        self.handler(id).and_then(|h| h.prepare_job(ctx))
+    pub fn prepare_job(
+        &self,
+        id: &LayerId,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> Option<DescribedJob> {
+        self.handler(id).and_then(|h| h.prepare_job(ctx, pane))
     }
 
     pub fn job_codec(&self, id: &LayerId) -> Option<&'static JobCodec> {
@@ -308,17 +311,22 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.hit_items())
     }
 
-    pub fn create_fetch_tasks(&self, id: &LayerId, ctx: &FetchConfig) -> Vec<FetchTask> {
+    pub fn create_fetch_tasks(
+        &self,
+        id: &LayerId,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+    ) -> Vec<FetchTask> {
         self.handler(id)
-            .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
+            .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx, pane))
     }
 
     /// The handler's own options, with its fetch health prepended.
-    pub fn controls(&self, id: &LayerId, ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    pub fn controls(&self, id: &LayerId, pane: &PaneRef<'_>) -> Vec<ControlItem> {
         let Some(handler) = self.handler(id) else {
             return Vec::new();
         };
-        let mut items = handler.controls(ctx);
+        let mut items = handler.controls(pane);
         // Inserted in reverse, so each lands above the one before it.
         if let Some(note) = handler.retry().and_then(|r| r.coverage().status_note()) {
             items.insert(0, ControlItem::InfoText { text: note });
@@ -333,10 +341,10 @@ impl OverlayRegistry {
         &mut self,
         id: &LayerId,
         update: &ControlUpdate,
-        ctx: &mut PaneControlContextMut<'_>,
+        pane: &mut PaneMut<'_>,
     ) -> ControlEffect {
         if let Some(h) = self.handler_mut(id) {
-            h.apply_control(update, ctx)
+            h.apply_control(update, pane)
         } else {
             ControlEffect::None
         }
@@ -646,12 +654,9 @@ mod retry_ledger_tests {
 
     #[test]
     fn every_fetching_layer_says_so_when_it_is_failing() {
-        use crate::render::controls::{ControlItem, PaneControlContext};
+        use crate::render::controls::ControlItem;
 
-        let ctx = PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let ctx = PaneRef::bare(0);
         let mut registry = OverlayRegistry::default();
         let kinds: Vec<LayerId> = registry
             .handlers()
@@ -767,7 +772,7 @@ mod retry_ledger_tests {
 
         for kind in kinds {
             registry.set_enabled(&kind, true);
-            let healthy = registry.status_line(&kind);
+            let healthy = registry.status_line(&kind, &PaneRef::bare(0));
             assert!(
                 !healthy
                     .as_deref()
@@ -777,7 +782,7 @@ mod retry_ledger_tests {
 
             registry.record_fetch_failure(&kind, &FetchError::transient("connection refused"));
             let marked = registry
-                .status_line(&kind)
+                .status_line(&kind, &PaneRef::bare(0))
                 .unwrap_or_else(|| panic!("{kind:?} says nothing on the row while failing"));
             assert!(
                 marked.starts_with("! not updating"),
@@ -793,7 +798,7 @@ mod retry_ledger_tests {
 
             registry.clear_retry(&kind);
             assert_eq!(
-                registry.status_line(&kind),
+                registry.status_line(&kind, &PaneRef::bare(0)),
                 healthy,
                 "{kind:?} kept the mark after recovering",
             );
@@ -844,10 +849,7 @@ mod retry_ledger_tests {
     fn a_layer_that_under_drew_says_so_on_its_row_and_in_its_options() {
         use crate::nws::zones::{ZoneFailure, ZoneResolution};
 
-        let ctx = PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let ctx = PaneRef::bare(0);
         let kind = known::NWS_ALERTS;
         let mut registry = OverlayRegistry::default();
 
@@ -856,7 +858,7 @@ mod retry_ledger_tests {
             data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
         });
         assert_eq!(
-            registry.status_line(&kind).as_deref(),
+            registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("297 shown - W/Wa/Adv/Oth"),
             "a whole round must read as a plain count",
         );
@@ -879,7 +881,7 @@ mod retry_ledger_tests {
         });
 
         assert_eq!(
-            registry.status_line(&kind).as_deref(),
+            registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
             "a layer drawing 85 of 297 warnings must not read as healthy",
         );
@@ -938,7 +940,7 @@ mod retry_ledger_tests {
             data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
         });
         assert_eq!(
-            registry.status_line(&kind).as_deref(),
+            registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("297 shown - W/Wa/Adv/Oth"),
             "the mark outlived the round it was about",
         );
@@ -966,21 +968,18 @@ mod retry_ledger_tests {
             ),
         });
         assert_eq!(
-            registry.status_line(&kind).as_deref(),
+            registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
         );
 
         registry.record_fetch_failure(&kind, &FetchError::transient("connection refused"));
         assert_eq!(
-            registry.status_line(&kind).as_deref(),
+            registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("! not updating, incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
             "a failure must not overwrite the coverage verdict, or the reverse",
         );
 
-        let ctx = PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let ctx = PaneRef::bare(0);
         let notes: Vec<String> = registry
             .controls(&kind, &ctx)
             .into_iter()
@@ -997,7 +996,7 @@ mod retry_ledger_tests {
 
         registry.clear_retry(&kind);
         assert_eq!(
-            registry.status_line(&kind).as_deref(),
+            registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
             "clearing the retry ladder marked the layer whole before the answer \
              that would make it whole had landed",
@@ -1035,7 +1034,7 @@ mod retry_ledger_tests {
         registry.set_enabled(&kind, false);
         assert!(
             !registry
-                .status_line(&kind)
+                .status_line(&kind, &PaneRef::bare(0))
                 .is_some_and(|l| l.contains("not updating")),
             "a layer that is switched off must not carry a staleness mark",
         );

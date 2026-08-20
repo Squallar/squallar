@@ -1,4 +1,5 @@
 use super::*;
+use crate::render::overlay_state::PaneRef;
 
 fn item(level: GlmDataLevel, energy: Option<f32>, area: Option<f32>) -> GlmFlashItem {
     GlmFlashItem {
@@ -102,10 +103,7 @@ fn dead_east() -> DeadFeed {
 }
 
 fn info_texts(handler: &GlmHandler) -> Vec<String> {
-    let ctx = PaneControlContext {
-        pane_idx: 0,
-        pane_state: None,
-    };
+    let ctx = PaneRef::bare(0);
     handler
         .controls(&ctx)
         .into_iter()
@@ -1059,13 +1057,9 @@ fn half_listed_round() -> FetchPayload {
 
 #[test]
 fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
-    use crate::render::controls::PaneControlContext;
     use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
 
-    let ctx = PaneControlContext {
-        pane_idx: 0,
-        pane_state: None,
-    };
+    let ctx = PaneRef::bare(0);
     let kind = known::LIGHTNING;
     let mut registry = OverlayRegistry::default();
     registry.set_enabled(&kind, true);
@@ -1076,7 +1070,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     });
 
     let line = registry
-        .status_line(&kind)
+        .status_line(&kind, &PaneRef::bare(0))
         .expect("an enabled lightning layer states its own line");
     assert!(
         line.starts_with("! incomplete"),
@@ -1124,7 +1118,7 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     });
     assert!(
         !registry
-            .status_line(&kind)
+            .status_line(&kind, &PaneRef::bare(0))
             .is_some_and(|l| l.contains("incomplete")),
         "the mark outlived the round it was about",
     );
@@ -1151,7 +1145,6 @@ fn round(
 }
 
 fn marks(payload: FetchPayload) -> (String, Option<String>) {
-    use crate::render::controls::PaneControlContext;
     use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
 
     let kind = known::LIGHTNING;
@@ -1161,10 +1154,7 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
         kind: kind.clone(),
         data: payload,
     });
-    let ctx = PaneControlContext {
-        pane_idx: 0,
-        pane_state: None,
-    };
+    let ctx = PaneRef::bare(0);
     let note = registry
         .controls(&kind, &ctx)
         .into_iter()
@@ -1174,7 +1164,7 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
         });
     (
         registry
-            .status_line(&kind)
+            .status_line(&kind, &PaneRef::bare(0))
             .expect("an enabled lightning layer states its own line"),
         note,
     )

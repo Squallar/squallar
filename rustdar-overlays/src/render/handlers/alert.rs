@@ -1,3 +1,4 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -5,8 +6,7 @@ use std::sync::Arc;
 use crate::fetch_policy::Assembled;
 use crate::nws::alert::{AlertCategory, NwsAlert};
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
@@ -249,7 +249,7 @@ impl OverlayHandler for NwsAlertHandler {
     ///
     /// [`drawn_count`]: NwsAlertHandler::drawn_count
     /// [`painted_count`]: NwsAlertHandler::painted_count
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
         if !self.is_enabled() {
             return None;
         }
@@ -395,7 +395,7 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         self.paint_input(ctx).map(DescribedJob::new)
     }
 
@@ -405,7 +405,7 @@ impl OverlayHandler for NwsAlertHandler {
             .find(|row| row.label == "overlay/alerts")
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         log::info!("Fetching NWS active alerts");
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
@@ -424,7 +424,7 @@ impl OverlayHandler for NwsAlertHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let mut items = vec![ControlItem::Heading {
             text: "NWS Alerts".into(),
         }];
@@ -479,11 +479,7 @@ impl OverlayHandler for NwsAlertHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         if update.id == "refresh" {
             return ControlEffect::Fetch;
         }
@@ -751,14 +747,14 @@ mod tests {
             "premise: every filter lets all three through",
         );
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 of 3 shown - W/Wa/Adv/Oth"),
             "two alerts with no shape must not be counted as shown",
         );
 
         handler.hidden_alerts.insert("a".to_string());
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("0 of 2 shown - W/Wa/Adv/Oth"),
             "both numbers must move with the filters, not just the denominator",
         );
@@ -766,7 +762,7 @@ mod tests {
         handler.hidden_alerts.clear();
         handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W/Wa/Adv/Oth")
         );
     }
@@ -778,27 +774,33 @@ mod tests {
             alert("b", "Severe Thunderstorm Warning"),
         ]);
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("2 shown - W/Wa/Adv/Oth")
         );
 
         handler.hidden_alerts.insert("b".to_string());
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W/Wa/Adv/Oth"),
             "a hidden alert is not shown, so it must not be counted as shown"
         );
 
         handler.enabled_categories.remove(&AlertCategory::Advisory);
         handler.enabled_categories.remove(&AlertCategory::Watch);
-        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Oth"));
+        assert_eq!(
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
+            Some("1 shown - W/Oth")
+        );
 
         handler.enabled_categories.remove(&AlertCategory::Other);
-        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W"));
+        assert_eq!(
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
+            Some("1 shown - W")
+        );
 
         handler.enabled_categories.clear();
         assert_eq!(
-            handler.status_line(),
+            handler.status_line(&PaneRef::bare(0)),
             None,
             "a disabled layer's dimmed row carries no status line"
         );
@@ -967,10 +969,7 @@ mod tests {
     fn every_category_has_a_toggle_that_turns_it_on_and_off() {
         let mut handler = NwsAlertHandler::new();
         let offered: Vec<&str> = handler
-            .controls(&PaneControlContext {
-                pane_idx: 0,
-                pane_state: None,
-            })
+            .controls(&PaneRef::bare(0))
             .into_iter()
             .filter_map(|item| match item {
                 ControlItem::Toggle { id, .. } => Some(id),
@@ -984,10 +983,7 @@ mod tests {
                 "{category} has no toggle; the panel offers {offered:?}",
             );
 
-            let mut ctx = PaneControlContextMut {
-                pane_idx: 0,
-                pane_state: None,
-            };
+            let mut ctx = PaneMut::bare(0);
             handler.apply_control(
                 &ControlUpdate {
                     id: category.control_id(),
@@ -1036,13 +1032,16 @@ mod tests {
         );
         assert_eq!(handler.clickable_items().len(), 2);
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("2 shown - W/Wa/Adv/Oth"),
         );
 
         handler.enabled_categories.remove(&AlertCategory::Other);
         assert_eq!(handler.drawn_count(), 1);
-        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Wa/Adv"));
+        assert_eq!(
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
+            Some("1 shown - W/Wa/Adv")
+        );
     }
 
     /// A set persisted by a build that had three toggles is not a user who

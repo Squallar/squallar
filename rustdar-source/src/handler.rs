@@ -10,9 +10,7 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::controls::{
-    ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
-};
+use crate::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::feature::{OverlayFeature, OverlayLabel};
 use crate::fetch_policy::{
@@ -261,6 +259,97 @@ pub struct Signed<T> {
     pub items: T,
 }
 
+/// The `null` a [`PaneRef`] with nothing saved points at. A `static` rather
+/// than a fresh value per call, so [`PaneRef::bare`] borrows instead of
+/// allocating.
+static NULL_CONFIG: serde_json::Value = serde_json::Value::Null;
+
+/// **One pane, as a handler sees it** — the pane-shaped half of every
+/// [`SourceHandler`] method that can differ between two panes showing the same
+/// layer.
+///
+/// A handler holds no per-pane fields: the pane owns them, hands them over as
+/// `state` for the duration of one call, and takes them back. `config` is the
+/// same facts as JSON, for a handler that has not been given a state type
+/// (and for the load that builds one).
+pub struct PaneRef<'a> {
+    /// Which pane. Still meaningful to a handler that keeps no state — the
+    /// fetch bookkeeping is keyed by it.
+    pub pane_idx: usize,
+    /// This layer's saved configuration in this pane; [`serde_json::Value::Null`]
+    /// when the pane has nothing saved for it.
+    pub config: &'a serde_json::Value,
+    /// This layer's live per-pane state, when the handler defined
+    /// [`SourceHandler::create_pane_state`]. Downcast with [`Self::state_as`].
+    pub state: Option<&'a dyn Any>,
+    /// The **sibling** slots' configs — the same pane's other layers, so a
+    /// layer can read a fact another one owns (the site picker reads the radar
+    /// slot's `"site"`). Look one up with [`Self::sibling`].
+    ///
+    /// The id is **borrowed**, not owned: an id read from a config file is a
+    /// `Cow::Owned`, and this table is rebuilt once per pane per frame, so
+    /// owning it would allocate a string per layer per pane per frame for a
+    /// list almost every handler ignores.
+    pub slots: &'a [(&'a LayerId, &'a serde_json::Value)],
+    /// **Radar-transitional.** The site this pane is currently loading, which
+    /// today lives on `Gui` rather than in any slot. WO-E8 dissolves the field
+    /// it is read from; this member goes with it, and nothing new may read it.
+    pub loading_site: Option<&'a str>,
+}
+
+impl<'a> PaneRef<'a> {
+    /// A pane with nothing saved, no state and no siblings — what a caller
+    /// that is asking a handler a pane-independent question passes, and what
+    /// a handler with no per-pane state is given.
+    pub fn bare(pane_idx: usize) -> Self {
+        Self {
+            pane_idx,
+            config: &NULL_CONFIG,
+            state: None,
+            slots: &[],
+            loading_site: None,
+        }
+    }
+
+    /// This pane's state as `T`, or `None` when the pane has no state for this
+    /// layer (or it is not a `T`).
+    pub fn state_as<T: 'static>(&self) -> Option<&'a T> {
+        self.state?.downcast_ref::<T>()
+    }
+
+    /// Another layer's saved config **in this same pane**.
+    pub fn sibling(&self, id: &LayerId) -> Option<&'a serde_json::Value> {
+        self.slots
+            .iter()
+            .find(|(slot_id, _)| *slot_id == id)
+            .map(|(_, config)| *config)
+    }
+}
+
+/// [`PaneRef`]'s mutable half — what [`SourceHandler::apply_control`] writes
+/// through. A control edit lands in the pane's own state, so the same edit in
+/// two panes produces two answers.
+pub struct PaneMut<'a> {
+    pub pane_idx: usize,
+    pub state: Option<&'a mut dyn Any>,
+}
+
+impl PaneMut<'_> {
+    /// A pane with no state — what a caller asking a handler that keeps none
+    /// passes.
+    pub fn bare(pane_idx: usize) -> Self {
+        Self {
+            pane_idx,
+            state: None,
+        }
+    }
+
+    /// This pane's state as `T`, mutably.
+    pub fn state_as<T: 'static>(&mut self) -> Option<&mut T> {
+        self.state.as_deref_mut()?.downcast_mut::<T>()
+    }
+}
+
 /// Adding a layer means: implement this, give it a [`known`](crate::id::known)
 /// const, append that spelling to
 /// [`LAYER_ID_LEDGER`](crate::id::LAYER_ID_LEDGER), and register it in the
@@ -354,12 +443,13 @@ pub trait SourceHandler: Send {
 
     /// One line of live status for the layer stack's row — `"3 shown · W/Wa"`.
     /// Called every frame; a disabled handler returns `None`.
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        let _ = pane;
         None
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
-        let _ = ctx;
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, pane: &PaneRef<'_>) -> Vec<FetchTask> {
+        let _ = (ctx, pane);
         Vec::new()
     }
 
@@ -368,8 +458,8 @@ pub trait SourceHandler: Send {
     /// This handler's raster as a described job, or `None` when there is nothing
     /// to render. `has_data()` must answer `false` exactly when this answers
     /// `None`, or the settle machinery asks for a render nothing can satisfy.
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
-        let _ = ctx;
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        let _ = (ctx, pane);
         None
     }
 
@@ -426,20 +516,17 @@ pub trait SourceHandler: Send {
 
     /// This layer's colour bar, [`Signed`] so a caller can keep what it baked:
     /// the bar is sampled once per pixel of its length, at frame rate.
-    fn legend(&self) -> Option<Signed<OverlayLegend>> {
+    fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
+        let _ = pane;
         None
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _pane: &PaneRef<'_>) -> Vec<ControlItem> {
         Vec::new()
     }
 
     /// The returned [`ControlEffect`] asks the caller for a side-effect.
-    fn apply_control(
-        &mut self,
-        _update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, _update: &ControlUpdate, _pane: &mut PaneMut<'_>) -> ControlEffect {
         ControlEffect::None
     }
 
